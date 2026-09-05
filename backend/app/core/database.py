@@ -3496,6 +3496,14 @@ async def run_migrations(conn):
         ("on_spool_recovery_failed", "1", "TRUE"),
         ("on_spool_out_of_rotation", "1", "TRUE"),
         ("on_spool_recovery_self_healed", "0", "FALSE"),
+        # Pause-recovery wave (2026-09-04 fleet outage): ONE column carries the whole
+        # lane — the per-outage fleet summary ("power restored — N resumed, M held")
+        # and the per-printer HOLD pages (a resume the firmware refused, a plate-vision
+        # trip confirmed on the second start, a printer that rebooted with a part on
+        # its plate). Default ON because every one of those asks a human for
+        # something, unlike the success-class toggles above; a successful auto-resume
+        # is a log line and never pages.
+        ("on_power_loss_recovery", "1", "TRUE"),
     ):
         _default = _sqlite_default if is_sqlite() else _pg_default
         await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")
@@ -3553,6 +3561,19 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE printer_model_geometry ADD COLUMN z_travel_mm FLOAT")
     _true = "1" if is_sqlite() else "TRUE"
     _false = "0" if is_sqlite() else "FALSE"
+    # Pause-recovery wave (2026-09-04): two per-model motion facts for the eject lane.
+    # z_reference_validated — the contact-free Z re-reference prologue (bed to its
+    # bottom stop, G92 Z<z_travel>) is emitted for this model ONLY after the hardware
+    # ladder flipped this flag through the geometry manager; default FALSE for every
+    # model, so a deploy changes no eject motion anywhere (red line 2). hold_lift_mm —
+    # how far the bed rises off its bottom stop while a printer is held after a
+    # confirmed plate-check trip; 12.0 = the vendor's own "avoid end stop" lift in
+    # the stock start G-code; the operator sets whatever clears their plate-release
+    # aid (a hardware number — config/DB by red line 3, never code).
+    await _safe_execute(
+        conn, f"ALTER TABLE printer_model_geometry ADD COLUMN z_reference_validated BOOLEAN NOT NULL DEFAULT {_false}"
+    )
+    await _safe_execute(conn, "ALTER TABLE printer_model_geometry ADD COLUMN hold_lift_mm FLOAT NOT NULL DEFAULT 12.0")
     # H2S — operator-witnessed dry run on 001-H2S (2026-07-04): validated.
     # z_travel_mm 340 = printable height (spec); machine bottom for the bed-drop assist.
     await _safe_execute(

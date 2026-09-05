@@ -8656,3 +8656,93 @@ class TestDepositEvidenceOverRealTerminalPayloads:
 
         assert evidence.peaks_reliable is False
         assert evidence.deposited is True
+
+
+class TestIdleFromPauseCompletion:
+    """A ``print.stop`` sent while the job is PAUSEd can land straight in IDLE (W10).
+
+    The detector only ever accepted IDLE from RUNNING, so such a stop produced NO
+    terminal at all and the queue row sat ``printing`` forever. It is the shape the
+    2026-09-04 plate-check lane makes on every trip — the firmware pauses at layer 0
+    and the farm stops it there — and it is also how an operator screen-stop of a
+    PAUSEd print has silently gone unrecorded.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST123",
+            access_code="12345678",
+        )
+
+    def test_pause_to_idle_after_a_job_fires_the_terminal(self, mqtt_client):
+        complete_data = {}
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_complete = lambda data: complete_data.update(data)
+
+        mqtt_client._previous_gcode_state = "PAUSE"
+        mqtt_client._was_running = True  # there WAS a job
+        mqtt_client._completion_triggered = False
+
+        mqtt_client._process_message(
+            {
+                "print": {
+                    "gcode_state": "IDLE",
+                    "gcode_file": "/data/Metadata/plate_1.gcode",
+                    "subtask_name": "PlateCheckTrip",
+                }
+            }
+        )
+
+        assert complete_data.get("status") == "aborted"
+
+    def test_pause_to_idle_with_no_job_fires_nothing(self, mqtt_client):
+        """Without ``_was_running`` there was no print, so there is no terminal."""
+        calls = []
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_complete = lambda data: calls.append(data)
+
+        mqtt_client._previous_gcode_state = "PAUSE"
+        mqtt_client._was_running = False
+        mqtt_client._completion_triggered = False
+
+        mqtt_client._process_message(
+            {
+                "print": {
+                    "gcode_state": "IDLE",
+                    "gcode_file": "/data/Metadata/plate_1.gcode",
+                    "subtask_name": "NothingRan",
+                }
+            }
+        )
+
+        assert calls == []
+
+    def test_running_to_idle_still_fires_without_the_was_running_flag(self, mqtt_client):
+        """The RUNNING arm is deliberately left unguarded — today's behaviour.
+
+        ``_was_running`` is only set on a RUNNING push that carried a filename, so
+        requiring it here would DROP terminals rather than add them.
+        """
+        complete_data = {}
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_complete = lambda data: complete_data.update(data)
+
+        mqtt_client._previous_gcode_state = "RUNNING"
+        mqtt_client._was_running = False
+        mqtt_client._completion_triggered = False
+
+        mqtt_client._process_message(
+            {
+                "print": {
+                    "gcode_state": "IDLE",
+                    "gcode_file": "/data/Metadata/plate_1.gcode",
+                    "subtask_name": "Aborted",
+                }
+            }
+        )
+
+        assert complete_data.get("status") == "aborted"

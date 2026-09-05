@@ -172,6 +172,7 @@ export default {
       printerCol: 'Yazıcı',
       timeCol: 'Bitti / başladı',
       stoppedByOperator: 'Operatör tarafından durduruldu',
+      stoppedByFarmVision: 'Çiftlik tarafından durduruldu: plaka kontrolü',
       firstArticleBadge: 'İlk parça',
       stagedBadge: 'Bekletildi',
       lowSpoolBadge: 'Filament az',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: 'Fiziksel arıza — elle müdahale gerekiyor, otomatik değişim yok',
         printerOfflineStalled: 'Yazıcı baskı sırasında çevrimdışı oldu — yeniden bağlanana kadar sonuç bilinmiyor',
         printPausedStalled: 'Yazıcıda duraklatıldı — müdahale gerekiyor (otomatik kurtarma yok)',
-        visionHold: 'Yazıcı görüşü: plaka boş değil — yatağı temizleyin, sonra yazıcıdan sürdürün',
+        visionHold: 'Plaka kontrolü iki kez tetiklendi — yatağı temizleyin, sonra “Plakayı temizlendi olarak işaretle”',
+        powerLossHold: 'Yazıcının elektrik kesintisi sorusunda bekliyor — yazıcıdan sürdürün',
+        zReferenceLost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın',
         previousPrintFailed: 'Bekletildi: önceki baskı başarısız oldu',
         filamentShort: 'Filament az',
         externalSpoolRunout: 'Harici makara bitti — AMS yuvasını değil, harici tutucuyu doldurun',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: '{{model}} modelini doğrulandı olarak işaretlemek, gözetimsiz üretim çıkarmasının kilidini açar. Yalnızca operatörün tanık olduğu donanım merdiveninden sonra onaylayın: boş tablada kuru çalışma → gözetimli baskı→soğuma→çıkarma döngüsü → kısa döngü.',
       confirmUnvalidateTitle: 'Doğrulama kaldırılsın mı?',
       confirmUnvalidateBody: '{{model}} modelinin doğrulamasını kaldırmak, yeniden doğrulanana kadar bu modelde üretim otomatik çıkarmasını güvenli şekilde devre dışı bırakır.',
+      confirmZReferenceTitle: 'Z yeniden referanslama açılsın mı?',
+      confirmZReferenceBody: '{{model}} için Z yeniden referanslama açıldığında, parça tablada iken yapılan her çıkarmanın başına tablayı alt dayanağa indiren korumalı bir hareket eklenir. Yalnızca operatörün gözlemlediği donanım merdiveni tamamlandıktan ve ayırma aparatı takılıyken onaylayın.',
+      confirmUnZReferenceTitle: 'Z yeniden referanslama kapatılsın mı?',
+      confirmUnZReferenceBody: 'Z yeniden referanslama kapatılırsa {{model}} çıkarmaları yeniden saklanan Z sıfırını kullanır; bu sıfır elektrik kesintisinde kaybolur.',
       columns: {
         model: 'Model',
         bed: 'Tabla (G×Y mm)',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: 'Maks. parça yüksekliği (mm)',
         zTravel: 'Z hareketi (mm)',
         zTravelHelp: 'Temizlemek için boş bırakın. O zaman bu modelde tabla indirme yardımı güvenli şekilde devre dışı kalır.',
+        zReferenceValidated: 'Z yeniden referanslama doğrulandı',
+        holdLift: 'Beklemede tabla yükselmesi (mm)',
+        holdLiftHelp: 'Tabla kontrolü doğrulandıktan sonra yazıcı beklemedeyken tablanın alt dayanaktan ne kadar yükseleceği.',
         notes: 'Notlar',
         validated: 'Donanımla doğrulandı',
       },
@@ -1204,7 +1214,21 @@ export default {
       jam: 'AMS sıkışması',
       runout: 'Filament bitti',
       physical: 'Filament arızası',
+      power_loss: 'Elektrik kesintisi',
+      plate_vision: 'Plaka kontrolü',
+      z_reference_lost: 'Z referansı kayboldu',
       recovering: 'Kurtarılıyor',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'AMS filaman yolunu temizleyin, sonra yazdırmayı sürdürün',
+      runout: 'İstenen yuvayı doldurun; yazdırma kendiliğinden sürer',
+      physical: 'Yazıcıdaki filaman yolunu temizleyin, sonra yazdırmayı sürdürün',
+      power_loss: 'Yazıcıdan sürdürün',
+      plate_vision: 'Yatağı temizleyin, sonra “Plakayı temizlendi olarak işaretle”',
+      z_reference_lost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın, sonra “Plakayı temizlendi olarak işaretle”',
     },
     // Fanlar
     fans: {

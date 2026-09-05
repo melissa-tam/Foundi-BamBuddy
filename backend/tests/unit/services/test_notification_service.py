@@ -3406,3 +3406,146 @@ class TestComposeHmsErrorSummary:
         lines = error_detail.split("\n")
         assert lines[0].startswith("0700_4025")
         assert lines[1].startswith("0700_0081")
+
+
+class TestPauseRecoveryNotifications:
+    """The 2026-09-04 pause-recovery pages, both on ONE provider column.
+
+    ``on_power_loss_recovery`` carries several truthful ``event_type``s rather than a
+    column each (the ``on_runout_auto_resumed`` precedent): they are the same outage and
+    the same operator's concern. Default TRUE, unlike the success-class toggles beside
+    it, because every message on this column asks a human for something — a power-loss
+    resume that WORKS is a log line and never reaches here.
+    """
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture
+    def mock_provider(self):
+        provider = MagicMock()
+        provider.id = 1
+        provider.name = "Test Provider"
+        provider.printer_id = None
+        return provider
+
+    @pytest.fixture
+    def mock_db(self):
+        db = AsyncMock()
+        db.commit = AsyncMock()
+        return db
+
+    @pytest.mark.asyncio
+    async def test_power_loss_hold_renders_the_outage_and_the_reason(self, service, mock_provider, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("001-H2S held at the power-loss prompt", "body")
+
+            await service.on_power_loss_hold(
+                printer_id=7,
+                printer_name="001-H2S",
+                job_name="SKU007 plate",
+                outage_minutes=12,
+                reason="The resume command was not accepted (disconnected).",
+                db=mock_db,
+            )
+
+            mock_get.assert_awaited_once_with(mock_db, "on_power_loss_recovery", 7)
+            _, event, variables = mock_build.call_args.args
+            assert event == "power_loss_recovery"
+            assert variables["reason"] == "The resume command was not accepted (disconnected)."
+            assert variables["outage"] == " Power was lost for ~12 min."
+            # The logged/webhook event_type is the truthful one, not the column name.
+            assert mock_send.call_args.args[4] == "power_loss_hold"
+            assert mock_send.call_args.kwargs["force_immediate"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_outage_drops_the_sentence_rather_than_guessing(self, service, mock_provider, mock_db):
+        """The hourly reminder re-fires this event hours later, when the only duration
+        it could name is how long the HOLD has run — which is not what "power was lost
+        for" means. The sentence is omitted, never filled with a plausible number."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("t", "b")
+
+            await service.on_power_loss_hold(
+                printer_id=7,
+                printer_name="001-H2S",
+                job_name="SKU007 plate",
+                outage_minutes=None,
+                reason="The farm could not answer the prompt; it is STILL waiting.",
+                db=mock_db,
+            )
+
+            _, _, variables = mock_build.call_args.args
+            assert variables["outage"] == ""
+
+    @pytest.mark.asyncio
+    async def test_power_loss_hold_skipped_when_the_column_is_off(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []  # provider boolean off -> filtered out
+
+            await service.on_power_loss_hold(
+                printer_id=7,
+                printer_name="001-H2S",
+                job_name="job",
+                outage_minutes=3,
+                reason="r",
+                db=mock_db,
+            )
+
+            mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_z_reference_lost_names_the_only_safe_act(self, service, mock_provider, mock_db):
+        """A human cannot re-home Z with a part on the plate either — a bare ``G28``
+        probes the bed centre, where the part is — so "remove it by hand, then Mark
+        plate cleared" is the whole instruction, and it must not say "re-home"."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = [mock_provider]
+
+            await service.on_z_reference_lost(printer_id=2, printer_name="002-H2S", db=mock_db)
+
+            mock_get.assert_awaited_once_with(mock_db, "on_power_loss_recovery", 2)
+            title = mock_send.call_args.args[1]
+            body = mock_send.call_args.args[2]
+            assert title == "002-H2S restarted with a part on the plate"
+            assert "remove the part by hand" in body
+            assert "Mark plate cleared" in body
+            assert "Ejects are refused" in body
+            assert "home" not in body.lower()
+            assert mock_send.call_args.args[4] == "z_reference_lost"
+
+    @pytest.mark.asyncio
+    async def test_z_reference_lost_skipped_when_the_column_is_off(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = []
+
+            await service.on_z_reference_lost(printer_id=2, printer_name="002-H2S", db=mock_db)
+
+            mock_send.assert_not_called()
+
+    def test_the_provider_column_defaults_to_true(self):
+        """Opposite to the success-class toggles: everything on this column is a request
+        for a human."""
+        from backend.app.models.notification import NotificationProvider
+
+        assert NotificationProvider.__table__.c.on_power_loss_recovery.default.arg is True

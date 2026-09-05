@@ -36,6 +36,13 @@ from sqlalchemy import func as sa_func, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.models.printer_incident import (
+    KIND_JAM,
+    KIND_PHYSICAL,
+    KIND_PLATE_VISION,
+    KIND_POWER_LOSS,
+    KIND_RUNOUT,
+    KIND_Z_REFERENCE_LOST,
+    RESOLVES_ON,
     STATUS_ABORTED,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
@@ -56,6 +63,122 @@ CLOSED_STATUSES: tuple[str, ...] = (STATUS_RESOLVED, STATUS_ABORTED)
 # printer_id -> the WS/REST projection of that printer's OPEN incident. Rebuilt from
 # the DB at startup (:func:`rehydrate`) and maintained by every write below.
 _open_cache: dict[int, dict] = {}
+
+
+# --- waiting_reason vocabulary (rendered by the queue UI, mapped in waitingReason.ts) ---
+#
+# The kind -> token table lives HERE, with the store that owns the kinds, because a
+# `waiting_reason` on a queue unit is a PROJECTION of an incident row and nothing else
+# (model docstring: never a second source of truth). It was `spool_recovery`'s while
+# every incident was an AMS fault; three pause-cause kinds later that module is one
+# consumer among several, and a table that lives in one consumer is how a kind ends up
+# registered for the reminder and not for the projection.
+WAITING_REASON_RECOVERING = "spool_jam_recovering"
+WAITING_REASON_FAILED = "spool_jam_recovery_failed"
+# A filament RUNOUT that escalated (distinct copy from a jam: the fix is to insert
+# filament into the SAME slot, not swap). farm_stall treats it as attended so the
+# pause-stall watchdog doesn't double-escalate.
+WAITING_REASON_RUNOUT = "filament_runout_recovery_failed"
+# An EXTERNAL-spool runout. Distinct from the AMS runout because the instruction is
+# different IN KIND, not in tone: there is no slot to refill — the roll on the spool
+# HOLDER has to be replaced — and the AMS copy ("refill the AMS slot") sends the
+# operator to a tray that never fed this print.
+WAITING_REASON_EXTERNAL_RUNOUT = "external_spool_runout"
+# An EXTERNAL-spool FEED fault (003-H2S 2026-08-11). The jam token is wrong here in
+# the same way the AMS runout copy is wrong for an external runout: it promises a
+# swap machine that has nothing to swap — no AMS, no sibling tray, no slot. The fix
+# is at the holder ("feed filament into the PTFE tube until it can not be pushed any
+# farther", which is literally what the firmware is asking).
+WAITING_REASON_EXTERNAL_FEED = "external_feed_fault"
+# A PHYSICAL filament fault (broken filament, clogged extruder, failed pull-back).
+# Distinct from both: there is no swap to attempt and no slot to refill — the copy
+# must send the operator to the printer rather than to the spool inventory.
+WAITING_REASON_PHYSICAL = "spool_physical_fault"
+# The printer is holding at the firmware's power-loss recovery prompt and the farm's
+# resume was refused or failed. Nothing on the AMS is wrong; the operator answers the
+# prompt on the printer's own screen.
+WAITING_REASON_POWER_LOSS = "power_loss_hold"
+# The printer's own pre-print vision check says the plate is not empty. This token's
+# ONE origin moved here from ``farm_correlation`` when the plate-vision hold became an
+# incident kind — the string is unchanged, so every rendered surface and locale key is
+# untouched.
+WAITING_REASON_PLATE_VISION = "plate_not_empty_printer_detected"
+# The printer rebooted with a part on the plate, so its Z datum is fiction and no eject
+# may run against it. Cleared by the human who removes the part.
+WAITING_REASON_Z_REFERENCE_LOST = "z_reference_lost"
+
+# The tokens an INCIDENT owns. A hold that resolves clears only these — an unrelated
+# hold another owner stamped (low filament, a stagger wait) must survive a resume the
+# recovery lane happened to observe. ``farm_stall`` derives its ATTENDED-pause set from
+# this one, so a token missing here would let the pause-stall watchdog double-escalate a
+# hold that already alerted. DERIVED from the table below rather than re-listed: a kind
+# registered for the projection is attended by construction, which is the coupling that
+# the two-list version kept losing.
+RECOVERY_WAITING_REASONS: frozenset[str]
+
+# kind -> the token its hold projects onto the farm queue unit.
+_WAITING_REASON_BY_KIND: dict[str, str] = {
+    KIND_JAM: WAITING_REASON_FAILED,
+    KIND_RUNOUT: WAITING_REASON_RUNOUT,
+    KIND_PHYSICAL: WAITING_REASON_PHYSICAL,
+    KIND_POWER_LOSS: WAITING_REASON_POWER_LOSS,
+    KIND_PLATE_VISION: WAITING_REASON_PLATE_VISION,
+    KIND_Z_REFERENCE_LOST: WAITING_REASON_Z_REFERENCE_LOST,
+}
+
+# The EXTERNAL overrides of the table above, by kind. ``external`` never changes
+# WHAT happened (the kind does that) — it changes WHERE the operator must go, and
+# only for the kinds whose AMS copy names a place that does not exist on a spool
+# holder. ``physical`` is deliberately absent: "a broken filament / a clog, go to the
+# printer" is already the right instruction on either hardware, so it keeps its one
+# token rather than minting a synonym. The three pause-cause kinds are absent for a
+# stronger reason — they are not AMS faults at all, so there is no holder variant.
+_EXTERNAL_WAITING_REASON_BY_KIND: dict[str, str] = {
+    KIND_RUNOUT: WAITING_REASON_EXTERNAL_RUNOUT,
+    KIND_JAM: WAITING_REASON_EXTERNAL_FEED,
+}
+
+RECOVERY_WAITING_REASONS = (
+    frozenset(_WAITING_REASON_BY_KIND.values())
+    | frozenset(_EXTERNAL_WAITING_REASON_BY_KIND.values())
+    | {WAITING_REASON_RECOVERING}
+)
+
+
+def resolves_on_operator(kind: str) -> bool:
+    """Does an incident of ``kind`` end ONLY when a human acts?
+
+    The one reading of the model's ``RESOLVES_ON`` table, so the ``"operator"`` literal
+    is spelled once and the two close paths that must honour it (``on_job_terminal`` and
+    ``sweep_open_incidents``) cannot drift apart. An unregistered kind answers False —
+    the pre-existing behaviour for every AMS kind, and the safe direction: a hold that
+    closes too readily is visible, one that never closes blocks the printer forever.
+    """
+    return RESOLVES_ON.get(kind) == "operator"
+
+
+def waiting_reason_for(kind: str, *, external: bool = False) -> str:
+    """The hold token an incident of ``kind`` projects onto a farm queue unit.
+
+    ``external`` splits the kinds whose OPERATOR INSTRUCTION differs from their kind
+    on the spool holder. An external-spool runout is a ``runout`` incident in every
+    other respect (same hold, same guidance lane, same dual-evidence auto-resume) but
+    has no AMS slot to send anyone to; an external FEED fault is a ``jam`` incident
+    that no swap machine will ever touch (003-H2S 2026-08-11 — the jam token promised
+    exactly the swap the incident could not perform). A ``physical`` fault reads the
+    same on both, so it keeps one token; the pause-cause kinds have no holder variant
+    at all, so ``external`` is simply irrelevant to them and defaults False.
+
+    An UNKNOWN kind RAISES. It used to fall back to the spool-jam token, which is a
+    vocabulary trap rather than a safe default: a newly registered kind would silently
+    project "jam recovery failed" onto a unit held for something else, and the wrong
+    copy is worse than a loud failure at the one call site that forgot to register.
+    """
+    if kind not in _WAITING_REASON_BY_KIND:
+        raise KeyError(f"no waiting_reason registered for incident kind {kind!r}")
+    if external:
+        return _EXTERNAL_WAITING_REASON_BY_KIND.get(kind, _WAITING_REASON_BY_KIND[kind])
+    return _WAITING_REASON_BY_KIND[kind]
 
 
 def _reset_state() -> None:
@@ -170,6 +293,33 @@ async def count_resolved(db: AsyncSession, printer_id: int, job_id: str, kind: s
             .where(PrinterIncident.job_id == job_id)
             .where(PrinterIncident.kind == kind)
             .where(PrinterIncident.status == STATUS_RESOLVED)
+        )
+        or 0
+    )
+
+
+async def count_recent(db: AsyncSession, printer_id: int, kind: str, since: datetime) -> int:
+    """How many incidents of ``kind`` this PRINTER has opened since ``since``.
+
+    PRINTER-scoped and WINDOWED — the ``recovery_escalation`` 24 h-window shape, and
+    deliberately NOT :func:`count_resolved`'s shape, which is JOB-scoped. The
+    distinction is load-bearing for the plate-vision re-check: every requeue is a NEW
+    job, so a job-scoped count can never see the first trip and "has this printer just
+    tripped twice?" would always answer no. ``recent_terminal_farm_items`` is likewise
+    unusable there — it excludes ``cancelled`` by design, which is exactly what a
+    farm-stopped unit becomes.
+
+    Counts every incident opened in the window whatever its status: a trip that has
+    already RESOLVED (the re-check requeued and the incident closed at the terminal)
+    is precisely the first trip the second one must see.
+    """
+    return int(
+        await db.scalar(
+            select(sa_func.count())
+            .select_from(PrinterIncident)
+            .where(PrinterIncident.printer_id == printer_id)
+            .where(PrinterIncident.kind == kind)
+            .where(PrinterIncident.created_at >= since)
         )
         or 0
     )

@@ -172,6 +172,7 @@ export default {
       printerCol: 'Printer',
       timeCol: 'Finished / started',
       stoppedByOperator: 'Stopped by operator',
+      stoppedByFarmVision: 'Stopped by the farm: plate check',
       firstArticleBadge: 'First article',
       stagedBadge: 'Staged',
       lowSpoolBadge: 'Low filament',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: 'Physical fault — hands needed, no auto-swap',
         printerOfflineStalled: 'Printer offline mid-print — outcome unknown until it reconnects',
         printPausedStalled: 'Paused on the printer — needs attention (no auto-recovery)',
-        visionHold: 'Printer vision: plate not empty — clear the bed, then resume on the printer',
+        visionHold: 'Plate check tripped twice — clear the bed, then Mark plate cleared',
+        powerLossHold: 'Held at the printer\'s power-loss prompt — resume at the printer',
+        zReferenceLost: 'Restarted with a part on the plate — remove it by hand',
         previousPrintFailed: 'Held: previous print failed',
         filamentShort: 'Low filament',
         externalSpoolRunout: 'External spool ran out — refill the external holder, not an AMS slot',
@@ -422,6 +425,10 @@ export default {
       confirmValidateBody: 'Marking {{model}} validated unlocks unattended production eject. Confirm only after the operator-witnessed hardware ladder: empty-bed dry run → supervised print→cool→eject cycle → short loop.',
       confirmUnvalidateTitle: 'Remove validation?',
       confirmUnvalidateBody: 'Un-validating {{model}} makes production auto-eject fail closed on this model until re-validated.',
+      confirmZReferenceTitle: 'Enable Z re-reference?',
+      confirmZReferenceBody: 'Enabling Z re-reference on {{model}} adds a guarded bed drive to the bottom stop at the start of every part-present eject. Confirm only after the operator-witnessed hardware ladder, with the plate-release aid installed.',
+      confirmUnZReferenceTitle: 'Disable Z re-reference?',
+      confirmUnZReferenceBody: 'Disabling Z re-reference on {{model}} returns its ejects to the retained Z datum, which a power cycle destroys.',
       columns: {
         model: 'Model',
         bed: 'Bed (W×H mm)',
@@ -447,6 +454,9 @@ export default {
         maxPartHeight: 'Max part height (mm)',
         zTravel: 'Z travel (mm)',
         zTravelHelp: 'Leave empty to clear. The bed-drop assist then fails closed on this model.',
+        zReferenceValidated: 'Z re-reference validated',
+        holdLift: 'Bed lift while held (mm)',
+        holdLiftHelp: 'How far the bed rises off its bottom stop while the printer is held after a confirmed plate-check trip.',
         notes: 'Notes',
         validated: 'Hardware-validated',
       },
@@ -1213,7 +1223,21 @@ export default {
       jam: 'AMS jam',
       runout: 'Filament out',
       physical: 'Filament fault',
+      power_loss: 'Power loss',
+      plate_vision: 'Plate check',
+      z_reference_lost: 'Z reference lost',
       recovering: 'Recovering',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Clear the AMS feed path, then resume the print',
+      runout: 'Refill the demanded slot; the print resumes on its own',
+      physical: 'Clear the filament path at the printer, then resume the print',
+      power_loss: 'Resume at the printer',
+      plate_vision: 'Clear the bed, then Mark plate cleared',
+      z_reference_lost: 'Restarted with a part on the plate — remove it by hand, then Mark plate cleared',
     },
     // Fans
     fans: {

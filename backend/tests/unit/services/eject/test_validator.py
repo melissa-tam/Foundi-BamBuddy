@@ -8,7 +8,11 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import generate_eject_gcode
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
-from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY, H2S_GEOMETRY
+from backend.tests.unit.services.eject.geometry_fixtures import (
+    H2C_GEOMETRY,
+    H2S_GEOMETRY,
+    H2S_GEOMETRY_Z_REFERENCED,
+)
 
 
 def _profile(**overrides) -> EjectProfile:
@@ -385,3 +389,108 @@ class TestBedslingerGuard:
         result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
         assert result.ok
         assert not any("bedslinger" in w for w in result.warnings)
+
+
+class TestZReferenceModalRules:
+    """The Z re-reference prologue is checked as MODAL RULES over the emitted text.
+
+    Not a text match against an expected block: a hand-edited or reordered prologue must
+    be caught by the same machinery that catches a generator regression. ``G91``,
+    ``G92``, ``G380`` and ``M211`` are all NEWLY admissible — none appeared in a
+    generated block before this recipe — so each carries its own rule and each is an
+    error outside the prologue."""
+
+    @staticmethod
+    def _errors(body: str, geometry=None) -> list[str]:
+        """Validate a hand-written prologue + a minimal legal remainder."""
+        geometry = geometry or H2S_GEOMETRY_Z_REFERENCED
+        profile = _profile()
+        gcode = (
+            f"; ===== FARM EJECT BLOCK profile={profile.name} =====\n"
+            f"M17\n{body}\nG28 X Y\nG90\nG1 Z40 F900\nG1 X170 Y160 F9000\n"
+        )
+        return validate_eject_gcode(gcode, profile, 30.0, geometry).errors
+
+    _GOOD = "M211 Z0\nG91\nG380 S2 Z390 F1200\nG90\nG92 Z340\nM211 Z1"
+
+    def test_the_generated_prologue_passes(self):
+        assert self._errors(self._GOOD) == []
+
+    def test_relative_mode_left_open_at_the_first_move_is_an_error(self):
+        # An open G91 makes every later coordinate guard in this validator — the Z
+        # floor, the Z ceiling, the XY envelope — read a displacement as a position,
+        # i.e. silently meaningless rather than merely wrong.
+        # A move emitted while G91 is still open — the shape a reordered prologue makes.
+        errors = self._errors("M211 Z0\nG91\nG380 S2 Z390 F1200\nG1 Z10 F600\nG90\nG92 Z340\nM211 Z1")
+        assert any("relative mode (G91) is still open" in e for e in errors), errors
+
+    def test_soft_end_stops_left_off_at_the_first_move_is_an_error(self):
+        errors = self._errors("M211 Z0\nG91\nG380 S2 Z390 F1200\nG90\nG92 Z340")
+        assert any("soft end stops left off" in e for e in errors), errors
+
+    def test_a_second_g92_is_an_error(self):
+        errors = self._errors(f"{self._GOOD}\nG92 Z340")
+        assert any("more than one G92" in e for e in errors), errors
+
+    def test_a_g92_on_any_axis_but_z_is_an_error(self):
+        errors = self._errors("M211 Z0\nG91\nG380 S2 Z390 F1200\nG90\nG92 X0 Z340\nM211 Z1")
+        assert any("G92 may declare Z only" in e for e in errors), errors
+
+    def test_a_g92_declaring_anything_but_z_travel_is_an_error(self):
+        # The declaration is safe ONLY because the physical stop sits at or beyond
+        # z_travel_mm, which makes the frame error <= 0 (more clearance). Any other
+        # value throws that argument away and declares a frame nothing supports.
+        errors = self._errors("M211 Z0\nG91\nG380 S2 Z390 F1200\nG90\nG92 Z300\nM211 Z1")
+        assert any("does not declare the machine bottom" in e for e in errors), errors
+
+    def test_a_g380_outside_relative_mode_is_an_error(self):
+        # An absolute guarded drive would target a coordinate in the very frame the
+        # move exists to replace.
+        errors = self._errors("M211 Z0\nG380 S2 Z390 F1200\nG92 Z340\nM211 Z1")
+        assert any("G380 outside relative mode" in e for e in errors), errors
+
+    def test_a_negative_g380_drives_toward_the_part_and_is_an_error(self):
+        errors = self._errors("M211 Z0\nG91\nG380 S2 Z-390 F1200\nG90\nG92 Z340\nM211 Z1")
+        assert any("TOWARD the nozzle" in e for e in errors), errors
+
+    @pytest.mark.parametrize(
+        ("line", "fragment"),
+        [
+            ("G92 Z340", "G92 after the first move"),
+            ("G380 S2 Z10 F1200", "G380 after the first move"),
+            ("M211 Z0", "M211 after the first move"),
+            ("G91", "G91 (relative positioning) after the first move"),
+        ],
+    )
+    def test_each_new_command_is_forbidden_after_the_first_move(self, line, fragment):
+        profile = _profile()
+        gcode = (
+            f"; ===== FARM EJECT BLOCK profile={profile.name} =====\n"
+            f"M17\nG28 X Y\nG90\nG1 Z40 F900\n{line}\nG1 X170 Y160 F9000\n"
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY_Z_REFERENCED).errors
+        assert any(fragment in e for e in errors), errors
+
+    def test_g28_z_is_still_forbidden_alongside_the_new_rules(self):
+        # Operator rule 2026-09-04: the re-reference exists precisely so that nothing
+        # ever probes the bed centre with a part on it.
+        errors = self._errors(f"{self._GOOD}\nG28 Z")
+        assert any("G28 Z probes the bed centre" in e for e in errors), errors
+
+    def test_a_bare_g28_is_still_forbidden(self):
+        errors = self._errors(f"{self._GOOD}\nG28")
+        assert any("homes all axes" in e for e in errors), errors
+
+    def test_the_gate_mirrors_the_generators_refusals(self):
+        # A block must not reach a printer through a hand-edited path the generator
+        # would have refused outright.
+        slinger = replace(H2S_GEOMETRY_Z_REFERENCED, model_key="A2L")
+        assert any("bedslinger" in e for e in self._errors(self._GOOD, slinger))
+        no_travel = replace(H2S_GEOMETRY_Z_REFERENCED, z_travel_mm=None)
+        assert any("no z_travel_mm to declare" in e for e in self._errors(self._GOOD, no_travel))
+
+    def test_a_flag_off_model_is_unaffected_by_any_of_it(self):
+        # The nine dormant recipes must validate exactly as before.
+        profile = _profile()
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok

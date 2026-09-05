@@ -172,6 +172,7 @@ export default {
       printerCol: 'Stampante',
       timeCol: 'Terminata / avviata',
       stoppedByOperator: 'Fermata dall\'operatore',
+      stoppedByFarmVision: 'Fermata dalla farm: controllo del piatto',
       firstArticleBadge: 'Primo pezzo',
       stagedBadge: 'Trattenuta',
       lowSpoolBadge: 'Filamento insufficiente',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: 'Guasto fisico — serve un intervento, nessuno scambio automatico',
         printerOfflineStalled: 'Stampante offline durante la stampa — esito sconosciuto finché non si riconnette',
         printPausedStalled: 'In pausa sulla stampante — richiede attenzione (nessun ripristino automatico)',
-        visionHold: 'Visione della stampante: piatto non vuoto — libera il piatto, poi riprendi sulla stampante',
+        visionHold: 'Controllo del piatto scattato due volte — libera il piano, poi «Segna il piatto come liberato»',
+        powerLossHold: 'In attesa alla richiesta di ripristino dopo l\'interruzione di corrente — riprendi sulla stampante',
+        zReferenceLost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano',
         previousPrintFailed: 'Trattenuta: la stampa precedente non è riuscita',
         filamentShort: 'Filamento insufficiente',
         externalSpoolRunout: 'La bobina esterna è esaurita — ricarica il supporto esterno, non uno slot AMS',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: "Segnare {{model}} come validato sblocca l'espulsione di produzione non presidiata. Conferma solo dopo la scala hardware verificata dall'operatore: prova a vuoto su piano vuoto → ciclo supervisionato stampa→raffreddamento→espulsione → ciclo breve.",
       confirmUnvalidateTitle: 'Rimuovere la validazione?',
       confirmUnvalidateBody: "Rimuovere la validazione di {{model}} fa fallire in sicurezza l'auto-espulsione di produzione su questo modello finché non viene rivalidato.",
+      confirmZReferenceTitle: 'Attivare il ri-riferimento Z?',
+      confirmZReferenceBody: 'Attivare il ri-riferimento Z su {{model}} aggiunge una discesa sorvegliata del piano fino al finecorsa inferiore all\'inizio di ogni espulsione con pezzo. Confermare solo dopo la scala hardware osservata dall\'operatore, con l\'ausilio di distacco installato.',
+      confirmUnZReferenceTitle: 'Disattivare il ri-riferimento Z?',
+      confirmUnZReferenceBody: 'Senza ri-riferimento Z, {{model}} espelle di nuovo usando lo zero Z conservato, che un\'interruzione di corrente distrugge.',
       columns: {
         model: 'Modello',
         bed: 'Piano (L×A mm)',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: 'Altezza max pezzo (mm)',
         zTravel: 'Corsa Z (mm)',
         zTravelHelp: "Lascia vuoto per cancellare. L'assistenza di abbassamento del piano fallisce quindi in sicurezza su questo modello.",
+        zReferenceValidated: 'Ri-riferimento Z validato',
+        holdLift: 'Sollevamento piano in attesa (mm)',
+        holdLiftHelp: 'Di quanto il piano si solleva dal finecorsa inferiore mentre la stampante è trattenuta dopo un controllo piano confermato.',
         notes: 'Note',
         validated: 'Validato a livello hardware',
       },
@@ -1204,7 +1214,21 @@ export default {
       jam: 'Inceppamento AMS',
       runout: 'Filamento esaurito',
       physical: 'Guasto filamento',
+      power_loss: 'Interruzione di corrente',
+      plate_vision: 'Controllo del piatto',
+      z_reference_lost: 'Riferimento Z perso',
       recovering: 'Ripristino',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Libera il percorso del filamento dell\'AMS, poi riprendi la stampa',
+      runout: 'Ricarica lo slot richiesto; la stampa riprende da sola',
+      physical: 'Libera il percorso del filamento sulla stampante, poi riprendi la stampa',
+      power_loss: 'Riprendi sulla stampante',
+      plate_vision: 'Libera il piano, poi «Segna il piatto come liberato»',
+      z_reference_lost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano, poi «Segna il piatto come liberato»',
     },
     // Fans
     fans: {

@@ -175,6 +175,36 @@ class TestManualEjectPreconditions:
             verdict = await manual.manual_eject(db_session, printer.id)
         assert verdict.reason == "job_active"
 
+    async def test_a_lost_z_reference_refuses_the_operators_eject_too(self, db_session):
+        """2026-09-04 002-H2S: the operator pressed "Eject plate" on a printer that had
+        rebooted with a part on the plate, and the sweep drove the bed past the Z floor
+        because the block's absolute Z moves ran against a frame the reboot destroyed.
+
+        The manual door is the one an operator reaches for after an outage, so it is the
+        one that most needs the refusal to be REACHABLE — the evidence therefore comes
+        from the eject lane's one origin, not from a second test in this service."""
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        printer = await _mk_printer(db_session, "ZLOST")
+        await db_session.commit()
+        _gate_up(printer.id)
+        c1, c2 = _connected(_state("IDLE"))
+        with (
+            c1,
+            c2,
+            patch(
+                "backend.app.services.printer_incidents.snapshot",
+                return_value={"kind": KIND_Z_REFERENCE_LOST, "status": "escalated"},
+            ),
+        ):
+            verdict = await manual.manual_eject(db_session, printer.id, declare_occupied=True)
+        assert verdict.outcome == "refused"
+        # The token is spelling-identical to the authority's — one refusal vocabulary
+        # from the state machine to the dialog — and the map's AssertionError guard
+        # (which fails loud on an unanswered token) is satisfied by it existing here.
+        assert verdict.reason == "z_unreferenced"
+        assert manual._REFUSAL_REASONS["z_unreferenced"] == "z_unreferenced"
+
     async def test_gate_down_without_declare_refuses_no_plate_gate(self, db_session):
         """The authority's ``not_occupied`` reaches the API under the name it has always
         had there. It survives ONLY for declare-less callers — every UI surface declares."""

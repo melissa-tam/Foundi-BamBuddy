@@ -103,10 +103,24 @@ logger = logging.getLogger(__name__)
 
 Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 
-# waiting_reason token for the native vision plate-occupancy hold. Single origin:
-# imported by farm_stall (skip set) and production_run (printer-state flag) so the
-# machine code has exactly one home and cannot drift.
-WAITING_REASON_PLATE_VISION = "plate_not_empty_printer_detected"
+# The farm's own abort mark, written onto a ``printing`` row's ``stop_source`` BEFORE
+# the stop that produces the terminal. ONE origin for the literal: it is written by
+# ``pause_recovery.on_plate_vision_trip``, read back by :func:`classify_stop`, honoured
+# by the terminal handler and rendered in the run-detail lineage, and four spellings of
+# a durable marker is how one of them ends up not matching.
+STOP_SOURCE_FARM_VISION_ABORT = "farm_vision_abort"
+
+# Why a terminal happened, as a CLOSED set. The disposition is selected from this
+# verdict once, ahead of the ``final_status`` fork, so a new reason for a print to end
+# has to be added here rather than sniffed out of a status string downstream.
+StopVerdict = Literal["farm_vision_abort", "operator_ui", "operator_screen"]
+
+# ``WAITING_REASON_PLATE_VISION`` used to be defined here. Its ORIGIN moved to
+# ``printer_incidents`` (2026-09-04) when the plate check became an incident KIND: the
+# token is a PROJECTION of that row, so it belongs with the kind -> token table rather
+# than in the correlation module that happened to raise the first one. Nothing reads
+# it from here any more (``production_run.vision_hold`` derives from the incident
+# snapshot), so there is no re-export either — one origin, one import path.
 
 # Verdicts where the finish IS the dispatched unit — the caller updates that item's
 # terminal status and runs farm_policy attribution for it. ``fallback`` is included
@@ -518,16 +532,37 @@ async def resolve_dispatch_donor(db: AsyncSession, printer_id: int, subtask_id: 
     return donor
 
 
-def classify_stop(payload: dict, printer_id: int, user_stopped_printer_ids: set[int]) -> str | None:
-    """Classify a terminal payload as an OPERATOR stop, or ``None`` (Phase 3.1).
+def classify_stop(
+    payload: dict,
+    printer_id: int,
+    user_stopped_printer_ids: set[int],
+    *,
+    item_stop_source: str | None = None,
+) -> StopVerdict | None:
+    """THE classifier of "why did this terminal happen" — a closed set of verdicts.
 
-    - ``operator_ui``     — ``printer_id`` is in ``user_stopped_printer_ids`` (Stop
-      was pressed in the Bambuddy queue UI). Membership WINS over the screen echo.
-    - ``operator_screen`` — the payload carries ``user_cancel_observed`` True: the
+    In precedence order:
+
+    - ``farm_vision_abort`` — the ``printing`` row ALREADY carries the farm's own
+      mark, written by ``pause_recovery.on_plate_vision_trip`` BEFORE it sent the
+      stop. Highest precedence, above BOTH operator signals.
+    - ``operator_ui``       — ``printer_id`` is in ``user_stopped_printer_ids`` (Stop
+      was pressed in the Bambuddy queue UI).
+    - ``operator_screen``   — the payload carries ``user_cancel_observed`` True: the
       firmware emitted a cancel-echo HMS code, i.e. the operator stopped the print
       on the printer's own touchscreen.
-    - ``None``            — neither signal (a genuine failure, a normal finish, or a
+    - ``None``              — none of them (a genuine failure, a normal finish, or a
       reconcile-synthesised interruption that carries no echo/membership).
+
+    The farm mark outranks the ECHO for a reason the design cannot afford to guess at:
+    an MQTT ``print.stop`` plausibly produces the same cancel-echo a touchscreen stop
+    does — unmeasured, so the mark must not depend on its absence — and relabelling the
+    farm's own abort ``operator_screen`` routes the unit into the operator-stop
+    disposition (cancelled, run holds, top-up on RESUME) instead of the requeue the
+    abort exists to produce. It outranks UI MEMBERSHIP too, which is the older rule
+    ("membership WINS") narrowed by one case: a human pressing Stop on a print the farm
+    is already aborting has not changed why the print ended, and the mark is on disk
+    while the membership is a process set.
 
     CAVEAT (observed live 2026-07-12, 007-H2C): H2C firmware emitted NO cancel-echo
     HMS on a touchscreen stop, so an H2C screen stop classifies as ``None`` — i.e.
@@ -536,8 +571,12 @@ def classify_stop(payload: dict, printer_id: int, user_stopped_printer_ids: set[
     prefer stopping H2C farm units from the Bambuddy UI (membership wins).
 
     Pure — no DB, no I/O — so it is directly unit-testable and callable before the
-    ``_user_stopped_printers`` set is mutated by the surrounding handler.
+    ``_user_stopped_printers`` set is mutated by the surrounding handler. The mark is
+    read for it by :func:`printing_stop_mark`, at the one call site, so the verdict is
+    decided ONCE and ahead of every status rewrite that keys off it.
     """
+    if item_stop_source == STOP_SOURCE_FARM_VISION_ABORT:
+        return STOP_SOURCE_FARM_VISION_ABORT
     if printer_id in user_stopped_printer_ids:
         return "operator_ui"
     if payload.get("user_cancel_observed"):
@@ -545,79 +584,60 @@ def classify_stop(payload: dict, printer_id: int, user_stopped_printer_ids: set[
     return None
 
 
-async def on_native_plate_detection(db: AsyncSession, printer_id: int, short_codes: set[str]) -> bool:
-    """React to the printer's NATIVE pre-print plate-occupancy vision check (Phase 3.3).
+async def printing_stop_mark(db: AsyncSession, printer_id: int) -> str | None:
+    """The ``stop_source`` already stamped on whatever is ``printing`` on this printer.
 
-    ``short_codes`` are the just-arrived HMS codes in
-    ``bambu_mqtt._HMS_PLATE_OCCUPANCY_CODES`` (foreign-objects-on-heatbed /
-    plate-marker). The printer PAUSEs the job on such a code, which for the farm
-    loop is authoritative eject-verification: a hit at unit N's start means unit
-    N−1's sweep did not clear the plate. When a FARM unit is currently ``printing``
-    on ``printer_id`` (its batch has a ``sku_file_id`` OR the item carries an
-    ``eject_profile_id``):
+    The farm stamps its abort mark on the row BEFORE it sends the stop, so by the time
+    the terminal arrives the mark is on disk and this read is what makes it visible to
+    :func:`classify_stop`. Deliberately a bare read of the ``printing`` row rather than
+    a re-use of the terminal correlation: the verdict is needed AHEAD of that
+    correlation (every status rewrite keys off it), and "what did the farm already
+    decide about the job this printer is running" needs no identity matching to answer.
 
-      (a) raise a HUMAN-CLEAR-ONLY plate gate — ``source_subtask_id=None`` so the
-          Phase-1 rearm/auto-clear rules never release it (only a human clearing
-          the bed does);
-      (b) flag the unit ``waiting_reason="plate_not_empty_printer_detected"`` (it
-          stays ``printing`` — the job is PAUSEd on the printer; the operator clears
-          the bed and Resumes on-screen, or stops it and the normal terminal path
-          takes over);
-      (c) fire ``on_plate_not_empty`` with the printer-vision ``source_detail``.
-
-    No auto-retry and no quarantine mutation follow from the pause itself. Returns
-    True if a farm unit was flagged; a non-farm printer yields no gate (False).
+    Newest first, and the first non-NULL mark wins — more than one ``printing`` row on
+    a printer is the ambiguous shape ``resolve_printing_item`` also refuses to guess
+    at, and a mark on any of them says the farm aborted this printer's job.
     """
-    from backend.app.models.printer import Printer
-    from backend.app.services.notification_service import notification_service
+    result = await db.execute(
+        select(PrintQueueItem.stop_source)
+        .where(PrintQueueItem.printer_id == printer_id)
+        .where(PrintQueueItem.status == "printing")
+        .order_by(PrintQueueItem.started_at.desc())
+    )
+    for mark in result.scalars().all():
+        if mark:
+            return mark
+    return None
 
+
+async def resolve_printing_farm_item(db: AsyncSession, printer_id: int) -> PrintQueueItem | None:
+    """The FARM unit currently ``printing`` on ``printer_id``, or None.
+
+    "Farm" here is the loop's own test, unchanged since Phase 3.3: the item carries an
+    ``eject_profile_id``, or its batch carries a ``sku_file_id``. Distinct from
+    :func:`resolve_printing_item`, which asks the IDENTITY question (which unit is this
+    echoed job?) — this one asks the OWNERSHIP question (is the farm loop responsible
+    for what is on this printer?), which is what decides whether there is a row to
+    stamp and a unit to requeue.
+
+    Extracted from the deleted ``on_native_plate_detection`` when the plate-vision
+    reaction moved to ``pause_recovery``: the resolution was the reusable half of that
+    function, and correlation is where it belongs.
+    """
     result = await db.execute(
         select(PrintQueueItem)
         .where(PrintQueueItem.printer_id == printer_id)
         .where(PrintQueueItem.status == "printing")
         .order_by(PrintQueueItem.started_at.desc())
     )
-    item: PrintQueueItem | None = None
     for candidate in result.scalars().all():
         if candidate.eject_profile_id is not None:
-            item = candidate
-            break
+            return candidate
         if candidate.batch_id is not None:
             batch = await db.get(PrintBatch, candidate.batch_id)
             if batch is not None and batch.sku_file_id is not None:
-                item = candidate
-                break
-    if item is None:
-        logger.info(
-            "farm_correlation: printer %s native plate-occupancy %s but no farm unit printing — no gate",
-            printer_id,
-            sorted(short_codes),
-        )
-        return False
-
-    # (a) human-clear-only gate, (b) flag the unit. The authority raises it source-less
-    # under EscalationOnly — a vision trip fires MID-JOB and has no job identity behind
-    # it to sweep against, so only a human can clear what the printer just saw.
-    plate_occupancy.note_plate_detected(printer_id, ",".join(sorted(short_codes)))
-    item.waiting_reason = WAITING_REASON_PLATE_VISION
-    await db.commit()
-
-    # (c) source-disambiguated notification.
-    printer = await db.get(Printer, printer_id)
-    printer_name = printer.name if printer is not None else f"printer {printer_id}"
-    detail = (
-        "Printer vision detected foreign objects on the heatbed at job start — the previous unit's "
-        "sweep may not have cleared the plate. Clear the bed, then Resume on the printer screen."
-    )
-    await notification_service.on_plate_not_empty(printer_id, printer_name, db, source_detail=detail)
-    logger.warning(
-        "farm_correlation: printer %s native plate-occupancy %s while unit %s printing — "
-        "human-clear-only gate raised, unit flagged plate_not_empty_printer_detected",
-        printer_id,
-        sorted(short_codes),
-        item.id,
-    )
-    return True
+                return candidate
+    return None
 
 
 async def farm_work_targets_printer(db: AsyncSession, printer_id: int) -> bool:

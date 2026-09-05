@@ -114,6 +114,9 @@ TransitionRefusal = Literal[
     "lease_revoked",
     # The lease offered is not the one this printer holds.
     "lease_unknown",
+    # The printer's Z frame is fiction (it rebooted with a part on the plate), so
+    # every absolute Z move an eject makes would run against a fabricated datum.
+    "z_unreferenced",
 ]
 
 # Who holds the printer. A projection, never stored — see :class:`OccupancyView`.
@@ -174,10 +177,22 @@ class Evidence:
     Deriving an eject refusal from it would lock the operator out of a provably idle
     plate for ≥12 minutes, which is strictly worse than the behaviour it replaces
     (the manual eject lane never read the queue row at all).
+
+    ``z_reference`` is "does the firmware's Z frame still describe the machine?", and
+    it is TRI-STATE on purpose: ``None`` = nothing is known (every caller that has not
+    asked, and the default), ``False`` = the frame is FICTION, ``True`` = positively
+    re-established. Only ``False`` refuses, so a caller who cannot answer is never
+    locked out. The fact is derived from a durable
+    ``printer_incident`` of kind ``z_reference_lost`` — opened when a printer rebooted
+    with a part on its plate — and is supplied by the CALLER like every other field
+    here: the 002-H2S eyewitness (2026-09-04) is what it exists for, where an eject
+    dispatched after a power cut drove the bed DOWN past the Z floor because the
+    block's absolute moves were executed against a frame the reboot had destroyed.
     """
 
     live_state: str | None = None
     db_claim: bool = False
+    z_reference: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -304,9 +319,10 @@ class PendingEject:
 
     ``expected_runtime_s`` (from the build) and ``started_at`` (stamped when the
     printer echoes the sweep's START) are what the in-flight runtime watchdog arms
-    on. ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` (also from the build) are the
-    per-phase budgets that arm the watchdog's edge lane, which bounds each phase on its
-    own rather than the whole job.
+    on. ``reference_s``, ``drop_span_s``, ``sweep_span_s`` and ``tail_s`` (also from the
+    build) are the per-phase budgets that arm the watchdog's edge lane, which bounds each
+    phase on its own rather than the whole job. ``reference_s`` is None for a block with
+    no Z re-reference phase — i.e. every block until a model's ladder opens that gate.
 
     ``runtime_exceeded_at`` is that watchdog's verdict, and the watchdog is the ONE
     authority on eject runtime: the mark is stamped the moment a deadline passes,
@@ -330,6 +346,7 @@ class PendingEject:
     expected_runtime_s: float | None = None
     started_at: datetime | None = None
     runtime_exceeded_at: datetime | None = None
+    reference_s: float | None = None
     drop_span_s: float | None = None
     sweep_span_s: float | None = None
     tail_s: float | None = None
@@ -911,7 +928,9 @@ class PlateOccupancy:
 
         Gated by exactly :meth:`ejectable`, so the pre-flight check the dispatcher
         makes before it spends seconds building and uploading a file is the same
-        gate that mints the claim.
+        gate that mints the claim — ``z_unreferenced`` included, which is what makes
+        a Z-frame hold refuse the claim as well as the pre-flight rather than only the
+        cheaper of the two.
 
         **A hydrated eject is SUPERSEDED, not protected.** It has ``started_at=None``
         by construction, no watchdog, no live identity, and ends in
@@ -1116,9 +1135,18 @@ class PlateOccupancy:
         can cure without waiting for anything (the manual lane declares occupancy
         first), so reporting it ahead of a real conflict would send them to fix the
         wrong thing.
+
+        ``z_unreferenced`` sits immediately behind the wire because both are physical
+        hazards and the wire's is the one that resolves itself: telling an operator to
+        remove a part by hand from a plate that is mid-print would send them to the
+        wrong machine. It refuses on ``False`` ONLY — an unanswered
+        :attr:`Evidence.z_reference` passes, so a caller that never asks about Z keeps
+        exactly today's behaviour.
         """
         if ev.live_state in ACTIVE_PRINT_STATES:
             return "job_active"
+        if ev.z_reference is False:
+            return "z_unreferenced"
         if self._lease_in_flight(printer_id, ev):
             return "dispatch_in_flight"
         if self._live_eject(printer_id) is not None:

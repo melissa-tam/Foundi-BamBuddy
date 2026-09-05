@@ -72,7 +72,19 @@ class TestPrinterManager:
         client.state.progress = 0
         client.state.temperatures = {"nozzle": 25, "bed": 25}
         client.state.raw_data = {}
+        client.state.disconnected_at = None
         client.logging_enabled = False
+
+        # `note_disconnected` is the client's ONE writer of the outage anchor, and
+        # `mark_printer_offline` routes through it rather than assigning the flag. The
+        # double models it, so a caller that goes back to writing `state.connected`
+        # directly (and silently loses the anchor) fails the tests below.
+        def _note_disconnected():
+            if client.state.connected:
+                client.state.disconnected_at = 1_757_000_000.0
+            client.state.connected = False
+
+        client.note_disconnected.side_effect = _note_disconnected
         return client
 
     # ========================================================================
@@ -341,6 +353,10 @@ class TestPrinterManager:
 
         assert mock_client.state.connected is False
         assert mock_client.state.state == "unknown"
+        # A smart-plug power cut is a genuine outage, so it must stamp the anchor the
+        # power-loss recovery lane reads to report how long the power was gone.
+        mock_client.note_disconnected.assert_called_once()
+        assert mock_client.state.disconnected_at is not None
 
     def test_mark_printer_offline_triggers_callback(self, manager, mock_client):
         """Verify mark_printer_offline triggers status callback."""
@@ -2264,3 +2280,118 @@ class TestOccupancyPayloadIsJsonSerializable:
 
         assert payload["occupancy"]["plate"]["since"] is None
         assert json.loads(json.dumps(payload))["occupancy"]["plate"]["since"] is None
+
+
+class TestSessionBoundaryOnTheStatusPayload:
+    """``connection_epoch`` / ``disconnected_at`` reach triage, as JSON primitives.
+
+    Both are the TRANSPORT's answer to "is this a new session, and when did the last one
+    end" — the fact several farm lanes read to avoid deriving a NEGATIVE edge across a
+    reconnect (a rebooted printer arrives with an empty HMS list, so every "the code went
+    away" edge fires at once). Exposing them is what makes an outage explainable from
+    ``GET /printers/{id}/status`` alone.
+    """
+
+    def _state(self):
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        return PrinterState(connected=True, state="RUNNING")
+
+    def test_both_fields_are_serialized(self):
+        state = self._state()
+        state.connection_epoch = 3
+        state.disconnected_at = 1_757_000_000.0
+
+        payload = printer_state_to_dict(state)
+
+        assert payload["connection_epoch"] == 3
+        assert payload["disconnected_at"] == 1_757_000_000.0
+
+    def test_a_printer_that_never_dropped_reports_no_anchor(self):
+        payload = printer_state_to_dict(self._state())
+
+        assert payload["connection_epoch"] == 0
+        assert payload["disconnected_at"] is None
+
+    def test_the_anchor_is_a_float_epoch_not_a_datetime(self):
+        """The WS lane hands this dict to a bare ``json.dumps``; a ``datetime`` here
+        would kill every status broadcast at 1 Hz while every REST probe stayed green
+        (2026-08-31, ``plate.since``)."""
+        import json as _json
+
+        state = self._state()
+        state.disconnected_at = 1_757_000_000.0
+
+        encoded = _json.dumps(printer_state_to_dict(state))
+
+        assert _json.loads(encoded)["disconnected_at"] == 1_757_000_000.0
+
+
+class TestNoteDisconnected:
+    """``BambuMQTTClient.note_disconnected`` is THE writer of the outage anchor."""
+
+    def _client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(ip_address="127.0.0.1", serial_number="S1", access_code="x")
+        # Stand in for paho. `_on_connect` subscribes and unpacks `(result, mid)` from
+        # the request-topic subscribe, so the double must answer that shape.
+        paho = MagicMock()
+        paho.subscribe.return_value = (0, 1)
+        client._client = paho
+        return client
+
+    def test_it_stamps_on_the_edge_and_clears_connected(self):
+        client = self._client()
+        client.state.connected = True
+
+        client.note_disconnected()
+
+        assert client.state.connected is False
+        assert client.state.disconnected_at is not None
+
+    def test_a_repeat_never_walks_the_anchor_forward(self):
+        """Stamped on the EDGE only. Re-stamping on every "still offline" assertion
+        would shrink a five-hour outage to nothing by the time it is reported."""
+        client = self._client()
+        client.state.connected = True
+        client.note_disconnected()
+        first = client.state.disconnected_at
+
+        client.note_disconnected()
+
+        assert client.state.disconnected_at == first
+
+    def test_the_anchor_survives_the_reconnect(self):
+        """It is the outage-DURATION anchor, so it must still be readable once the
+        printer is back — that is the only moment the farm can act on it."""
+        client = self._client()
+        client.state.connected = True
+        client.note_disconnected()
+        stamped = client.state.disconnected_at
+
+        client._on_connect(client._client, None, {}, 0)
+
+        assert client.state.connected is True
+        assert client.state.disconnected_at == stamped
+
+    def test_every_connect_mints_a_new_session(self):
+        """Including a paho AUTO-reconnect, which is what a printer reboot looks like
+        from this side — and the 2026-09-04 outage arrived as a stale-reconnect whose
+        disconnect callback returns early by design, so an epoch that depended on
+        observing the disconnect would not have moved."""
+        client = self._client()
+        assert client.state.connection_epoch == 0
+
+        client._on_connect(client._client, None, {}, 0)
+        client._on_connect(client._client, None, {}, 0)
+
+        assert client.state.connection_epoch == 2
+
+    def test_a_refused_connect_mints_nothing(self):
+        client = self._client()
+
+        client._on_connect(client._client, None, {}, 1)  # non-zero rc = refused
+
+        assert client.state.connection_epoch == 0
+        assert client.state.connected is False

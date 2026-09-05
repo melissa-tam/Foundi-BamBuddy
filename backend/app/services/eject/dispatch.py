@@ -58,6 +58,11 @@ class BuiltEject:
     they are unconditional: every generated block sweeps and every generated block ends
     in the park + completion epilogue, so both are always figures rather than an
     optional tuning's by-product.
+
+    ``reference_s`` is the guarded Z re-reference drive's budget, and like ``drop_span_s``
+    it is conditional — ``None`` for every model whose ladder has not opened
+    ``z_reference_validated``, which is all of them until one does. A block without that
+    phase must leave the watchdog's lane DISARMED rather than arm a zero-length deadline.
     """
 
     path: Path
@@ -65,6 +70,7 @@ class BuiltEject:
     drop_span_s: float | None
     sweep_span_s: float
     tail_s: float
+    reference_s: float | None = None
 
 
 def _parse_max_z_height(source_path: Path, plate_id: int) -> float | None:
@@ -163,13 +169,15 @@ async def build_part_present_eject_file(
     except EjectBuildError as exc:
         raise EjectGenerationError(f"Failed to repack the part-present eject 3mf: {exc}") from exc
     logger.info(
-        "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r) — expected runtime "
-        "%.0fs (pre %.0fs, bed-drop span %s, sweep span %.0fs, tail %.0fs)",
+        "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r, z_ref=%s) — "
+        "expected runtime %.0fs (z-reference %s, pre %.0fs, bed-drop span %s, sweep span %.0fs, tail %.0fs)",
         Path(source_path).name,
         plate_id,
         max_z,
         profile.name,
+        "on" if geometry.z_reference_validated else "off",
         segments.total_s,
+        f"{segments.reference_s:.0f}s" if segments.reference_s is not None else "off",
         segments.pre_s,
         f"{drop_span_s:.0f}s" if drop_span_s is not None else "off",
         segments.sweep_span_s,
@@ -181,4 +189,5 @@ async def build_part_present_eject_file(
         drop_span_s=drop_span_s,
         sweep_span_s=segments.sweep_span_s,
         tail_s=segments.tail_s,
+        reference_s=segments.reference_s,
     )

@@ -20,6 +20,8 @@ class ModelGeometryResponse(BaseModel):
     max_part_height_mm: float
     z_travel_mm: float | None
     validated: bool
+    z_reference_validated: bool
+    hold_lift_mm: float
     notes: str | None
     updated_at: datetime
 
@@ -53,7 +55,10 @@ class ModelGeometryUpdate(BaseModel):
     Bed dimensions and the height ceiling must be positive; envelope bounds may be
     negative (Y overhangs run past the bed edge). ``validated`` flips the
     hardware-ladder gate — set True only after the empty-bed dry run + thermal
-    cycle for this model has been operator-witnessed.
+    cycle for this model has been operator-witnessed. ``z_reference_validated`` is
+    the SECOND, independent ladder gate: set it True only after the guarded Z drive
+    onto the bottom stop has been witnessed on this machine, with the operator's
+    plate-release aid installed.
     """
 
     bed_x: float | None = Field(default=None, gt=0)
@@ -67,4 +72,11 @@ class ModelGeometryUpdate(BaseModel):
     # legitimately clears it (the column is nullable → the assist fails closed).
     z_travel_mm: float | None = Field(default=None, gt=0)
     validated: bool | None = None
+    z_reference_validated: bool | None = None
+    # Bed clearance off the PHYSICAL bottom stop while a printer is held. Floored at
+    # the vendor's own 12 mm (the stock start block's ``G380 S2 Z-12``) because a
+    # smaller lift cannot be shown to clear the operator's plate-release aid, and
+    # capped at 60 mm so a typo cannot drive the bed most of the way up while a part
+    # is still on the plate. Non-nullable in the DB, so there is no "clear it" case.
+    hold_lift_mm: float | None = Field(default=None, ge=12, le=60)
     notes: str | None = None

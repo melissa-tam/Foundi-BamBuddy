@@ -1227,3 +1227,81 @@ class TestNotifySuppression:
         assert set(NOTIFY_SUPPRESSED_CODE32) == {0x00030002}
         for code in NOTIFY_SUPPRESSED_CODE32:
             assert classify_ams_fault(0x07002200, code) is None
+
+
+class TestPowerLossVocabulary:
+    """The 2026-09-04 fleet-outage codes, and the predicates the recovery lanes read.
+
+    These are print-module (0x03) codes and deliberately live OUTSIDE the AMS fault
+    taxonomy — the module gate excludes 0x03 by construction, and a shared suffix is not
+    kinship (the same ruling that keeps `0300_8003`, AI spaghetti detection, out of it).
+    """
+
+    def test_the_catalog_states_what_the_prompt_accepts(self):
+        """VENDOR EVIDENCE, not our inference: the firmware's own action list for
+        `0300_8007` is exactly resume-or-stop, which is what makes a plain
+        `print.resume` the correct answer to it (live-proven on printer 8, 09:28:33 ->
+        RUNNING at 09:28:34). If a vendored-catalog refresh ever changes this, the
+        recovery lane's whole premise changes with it."""
+        from backend.app.services.hms_actions import get_actions_for_error_code
+
+        assert get_actions_for_error_code("default", "03008007") == ["RESUME_PRINTING", "STOP_PRINTING"]
+
+    def test_both_codes_carry_their_vendor_text(self):
+        assert "lost power" in HMS_ERROR_DESCRIPTIONS["0300_8007"]
+        assert HMS_ERROR_DESCRIPTIONS["0300_400D"] == "Resume failed after power loss."
+
+    def test_the_prompt_is_detected_on_a_real_hms_error(self):
+        from backend.app.services.bambu_mqtt import HMSError
+        from backend.app.services.hms_errors import power_loss_prompt_standing
+
+        prompt = HMSError(code="8007", attr=0x03000000, module=3, severity=3)
+        assert power_loss_prompt_standing([prompt]) is True
+        assert power_loss_prompt_standing([]) is False
+        assert power_loss_prompt_standing(None) is False
+
+    def test_a_sibling_print_module_code_is_not_the_prompt(self):
+        """`0300_8006` is the build-plate marker check — same module, unrelated fault."""
+        from backend.app.services.bambu_mqtt import HMSError
+        from backend.app.services.hms_errors import power_loss_prompt_standing
+
+        assert power_loss_prompt_standing([HMSError(code="8006", attr=0x03000000, module=3, severity=3)]) is False
+
+    def test_resume_failed_is_its_own_predicate(self):
+        from backend.app.services.bambu_mqtt import HMSError
+        from backend.app.services.hms_errors import power_loss_prompt_standing, power_loss_resume_failed
+
+        failed = HMSError(code="400D", attr=0x03000000, module=3, severity=3)
+        assert power_loss_resume_failed([failed]) is True
+        assert power_loss_prompt_standing([failed]) is False
+
+    def test_the_hold_needs_both_legs(self):
+        """PAUSE alone is every other pause cause on the farm; the prompt alone can
+        stand for a moment on a printer somebody already resumed."""
+        from backend.app.services.bambu_mqtt import HMSError, PrinterState
+        from backend.app.services.hms_errors import power_loss_hold_active
+
+        prompt = HMSError(code="8007", attr=0x03000000, module=3, severity=3)
+
+        held = PrinterState(state="PAUSE", hms_errors=[prompt])
+        assert power_loss_hold_active(held) is True
+        assert power_loss_hold_active(PrinterState(state="RUNNING", hms_errors=[prompt])) is False
+        assert power_loss_hold_active(PrinterState(state="PAUSE", hms_errors=[])) is False
+
+    def test_a_malformed_entry_never_raises(self):
+        """Every caller is on an MQTT callback path (invariant 10), and a predicate that
+        raises there would take the status/AMS chain down with it."""
+        from backend.app.services.hms_errors import power_loss_hold_active, power_loss_prompt_standing
+
+        assert power_loss_prompt_standing([SimpleNamespace()]) is False
+        assert power_loss_hold_active(None) is False
+        assert power_loss_hold_active(SimpleNamespace(state="PAUSE", hms_errors=[SimpleNamespace()])) is False
+
+    def test_the_codes_are_not_ams_taxonomy_rows(self):
+        """The AMS classifier must not claim them — `spool_recovery` derives its trigger
+        sets from that taxonomy, and a power-loss prompt routed into the swap machine
+        would try to change filament on a printer that just rebooted."""
+        from backend.app.services.hms_errors import classify_short_code
+
+        assert classify_short_code("0300_8007") is None
+        assert classify_short_code("0300_400D") is None

@@ -1874,6 +1874,94 @@ def runout_hold_active(state) -> bool:
         return False
 
 
+# The firmware's power-loss recovery PROMPT: "There was an unfinished print job when
+# the printer lost power. If the model is still adhered to the build plate, you can try
+# resuming the print job." Every one of the 11 active printers raised exactly this code
+# as its first HMS after the 2026-09-04 09:25 fleet outage, and each then sat PAUSEd
+# until a human touched its screen ~5 h later.
+#
+# It is the firmware's own OFFER, and the vendored action catalog states what the offer
+# accepts: ``hms_actions.get_actions_for_error_code("default", "03008007")`` is exactly
+# ``["RESUME_PRINTING", "STOP_PRINTING"]``, and ``bambu_mqtt.execute_hms_action`` resolves
+# RESUME_PRINTING to the plain ``{"print":{"command":"resume"}}``. Live proof that the
+# plain resume answers it: printer 8 (010-H2S) received one at 09:28:33 and was RUNNING
+# at 09:28:34, with ``0300_8007`` cleared.
+#
+# DELIBERATELY OUTSIDE the AMS fault taxonomy. These are print-module (0x03) codes and
+# the taxonomy's module gate ``_AMS_MODULES`` excludes 0x03 by construction — a shared
+# code suffix is not kinship (the same ruling that keeps ``0300_8003``, AI spaghetti
+# detection, out of it). So the "never write a new HMS frozenset literal, add a taxonomy
+# row" rule does not reach here; the prior art for a non-AMS literal set is
+# ``bambu_mqtt._HMS_PLATE_OCCUPANCY_CODES`` and ``usb_storage.HMS_STORAGE_LOW_FULL_CODES``.
+#
+# Matched on the SHORT code (``hms_short_code``), the same shape the plate-occupancy set
+# is matched on.
+POWER_LOSS_PROMPT_CODES: frozenset[str] = frozenset({"0300_8007"})
+
+# "Resume failed after power loss." — the catalog's own failure answer to a resume issued
+# against the prompt above. Its appearance is a TERMINAL verdict on that attempt: the
+# recovery lane holds for a human and never retries (a second resume cannot un-fail the
+# firmware's own recovery).
+POWER_LOSS_RESUME_FAILED_CODES: frozenset[str] = frozenset({"0300_400D"})
+
+
+def _short_code_standing(hms_list, codes: frozenset[str]) -> bool:
+    """Is any member of ``codes`` standing in this live HMS list?
+
+    Shared body for the two power-loss predicates. Pure decode over any HMSError-shaped
+    sequence (``.attr`` + ``.code``); a malformed entry is skipped, never raised — every
+    caller is on an MQTT callback path (invariant 10).
+    """
+    for e in hms_list or []:
+        try:
+            if hms_short_code(e.attr, e.code) in codes:
+                return True
+        except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the predicate
+            continue
+    return False
+
+
+def power_loss_prompt_standing(hms_list) -> bool:
+    """Is the firmware's power-loss recovery prompt standing on the wire right now?
+
+    True while :data:`POWER_LOSS_PROMPT_CODES` is present in the live list. Two very
+    different consumers read it, which is why it is a predicate and not an inline
+    membership test:
+
+    * the recovery lane, as the signal that the printer is holding an answerable offer;
+    * ``spool_recovery.note_demand_watch``, as a DISQUALIFIER — a reboot WIPES the whole
+      standing HMS list, so a runout code vanishing while this prompt stands is the wipe,
+      not the firmware answering. Printer 8 lost ~2 min of print and re-raised its runout
+      because nothing made that distinction on 2026-09-04.
+    """
+    return _short_code_standing(hms_list, POWER_LOSS_PROMPT_CODES)
+
+
+def power_loss_resume_failed(hms_list) -> bool:
+    """Has the firmware declared the power-loss resume FAILED (``0300_400D``)?"""
+    return _short_code_standing(hms_list, POWER_LOSS_RESUME_FAILED_CODES)
+
+
+def power_loss_hold_active(state) -> bool:
+    """True when the printer is PAUSEd holding at the firmware's power-loss prompt.
+
+    The sibling of :func:`runout_hold_active`, and the same two-leg shape: live
+    ``gcode_state == "PAUSE"`` AND the prompt standing in ``hms_errors``. Both legs are
+    required — the prompt alone does not mean the printer is waiting (it can stand for a
+    moment on a printer the operator already resumed), and PAUSE alone is every other
+    pause cause on the farm.
+
+    Fails closed (False) on a malformed/absent state — a predicate that errors must never
+    make the farm resume a print.
+    """
+    try:
+        if (getattr(state, "state", None) or "") != "PAUSE":
+            return False
+        return power_loss_prompt_standing(getattr(state, "hms_errors", None) or [])
+    except Exception:  # noqa: BLE001 — a gate predicate must never raise into a callback/route
+        return False
+
+
 def hms_error_payload(e) -> dict:
     """Serialize an HMSError to the API/WS wire dict.
 

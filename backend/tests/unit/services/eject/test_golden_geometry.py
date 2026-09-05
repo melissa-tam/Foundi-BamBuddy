@@ -22,6 +22,7 @@ and ``_profile``), so the two never drift.
 from __future__ import annotations
 
 import pathlib
+from dataclasses import replace
 
 import pytest
 
@@ -42,7 +43,17 @@ H2S_GEOMETRY = ModelGeometry(
     max_part_height_mm=42.0,
     validated=True,
     z_travel_mm=340.0,
+    # Closed, like the registry seed for all seven models: the nine pre-existing goldens
+    # below MUST stay byte-identical, which is the whole proof that shipping the Z
+    # re-reference recipe changes no eject motion anywhere until a ladder opens it.
+    z_reference_validated=False,
+    hold_lift_mm=12.0,
 )
+
+# The two flag-ON goldens' geometries — one per homing dialect, because the prologue is
+# emitted at MODEL level and must compose with both.
+H2S_GEOMETRY_Z_REFERENCED = replace(H2S_GEOMETRY, z_reference_validated=True)
+H2C_GEOMETRY_Z_REFERENCED = replace(H2C_GEOMETRY, z_reference_validated=True)
 
 _DEFAULTS = {
     "name": "default",
@@ -138,6 +149,13 @@ MATRIX = [
         },
         30.0,
     ),
+    # Z RE-REFERENCE (2026-09-04), one golden per homing dialect. These lock the recipe
+    # a model receives ONCE its own ladder flips ``z_reference_validated`` — dormant
+    # until then, which is exactly why the nine goldens above must remain byte-identical.
+    # H2S drives G380 S2 Z390 (340 travel + 50 overtravel) then declares G92 Z340; H2C
+    # drives Z375 and declares Z325, composed with the torque home pair.
+    ("zref_h2s_z30", H2S_GEOMETRY_Z_REFERENCED, {"name": "zref"}, 30.0),
+    ("zref_h2c_z30", H2C_GEOMETRY_Z_REFERENCED, {"name": "zref"}, 30.0),
 ]
 
 

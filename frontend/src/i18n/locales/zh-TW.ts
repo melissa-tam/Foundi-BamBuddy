@@ -172,6 +172,7 @@ export default {
       printerCol: '印表機',
       timeCol: '完成 / 開始',
       stoppedByOperator: '已由操作員停止',
+      stoppedByFarmVision: '農場停止：列印板偵測',
       firstArticleBadge: '首件',
       stagedBadge: '已擱置',
       lowSpoolBadge: '線材不足',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: '實體故障 — 需要人工處理，不會自動換料',
         printerOfflineStalled: '列印過程中印表機離線 — 重新連線前結果未知',
         printPausedStalled: '印表機上已暫停 — 需要人工處理（無法自動復原）',
-        visionHold: '印表機視覺偵測：列印板不為空 — 清理熱床後在印表機上繼續',
+        visionHold: '列印板偵測兩次觸發 — 清理熱床後點選「將列印板標記為已清理」',
+        powerLossHold: '停在印表機的斷電復原提示 — 請在印表機上繼續',
+        zReferenceLost: '重新啟動時列印板上仍有零件 — 請手動取下',
         previousPrintFailed: '已擱置：上一次列印失敗',
         filamentShort: '線材不足',
         externalSpoolRunout: '外接料卷已用盡 — 請補充外接料架，而不是 AMS 料槽',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: '將 {{model}} 標記為已驗證會解鎖無人值守的量產取件。僅在操作員見證的硬體階梯之後確認：空床空跑 → 有人監督的列印→冷卻→取件循環 → 短循環。',
       confirmUnvalidateTitle: '移除驗證？',
       confirmUnvalidateBody: '移除 {{model}} 的驗證會使該型號的量產自動取件安全失效，直到重新驗證。',
+      confirmZReferenceTitle: '啟用 Z 重新參考？',
+      confirmZReferenceBody: '為 {{model}} 啟用 Z 重新參考後，每次帶件取出都會先執行一次受保護的熱床下行動作，直到下限位。請僅在操作員現場完成硬體階梯驗證、且已安裝脫模輔具後確認。',
+      confirmUnZReferenceTitle: '停用 Z 重新參考？',
+      confirmUnZReferenceBody: '停用後，{{model}} 的取出將重新依賴保留的 Z 原點，而斷電會破壞該原點。',
       columns: {
         model: '型號',
         bed: '熱床（寬×高 mm）',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: '最大零件高度（mm）',
         zTravel: 'Z 行程（mm）',
         zTravelHelp: '留空則清除。此時該型號的熱床下降輔助將安全失效。',
+        zReferenceValidated: 'Z 重新參考已驗證',
+        holdLift: '保持時熱床抬升 (mm)',
+        holdLiftHelp: '熱床檢查確認後印表機處於保持狀態時，熱床從下限位抬升的距離。',
         notes: '備註',
         validated: '已硬體驗證',
       },
@@ -1204,7 +1214,21 @@ export default {
       jam: 'AMS 卡料',
       runout: '耗材用盡',
       physical: '耗材故障',
+      power_loss: '斷電',
+      plate_vision: '列印板偵測',
+      z_reference_lost: 'Z 基準遺失',
       recovering: '恢復中',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: '清理 AMS 送料通道，然後繼續列印',
+      runout: '為所要求的槽位補充耗材；列印會自動繼續',
+      physical: '在印表機上清理耗材通道，然後繼續列印',
+      power_loss: '請在印表機上繼續',
+      plate_vision: '清理熱床後點選「將列印板標記為已清理」',
+      z_reference_lost: '重新啟動時列印板上仍有零件 — 手動取下後點選「將列印板標記為已清理」',
     },
     // Fans
     fans: {

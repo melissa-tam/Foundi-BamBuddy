@@ -172,6 +172,7 @@ export default {
       printerCol: 'Imprimante',
       timeCol: 'Terminée / démarrée',
       stoppedByOperator: 'Arrêtée par l\'opérateur',
+      stoppedByFarmVision: 'Arrêtée par la ferme : contrôle du plateau',
       firstArticleBadge: 'Première pièce',
       stagedBadge: 'Retenue',
       lowSpoolBadge: 'Filament insuffisant',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: 'Panne physique — intervention requise, aucun échange automatique',
         printerOfflineStalled: 'Imprimante hors ligne en cours d\'impression — résultat inconnu jusqu\'à sa reconnexion',
         printPausedStalled: 'En pause sur l\'imprimante — intervention requise (pas de récupération automatique)',
-        visionHold: 'Vision de l\'imprimante : plateau non vide — dégagez le plateau, puis reprenez sur l\'imprimante',
+        visionHold: 'Contrôle du plateau déclenché deux fois — dégagez le plateau, puis « Marquer le plateau comme dégagé »',
+        powerLossHold: 'En attente sur l\'invite de coupure de courant de l\'imprimante — reprenez sur l\'imprimante',
+        zReferenceLost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main',
         previousPrintFailed: 'Retenue : l\'impression précédente a échoué',
         filamentShort: 'Filament insuffisant',
         externalSpoolRunout: 'La bobine externe est vide — rechargez le support externe, pas un emplacement AMS',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: "Marquer {{model}} comme validé déverrouille l'éjection de production sans surveillance. Confirmez uniquement après l'échelle matérielle constatée par l'opérateur : test à vide sur plateau vide → cycle supervisé impression→refroidissement→éjection → boucle courte.",
       confirmUnvalidateTitle: 'Retirer la validation ?',
       confirmUnvalidateBody: "Retirer la validation de {{model}} fait échouer en sécurité l'auto-éjection de production sur ce modèle jusqu'à sa revalidation.",
+      confirmZReferenceTitle: 'Activer le re-référencement Z ?',
+      confirmZReferenceBody: 'Activer le re-référencement Z sur {{model}} ajoute une descente surveillée du plateau jusqu\'à la butée basse au début de chaque éjection avec pièce. À confirmer uniquement après l\'échelle matérielle observée par l\'opérateur, avec l\'aide au décollage installée.',
+      confirmUnZReferenceTitle: 'Désactiver le re-référencement Z ?',
+      confirmUnZReferenceBody: 'Sans re-référencement Z, {{model}} éjecte de nouveau à partir du zéro Z conservé, qu\'une coupure de courant détruit.',
       columns: {
         model: 'Modèle',
         bed: 'Plateau (L×H mm)',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: 'Hauteur max. de pièce (mm)',
         zTravel: 'Course Z (mm)',
         zTravelHelp: "Laissez vide pour effacer. L'assistance d'abaissement du plateau échoue alors en sécurité sur ce modèle.",
+        zReferenceValidated: 'Re-référencement Z validé',
+        holdLift: 'Levée du plateau en attente (mm)',
+        holdLiftHelp: 'De combien le plateau s\'élève depuis sa butée basse pendant que l\'imprimante est retenue après un contrôle de plateau confirmé.',
         notes: 'Notes',
         validated: 'Validé matériellement',
       },
@@ -1204,7 +1214,21 @@ export default {
       jam: 'Bourrage AMS',
       runout: 'Filament épuisé',
       physical: 'Panne de filament',
+      power_loss: 'Coupure de courant',
+      plate_vision: 'Contrôle du plateau',
+      z_reference_lost: 'Référence Z perdue',
       recovering: 'Récupération',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Dégagez le chemin du filament de l\'AMS, puis reprenez l\'impression',
+      runout: 'Rechargez l\'emplacement demandé ; l\'impression reprend d\'elle-même',
+      physical: 'Dégagez le chemin du filament sur l\'imprimante, puis reprenez l\'impression',
+      power_loss: 'Reprenez sur l\'imprimante',
+      plate_vision: 'Dégagez le plateau, puis « Marquer le plateau comme dégagé »',
+      z_reference_lost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main, puis « Marquer le plateau comme dégagé »',
     },
     // Fans
     fans: {

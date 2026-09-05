@@ -710,6 +710,40 @@ class PrinterManager:
         """Get the MQTT client for a printer."""
         return self._clients.get(printer_id)
 
+    async def await_state(
+        self,
+        printer_id: int,
+        states: set[str],
+        timeout_s: float,
+        *,
+        poll_interval_s: float = 1.0,
+    ) -> bool:
+        """Poll live ``gcode_state`` until it is one of ``states``, or ``timeout_s`` elapses.
+
+        The shared "did the printer actually do what I just told it to?" confirm wait.
+        Promoted here from ``spool_recovery._await_state`` when a second lane needed the
+        same wait: a command's ACK proves only that it was accepted, so every lane that
+        sends ``resume``/``pause``/``stop`` must confirm against the wire, and two copies
+        of that loop would drift on the one decision that matters — whether an absent
+        state (a disconnected printer) reads as failure. It does: ``get_status`` returns
+        None and the final re-check answers False.
+
+        ``poll_interval_s`` is the CALLER's latency budget, not this method's — the
+        recovery lanes each name their own constant so the AMS skill's latency-budget
+        table keeps one owner per wait.
+
+        Re-checks once after the deadline so a state that arrived during the last sleep
+        is not lost to an off-by-one poll.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while asyncio.get_running_loop().time() < deadline:
+            st = self.get_status(printer_id)
+            if st is not None and getattr(st, "state", None) in states:
+                return True
+            await asyncio.sleep(poll_interval_s)
+        st = self.get_status(printer_id)
+        return st is not None and getattr(st, "state", None) in states
+
     def mark_printer_offline(self, printer_id: int):
         """Mark a printer as offline and trigger status callback.
 
@@ -724,7 +758,10 @@ class PrinterManager:
             client = self._clients[printer_id]
             if client.state.connected:
                 logger.info("Marking printer %s as offline (smart plug power off)", printer_id)
-                client.state.connected = False
+                # Through the client's one writer so the outage anchor is stamped: a
+                # smart-plug power cut is a genuine outage, and the power-loss recovery
+                # lane reads `disconnected_at` to report how long it lasted.
+                client.note_disconnected()
                 client.state.state = "unknown"
                 # Trigger the status change callback to broadcast via WebSocket
                 if self._on_status_change:
@@ -1321,6 +1358,13 @@ def printer_state_to_dict(
 
     result = {
         "connected": state.connected,
+        # Session boundary, for triage: which MQTT session this reading belongs to, and
+        # the wall-clock moment the previous one ended (None = never disconnected in this
+        # process). Both are JSON primitives — `disconnected_at` is a float epoch, never a
+        # datetime, because this payload is also serialized by the WS lane's bare
+        # `json.dumps` (2026-08-31: a raw datetime here killed every status broadcast).
+        "connection_epoch": state.connection_epoch,
+        "disconnected_at": state.disconnected_at,
         "state": state.state,
         "current_print": state.current_print,
         "subtask_name": state.subtask_name,

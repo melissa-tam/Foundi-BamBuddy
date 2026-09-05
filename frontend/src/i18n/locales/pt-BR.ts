@@ -172,6 +172,7 @@ export default {
       printerCol: 'Impressora',
       timeCol: 'Concluída / iniciada',
       stoppedByOperator: 'Parada pelo operador',
+      stoppedByFarmVision: 'Parada pela fazenda: verificação da placa',
       firstArticleBadge: 'Primeira peça',
       stagedBadge: 'Retida',
       lowSpoolBadge: 'Filamento insuficiente',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: 'Falha física — precisa de intervenção, sem troca automática',
         printerOfflineStalled: 'Impressora offline no meio da impressão — resultado desconhecido até reconectar',
         printPausedStalled: 'Pausada na impressora — precisa de atenção (sem recuperação automática)',
-        visionHold: 'Visão da impressora: placa não vazia — libere a placa e retome na impressora',
+        visionHold: 'Verificação da placa disparou duas vezes — libere a mesa e depois «Marcar placa como liberada»',
+        powerLossHold: 'Retida no aviso de queda de energia da impressora — retome na impressora',
+        zReferenceLost: 'Reiniciada com uma peça na placa — remova-a à mão',
         previousPrintFailed: 'Retida: a impressão anterior falhou',
         filamentShort: 'Filamento insuficiente',
         externalSpoolRunout: 'A bobina externa acabou — reabasteça o suporte externo, não um slot do AMS',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: 'Marcar {{model}} como validado libera a ejeção de produção sem supervisão. Confirme apenas após a escada de hardware testemunhada pelo operador: teste a seco com mesa vazia → ciclo supervisionado impressão→resfriamento→ejeção → laço curto.',
       confirmUnvalidateTitle: 'Remover a validação?',
       confirmUnvalidateBody: 'Remover a validação de {{model}} faz a ejeção automática de produção falhar com segurança neste modelo até ser revalidado.',
+      confirmZReferenceTitle: 'Ativar a re-referência Z?',
+      confirmZReferenceBody: 'Ativar a re-referência Z em {{model}} acrescenta uma descida vigiada da mesa até o batente inferior no início de cada ejeção com peça. Confirme apenas após a escada de hardware presenciada pelo operador, com o auxiliar de soltura instalado.',
+      confirmUnZReferenceTitle: 'Desativar a re-referência Z?',
+      confirmUnZReferenceBody: 'Sem a re-referência Z, {{model}} volta a ejetar usando o zero Z retido, que uma queda de energia destrói.',
       columns: {
         model: 'Modelo',
         bed: 'Mesa (L×A mm)',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: 'Altura máx. da peça (mm)',
         zTravel: 'Curso Z (mm)',
         zTravelHelp: 'Deixe vazio para limpar. A assistência de descida da mesa então falha com segurança neste modelo.',
+        zReferenceValidated: 'Re-referência Z validada',
+        holdLift: 'Elevação da mesa em espera (mm)',
+        holdLiftHelp: 'Quanto a mesa sobe a partir do batente inferior enquanto a impressora está retida após uma verificação de mesa confirmada.',
         notes: 'Notas',
         validated: 'Validado por hardware',
       },
@@ -1204,7 +1214,21 @@ export default {
       jam: 'Entupimento do AMS',
       runout: 'Filamento acabou',
       physical: 'Falha de filamento',
+      power_loss: 'Queda de energia',
+      plate_vision: 'Verificação da placa',
+      z_reference_lost: 'Referência Z perdida',
       recovering: 'Recuperando',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Desobstrua o caminho do filamento do AMS e retome a impressão',
+      runout: 'Reabasteça o slot solicitado; a impressão retoma sozinha',
+      physical: 'Desobstrua o caminho do filamento na impressora e retome a impressão',
+      power_loss: 'Retome na impressora',
+      plate_vision: 'Libere a mesa e depois «Marcar placa como liberada»',
+      z_reference_lost: 'Reiniciada com uma peça na placa — remova-a à mão e depois «Marcar placa como liberada»',
     },
     // Fans
     fans: {

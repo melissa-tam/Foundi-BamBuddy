@@ -49,6 +49,19 @@ class ModelGeometry:
     # drives to. ``None`` ⇒ a profile with the drop enabled fails closed. Defaulted
     # so existing constructions (test fixtures, transient geometries) still compile.
     z_travel_mm: float | None = None
+    # May the eject block open with the contact-free Z RE-REFERENCE prologue? The
+    # SECOND hardware-ladder gate (2026-09-04), independent of ``validated``: that one
+    # says the XY envelope is proven, this one says the guarded Z drive onto the bottom
+    # stop was witnessed on this machine with the plate-release aid installed.
+    #
+    # **Defaulted False, and the default is load-bearing**: a default-constructed
+    # ``ModelGeometry`` — every transient geometry, every unmigrated fixture — must be
+    # unable to produce the block, so a new motion can never appear by omission. Pinned
+    # by a test.
+    z_reference_validated: bool = False
+    # Bed clearance (mm) off the PHYSICAL bottom stop while the printer is held after a
+    # confirmed plate-check trip. Read by the hold lane, never by the eject generator.
+    hold_lift_mm: float = 12.0
 
 
 class GeometryUnavailable(Exception):
@@ -69,6 +82,8 @@ def _to_geometry(row: PrinterModelGeometry) -> ModelGeometry:
         max_part_height_mm=row.max_part_height_mm,
         validated=bool(row.validated),
         z_travel_mm=row.z_travel_mm,
+        z_reference_validated=bool(row.z_reference_validated),
+        hold_lift_mm=row.hold_lift_mm,
     )
 
 

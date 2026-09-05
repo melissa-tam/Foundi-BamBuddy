@@ -282,3 +282,137 @@ class TestMigration:
             assert "WHERE resolved_at IS NULL" in (sql or "")
         finally:
             await engine.dispose()
+
+
+class TestWaitingReasonVocabulary:
+    """The kind -> token table, moved here 2026-09-04 from ``spool_recovery``.
+
+    A ``waiting_reason`` is a PROJECTION of an incident row, so the table belongs with
+    the store that owns the kinds. While it lived in one consumer, a kind could be
+    registered for the hourly reminder and not for the projection — and the fallback hid
+    it, because the missing kind rendered the spool-jam token instead of failing.
+    """
+
+    async def test_every_kind_has_a_token(self):
+        """The pin that makes registration total. A new kind added to the model without
+        a row here fails HERE, not in production as jam copy on an unrelated hold."""
+        from backend.app.models.printer_incident import AMS_FAULT_KINDS, PAUSE_CAUSE_KINDS
+
+        for kind in AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS:
+            assert printer_incidents.waiting_reason_for(kind)
+
+    async def test_an_unknown_kind_raises(self):
+        """It used to return the spool-jam token — a vocabulary trap: the wrong copy on
+        a unit held for something else is worse than a loud failure at the one call site
+        that forgot to register."""
+        with pytest.raises(KeyError):
+            printer_incidents.waiting_reason_for("no_such_kind")
+
+    async def test_external_defaults_to_false(self):
+        """It was keyword-only with NO default, so ``waiting_reason_for(KIND_POWER_LOSS)``
+        was a TypeError — and the pause-cause kinds have no holder variant to pass."""
+        from backend.app.models.printer_incident import KIND_POWER_LOSS
+
+        assert printer_incidents.waiting_reason_for(KIND_POWER_LOSS) == "power_loss_hold"
+
+    async def test_external_only_overrides_the_two_kinds_that_need_it(self):
+        assert printer_incidents.waiting_reason_for(KIND_RUNOUT, external=True) == "external_spool_runout"
+        assert printer_incidents.waiting_reason_for(KIND_JAM, external=True) == "external_feed_fault"
+        # A physical fault reads the same on either hardware — one token, no synonym.
+        physical = printer_incidents.waiting_reason_for(KIND_PHYSICAL)
+        assert printer_incidents.waiting_reason_for(KIND_PHYSICAL, external=True) == physical
+
+    async def test_the_owned_set_is_derived_from_the_table(self):
+        """``farm_stall._ATTENDED_PAUSE_REASONS`` derives from this set, so a token
+        missing from it lets the pause-stall watchdog double-escalate a hold that has
+        already alerted. Deriving it removes the possibility."""
+        every_token = set(printer_incidents._WAITING_REASON_BY_KIND.values()) | set(
+            printer_incidents._EXTERNAL_WAITING_REASON_BY_KIND.values()
+        )
+        assert every_token <= printer_incidents.RECOVERY_WAITING_REASONS
+
+    async def test_the_plate_vision_token_string_is_unchanged(self):
+        """Its ORIGIN moved from ``farm_correlation`` (which keeps NO alias — one
+        origin, no dual path); the STRING must not move, or every rendered surface
+        and locale key that keys off it goes blank."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        assert printer_incidents.waiting_reason_for(KIND_PLATE_VISION) == "plate_not_empty_printer_detected"
+        assert printer_incidents.WAITING_REASON_PLATE_VISION == "plate_not_empty_printer_detected"
+
+
+class TestResolvesOnOperator:
+    async def test_the_pause_cause_kinds_that_need_hands_are_operator_resolved(self):
+        from backend.app.models.printer_incident import KIND_PLATE_VISION, KIND_Z_REFERENCE_LOST
+
+        assert printer_incidents.resolves_on_operator(KIND_PLATE_VISION) is True
+        assert printer_incidents.resolves_on_operator(KIND_Z_REFERENCE_LOST) is True
+
+    async def test_wire_resolved_kinds_are_not(self):
+        """Power loss included: the prompt clearing IS a wire fact, so that hold closes
+        itself when the printer starts printing again."""
+        from backend.app.models.printer_incident import KIND_POWER_LOSS
+
+        for kind in (KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL, KIND_POWER_LOSS):
+            assert printer_incidents.resolves_on_operator(kind) is False
+
+    async def test_an_unregistered_kind_is_wire_resolved(self):
+        """The safe direction: a hold that closes too readily is visible, one that never
+        closes blocks the printer forever."""
+        assert printer_incidents.resolves_on_operator("no_such_kind") is False
+
+
+class TestCountRecent:
+    """``count_recent`` — PRINTER-scoped and windowed, unlike ``count_resolved``."""
+
+    async def test_counts_only_this_printer_and_kind_inside_the_window(self, db_session, printer_factory):
+        from datetime import datetime, timedelta
+
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        one = await printer_factory()
+        two = await printer_factory()
+        now = datetime.utcnow()
+
+        inc = await _open(db_session, one.id, kind=KIND_PLATE_VISION, job_id="job-a")
+        await printer_incidents.close(db_session, inc.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
+        # A different printer, and a different kind on the same printer: neither counts.
+        await _open(db_session, two.id, kind=KIND_PLATE_VISION, job_id="job-a")
+        stale = await _open(db_session, one.id, kind=KIND_JAM, job_id="job-b", codes="jam:0700_8010")
+        await printer_incidents.close(db_session, stale.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
+
+        since = now - timedelta(hours=1)
+        assert await printer_incidents.count_recent(db_session, one.id, KIND_PLATE_VISION, since) == 1
+        assert await printer_incidents.count_recent(db_session, two.id, KIND_PLATE_VISION, since) == 1
+
+    async def test_a_resolved_incident_still_counts(self, db_session, printer_factory):
+        """The first trip is RESOLVED by the time the second happens — the requeue closed
+        it at the terminal — so a status filter would make the second trip invisible and
+        the printer would re-check forever."""
+        from datetime import datetime, timedelta
+
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        printer = await printer_factory()
+        first = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="job-1")
+        await printer_incidents.close(db_session, first.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
+        # The requeue is a NEW job — which is exactly why the job-scoped `count_resolved`
+        # cannot answer this question.
+        await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="job-2")
+
+        since = datetime.utcnow() - timedelta(hours=1)
+        assert await printer_incidents.count_recent(db_session, printer.id, KIND_PLATE_VISION, since) == 2
+        assert await printer_incidents.count_resolved(db_session, printer.id, "job-2", KIND_PLATE_VISION) == 0
+
+    async def test_the_window_excludes_older_rows(self, db_session, printer_factory):
+        from datetime import datetime, timedelta
+
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        printer = await printer_factory()
+        old = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="job-1")
+        old.created_at = datetime.utcnow() - timedelta(days=2)
+        await db_session.commit()
+
+        since = datetime.utcnow() - timedelta(hours=1)
+        assert await printer_incidents.count_recent(db_session, printer.id, KIND_PLATE_VISION, since) == 0

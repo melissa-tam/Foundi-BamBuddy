@@ -126,12 +126,21 @@ class PrintQueueItem(Base):
     # for items never dispatched.
     dispatch_subtask_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
-    # How this unit reached a terminal 'cancelled': 'operator_ui' (Stop pressed in
-    # the Bambuddy queue UI) or 'operator_screen' (stopped on the printer's own
-    # touchscreen — detected from the firmware's cancel-echo HMS codes). NULL for
-    # a genuine failure, a normal completion, or a reconcile-synthesised interruption
-    # (unknown cause). Drives the farm policy: an attributed operator stop takes NO
-    # auto-retry and does NOT count toward quarantine (Phase 3).
+    # How this unit reached a terminal 'cancelled' — the persisted verdict of
+    # ``farm_correlation.classify_stop`` (its closed ``StopVerdict`` Literal is the one
+    # origin for these strings):
+    #   'operator_ui'       Stop pressed in the Bambuddy queue UI;
+    #   'operator_screen'   stopped on the printer's own touchscreen (detected from the
+    #                       firmware's cancel-echo HMS codes);
+    #   'farm_vision_abort' the FARM stopped the print — the printer's pre-print plate
+    #                       check tripped and ``pause_recovery`` sent the stop. Written
+    #                       onto the ``printing`` row BEFORE the stop goes out, so the
+    #                       terminal HONOURS the mark however the firmware echoes it
+    #                       (the ``note_eject_runtime_exceeded`` contract).
+    # NULL for a genuine failure, a normal completion, or a reconcile-synthesised
+    # interruption (unknown cause). Drives the farm policy: an attributed operator stop
+    # takes NO auto-retry and does NOT count toward quarantine (Phase 3), while a farm
+    # abort REQUEUES the plate lineage-only (``farm_policy.on_farm_requeue``, W10).
     stop_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Durable mirror of the in-memory PendingEject (services/eject/remote.py): the

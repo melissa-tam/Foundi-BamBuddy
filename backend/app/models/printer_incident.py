@@ -51,12 +51,39 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.core.database import Base
 
-# Incident kinds — the farm's reaction vocabulary, derived from the WS2a fault
-# taxonomy (``hms_errors.AmsFaultClass``) and NOT a second classification: the
-# mapping lives in ``spool_recovery._KIND_BY_CLASS`` (one origin).
+# Incident kinds — the farm's reaction vocabulary. TWO closed origins, both listed
+# here so the store owns the whole vocabulary (2026-09-04 pause-recovery wave):
+#
+# 1. The AMS fault taxonomy (``hms_errors.AmsFaultClass``) — NOT a second
+#    classification: the class -> kind mapping lives in ``spool_recovery._KIND_BY_CLASS``.
 KIND_JAM = "jam"  # mechanical_feed — the swap machine's territory (farm prints only)
 KIND_RUNOUT = "runout"  # runout / runout_external — hold for a SAME-slot refill
 KIND_PHYSICAL = "physical"  # physical_fault — hands needed, never a swap
+#
+# 2. The pause-cause vocabulary (``services/pause_recovery.py``) — holds that are
+#    NOT AMS faults but are, exactly like them, "this printer is held for a human":
+KIND_POWER_LOSS = "power_loss"  # the firmware's power-loss prompt could not be answered (resume refused/failed)
+KIND_PLATE_VISION = "plate_vision"  # the pre-print plate check tripped (confirmed on the second consecutive trip)
+KIND_Z_REFERENCE_LOST = "z_reference_lost"  # rebooted with a part on the plate; the eject's Z frame is fiction
+
+PAUSE_CAUSE_KINDS: frozenset[str] = frozenset({KIND_POWER_LOSS, KIND_PLATE_VISION, KIND_Z_REFERENCE_LOST})
+AMS_FAULT_KINDS: frozenset[str] = frozenset({KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL})
+
+# What ENDS a hold of each kind. ``"wire"``: the printer's own state answers it (a
+# PAUSE->RUNNING edge, a job terminal, or the fault vanishing from the live HMS —
+# ``spool_recovery.on_observed_running`` / ``on_job_terminal`` / ``sweep_open_incidents``).
+# ``"operator"``: only a human act ends it (``clear_plate`` / ``operator_recover``),
+# because the terminal that follows was CAUSED by the farm (a plate-vision stop) or
+# the wire cannot see the plate (a lost Z frame) — so a farm-caused terminal or an
+# empty HMS list is NOT evidence the hold is over and the close paths must skip it.
+RESOLVES_ON: dict[str, str] = {
+    KIND_JAM: "wire",
+    KIND_RUNOUT: "wire",
+    KIND_PHYSICAL: "wire",
+    KIND_POWER_LOSS: "wire",
+    KIND_PLATE_VISION: "operator",
+    KIND_Z_REFERENCE_LOST: "operator",
+}
 
 STATUS_RECOVERING = "recovering"
 STATUS_ESCALATED = "escalated"

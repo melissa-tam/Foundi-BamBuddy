@@ -18,11 +18,13 @@ through the authority rather than scripting a manager flag.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
-from backend.app.services.eject import monitor as monitor_mod
+from backend.app.services.eject import monitor as monitor_mod, remote as eject_remote
 from backend.app.services.eject.monitor import (
     EjectCooldownMonitor,
     _ArmedWatch,
@@ -195,16 +197,19 @@ async def _noop_sleep(_seconds):
 class _NotifyRecorder:
     """Injectable notify callable: records printer_ids (and the live bed the cooldown
     watch passes) and optionally raises. Accepts the foreign-gate watch's bare
-    ``notify(printer_id)`` and the cooldown watch's ``notify(printer_id, bed_c=...)``."""
+    ``notify(printer_id)``, the cooldown watch's ``notify(printer_id, bed_c=...)`` and
+    the plate-not-empty page's ``notify(printer_id, source_detail=...)``."""
 
     def __init__(self, raise_exc: bool = False):
         self.calls: list[int] = []
         self.bed_calls: list[float | None] = []
+        self.details: list[str] = []
         self._raise = raise_exc
 
-    async def __call__(self, printer_id, *, bed_c=None):
+    async def __call__(self, printer_id, *, bed_c=None, source_detail=""):
         self.calls.append(printer_id)
         self.bed_calls.append(bed_c)
+        self.details.append(source_detail)
         if self._raise:
             raise RuntimeError("notify boom")
 
@@ -1379,3 +1384,119 @@ class TestDoReleaseGateGuard:
         )
         assert outcome == "released"
         assert rel.calls == 1
+
+
+class _TerminalRefuser:
+    """An ``on_release`` that refuses TERMINALLY — the lost-Z-frame shape (2026-09-04).
+
+    A dispatcher raises the authority's refusal through ``_refusal_error``, so the test
+    uses the REAL error the real gate produces rather than a hand-built stand-in."""
+
+    def __init__(self, refusal: str = "z_unreferenced"):
+        self.calls = 0
+        self._refusal = refusal
+
+    async def __call__(self):
+        self.calls += 1
+        raise eject_remote._refusal_error(self._refusal)
+
+
+class TestTerminalRefusalHoldsForAHuman:
+    """A refusal no waiting can cure pages once and hands the plate to a human.
+
+    The 2026-09-04 002-H2S shape: the printer rebooted with a part on the plate, so its
+    Z frame is fiction and the sweep's absolute Z moves would run against it. Retrying
+    that three times only delays the page."""
+
+    async def test_it_pages_then_holds_without_striking_or_quarantining(self):
+        _gate_up(11)
+        mgr = _FakeManager([_status(20)])
+        rel, stall = _TerminalRefuser(), _StallRecorder()
+        notify = _NotifyRecorder()
+        with patch.object(monitor_mod, "notify_plate_not_empty", notify):
+            outcome = await watch_bed_and_clear(
+                11,
+                30.0,
+                manager=mgr,
+                escalate_s=100000,
+                check_interval_s=20,
+                sleep=_noop_sleep,
+                on_release=rel,
+                on_stall=stall,
+            )
+        assert outcome == "stalled"
+        assert rel.calls == 1  # ONE attempt: not three, not a strike
+        assert stall.reasons == []  # on_stall is the quarantine lane — never entered
+        assert notify.calls == [11]
+        assert notify.details == ["z_reference_lost_after_reboot"]
+        # The plate is held for a human, and still occupied.
+        assert plate_occupancy.is_plate_occupied(11) is True
+        assert isinstance(plate_occupancy.snapshot(11).plate_policy, EscalationOnly)
+
+    async def test_the_page_fires_even_though_the_policy_change_cancels_this_watch(self):
+        """ORDER PIN. ``set_policy`` fans out to the driver, which CANCELS the watch task
+        this coroutine runs inside — so a page issued after it would die at its first
+        await and the operator would never be told. Driven through the real driver with
+        a real task, so the cancellation actually happens."""
+        monitor = EjectCooldownMonitor()
+        plate_occupancy.configure(policy_driver=monitor.on_occupancy_change)
+        _gate_up(12)
+        mgr = _FakeManager([_status(20)])
+        notify = _NotifyRecorder()
+        rel = _TerminalRefuser()
+        order: list[str] = []
+
+        async def _recording_notify(printer_id, *, source_detail=""):
+            order.append("page")
+            await notify(printer_id, source_detail=source_detail)
+
+        real_set_policy = plate_occupancy.set_policy
+
+        def _recording_set_policy(printer_id, policy):
+            order.append("set_policy")
+            return real_set_policy(printer_id, policy)
+
+        async def _run():
+            return await watch_bed_and_clear(
+                12,
+                30.0,
+                manager=mgr,
+                escalate_s=100000,
+                check_interval_s=20,
+                sleep=_noop_sleep,
+                on_release=rel,
+            )
+
+        task = asyncio.get_running_loop().create_task(_run())
+        # The driver cancels whatever it holds for this printer; register OUR task so
+        # the transition really does cancel the coroutine that is paging.
+        monitor._armed[12] = _ArmedWatch(policy=CooldownEject(unit_id=1, run_id=None), task=task)
+        with (
+            patch.object(monitor_mod, "notify_plate_not_empty", _recording_notify),
+            patch.object(monitor_mod.plate_occupancy, "set_policy", _recording_set_policy),
+            contextlib.suppress(asyncio.CancelledError),
+        ):
+            await task
+        assert order == ["page", "set_policy"], "the page must precede the transition that cancels the watch"
+        assert notify.calls == [12]
+        plate_occupancy.configure(policy_driver=None)
+
+    async def test_a_transient_refusal_still_retries_three_times(self):
+        # The contrast case: ``job_active`` is curable by waiting, so it stays a strike
+        # and reaches the ordinary stall path after three consecutive failures.
+        _gate_up(13)
+        mgr = _FakeManager([_status(20)])
+        rel, stall = _TerminalRefuser("job_active"), _StallRecorder()
+        outcome = await watch_bed_and_clear(
+            13,
+            30.0,
+            manager=mgr,
+            escalate_s=100000,
+            check_interval_s=20,
+            sleep=_noop_sleep,
+            on_release=rel,
+            on_stall=stall,
+        )
+        assert outcome == "stalled"
+        assert rel.calls == 3
+        assert stall.reasons == ["eject dispatch failed ×3"]

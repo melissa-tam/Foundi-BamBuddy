@@ -64,6 +64,13 @@ class TestModelGeometryGet:
         assert by_key["H2C"]["validated"] is False
         assert by_key["H2C"]["env_x_min"] == 25.0
         assert by_key["H2C"]["z_travel_mm"] == 325.0
+        # The SECOND hardware-ladder gate (2026-09-04) ships CLOSED on every row, and
+        # the held-bed lift ships at the vendor's own 12 mm. This assertion is the
+        # deploy-day contract: a model keeps today's eject recipe until its own ladder
+        # opens the gate, so shipping the code changes no motion anywhere.
+        for row in body["geometries"]:
+            assert row["z_reference_validated"] is False, row["model_key"]
+            assert row["hold_lift_mm"] == 12.0, row["model_key"]
 
 
 @pytest.mark.asyncio
@@ -118,6 +125,38 @@ class TestModelGeometryPut:
     async def test_put_z_travel_zero_422(self, async_client: AsyncClient):
         # z_travel_mm must be positive (gt=0) — 0 is rejected before the row is touched.
         resp = await async_client.put("/api/v1/model-geometry/H2S", json={"z_travel_mm": 0})
+        assert resp.status_code == 422
+
+    async def test_put_flips_the_z_reference_gate_and_logs_warning(self, async_client: AsyncClient, caplog):
+        # This flip is what ACTIVATES the Z re-reference recipe for a model, so it must
+        # leave the same audit trail the envelope/validated edits do.
+        with caplog.at_level(logging.WARNING, logger="backend.app.api.routes.model_geometry"):
+            resp = await async_client.put("/api/v1/model-geometry/H2S", json={"z_reference_validated": True})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["z_reference_validated"] is True
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("model-geometry H2S" in m and "z_reference_validated" in m for m in warnings), warnings
+
+    async def test_the_two_ladder_gates_are_independent(self, async_client: AsyncClient):
+        # A proven XY envelope is not a witnessed Z stop: conflating them would unlock
+        # motion nobody has watched.
+        resp = await async_client.put("/api/v1/model-geometry/H2C", json={"validated": True})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["validated"] is True
+        assert resp.json()["z_reference_validated"] is False
+
+    async def test_put_hold_lift_round_trips(self, async_client: AsyncClient):
+        resp = await async_client.put("/api/v1/model-geometry/H2S", json={"hold_lift_mm": 25.0})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["hold_lift_mm"] == 25.0
+
+    @pytest.mark.parametrize("value", [11.9, 60.1, 0])
+    async def test_hold_lift_is_bounded_at_both_ends(self, async_client: AsyncClient, value):
+        # Floored at the vendor's own 12 mm (the stock start block's G380 S2 Z-12),
+        # because a smaller lift cannot be shown to clear the operator's plate-release
+        # aid; capped at 60 so a typo cannot drive the bed most of the way up with a
+        # part still on the plate.
+        resp = await async_client.put("/api/v1/model-geometry/H2S", json={"hold_lift_mm": value})
         assert resp.status_code == 422
 
 

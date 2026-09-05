@@ -15,7 +15,7 @@ the generator/validator consume.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, String, Text, false, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.core.database import Base
@@ -56,6 +56,35 @@ class PrinterModelGeometry(Base):
     # dry run + thermal cycle for this model. Production dispatch requires True;
     # the preview/dry-run ladder tools allow False (with a warning).
     validated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # SECOND, independent hardware-ladder gate (2026-09-04): may the eject block open
+    # with the contact-free Z RE-REFERENCE prologue? False for every seeded model, so
+    # a deploy changes no eject motion anywhere and each model keeps today's recipe
+    # until its own ladder flips this through PUT /model-geometry (red line 2).
+    #
+    # Separate from ``validated`` on purpose: that flag says "the XY envelope is
+    # proven", this one says "the guarded Z drive to the bottom stop was witnessed on
+    # this machine, WITH the operator's plate-release aid installed". A model can have
+    # a proven envelope and an unproven Z stop; conflating them would unlock motion no
+    # one has watched.
+    #
+    # ``server_default`` is REQUIRED here, unlike on ``validated`` above: the registry's
+    # idempotent seed in ``run_migrations`` is an ``INSERT ... SELECT`` that names its
+    # columns explicitly, and it names ``validated`` but not this one. On a fresh DB —
+    # which ``create_all`` builds from THIS declaration, not from the ALTER TABLE that
+    # carries the DEFAULT for existing installs — a NOT NULL column the seed omits and
+    # the ORM defaults only in Python fails the insert outright. ``false()`` renders per
+    # dialect (SQLite ``0`` / Postgres ``false``), matching the migration's own ``_false``.
+    z_reference_validated: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+
+    # How far (mm) the bed rises off its bottom stop while the printer is HELD after a
+    # confirmed plate-check trip. A clearance measured from the PHYSICAL stop, not from
+    # the firmware's frame, so it stays true whatever the frame says. The distance that
+    # clears the operator's plate-release aid is a hardware fact the code cannot know
+    # (red line 3), hence a registry column; 12.0 is the vendor's own value from the
+    # stock start block's ``G380 S2 Z-12`` and is the seeded default for every model.
+    # ``server_default`` for the same reason as the column above — the seed omits it.
+    hold_lift_mm: Mapped[float] = mapped_column(Float, default=12.0, server_default=text("12.0"), nullable=False)
 
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 

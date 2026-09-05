@@ -29,8 +29,9 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.models.printer_incident import KIND_PLATE_VISION
 from backend.app.models.sku import SkuFile
-from backend.app.services import spool_selection
+from backend.app.services import printer_incidents, spool_selection
 from backend.app.services.capability_gate import (
     evaluate_capability,
     extract_file_capabilities,
@@ -39,7 +40,6 @@ from backend.app.services.capability_gate import (
 )
 from backend.app.services.dispatch_target import DispatchTarget, TargetKind, target_of
 from backend.app.services.eject.geometry import list_geometries
-from backend.app.services.farm_correlation import WAITING_REASON_PLATE_VISION
 from backend.app.services.farm_policy import (
     _sku_code,
     build_first_article_plan,
@@ -50,7 +50,7 @@ from backend.app.services.farm_staging import release_filament_staged
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.queue_builder import create_queue_items
+from backend.app.services.queue_builder import create_queue_items, requeue_fields
 from backend.app.services.queue_transitions import (
     cancel_pending_items,
     delete_items_unless_printing,
@@ -330,8 +330,7 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
 # Farm waiting-reason machine codes surfaced as per-printer flags. This is the
 # ONE place the vocabulary is mapped — both the run-detail printer states and the
 # fleet-scoped printer contexts derive from ``_derive_printer_unit_context`` so no
-# parallel mapping (and no new reason codes) can drift in. The vision token is
-# imported from its single origin in farm_correlation (no local duplicate).
+# parallel mapping (and no new reason codes) can drift in.
 _WAIT_STALLED = "printer_offline_stalled"
 
 
@@ -409,17 +408,26 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
     Everything here is DERIVED per 3NF — DB flags (quarantine) plus the live
     ``printer_manager`` flags the scheduler actually gates on (plate-clear gate,
     model mismatch, connectivity; model_mismatch has no DB column at all) plus
-    the representative unit's waiting_reason machine codes (offline stall,
-    printer-vision hold) resolved by the shared ``_derive_printer_unit_context``.
+    the representative unit's waiting_reason machine codes (offline stall) resolved
+    by the shared ``_derive_printer_unit_context``.
     Returns ``(states, any_blocked)``. Mirrors ``farm_policy._printer_unavailable``
     for the never-connected case: a printer with no live status yet is *unknown*,
     not offline, so tests/startup don't spuriously report every printer blocked.
+
+    ``vision_hold`` is the one flag that does NOT come from a unit token, and since
+    2026-09-04 it cannot: a plate-check trip now STOPS the print, so the tripped unit
+    becomes ``cancelled`` and its ``waiting_reason`` is cleared at the terminal, while
+    the hold itself is printer-scoped and outlives the requeue. It is read from the
+    incident store's projection (``printer_incidents.snapshot`` — pure, DB-free, the
+    same source the printer card's chip renders), which is the row that actually holds
+    the printer.
     """
     states: list[dict] = []
     any_blocked = False
     for p in printer_rows:
         connected = printer_manager.is_connected(p.id)
         waiting_reason = _derive_printer_unit_context(p.id, items)["waiting_reason"]
+        incident = printer_incidents.snapshot(p.id)
         state = {
             "printer_id": p.id,
             "name": p.name,
@@ -429,7 +437,7 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
             "model_mismatch": printer_manager.is_model_mismatch(p.id),
             "model_mismatch_reason": printer_manager.model_mismatch_reason(p.id),
             "stalled": waiting_reason == _WAIT_STALLED,
-            "vision_hold": waiting_reason == WAITING_REASON_PLATE_VISION,
+            "vision_hold": incident is not None and incident.get("kind") == KIND_PLATE_VISION,
         }
         disconnected = printer_manager.get_status(p.id) is not None and not connected
         if (
@@ -1077,25 +1085,25 @@ async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:
     template = next((it for it in primaries if not it.first_article), None) or (primaries[0] if primaries else None)
     if template is None:
         return 0
-    fields = {
-        "library_file_id": template.library_file_id,
-        "archive_id": template.archive_id,
-        "plate_id": template.plate_id,
-        "eject_profile_id": template.eject_profile_id,
-        "print_time_seconds": template.print_time_seconds,
-        "required_filament_types": template.required_filament_types,
-        "target_location": template.target_location,
-        "created_by_id": template.created_by_id,
-        "batch_id": run.id,
-        "status": "pending",
-        "first_article": False,
-    }
-
+    # The replacement plate is the SAME plate, so it carries the same settings —
+    # through ``queue_builder.requeue_fields``, the one allowlist shared with
+    # ``farm_policy.create_retry_if_absent``. This template used to name 8 columns by
+    # hand and reverted the rest to model defaults, so a topped-up run printed with
+    # different calibrations and filament overrides from the plates it was replacing.
+    # ``first_article`` is forced False after the spread: a replacement is never the
+    # run's first article, whatever the template happened to be.
+    #
     # Same target as the template row — spread LAST so no stale target column survives.
     # ``target.printer_id`` is the position scope: None (the shared pool scope) for a
     # pool template, the pin for a genuinely pinned one — the same scope rule as before.
     target = target_of(template)
-    fields = {**fields, **target.fields()}
+    fields = {
+        **requeue_fields(template),
+        "batch_id": run.id,
+        "status": "pending",
+        "first_article": False,
+        **target.fields(),
+    }
     await create_queue_items(db, count=deficit, printer_id=target.printer_id, fields=fields)
     await db.commit()
     broadcast_production_run_changed(run.id)

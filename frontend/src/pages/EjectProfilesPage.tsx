@@ -1387,10 +1387,14 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
   const [zTravel, setZTravel] = useState<string>(
     geometry.z_travel_mm != null ? String(geometry.z_travel_mm) : '',
   );
+  const [holdLift, setHoldLift] = useState<string>(String(geometry.hold_lift_mm));
   const [notes, setNotes] = useState<string>(geometry.notes ?? '');
   const [validated, setValidated] = useState<boolean>(geometry.validated);
-  // Non-null while a validated-flip confirmation is pending; carries the exact
-  // change set so the confirm action dispatches precisely what was reviewed.
+  const [zReferenceValidated, setZReferenceValidated] = useState<boolean>(
+    geometry.z_reference_validated,
+  );
+  // Non-null while a ladder-gate confirmation is pending; carries the exact change
+  // set so the confirm action dispatches precisely what was reviewed.
   const [pendingChanges, setPendingChanges] = useState<ModelGeometryUpdate | null>(null);
 
   const buildChanges = (): ModelGeometryUpdate => {
@@ -1406,10 +1410,18 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
     const zRaw = zTravel.trim();
     const zNext = zRaw === '' ? null : Number.isFinite(Number(zRaw)) ? Number(zRaw) : geometry.z_travel_mm;
     if (zNext !== geometry.z_travel_mm) changes.z_travel_mm = zNext;
+    // hold_lift_mm: non-nullable — an unparseable field keeps the stored value.
+    const liftNext = Number(holdLift.trim());
+    if (holdLift.trim() !== '' && Number.isFinite(liftNext) && liftNext !== geometry.hold_lift_mm) {
+      changes.hold_lift_mm = liftNext;
+    }
     // notes: empty ⇒ null.
     const notesNext = notes.trim() === '' ? null : notes;
     if (notesNext !== (geometry.notes ?? null)) changes.notes = notesNext;
     if (validated !== geometry.validated) changes.validated = validated;
+    if (zReferenceValidated !== geometry.z_reference_validated) {
+      changes.z_reference_validated = zReferenceValidated;
+    }
     return changes;
   };
 
@@ -1419,12 +1431,19 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
       onClose(); // nothing changed — no PUT needed
       return;
     }
-    if (changes.validated !== undefined) {
-      setPendingChanges(changes); // validation flip requires confirmation
+    // Either ladder gate requires confirmation: both unlock motion that only a
+    // witnessed hardware ladder may authorise.
+    if (changes.validated !== undefined || changes.z_reference_validated !== undefined) {
+      setPendingChanges(changes);
     } else {
       onSave(changes);
     }
   };
+
+  // Which gate the confirm dialog is about. `validated` takes precedence when both
+  // moved in one edit — it is the broader gate, and its copy names the whole ladder.
+  const confirmingZReference =
+    pendingChanges?.validated === undefined && pendingChanges?.z_reference_validated !== undefined;
 
   return (
     <>
@@ -1483,6 +1502,29 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
                   {t('ejectProfiles.geometryManager.fields.zTravelHelp')}
                 </p>
               </div>
+
+              {/* Bed lift while held — a clearance measured from the PHYSICAL bottom
+                  stop, not from the firmware's frame. Bounded 12..60 server-side. */}
+              <div>
+                <label htmlFor="geo-hold-lift" className="block text-sm text-bambu-gray mb-1">
+                  {t('ejectProfiles.geometryManager.fields.holdLift')}
+                </label>
+                <input
+                  id="geo-hold-lift"
+                  type="number"
+                  inputMode="decimal"
+                  step={1}
+                  min={12}
+                  max={60}
+                  value={holdLift}
+                  onChange={(e) => setHoldLift(e.target.value)}
+                  className={inputClass}
+                  aria-describedby="geo-hold-lift-help"
+                />
+                <p id="geo-hold-lift-help" className="text-xs text-bambu-gray mt-1">
+                  {t('ejectProfiles.geometryManager.fields.holdLiftHelp')}
+                </p>
+              </div>
             </div>
 
             {/* Notes */}
@@ -1508,6 +1550,18 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
                 checked={validated}
                 onChange={setValidated}
                 aria-label={t('ejectProfiles.geometryManager.fields.validated')}
+              />
+            </div>
+
+            {/* Second, independent ladder gate: the contact-free Z re-reference. */}
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-sm text-white">
+                {t('ejectProfiles.geometryManager.fields.zReferenceValidated')}
+              </span>
+              <Toggle
+                checked={zReferenceValidated}
+                onChange={setZReferenceValidated}
+                aria-label={t('ejectProfiles.geometryManager.fields.zReferenceValidated')}
               />
             </div>
 
@@ -1537,18 +1591,26 @@ function GeometryEditDialog({ geometry, saving, onSave, onClose }: GeometryEditD
       {pendingChanges && (
         <ConfirmModal
           title={t(
-            validated
-              ? 'ejectProfiles.geometryManager.confirmValidateTitle'
-              : 'ejectProfiles.geometryManager.confirmUnvalidateTitle',
+            confirmingZReference
+              ? zReferenceValidated
+                ? 'ejectProfiles.geometryManager.confirmZReferenceTitle'
+                : 'ejectProfiles.geometryManager.confirmUnZReferenceTitle'
+              : validated
+                ? 'ejectProfiles.geometryManager.confirmValidateTitle'
+                : 'ejectProfiles.geometryManager.confirmUnvalidateTitle',
           )}
           message={t(
-            validated
-              ? 'ejectProfiles.geometryManager.confirmValidateBody'
-              : 'ejectProfiles.geometryManager.confirmUnvalidateBody',
+            confirmingZReference
+              ? zReferenceValidated
+                ? 'ejectProfiles.geometryManager.confirmZReferenceBody'
+                : 'ejectProfiles.geometryManager.confirmUnZReferenceBody'
+              : validated
+                ? 'ejectProfiles.geometryManager.confirmValidateBody'
+                : 'ejectProfiles.geometryManager.confirmUnvalidateBody',
             { model: geometry.model_key },
           )}
           cancelText={t('common.cancel')}
-          variant={validated ? 'default' : 'danger'}
+          variant={(confirmingZReference ? zReferenceValidated : validated) ? 'default' : 'danger'}
           isLoading={saving}
           overlayZIndex="z-[110]"
           onConfirm={() => onSave(pendingChanges)}

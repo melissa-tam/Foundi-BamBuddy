@@ -4060,9 +4060,12 @@ function PrinterCard({
                       : 'bg-yellow-500/20 text-yellow-400'
                   }`}
                   title={
+                    // The pill names the hold; the tooltip says what it asks for
+                    // (one label per control, the consequence in the title —
+                    // react-best-practices §9), slot-qualified when the hold names one.
                     status.open_incident.slot_desc
-                      ? `${t(`printers.incident.${status.open_incident.kind}`)} — ${status.open_incident.slot_desc}`
-                      : t(`printers.incident.${status.open_incident.kind}`)
+                      ? `${t(`printers.incidentAction.${status.open_incident.kind}`)} — ${status.open_incident.slot_desc}`
+                      : t(`printers.incidentAction.${status.open_incident.kind}`)
                   }
                 >
                   <AlertTriangle className="w-3 h-3" />

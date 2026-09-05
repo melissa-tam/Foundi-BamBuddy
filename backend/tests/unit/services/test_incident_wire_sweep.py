@@ -148,7 +148,7 @@ class TestWireClearSweep:
             printer_id=printer.id,
             status="printing",
             position=1,
-            waiting_reason=spool_recovery.WAITING_REASON_PHYSICAL,
+            waiting_reason=printer_incidents.WAITING_REASON_PHYSICAL,
         )
         db_session.add(item)
         await db_session.commit()

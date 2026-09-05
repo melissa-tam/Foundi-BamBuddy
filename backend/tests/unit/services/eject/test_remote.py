@@ -1782,3 +1782,284 @@ class TestRuntimeWatchdogEpilogue:
         detail = env.notify.await_args.kwargs["source_detail"]
         assert "sweep COMPLETED" in detail and "under the heatbed" not in detail
         assert 90073 not in remote._runtime_watchdogs
+
+
+class TestZReferenceEvidence:
+    """The eject lane's ONE origin for "is this printer's Z frame still real?".
+
+    Reads the durable ``z_reference_lost`` hold through the incident store's process
+    cache (the same projection the printer card's chip renders), so the answer is
+    identical at the automatic release boundary and in the operator's dialog."""
+
+    @staticmethod
+    def _snapshot(payload):
+        from backend.app.services import printer_incidents
+
+        return patch.object(printer_incidents, "snapshot", MagicMock(return_value=payload))
+
+    async def test_an_open_z_reference_hold_reads_false(self):
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        with self._snapshot({"kind": KIND_Z_REFERENCE_LOST, "status": "escalated"}):
+            assert remote.z_reference_evidence(7) is False
+
+    async def test_no_incident_reads_unknown_never_true(self):
+        # None, not True: the farm has no POSITIVE evidence that Z is referenced, and
+        # inventing one would make the gate assert something it cannot know.
+        with self._snapshot(None):
+            assert remote.z_reference_evidence(7) is None
+
+    async def test_another_kind_of_hold_does_not_gate_the_eject(self):
+        # 2026-08-29 gotcha (d): the eject lane stays ungated by AMS faults — an eject
+        # is filament-less, and holding the plate behind one deadlocks the printer.
+        from backend.app.models.printer_incident import KIND_RUNOUT
+
+        with self._snapshot({"kind": KIND_RUNOUT, "status": "escalated"}):
+            assert remote.z_reference_evidence(7) is None
+
+    async def test_the_live_evidence_builder_carries_it(self):
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        with (
+            patch.object(printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="IDLE"))),
+            self._snapshot({"kind": KIND_Z_REFERENCE_LOST, "status": "escalated"}),
+        ):
+            ev = remote._live_evidence(7)
+        assert ev.live_state == "IDLE"
+        assert ev.z_reference is False
+
+
+class TestTerminalRefusalVocabulary:
+    """Terminal-ness is a property of the refusal VOCABULARY, set by ``_refusal_error``
+    — never a flag a raiser chooses, which is how two raisers of one token come to
+    disagree about whether waiting could help."""
+
+    def test_the_z_refusal_is_terminal_and_carries_its_token(self):
+        err = remote._refusal_error("z_unreferenced")
+        assert err.terminal is True
+        assert err.code == "z_unreferenced"
+        assert err.status_code == 409
+        assert "Z reference is lost" in str(err)
+        assert "Mark plate cleared" in str(err)
+
+    def test_transient_refusals_are_not_terminal(self):
+        for token in ("job_active", "dispatch_in_flight", "eject_in_flight", "not_occupied"):
+            assert remote._refusal_error(token).terminal is False, token
+
+    def test_every_terminal_refusal_has_operator_copy(self):
+        # The map is what the API hands the dialog; a terminal token with no sentence
+        # would refuse the operator in a vocabulary only the state machine speaks.
+        for token in remote._TERMINAL_REFUSALS:
+            assert token in remote._EJECT_REFUSAL_MESSAGES
+
+    def test_the_escalation_detail_lives_with_the_vocabulary(self):
+        assert remote.terminal_refusal_detail("z_unreferenced") == "z_reference_lost_after_reboot"
+        # An unmapped token pages under its own name rather than another's wording.
+        assert remote.terminal_refusal_detail("some_future_token") == "some_future_token"
+
+    def test_the_default_error_is_not_terminal(self):
+        assert remote.EjectDispatchError("boom").terminal is False
+
+
+class TestRedriveEjectStop:
+    """Re-drive the ONE kill path for a pending whose stop never landed.
+
+    2026-09-04: the watchdog fired while the printer was off the wire, BOTH stop sends
+    returned False, the task exited — and nothing re-sent on reconnect. The pending and
+    its ``runtime_exceeded_at`` stayed registered, so every later eject on that printer
+    refused ``eject_in_flight`` forever."""
+
+    @staticmethod
+    def _stop_patch(*, delivered: bool = True):
+        return patch.object(printer_manager, "stop_print", MagicMock(return_value=delivered))
+
+    @staticmethod
+    def _notify_patch():
+        from backend.app.services.eject import monitor as monitor_mod
+
+        return patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock)
+
+    async def test_stamps_the_verdict_before_the_stop_goes_out(self):
+        pid = 90200
+        _claim(pid, _armed())
+        mark_at_stop: list[object] = []
+
+        def _stop(printer_id: int) -> bool:
+            mark_at_stop.append(plate_occupancy.pending_eject_view(printer_id).runtime_exceeded_at)
+            return True
+
+        with (
+            patch.object(printer_manager, "stop_print", MagicMock(side_effect=_stop)) as stop,
+            self._notify_patch() as notify,
+        ):
+            assert await remote.redrive_eject_stop(pid, stage="power_loss") is True
+        stop.assert_called_once_with(pid)
+        assert mark_at_stop and mark_at_stop[0] is not None
+        notify.assert_awaited_once()
+        assert notify.await_args.kwargs["source_detail"] == "power_loss_eject_interrupted"
+
+    async def test_an_undelivered_stop_is_retried_exactly_once(self):
+        pid = 90201
+        _claim(pid, _armed())
+        sleep = _FakeSleep()
+        with self._stop_patch(delivered=False) as stop, self._notify_patch():
+            assert await remote.redrive_eject_stop(pid, stage="power_loss", sleep=sleep) is True
+        assert stop.call_count == 2
+        assert sleep.delays == [remote._STOP_RETRY_DELAY_S]
+
+    async def test_it_is_idempotent_over_an_already_stamped_pending(self):
+        # The outage shape exactly: the watchdog stamped, the stop could not be
+        # delivered. Re-driving must NOT move the verdict time (first-write-wins) but
+        # MUST redo the delivery — the stop is the part that failed.
+        pid = 90202
+        _claim(pid, _armed())
+        stamped_at = datetime.now(timezone.utc) - timedelta(minutes=40)
+        plate_occupancy.note_eject_runtime_exceeded(pid, stamped_at, "total")
+
+        with self._stop_patch() as stop, self._notify_patch() as notify:
+            assert await remote.redrive_eject_stop(pid, stage="power_loss") is True
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at == stamped_at
+        stop.assert_called_once_with(pid)
+        notify.assert_awaited_once()
+
+    async def test_no_pending_means_nothing_to_stop_and_nothing_to_say(self):
+        pid = 90203
+        _gate(pid)
+        with self._stop_patch() as stop, self._notify_patch() as notify:
+            assert await remote.redrive_eject_stop(pid, stage="power_loss") is False
+        stop.assert_not_called()
+        notify.assert_not_awaited()
+
+    async def test_it_never_resolves_the_eject_itself(self):
+        """``farm_policy.on_terminal`` stays the ONE ``resolve_eject`` caller: the
+        stopped job's own terminal resolves it ``unverified``. A second caller here
+        would decide the plate's fate on a criterion other than the terminal."""
+        pid = 90204
+        _claim(pid, _armed())
+        with self._stop_patch(), self._notify_patch():
+            await remote.redrive_eject_stop(pid, stage="power_loss")
+        assert plate_occupancy.pending_eject_view(pid) is not None
+        assert "resolve_eject(" not in Path(remote.__file__).read_text(encoding="utf-8")
+
+    async def test_the_power_loss_stage_invents_no_runtime_evidence(self):
+        # Every other stage renders spans and deadlines. Here the machine was off the
+        # wire, so any span would describe a job nobody was watching.
+        diagnostic, detail = remote._stop_reason(
+            "power_loss",
+            fired_deadline_s=0.0,
+            phase_elapsed_s=0.0,
+            expected_s=0.0,
+            drop_span_s=None,
+            sweep_span_s=None,
+        )
+        assert diagnostic == "eject interrupted by a power loss; sweep unverified"
+        assert detail == "power_loss_eject_interrupted"
+        assert "budget" not in diagnostic and "deadline" not in diagnostic
+
+
+def _armed_with_reference(pid_item: int = 5, *, reference_s: float = 19.5, **kw) -> remote.PendingEject:
+    """A started pending whose block carries the Z re-reference phase.
+
+    83 s expected → a 103.75 s whole-job deadline; a 19.5 s drive → the 8 s margin floor
+    → its own budget line lands at overhead(25) + 19.5 + 8 = 52.5 s after the start echo,
+    and P5 is no longer expected before overhead + 19.5 + abort margin(20.75) = 65.25 s."""
+    kw.setdefault("expected_runtime_s", 83.0)
+    kw.setdefault("started_at", datetime.now(timezone.utc))
+    kw.setdefault("drop_span_s", 30.0)
+    kw.setdefault("sweep_span_s", 20.0)
+    kw.setdefault("tail_s", 15.0)
+    return remote.PendingEject("production", 1, pid_item, reference_s=reference_s, **kw)
+
+
+class TestRuntimeWatchdogReferencePhase:
+    """The guarded Z re-reference drive's own lane (2026-09-04).
+
+    It MEASURES and WARNs; it never kills — two independent reasons, either sufficient.
+    EVIDENCE: no P2 span has been observed on hardware (the recipe is dormant until a
+    ladder opens it), and at the FIRST beacon a stuck percent cannot be told apart from
+    firmware that never reflects M73. MECHANISM (decisive): a stop there lands inside the
+    prologue's own unguarded window — soft end stops off, frame not yet declared — and
+    the drive moves the bed AWAY from the nozzle, so there is no plate contact to
+    pre-empt and nothing is bought by stopping early."""
+
+    @staticmethod
+    async def _run(pid: int, armed, samples, caplog, *, level=logging.INFO):
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, samples)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(level, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        return env, clock
+
+    async def test_a_block_without_the_phase_opens_where_it_always_did(self, caplog):
+        # reference_s None ⇒ the lane is DISARMED, not armed with a zero-length deadline.
+        env, _clock = await self._run(90080, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog)
+        assert _records(caplog, "Z re-reference") == []
+        assert _records(caplog, "bed-drop phase cleared")
+
+    async def test_the_drive_clearing_advances_to_the_existing_prologue_phase(self, caplog):
+        env, _clock = await self._run(
+            90081, _armed_with_reference(), [(2.0, 0.0), (5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog
+        )
+        cleared = _records(caplog, "Z re-reference cleared")
+        assert len(cleared) == 1
+        assert cleared[0].levelno == logging.INFO
+        assert "budget 20s" in cleared[0].getMessage()  # 19.5 s, rendered %.0f
+        # ...and the phases after it run exactly as they do without the prologue.
+        assert _records(caplog, "bed-drop phase cleared")
+
+    async def test_a_drive_past_its_budget_warns_once_and_never_kills_there(self, caplog):
+        # Percent parked at 0: the drive's budget line (52.5 s) passes and NOTHING may
+        # fire there. The job is stopped later, by the whole-job backstop.
+        env, clock = await self._run(90082, _armed_with_reference(), [(0.0, 0.0)], caplog, level=logging.WARNING)
+        warnings = _records(caplog, "Z re-reference running")
+        assert len(warnings) == 1
+        assert "19s budget" in warnings[0].getMessage() or "20s budget" in warnings[0].getMessage()
+        assert "no phase kill fires here" in warnings[0].getMessage()
+        # The kill that DID happen is the whole-job backstop — never a reference stage.
+        kill = _kill_line(caplog)
+        assert "stage=total" in kill
+        assert clock.now - 1000.0 == pytest.approx(remote.eject_abort_deadline_s(83.0), abs=2.0)
+
+    async def test_dead_beacons_fall_back_exactly_as_they_do_today(self, caplog):
+        # Never a kill at the first beacon: a stuck percent there is indistinguishable
+        # from firmware that does not reflect M73, so the printer degrades to the
+        # deadline-only watchdog it would have had before this recipe existed.
+        env, _clock = await self._run(90083, _armed_with_reference(), [(0.0, 0.0)], caplog, level=logging.WARNING)
+        fallback = _records(caplog, "not reflected in mc_percent")
+        assert len(fallback) == 1
+        assert "Z re-reference budget" in fallback[0].getMessage()
+        assert "stage=total" in _kill_line(caplog)
+
+    async def test_the_p5_deadline_is_pushed_out_by_the_drive(self):
+        # Without this, enabling the prologue would look like beacon-death on EVERY job:
+        # the drive genuinely delays P5, so its budget must move the beacon-death line.
+        drive_s = 19.5
+        without = remote.EJECT_RUNTIME_OVERHEAD_S + remote._abort_margin_s(83.0)
+        with_drive = remote.EJECT_RUNTIME_OVERHEAD_S + drive_s + remote._abort_margin_s(83.0)
+        assert with_drive == pytest.approx(without + drive_s)
+
+    async def test_a_stale_sample_never_advances_the_phase(self, caplog):
+        # FRESH-only, like every other lane: a percent published before this eject
+        # started is not evidence that its drive completed.
+        env, _clock = await self._run(90084, _armed_with_reference(), [(2.0, None)], caplog, level=logging.WARNING)
+        assert _records(caplog, "Z re-reference cleared") == []
+
+    async def test_going_blind_asks_for_evidence_once_rather_than_judging_on_silence(self, caplog):
+        env, _clock = await self._run(90085, _armed_with_reference(), [(0.0, None)], caplog, level=logging.WARNING)
+        env.pushall.assert_called_once_with(90085, remote._EVIDENCE_REASON)
+
+    async def test_the_healthy_sequence_still_reaches_the_epilogue(self, caplog):
+        # LIVENESS: the added phase must not strand the poller short of the lanes that
+        # come after it (the 2026-08-08 lesson — a cured storm and a starved deadlock
+        # look identical on absence metrics).
+        env, _clock = await self._run(
+            90086, _armed_with_reference(), [(2.0, 0.0), (5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog
+        )
+        assert _records(caplog, "Z re-reference cleared")
+        assert _records(caplog, "bed-drop phase cleared")
+        assert _records(caplog, "sweep phase cleared")
+        assert "stage=epilogue" in _kill_line(caplog)

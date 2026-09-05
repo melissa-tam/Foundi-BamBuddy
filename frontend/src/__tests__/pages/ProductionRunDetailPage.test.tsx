@@ -272,6 +272,15 @@ describe('ProductionRunDetailPage', () => {
                 waiting_reason: 'plate_not_empty_printer_detected',
                 completed_at: null,
               }),
+              // 2026-09-04 wave: the farm's OWN stop of a plate-check trip.
+              // No human touched this printer, so it must not be attributed to
+              // an operator — the lineage is what tells a reader whether a
+              // plate was abandoned deliberately or re-checked by the farm.
+              unit({
+                id: 105,
+                status: 'cancelled',
+                stop_source: 'farm_vision_abort',
+              }),
             ],
           }),
         ),
@@ -284,10 +293,17 @@ describe('ProductionRunDetailPage', () => {
 
     const table = screen.getByRole('table');
     expect(within(table).getByText('Stopped by operator')).toBeInTheDocument();
+    // The farm's own plate-check stop carries its own attribution, and the
+    // operator badge stays a one-off (unit 103) rather than covering both.
+    expect(within(table).getByText('Stopped by the farm: plate check')).toBeInTheDocument();
+    expect(within(table).getAllByText('Stopped by operator')).toHaveLength(1);
     expect(within(table).getByText('Retry #1 of unit 101')).toBeInTheDocument();
     expect(within(table).getByText('HMS 0300_8017')).toBeInTheDocument();
+    // Copy changed in the 2026-09-04 wave: the farm now STOPS the print on the
+    // second trip, so the old "resume on the printer" instruction is false —
+    // the plate gate is human-clear-only.
     expect(
-      within(table).getByText(/printer vision: plate not empty/i),
+      within(table).getByText(/plate check tripped twice/i),
     ).toBeInTheDocument();
     // Unit ids render for cross-referencing.
     expect(within(table).getByText('#101')).toBeInTheDocument();

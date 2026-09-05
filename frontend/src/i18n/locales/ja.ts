@@ -172,6 +172,7 @@ export default {
       printerCol: 'プリンター',
       timeCol: '完了 / 開始',
       stoppedByOperator: 'オペレーターによる停止',
+      stoppedByFarmVision: 'ファームによる停止: プレート検査',
       firstArticleBadge: '初品',
       stagedBadge: '保留',
       lowSpoolBadge: 'フィラメント不足',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: '物理的な故障 — 手動対応が必要です。自動交換は行いません',
         printerOfflineStalled: '印刷中にプリンターがオフラインになりました — 再接続まで結果は不明です',
         printPausedStalled: 'プリンターで一時停止中 — 対応が必要です（自動復旧は適用外）',
-        visionHold: 'プリンターの検知: プレートが空ではありません — ベッドを片付けてからプリンター側で再開してください',
+        visionHold: 'プレート検査が2回作動 — ベッドを片付けてから「プレートをクリア済みにする」',
+        powerLossHold: 'プリンターの停電復帰確認で待機中 — プリンター側で再開してください',
+        zReferenceLost: '部品がプレートに載ったまま再起動 — 手で取り除いてください',
         previousPrintFailed: '保留中: 前の印刷が失敗しました',
         filamentShort: 'フィラメント不足',
         externalSpoolRunout: '外部スプールが切れました — AMS スロットではなく外部ホルダーを補充してください',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: '{{model}} を検証済みにすると、無人の量産取り出しが有効になります。オペレーター立ち会いのハードウェアラダー（空ベッドのドライラン → 監視付きの印刷→冷却→取り出しサイクル → 短いループ）の後にのみ確定してください。',
       confirmUnvalidateTitle: '検証を解除しますか？',
       confirmUnvalidateBody: '{{model}} の検証を解除すると、再検証されるまでこのモデルの量産自動取り出しはフェイルクローズします。',
+      confirmZReferenceTitle: 'Z 再基準化を有効にしますか？',
+      confirmZReferenceBody: '{{model}} で Z 再基準化を有効にすると、部品がある状態の取り出しごとに、ベッドを下端ストッパーまで下げる保護付き動作が先頭に追加されます。剥離補助具を取り付けた状態で、オペレーター立ち会いのハードウェアラダーを終えてから確認してください。',
+      confirmUnZReferenceTitle: 'Z 再基準化を無効にしますか？',
+      confirmUnZReferenceBody: 'Z 再基準化を無効にすると、{{model}} の取り出しは保持された Z 原点に戻ります。この原点は電源が切れると失われます。',
       columns: {
         model: 'モデル',
         bed: 'ベッド（幅×奥行 mm）',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: '最大部品高さ（mm）',
         zTravel: 'Z 移動量（mm）',
         zTravelHelp: '空にするとクリアされます。その場合、このモデルではベッド降下アシストはフェイルクローズします。',
+        zReferenceValidated: 'Z 再基準化を検証済み',
+        holdLift: '保留中のベッド上昇量 (mm)',
+        holdLiftHelp: 'ベッドチェックの確定後にプリンターが保留されている間、ベッドが下端ストッパーからどれだけ上昇するか。',
         notes: 'メモ',
         validated: 'ハードウェア検証済み',
       },
@@ -1203,7 +1213,21 @@ export default {
       jam: 'AMS詰まり',
       runout: 'フィラメント切れ',
       physical: 'フィラメント故障',
+      power_loss: '停電',
+      plate_vision: 'プレート検査',
+      z_reference_lost: 'Z基準喪失',
       recovering: '復旧中',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'AMSのフィラメント経路を解消してから印刷を再開してください',
+      runout: '要求されたスロットに補充してください。印刷は自動で再開します',
+      physical: 'プリンター側でフィラメント経路を解消してから印刷を再開してください',
+      power_loss: 'プリンター側で再開してください',
+      plate_vision: 'ベッドを片付けてから「プレートをクリア済みにする」',
+      z_reference_lost: '部品がプレートに載ったまま再起動 — 手で取り除いてから「プレートをクリア済みにする」',
     },
     // Fans
     fans: {

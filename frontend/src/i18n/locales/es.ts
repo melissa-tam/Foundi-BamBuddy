@@ -172,6 +172,7 @@ export default {
       printerCol: 'Impresora',
       timeCol: 'Terminada / iniciada',
       stoppedByOperator: 'Detenida por el operador',
+      stoppedByFarmVision: 'Detenida por la granja: comprobación de la cama',
       firstArticleBadge: 'Primera pieza',
       stagedBadge: 'Retenida',
       lowSpoolBadge: 'Filamento insuficiente',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: 'Fallo físico: se requiere intervención, sin cambio automático',
         printerOfflineStalled: 'Impresora sin conexión a mitad de impresión — resultado desconocido hasta que se reconecte',
         printPausedStalled: 'En pausa en la impresora — requiere atención (sin recuperación automática)',
-        visionHold: 'Visión de la impresora: cama no vacía — despeje la cama y reanude en la impresora',
+        visionHold: 'La comprobación de la cama se activó dos veces — despeje la cama y luego «Marcar cama como despejada»',
+        powerLossHold: 'Retenida en el aviso de corte de energía de la impresora — reanude en la impresora',
+        zReferenceLost: 'Reiniciada con una pieza en la cama — retírela a mano',
         previousPrintFailed: 'Retenida: la impresión anterior falló',
         filamentShort: 'Filamento insuficiente',
         externalSpoolRunout: 'La bobina externa se agotó — repón el soporte externo, no una ranura del AMS',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: 'Marcar {{model}} como validado desbloquea la expulsión de producción sin supervisión. Confirma solo tras la escalera de hardware presenciada por el operario: prueba en vacío con cama vacía → ciclo supervisado de impresión→enfriamiento→expulsión → bucle corto.',
       confirmUnvalidateTitle: '¿Quitar la validación?',
       confirmUnvalidateBody: 'Quitar la validación de {{model}} hace que la expulsión automática de producción falle de forma segura en este modelo hasta que se vuelva a validar.',
+      confirmZReferenceTitle: '¿Activar la re-referencia Z?',
+      confirmZReferenceBody: 'Activar la re-referencia Z en {{model}} añade un descenso vigilado de la cama hasta el tope inferior al inicio de cada expulsión con pieza. Confirme solo tras la escalera de hardware presenciada por el operador, con el accesorio de despegue instalado.',
+      confirmUnZReferenceTitle: '¿Desactivar la re-referencia Z?',
+      confirmUnZReferenceBody: 'Sin la re-referencia Z, {{model}} vuelve a expulsar usando el origen Z retenido, que un corte de corriente destruye.',
       columns: {
         model: 'Modelo',
         bed: 'Cama (An×Al mm)',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: 'Altura máx. de pieza (mm)',
         zTravel: 'Recorrido Z (mm)',
         zTravelHelp: 'Déjalo vacío para borrarlo. La asistencia de bajada de cama fallará entonces de forma segura en este modelo.',
+        zReferenceValidated: 'Re-referencia Z validada',
+        holdLift: 'Elevación de la cama en espera (mm)',
+        holdLiftHelp: 'Cuánto sube la cama desde su tope inferior mientras la impresora está retenida tras una comprobación de cama confirmada.',
         notes: 'Notas',
         validated: 'Validado por hardware',
       },
@@ -1204,7 +1214,21 @@ export default {
       jam: 'Atasco del AMS',
       runout: 'Sin filamento',
       physical: 'Fallo de filamento',
+      power_loss: 'Corte de energía',
+      plate_vision: 'Comprobación de la cama',
+      z_reference_lost: 'Referencia Z perdida',
       recovering: 'Recuperando',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'Despeje la vía de filamento del AMS y reanude la impresión',
+      runout: 'Recargue la ranura solicitada; la impresión se reanuda sola',
+      physical: 'Despeje la vía del filamento en la impresora y reanude la impresión',
+      power_loss: 'Reanude en la impresora',
+      plate_vision: 'Despeje la cama y luego «Marcar cama como despejada»',
+      z_reference_lost: 'Reiniciada con una pieza en la cama — retírela a mano y luego «Marcar cama como despejada»',
     },
     // Fans
     fans: {

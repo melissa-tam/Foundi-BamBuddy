@@ -172,6 +172,7 @@ export default {
       printerCol: 'Drucker',
       timeCol: 'Fertig / gestartet',
       stoppedByOperator: 'Vom Bediener gestoppt',
+      stoppedByFarmVision: 'Von der Farm gestoppt: Plattenprüfung',
       firstArticleBadge: 'Erstmuster',
       stagedBadge: 'Zurückgestellt',
       lowSpoolBadge: 'Filament knapp',
@@ -189,7 +190,9 @@ export default {
         spoolPhysicalFault: 'Physischer Fehler — Eingriff nötig, kein automatischer Wechsel',
         printerOfflineStalled: 'Drucker mitten im Druck offline — Ergebnis unbekannt, bis er sich wieder verbindet',
         printPausedStalled: 'Am Drucker pausiert — Eingriff nötig (keine automatische Behebung)',
-        visionHold: 'Druckererkennung: Platte nicht leer — Bett freiräumen, dann am Drucker fortsetzen',
+        visionHold: 'Plattenprüfung zweimal ausgelöst — Bett freiräumen, dann „Platte als freigegeben markieren“',
+        powerLossHold: 'Wartet an der Stromausfall-Abfrage des Druckers — am Drucker fortsetzen',
+        zReferenceLost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen',
         previousPrintFailed: 'Angehalten: vorheriger Druck fehlgeschlagen',
         filamentShort: 'Filament knapp',
         externalSpoolRunout: 'Externe Spule ist leer — den externen Halter nachfüllen, nicht ein AMS-Fach',
@@ -421,6 +424,10 @@ export default {
       confirmValidateBody: 'Wenn {{model}} als validiert markiert wird, wird der unbeaufsichtigte Produktions-Auswurf freigeschaltet. Bestätigen Sie erst nach der vom Bediener bezeugten Hardware-Leiter: Trockenlauf auf leerem Bett → beaufsichtigter Zyklus Druck→Abkühlen→Auswurf → kurze Schleife.',
       confirmUnvalidateTitle: 'Validierung aufheben?',
       confirmUnvalidateBody: 'Wenn die Validierung von {{model}} aufgehoben wird, fällt der Produktions-Auto-Auswurf bei diesem Modell sicher aus, bis es erneut validiert wird.',
+      confirmZReferenceTitle: 'Z-Neureferenzierung aktivieren?',
+      confirmZReferenceBody: 'Die Z-Neureferenzierung für {{model}} fügt am Anfang jedes Auswurfs mit Teil auf dem Bett eine überwachte Bettfahrt zum unteren Endanschlag hinzu. Nur nach der vom Bediener beobachteten Hardware-Leiter bestätigen, mit installierter Löse-Hilfe.',
+      confirmUnZReferenceTitle: 'Z-Neureferenzierung deaktivieren?',
+      confirmUnZReferenceBody: 'Ohne Z-Neureferenzierung nutzt {{model}} beim Auswurf wieder den gespeicherten Z-Nullpunkt, den ein Stromausfall zerstört.',
       columns: {
         model: 'Modell',
         bed: 'Bett (B×H mm)',
@@ -446,6 +453,9 @@ export default {
         maxPartHeight: 'Max. Teilehöhe (mm)',
         zTravel: 'Z-Verfahrweg (mm)',
         zTravelHelp: 'Leer lassen zum Löschen. Die Bett-Absenk-Hilfe fällt dann bei diesem Modell sicher aus.',
+        zReferenceValidated: 'Z-Neureferenzierung validiert',
+        holdLift: 'Betthub im Haltezustand (mm)',
+        holdLiftHelp: 'Wie weit sich das Bett vom unteren Endanschlag hebt, während der Drucker nach einer bestätigten Bettprüfung angehalten ist.',
         notes: 'Notizen',
         validated: 'Hardware-validiert',
       },
@@ -1204,7 +1214,21 @@ export default {
       jam: 'AMS-Stau',
       runout: 'Filament leer',
       physical: 'Filamentfehler',
+      power_loss: 'Stromausfall',
+      plate_vision: 'Plattenprüfung',
+      z_reference_lost: 'Z-Referenz verloren',
       recovering: 'Wiederherstellung',
+    },
+    // The chip's tooltip: the instruction each hold asks for. The pill itself
+    // carries only the noun (one label per control; the consequence rides the
+    // title — react-best-practices §9).
+    incidentAction: {
+      jam: 'AMS-Filamentweg freimachen, dann Druck fortsetzen',
+      runout: 'Angeforderten Slot nachfüllen; der Druck läuft von selbst weiter',
+      physical: 'Filamentweg am Drucker freimachen, dann Druck fortsetzen',
+      power_loss: 'Am Drucker fortsetzen',
+      plate_vision: 'Bett freiräumen, dann „Platte als freigegeben markieren“',
+      z_reference_lost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen, dann „Platte als freigegeben markieren“',
     },
     // Fans
     fans: {

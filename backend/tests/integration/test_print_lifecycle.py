@@ -571,6 +571,75 @@ class TestPlateClearGate:
         resolver_spy.assert_awaited()
 
 
+class TestFarmVisionAbortPrecedence:
+    """W9: the farm's own abort mark is stamped on the ``printing`` row BEFORE the stop
+    goes out, and the terminal HONOURS it.
+
+    Two things have to hold at once, and both used to fail: the recorded status must
+    become ``cancelled`` (a farm abort is a stop, not a failure — a FIRST ARTICLE would
+    otherwise keep ``failed`` and route into ``_on_item_failed`` plus a quarantine count
+    for a plate the farm itself refused), and the mark must survive the terminal's own
+    ``stop_source`` write."""
+
+    @staticmethod
+    async def _run_terminal(test_engine, *, mark, first_article):
+        from contextlib import ExitStack
+
+        from backend.app.models.print_queue import PrintQueueItem
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            printer_id, item_id = await TestPlateClearGate._seed_printing_item(
+                mocks.maker, serial="VIS-1", dispatch_subtask_id="SUB-V", first_article=first_article
+            )
+            if mark is not None:
+                async with mocks.maker() as s:
+                    item = await s.get(PrintQueueItem, item_id)
+                    item.stop_source = mark
+                    await s.commit()
+
+            from backend.app.main import on_print_complete
+
+            await on_print_complete(
+                printer_id,
+                {
+                    "status": "failed",
+                    "filename": "/data/Metadata/test.gcode",
+                    "subtask_name": "Test",
+                    "subtask_id": "SUB-V",
+                    "timelapse_was_active": False,
+                    # The firmware's cancel echo: an MQTT print.stop plausibly produces
+                    # one, so the mark must outrank it.
+                    "user_cancel_observed": True,
+                    "peaks_reliable": True,
+                    "last_layer_num": 0,
+                    "last_progress": 0,
+                },
+            )
+            await TestPlateClearGate._drain(tasks_before)
+
+            async with mocks.maker() as s:
+                item = await s.get(PrintQueueItem, item_id)
+                return item.status, item.stop_source
+
+    @pytest.mark.asyncio
+    async def test_a_marked_first_article_records_cancelled_and_keeps_the_mark(self, test_engine):
+        status, stop_source = await self._run_terminal(test_engine, mark="farm_vision_abort", first_article=True)
+
+        assert status == "cancelled"
+        assert stop_source == "farm_vision_abort"  # never relabelled operator_screen
+
+    @pytest.mark.asyncio
+    async def test_without_the_mark_a_first_article_failure_is_unchanged(self, test_engine):
+        """The pre-existing contract: a first-article no-deposit stop deliberately keeps
+        ``failed`` so the run still retries its first article."""
+        status, stop_source = await self._run_terminal(test_engine, mark=None, first_article=True)
+
+        assert status == "failed"
+        assert stop_source is None
+
+
 class TestEjectJobCallbacks:
     """C2: a server-dispatched eject sweep (a PendingEject, NO queue item, NO
     archive) must be exempt from the no-deposit status rewrite and the user-facing

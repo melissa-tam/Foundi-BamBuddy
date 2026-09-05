@@ -40,7 +40,24 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
     case 'print_paused_stalled':
       return t('productionRuns.detail.waiting.printPausedStalled');
     case 'plate_not_empty_printer_detected':
+      // The printer's own vision check tripped TWICE in the window: the farm
+      // stopped the print and raised a human-clear plate gate. Copy (not the
+      // key) changed in the 2026-09-04 wave — the print is stopped, not paused,
+      // so "resume on the printer" is no longer a thing an operator can do.
       return t('productionRuns.detail.waiting.visionHold');
+    case 'power_loss_hold':
+      // The printer is sitting at the firmware's OWN power-loss prompt and the
+      // farm's resume was not accepted. The humanized fallback ("Power loss
+      // hold") names the cause but hides the only action that clears it — the
+      // operator resuming on the printer's touchscreen; nothing in this UI can.
+      return t('productionRuns.detail.waiting.powerLossHold');
+    case 'z_reference_lost':
+      // The printer rebooted with a part still on the plate, so its Z datum is
+      // fiction and no eject may run against it. "Z reference lost" would read
+      // as a calibration warning; the operator instruction is the point — take
+      // the part off BY HAND (never via Eject plate, whose absolute Z moves
+      // would run against the destroyed frame — the 002-H2S bed-floor drive).
+      return t('productionRuns.detail.waiting.zReferenceLost');
     case 'previous_print_failed':
       return t('productionRuns.detail.waiting.previousPrintFailed');
     case 'filament_short':

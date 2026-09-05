@@ -80,7 +80,8 @@ export interface RunPrinterState {
 export interface RunUnit {
   id: number;
   status: 'pending' | 'printing' | 'completed' | 'failed' | 'skipped' | 'cancelled';
-  /** 'operator_ui' / 'operator_screen' when deliberately stopped; else null. */
+  /** Who stopped it on purpose: 'operator_ui' / 'operator_screen' (a human) or
+   *  'farm_vision_abort' (the farm, on a plate-check trip — 2026-09-04); else null. */
   stop_source: string | null;
   waiting_reason: string | null;
   /** One-time deferred start (UTC ISO); future = held until then, null = ASAP. */

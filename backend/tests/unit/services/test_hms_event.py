@@ -58,14 +58,14 @@ def _reset_hms_state():
     """The writer's throttle map is process state, like the dedup ledgers around it."""
     notify_dedup._reset_state()
     main_module._hms_event_written_at.clear()
-    main_module._printer_last_connected.clear()
-    main_module._printer_reconciled_since_connect.clear()
+    main_module._printer_offline_edge_at.clear()
+    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
     yield
     notify_dedup._reset_state()
     main_module._hms_event_written_at.clear()
-    main_module._printer_last_connected.clear()
-    main_module._printer_reconciled_since_connect.clear()
+    main_module._printer_offline_edge_at.clear()
+    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
 
 
