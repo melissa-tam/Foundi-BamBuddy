@@ -25,6 +25,7 @@ import pytest
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.schemas.settings import AppSettings
 from backend.app.services.eject import cooldown_prep, generator
 from backend.app.services.eject.geometry import GeometryUnavailable
 
@@ -50,6 +51,8 @@ ITEM_ID = 42
 # at Y262 on the production corpus, well clear of the 285 keep-out line).
 MAX_Z = 50.1
 BBOX = ((10.0, 20.0, 300.0, 262.0), 1)
+# The operator's hold target, read from the schema so this suite cannot drift from it.
+HOLD_PART_TOP_DEFAULT = int(AppSettings.model_fields["farm_cooldown_hold_part_top_mm"].default)
 
 
 def _profile(**overrides) -> EjectProfile:
@@ -140,6 +143,11 @@ class _Env:
         )
         self.max_z: float | None = MAX_Z
         self.bbox = BBOX
+        # The operator's two hold inputs, resolved once by the watch and handed to
+        # ``begin``. The defaults are the schema's: the hold is on, and the target asks
+        # for as much of the clear zone as the part can reach.
+        self.hold_enabled = True
+        self.hold_part_top_mm = HOLD_PART_TOP_DEFAULT
         self.refusal: str | None = None
         self.sessions = 0
         self.sleeps: list[float] = []
@@ -191,6 +199,8 @@ class _Env:
             PRINTER_ID,
             queue_item_id=queue_item_id,
             aux_fan_percent=aux_fan_percent,
+            hold_enabled=self.hold_enabled,
+            hold_part_top_mm=self.hold_part_top_mm,
             settle_s=settle_s,
             sleep=self.sleep,
         )
@@ -226,7 +236,7 @@ class TestPlateHold:
         assert prep.hold == "sent"
         assert prep.hold_z == 2.0  # a 50.1 mm part under 51 mm of clearance
         assert prep.max_z == MAX_Z
-        expected = "\n".join(generator.cooldown_hold_lines(MAX_Z, env.profile, 51.0))
+        expected = "\n".join(generator.cooldown_hold_lines(MAX_Z, env.profile, 51.0, HOLD_PART_TOP_DEFAULT)[0])
         assert env.client.gcode == [expected]
         assert "plate hold sent" in "\n".join(r.getMessage() for r in caplog.records)
 
@@ -320,6 +330,92 @@ class TestPlateHold:
         assert prep.max_z == 60.0  # measured, then refused — the two are distinguishable
         assert "exceeds profile max_part_height_mm" in caplog.text
         assert env.client.gcode == []
+
+
+class TestTheOperatorsHoldSettings:
+    """The switch and the target: two numbers the watch resolves and hands in.
+
+    Nothing here is re-read from the settings store — the prep computes no height and
+    reads no setting, so what these pin is that the operator's inputs travel intact from
+    ``begin`` to the emitted G-code and to the record the estimator is seeded from."""
+
+    async def test_the_switch_off_skips_the_hold_before_any_db_work(self, env, caplog):
+        """An operator who switched the hold off gets a fan-only cooldown, and the
+        refusal costs nothing: it is decided before a session is opened."""
+        env.hold_enabled = False
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin()
+        assert (prep.hold, prep.hold_z, prep.max_z) == ("skipped:disabled", None, None)
+        assert env.sessions == 0
+        assert env.client.gcode == []
+        assert env.client.fans == [(2, 100)]  # the fan is the other actuator, untouched
+        assert "plate hold switched off" in caplog.text
+
+    async def test_the_switch_off_is_info_not_a_warning(self, env, caplog):
+        """A deliberate operator state must not sit in the channel operators triage."""
+        env.hold_enabled = False
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            await env.begin()
+        levels = {r.levelno for r in caplog.records if "plate hold switched off" in r.getMessage()}
+        assert levels == {logging.INFO}
+
+    async def test_the_foreign_refusal_is_asked_first(self, env):
+        """Order matters for the log: a foreign plate has no unit to hold at all, so it
+        reports ``skipped:foreign`` whatever the switch says."""
+        env.hold_enabled = False
+        prep = await env.begin(queue_item_id=None)
+        assert prep.hold == "skipped:foreign"
+
+    @pytest.mark.parametrize(
+        ("target", "expected_z"),
+        [
+            pytest.param(0, 50.1, id="flush-with-the-plane"),
+            pytest.param(-20, 70.1, id="fan-above-the-part"),
+            pytest.param(100, 2.0, id="as-high-as-the-part-allows"),
+        ],
+    )
+    async def test_the_target_reaches_the_emitted_gcode(self, env, target, expected_z):
+        """The setting is the ONLY thing that moves the hold height for a given part."""
+        env.hold_part_top_mm = target
+        prep = await env.begin()
+        assert prep.hold == "sent"
+        assert prep.hold_z == pytest.approx(expected_z)
+        hold_line = next(ln for ln in env.client.gcode[0].splitlines() if "; hold:" in ln)
+        assert hold_line.startswith(f"G1 Z{expected_z:g} F900")
+
+    async def test_the_recorded_hold_z_is_the_one_that_was_sent(self, env):
+        """Parsed back out of the published text rather than re-derived: the record is
+        the eject estimator's seed, and a seed that disagrees with the plate's real
+        position is exactly what the single-evaluation change exists to prevent."""
+        for target in (-50, 0, 33, 100):
+            env.client.gcode.clear()
+            env.hold_part_top_mm = target
+            prep = await env.begin()
+            hold_line = next(ln for ln in env.client.gcode[0].splitlines() if "; hold:" in ln)
+            assert hold_line.split()[1] == f"Z{prep.hold_z:g}"
+
+    async def test_the_sent_line_names_the_target_and_the_bound(self, env, caplog):
+        """``grep "[cooldown-prep]"`` has to be readable per setting: what was asked for,
+        what the part actually got, and which constraint decided."""
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            await env.begin()
+        line = next(r.getMessage() for r in caplog.records if "plate hold sent" in r.getMessage())
+        assert line == (
+            "[cooldown-prep] printer 7: plate hold sent "
+            "(max_z=50.10 hold_z=2.00 part_top=48.10 target=100 bound=floor "
+            "clear_above=51.00 keepout_y=285.00 bbox_y_max=262.00)"
+        )
+
+    async def test_a_target_the_model_cannot_grant_is_reported_as_the_ceiling(self, env, caplog):
+        """The registry number is the hard cap; the log says so rather than silently
+        delivering something other than what was asked for."""
+        env.max_z = 55.0  # the profile's ceiling, under a 51 mm clear zone
+        env.hold_part_top_mm = 200
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin()
+        assert prep.hold_z == pytest.approx(4.0)  # 55 - 51, the ceiling
+        line = next(r.getMessage() for r in caplog.records if "plate hold sent" in r.getMessage())
+        assert "part_top=51.00 target=200 bound=ceiling" in line
 
 
 class TestKeepOut:
@@ -475,7 +571,13 @@ class TestAuxFan:
         during the settle must already hold the prep so its ``finally`` can retire
         it. The witness therefore waits in ``observe_start``, not in ``begin``."""
         prep = await cooldown_prep.begin(
-            PRINTER_ID, queue_item_id=ITEM_ID, aux_fan_percent=100, settle_s=1.5, sleep=env.sleep
+            PRINTER_ID,
+            queue_item_id=ITEM_ID,
+            aux_fan_percent=100,
+            hold_enabled=True,
+            hold_part_top_mm=HOLD_PART_TOP_DEFAULT,
+            settle_s=1.5,
+            sleep=env.sleep,
         )
         assert env.client.fans == [(2, 100)]
         assert prep.fan_published is True
@@ -487,7 +589,13 @@ class TestAuxFan:
 
     async def test_observe_start_is_a_no_op_when_nothing_was_published(self, env, caplog):
         prep = await cooldown_prep.begin(
-            PRINTER_ID, queue_item_id=ITEM_ID, aux_fan_percent=0, settle_s=1.5, sleep=env.sleep
+            PRINTER_ID,
+            queue_item_id=ITEM_ID,
+            aux_fan_percent=0,
+            hold_enabled=True,
+            hold_part_top_mm=HOLD_PART_TOP_DEFAULT,
+            settle_s=1.5,
+            sleep=env.sleep,
         )
         with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
             await prep.observe_start()
@@ -621,6 +729,7 @@ class TestHoldZIsOnlyEverSetOnSent:
             pytest.param(lambda e: setattr(e, "item", None), id="item_missing"),
             pytest.param(lambda e: setattr(e, "profile", None), id="profile_missing"),
             pytest.param(lambda e: setattr(e, "db_error", RuntimeError("db")), id="error"),
+            pytest.param(lambda e: setattr(e, "hold_enabled", False), id="disabled"),
         ],
     )
     async def test_skip_leaves_no_seed(self, env, mutate):

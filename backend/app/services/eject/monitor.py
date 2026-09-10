@@ -612,6 +612,21 @@ async def _setting_num(db, key: str, default, cast):
         return default
 
 
+async def _setting_bool(db, key: str, default: bool) -> bool:
+    """get_setting(key) read as a boolean, falling back to ``default``.
+
+    A sibling of :func:`_setting_num` rather than a ``cast=bool`` call, because
+    ``bool("false")`` is True: the settings store keeps booleans as the strings the PUT
+    route writes, so the only correct read is the same ``== "true"`` test every other
+    boolean setting is read with (``farm_policy``'s ``farm_idle_park_enabled``). Same
+    fallback contract — an absent row is the schema default, never False.
+    """
+    from backend.app.api.routes.settings import get_setting
+
+    raw = await get_setting(db, key)
+    return default if raw is None else raw.strip().lower() == "true"
+
+
 @dataclass(frozen=True)
 class CooldownWatchSettings:
     """Everything a cooldown watch reads from farm settings, resolved ONCE at arm.
@@ -626,6 +641,10 @@ class CooldownWatchSettings:
     max_hold_s: int
     plateau_eject_margin_c: float
     aux_fan_percent: int
+    # The prep's other two operator inputs: whether the plate is raised at all, and
+    # where the part's TOP should sit relative to the nozzle plane while it is.
+    hold_enabled: bool
+    hold_part_top_mm: int
 
 
 async def _resolve_stall_settings() -> CooldownWatchSettings:
@@ -638,7 +657,9 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
     °C-above-threshold band inside which a plateaued bed is RELEASED rather than
     quarantined (equilibrated at ambient). ``aux_fan_percent`` is what
     :mod:`~backend.app.services.eject.cooldown_prep` runs the auxiliary fan at for
-    the whole wait (0 = off).
+    the whole wait (0 = off); ``hold_enabled``/``hold_part_top_mm`` are that module's
+    other two operator inputs — the plate hold's switch, and where the part's top is
+    held relative to the nozzle plane (capped per model by the geometry registry).
 
     A settings-store failure (DB unavailable at arm time) must NOT kill the
     watch — a dead watch strands the plate-clear gate and silently stalls the
@@ -653,6 +674,8 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
     max_hold_min = fields["farm_cooldown_max_hold_minutes"].default
     margin = fields["farm_cooldown_plateau_eject_margin_c"].default
     aux_fan = fields["farm_cooldown_aux_fan_percent"].default
+    hold_enabled = fields["farm_cooldown_hold_enabled"].default
+    hold_part_top = fields["farm_cooldown_hold_part_top_mm"].default
     try:
         async with async_session() as db:
             window_min = await _setting_num(db, "farm_cooldown_stall_window_minutes", window_min, int)
@@ -660,6 +683,8 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
             max_hold_min = await _setting_num(db, "farm_cooldown_max_hold_minutes", max_hold_min, int)
             margin = await _setting_num(db, "farm_cooldown_plateau_eject_margin_c", margin, float)
             aux_fan = await _setting_num(db, "farm_cooldown_aux_fan_percent", aux_fan, int)
+            hold_enabled = await _setting_bool(db, "farm_cooldown_hold_enabled", bool(hold_enabled))
+            hold_part_top = await _setting_num(db, "farm_cooldown_hold_part_top_mm", hold_part_top, int)
     except Exception:  # noqa: BLE001 — arm with defaults rather than strand the gate
         logger.exception("Eject monitor: cooldown stall settings read failed — arming with schema defaults")
     return CooldownWatchSettings(
@@ -668,6 +693,8 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
         max_hold_s=int(max_hold_min) * 60,
         plateau_eject_margin_c=float(margin),
         aux_fan_percent=int(aux_fan),
+        hold_enabled=bool(hold_enabled),
+        hold_part_top_mm=int(hold_part_top),
     )
 
 
@@ -1194,7 +1221,11 @@ class EjectCooldownMonitor:
             # exactly as it was before this wave, which is a slower cooldown, not a
             # stranded gate.
             prep = await cooldown_prep.begin(
-                printer_id, queue_item_id=queue_item_id, aux_fan_percent=settings.aux_fan_percent
+                printer_id,
+                queue_item_id=queue_item_id,
+                aux_fan_percent=settings.aux_fan_percent,
+                hold_enabled=settings.hold_enabled,
+                hold_part_top_mm=settings.hold_part_top_mm,
             )
             armed = self._armed.get(printer_id)
             if armed is not None and armed.task is asyncio.current_task():

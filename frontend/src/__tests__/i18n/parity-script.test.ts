@@ -1,8 +1,13 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error -- .mjs script with no type declarations; pure JS import is fine for tests
-import { compareLocales } from '../../../scripts/check-i18n-parity.mjs';
+import { compareLocales, loadLocale } from '../../../scripts/check-i18n-parity.mjs';
 
 type LocaleMap = Map<string, string>;
+
+const readLocale = loadLocale as (filePath: string) => LocaleMap;
 
 const toMap = (obj: Record<string, string>): LocaleMap => new Map(Object.entries(obj));
 
@@ -67,24 +72,98 @@ describe('compareLocales (parity-script self-test)', () => {
     expect(hasReport(result.reports, 'placeholder mismatch', 'uploadFailed')).toBe(true);
   });
 
-  it('flags missing plural suffix keys in a non-en locale', () => {
+  // --- check 3: plural SHAPE, evaluated on en only -------------------------
+  // i18next 25 (compatibilityJSON unset) resolves `_one` / `_other` and nothing
+  // else — see the statement above `.init({` in src/i18n/index.ts. Check 1
+  // mirrors en's key set into every locale, so a shape stated once on en is a
+  // shape enforced everywhere; the non-en direction belongs to check 1.
+
+  it('flags a dead _plural suffix in en', () => {
     const result = compareLocales({
-      en: toMap({ item_one: 'item', item_other: 'items' }),
-      'zh-TW': toMap({ item_one: '項目' }), // item_other missing
+      en: toMap({ item_one: 'item', item_plural: 'items' }),
+      'zh-CN': toMap({ item_one: '项', item_plural: '项' }),
     });
     expect(result.failed).toBe(true);
-    expect(hasReport(result.reports, 'plural key mismatch', 'missing _other')).toBe(true);
+    expect(hasReport(result.reports, 'en: plural shape', 'dead plural suffix')).toBe(true);
   });
 
-  it('flags a non-en _one key that does not exist in en', () => {
+  it('leaves a _plural present only in a non-en locale to check 1 (extra key)', () => {
     const result = compareLocales({
-      en: toMap({ item: 'item' }),
-      'zh-CN': toMap({ item: '项', item_one: '一项' }), // en never plural-gated this
+      en: toMap({ item_one: 'item', item_other: 'items' }),
+      'zh-CN': toMap({ item_one: '项', item_other: '项', item_plural: '项' }),
     });
     expect(result.failed).toBe(true);
-    expect(
-      hasReport(result.reports, 'plural key mismatch', 'unexpected _one not present in en'),
-    ).toBe(true);
+    expect(hasReport(result.reports, 'zh-CN: extra keys vs en', 'item_plural')).toBe(true);
+  });
+
+  it('flags _one without a matching _other', () => {
+    const result = compareLocales({
+      en: toMap({ item_one: 'item' }),
+      'zh-CN': toMap({ item_one: '项' }),
+    });
+    expect(result.failed).toBe(true);
+    expect(hasReport(result.reports, 'en: plural shape', '_one without _other')).toBe(true);
+  });
+
+  it('flags _other without a matching _one (catches a typo\'d half, e.g. item_ohter)', () => {
+    const result = compareLocales({
+      en: toMap({ item_other: 'items' }),
+      'zh-CN': toMap({ item_other: '项' }),
+    });
+    expect(result.failed).toBe(true);
+    expect(hasReport(result.reports, 'en: plural shape', '_other without _one')).toBe(true);
+  });
+
+  it('flags a bare key sharing a plural pair\'s base', () => {
+    const result = compareLocales({
+      en: toMap({ item: 'item', item_one: 'item', item_other: 'items' }),
+      'zh-CN': toMap({ item: '项', item_one: '项', item_other: '项' }),
+    });
+    expect(result.failed).toBe(true);
+    expect(hasReport(result.reports, 'en: plural shape', 'bare sibling of plural pair')).toBe(true);
+  });
+
+  it('flags an unsupported plural form (_zero) even though i18next would resolve it', () => {
+    const result = compareLocales({
+      en: toMap({ item_zero: 'none', item_one: 'item', item_other: 'items' }),
+      'zh-CN': toMap({ item_zero: '无', item_one: '项', item_other: '项' }),
+    });
+    expect(result.failed).toBe(true);
+    expect(hasReport(result.reports, 'en: plural shape', 'unsupported plural form')).toBe(true);
+  });
+
+  it('passes the sanctioned nested pair shape', () => {
+    const result = compareLocales({
+      en: toMap({
+        'queue.itemCount_one': '{{count}} item',
+        'queue.itemCount_other': '{{count}} items',
+      }),
+      'zh-CN': toMap({
+        'queue.itemCount_one': '{{count}} 个项目',
+        'queue.itemCount_other': '{{count}} 个项目',
+      }),
+    });
+    expect(result.failed).toBe(false);
+    expect(result.reports).toEqual([]);
+  });
+
+  it('reports nothing for the real locale files on disk', () => {
+    const localesDir = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../i18n/locales',
+    );
+    const codes = fs
+      .readdirSync(localesDir)
+      .filter((f) => f.endsWith('.ts'))
+      .map((f) => f.slice(0, -3));
+    expect(codes).toContain('en');
+    const locales = Object.fromEntries(
+      codes.map((code) => [code, readLocale(path.join(localesDir, `${code}.ts`))]),
+    );
+
+    const result = compareLocales(locales);
+    expect(result.reports).toEqual([]);
+    expect(result.failed).toBe(false);
   });
 
   it('throws when the en locale is absent', () => {

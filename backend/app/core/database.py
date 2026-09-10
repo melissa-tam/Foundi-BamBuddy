@@ -683,6 +683,19 @@ async def _migrate_widen_spoolman_slot_ams_id_range(conn) -> None:
         raise
 
 
+# The H2S cooldown-hold clearance (mm): how far a part's top may stand above the nozzle
+# plane while the toolhead is parked at the chute. MEASURED by the operator 2026-09-10
+# ("it's 100mm part max"), superseding the 51 mm witnessed-safe placeholder the first
+# wave shipped with. Spelled ONCE because two statements consume it — the fresh-DB seed
+# and the one-time migration that lifts the placeholder on installs that already ran.
+#
+# Consumed with NO margin against the slicer's MODELLED ``max_z``: a warped or failed
+# part stands taller than the file says and nothing re-checks it. That is admissible
+# only because the fleet's tallest ADMITTED part is 55 mm (the production profile's
+# ``max_part_height_mm``), so today the ceiling is never even approached.
+_H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM = 100.0
+
+
 async def run_migrations(conn):
     """Run all schema migrations and data backfills on startup.
 
@@ -3616,13 +3629,13 @@ async def run_migrations(conn):
         await conn.execute(
             text("UPDATE printer_model_geometry SET z_travel_mm = 325 WHERE model_key = 'H2C' AND z_travel_mm IS NULL")
         )
-        # Cooldown plate-hold seed — H2S ONLY, and both numbers are PLACEHOLDERS.
-        # Operator ruling 2026-09-10 (eyewitness): the space above the nozzle plane with
-        # the toolhead parked at the chute is clear to AT LEAST 50 mm, so 51 is seeded as
-        # a witnessed-safe floor; the TRUE maximum has still to be measured, and this seed
-        # is where it lands when it is. The keep-out line is the vendor's rear service
-        # area (Y295) minus 10 mm of margin = 285; for reference the production plate's
-        # own bbox_all ends at Y 261.97, well clear of it.
+        # Cooldown plate-hold seed — H2S ONLY. Operator ruling 2026-09-10 (eyewitness):
+        # with the toolhead parked at the chute the space above the nozzle plane over the
+        # part area is clear to 100 mm (``_H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM``, MEASURED —
+        # the first wave shipped 51 as a witnessed-safe placeholder and the one-time
+        # migration below lifts it on installs that already have it). The keep-out line is
+        # the vendor's rear service area (Y295) minus 10 mm of margin = 285; for reference
+        # the production plate's own bbox_all ends at Y 261.97, well clear of it.
         # Every OTHER model stays NULL — unmeasured, so hold OFF and fan only (H2C
         # explicitly gets no numbers). Idempotent via the IS NULL guard, exactly like the
         # z_travel backfill above: re-runs no-op, and the pair is written together so a
@@ -3630,9 +3643,10 @@ async def run_migrations(conn):
         await conn.execute(
             text(
                 "UPDATE printer_model_geometry "
-                "SET cooldown_hold_keepout_y_mm = 285.0, cooldown_hold_clear_above_mm = 51.0 "
+                "SET cooldown_hold_keepout_y_mm = 285.0, cooldown_hold_clear_above_mm = :clear "
                 "WHERE model_key = 'H2S' AND cooldown_hold_clear_above_mm IS NULL"
-            )
+            ),
+            {"clear": _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM},
         )
 
     # Additional fleet geometry rows (published-spec provisional envelopes, all
@@ -5040,6 +5054,45 @@ async def run_migrations(conn):
                 "later boot retries it",
                 _blank_identity_marker,
             )
+
+    # Cooldown-hold clearance (2026-09-10): the H2S placeholder becomes the measured
+    # value. The seed above only fills a NULL, so an install that already ran the first
+    # wave carries 51.0 and would keep holding every plate 49 mm lower than the machine
+    # allows.
+    #
+    # ONE-TIME, not idempotent-by-repetition: a plain UPDATE keyed on 51.0 would re-run
+    # at every startup and silently re-rewrite a later RE-MEASURE (or a hand repair) that
+    # happened to land back on 51.0 — value-as-identity, the rewrite this file's own
+    # ``_posture_marker`` note warns against. The durable marker is a settings row written
+    # in the SAME nested transaction as the update, so the pair is all-or-nothing and a
+    # second boot is a no-op. Guarded INSERT ... SELECT rather than ON CONFLICT
+    # (dialect-neutral across SQLite + Postgres), matching that migration exactly.
+    _hold_clear_marker = "migration_cooldown_hold_clear_h2s_20260910"
+    _hold_clear_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _hold_clear_marker})
+    ).scalar()
+    if not _hold_clear_done:
+        async with conn.begin_nested():
+            _hold_clear_lifted = await conn.execute(
+                text(
+                    "UPDATE printer_model_geometry SET cooldown_hold_clear_above_mm = :clear "
+                    "WHERE model_key = 'H2S' AND cooldown_hold_clear_above_mm = 51.0"
+                ),
+                {"clear": _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                    "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                ),
+                {"key": _hold_clear_marker},
+            )
+        logger.info(
+            "[MIGRATION] H2S cooldown-hold clearance placeholder 51.0 -> %s mm (measured) on %s row(s); "
+            "one-time, a later re-measure is never rewritten",
+            _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM,
+            _hold_clear_lifted.rowcount,
+        )
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

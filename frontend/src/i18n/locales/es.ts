@@ -636,11 +636,10 @@ export default {
     progress: '{{percent}}% completado',
     timeRemaining: '{{time}} restante',
     deleteConfirm: '¿Está seguro de que desea eliminar "{{name}}"?',
-    maintenanceOk: 'Mantenimiento correcto',
-    maintenanceWarning: '{{count}} advertencia',
-    maintenanceWarning_plural: '{{count}} advertencias',
-    maintenanceDue: '{{count}} pendiente',
-    maintenanceDue_plural: '{{count}} pendientes',
+    maintenanceWarning_one: '{{count}} advertencia',
+    maintenanceWarning_other: '{{count}} advertencias',
+    maintenanceDue_one: '{{count}} pendiente',
+    maintenanceDue_other: '{{count}} pendientes',
     // Sort options
     sort: {
       name: 'Nombre',
@@ -959,8 +958,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: '{{count}} impresión en cola',
-      inQueue_plural: '{{count}} impresiones en cola',
+      inQueue_one: '{{count}} impresión en cola',
+      inQueue_other: '{{count}} impresiones en cola',
     },
     // Controls section
     controls: 'Controles',
@@ -1446,8 +1445,8 @@ export default {
       title: 'Seleccione la cama para la vista previa',
       hint: 'Este archivo tiene varias camas. Elija una para abrirla en el visor de G-code.',
       plateLabel: 'Cama {{index}}',
-      objectCount: '{{count}} objeto',
-      objectCount_plural: '{{count}} objetos',
+      objectCount_one: '{{count}} objeto',
+      objectCount_other: '{{count}} objetos',
       noGcode: 'Este archivo no tiene G-code laminado para previsualizar. Ábralo en Bambu Studio para laminarlo primero.',
     },
     card: {
@@ -1672,8 +1671,8 @@ export default {
     printingInProgress: 'Impresión en curso...',
     viewArchive: 'Ver archivo',
     viewInFileManager: 'Ver en el gestor de archivos',
-    itemCount: '{{count}} elemento',
-    itemCount_plural: '{{count}} elementos',
+    itemCount_one: '{{count}} elemento',
+    itemCount_other: '{{count}} elementos',
     dragToReorder: 'Arrastre para reordenar (solo elementos «lo antes posible»)',
     reorderHint: 'La posición solo afecta a los elementos «lo antes posible». Los elementos programados se ejecutan a su hora establecida.',
     sjf: {
@@ -1695,10 +1694,10 @@ export default {
     cancelBatchConfirmMessage: '¿Cancelar todos los elementos pendientes restantes de este lote?',
     batch: {
       defaultName: 'Lote',
-      label: '{{count}} elemento',
-      label_plural: '{{count}} elementos',
-      pendingCount: '{{count}} pendiente',
-      pendingCount_plural: '{{count}} pendientes',
+      label_one: '{{count}} elemento',
+      label_other: '{{count}} elementos',
+      pendingCount_one: '{{count}} pendiente',
+      pendingCount_other: '{{count}} pendientes',
       expand: 'Expandir lote',
       collapse: 'Contraer lote',
       groupAsBatch: 'Agrupar como lote…',
@@ -1727,8 +1726,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}} elementos',
-      batch: '{{name}} ({{count}} copia)',
-      batch_plural: '{{name}} ({{count}} copias)',
+      batch_one: '{{name}} ({{count}} copia)',
+      batch_other: '{{name}} ({{count}} copias)',
     },
     // Sections
     sections: {
@@ -1812,8 +1811,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: 'Editar {{count}} elemento',
-      title_plural: 'Editar {{count}} elementos',
+      title_one: 'Editar {{count}} elemento',
+      title_other: 'Editar {{count}} elementos',
       description: 'Solo se aplicarán los ajustes modificados a los elementos seleccionados.',
       printer: 'Impresora',
       noChange: '— Sin cambios —',
@@ -2044,10 +2043,10 @@ export default {
     title: 'Mantenimiento',
     overview: 'Resumen',
     allOk: 'Todo el mantenimiento al día',
-    dueCount: '{{count}} tarea pendiente',
-    dueCount_plural: '{{count}} tareas pendientes',
-    warningCount: '{{count}} advertencia',
-    warningCount_plural: '{{count}} advertencias',
+    dueCount_one: '{{count}} tarea pendiente',
+    dueCount_other: '{{count}} tareas pendientes',
+    warningCount_one: '{{count}} advertencia',
+    warningCount_other: '{{count}} advertencias',
     totalPrintTime: 'Tiempo total de impresión',
     nextMaintenance: 'Próximo mantenimiento',
     nothingDue: 'Nada pendiente',
@@ -2678,6 +2677,10 @@ export default {
     farmCooldownPlateauMarginHelp: 'Si el enfriamiento se estanca pero la cama está dentro de estos grados de la temperatura de expulsión, se trata como enfriada y se expulsa; si queda más caliente que eso, la impresora se pone en cuarentena.',
     farmCooldownAuxFan: 'Ventilador auxiliar durante el enfriamiento (%)',
     farmCooldownAuxFanHelp: 'Hace funcionar el ventilador auxiliar de la impresora a esta velocidad desde el final de la impresión hasta que se envía la expulsión. 0 lo desactiva.',
+    farmCooldownHoldEnabled: 'Mantener la placa junto al ventilador durante el enfriamiento',
+    farmCooldownHoldEnabledHelp: 'Eleva la placa hacia el plano de la boquilla con el cabezal aparcado en la rampa mientras la pieza se enfría. Desactivado deja la placa donde terminó la impresión.',
+    farmCooldownHoldPartTop: 'Parte superior de la pieza sobre el plano de la boquilla (mm)',
+    farmCooldownHoldPartTopHelp: 'Define dónde se mantiene la placa mientras la pieza se enfría, como la altura de la parte superior de la pieza sobre el flujo del ventilador auxiliar en el plano de la boquilla. 100 mantiene la placa junto al ventilador con la pieza elevándose hacia la zona libre sobre la boquilla. 0 sitúa la parte superior de la pieza al nivel del ventilador. Por debajo de 0 mantiene la pieza esa distancia bajo el ventilador para que el aire pase por encima. Limitado a la altura libre medida del modelo de impresora.',
     respoolPromptThreshold: 'Umbral de observación de reasignación (g)',
     respoolPromptThresholdHelp: 'Registrar una observación de reasignación cuando llegue una etiqueta Bambu reutilizada y a la bobina de origen le queden estos gramos o menos sin un marcador de agotado verificado por hardware (0–1000).',
     farmUsbAutoCleanup: 'Limpiar USB automáticamente cuando esté lleno',
@@ -4906,9 +4909,6 @@ export default {
       slot: 'Última en esta ranura',
       ams: 'Última en este AMS',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '{{count}} bobina vacía oculta',
     assignEmptyHidden_other: '{{count}} bobinas vacías ocultas',
     spoolmanSpools: 'Bobinas de Spoolman',
@@ -5829,11 +5829,11 @@ export default {
     plates: 'Camas',
     allPlates: 'Todas las camas',
     plateNumber: 'Cama {{number}}',
-    plateCount: '{{count}} cama',
+    plateCount_one: '{{count}} cama',
     plateCount_other: '{{count}} camas',
-    objectCount: '{{count}} objeto',
+    objectCount_one: '{{count}} objeto',
     objectCount_other: '{{count}} objetos',
-    filamentCount: '{{count}} filamento',
+    filamentCount_one: '{{count}} filamento',
     filamentCount_other: '{{count}} filamentos',
     eta: 'Tiempo estimado {{minutes}} min',
     noPreview: 'No hay vista previa disponible para este archivo',

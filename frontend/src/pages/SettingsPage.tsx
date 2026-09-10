@@ -79,7 +79,7 @@ registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
 registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position', anchor: 'card-farm-production' });
-registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine aux fan auxiliary speed percent', anchor: 'card-farm-cooldown' });
+registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine aux fan auxiliary speed percent hold plate position fan part top', anchor: 'card-farm-cooldown' });
 registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
 registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool observation prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
@@ -186,6 +186,14 @@ export function SettingsPage() {
   // so intermediate values ("", "3", "5") are not eaten by the [5, 95] clamp
   // while the user is mid-typing.
   const [humidityDrafts, setHumidityDrafts] = useState<Record<string, string>>({});
+  // Draft buffer for the signed cooldown-hold target (the only field on this
+  // page whose range includes negatives). An `<input type="number">` sanitises a
+  // lone "-" to "", so a controlled value would immediately overwrite that
+  // keystroke and make a negative target untypable. While the raw string does
+  // not parse the draft is displayed and the stored value is left untouched; a
+  // parseable value commits at once, and a clamped one drops the draft so the
+  // clamp is visible immediately. Same shape as `humidityDrafts` above.
+  const [holdPartTopDraft, setHoldPartTopDraft] = useState<string | null>(null);
   const [showPlugModal, setShowPlugModal] = useState(false);
   const [editingPlug, setEditingPlug] = useState<SmartPlug | null>(null);
   const [showNotificationModal, setShowNotificationModal] = useState(false);
@@ -1066,6 +1074,8 @@ export function SettingsPage() {
       (settings.farm_cooldown_max_hold_minutes ?? 180) !== (localSettings.farm_cooldown_max_hold_minutes ?? 180) ||
       (settings.farm_cooldown_plateau_eject_margin_c ?? 3) !== (localSettings.farm_cooldown_plateau_eject_margin_c ?? 3) ||
       (settings.farm_cooldown_aux_fan_percent ?? 100) !== (localSettings.farm_cooldown_aux_fan_percent ?? 100) ||
+      (settings.farm_cooldown_hold_enabled ?? true) !== (localSettings.farm_cooldown_hold_enabled ?? true) ||
+      (settings.farm_cooldown_hold_part_top_mm ?? 100) !== (localSettings.farm_cooldown_hold_part_top_mm ?? 100) ||
       (settings.farm_usb_auto_cleanup ?? true) !== (localSettings.farm_usb_auto_cleanup ?? true) ||
       (settings.farm_idle_park_enabled ?? true) !== (localSettings.farm_idle_park_enabled ?? true) ||
       (settings.farm_idle_park_percent ?? 75) !== (localSettings.farm_idle_park_percent ?? 75) ||
@@ -1189,6 +1199,8 @@ export function SettingsPage() {
         farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
         farm_cooldown_plateau_eject_margin_c: localSettings.farm_cooldown_plateau_eject_margin_c,
         farm_cooldown_aux_fan_percent: localSettings.farm_cooldown_aux_fan_percent,
+        farm_cooldown_hold_enabled: localSettings.farm_cooldown_hold_enabled,
+        farm_cooldown_hold_part_top_mm: localSettings.farm_cooldown_hold_part_top_mm,
         farm_usb_auto_cleanup: localSettings.farm_usb_auto_cleanup,
         farm_idle_park_enabled: localSettings.farm_idle_park_enabled,
         farm_idle_park_percent: localSettings.farm_idle_park_percent,
@@ -5284,6 +5296,68 @@ export function SettingsPage() {
                     {t('settings.farmCooldownAuxFanHelp', "Runs the printer's auxiliary fan at this speed from the end of the print until the eject dispatches. 0 turns it off.")}
                   </p>
                 </div>
+              </div>
+              {/* Cooldown plate hold. While the part cools the plate is raised
+                  toward the nozzle plane with the toolhead parked at the chute,
+                  so the aux fan's stream reaches the part. The switch is the
+                  operator's off (no deploy needed); the signed number below is
+                  where the part's TOP sits relative to that plane, capped per
+                  model by the registry's measured clear height. Laid out as the
+                  toggle-plus-dependent-number pair the Farm Production card
+                  uses for the idle bed park. */}
+              <div className="flex items-center justify-between pt-1">
+                <div className="flex items-center gap-1.5 flex-1 mr-4">
+                  <p className="text-sm text-white">
+                    {t('settings.farmCooldownHoldEnabled', 'Hold the plate at the fan during cooldown')}
+                  </p>
+                  <InfoHint text={t('settings.farmCooldownHoldEnabledHelp', 'Raises the plate toward the nozzle plane with the toolhead parked at the chute while the part cools. Off leaves the plate where the print ended.')} />
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    aria-label={t('settings.farmCooldownHoldEnabled', 'Hold the plate at the fan during cooldown')}
+                    checked={localSettings.farm_cooldown_hold_enabled ?? true}
+                    onChange={(e) => updateSetting('farm_cooldown_hold_enabled', e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                </label>
+              </div>
+              <div className={`sm:max-w-xs ${(localSettings.farm_cooldown_hold_enabled ?? true) ? '' : 'opacity-50'}`}>
+                <div className="flex items-center gap-1.5 mb-1">
+                  <label htmlFor="farm-cooldown-hold-part-top" className="block text-xs text-bambu-gray">
+                    {t('settings.farmCooldownHoldPartTop', 'Part top above the nozzle plane (mm)')}
+                  </label>
+                  <InfoHint text={t('settings.farmCooldownHoldPartTopHelp')} />
+                </div>
+                <input
+                  id="farm-cooldown-hold-part-top"
+                  type="number"
+                  min={-50}
+                  max={200}
+                  step={1}
+                  value={holdPartTopDraft ?? String(localSettings.farm_cooldown_hold_part_top_mm ?? 100)}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    const parsed = parseInt(raw, 10);
+                    if (Number.isNaN(parsed)) {
+                      // Mid-typing ("-", or an emptied field): show the raw
+                      // string, leave the stored target alone.
+                      setHoldPartTopDraft(raw);
+                      return;
+                    }
+                    const clamped = Math.max(-50, Math.min(200, parsed));
+                    // A clamped entry drops the draft so the bound shows at once.
+                    setHoldPartTopDraft(clamped === parsed ? raw : null);
+                    updateSetting('farm_cooldown_hold_part_top_mm', clamped);
+                  }}
+                  onBlur={() => setHoldPartTopDraft(null)}
+                  disabled={!(localSettings.farm_cooldown_hold_enabled ?? true)}
+                  className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                />
+                <p className="text-xs text-bambu-gray mt-1">
+                  {t('settings.farmCooldownHoldPartTopHelp', "Sets where the plate is held while the part cools, as the height of the top of the part above the aux fan's stream at the nozzle plane. 100 holds the plate at the fan with the part rising into the clear zone above the nozzle. 0 puts the top of the part level with the fan. Below 0 holds the part that far under the fan so air moves over it. Capped at the printer model's measured clear height.")}
+                </p>
               </div>
             </CardContent>
           </Card>

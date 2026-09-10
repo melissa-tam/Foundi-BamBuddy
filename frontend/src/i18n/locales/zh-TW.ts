@@ -636,11 +636,10 @@ export default {
     progress: '{{percent}}% 完成',
     timeRemaining: '剩餘 {{time}}',
     deleteConfirm: '確定要刪除"{{name}}"嗎？',
-    maintenanceOk: '維護正常',
-    maintenanceWarning: '{{count}} 個警告',
-    maintenanceWarning_plural: '{{count}} 個警告',
-    maintenanceDue: '{{count}} 個到期',
-    maintenanceDue_plural: '{{count}} 個到期',
+    maintenanceWarning_one: '{{count}} 個警告',
+    maintenanceWarning_other: '{{count}} 個警告',
+    maintenanceDue_one: '{{count}} 個到期',
+    maintenanceDue_other: '{{count}} 個到期',
     // Sort options
     sort: {
       name: '名稱',
@@ -959,8 +958,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: '佇列中有 {{count}} 個列印任務',
-      inQueue_plural: '佇列中有 {{count}} 個列印任務',
+      inQueue_one: '佇列中有 {{count}} 個列印任務',
+      inQueue_other: '佇列中有 {{count}} 個列印任務',
     },
     // Controls section
     controls: '控制',
@@ -1446,8 +1445,8 @@ export default {
       title: '選擇要預覽的列印板',
       hint: '此存檔包含多個列印板。選擇一個在 GCode 檢視器中開啟。',
       plateLabel: '列印板 {{index}}',
-      objectCount: '{{count}} 個物件',
-      objectCount_plural: '{{count}} 個物件',
+      objectCount_one: '{{count}} 個物件',
+      objectCount_other: '{{count}} 個物件',
       noGcode: '此存檔沒有可預覽的已切片 G 代碼。請先在 Bambu Studio 中開啟並切片。',
     },
     card: {
@@ -1672,8 +1671,8 @@ export default {
     printingInProgress: '列印進行中...',
     viewArchive: '檢視歸檔',
     viewInFileManager: '在檔案管理器中檢視',
-    itemCount: '{{count}} 個項目',
-    itemCount_plural: '{{count}} 個項目',
+    itemCount_one: '{{count}} 個項目',
+    itemCount_other: '{{count}} 個項目',
     dragToReorder: '拖曳以重新排序（僅限盡快）',
     reorderHint: '位置僅影響"儘快"項目。排程項目按設定時間執行。',
     sjf: {
@@ -1695,10 +1694,10 @@ export default {
     cancelBatchConfirmMessage: '取消此批次中所有剩餘的待處理項目？',
     batch: {
       defaultName: '批次',
-      label: '{{count}} 項',
-      label_plural: '{{count}} 項',
-      pendingCount: '{{count}} 待處理',
-      pendingCount_plural: '{{count}} 待處理',
+      label_one: '{{count}} 項',
+      label_other: '{{count}} 項',
+      pendingCount_one: '{{count}} 待處理',
+      pendingCount_other: '{{count}} 待處理',
       expand: '展開批次',
       collapse: '收合批次',
       groupAsBatch: '組合為批次…',
@@ -1727,8 +1726,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}} 項',
-      batch: '{{name}}（{{count}} 份）',
-      batch_plural: '{{name}}（{{count}} 份）',
+      batch_one: '{{name}}（{{count}} 份）',
+      batch_other: '{{name}}（{{count}} 份）',
     },
     // Sections
     sections: {
@@ -1812,8 +1811,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: '編輯 {{count}} 個項目',
-      title_plural: '編輯 {{count}} 個項目',
+      title_one: '編輯 {{count}} 個項目',
+      title_other: '編輯 {{count}} 個項目',
       description: '僅更改的設定將套用於所選項目。',
       printer: '印表機',
       noChange: '— 不更改 —',
@@ -2043,10 +2042,10 @@ export default {
     title: '維護',
     overview: '概覽',
     allOk: '所有維護均已完成',
-    dueCount: '{{count}} 項到期',
-    dueCount_plural: '{{count}} 項到期',
-    warningCount: '{{count}} 個警告',
-    warningCount_plural: '{{count}} 個警告',
+    dueCount_one: '{{count}} 項到期',
+    dueCount_other: '{{count}} 項到期',
+    warningCount_one: '{{count}} 個警告',
+    warningCount_other: '{{count}} 個警告',
     totalPrintTime: '總列印時間',
     nextMaintenance: '下次維護',
     nothingDue: '無到期項目',
@@ -2676,6 +2675,10 @@ export default {
     farmCooldownPlateauMarginHelp: '若降溫停滯但熱床處於取件溫度的該溫差範圍內，則視為已冷卻並取件；若卡在更高溫度，則將印表機隔離。',
     farmCooldownAuxFan: '冷卻期間的輔助風扇 (%)',
     farmCooldownAuxFanHelp: '從列印結束到取件下發期間，以此轉速運行列印機的輔助風扇。0 表示關閉。',
+    farmCooldownHoldEnabled: '冷卻期間將熱床保持在風扇處',
+    farmCooldownHoldEnabledHelp: '在零件冷卻期間，將工具頭停靠在落料口，並把熱床抬升至噴嘴平面。關閉時熱床停在列印結束的位置。',
+    farmCooldownHoldPartTop: '零件頂部高於噴嘴平面的高度 (mm)',
+    farmCooldownHoldPartTopHelp: '設定零件冷卻期間熱床的保持位置，即零件頂部高於噴嘴平面處輔助風扇氣流的高度。100 表示熱床停在風扇處，零件伸入噴嘴上方的空隙區。0 表示零件頂部與風扇齊平。低於 0 表示零件頂部位於風扇下方該距離處，氣流從其上方經過。上限為該印表機型號實測的空隙高度。',
     respoolPromptThreshold: '重新綁定觀察閾值 (g)',
     respoolPromptThresholdHelp: '當重複使用的 Bambu 標籤出現、來源線軸剩餘不超過這麼多克且沒有硬體確認的用盡標記時，記錄一筆重新綁定觀察日誌（0–1000）。',
     farmUsbAutoCleanup: '儲存滿時自動清理 USB',
@@ -4895,9 +4898,6 @@ export default {
       slot: '上次位於此槽位',
       ams: '上次位於此 AMS',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '已隱藏 {{count}} 個空耗材盤',
     assignEmptyHidden_other: '已隱藏 {{count}} 個空耗材盤',
     spoolmanSpools: 'Spoolman 線軸',
@@ -5809,11 +5809,11 @@ export default {
     plates: '板',
     allPlates: '所有板',
     plateNumber: '板 {{number}}',
-    plateCount: '{{count}} 個板',
+    plateCount_one: '{{count}} 個板',
     plateCount_other: '{{count}} 個板',
-    objectCount: '{{count}} 個物件',
+    objectCount_one: '{{count}} 個物件',
     objectCount_other: '{{count}} 個物件',
-    filamentCount: '{{count}} 種耗材',
+    filamentCount_one: '{{count}} 種耗材',
     filamentCount_other: '{{count}} 種耗材',
     eta: '預計 {{minutes}} 分鐘',
     noPreview: '此檔案無可用預覽',

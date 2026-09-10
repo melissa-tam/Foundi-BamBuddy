@@ -634,8 +634,7 @@ describe('AssignSpoolModal — empty rolls and slot recency', () => {
     });
   });
 
-  // i18next JSON v4 plurals (`_one` / `_other`) — the repo's older `_plural`
-  // keys are dead under i18next 25 and render the singular for every count.
+  // Plural suffix rules: see the statement above `.init({` in src/i18n/index.ts.
   it('renders the hidden-empty count beside the toggle in the SINGULAR at 1, and drops it when the toggle is on', async () => {
     (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, spentSpool]);
 

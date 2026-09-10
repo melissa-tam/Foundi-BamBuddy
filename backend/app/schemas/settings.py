@@ -657,6 +657,31 @@ class AppSettings(BaseModel):
         le=100,
         description="Auxiliary fan speed (%) held from the end of a farm print until its eject dispatches; 0 = off",
     )
+    farm_cooldown_hold_enabled: bool = Field(
+        default=True,
+        description="Raise the plate toward the nozzle plane, toolhead parked at the chute, while a finished part "
+        "cools; off leaves the plate where the print ended",
+    )
+    # Range and default, both load-bearing:
+    #   ge=-50 keeps every reachable hold ABOVE the vendor's own end-block park. That
+    #     park is ``max_z/2 + 98`` (>= 108 mm for any part a profile admits) while a
+    #     hold is at most ``max_z + 50`` (<= 105 mm), so "plate raised" on the printer
+    #     card is true for EVERY admissible value and no z_travel bound is needed.
+    #   default=100 means "as high as the part allows" today because it duplicates the
+    #     H2S clear height BY VALUE. That coincidence is pinned by a test against the
+    #     seed constant, so a future re-measure past 100 fails there instead of silently
+    #     turning the default into a mid-range number.
+    farm_cooldown_hold_part_top_mm: int = Field(
+        default=100,
+        ge=-50,
+        le=200,
+        description="Where the part's TOP is held relative to the nozzle plane (mm) while it cools: positive "
+        "raises it into the clear zone above the plane so the auxiliary fan's stream hits it, 0 holds the top "
+        "level with the plane, negative holds it that far below. One fleet-wide number is admissible because it "
+        "is measured from the part top, so it means the same physical thing for a 20 mm and a 55 mm part; it is "
+        "capped per model by the measured clear height in the geometry registry and floored by the plate's own "
+        "minimum, and only models carrying registry clearance numbers hold at all",
+    )
     farm_usb_auto_cleanup: bool = Field(
         default=True,
         description="On a USB-storage-low HMS fault, auto-delete old camera recordings then oldest unused print files",
@@ -841,6 +866,8 @@ class AppSettingsUpdate(BaseModel):
     farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)
     farm_cooldown_plateau_eject_margin_c: float | None = Field(default=None, ge=0.0, le=50.0)
     farm_cooldown_aux_fan_percent: int | None = Field(default=None, ge=0, le=100)
+    farm_cooldown_hold_enabled: bool | None = None
+    farm_cooldown_hold_part_top_mm: int | None = Field(default=None, ge=-50, le=200)
     farm_idle_park_enabled: bool | None = None
     farm_idle_park_percent: int | None = Field(default=None, ge=10, le=95)
     respool_prompt_threshold_g: int | None = Field(default=None, ge=0, le=1000)

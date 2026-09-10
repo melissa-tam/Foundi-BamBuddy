@@ -3992,7 +3992,14 @@ function PrinterCard({
                   }`}
                   title={
                     maintenanceInfo.due_count > 0 || maintenanceInfo.warning_count > 0
-                      ? `${maintenanceInfo.due_count > 0 ? `${maintenanceInfo.due_count} maintenance due` : ''}${maintenanceInfo.due_count > 0 && maintenanceInfo.warning_count > 0 ? ', ' : ''}${maintenanceInfo.warning_count > 0 ? `${maintenanceInfo.warning_count} due soon` : ''} - Click to view`
+                      ? [
+                          maintenanceInfo.due_count > 0 &&
+                            t('printers.maintenanceDue', { count: maintenanceInfo.due_count }),
+                          maintenanceInfo.warning_count > 0 &&
+                            t('printers.maintenanceWarning', { count: maintenanceInfo.warning_count }),
+                        ]
+                          .filter(Boolean)
+                          .join(', ')
                       : t('printers.maintenanceUpToDate')
                   }
                 >

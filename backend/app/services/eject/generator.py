@@ -87,7 +87,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME, is_bedslinger_model, is_dual_nozzle_model
 
@@ -110,7 +110,8 @@ SWEEP_BAND_MIN_WIDTH_MM = 10.0
 # park-Z floor for the upper-Z ceiling guard (``_fmt(10.0)`` == "10", byte-identical).
 PARK_Z_MM = 10.0
 
-# The FLOOR (mm) of the cooldown hold — the lowest Z :func:`hold_z` will ever ask for.
+# The FLOOR (mm) of the cooldown hold — the lowest Z :func:`hold_placement` will ever
+# ask for, whatever the operator's target.
 #
 # The hold happens with the toolhead parked AT THE CHUTE (the vendor's own ``G150.3``
 # position), off the plate entirely, so the plate never touches the nozzle there and
@@ -120,6 +121,27 @@ PARK_Z_MM = 10.0
 # enough that the hold still buys the eject its whole one-flow Z move, large enough
 # that no plausible drift closes it.
 HOLD_Z_MIN_MM = 2.0
+
+
+# Which of the three constraints decided a hold's Z. Reported rather than re-derived:
+# the operator's target, the model's measured clear height, and the plate floor all
+# produce a legal Z, and only the LABEL says whether the number in the log is the one
+# the operator asked for or the one a clamp gave back.
+HoldBound = Literal["target", "ceiling", "floor"]
+
+
+@dataclass(frozen=True)
+class HoldPlacement:
+    """Where a cooldown hold puts the plate, and what decided it. See :func:`hold_placement`."""
+
+    # The commanded hold Z: how far the bed sits BELOW the nozzle plane.
+    z: float
+    # ``max_z_height - z`` — where the part's top ACTUALLY ends up, signed: positive is
+    # that far above the nozzle plane, negative that far below it. Never the target: it
+    # is what the two clamps left, which is the only figure worth logging.
+    part_top_mm: float
+    bound: HoldBound
+
 
 # Seconds :func:`estimate_runtime_segments` books for each ``G28`` line it walks.
 #
@@ -451,69 +473,123 @@ def park_z(max_z_height: float, profile: EjectProfile) -> float:
     return max(lift_z(max_z_height, profile), PARK_Z_MM)
 
 
-def hold_z(max_z_height: float, clear_above_mm: float) -> float:
-    """The COOLDOWN HOLD height (mm) for a part of ``max_z_height``.
+def hold_placement(max_z_height: float, clear_above_mm: float, part_top_mm: float) -> HoldPlacement:
+    """Where to hold a part of ``max_z_height``: the operator's target under two clamps.
 
-    ``clear_above_mm`` is the model's chute-park headroom — how far the part top may
-    stand past the nozzle plane while the toolhead sits AT the chute, off the plate.
-    The hold is therefore ``max_z_height - clear_above_mm``, floored at
-    :data:`HOLD_Z_MIN_MM`: a 50 mm part under 51 mm of headroom holds at 2.0, and a
-    55 mm part under the same headroom holds at 4.0.
+    ``part_top_mm`` is the OPERATOR's target, and it names where the part's TOP should
+    sit relative to the nozzle plane while the plate is held — positive = that far ABOVE
+    the plane, up into the clear zone, so the aux fan's stream (centred on the plane)
+    hits the part's flank with the plate itself in the stream; 0 = flush with the plane,
+    so the fan blows across the top surface; negative = that far BELOW the plane, so the
+    fan blows above the part and circulates air over it. One signed number expresses
+    every intent, and ``z = max_z_height - part_top`` converts it (bed Z is measured
+    downward from the nozzle, so a bigger Z is a plate FARTHER from the plane).
 
-    The scalar arrives as an argument rather than as a geometry attribute on purpose —
-    the registry column that carries it is owned elsewhere, and the generator must not
-    take a dependency on its name to compute a height.
+    It is expressed relative to the PART TOP rather than as a plate height because that
+    is what makes ONE fleet-wide setting admissible: "top 20 mm above the plane" means
+    the same physical thing for a 20 mm part and a 55 mm one, while "plate at Z30" does
+    not. Two clamps then keep every value safe on their own:
+
+    * the CEILING — ``clear_above_mm``, the model's MEASURED clearance above the nozzle
+      plane with the toolhead parked at the chute. The part never rises past it, however
+      large the target. Consumed with NO margin against ``max_z_height``, which is the
+      slicer's MODELLED height and not a measurement: a warped or failed part stands
+      taller and nothing re-checks it;
+    * the FLOOR — :data:`HOLD_Z_MIN_MM`, the closest the plate itself may come to the
+      plane whatever the target asks for.
+
+    The table (H2S, ``clear_above_mm`` 100 measured 2026-09-10)::
+
+        max_z   target   clear    z      part top    bound
+        50.1    100      100      2.0    48.1        floor     <- the fleet's parts today
+        50.1    0        100      50.1   0           target    <- fan across the top
+        50.1    -20      100      70.1   -20         target    <- fan above the part
+        100     100      100      2.0    98          floor
+        120     150      100      20     100         ceiling   <- never more than 100
+        50.1    100      51       2.0    48.1        floor     <- the old placeholder
+
+    Invariant for EVERY input: ``max_z_height - z <= clear_above_mm``. It survives the
+    floor because the floor can only bind when ``max_z_height < target + 2`` and the
+    target is already at most the ceiling, so the part top it leaves is below it too.
+
+    There is deliberately NO ``z_travel_mm`` bound: the setting's own ``ge=-50`` keeps
+    every reachable hold above the vendor's end-block park (``max_z/2 + 98``, ≥ 108 for
+    any admitted part, against ``z <= max_z + 50 <= 105``), so a hold is always a RAISED
+    plate and a travel bound would be a guard for a state no input can reach.
+
+    Both scalars arrive as arguments rather than as a geometry attribute and a settings
+    read on purpose — the registry column and the settings key that carry them are owned
+    elsewhere, and the generator must not take a dependency on either name to compute a
+    height.
     """
-    return max(HOLD_Z_MIN_MM, max_z_height - clear_above_mm)
+    target = min(part_top_mm, clear_above_mm)  # ceiling: never past the witnessed clear zone
+    z = max_z_height - target
+    bound: HoldBound = "target" if part_top_mm <= clear_above_mm else "ceiling"
+    if z < HOLD_Z_MIN_MM:  # floor: the plate never closer to the plane than this
+        z, bound = HOLD_Z_MIN_MM, "floor"
+    return HoldPlacement(z=z, part_top_mm=max_z_height - z, bound=bound)
 
 
-def cooldown_hold_lines(max_z_height: float, profile: EjectProfile, clear_above_mm: float) -> list[str]:
+def cooldown_hold_lines(
+    max_z_height: float, profile: EjectProfile, clear_above_mm: float, part_top_mm: float
+) -> tuple[list[str], HoldPlacement]:
     """The COOLDOWN HOLD command block: transit clear, park at the chute, hold, release.
 
-    Sent over the G-code line channel while a finished plate waits out its cooldown, so
-    that when the eject job finally runs the plate is already near the nozzle plane and
-    the eject's first Z move is ONE flow from there.
+        Sent over the G-code line channel while a finished plate waits out its cooldown, so
+        that when the eject job finally runs the plate is already near the nozzle plane and
+        the eject's first Z move is ONE flow from there.
 
-    The lines, and what each rests on::
+        The lines, and what each rests on::
 
-        M17                     ; motors back on after the stock shutdown's M18
-        G90                     ; absolute
-        G1 Z{park_z} F900       ; TRANSIT: max(lift_z, PARK_Z_MM) — the same height the
-                                ;   eject block's own park uses, so the toolhead's
-                                ;   traverse to the chute clears the part exactly as the
-                                ;   post-sweep traverse does. It is never TIGHTER than
-                                ;   the vendor's own precondition either: the stock end
-                                ;   block runs its ``G150.3`` at ``max_layer_z + 10``.
-        M400
-        G150.3                  ; vendor macro: toolhead to the chute park
-        M400
-        G1 Z{hold_z} F900       ; HOLD (see :func:`hold_z`)
-        M400
-        M18                     ; motors off again — the hold is a parked state, not a
-                                ;   held position under current
+            M17                     ; motors back on after the stock shutdown's M18
+            G90                     ; absolute
+            G1 Z{park_z} F900       ; TRANSIT: max(lift_z, PARK_Z_MM) — the same height the
+                                    ;   eject block's own park uses, so the toolhead's
+                                    ;   traverse to the chute clears the part exactly as the
+                                    ;   post-sweep traverse does. It is never TIGHTER than
+                                    ;   the vendor's own precondition either: the stock end
+                                    ;   block runs its ``G150.3`` at ``max_layer_z + 10``.
+            M400
+            G150.3                  ; vendor macro: toolhead to the chute park
+            M400
+            G1 Z{placement.z} F900  ; HOLD (see :func:`hold_placement`)
+            M400
+            M18                     ; motors off again — the hold is a parked state, not a
+                                    ;   held position under current
 
-    ``G150.3`` is the farm's FIRST proprietary-macro emission, and it is admissible only
-    because it copies the vendor's own verbatim end-block state: by cooldown time the
-    stock end block has already run ``T65535`` and ``G150.2``, and the vendor's own
-    ``G150.3`` runs at exactly that machine state. It is COMMANDED rather than assumed
-    because :class:`PrinterState` carries no toolhead XY — a screen jog, or a re-entry
-    into the hold from an already-held plate, would otherwise move the bed toward a
-    toolhead nobody can see, and fail silently.
+    The placement is evaluated ONCE, here, and returned beside the lines: the caller
+    records what was SENT rather than re-deriving it, so the commanded Z, the Z the eject
+    estimator is seeded from and the Z the operator's card renders can never diverge.
 
-    This block deliberately does NOT pass :func:`~backend.app.services.eject.validator.
-    validate_eject_gcode`: that validator's subject is the eject BLOCK (a home, a sweep,
-    a park, an envelope), none of which this is. Its safety comes from the same two
-    functions the eject itself uses for every coordinate it emits — :func:`park_z` and
-    :func:`hold_z` — and its one refusal is :func:`part_height_error`, the same sentence
-    the generator raises.
+        ``G150.3`` is the farm's FIRST proprietary-macro emission, and it is admissible only
+        because it copies the vendor's own verbatim end-block state: by cooldown time the
+        stock end block has already run ``T65535`` and ``G150.2``, and the vendor's own
+        ``G150.3`` runs at exactly that machine state. It is COMMANDED rather than assumed
+        because :class:`PrinterState` carries no toolhead XY — a screen jog, or a re-entry
+        into the hold from an already-held plate, would otherwise move the bed toward a
+        toolhead nobody can see, and fail silently.
 
-    Raises:
-        EjectGenerationError: the part is taller than the profile's guard.
+        This block deliberately does NOT pass :func:`~backend.app.services.eject.validator.
+        validate_eject_gcode`: that validator's subject is the eject BLOCK (a home, a sweep,
+        a park, an envelope), none of which this is. Its safety comes from the same two
+        functions the eject itself uses for every coordinate it emits — :func:`park_z` and
+        :func:`hold_placement` — and its one refusal is :func:`part_height_error`, the same
+        sentence the generator raises.
+
+        On an assist-OFF eject profile a target below ``-clearance_mm`` holds the plate
+        LOWER than that block's own ``lift_z``, so the eject's first Z move then travels
+        toward the nozzle instead of away from it — the reverse of the assist-ON flow, and
+        safe: the toolhead is at the chute for the whole hold, and the target keeps the part
+        top at least ``clearance_mm`` under the lift height the block moves to.
+
+        Raises:
+            EjectGenerationError: the part is taller than the profile's guard.
     """
     height_error = part_height_error(max_z_height, profile)
     if height_error is not None:
         raise EjectGenerationError(height_error)
-    return [
+    placement = hold_placement(max_z_height, clear_above_mm, part_top_mm)
+    lines = [
         "M17",
         "G90",
         f"G1 Z{_fmt(park_z(max_z_height, profile))} F900 ; transit: never tighter than the vendor's own "
@@ -521,11 +597,12 @@ def cooldown_hold_lines(max_z_height: float, profile: EjectProfile, clear_above_
         "M400",
         "G150.3 ; vendor macro: toolhead to the chute park (the end block's own last travel)",
         "M400",
-        f"G1 Z{_fmt(hold_z(max_z_height, clear_above_mm))} F900 ; hold: part top "
-        f"{_fmt(clear_above_mm)} mm above the nozzle plane at most",
+        f"G1 Z{_fmt(placement.z)} F900 ; hold: part top {_fmt(placement.part_top_mm)} mm above the nozzle plane "
+        f"(target {_fmt(part_top_mm)}, clear {_fmt(clear_above_mm)}, bound {placement.bound})",
         "M400",
         "M18",
     ]
+    return lines, placement
 
 
 @dataclass(frozen=True)

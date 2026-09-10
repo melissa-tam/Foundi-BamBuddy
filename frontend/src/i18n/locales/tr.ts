@@ -636,11 +636,10 @@ export default {
     progress: '%{{percent}} tamamlandı',
     timeRemaining: '{{time}} kaldı',
     deleteConfirm: '"{{name}}" silmek istediğinizden emin misiniz?',
-    maintenanceOk: 'Bakım Tamam',
-    maintenanceWarning: '{{count}} uyarı',
-    maintenanceWarning_plural: '{{count}} uyarı',
-    maintenanceDue: '{{count}} bekliyor',
-    maintenanceDue_plural: '{{count}} bekliyor',
+    maintenanceWarning_one: '{{count}} uyarı',
+    maintenanceWarning_other: '{{count}} uyarı',
+    maintenanceDue_one: '{{count}} bekliyor',
+    maintenanceDue_other: '{{count}} bekliyor',
     // Sıralama seçenekleri
     sort: {
       name: 'Ad',
@@ -959,8 +958,8 @@ export default {
     },
     // Kuyruk bilgisi
     queue: {
-      inQueue: 'Kuyrukta {{count}} baskı',
-      inQueue_plural: 'Kuyrukta {{count}} baskı',
+      inQueue_one: 'Kuyrukta {{count}} baskı',
+      inQueue_other: 'Kuyrukta {{count}} baskı',
     },
     // Kontroller bölümü
     controls: 'Kontroller',
@@ -1446,8 +1445,8 @@ export default {
       title: 'Önizleme için plaka seçin',
       hint: 'Bu arşivde birden fazla plaka var. GCode görüntüleyicide açmak için birini seçin.',
       plateLabel: 'Plaka {{index}}',
-      objectCount: '{{count}} nesne',
-      objectCount_plural: '{{count}} nesne',
+      objectCount_one: '{{count}} nesne',
+      objectCount_other: '{{count}} nesne',
       noGcode: "Bu arşivin önizleme için dilimlenmiş G-kodu yok. Önce dilimlemek için Bambu Studio'da açın.",
     },
     card: {
@@ -1672,8 +1671,8 @@ export default {
     printingInProgress: 'Baskı devam ediyor...',
     viewArchive: 'Arşivi görüntüle',
     viewInFileManager: 'Dosya Yöneticisinde görüntüle',
-    itemCount: '{{count}} öğe',
-    itemCount_plural: '{{count}} öğe',
+    itemCount_one: '{{count}} öğe',
+    itemCount_other: '{{count}} öğe',
     dragToReorder: 'Yeniden sıralamak için sürükleyin (yalnızca ASAP)',
     reorderHint: 'Konum yalnızca ASAP öğelerini etkiler. Zamanlanmış öğeler belirlenen zamanlarında çalışır.',
     sjf: {
@@ -1695,10 +1694,10 @@ export default {
     cancelBatchConfirmMessage: 'Bu yığındaki tüm bekleyen öğeler iptal edilsin mi?',
     batch: {
       defaultName: 'Yığın',
-      label: '{{count}} öğe',
-      label_plural: '{{count}} öğe',
-      pendingCount: '{{count}} bekleyen',
-      pendingCount_plural: '{{count}} bekleyen',
+      label_one: '{{count}} öğe',
+      label_other: '{{count}} öğe',
+      pendingCount_one: '{{count}} bekleyen',
+      pendingCount_other: '{{count}} bekleyen',
       expand: 'Yığını genişlet',
       collapse: 'Yığını daralt',
       groupAsBatch: 'Yığın olarak grupla…',
@@ -1727,8 +1726,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}} öğe',
-      batch: '{{name}} ({{count}} kopya)',
-      batch_plural: '{{name}} ({{count}} kopya)',
+      batch_one: '{{name}} ({{count}} kopya)',
+      batch_other: '{{name}} ({{count}} kopya)',
     },
     // Bölümler
     sections: {
@@ -1812,8 +1811,8 @@ export default {
     },
     // Toplu düzenleme
     bulkEdit: {
-      title: '{{count}} Öğeyi Düzenle',
-      title_plural: '{{count}} Öğeyi Düzenle',
+      title_one: '{{count}} Öğeyi Düzenle',
+      title_other: '{{count}} Öğeyi Düzenle',
       description: 'Yalnızca değiştirilen ayarlar seçili öğelere uygulanacak.',
       printer: 'Yazıcı',
       noChange: '— Değişiklik yok —',
@@ -2045,10 +2044,10 @@ export default {
     title: 'Bakım',
     overview: 'Genel Bakış',
     allOk: 'Tüm bakım güncel',
-    dueCount: '{{count}} öğe bekliyor',
-    dueCount_plural: '{{count}} öğe bekliyor',
-    warningCount: '{{count}} uyarı',
-    warningCount_plural: '{{count}} uyarı',
+    dueCount_one: '{{count}} öğe bekliyor',
+    dueCount_other: '{{count}} öğe bekliyor',
+    warningCount_one: '{{count}} uyarı',
+    warningCount_other: '{{count}} uyarı',
     totalPrintTime: 'Toplam Baskı Süresi',
     nextMaintenance: 'Sonraki Bakım',
     nothingDue: 'Bekleyen yok',
@@ -2679,6 +2678,10 @@ export default {
     farmCooldownPlateauMarginHelp: 'Soğuma durursa ancak tabla çıkarma sıcaklığının bu kadar derece içindeyse, soğumuş kabul edilip çıkarılır; bundan daha sıcak takılı kalırsa yazıcı karantinaya alınır.',
     farmCooldownAuxFan: 'Soğuma sırasında yardımcı fan (%)',
     farmCooldownAuxFanHelp: 'Baskı bittiğinden çıkarma gönderilene kadar yazıcının yardımcı fanını bu hızda çalıştırır. 0 kapatır.',
+    farmCooldownHoldEnabled: 'Soğuma sırasında tablayı fanın hizasında tut',
+    farmCooldownHoldEnabledHelp: 'Parça soğurken takım kafası oluğa park etmiş haldeyken tablayı nozul düzlemine doğru kaldırır. Kapalıyken tabla baskının bittiği yerde kalır.',
+    farmCooldownHoldPartTop: 'Nozul düzleminin üstünde parça tepesi (mm)',
+    farmCooldownHoldPartTopHelp: 'Parça soğurken tablanın tutulacağı yeri, nozul düzlemindeki yardımcı fan akışının üstünde kalan parça tepesinin yüksekliği olarak belirler. 100, tablayı fanın hizasında tutar ve parça nozulun üstündeki boş bölgeye yükselir. 0, parça tepesini fan hizasına getirir. 0 altındaki değerler parçayı fanın o kadar altında tutar, böylece hava üzerinden geçer. Yazıcı modelinin ölçülen boş yüksekliğiyle sınırlıdır.',
     respoolPromptThreshold: 'Yeniden makara gözlem eşiği (g)',
     respoolPromptThresholdHelp: 'Yeniden kullanılan bir Bambu etiketi geldiğinde kaynak makarada bu kadar veya daha az gram kaldıysa ve donanımla kesinleşmiş tükenme işareti yoksa bir yeniden makara gözlemi günlüğe yazılır (0–1000).',
     farmUsbAutoCleanup: 'Dolduğunda USB\'yi otomatik temizle',
@@ -4890,9 +4893,6 @@ export default {
       slot: 'Bu yuvadaki sonuncu',
       ams: 'Bu AMS içindeki sonuncu',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '{{count}} boş makara gizlendi',
     assignEmptyHidden_other: '{{count}} boş makara gizlendi',
     spoolmanSpools: 'Spoolman Makaraları',
@@ -5785,11 +5785,11 @@ export default {
     plates: 'Plakalar',
     allPlates: 'Tüm Plakalar',
     plateNumber: 'Plaka {{number}}',
-    plateCount: '{{count}} plaka',
+    plateCount_one: '{{count}} plaka',
     plateCount_other: '{{count}} plaka',
-    objectCount: '{{count}} nesne',
+    objectCount_one: '{{count}} nesne',
     objectCount_other: '{{count}} nesne',
-    filamentCount: '{{count}} filament',
+    filamentCount_one: '{{count}} filament',
     filamentCount_other: '{{count}} filament',
     eta: 'ETA {{minutes}} dk',
     noPreview: 'Bu dosya için önizleme yok',

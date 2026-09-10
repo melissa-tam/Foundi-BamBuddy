@@ -1,11 +1,16 @@
-// Verifies parity across locale files (en / de / fr / it / ja / pt-BR / zh-CN / zh-TW):
-//   1. Leaf-key sets are identical
-//   2. Each leaf's {{placeholder}} set is identical
-//   3. Plural suffixes: every en key ending in _plural / _one / _other must
-//      exist in every other locale, and other locales must not introduce an
-//      _one key that en does not have.
-//   4. NEW: leaves in a non-English locale must not be identical to en, unless
-//      the value is a brand name / technical token / pure punctuation, OR the
+// Verifies parity across every locale file discovered in src/i18n/locales
+// (today: en / de / es / fr / it / ja / ko / pt-BR / tr / zh-CN / zh-TW), with
+// en as the reference:
+//   1. Leaf-key sets are identical to en's, in both directions (missing / extra).
+//   2. Each leaf's {{placeholder}} set is identical to en's.
+//   3. Plural SHAPE, on en only — one sanctioned pair per family and nothing
+//      else: `base_one` + `base_other`, no `base_plural` (i18next 25 with
+//      `compatibilityJSON` unset never resolves it — see src/i18n/index.ts), no
+//      `_zero`/`_two`/`_few`/`_many`, no half pair, and no bare `base` sibling
+//      masking a missing form as the singular. Check 1 propagates the shape to
+//      the other ten locales, so stating it once on en states it everywhere.
+//   4. Leaves in a non-English locale must not be identical to en, unless the
+//      value is a brand name / technical token / pure punctuation, OR the
 //      key+locale pair is explicitly listed in IDENTICAL_TO_EN_ALLOWED below.
 //      Catches the "copy English text into non-English locale to satisfy the
 //      key-count parity gate" anti-pattern that accumulated 700+ shipped
@@ -14,6 +19,9 @@
 // Malformed input (missing `export default`, parse errors, non-string leaves,
 // unsupported property kinds) fails loudly instead of silently passing the gate.
 // Exits 1 with a diagnostic report on any failure, else exits 0.
+// `compareLocales` and `loadLocale` are exported: src/__tests__/i18n runs this
+// same implementation in the Vitest watch loop, and the runtime counterpart
+// (that the surviving shape actually renders a plural) is plurals.test.ts.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -74,7 +82,10 @@ function extractStringValue(node, keyPath) {
   process.exit(1);
 }
 
-function loadLocale(filePath) {
+// The one leaf extractor for locale files: full dotted key -> string value.
+// Exported so the Vitest suites read the same map the gate does (no second
+// flattener can drift from this one).
+export function loadLocale(filePath) {
   const src = fs.readFileSync(filePath, 'utf8');
   const sf = ts.createSourceFile(filePath, src, ts.ScriptTarget.Latest, true);
   if (sf.parseDiagnostics && sf.parseDiagnostics.length > 0) {
@@ -384,6 +395,11 @@ const IDENTICAL_TO_EN_ALLOWED = {
   tr: new Set(TR_COGNATES),
 };
 
+// CLDR forms i18next would resolve, or that other i18n stacks use, but that this
+// app does not sanction: check 1 mirrors every en key into all 11 locales, and a
+// form that CLDR never selects in most of them is dead the same way `_plural` is.
+const UNSUPPORTED_PLURAL_SUFFIXES = ['_zero', '_two', '_few', '_many'];
+
 // Pure comparison logic, exported so tests can verify each failure mode
 // without going through file IO or the TypeScript parser.
 // Input:  locales = { code: Map<leafKey, leafString> }  (must contain 'en')
@@ -425,22 +441,46 @@ export function compareLocales(locales) {
     add(`${code}: placeholder mismatch vs en`, mismatches);
   }
 
-  // Check 3: plural suffix presence + reverse _one guard
-  for (const [code, map] of Object.entries(locales)) {
-    if (code === 'en') continue;
-    const pluralIssues = [];
-    for (const key of enKeys) {
-      if (key.endsWith('_plural') && !map.has(key)) pluralIssues.push(`missing _plural key: ${key}`);
-      if (key.endsWith('_one') && !map.has(key)) pluralIssues.push(`missing _one key: ${key}`);
-      if (key.endsWith('_other') && !map.has(key)) pluralIssues.push(`missing _other key: ${key}`);
+  // Check 3: plural SHAPE — evaluated on en ONLY.
+  // i18next 25 with `compatibilityJSON` unset resolves `_one` / `_other` and
+  // nothing else (statement + citation above `.init({` in src/i18n/index.ts).
+  // Check 1 already mirrors en's key set into every locale, so a shape stated
+  // once on en is a shape enforced in all 11 — running this per locale would
+  // turn one defect into 11 identical reports while never checking en itself.
+  const shapeIssues = [];
+  for (const key of enKeys) {
+    if (key.endsWith('_plural')) {
+      shapeIssues.push(
+        `dead plural suffix (i18next 25 resolves only _one/_other — see src/i18n/index.ts): ${key}`,
+      );
+      continue;
     }
-    for (const key of map.keys()) {
-      if (key.endsWith('_one') && !enKeys.has(key)) {
-        pluralIssues.push(`unexpected _one not present in en: ${key}`);
+    const unsupported = UNSUPPORTED_PLURAL_SUFFIXES.find((s) => key.endsWith(s));
+    if (unsupported) {
+      shapeIssues.push(
+        `unsupported plural form (only _one/_other are sanctioned; check 1 mirrors every key ` +
+        `into 11 locales, so a form CLDR selects in few or none of them is dead the same way ` +
+        `_plural is — widen check 3 deliberately): ${key}`,
+      );
+      continue;
+    }
+    if (key.endsWith('_one')) {
+      if (!enKeys.has(`${key.slice(0, -'_one'.length)}_other`)) {
+        shapeIssues.push(`_one without _other: ${key}`);
       }
+      continue;
     }
-    add(`${code}: plural key mismatch`, pluralIssues);
+    if (key.endsWith('_other')) {
+      if (!enKeys.has(`${key.slice(0, -'_other'.length)}_one`)) {
+        shapeIssues.push(`_other without _one: ${key}`);
+      }
+      continue;
+    }
+    if (enKeys.has(`${key}_one`) || enKeys.has(`${key}_other`)) {
+      shapeIssues.push(`bare sibling of plural pair (masks a missing form as the singular): ${key}`);
+    }
   }
+  add('en: plural shape', shapeIssues);
 
   // Check 4: identical-to-en leaks. A non-English leaf whose value exactly
   // matches en.ts must either pass the always-allowed heuristic OR be listed

@@ -2518,11 +2518,7 @@ export function QueuePage() {
                         <div className="flex items-center gap-3 px-3 py-2 bg-bambu-dark-secondary border-2 border-cyan-600 dark:border-cyan-400 rounded-lg shadow-2xl">
                           <Package className="w-4 h-4 text-cyan-700 dark:text-cyan-300" />
                           <span className="text-sm text-white font-medium">
-                            {t('queue.dragGhost.batch', {
-                              defaultValue: '{{name}} ({{count}} copies)',
-                              name,
-                              count: siblings.length,
-                            })}
+                            {t('queue.dragGhost.batch', { name, count: siblings.length })}
                           </span>
                         </div>
                       );

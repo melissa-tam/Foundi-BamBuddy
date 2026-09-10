@@ -32,6 +32,12 @@ const resources = {
 const SUPPORTED_LNGS = ['en', 'de', 'es', 'fr', 'ja', 'it', 'ko', 'pt-BR', 'tr', 'zh-CN', 'zh-TW'];
 const APPLIANCE_CONSUMED_KEY = 'bambuddy_appliance_locale_consumed';
 
+// Plural suffixes: `compatibilityJSON` is deliberately left unset, so i18next 25
+// runs JSON v4 and resolves `<key>_one` / `<key>_other` (via Intl.PluralRules)
+// and nothing else — a `<key>_plural` never resolves and silently renders the
+// singular at every count. `scripts/check-i18n-parity.mjs` check 3 refuses that
+// shape on disk; `src/__tests__/i18n/plurals.test.ts` proves this instance still
+// selects the right form at runtime.
 i18n
   .use(LanguageDetector)
   .use(initReactI18next)

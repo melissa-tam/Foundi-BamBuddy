@@ -636,11 +636,10 @@ export default {
     progress: '{{percent}}% completato',
     timeRemaining: '{{time}} rimanente',
     deleteConfirm: 'Sei sicuro di eliminare "{{name}}"?',
-    maintenanceOk: 'Manutenzione OK',
-    maintenanceWarning: '{{count}} avviso',
-    maintenanceWarning_plural: '{{count}} avvisi',
-    maintenanceDue: '{{count}} in scadenza',
-    maintenanceDue_plural: '{{count}} in scadenza',
+    maintenanceWarning_one: '{{count}} avviso',
+    maintenanceWarning_other: '{{count}} avvisi',
+    maintenanceDue_one: '{{count}} in scadenza',
+    maintenanceDue_other: '{{count}} in scadenza',
     // Sort options
     sort: {
       name: 'Nome',
@@ -959,8 +958,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: '{{count}} stampa in coda',
-      inQueue_plural: '{{count}} stampe in coda',
+      inQueue_one: '{{count}} stampa in coda',
+      inQueue_other: '{{count}} stampe in coda',
     },
     // Controls section
     controls: 'Controlli',
@@ -1446,8 +1445,8 @@ export default {
       title: 'Seleziona la piastra da visualizzare',
       hint: 'Questo archivio contiene più piastre. Scegline una da aprire nel visualizzatore GCode.',
       plateLabel: 'Piastra {{index}}',
-      objectCount: '{{count}} oggetto',
-      objectCount_plural: '{{count}} oggetti',
+      objectCount_one: '{{count}} oggetto',
+      objectCount_other: '{{count}} oggetti',
       noGcode: 'Questo archivio non contiene G-code generato da visualizzare. Aprilo prima in Bambu Studio per sezionarlo.',
     },
     card: {
@@ -1672,8 +1671,8 @@ export default {
     printingInProgress: 'Stampa in corso...',
     viewArchive: 'Vedi archivio',
     viewInFileManager: 'Vedi nel Gestore file',
-    itemCount: '{{count}} elemento',
-    itemCount_plural: '{{count}} elementi',
+    itemCount_one: '{{count}} elemento',
+    itemCount_other: '{{count}} elementi',
     dragToReorder: 'Trascina per riordinare (solo ASAP)',
     reorderHint: 'La posizione influisce solo sugli elementi ASAP. Quelli programmati partono all\'orario.',
     sjf: {
@@ -1695,10 +1694,10 @@ export default {
     cancelBatchConfirmMessage: 'Annullare tutti gli elementi in sospeso rimanenti in questo lotto?',
     batch: {
       defaultName: 'Lotto',
-      label: '{{count}} elemento',
-      label_plural: '{{count}} elementi',
-      pendingCount: '{{count}} in attesa',
-      pendingCount_plural: '{{count}} in attesa',
+      label_one: '{{count}} elemento',
+      label_other: '{{count}} elementi',
+      pendingCount_one: '{{count}} in attesa',
+      pendingCount_other: '{{count}} in attesa',
       expand: 'Espandi lotto',
       collapse: 'Comprimi lotto',
       groupAsBatch: 'Raggruppa come lotto…',
@@ -1727,8 +1726,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}} elementi',
-      batch: '{{name}} ({{count}} copia)',
-      batch_plural: '{{name}} ({{count}} copie)',
+      batch_one: '{{name}} ({{count}} copia)',
+      batch_other: '{{name}} ({{count}} copie)',
     },
     // Sections
     sections: {
@@ -1812,8 +1811,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: 'Modifica {{count}} elemento',
-      title_plural: 'Modifica {{count}} elementi',
+      title_one: 'Modifica {{count}} elemento',
+      title_other: 'Modifica {{count}} elementi',
       description: 'Solo le impostazioni modificate saranno applicate agli elementi selezionati.',
       printer: 'Stampante',
       noChange: '— Nessun cambio —',
@@ -2043,10 +2042,10 @@ export default {
     title: 'Manutenzione',
     overview: 'Panoramica',
     allOk: 'Tutta la manutenzione aggiornata',
-    dueCount: '{{count}} elemento in scadenza',
-    dueCount_plural: '{{count}} elementi in scadenza',
-    warningCount: '{{count}} avviso',
-    warningCount_plural: '{{count}} avvisi',
+    dueCount_one: '{{count}} elemento in scadenza',
+    dueCount_other: '{{count}} elementi in scadenza',
+    warningCount_one: '{{count}} avviso',
+    warningCount_other: '{{count}} avvisi',
     totalPrintTime: 'Tempo totale di stampa',
     nextMaintenance: 'Prossima manutenzione',
     nothingDue: 'Niente in scadenza',
@@ -2631,6 +2630,10 @@ export default {
     farmCooldownPlateauMarginHelp: 'Se il raffreddamento si blocca ma il piatto è entro questi gradi dalla temperatura di espulsione, trattalo come raffreddato ed espelli; se resta più caldo, la stampante va in quarantena.',
     farmCooldownAuxFan: 'Ventola ausiliaria durante il raffreddamento (%)',
     farmCooldownAuxFanHelp: 'Fa girare la ventola ausiliaria della stampante a questa velocità dalla fine della stampa fino all\'invio dell\'espulsione. 0 la disattiva.',
+    farmCooldownHoldEnabled: 'Mantieni il piatto alla ventola durante il raffreddamento',
+    farmCooldownHoldEnabledHelp: 'Solleva il piatto verso il piano dell\'ugello con la testa parcheggiata allo scivolo mentre il pezzo si raffredda. Disattivato lascia il piatto dove è terminata la stampa.',
+    farmCooldownHoldPartTop: 'Sommità del pezzo sopra il piano dell\'ugello (mm)',
+    farmCooldownHoldPartTopHelp: 'Imposta dove viene mantenuto il piatto mentre il pezzo si raffredda, come altezza della sommità del pezzo sopra il flusso della ventola ausiliaria sul piano dell\'ugello. 100 mantiene il piatto alla ventola con il pezzo che sale nella zona libera sopra l\'ugello. 0 porta la sommità del pezzo al livello della ventola. Sotto 0 mantiene il pezzo a quella distanza sotto la ventola, così l\'aria passa sopra. Limitato all\'altezza libera misurata del modello di stampante.',
     respoolPromptThreshold: 'Soglia di osservazione riassegnazione (g)',
     respoolPromptThresholdHelp: 'Registra un\'osservazione di riassegnazione quando arriva un tag Bambu riutilizzato e alla bobina di origine restano questi grammi o meno senza un marcatore di esaurimento certificato dall\'hardware (0–1000).',
     farmUsbAutoCleanup: 'Pulisci automaticamente l\'USB quando è pieno',
@@ -4889,9 +4892,6 @@ export default {
       slot: 'Ultima in questo slot',
       ams: 'Ultima in questo AMS',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '{{count}} bobina vuota nascosta',
     assignEmptyHidden_other: '{{count}} bobine vuote nascoste',
     spoolmanSpools: 'Bobine Spoolman',
@@ -5809,11 +5809,11 @@ export default {
     plates: 'Piatti',
     allPlates: 'Tutti i piatti',
     plateNumber: 'Piatto {{number}}',
-    plateCount: '{{count}} piatto',
+    plateCount_one: '{{count}} piatto',
     plateCount_other: '{{count}} piatti',
-    objectCount: '{{count}} oggetto',
+    objectCount_one: '{{count}} oggetto',
     objectCount_other: '{{count}} oggetti',
-    filamentCount: '{{count}} filamento',
+    filamentCount_one: '{{count}} filamento',
     filamentCount_other: '{{count}} filamenti',
     eta: 'ETA {{minutes}} min',
     noPreview: 'Nessuna anteprima disponibile per questo file',

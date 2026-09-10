@@ -636,11 +636,10 @@ export default {
     progress: '{{percent}}% 完成',
     timeRemaining: '剩余 {{time}}',
     deleteConfirm: '确定要删除"{{name}}"吗？',
-    maintenanceOk: '维护正常',
-    maintenanceWarning: '{{count}} 个警告',
-    maintenanceWarning_plural: '{{count}} 个警告',
-    maintenanceDue: '{{count}} 个到期',
-    maintenanceDue_plural: '{{count}} 个到期',
+    maintenanceWarning_one: '{{count}} 个警告',
+    maintenanceWarning_other: '{{count}} 个警告',
+    maintenanceDue_one: '{{count}} 个到期',
+    maintenanceDue_other: '{{count}} 个到期',
     // Sort options
     sort: {
       name: '名称',
@@ -959,8 +958,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: '队列中有 {{count}} 个打印任务',
-      inQueue_plural: '队列中有 {{count}} 个打印任务',
+      inQueue_one: '队列中有 {{count}} 个打印任务',
+      inQueue_other: '队列中有 {{count}} 个打印任务',
     },
     // Controls section
     controls: '控制',
@@ -1446,8 +1445,8 @@ export default {
       title: '选择要预览的打印板',
       hint: '此存档包含多个打印板。选择一个在 GCode 查看器中打开。',
       plateLabel: '打印板 {{index}}',
-      objectCount: '{{count}} 个对象',
-      objectCount_plural: '{{count}} 个对象',
+      objectCount_one: '{{count}} 个对象',
+      objectCount_other: '{{count}} 个对象',
       noGcode: '此存档没有可预览的已切片 G 代码。请先在 Bambu Studio 中打开并切片。',
     },
     card: {
@@ -1672,8 +1671,8 @@ export default {
     printingInProgress: '打印进行中...',
     viewArchive: '查看归档',
     viewInFileManager: '在文件管理器中查看',
-    itemCount: '{{count}} 个项目',
-    itemCount_plural: '{{count}} 个项目',
+    itemCount_one: '{{count}} 个项目',
+    itemCount_other: '{{count}} 个项目',
     dragToReorder: '拖动以重新排序（仅限尽快）',
     reorderHint: '位置仅影响"尽快"项目。排程项目按设定时间运行。',
     sjf: {
@@ -1695,10 +1694,10 @@ export default {
     cancelBatchConfirmMessage: '取消此批次中所有剩余的待处理项目？',
     batch: {
       defaultName: '批次',
-      label: '{{count}} 项',
-      label_plural: '{{count}} 项',
-      pendingCount: '{{count}} 待处理',
-      pendingCount_plural: '{{count}} 待处理',
+      label_one: '{{count}} 项',
+      label_other: '{{count}} 项',
+      pendingCount_one: '{{count}} 待处理',
+      pendingCount_other: '{{count}} 待处理',
       expand: '展开批次',
       collapse: '折叠批次',
       groupAsBatch: '组合为批次…',
@@ -1727,8 +1726,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}} 项',
-      batch: '{{name}}（{{count}} 份）',
-      batch_plural: '{{name}}（{{count}} 份）',
+      batch_one: '{{name}}（{{count}} 份）',
+      batch_other: '{{name}}（{{count}} 份）',
     },
     // Sections
     sections: {
@@ -1812,8 +1811,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: '编辑 {{count}} 个项目',
-      title_plural: '编辑 {{count}} 个项目',
+      title_one: '编辑 {{count}} 个项目',
+      title_other: '编辑 {{count}} 个项目',
       description: '仅更改的设置将应用于所选项目。',
       printer: '打印机',
       noChange: '— 不更改 —',
@@ -2043,10 +2042,10 @@ export default {
     title: '维护',
     overview: '概览',
     allOk: '所有维护均已完成',
-    dueCount: '{{count}} 项到期',
-    dueCount_plural: '{{count}} 项到期',
-    warningCount: '{{count}} 个警告',
-    warningCount_plural: '{{count}} 个警告',
+    dueCount_one: '{{count}} 项到期',
+    dueCount_other: '{{count}} 项到期',
+    warningCount_one: '{{count}} 个警告',
+    warningCount_other: '{{count}} 个警告',
     totalPrintTime: '总打印时间',
     nextMaintenance: '下次维护',
     nothingDue: '无到期项目',
@@ -2676,6 +2675,10 @@ export default {
     farmCooldownPlateauMarginHelp: '若降温停滞但热床处于取件温度的该温差范围内，则视为已冷却并取件；若卡在更高温度，则将打印机隔离。',
     farmCooldownAuxFan: '冷却期间的辅助风扇 (%)',
     farmCooldownAuxFanHelp: '从打印结束到取件下发期间，以此转速运行打印机的辅助风扇。0 表示关闭。',
+    farmCooldownHoldEnabled: '冷却期间将热床保持在风扇处',
+    farmCooldownHoldEnabledHelp: '在零件冷却期间，将工具头停靠在落料口，并把热床抬升至喷嘴平面。关闭时热床停在打印结束的位置。',
+    farmCooldownHoldPartTop: '零件顶部高于喷嘴平面的高度 (mm)',
+    farmCooldownHoldPartTopHelp: '设置零件冷却期间热床的保持位置，即零件顶部高于喷嘴平面处辅助风扇气流的高度。100 表示热床停在风扇处，零件伸入喷嘴上方的空隙区。0 表示零件顶部与风扇平齐。低于 0 表示零件顶部位于风扇下方该距离处，气流从其上方经过。上限为该打印机型号实测的空隙高度。',
     respoolPromptThreshold: '重新绑定观察阈值 (g)',
     respoolPromptThresholdHelp: '当重复使用的 Bambu 标签出现、供体料卷剩余不超过这么多克且没有硬件确认的用尽标记时，记录一条重新绑定观察日志（0–1000）。',
     farmUsbAutoCleanup: '存储满时自动清理 USB',
@@ -4895,9 +4898,6 @@ export default {
       slot: '上次位于此槽位',
       ams: '上次位于此 AMS',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '已隐藏 {{count}} 个空耗材盘',
     assignEmptyHidden_other: '已隐藏 {{count}} 个空耗材盘',
     spoolmanSpools: 'Spoolman 线轴',
@@ -5809,11 +5809,11 @@ export default {
     plates: '板',
     allPlates: '所有板',
     plateNumber: '板 {{number}}',
-    plateCount: '{{count}} 个板',
+    plateCount_one: '{{count}} 个板',
     plateCount_other: '{{count}} 个板',
-    objectCount: '{{count}} 个对象',
+    objectCount_one: '{{count}} 个对象',
     objectCount_other: '{{count}} 个对象',
-    filamentCount: '{{count}} 种耗材',
+    filamentCount_one: '{{count}} 种耗材',
     filamentCount_other: '{{count}} 种耗材',
     eta: '预计 {{minutes}} 分钟',
     noPreview: '此文件无可用预览',

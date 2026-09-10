@@ -638,11 +638,10 @@ export default {
     progress: '{{percent}}% complete',
     timeRemaining: '{{time}} remaining',
     deleteConfirm: 'Are you sure you want to delete "{{name}}"?',
-    maintenanceOk: 'Maintenance OK',
-    maintenanceWarning: '{{count}} warning',
-    maintenanceWarning_plural: '{{count}} warnings',
-    maintenanceDue: '{{count}} due',
-    maintenanceDue_plural: '{{count}} due',
+    maintenanceWarning_one: '{{count}} warning',
+    maintenanceWarning_other: '{{count}} warnings',
+    maintenanceDue_one: '{{count}} due',
+    maintenanceDue_other: '{{count}} due',
     // Sort options
     sort: {
       name: 'Name',
@@ -967,8 +966,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: '{{count}} print in queue',
-      inQueue_plural: '{{count}} prints in queue',
+      inQueue_one: '{{count}} print in queue',
+      inQueue_other: '{{count}} prints in queue',
     },
     // Controls section
     controls: 'Controls',
@@ -1455,8 +1454,8 @@ export default {
       title: 'Select plate to preview',
       hint: 'This archive has multiple plates. Pick one to open in the GCode viewer.',
       plateLabel: 'Plate {{index}}',
-      objectCount: '{{count}} object',
-      objectCount_plural: '{{count}} objects',
+      objectCount_one: '{{count}} object',
+      objectCount_other: '{{count}} objects',
       noGcode: 'This archive has no sliced G-code to preview. Open it in Bambu Studio to slice first.',
     },
     card: {
@@ -1681,8 +1680,8 @@ export default {
     printingInProgress: 'Printing in progress...',
     viewArchive: 'View archive',
     viewInFileManager: 'View in File Manager',
-    itemCount: '{{count}} item',
-    itemCount_plural: '{{count}} items',
+    itemCount_one: '{{count}} item',
+    itemCount_other: '{{count}} items',
     dragToReorder: 'Drag to reorder (ASAP only)',
     reorderHint: 'Position only affects ASAP items. Scheduled items run at their set time.',
     sjf: {
@@ -1704,10 +1703,10 @@ export default {
     cancelBatchConfirmMessage: 'Cancel all remaining pending items in this batch?',
     batch: {
       defaultName: 'Batch',
-      label: '{{count}} item',
-      label_plural: '{{count}} items',
-      pendingCount: '{{count}} pending',
-      pendingCount_plural: '{{count}} pending',
+      label_one: '{{count}} item',
+      label_other: '{{count}} items',
+      pendingCount_one: '{{count}} pending',
+      pendingCount_other: '{{count}} pending',
       expand: 'Expand batch',
       collapse: 'Collapse batch',
       groupAsBatch: 'Group as batch…',
@@ -1742,8 +1741,8 @@ export default {
     // Drag ghost label when multi-dragging
     dragGhost: {
       multiCount: '{{count}} items',
-      batch: '{{name}} ({{count}} copy)',
-      batch_plural: '{{name}} ({{count}} copies)',
+      batch_one: '{{name}} ({{count}} copy)',
+      batch_other: '{{name}} ({{count}} copies)',
     },
     // Sections
     sections: {
@@ -1827,8 +1826,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: 'Edit {{count}} Item',
-      title_plural: 'Edit {{count}} Items',
+      title_one: 'Edit {{count}} Item',
+      title_other: 'Edit {{count}} Items',
       description: 'Only changed settings will be applied to selected items.',
       printer: 'Printer',
       noChange: '— No change —',
@@ -2060,10 +2059,10 @@ export default {
     title: 'Maintenance',
     overview: 'Overview',
     allOk: 'All maintenance up to date',
-    dueCount: '{{count}} item due',
-    dueCount_plural: '{{count}} items due',
-    warningCount: '{{count}} warning',
-    warningCount_plural: '{{count}} warnings',
+    dueCount_one: '{{count}} item due',
+    dueCount_other: '{{count}} items due',
+    warningCount_one: '{{count}} warning',
+    warningCount_other: '{{count}} warnings',
     totalPrintTime: 'Total Print Time',
     nextMaintenance: 'Next Maintenance',
     nothingDue: 'Nothing due',
@@ -2694,6 +2693,10 @@ export default {
     farmCooldownPlateauMarginHelp: 'If cooling stalls but the bed is within this many degrees of the eject temperature, treat it as cooled and eject; stuck hotter than that quarantines the printer.',
     farmCooldownAuxFan: 'Aux fan during cooldown (%)',
     farmCooldownAuxFanHelp: 'Runs the printer\'s auxiliary fan at this speed from the end of the print until the eject dispatches. 0 turns it off.',
+    farmCooldownHoldEnabled: 'Hold the plate at the fan during cooldown',
+    farmCooldownHoldEnabledHelp: 'Raises the plate toward the nozzle plane with the toolhead parked at the chute while the part cools. Off leaves the plate where the print ended.',
+    farmCooldownHoldPartTop: 'Part top above the nozzle plane (mm)',
+    farmCooldownHoldPartTopHelp: 'Sets where the plate is held while the part cools, as the height of the top of the part above the aux fan\'s stream at the nozzle plane. 100 holds the plate at the fan with the part rising into the clear zone above the nozzle. 0 puts the top of the part level with the fan. Below 0 holds the part that far under the fan so air moves over it. Capped at the printer model\'s measured clear height.',
     respoolPromptThreshold: 'Re-spool observation threshold (g)',
     respoolPromptThresholdHelp: 'Log a re-spool observation when a reused Bambu tag arrives with this many grams or fewer left on the donor spool and no hardware-certain spent marker (0–1000).',
     farmUsbAutoCleanup: 'Auto-clean USB when full',
@@ -4927,9 +4930,6 @@ export default {
       slot: 'Last in this slot',
       ams: 'Last in this AMS',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '{{count}} empty spool hidden',
     assignEmptyHidden_other: '{{count}} empty spools hidden',
     spoolmanSpools: 'Spoolman Spools',
@@ -5850,11 +5850,11 @@ export default {
     plates: 'Plates',
     allPlates: 'All Plates',
     plateNumber: 'Plate {{number}}',
-    plateCount: '{{count}} plate',
+    plateCount_one: '{{count}} plate',
     plateCount_other: '{{count}} plates',
-    objectCount: '{{count}} object',
+    objectCount_one: '{{count}} object',
     objectCount_other: '{{count}} objects',
-    filamentCount: '{{count}} filament',
+    filamentCount_one: '{{count}} filament',
     filamentCount_other: '{{count}} filaments',
     eta: 'ETA {{minutes}} min',
     noPreview: 'No preview available for this file',
