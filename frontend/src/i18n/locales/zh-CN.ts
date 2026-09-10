@@ -4889,6 +4889,17 @@ export default {
     assigning: '分配中...',
     searchSpools: '搜索耗材...',
     showAllSpools: '显示所有耗材',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: '上次位于此槽位',
+      ams: '上次位于此 AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '已隐藏 {{count}} 个空耗材盘',
+    assignEmptyHidden_other: '已隐藏 {{count}} 个空耗材盘',
     spoolmanSpools: 'Spoolman 线轴',
     allMaterials: '所有材料',
     filterByBrand: '按品牌筛选...',

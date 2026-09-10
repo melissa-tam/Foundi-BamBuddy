@@ -4895,6 +4895,17 @@ export default {
     assigning: '割り当て中...',
     searchSpools: 'スプールを検索...',
     showAllSpools: 'すべてのスプールを表示',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'このスロットで最後に使用',
+      ams: 'この AMS で最後に使用',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '空のスプール {{count}} 件を非表示',
+    assignEmptyHidden_other: '空のスプール {{count}} 件を非表示',
     spoolmanSpools: 'Spoolman スプール',
     allMaterials: 'すべての素材',
     filterByBrand: 'ブランドで絞り込み...',

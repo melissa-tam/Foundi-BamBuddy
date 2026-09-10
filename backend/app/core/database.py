@@ -4897,6 +4897,150 @@ async def run_migrations(conn):
     # reported on the live farm DB (see ``services.user_deletion``).
     await _safe_execute(conn, "DROP TABLE IF EXISTS sponsor_toast_state")
 
+    # Repair (2026-09-10): give the auto-minted tagless rows of the DEFAULT filament
+    # the brand and subtype their own mint owed them.
+    #
+    # Root cause: ``mint_tagless_spool``'s TRAY arm hardcoded ``brand = None`` while
+    # its DEFAULT arm read the setting's brand — two identities for one filament out
+    # of one function. Every farm-configured tagless tray reports
+    # ``tray_sub_brands=""`` on the wire, so ``parse_tray_fields`` yields no subtype
+    # either, and the row landed with both fields NULL. 208 of 269 ``ams_auto`` rows
+    # on the live farm are in that state, 205 of them the fleet default (PETG / GFG02
+    # / black). The operator-visible cost is not cosmetic: the inventory form requires
+    # brand AND subtype on every save, so "open in inventory → correct the weight →
+    # Save" silently did nothing on every one of those rows.
+    #
+    # Why corrected code cannot self-heal these forward — the ruling-9 test, answered
+    # honestly rather than assumed. The fixed mint DOES emit the pair, but only at the
+    # next MINT, and it cannot reach: (a) a row while it stays bound to its slot, which
+    # is days to weeks of printing; (b) an archived or spent row, which the operator
+    # still opens and edits; (c) a row the overcharge reconciler replaced through
+    # ``_mint_successor_row``, which INHERITS the departed row's NULL brand and so
+    # carries the defect forward across roll changes. Meanwhile the operator's edit is
+    # blocked today. That is the narrow case where a repair ships as a migration.
+    #
+    # Shape B (durable settings marker) rather than a self-predicating idempotent
+    # UPDATE, for the same reason the ``repair_runout_reclaim_20260813`` block above
+    # states: the state this writes IS the state such a predicate would test for, so a
+    # re-running version would re-fill, at every boot, a brand the operator had
+    # deliberately cleared. The marker INSERT rides the SAME savepoint as the fills,
+    # so the pair is all-or-nothing and a second boot is a no-op.
+    #
+    # Adjudication is the MINT's own predicate, in Python, never a hand-written SQL
+    # colour/preset test: ``spool_tagless.default_row_identity`` decides per row, so
+    # the repair and the code that will mint tomorrow's rows can never disagree about
+    # what "the default filament" is. Rows it refuses — a grey PLA roll, a tray that
+    # asserted its own "Basic" variant — keep an honest unknown and are counted out
+    # loud. Only NULL fields are filled; material, colour, temps and grams are never
+    # touched, and a row is selected by a DERIVED predicate rather than an id list.
+    #
+    # Not to be confused with the neighbouring ``test_tagless_default_identity_migration``:
+    # that one rewrites the SETTING (a different fact); this one rewrites ROWS.
+    #
+    # Fully guarded: a repair that cannot run must never take startup migrations down
+    # for every install, and its rollback leaves the marker unwritten so a fixed build
+    # simply tries again.
+    _blank_identity_marker = "repair_blank_tagless_identity_20260910"
+    _blank_identity_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _blank_identity_marker})
+    ).scalar()
+    if not _blank_identity_done:
+        # Every line carries the marker key, filled and skipped alike — the post-deploy
+        # probe greps the key and reads the counts.
+        _bi_tag = f"[REPAIR] {_blank_identity_marker}:"
+        try:
+            from sqlalchemy import or_ as _or, select as _select
+            from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+            from backend.app.models.spool import Spool as _Spool
+            from backend.app.services import spool_tagless as _spool_tagless
+
+            _bi_session = _AsyncSession(bind=conn, join_transaction_mode="create_savepoint")
+            try:
+                _bi_default = await _spool_tagless.tagless_default_filament(_bi_session)
+                _bi_filled = 0
+                _bi_skipped = 0
+                if _bi_default is None:
+                    logger.info("%s tagless default filament is off — nothing to do", _bi_tag)
+                else:
+                    _bi_rows = (
+                        (
+                            await _bi_session.execute(
+                                _select(_Spool).where(
+                                    _Spool.data_origin == "ams_auto",
+                                    _or(_Spool.brand.is_(None), _Spool.subtype.is_(None)),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    for _bi_spool in _bi_rows:
+                        _bi_identity = _spool_tagless.default_row_identity(
+                            _bi_default,
+                            slicer_filament=_bi_spool.slicer_filament,
+                            material=_bi_spool.material,
+                            rgba=_bi_spool.rgba,
+                            subtype=_bi_spool.subtype,
+                        )
+                        if _bi_identity is None:
+                            _bi_skipped += 1
+                            logger.debug(
+                                "%s skip spool %s: %s / %s / %s is not the default filament — "
+                                "brand stays an honest unknown",
+                                _bi_tag,
+                                _bi_spool.id,
+                                _bi_spool.material,
+                                _bi_spool.rgba,
+                                _bi_spool.subtype,
+                            )
+                            continue
+                        _bi_before = (_bi_spool.brand, _bi_spool.subtype)
+                        if _bi_spool.brand is None:
+                            _bi_spool.brand = _bi_identity.brand
+                        if _bi_spool.subtype is None:
+                            _bi_spool.subtype = _bi_identity.subtype
+                        if (_bi_spool.brand, _bi_spool.subtype) == _bi_before:
+                            # The default carries no brand/subtype of its own to give.
+                            _bi_skipped += 1
+                            continue
+                        _bi_filled += 1
+                        logger.debug(
+                            "%s spool %s: brand %r -> %r, subtype %r -> %r",
+                            _bi_tag,
+                            _bi_spool.id,
+                            _bi_before[0],
+                            _bi_spool.brand,
+                            _bi_before[1],
+                            _bi_spool.subtype,
+                        )
+                    await _bi_session.flush()
+                await _bi_session.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _blank_identity_marker},
+                )
+                await _bi_session.commit()
+            except Exception:
+                await _bi_session.rollback()
+                raise
+            finally:
+                await _bi_session.close()
+            logger.info(
+                "%s filled %d row(s), skipped %d (not the default filament)",
+                _bi_tag,
+                _bi_filled,
+                _bi_skipped,
+            )
+        except Exception:  # noqa: BLE001 — a repair must never take startup down for every install
+            logger.exception(
+                "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a "
+                "later boot retries it",
+                _blank_identity_marker,
+            )
+
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
     ("user_print_start", "User Print Started", "User Print Started Email"),

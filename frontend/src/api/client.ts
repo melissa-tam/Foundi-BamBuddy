@@ -3021,6 +3021,22 @@ export interface InventorySpool {
   // badge; a spent spool is hard-excluded from selection. Optional for
   // back-compat with pre-migration snapshots and object-literal test fixtures.
   spent_at?: string | null;
+  // Slot this roll was LAST released/moved FROM — server-owned release/move
+  // residue with exactly ONE writer (`spool_binding._stamp_last_location`), so
+  // these are READ-ONLY here and excluded from every write payload below.
+  //
+  // Residue contract (mirrored from `spool_binding.last_released_from_slot_stmt`):
+  // N rows can carry the same slot's residue, only the SINGLE newest
+  // `last_location_at` is "what left this slot last", and a residue routinely
+  // belongs to a roll bound somewhere else NOW. Any reader must honour that —
+  // see `utils/spoolPicker.ts`, which consumes it for DISPLAY ordering only.
+  //
+  // Optional for back-compat with pre-migration snapshots and object-literal
+  // test fixtures.
+  last_location_printer_id?: number | null;
+  last_location_ams_id?: number | null;
+  last_location_tray_id?: number | null;
+  last_location_at?: string | null;
 }
 
 export interface SpoolmanBulkCreateResult {
@@ -5928,12 +5944,12 @@ export const api = {
   getSpools: (includeArchived = false) =>
     request<InventorySpool[]>(`/inventory/spools?include_archived=${includeArchived}`),
   getSpool: (id: number) => request<InventorySpool>(`/inventory/spools/${id}`),
-  createSpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>) =>
+  createSpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>) =>
     request<InventorySpool>('/inventory/spools', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  bulkCreateSpools: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>, quantity: number) =>
+  bulkCreateSpools: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>, quantity: number) =>
     request<InventorySpool[]>('/inventory/spools/bulk', {
       method: 'POST',
       body: JSON.stringify({ spool: data, quantity }),
@@ -5963,7 +5979,7 @@ export const api = {
     document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
   },
-  updateSpool: (id: number, data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>) =>
+  updateSpool: (id: number, data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>) =>
     request<InventorySpool>(`/inventory/spools/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
@@ -5981,7 +5997,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ spool_ids: spoolIds }),
     }),
-  bulkUpdateSpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>) =>
+  bulkUpdateSpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>) =>
     request<{ updated: number; not_found: number[] }>(`/inventory/spools/bulk-update`, {
       method: 'POST',
       body: JSON.stringify({ ids, update }),
@@ -6146,13 +6162,13 @@ export const api = {
     request<InventorySpool[]>(`/spoolman/inventory/spools?include_archived=${includeArchived}`),
   getSpoolmanInventorySpool: (id: number) =>
     request<InventorySpool>(`/spoolman/inventory/spools/${id}`),
-  createSpoolmanInventorySpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>) =>
+  createSpoolmanInventorySpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>) =>
     request<InventorySpool>('/spoolman/inventory/spools', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   bulkCreateSpoolmanInventorySpools: (
-    data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>,
+    data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>,
     quantity: number,
   ) =>
     request<SpoolmanBulkCreateResult | InventorySpool[]>('/spoolman/inventory/spools/bulk', {
@@ -6161,7 +6177,7 @@ export const api = {
     }),
   updateSpoolmanInventorySpool: (
     id: number,
-    data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>,
+    data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>,
   ) =>
     request<InventorySpool>(`/spoolman/inventory/spools/${id}`, {
       method: 'PATCH',
@@ -6180,7 +6196,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ spool_ids: spoolIds }),
     }),
-  bulkUpdateSpoolmanInventorySpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>) =>
+  bulkUpdateSpoolmanInventorySpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>) =>
     request<{ updated: number; errors: Array<{ id: number; status: number; detail: string }> }>(`/spoolman/inventory/spools/bulk-update`, {
       method: 'POST',
       body: JSON.stringify({ ids, update }),
