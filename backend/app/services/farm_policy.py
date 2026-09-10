@@ -330,12 +330,17 @@ async def on_terminal(
                     else None
                 )
                 if actual_s is not None:
+                    # ``start_z`` rides the line because the expectation is a function of
+                    # it: seeded, the estimate MEASURED the block's first Z move; unseeded,
+                    # it bounded it. Two populations of one instrument — a runtime series
+                    # that does not say which is which cannot be read.
                     logger.info(
-                        "farm_policy: %s eject on printer %s ran %.0fs (expected %s)",
+                        "farm_policy: %s eject on printer %s ran %.0fs (expected %s, start_z=%s)",
                         pending.purpose,
                         printer_id,
                         actual_s,
                         f"{pending.expected_runtime_s:.0f}s" if pending.expected_runtime_s is not None else "n/a",
+                        f"{pending.start_z:g}" if pending.start_z is not None else "unseeded",
                     )
                 if pending.runtime_exceeded_at is not None:
                     # The in-flight watchdog already stopped this job and paged the

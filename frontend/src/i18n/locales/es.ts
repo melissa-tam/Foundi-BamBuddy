@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: 'Imprimiendo',
       cooling: 'Enfriando hasta {{threshold}}°C',
+      coolingHeld: 'Enfriando hasta {{threshold}}°C · placa elevada',
+      coolingHeldHint: 'La placa se mantiene a la altura de la boquilla con el cabezal aparcado en la rampa. No mueva el cabezal hasta que se ejecute la expulsión.',
       awaitingPlateClear: 'Esperando despeje de la cama',
     },
     ejectPhase: {
@@ -2674,6 +2676,8 @@ export default {
     farmCooldownMaxHoldHelp: 'Si la cama sigue más caliente que la temperatura de expulsión tras este tiempo, expulsa igualmente. 0 = seguir esperando.',
     farmCooldownPlateauMargin: 'Margen de casi suficiente (°C)',
     farmCooldownPlateauMarginHelp: 'Si el enfriamiento se estanca pero la cama está dentro de estos grados de la temperatura de expulsión, se trata como enfriada y se expulsa; si queda más caliente que eso, la impresora se pone en cuarentena.',
+    farmCooldownAuxFan: 'Ventilador auxiliar durante el enfriamiento (%)',
+    farmCooldownAuxFanHelp: 'Hace funcionar el ventilador auxiliar de la impresora a esta velocidad desde el final de la impresión hasta que se envía la expulsión. 0 lo desactiva.',
     respoolPromptThreshold: 'Umbral de observación de reasignación (g)',
     respoolPromptThresholdHelp: 'Registrar una observación de reasignación cuando llegue una etiqueta Bambu reutilizada y a la bobina de origen le queden estos gramos o menos sin un marcador de agotado verificado por hardware (0–1000).',
     farmUsbAutoCleanup: 'Limpiar USB automáticamente cuando esté lleno',
@@ -4896,6 +4900,17 @@ export default {
     assigning: 'Asignando...',
     searchSpools: 'Buscar bobinas...',
     showAllSpools: 'Mostrar todas las bobinas',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Última en esta ranura',
+      ams: 'Última en este AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} bobina vacía oculta',
+    assignEmptyHidden_other: '{{count}} bobinas vacías ocultas',
     spoolmanSpools: 'Bobinas de Spoolman',
     allMaterials: 'Todos los materiales',
     filterByBrand: 'Filtrar por marca...',

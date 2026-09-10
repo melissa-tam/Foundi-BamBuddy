@@ -3193,8 +3193,7 @@ async def set_fan_speed(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    pwm_speed = round(speed * 255 / 100)
-    success = client.set_fan_speed(fan_id, pwm_speed)
+    success = client.set_fan_percent(fan_id, speed)
     if not success:
         raise HTTPException(502, "Failed to set fan speed — printer MQTT session not connected, command not delivered")
 

@@ -262,6 +262,30 @@ describe('door 2 — the expanded card\'s raised-gate banner', () => {
       await screen.findByTitle('Marking the plate cleared cancels the pending auto-eject.'),
     ).toBeInTheDocument();
   });
+
+  // A cooldown wait the farm spends HOLDING the plate at the nozzle plane is a
+  // different operator situation from a plain cool-down: the toolhead is parked
+  // at the chute and must not be jogged. The pill says which one it is; the
+  // constraint itself rides a tooltip rather than the pill's one-line label.
+  it('marks the cooling pill as HELD, with the do-not-jog constraint on a tooltip', async () => {
+    mount(statusFinish({ eject_watch: { threshold_c: 33, hold_z: 2 } }));
+    render(<PrintersPage />);
+
+    const pill = await screen.findByTitle(
+      'Plate held at the nozzle plane with the toolhead parked at the chute. Do not jog the toolhead until the eject runs.',
+    );
+    // The release target stays on the label — a held plate is still cooling.
+    expect(pill.textContent).toContain('33');
+    expect(pill.textContent).toContain('plate raised');
+  });
+
+  it('leaves the plain cooling pill untouched when the plate is not held', async () => {
+    mount(statusFinish({ eject_watch: { threshold_c: 33, hold_z: null } }));
+    render(<PrintersPage />);
+
+    expect(await screen.findByText('Cooling to 33°C')).toBeInTheDocument();
+    expect(screen.queryByText(/plate raised/)).not.toBeInTheDocument();
+  });
 });
 
 describe('door 1 — the overflow menu item', () => {

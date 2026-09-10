@@ -116,7 +116,9 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
     // Never claim "cooling" for a printer we cannot observe — mirror the
     // printer card, which shows no phase pill while disconnected.
     if (state.connected) {
-      phaseText = t('printers.phase.cooling', { threshold: Math.round(phase.threshold) });
+      phaseText = t(phase.held ? 'printers.phase.coolingHeld' : 'printers.phase.cooling', {
+        threshold: Math.round(phase.threshold),
+      });
     }
   } else if (phase?.kind === 'awaitingPlateClear') phaseText = t('printers.phase.awaitingPlateClear');
 

@@ -27,6 +27,7 @@ from backend.app.utils.threemf_tools import (
     parse_gcode_layer_filament_usage,
     read_plate_gcode_header,
     read_plate_gcode_machine_end,
+    read_plate_json,
     repack_3mf_eject,
     repack_3mf_with_gcode,
     zero_slice_usage_bytes,
@@ -1356,3 +1357,66 @@ class TestRepack3mfEjectSlim:
             assert list_gcode_plate_ids(slim) == [1]
         finally:
             slim.unlink(missing_ok=True)
+
+
+class TestReadPlateJson:
+    """``read_plate_json`` is the ONE parser for the per-plate metadata sidecar.
+
+    Both consumers go through it — the archive's printable-object extraction (which
+    wants ``bbox_objects``) and the eject lane's plate-footprint check (which wants
+    ``bbox_all``) — so its "absent or unreadable ⇒ None, never raise" contract is pinned
+    here once rather than being re-asserted at each call site.
+    """
+
+    @staticmethod
+    def _zip_with(members: dict[str, bytes], tmp_path) -> Path:
+        path = tmp_path / "plate.3mf"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, body in members.items():
+                zf.writestr(name, body)
+        return path
+
+    def test_parses_the_sidecar(self, tmp_path):
+        payload = {"bbox_all": [13.66, 52.31, 325.2, 261.97], "filament_ids": [0], "bed_type": "textured_plate"}
+        path = self._zip_with({"Metadata/plate_1.json": json.dumps(payload).encode()}, tmp_path)
+        with zipfile.ZipFile(path) as zf:
+            assert read_plate_json(zf, 1) == payload
+
+    def test_reads_the_requested_plate_index(self, tmp_path):
+        path = self._zip_with(
+            {
+                "Metadata/plate_1.json": json.dumps({"bbox_all": [1, 1, 2, 2]}).encode(),
+                "Metadata/plate_3.json": json.dumps({"bbox_all": [3, 3, 4, 4]}).encode(),
+            },
+            tmp_path,
+        )
+        with zipfile.ZipFile(path) as zf:
+            assert read_plate_json(zf, 3) == {"bbox_all": [3, 3, 4, 4]}
+
+    def test_absent_member_returns_none(self, tmp_path):
+        """A plate legitimately has no sidecar (older slicer output) — ordinary, not an
+        error, so callers get None rather than an exception to handle."""
+        path = self._zip_with({"3D/3dmodel.model": b"<model/>"}, tmp_path)
+        with zipfile.ZipFile(path) as zf:
+            assert read_plate_json(zf, 1) is None
+
+    def test_unparseable_json_returns_none(self, tmp_path):
+        path = self._zip_with({"Metadata/plate_1.json": b"{ not json at all"}, tmp_path)
+        with zipfile.ZipFile(path) as zf:
+            assert read_plate_json(zf, 1) is None
+
+    def test_non_object_json_returns_none(self, tmp_path):
+        """Valid JSON that is not an object cannot answer ``.get()`` — callers index it
+        like a dict, so a list must not reach them."""
+        path = self._zip_with({"Metadata/plate_1.json": b'["a", "list"]'}, tmp_path)
+        with zipfile.ZipFile(path) as zf:
+            assert read_plate_json(zf, 1) is None
+
+    def test_undecodable_bytes_return_none_instead_of_raising(self, tmp_path):
+        """The old inline parser in ``archive.py`` caught JSONDecodeError but decoded
+        strictly, so a non-UTF-8 sidecar raised UnicodeDecodeError past that handler and
+        into the extractor's blanket ``except Exception``, silently costing the caller
+        every printable object. The shared parser answers None instead."""
+        path = self._zip_with({"Metadata/plate_1.json": b"\xff\xfe{\x00b\x00"}, tmp_path)
+        with zipfile.ZipFile(path) as zf:
+            assert read_plate_json(zf, 1) is None

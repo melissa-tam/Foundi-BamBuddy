@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: 'Imprimindo',
       cooling: 'Resfriando até {{threshold}}°C',
+      coolingHeld: 'Resfriando até {{threshold}}°C · placa elevada',
+      coolingHeldHint: 'A placa é mantida na altura do bico com o cabeçote estacionado na calha. Não mova o cabeçote até a ejeção ser executada.',
       awaitingPlateClear: 'Aguardando liberação da placa',
     },
     ejectPhase: {
@@ -2627,6 +2629,8 @@ export default {
     farmCooldownMaxHoldHelp: 'Se a mesa ainda estiver mais quente que a temperatura de ejeção após este tempo, ejetar mesmo assim. 0 = continuar esperando.',
     farmCooldownPlateauMargin: 'Margem de tolerância (°C)',
     farmCooldownPlateauMarginHelp: 'Se o resfriamento estagnar mas a mesa estiver dentro destes graus da temperatura de ejeção, tratá-la como resfriada e ejetar; se ficar mais quente que isso, a impressora é colocada em quarentena.',
+    farmCooldownAuxFan: 'Ventoinha auxiliar durante o resfriamento (%)',
+    farmCooldownAuxFanHelp: 'Mantém a ventoinha auxiliar da impressora nesta velocidade do fim da impressão até a ejeção ser despachada. 0 desliga.',
     respoolPromptThreshold: 'Limite de observação de reatribuição (g)',
     respoolPromptThresholdHelp: 'Registrar uma observação de reatribuição quando uma etiqueta Bambu reutilizada aparecer com a bobina de origem tendo esta quantidade de gramas ou menos e nenhum marcador de esgotamento confirmado por hardware (0–1000).',
     farmUsbAutoCleanup: 'Limpar USB automaticamente quando cheio',
@@ -4879,6 +4883,17 @@ export default {
     assigning: 'Atribuindo...',
     searchSpools: 'Pesquisar carretéis...',
     showAllSpools: 'Mostrar todos os carretéis',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Último neste compartimento',
+      ams: 'Último neste AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} carretel vazio oculto',
+    assignEmptyHidden_other: '{{count}} carretéis vazios ocultos',
     spoolmanSpools: 'Bobinas Spoolman',
     allMaterials: 'Todos os Materiais',
     filterByBrand: 'Filtrar por marca...',

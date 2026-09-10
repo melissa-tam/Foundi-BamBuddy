@@ -651,6 +651,12 @@ class AppSettings(BaseModel):
         "°C of the release threshold (bed equilibrated at ambient). Above threshold+margin the bed is genuinely "
         "stuck hot and the printer is quarantined with NO eject.",
     )
+    farm_cooldown_aux_fan_percent: int = Field(
+        default=100,
+        ge=0,
+        le=100,
+        description="Auxiliary fan speed (%) held from the end of a farm print until its eject dispatches; 0 = off",
+    )
     farm_usb_auto_cleanup: bool = Field(
         default=True,
         description="On a USB-storage-low HMS fault, auto-delete old camera recordings then oldest unused print files",
@@ -834,6 +840,7 @@ class AppSettingsUpdate(BaseModel):
     farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
     farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)
     farm_cooldown_plateau_eject_margin_c: float | None = Field(default=None, ge=0.0, le=50.0)
+    farm_cooldown_aux_fan_percent: int | None = Field(default=None, ge=0, le=100)
     farm_idle_park_enabled: bool | None = None
     farm_idle_park_percent: int | None = Field(default=None, ge=10, le=95)
     respool_prompt_threshold_g: int | None = Field(default=None, ge=0, le=1000)

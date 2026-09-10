@@ -239,6 +239,18 @@ class SpoolResponse(SpoolBase):
     # stamped (deliberately ABSENT from SpoolUpdate); NULL falls back to
     # first_loaded_at / created_at.
     loaded_at: datetime | None = None
+    # Slot-recency residue: the AMS slot this roll was LAST released or moved from.
+    # A documented denormalisation (`models/spool.py` — no FK on the printer id) whose
+    # ONE writer is `spool_binding._stamp_last_location`, stamped on every release and
+    # every move. Read-only here and deliberately ABSENT from SpoolUpdate: it records
+    # what the wire observed, so a PATCH must never be able to state it. Consumers
+    # (the Assign-spool picker's ordering) must honour the residue contract —
+    # `last_released_from_slot_stmt`'s "the SINGLE newest row is what left this slot
+    # last", and a row bound elsewhere now is not this slot's occupant (invariant 11).
+    last_location_printer_id: int | None = None
+    last_location_ams_id: int | None = None
+    last_location_tray_id: int | None = None
+    last_location_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     k_profiles: list[SpoolKProfileResponse] = []

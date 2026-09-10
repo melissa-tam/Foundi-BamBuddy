@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: 'Druckt',
       cooling: 'Kühlt auf {{threshold}}°C ab',
+      coolingHeld: 'Kühlt auf {{threshold}}°C ab · Platte angehoben',
+      coolingHeldHint: 'Die Platte wird auf Düsenhöhe gehalten, der Druckkopf steht an der Rutsche. Den Druckkopf erst nach dem Auswurf bewegen.',
       awaitingPlateClear: 'Wartet auf Plattenfreigabe',
     },
     ejectPhase: {
@@ -2671,6 +2673,8 @@ export default {
     farmCooldownMaxHoldHelp: 'Ist das Bett nach dieser Zeit noch wärmer als die Auswurftemperatur, wird trotzdem ausgeworfen. 0 = weiter warten.',
     farmCooldownPlateauMargin: 'Nah-genug-Spielraum (°C)',
     farmCooldownPlateauMarginHelp: 'Stockt die Abkühlung, liegt das Bett aber innerhalb dieser Grad zur Auswurftemperatur, wird es als abgekühlt behandelt und ausgeworfen; bleibt es heißer, wird der Drucker unter Quarantäne gestellt.',
+    farmCooldownAuxFan: 'Hilfslüfter beim Abkühlen (%)',
+    farmCooldownAuxFanHelp: 'Betreibt den Hilfslüfter des Druckers mit dieser Drehzahl vom Druckende bis zum Absenden des Auswurfs. 0 schaltet ihn aus.',
     respoolPromptThreshold: 'Umspul-Beobachtungsschwelle (g)',
     respoolPromptThresholdHelp: 'Eine Umspul-Beobachtung protokollieren, wenn ein wiederverwendeter Bambu-Tag auftaucht, während die Spenderspule so viele Gramm oder weniger übrig hat und keine hardware-sichere Leer-Markierung vorliegt (0–1000).',
     farmUsbAutoCleanup: 'USB bei vollem Speicher automatisch bereinigen',
@@ -4892,6 +4896,17 @@ export default {
     assigning: 'Wird zugewiesen...',
     searchSpools: 'Spulen suchen...',
     showAllSpools: 'Alle Spulen anzeigen',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Zuletzt in diesem Fach',
+      ams: 'Zuletzt in diesem AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} leere Spule ausgeblendet',
+    assignEmptyHidden_other: '{{count}} leere Spulen ausgeblendet',
     spoolmanSpools: 'Spoolman-Spulen',
     allMaterials: 'Alle Materialien',
     filterByBrand: 'Nach Marke filtern...',

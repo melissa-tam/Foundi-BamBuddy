@@ -659,7 +659,10 @@ export interface PrinterStatus {
   // Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
   // release threshold. Present while the farm waits for the bed to cool before
   // auto-clearing the plate gate; null/absent otherwise.
-  eject_watch?: { threshold_c: number } | null;
+  // `hold_z` is the height the plate is being HELD at for the duration of that
+  // wait (nozzle plane, toolhead parked at the chute) — non-null means an
+  // operator must not jog the toolhead until the eject runs; null = not held.
+  eject_watch?: { threshold_c: number; hold_z: number | null } | null;
   // Open printer-hold incident (WS2b): the fault this printer is currently held
   // by. Present for FOREIGN prints too — those have no queue unit, so this chip
   // is the only place their hold is visible. Null/absent when clear.
@@ -1410,6 +1413,9 @@ export interface AppSettings {
   // When cooling plateaus within this many °C of the release threshold, eject
   // (bed equilibrated at ambient) instead of quarantining the printer.
   farm_cooldown_plateau_eject_margin_c: number;
+  // Auxiliary-fan speed (%) held from the end of the print until the eject
+  // dispatches, to pull heat off the plate during the cooldown wait. 0 = off.
+  farm_cooldown_aux_fan_percent: number;
   // USB storage-low auto-cleanup: on a "USB full" HMS fault, auto-delete old
   // camera recordings then oldest unused print files so dispatch keeps working.
   farm_usb_auto_cleanup: boolean;
@@ -3015,6 +3021,22 @@ export interface InventorySpool {
   // badge; a spent spool is hard-excluded from selection. Optional for
   // back-compat with pre-migration snapshots and object-literal test fixtures.
   spent_at?: string | null;
+  // Slot this roll was LAST released/moved FROM — server-owned release/move
+  // residue with exactly ONE writer (`spool_binding._stamp_last_location`), so
+  // these are READ-ONLY here and excluded from every write payload below.
+  //
+  // Residue contract (mirrored from `spool_binding.last_released_from_slot_stmt`):
+  // N rows can carry the same slot's residue, only the SINGLE newest
+  // `last_location_at` is "what left this slot last", and a residue routinely
+  // belongs to a roll bound somewhere else NOW. Any reader must honour that —
+  // see `utils/spoolPicker.ts`, which consumes it for DISPLAY ordering only.
+  //
+  // Optional for back-compat with pre-migration snapshots and object-literal
+  // test fixtures.
+  last_location_printer_id?: number | null;
+  last_location_ams_id?: number | null;
+  last_location_tray_id?: number | null;
+  last_location_at?: string | null;
 }
 
 export interface SpoolmanBulkCreateResult {
@@ -5922,12 +5944,12 @@ export const api = {
   getSpools: (includeArchived = false) =>
     request<InventorySpool[]>(`/inventory/spools?include_archived=${includeArchived}`),
   getSpool: (id: number) => request<InventorySpool>(`/inventory/spools/${id}`),
-  createSpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>) =>
+  createSpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>) =>
     request<InventorySpool>('/inventory/spools', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  bulkCreateSpools: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>, quantity: number) =>
+  bulkCreateSpools: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>, quantity: number) =>
     request<InventorySpool[]>('/inventory/spools/bulk', {
       method: 'POST',
       body: JSON.stringify({ spool: data, quantity }),
@@ -5957,7 +5979,7 @@ export const api = {
     document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
   },
-  updateSpool: (id: number, data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>) =>
+  updateSpool: (id: number, data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>) =>
     request<InventorySpool>(`/inventory/spools/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
@@ -5975,7 +5997,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ spool_ids: spoolIds }),
     }),
-  bulkUpdateSpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>) =>
+  bulkUpdateSpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>) =>
     request<{ updated: number; not_found: number[] }>(`/inventory/spools/bulk-update`, {
       method: 'POST',
       body: JSON.stringify({ ids, update }),
@@ -6140,13 +6162,13 @@ export const api = {
     request<InventorySpool[]>(`/spoolman/inventory/spools?include_archived=${includeArchived}`),
   getSpoolmanInventorySpool: (id: number) =>
     request<InventorySpool>(`/spoolman/inventory/spools/${id}`),
-  createSpoolmanInventorySpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>) =>
+  createSpoolmanInventorySpool: (data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>) =>
     request<InventorySpool>('/spoolman/inventory/spools', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   bulkCreateSpoolmanInventorySpools: (
-    data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>,
+    data: Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>,
     quantity: number,
   ) =>
     request<SpoolmanBulkCreateResult | InventorySpool[]>('/spoolman/inventory/spools/bulk', {
@@ -6155,7 +6177,7 @@ export const api = {
     }),
   updateSpoolmanInventorySpool: (
     id: number,
-    data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>,
+    data: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>,
   ) =>
     request<InventorySpool>(`/spoolman/inventory/spools/${id}`, {
       method: 'PATCH',
@@ -6174,7 +6196,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ spool_ids: spoolIds }),
     }),
-  bulkUpdateSpoolmanInventorySpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>>) =>
+  bulkUpdateSpoolmanInventorySpools: (ids: number[], update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles' | 'last_location_printer_id' | 'last_location_ams_id' | 'last_location_tray_id' | 'last_location_at'>>) =>
     request<{ updated: number; errors: Array<{ id: number; status: number; detail: string }> }>(`/spoolman/inventory/spools/bulk-update`, {
       method: 'POST',
       body: JSON.stringify({ ids, update }),

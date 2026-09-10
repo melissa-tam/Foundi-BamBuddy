@@ -14,7 +14,10 @@ everything AROUND that decision, in three groups:
   default filament, spelled non-canonically?" — it replaced the three overlapping
   helpers (``override_generic_identity``, ``default_temps_for_fingerprint`` and the
   mint's inline override) in the 2026-08-21 backup-group wave, and it now covers the
-  COLOUR dimension the earlier helpers left split.
+  COLOUR dimension the earlier helpers left split. Its ROW-side twin
+  :func:`default_row_identity` answers the other half — the ``brand``/``subtype`` pair
+  the wire never states for a tagless tray — so both mint arms emit ONE identity for
+  the default filament instead of two.
 * **Wire config (a sibling lane, NOT identity)** — :func:`maybe_autoconfigure_bare_tray`
   pushes the default filament to a BARE tray (spool present, ``tray_type`` empty,
   state 10/11) so the slot is usable, including mid-print where it joins the firmware
@@ -586,6 +589,89 @@ def canonical_default_identity(
     }
 
 
+class DefaultRowIdentity(NamedTuple):
+    """The tagless default's ROW-side identity — ``brand`` and ``subtype``, together."""
+
+    brand: str | None
+    subtype: str | None
+
+
+def _default_row_pair(default: dict) -> DefaultRowIdentity:
+    """The default dict's ``brand``/``subtype``, read UNCONDITIONALLY.
+
+    The one spelling of "what row identity does this default state?" — strip, and an
+    empty string is no statement rather than a blank one. Both callers need exactly
+    this and differ only in whether they are ENTITLED to it: :func:`default_row_identity`
+    asks the eligibility and same-subtype questions first, while the mint's default arm
+    is minting the default itself and is trivially entitled. Extracted because the two
+    had grown the same two expressions side by side, which is the drift the pair-or-
+    nothing rule exists to prevent — a fix here (a new field, a different empty rule)
+    must not be applicable to one arm and forgotten in the other.
+
+    A default carrying neither field answers ``(None, None)``: a conclusion with
+    nothing to stamp, which is not the same answer as "this is not the default
+    filament" — see :func:`default_row_identity`'s ``None``.
+    """
+    return DefaultRowIdentity(
+        (default.get("brand") or "").strip() or None,
+        (default.get("subtype") or "").strip() or None,
+    )
+
+
+def default_row_identity(
+    default: dict | None,
+    *,
+    slicer_filament: str | None,
+    material: str | None,
+    rgba: str | None,
+    subtype: str | None,
+) -> DefaultRowIdentity | None:
+    """The default's ROW-side identity to stamp on this row — or ``None``.
+
+    THE projection of ``brand``/``subtype`` out of the parsed
+    ``tagless_default_filament`` dict, for a row whose filament IS that default. Two
+    fields, answered **as a PAIR or not at all**: a ``"PETG Basic"`` label on a
+    ``GFG02`` black tray is not the default filament, and stamping "Bambu Lab" beside
+    the tray's own "Basic" would mint an identity neither source ever stated.
+
+    Answers when :func:`_eligible_for_default_identity` holds — the SAME eligibility
+    origin :func:`canonical_default_identity` uses, so "is this the fleet's default
+    filament?" has one answer per row — AND the caller's ``subtype`` is unstated or
+    equals the default's (case-insensitively; ``tray_sub_brands`` reaches us as the
+    parsed variant word). ``None`` otherwise, which leaves the row's brand an honest
+    unknown for the operator to fill in once.
+
+    Why this is a SEPARATE function from :func:`canonical_default_identity` rather
+    than two more fields on it, and neither is a widening of the other:
+
+    * That one answers "does anything DIFFER from the default?" and returns ``None``
+      when nothing does — so a tray already spelled canonically would come back with
+      no brand at all, which is exactly the row this projection exists to fill.
+    * Its four fields are WIRE dimensions: three callers publish them to hardware
+      (mint, harmonise arm, reconcile walk). ``brand`` and ``subtype`` are ROW-only
+      and are never published to a tray. Handing the wire-writing callers two fields
+      they must remember to ignore is the interface-segregation mistake; a second
+      question with its own answer type is not (ISP).
+
+    Pure and synchronous, like its sibling: the caller supplies the parsed dict
+    (:func:`tagless_default_filament`), so the settings read happens once per lane.
+    A ``None`` default (feature off) answers ``None``.
+    """
+    if not default:
+        return None
+    if not _eligible_for_default_identity(default, slicer_filament=slicer_filament, material=material, rgba=rgba):
+        return None
+
+    pair = _default_row_pair(default)
+
+    stated = (subtype or "").strip()
+    if stated and stated.casefold() != (pair.subtype or "").casefold():
+        # The tray asserts a DIFFERENT variant — an operator statement about which
+        # filament this is (doctrine rule 2), and the pair is never split.
+        return None
+    return pair
+
+
 def _tray_canonical_delta(default: dict | None, tray: dict) -> dict | None:
     """:func:`canonical_default_identity` for a LIVE tray dict.
 
@@ -676,6 +762,15 @@ async def mint_tagless_spool(
     positive one, otherwise it is left to the ``Spool`` model's default (see
     ``models/spool.py`` — ``label_weight`` default = 1000 g); tagless trays
     commonly report ``tray_weight="0"``.
+
+    **Both arms emit ONE identity for the default filament.** The tray arm used to
+    hardcode ``brand=None`` while the default arm read the setting's brand, so the
+    same black PETG minted two different rows depending on whether the AMS had a
+    filament type to report — 208 of 269 ``ams_auto`` rows on the live farm carried
+    no brand and no subtype, and the inventory form (which requires both on save)
+    refused every weight edit on them. A tray whose filament IS the default now takes
+    the default's ROW-side identity through :func:`default_row_identity`; a tray that
+    is something else keeps an honest unknown.
     """
     if (tray is None) == (default_filament is None):
         raise ValueError("mint_tagless_spool requires exactly one of tray / default_filament")
@@ -687,7 +782,10 @@ async def mint_tagless_spool(
         subtype = parsed.subtype
         color_name = parsed.color_name
         rgba = parsed.rgba
-        brand = None  # tagless: brand unknown (third-party) — the operator can set it
+        # Brand/subtype are decided below, AFTER the canonical guard: a tray whose
+        # filament is the fleet default takes the default's row identity, anything
+        # else keeps an honest unknown (third-party roll — the operator sets it once).
+        brand = None
         core_weight = parsed.core_weight
         slicer_filament = parsed.slicer_filament
         slicer_filament_name = parsed.slicer_filament_name
@@ -700,8 +798,9 @@ async def mint_tagless_spool(
         # a row born canonical on the others is still not a firmware backup-group peer
         # while its COLOUR is off: 010-H2S ran dry twice in 28 h on rows that matched the
         # default's preset and carried 161616FF for its colour.
+        default = await _tagless_default(db)
         _canon = canonical_default_identity(
-            await _tagless_default(db),
+            default,
             slicer_filament=slicer_filament,
             material=material,
             rgba=rgba,
@@ -720,15 +819,34 @@ async def mint_tagless_spool(
                 nozzle_temp_min = _canon["nozzle_temp_min"]
             if _canon["nozzle_temp_max"] is not None:
                 nozzle_temp_max = _canon["nozzle_temp_max"]
+        # ROW-IDENTITY projection, asked AFTER the canonical guard so it reads the
+        # identity this row is actually being minted with. brand/subtype are the two
+        # fields the inventory form requires and the wire never states for a tagless
+        # tray (`tray_sub_brands` reads "" on every farm-configured slot), so a tray
+        # whose filament IS the default takes the default's pair; anything else — a
+        # different colour, material or preset, or a tray asserting its own variant —
+        # keeps brand unknown rather than inheriting a brand nobody stated.
+        _row_identity = default_row_identity(
+            default,
+            slicer_filament=slicer_filament,
+            material=material,
+            rgba=rgba,
+            subtype=subtype,
+        )
+        if _row_identity is not None:
+            brand, subtype = _row_identity.brand, _row_identity.subtype
         # Only a POSITIVE reported net weight overrides the model default.
         label_weight = parsed.label_weight if parsed.label_weight > 0 else None
         source = "tray"
     else:
         material = default_filament.get("material") or "PLA"
-        subtype = (default_filament.get("subtype") or "").strip() or None
         color_name = None
         rgba = default_filament.get("rgba")
-        brand = default_filament.get("brand") or None
+        # The SAME projection the tray arm reaches through `default_row_identity`,
+        # taken unconditionally: this row's filament IS the default by construction,
+        # so the pair is trivially owed and there is no eligibility to test. One
+        # spelling (:func:`_default_row_pair`) means the two arms cannot drift.
+        brand, subtype = _default_row_pair(default_filament)
         core_weight = 250
         slicer_filament = default_filament.get("slicer_filament") or None
         slicer_filament_name = None
@@ -766,11 +884,12 @@ async def mint_tagless_spool(
     db.add(spool)
     await db.flush()
     logger.info(
-        "Auto-minted tagless spool %d: %s %s %s (source=%s, origin=ams_auto)",
+        "Auto-minted tagless spool %d: %s %s %s (brand=%s, source=%s, origin=ams_auto)",
         spool.id,
         material,
         subtype or "",
         color_name or "",
+        brand or "unknown",
         source,
     )
     return spool

@@ -10,10 +10,11 @@ ladder-gated recipe change, and fix the generator to reproduce the locked bytes
 otherwise.
 
 * **H2S goldens** (``*_h2s_*``) lock the single-nozzle recipe (bare ``G28 X Y``).
-* **H2C goldens** (``*_h2c_*``) lock the dual-nozzle recipe: the prologue homes
-  with the parameterized stock forms (``M17`` → ``G28 X T300`` → ``G28 Y T300`` →
-  ``G90``) instead of the bare ``G28 X Y`` that stall-loops on that firmware
-  (007-H2C incident).
+* **H2C goldens** (``*_h2c_*``) lock the dual-nozzle recipe: the block homes with the
+  parameterized stock forms (``G28 X T300`` → ``G28 Y T300``) instead of the bare
+  ``G28 X Y`` that stall-loops on that firmware (007-H2C incident).
+* Both dialects home AFTER the block's first Z move (2026-09-10, one Z flow), which
+  ``test_every_golden_is_one_z_flow`` asserts on the committed bytes.
 
 ``capture_golden.py`` regenerates every fixture below (it imports this ``MATRIX``
 and ``_profile``), so the two never drift.
@@ -27,8 +28,14 @@ from dataclasses import replace
 import pytest
 
 from backend.app.models.eject_profile import EjectProfile
-from backend.app.services.eject.generator import generate_eject_gcode
+from backend.app.services.eject.generator import (
+    PHASE_BEACON_LIFTED,
+    SWEEP_PHASE_MARKER,
+    generate_eject_gcode,
+    lift_z,
+)
 from backend.app.services.eject.geometry import ModelGeometry
+from backend.app.utils.printer_models import is_dual_nozzle_model
 from backend.tests.unit.services.eject.geometry_fixtures import H2C_GEOMETRY
 
 GOLDEN_DIR = pathlib.Path(__file__).parent / "golden"
@@ -167,6 +174,47 @@ def test_eject_gcode_is_byte_identical(name, geometry, overrides, max_z):
         f"Eject G-code DRIFTED for {name!r} ({geometry.model_key}). Generator output changed — "
         "re-run the hardware ladder; regenerate the goldens only as a deliberate ladder-gated recipe change."
     )
+
+
+@pytest.mark.parametrize("name,geometry,overrides,max_z", MATRIX, ids=[m[0] for m in MATRIX])
+def test_every_golden_is_one_z_flow(name, geometry, overrides, max_z):
+    """The block's structure, asserted on the committed bytes rather than on the code.
+
+    ONE Z flow: the drop-phase beacon opens before the first Z move (so the deadline it
+    arms covers that move), the first Z move goes straight where the block needs the bed
+    from wherever the plate is, and the X/Y home runs after it — at the clearest point —
+    exactly once, before the sweep. Byte-equality above pins WHAT changed; this pins WHY
+    the order is what it is, in terms a reader can check against the recipe."""
+    profile = _profile(**overrides)
+    lines = [ln.strip() for ln in (GOLDEN_DIR / f"{name}.gcode").read_text().splitlines()]
+
+    beacon_idx = next(i for i, ln in enumerate(lines) if ln.startswith(PHASE_BEACON_LIFTED + " "))
+    aux_idx = lines.index("M106 P2 S0")
+    first_z_idx = next(i for i, ln in enumerate(lines) if ln.startswith("G1 Z"))
+    sweep_idx = lines.index(SWEEP_PHASE_MARKER)
+    homes = [i for i, ln in enumerate(lines) if ln.startswith("G28")]
+
+    # The beacon, then the two non-motion commands, then the first move.
+    assert beacon_idx < lines.index("M140 S0") < aux_idx < first_z_idx
+    # Exactly one home — one command per axis on a dual-nozzle model — after the first
+    # Z move and before the sweep begins.
+    assert len(homes) == (2 if is_dual_nozzle_model(geometry.model_key) else 1)
+    assert all(first_z_idx < home < sweep_idx for home in homes)
+
+    lift = lift_z(max_z, profile)
+    bed_drop = profile.bed_drop_clearance_mm
+    if bed_drop is None:
+        assert lines[first_z_idx] == f"G1 Z{lift:g} F900"
+    else:
+        drop = geometry.z_travel_mm - bed_drop
+        # The drop IS the first move: no lift precedes it (the old order's 63 mm up
+        # immediately undone by 280 mm down), and the return follows the home.
+        assert lines[first_z_idx] == f"G1 Z{drop:g} F900"
+        assert f"G1 Z{lift:g} F900" not in lines[:first_z_idx]
+        assert lines[max(homes) + 1] == f"G1 Z{lift:g} F900"
+        if profile.bed_drop_jitter_cycles is None:
+            # Without jitter strokes the floor is visited exactly once.
+            assert sum(1 for ln in lines if ln == f"G1 Z{drop:g} F900") == 1
 
 
 def test_all_golden_fixtures_are_covered():

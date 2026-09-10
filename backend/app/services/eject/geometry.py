@@ -62,6 +62,40 @@ class ModelGeometry:
     # Bed clearance (mm) off the PHYSICAL bottom stop while the printer is held after a
     # confirmed plate-check trip. Read by the hold lane, never by the eject generator.
     hold_lift_mm: float = 12.0
+    # Cooldown plate-hold limits (2026-09-10) — the two PHYSICAL numbers that decide
+    # whether the finished plate may be held at the nozzle plane through the eject
+    # cooldown with the toolhead parked at the chute. ``keepout_y`` is the bed-Y line the
+    # parked toolhead occupies (a plate whose object bbox ends past it is never held);
+    # ``clear_above`` is the height physically available above the nozzle plane there.
+    #
+    # **Defaulted None, and the default is load-bearing** (same reasoning as
+    # ``z_reference_validated`` above): every transient geometry and every unmigrated
+    # fixture must read as "hold OFF", so the hold can never appear on a model by
+    # omission — only a registry row that was explicitly seeded with both numbers enables
+    # it. Both-or-neither is enforced in ``__post_init__``.
+    cooldown_hold_keepout_y_mm: float | None = None
+    cooldown_hold_clear_above_mm: float | None = None
+
+    def __post_init__(self) -> None:
+        """Reject a one-sided cooldown-hold pair.
+
+        The two numbers are ONE fact — a keep-out line with no clear height (or a clear
+        height with no keep-out line) describes no hold at all, and the dangerous reading
+        is the silent one: treating the missing half as "unbounded" would authorise
+        holding a plate under a clearance nobody measured.
+
+        These columns are seed-only (absent from ``ModelGeometryUpdate``), so a one-sided
+        row cannot come from an operator — it can only be a bad seed or a hand-edited DB,
+        which is precisely the case that must be LOUD rather than half-honoured. Raising
+        here fails the whole geometry read for that model, which is the fail-closed
+        direction: no eject at all beats an eject built on a half-configured machine fact.
+        """
+        one_sided = (self.cooldown_hold_keepout_y_mm is None) != (self.cooldown_hold_clear_above_mm is None)
+        if one_sided:
+            raise ValueError(
+                f"model {self.model_key!r}: cooldown_hold_keepout_y_mm and cooldown_hold_clear_above_mm "
+                "must both be set or both be None"
+            )
 
 
 class GeometryUnavailable(Exception):
@@ -84,6 +118,8 @@ def _to_geometry(row: PrinterModelGeometry) -> ModelGeometry:
         z_travel_mm=row.z_travel_mm,
         z_reference_validated=bool(row.z_reference_validated),
         hold_lift_mm=row.hold_lift_mm,
+        cooldown_hold_keepout_y_mm=row.cooldown_hold_keepout_y_mm,
+        cooldown_hold_clear_above_mm=row.cooldown_hold_clear_above_mm,
     )
 
 

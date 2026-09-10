@@ -50,7 +50,7 @@ from sqlalchemy import select
 
 from backend.app.core.tasks import spawn_background_task
 from backend.app.schemas.settings import AppSettings
-from backend.app.services.eject import remote as eject_remote
+from backend.app.services.eject import cooldown_prep, remote as eject_remote
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     EscalationOnly,
@@ -90,6 +90,12 @@ class _ArmedWatch:
     queue_item_id: int | None = None
     release_now: asyncio.Event | None = None
     threshold_c: float | None = field(default=None)
+    # The Z the cooldown hold parked this printer's plate at, written ONCE by the
+    # watch task and only when its hold was actually SENT (``cooldown_prep``). The
+    # one store behind all three consumers — ``hold_z()`` → the status payload → the
+    # printer card's "plate raised" chip, and the eject's estimator seed — so a plate
+    # nobody held cannot be reported as raised or costed as if it were.
+    hold_z: float | None = field(default=None)
 
 
 # Fallbacks for direct watch_bed_and_clear callers (tests / manual arms) — derived
@@ -119,6 +125,12 @@ _WATCH_ESCALATE_S = 5400
 # act on the live state. Named constants per the ``_CHECK_INTERVAL_S`` precedent.
 _RECONCILE_POLL_S = 20
 _RECONCILE_MAX_WAIT_S = 900
+
+# The cooldown prep's connect wait (see :func:`_await_printer_connected`). Sized off
+# measured reconnects: the virtual printer ~1.5 s, a real printer ~10 s, and the whole
+# fleet back inside 3 minutes after the 2026-09-04 power outage.
+_PREP_CONNECT_POLL_S = 1.0
+_PREP_CONNECT_WAIT_S = 300.0
 
 
 def should_auto_clear(final_status: str) -> bool:
@@ -600,16 +612,33 @@ async def _setting_num(db, key: str, default, cast):
         return default
 
 
-async def _resolve_stall_settings() -> tuple[int, float, int, float]:
-    """Resolve ``(stall_window_s, stall_epsilon_c, max_hold_s, plateau_eject_margin_c)``
-    from farm settings.
+@dataclass(frozen=True)
+class CooldownWatchSettings:
+    """Everything a cooldown watch reads from farm settings, resolved ONCE at arm.
+
+    A value object rather than a tuple because the set grew a member that is not a
+    plateau/cap number at all (``aux_fan_percent`` is the prep's actuator), and a
+    five-tuple unpacked at every call site is a rename waiting to go silently wrong.
+    """
+
+    stall_window_s: int
+    stall_epsilon_c: float
+    max_hold_s: int
+    plateau_eject_margin_c: float
+    aux_fan_percent: int
+
+
+async def _resolve_stall_settings() -> CooldownWatchSettings:
+    """Resolve the watch's settings-backed policy numbers from farm settings.
 
     Read ONCE at watch arm. Fallbacks come from the ``AppSettings`` schema field
     defaults (the single origin — no mirrored literals here). Minute-valued
     settings are converted to seconds. ``window == 0`` disables the plateau
     watchdog; ``max_hold == 0`` disables the cap. ``plateau_eject_margin_c`` is the
     °C-above-threshold band inside which a plateaued bed is RELEASED rather than
-    quarantined (equilibrated at ambient).
+    quarantined (equilibrated at ambient). ``aux_fan_percent`` is what
+    :mod:`~backend.app.services.eject.cooldown_prep` runs the auxiliary fan at for
+    the whole wait (0 = off).
 
     A settings-store failure (DB unavailable at arm time) must NOT kill the
     watch — a dead watch strands the plate-clear gate and silently stalls the
@@ -623,25 +652,92 @@ async def _resolve_stall_settings() -> tuple[int, float, int, float]:
     epsilon = fields["farm_cooldown_stall_epsilon_c"].default
     max_hold_min = fields["farm_cooldown_max_hold_minutes"].default
     margin = fields["farm_cooldown_plateau_eject_margin_c"].default
+    aux_fan = fields["farm_cooldown_aux_fan_percent"].default
     try:
         async with async_session() as db:
             window_min = await _setting_num(db, "farm_cooldown_stall_window_minutes", window_min, int)
             epsilon = await _setting_num(db, "farm_cooldown_stall_epsilon_c", epsilon, float)
             max_hold_min = await _setting_num(db, "farm_cooldown_max_hold_minutes", max_hold_min, int)
             margin = await _setting_num(db, "farm_cooldown_plateau_eject_margin_c", margin, float)
+            aux_fan = await _setting_num(db, "farm_cooldown_aux_fan_percent", aux_fan, int)
     except Exception:  # noqa: BLE001 — arm with defaults rather than strand the gate
         logger.exception("Eject monitor: cooldown stall settings read failed — arming with schema defaults")
-    return int(window_min) * 60, float(epsilon), int(max_hold_min) * 60, float(margin)
+    return CooldownWatchSettings(
+        stall_window_s=int(window_min) * 60,
+        stall_epsilon_c=float(epsilon),
+        max_hold_s=int(max_hold_min) * 60,
+        plateau_eject_margin_c=float(margin),
+        aux_fan_percent=int(aux_fan),
+    )
 
 
-async def _dispatch_production_eject(*, printer_id: int, queue_item_id: int) -> None:
+async def _await_printer_connected(printer_id: int) -> bool:
+    """Wait, bounded, for the printer's MQTT session before the cooldown prep arms.
+
+    **The gap this closes is a lifespan ORDER, not a race.** ``main``'s lifespan runs
+    ``plate_occupancy_store.hydrate()`` BEFORE ``init_printer_connections`` — and that
+    order is deliberate: rebuilding every occupied plate first is what lets a terminal
+    arriving on a fresh MQTT session find its plate already there, instead of racing a
+    hydration that had not run yet. The consequence is that EVERY watch a restart
+    re-arms starts life on a printer that is not connected yet. Without this wait, each
+    one calls ``cooldown_prep.begin`` into a closed socket and logs
+    ``not connected — plate not held`` plus ``aux fan publish refused`` (observed live,
+    with the virtual printer connecting 1.5 s later), so every deploy would drop both
+    actuators for every plate then mid-cooldown.
+
+    The invisible half is worse than the lost minutes: a plate that WAS held before the
+    restart is still physically at ~Z2 afterwards, but with no hold to report the card
+    stops saying "plate raised" — and that chip is what tells an operator not to jog the
+    toolhead, which is the whole safety case. Re-arming the hold restores the truth, and
+    re-holding an already-held plate is safe by construction: the block's first move is
+    the transit to ``park_z``, which LOWERS a held plate to the vendor's own ``G150.3``
+    height before the toolhead is asked to move (``cooldown_prep``'s "re-entry" note).
+    This wait is what makes that note true rather than merely intended.
+
+    Bounded, because a printer that is off, unplugged or out of the farm's network must
+    not park a watch forever: its plate still needs the bed poll, whose max-hold cap and
+    escalation are the only things that will ever page a human about it. So on timeout
+    the caller arms anyway and ``begin`` records an honest ``skipped:disconnected``.
+    ``_PREP_CONNECT_WAIT_S`` is 300 s against measured reconnects of ~1.5 s (VP), ~10 s
+    (a real printer) and under 3 minutes for a whole rebooted fleet (2026-09-04).
+
+    Returns True if the session came up, False at the bound. Cancellation propagates —
+    a gate cleared during the wait cancels this task exactly as it does mid-poll.
+    """
+    if printer_manager.is_connected(printer_id):
+        return True
+    waited = 0.0
+    while waited < _PREP_CONNECT_WAIT_S:
+        await asyncio.sleep(_PREP_CONNECT_POLL_S)
+        waited += _PREP_CONNECT_POLL_S
+        if printer_manager.is_connected(printer_id):
+            logger.info(
+                "Eject monitor: printer %s connected after %.0f s — arming the cooldown prep",
+                printer_id,
+                waited,
+            )
+            return True
+    logger.warning(
+        "Eject monitor: printer %s still disconnected after %.0f s — arming the cooldown prep without it "
+        "(the plate is not held and the aux fan is not commanded; the bed poll still runs)",
+        printer_id,
+        waited,
+    )
+    return False
+
+
+async def _dispatch_production_eject(*, printer_id: int, queue_item_id: int, plate_z: float | None = None) -> None:
     """``on_release`` action: dispatch the part-present motion-only eject for the
     finished unit through the shared dispatcher.
 
     Opens its own session, resolves the unit's run, and hands off to
     ``eject.remote.dispatch_part_present_eject(purpose="production")``. RAISES on
     any failure so :func:`watch_bed_and_clear` counts a dispatch failure (retry,
-    then stall after three)."""
+    then stall after three).
+
+    ``plate_z`` is where the cooldown hold parked the plate, when it held one — the
+    estimator seed, bound at arm from this watch's own prep. None means "unheld", and
+    the eject then costs its first Z move at the safe over-statement instead."""
     from backend.app.core.database import async_session
     from backend.app.models.print_queue import PrintQueueItem
     from backend.app.services.eject import remote
@@ -655,14 +751,18 @@ async def _dispatch_production_eject(*, printer_id: int, queue_item_id: int) -> 
             queue_item_id=queue_item_id,
             purpose="production",
             run_id=run_id,
+            plate_z=plate_z,
         )
 
 
-async def _dispatch_fa_eject(*, printer_id: int, queue_item_id: int, run_id: int | None) -> None:
+async def _dispatch_fa_eject(
+    *, printer_id: int, queue_item_id: int, run_id: int | None, plate_z: float | None = None
+) -> None:
     """``on_release`` action for an approved first article: dispatch its part-present
     eject through the shared dispatcher once the bed has reached the release
     threshold. RAISES on failure so the watch retries then stalls (same policy as
-    the production release)."""
+    the production release). ``plate_z`` carries the hold's parked height, exactly as
+    for the production release."""
     from backend.app.core.database import async_session
     from backend.app.services.eject import remote
 
@@ -673,6 +773,7 @@ async def _dispatch_fa_eject(*, printer_id: int, queue_item_id: int, run_id: int
             queue_item_id=queue_item_id,
             purpose="fa",
             run_id=run_id,
+            plate_z=plate_z,
         )
 
 
@@ -1004,6 +1105,29 @@ class EjectCooldownMonitor:
         armed = self._armed.get(printer_id)
         return armed.threshold_c if armed is not None else None
 
+    def hold_z(self, printer_id: int) -> float | None:
+        """The Z the armed cooldown watch is HOLDING this printer's plate at, or None.
+
+        None covers every "the plate is where the end block left it" case at once: no
+        watch, an escalation-only hold, a hold the prep skipped, and a cooldown watch
+        that has not finished arming. This is the only reader of ``_armed.hold_z``
+        outside the watch task that writes it — nothing else may reach into
+        ``_armed``."""
+        armed = self._armed.get(printer_id)
+        return armed.hold_z if armed is not None else None
+
+    def _cooldown_armed(self, printer_id: int, *, other_than: asyncio.Task | None) -> bool:
+        """Is a RELEASING watch other than ``other_than``'s armed for this printer?
+
+        The one arbiter of "does this printer still want its aux fan" at a watch's
+        exit. Order-independent by construction: whether a successor's ``begin`` ran
+        before or after this exit, the record it installed is already in ``_armed``
+        when ``_cancel`` popped ours — so the fan ends ON under a cooldown-class
+        successor and OFF under an escalation-only hold or no watch at all.
+        """
+        armed = self._armed.get(printer_id)
+        return armed is not None and armed.task is not other_than and not isinstance(armed.policy, EscalationOnly)
+
     def request_release_now(self, printer_id: int) -> bool:
         """Signal an armed RELEASING watch to sweep immediately (manual "Eject now").
 
@@ -1057,31 +1181,74 @@ class EjectCooldownMonitor:
                 armed.threshold_c = threshold
             # Resolve the plateau/cap policy once at arm; bind the eject dispatch and
             # the stall reaction to THIS unit so the watch stays identity-scoped.
-            stall_window_s, stall_epsilon_c, max_hold_s, plateau_eject_margin_c = await _resolve_stall_settings()
+            settings = await _resolve_stall_settings()
+            # Both actuators speak over MQTT, and on a restart this watch is re-armed
+            # from the hydrated plate BEFORE the lifespan opens the sessions — so wait
+            # for the wire first, bounded. On timeout we arm anyway: the prep records
+            # an honest skip and the bed poll below is what an offline printer's plate
+            # actually needs.
+            await _await_printer_connected(printer_id)
+            # Arm the cooldown actuators (plate hold + aux fan) BEFORE the first bed
+            # poll — the whole point is to shorten the wait this loop is about to sit
+            # through. ``begin`` never raises: a prep failure leaves the cooldown
+            # exactly as it was before this wave, which is a slower cooldown, not a
+            # stranded gate.
+            prep = await cooldown_prep.begin(
+                printer_id, queue_item_id=queue_item_id, aux_fan_percent=settings.aux_fan_percent
+            )
+            armed = self._armed.get(printer_id)
+            if armed is not None and armed.task is asyncio.current_task():
+                armed.hold_z = prep.hold_z if prep.hold == "sent" else None
+            # Where the eject will find the plate. Read back off the record rather
+            # than from ``prep`` so the seed and what the UI renders are the same
+            # value from the same store — and so a watch whose record was already
+            # taken over seeds nothing.
+            plate_z = armed.hold_z if (armed is not None and armed.task is asyncio.current_task()) else None
             if purpose == "fa":
                 on_release = functools.partial(
-                    _dispatch_fa_eject, printer_id=printer_id, queue_item_id=queue_item_id, run_id=run_id
+                    _dispatch_fa_eject,
+                    printer_id=printer_id,
+                    queue_item_id=queue_item_id,
+                    run_id=run_id,
+                    plate_z=plate_z,
                 )
             elif purpose == "foreign":
+                # No hold ever happens on a foreign plate (no unit, no donor, no
+                # measured part height), so its eject stays unseeded by construction.
                 on_release = functools.partial(
                     eject_remote.dispatch_identified_foreign_eject, printer_id=printer_id, profile_id=profile_id
                 )
             else:
                 on_release = functools.partial(
-                    _dispatch_production_eject, printer_id=printer_id, queue_item_id=queue_item_id
+                    _dispatch_production_eject,
+                    printer_id=printer_id,
+                    queue_item_id=queue_item_id,
+                    plate_z=plate_z,
                 )
             on_stall = functools.partial(_act_on_cooldown_stall, printer_id=printer_id, queue_item_id=queue_item_id)
-            await watch_bed_and_clear(
-                printer_id,
-                threshold,
-                stall_window_s=stall_window_s,
-                stall_epsilon_c=stall_epsilon_c,
-                plateau_eject_margin_c=plateau_eject_margin_c,
-                max_hold_s=max_hold_s,
-                on_release=on_release,
-                on_stall=on_stall,
-                release_now=release_now,
-            )
+            try:
+                # The fan witness waits INSIDE the guarded span: a cancel during its
+                # settle must still retire the prep below, or a fan commanded ON in
+                # ``begin`` would outlive the watch that switched it on.
+                await prep.observe_start()
+                await watch_bed_and_clear(
+                    printer_id,
+                    threshold,
+                    stall_window_s=settings.stall_window_s,
+                    stall_epsilon_c=settings.stall_epsilon_c,
+                    plateau_eject_margin_c=settings.plateau_eject_margin_c,
+                    max_hold_s=settings.max_hold_s,
+                    on_release=on_release,
+                    on_stall=on_stall,
+                    release_now=release_now,
+                )
+            finally:
+                # Retire the prep however the poll ended — release, stall, gate clear,
+                # exception or cancellation. This inner ``finally`` runs BEFORE the
+                # outer one's ``_release_record``, so ``_armed[printer_id]`` still
+                # holds OUR record on a normal exit and the SUCCESSOR's (or nothing)
+                # on a cancel — which is exactly the question the fan-off asks.
+                prep.end(fan_off=not self._cooldown_armed(printer_id, other_than=asyncio.current_task()))
         except asyncio.CancelledError:
             raise  # the driver cancelled us because the policy changed — not a failure
         except Exception:  # noqa: BLE001 — a watch failure must not crash the callback loop

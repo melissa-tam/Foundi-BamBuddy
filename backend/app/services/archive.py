@@ -22,7 +22,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.filament import Filament
 from backend.app.models.printer import Printer
 from backend.app.utils.safe_path import PathTraversalError, safe_join_under
-from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf
+from backend.app.utils.threemf_tools import extract_nozzle_mapping_from_3mf, read_plate_json
 
 logger = logging.getLogger(__name__)
 
@@ -894,21 +894,19 @@ def extract_printable_objects_from_3mf(
             # Build a lookup by name - use list to handle duplicate names
             bbox_by_name: dict[str, list[list]] = {}
             if include_positions:
-                plate_json_path = f"Metadata/plate_{plate_idx}.json"
-                if plate_json_path in zf.namelist():
-                    try:
-                        plate_json = json.loads(zf.read(plate_json_path).decode())
-                        # Get bbox_all - the bounding box of all objects (used for image bounds)
-                        bbox_all = plate_json.get("bbox_all")
-                        for bbox_obj in plate_json.get("bbox_objects", []):
-                            obj_name = bbox_obj.get("name")
-                            bbox = bbox_obj.get("bbox", [])
-                            if obj_name and len(bbox) >= 4:
-                                if obj_name not in bbox_by_name:
-                                    bbox_by_name[obj_name] = []
-                                bbox_by_name[obj_name].append(bbox)
-                    except (json.JSONDecodeError, KeyError):
-                        pass  # Position data is optional; objects will lack x/y coordinates
+                # Shared sidecar parser (absent/unparseable => None); position data is
+                # optional, so a None here just leaves objects without x/y coordinates.
+                plate_json = read_plate_json(zf, plate_idx)
+                if plate_json is not None:
+                    # Get bbox_all - the bounding box of all objects (used for image bounds)
+                    bbox_all = plate_json.get("bbox_all")
+                    for bbox_obj in plate_json.get("bbox_objects", []):
+                        obj_name = bbox_obj.get("name")
+                        bbox = bbox_obj.get("bbox", [])
+                        if obj_name and len(bbox) >= 4:
+                            if obj_name not in bbox_by_name:
+                                bbox_by_name[obj_name] = []
+                            bbox_by_name[obj_name].append(bbox)
 
             # Extract objects from slice_info.config
             for obj in plate.findall("object"):

@@ -22,6 +22,12 @@ class ModelGeometryResponse(BaseModel):
     validated: bool
     z_reference_validated: bool
     hold_lift_mm: float
+    # Cooldown plate-hold limits (2026-09-10). RESPONSE-ONLY on purpose: both are
+    # PHYSICAL facts about the machine, not operator settings, so they appear here and
+    # deliberately NOT on ``ModelGeometryUpdate`` — they are seeded by migration and
+    # change only by changing that seed. Both NULL ⇒ the hold is off for this model.
+    cooldown_hold_keepout_y_mm: float | None
+    cooldown_hold_clear_above_mm: float | None
     notes: str | None
     updated_at: datetime
 

@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: '列印中',
       cooling: '正在冷卻至 {{threshold}}°C',
+      coolingHeld: '正在冷卻至 {{threshold}}°C · 列印板已抬升',
+      coolingHeldHint: '列印板保持在噴嘴高度，工具頭停在滑槽處。取件執行前請勿移動工具頭。',
       awaitingPlateClear: '等待清理列印板',
     },
     ejectPhase: {
@@ -2672,6 +2674,8 @@ export default {
     farmCooldownMaxHoldHelp: '超過這段時間後熱床仍高於取件溫度，則照常取件。0 = 一直等待。',
     farmCooldownPlateauMargin: '足夠接近餘量（°C）',
     farmCooldownPlateauMarginHelp: '若降溫停滯但熱床處於取件溫度的該溫差範圍內，則視為已冷卻並取件；若卡在更高溫度，則將印表機隔離。',
+    farmCooldownAuxFan: '冷卻期間的輔助風扇 (%)',
+    farmCooldownAuxFanHelp: '從列印結束到取件下發期間，以此轉速運行列印機的輔助風扇。0 表示關閉。',
     respoolPromptThreshold: '重新綁定觀察閾值 (g)',
     respoolPromptThresholdHelp: '當重複使用的 Bambu 標籤出現、來源線軸剩餘不超過這麼多克且沒有硬體確認的用盡標記時，記錄一筆重新綁定觀察日誌（0–1000）。',
     farmUsbAutoCleanup: '儲存滿時自動清理 USB',
@@ -4885,6 +4889,17 @@ export default {
     assigning: '分配中...',
     searchSpools: '搜尋耗材...',
     showAllSpools: '顯示所有耗材',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: '上次位於此槽位',
+      ams: '上次位於此 AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '已隱藏 {{count}} 個空耗材盤',
+    assignEmptyHidden_other: '已隱藏 {{count}} 個空耗材盤',
     spoolmanSpools: 'Spoolman 線軸',
     allMaterials: '所有材料',
     filterByBrand: '按品牌篩選...',

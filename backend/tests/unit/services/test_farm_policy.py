@@ -1,6 +1,7 @@
 """Unit tests for the farm first-article + failure/quarantine policy (Phase 3)."""
 
 import dataclasses
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -1502,6 +1503,54 @@ class TestOnTerminalEjectHandling:
 
         assert plate_occupancy.pending_eject_view(printer.id) is None  # eject retired
         assert plate_occupancy.is_plate_occupied(printer.id) is False  # plate released
+
+    async def test_the_runtime_line_names_the_estimates_population(self, db_session, caplog):
+        """``ran Ns (expected Ns, start_z=...)`` — the series the eject tail is read from.
+
+        Seeded, the expectation MEASURED the block's first Z move; unseeded it bounded
+        it. Two populations of one instrument: without the field, a slow eject and a
+        pessimistic estimate look identical in the log."""
+        printer = await self._mk_printer(db_session, "PErun")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        pending = PendingEject(
+            "production",
+            batch.id,
+            333,
+            expected_runtime_s=83.0,
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=81),
+            start_z=2.0,
+        )
+        self._arm(printer.id, pending)
+
+        with (
+            caplog.at_level(logging.INFO, logger="backend.app.services.farm_policy"),
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+        ):
+            await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+        assert any("expected 83s, start_z=2" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+
+    async def test_the_runtime_line_says_unseeded_when_the_build_could_not_know(self, db_session, caplog):
+        printer = await self._mk_printer(db_session, "PErun2")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        pending = PendingEject(
+            "production",
+            batch.id,
+            444,
+            expected_runtime_s=83.0,
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=81),
+        )
+        self._arm(printer.id, pending)
+
+        with (
+            caplog.at_level(logging.INFO, logger="backend.app.services.farm_policy"),
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+        ):
+            await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+        assert any("start_z=unseeded" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
 
     async def test_production_failed_keeps_plate_and_quarantines(self, db_session):
         printer = await self._mk_printer(db_session, "PEfail")

@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: 'In stampa',
       cooling: 'Raffreddamento fino a {{threshold}}°C',
+      coolingHeld: 'Raffreddamento fino a {{threshold}}°C · piatto sollevato',
+      coolingHeldHint: 'Il piatto resta all\'altezza dell\'ugello con la testina parcheggiata allo scivolo. Non muovere la testina prima dell\'espulsione.',
       awaitingPlateClear: 'In attesa che il piatto venga liberato',
     },
     ejectPhase: {
@@ -2627,6 +2629,8 @@ export default {
     farmCooldownMaxHoldHelp: 'Se il piatto è ancora più caldo della temperatura di espulsione dopo questo tempo, espelli comunque. 0 = continua ad attendere.',
     farmCooldownPlateauMargin: 'Margine di tolleranza (°C)',
     farmCooldownPlateauMarginHelp: 'Se il raffreddamento si blocca ma il piatto è entro questi gradi dalla temperatura di espulsione, trattalo come raffreddato ed espelli; se resta più caldo, la stampante va in quarantena.',
+    farmCooldownAuxFan: 'Ventola ausiliaria durante il raffreddamento (%)',
+    farmCooldownAuxFanHelp: 'Fa girare la ventola ausiliaria della stampante a questa velocità dalla fine della stampa fino all\'invio dell\'espulsione. 0 la disattiva.',
     respoolPromptThreshold: 'Soglia di osservazione riassegnazione (g)',
     respoolPromptThresholdHelp: 'Registra un\'osservazione di riassegnazione quando arriva un tag Bambu riutilizzato e alla bobina di origine restano questi grammi o meno senza un marcatore di esaurimento certificato dall\'hardware (0–1000).',
     farmUsbAutoCleanup: 'Pulisci automaticamente l\'USB quando è pieno',
@@ -4879,6 +4883,17 @@ export default {
     assigning: 'Assegnazione...',
     searchSpools: 'Cerca bobine...',
     showAllSpools: 'Mostra tutte le bobine',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Ultima in questo slot',
+      ams: 'Ultima in questo AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} bobina vuota nascosta',
+    assignEmptyHidden_other: '{{count}} bobine vuote nascoste',
     spoolmanSpools: 'Bobine Spoolman',
     allMaterials: 'Tutti i Materiali',
     filterByBrand: 'Filtra per marchio...',

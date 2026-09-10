@@ -10,6 +10,9 @@ import pytest
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.generator import (
     EJECT_RUNTIME_OVERHEAD_S,
+    HOLD_Z_MIN_MM,
+    HOMING_ALLOWANCE_S,
+    PARK_Z_MM,
     PHASE_BEACON_LIFTED,
     PHASE_BEACON_PARK,
     PHASE_BEACON_REFERENCED,
@@ -18,9 +21,14 @@ from backend.app.services.eject.generator import (
     UNMODELLED_EPILOGUE_ALLOWANCE_S,
     Z_REFERENCE_OVERTRAVEL_MM,
     EjectGenerationError,
+    cooldown_hold_lines,
     estimate_runtime_s,
     estimate_runtime_segments,
     generate_eject_gcode,
+    hold_z,
+    lift_z,
+    park_z,
+    part_height_error,
     z_reference_prologue_lines,
 )
 from backend.app.services.eject.geometry import ModelGeometry
@@ -243,12 +251,16 @@ class TestDualNozzleHoming:
         lines = [ln.strip() for ln in gcode.splitlines()]
         for home in DUAL_NOZZLE_HOME:
             assert home in lines
-        # In order, directly after M17, before G90.
+        # In order: after the prologue AND after the block's first Z move (the home
+        # runs at the clearest point, never before the bed has been placed), before the
+        # sweep. Both torque forms stay adjacent and in X-then-Y order.
         m17_idx = lines.index("M17")
+        g90_idx = lines.index("G90")
+        first_z_idx = lines.index("G1 Z40 F900")
         x_idx = lines.index("G28 X T300")
         y_idx = lines.index("G28 Y T300")
-        g90_idx = lines.index("G90")
-        assert m17_idx < x_idx < y_idx < g90_idx
+        sweep_idx = lines.index(SWEEP_PHASE_MARKER)
+        assert m17_idx < g90_idx < first_z_idx < x_idx < y_idx < sweep_idx
 
     def test_dual_geometry_never_emits_g28_x_y(self):
         gcode = generate_eject_gcode(_profile(), 30.0, H2C_GEOMETRY)
@@ -463,21 +475,24 @@ class TestBedDropReleaseAssist:
     way DOWN (bigger Z) then back to the lift height, between the heater-off and the
     sweep. NULL clearance = off (the v1 goldens stay byte-identical)."""
 
-    def test_drop_emits_down_then_return_between_heater_off_and_sweep(self):
+    def test_drop_is_the_first_z_move_and_the_return_follows_the_home(self):
         # H2S z_travel 340, clearance 50 -> drop to 290; max_z 30 + clearance 10 ->
-        # return to lift 40. The pair sits after M140 S0, before the sweep comment.
+        # return to lift 40. Since the block became ONE Z flow the drop IS the first Z
+        # move: nothing lifts to 40 first (the old order's 63 mm up / 280 mm down), the
+        # home runs at the drop floor, and only then does the bed return to the lift.
         profile = _profile(bed_drop_clearance_mm=50.0)
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
-        # The drop (Z290) + return (Z40) are the two lines right after the marker,
-        # which itself sits between M140 S0 and the sweep. (Z40 also appears in the
-        # prologue clearance lift, so anchor positionally on the unique marker.)
         heater_idx = lines.index("M140 S0")
-        marker_idx = lines.index("; --- bed-drop release assist: full down + return ---")
+        aux_idx = lines.index("M106 P2 S0")
+        home_idx = lines.index("G28 X Y")
         sweep_idx = lines.index("; --- sweep: push part off the front edge ---")
-        assert heater_idx < marker_idx < sweep_idx
-        assert lines[marker_idx + 1] == "G1 Z290 F900"
-        assert lines[marker_idx + 2] == "G1 Z40 F900"
+        assert heater_idx < aux_idx < home_idx < sweep_idx
+        first_move = next(ln for ln in lines[aux_idx + 1 :] if ln and not ln.startswith(";"))
+        assert first_move == "G1 Z290 F900"
+        assert lines[home_idx + 1] == "G1 Z40 F900"
+        # Nothing moves Z before the drop.
+        assert not any(ln.startswith("G1 Z") for ln in lines[:aux_idx])
 
     def test_drop_zero_clearance_goes_to_full_travel(self):
         # clearance 0 (still "set", not None) -> drop to the machine bottom z_travel.
@@ -527,10 +542,10 @@ class TestBedDropDwellAndJitter:
         )
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
-        marker_idx = lines.index("; --- bed-drop release assist: full down + return ---")
-        block = [ln for ln in lines[marker_idx + 1 :] if ln and not ln.startswith(";")]
-        assert block[:9] == [
-            "G1 Z290 F900",  # drop to the floor
+        aux_idx = lines.index("M106 P2 S0")
+        block = [ln for ln in lines[aux_idx + 1 :] if ln and not ln.startswith(";")]
+        assert block[:10] == [
+            "G1 Z290 F900",  # drop to the floor — the block's FIRST Z move
             "G1 Z280 F900",  # jitter 1: up (away from the machine bottom) ...
             "G1 Z290 F900",  # ... and back to the floor
             "G1 Z280 F900",  # jitter 2
@@ -538,17 +553,17 @@ class TestBedDropDwellAndJitter:
             "G1 Z280 F900",  # jitter 3
             "G1 Z290 F900",
             "M400 S5",  # dwell at the floor, AFTER the strokes
+            "G28 X Y",  # home at the floor — the block's clearest point
             "G1 Z40 F900",  # return to the lift height, LAST
         ]
 
-    def test_dwell_alone_sits_between_drop_and_return(self):
+    def test_dwell_alone_sits_between_drop_and_home(self):
         profile = _profile(bed_drop_clearance_mm=50.0, bed_drop_dwell_s=7)
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
-        marker_idx = lines.index("; --- bed-drop release assist: full down + return ---")
-        assert lines[marker_idx + 1] == "G1 Z290 F900"
-        assert lines[marker_idx + 3] == "M400 S7"  # +2 is the dwell comment
-        assert lines[marker_idx + 4] == "G1 Z40 F900"
+        aux_idx = lines.index("M106 P2 S0")
+        block = [ln for ln in lines[aux_idx + 1 :] if ln and not ln.startswith(";")]
+        assert block[:4] == ["G1 Z290 F900", "M400 S7", "G28 X Y", "G1 Z40 F900"]
 
     def test_dwell_is_m400_never_g4(self):
         # G4 is invisible to estimate_runtime_s, which the abort watchdog consumes.
@@ -662,6 +677,34 @@ M18
 """
 
 
+# The SAME single-pass shape under the one-Z-flow order (2026-09-10): the drop is the
+# block's first Z move, the home runs at the floor, the return follows it. Kept beside
+# its predecessor so the two orders' estimates can be read against each other.
+_ONE_FLOW_SHAPE_BLOCK = """\
+; ===== FARM EJECT BLOCK profile=singlepass =====
+M17
+G90
+M73 P5
+M140 S0
+M106 P2 S0
+G1 Z340 F900
+G28 X Y
+G1 Z60.1 F900
+M73 P50
+; --- sweep ---
+G1 X3 Y322 F9000
+G1 Z50 F600
+G1 X3 F9000
+G1 Y-2 F3000
+G1 Y322 F9000
+M73 P75
+G1 Z60.1 F900
+G1 X170 Y160 F9000
+M400 S1
+M18
+"""
+
+
 class TestEstimateRuntime:
     """The runtime estimator behind the eject runtime guard (2026-07-31 incident).
 
@@ -685,9 +728,11 @@ class TestEstimateRuntime:
             assert EJECT_RUNTIME_OVERHEAD_S < seconds < 900, f"{path.name} estimated {seconds:.1f}s"
 
     def test_bed_drop_pair_is_counted(self):
-        # The drop goldens differ from their namesakes ONLY by the bed-drop pair
-        # (lift 40 → 290 → 40 at F900 = 500 mm ≈ 33.3 s). That move is the one that
-        # stalled in the incident, so it must be fully inside the estimate.
+        # The drop goldens differ from their namesakes by where the block's single Z
+        # approach goes: to the drop floor 290 and back to lift 40, instead of straight
+        # to 40. Unseeded that is 290 + 250 mm against 40 mm — still exactly the 500 mm
+        # ≈ 33.3 s the assist adds. That move is the one that stalled in the incident,
+        # so it must be fully inside the estimate.
         golden_dir = pathlib.Path(__file__).parent / "golden"
         plain = estimate_runtime_s((golden_dir / "default_h2s_z30.gcode").read_text())
         with_drop = estimate_runtime_s((golden_dir / "drop_h2s_z30.gcode").read_text())
@@ -715,29 +760,46 @@ class TestEstimateRuntime:
         # F is modal: the second move carries no F and must inherit F600, not be
         # dropped as feedless. 60 mm at F600 = 6 s per move.
         gcode = "G28 X Y\nG1 X60 F600\nG1 X120\n"
-        assert estimate_runtime_s(gcode) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + 12.0)
+        assert estimate_runtime_s(gcode) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + HOMING_ALLOWANCE_S + 12.0)
 
     def test_move_before_any_feedrate_contributes_nothing(self):
         # Defensive: the generator always emits an explicit F, so a feedless leading
         # move means the input is not one of ours — score it 0 rather than guess.
-        assert estimate_runtime_s("G28 X Y\nG1 X100\n") == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
+        assert estimate_runtime_s("G28 X Y\nG1 X100\n") == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + HOMING_ALLOWANCE_S)
 
-    def test_unknown_axis_first_move_contributes_zero(self):
-        # G28 zeroes X/Y but NEVER Z (the eject prologue must not home Z with a part
-        # on the plate), so the prologue's first Z lift has no known origin and is
-        # unmeasurable. It still makes Z known — the bed-drop that follows IS counted.
-        prologue_only = "M17\nG28 X Y\nG90\nG1 Z60 F900\n"
-        assert estimate_runtime_s(prologue_only) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
-        then_dropped = prologue_only + "G1 Z340 F900\n"
-        assert estimate_runtime_s(then_dropped) == pytest.approx(EJECT_RUNTIME_OVERHEAD_S + 280.0 / 900.0 * 60.0)
+    def test_an_unknown_first_z_move_counts_its_longest_possible_travel(self):
+        # G28 zeroes X/Y but NEVER Z (the eject prologue must not home Z with a part on
+        # the plate), so the block's first Z move has no known origin. Since the block
+        # became one Z flow that move IS the bed drop — the move that stalls — so it is
+        # scored as the LONGEST travel it could be, max(target, z_travel - target). The
+        # old "unknown contributes 0 mm" rule would hand the drop-span deadline a budget
+        # 217-338 mm short of the motion and kill healthy ejects.
+        floor = EJECT_RUNTIME_OVERHEAD_S + HOMING_ALLOWANCE_S
+        deep = "M17\nG28 X Y\nG90\nG1 Z340 F900\n"
+        assert estimate_runtime_s(deep, z_travel_mm=340.0) == pytest.approx(floor + 340.0 / 900.0 * 60.0)
+        # A shallow target is bounded by the travel ABOVE it instead.
+        shallow = "M17\nG28 X Y\nG90\nG1 Z40 F900\n"
+        assert estimate_runtime_s(shallow, z_travel_mm=340.0) == pytest.approx(floor + 300.0 / 900.0 * 60.0)
+        # SEEDED — the cooldown hold parked the plate at a height the server commanded —
+        # the same move is measured rather than bounded.
+        assert estimate_runtime_s(shallow, start_z=2.0, z_travel_mm=340.0) == pytest.approx(floor + 38.0 / 900.0 * 60.0)
+        # With no z_travel to bound it, the only figure available is the target itself.
+        assert estimate_runtime_s(shallow) == pytest.approx(floor + 40.0 / 900.0 * 60.0)
+
+    def test_an_unknown_xy_move_still_contributes_zero(self):
+        # X/Y keep the original rule: a G28 precedes every X/Y move in every block the
+        # generator emits, so an unknown X/Y origin means the input is not one of ours.
+        assert estimate_runtime_s("G1 X100 F9000\n") == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
 
     def test_torque_home_dialect_zeroes_xy_like_the_bare_form(self):
         # Dual-nozzle models home with G28 X T300 / G28 Y T300 (a bare G28 X Y
         # stall-loops that firmware). Both dialects must establish the same datum,
-        # or every H2C estimate would silently lose its first sweep move.
+        # or every H2C estimate would silently lose its first sweep move — so the MOVE
+        # scores identically, and the torque dialect books one extra homing allowance
+        # purely because it is two commands.
         bare = "G28 X Y\nG1 X60 Y0 F600\n"
         torque = "G28 X T300\nG28 Y T300\nG1 X60 Y0 F600\n"
-        assert estimate_runtime_s(torque) == pytest.approx(estimate_runtime_s(bare))
+        assert estimate_runtime_s(torque) == pytest.approx(estimate_runtime_s(bare) + HOMING_ALLOWANCE_S)
 
     def test_comments_are_stripped(self):
         assert estimate_runtime_s("; G1 X999 F60\n") == pytest.approx(EJECT_RUNTIME_OVERHEAD_S)
@@ -747,12 +809,107 @@ class TestEstimateRuntime:
         # 80-83 s across 11 nominal ejects. The estimate must land in that
         # neighbourhood — too low and the watchdog aborts healthy sweeps, too high and
         # the deadline drifts out past the incident's stall.
+        #
+        # It now sits ~9 s ABOVE that measured nominal, and both terms are deliberate:
+        # the block's home is finally modelled (HOMING_ALLOWANCE_S, time the machine
+        # always spent and the estimate always ignored) and its first Z move is BOUNDED
+        # rather than scored 0 mm. Both push the deadline toward patience, which is the
+        # only direction a deadline may be wrong in.
         seconds = estimate_runtime_s(_INCIDENT_SHAPE_BLOCK)
         assert 67.0 <= seconds <= 97.0, f"estimated {seconds:.1f}s, expected 82±15s"
         # The watchdog must fire well before the incident's 179 s while leaving every
         # nominal 80-83 s sweep untouched.
         assert eject_abort_deadline_s(seconds) < 179.0
         assert eject_abort_deadline_s(seconds) >= 83.0
+
+    def test_the_one_flow_shape_keeps_the_same_guarantees(self):
+        # The same profile under the ONE-Z-FLOW order: no lift before the drop, the home
+        # at the floor, the return after it. The machine does strictly LESS motion (the
+        # 63 mm lift is gone) while the estimate covers strictly more of it, so both ends
+        # of the incident calibration must still hold.
+        seconds = estimate_runtime_s(_ONE_FLOW_SHAPE_BLOCK, z_travel_mm=340.0)
+        assert 67.0 <= seconds <= 105.0, f"estimated {seconds:.1f}s"
+        assert eject_abort_deadline_s(seconds) < 179.0
+        assert eject_abort_deadline_s(seconds) >= 83.0
+        # Seeded from the cooldown hold, the same block estimates slightly TIGHTER: the
+        # drop leg is measured from 2 mm instead of bounded from anywhere.
+        seeded = estimate_runtime_s(_ONE_FLOW_SHAPE_BLOCK, start_z=2.0, z_travel_mm=340.0)
+        assert seeded < seconds
+
+
+class TestSharedCoordinateOrigins:
+    """Every Z the block emits comes from ONE function, shared with the validator.
+
+    The validator used to re-derive the lift and the park from the same arithmetic; two
+    copies of a coordinate rule is how a guard ends up bounding a number the generator
+    never emitted."""
+
+    def test_lift_is_the_part_top_plus_the_clearance(self):
+        assert lift_z(30.0, _profile(clearance_mm=10.0)) == pytest.approx(40.0)
+        assert lift_z(0.0, _profile(clearance_mm=0.0)) == pytest.approx(0.0)
+
+    def test_park_is_the_lift_floored_at_the_park_minimum(self):
+        # A tiny part under a legal clearance_mm=0 still ends the block a usable
+        # distance from the nozzle.
+        assert park_z(30.0, _profile(clearance_mm=10.0)) == pytest.approx(40.0)
+        assert park_z(1.0, _profile(clearance_mm=0.0)) == pytest.approx(PARK_Z_MM)
+
+    def test_the_block_emits_exactly_those_numbers(self):
+        profile = _profile()
+        lines = [ln.strip() for ln in generate_eject_gcode(profile, 30.0, H2S_GEOMETRY).splitlines()]
+        assert f"G1 Z{lift_z(30.0, profile):g} F900" in lines
+        park_idx = lines.index(PHASE_BEACON_PARK + " ; phase beacon: sweep done - eject runtime watchdog")
+        assert lines[park_idx + 1] == f"G1 Z{park_z(30.0, profile):g} F900"
+
+
+class TestCooldownHoldLines:
+    """The cooldown HOLD block: transit clear, park at the chute, hold, release.
+
+    Sent while a finished plate waits out its cooldown, so the eject that follows starts
+    its one Z flow from a KNOWN height instead of from the vendor's parked bed. It is
+    not an eject block and deliberately does not pass the eject validator — its safety
+    is the two functions it shares with the eject (park_z, hold_z) and the one refusal
+    it shares with the generator (part_height_error)."""
+
+    def test_hold_height_is_the_part_top_under_the_chute_headroom(self):
+        # 50 mm part under 51 mm of headroom lands on the floor; 55 mm under the same
+        # headroom sits 4 mm above it.
+        assert hold_z(50.0, 51.0) == pytest.approx(HOLD_Z_MIN_MM)
+        assert hold_z(55.0, 51.0) == pytest.approx(4.0)
+
+    def test_the_floor_is_never_breached(self):
+        # However short the part, the plate never rides closer than the floor — the
+        # margin the frame's own slop has to fit inside.
+        assert hold_z(0.0, 51.0) == pytest.approx(HOLD_Z_MIN_MM)
+
+    def test_the_block_is_pinned_line_by_line(self):
+        # A 50.1 mm part under a 55 mm guard: transit at the park height (lift 60.1),
+        # the vendor macro, then the hold at the floor.
+        lines = cooldown_hold_lines(50.1, _profile(max_part_height_mm=55.0), 51.0)
+        assert lines == [
+            "M17",
+            "G90",
+            "G1 Z60.1 F900 ; transit: never tighter than the vendor's own G150.3 precondition",
+            "M400",
+            "G150.3 ; vendor macro: toolhead to the chute park (the end block's own last travel)",
+            "M400",
+            "G1 Z2 F900 ; hold: part top 51 mm above the nozzle plane at most",
+            "M400",
+            "M18",
+        ]
+
+    def test_the_transit_is_the_blocks_own_park_height(self):
+        # Never tighter than the vendor's own G150.3 precondition (its end block runs
+        # the macro at max_layer_z + 10), and the same height the eject parks at.
+        profile = _profile(max_part_height_mm=55.0)
+        transit = cooldown_hold_lines(50.1, profile, 51.0)[2]
+        assert transit.startswith(f"G1 Z{park_z(50.1, profile):g} F900")
+
+    def test_it_refuses_an_over_height_part_in_the_generators_own_words(self):
+        profile = _profile(max_part_height_mm=42.0)
+        with pytest.raises(EjectGenerationError) as raised:
+            cooldown_hold_lines(50.0, profile, 51.0)
+        assert str(raised.value) == part_height_error(50.0, profile)
 
 
 class TestBuildSummaryLog:
@@ -761,6 +918,16 @@ class TestBuildSummaryLog:
     The emitted G-code is never persisted (it lives inside a temp artifact), so
     before this line the 2026-07-31 incident could only be reconstructed by
     re-deriving the block through the preview endpoint."""
+
+    def test_summary_names_the_first_z_move(self, caplog):
+        # The block's first Z move is where it starts from AND the move that stalls, so
+        # a post-incident reader must find it in the log without re-deriving the profile.
+        with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
+            generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("first_z=290" in m and "drop_z=290" in m for m in messages)
+        assert any("first_z=40" in m and "drop_z=off" in m for m in messages)
 
     def test_summary_names_the_drop_target(self, caplog):
         with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
@@ -792,13 +959,25 @@ class TestPhaseBeacons:
     def _lines(gcode: str) -> list[str]:
         return [ln.strip() for ln in gcode.splitlines()]
 
-    def test_lifted_beacon_follows_the_prologue_lift(self):
+    def test_lifted_beacon_precedes_the_blocks_first_z_move(self):
+        # The beacon opens the drop span, and since the block became one Z flow the first
+        # Z move IS the move that span exists to bound — so the beacon must be emitted
+        # BEFORE it, never after.
         lines = self._lines(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
-        lift_idx = lines.index("G1 Z40 F900")
-        assert lines[lift_idx + 1].startswith(PHASE_BEACON_LIFTED + " ;")
-        # ...and it precedes the heater-off section, so the drop span it opens covers the
-        # whole pre-sweep block rather than starting mid-way through it.
-        assert lift_idx + 1 < lines.index("; --- bed heater off ---")
+        beacon_idx = next(i for i, ln in enumerate(lines) if ln.startswith(PHASE_BEACON_LIFTED + " ;"))
+        assert beacon_idx < lines.index("G1 Z40 F900")
+        # Nothing before it moves at all, which is what makes the span complete.
+        assert not any(ln.startswith(("G0 ", "G1 ", "G380")) for ln in lines[:beacon_idx])
+        # ...and it precedes the heater-off section.
+        assert beacon_idx < lines.index("; --- bed heater off, aux fan off ---")
+
+    def test_the_aux_fan_stop_sits_between_the_beacon_and_the_first_move(self):
+        # The cooldown prep runs the aux fan during the wait and its server-side OFF is
+        # best-effort (a restart orphans it), so the eject file — the one writer that
+        # cannot be lost — commands it off too. Non-motion, so it costs the span nothing.
+        lines = self._lines(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
+        beacon_idx = next(i for i, ln in enumerate(lines) if ln.startswith(PHASE_BEACON_LIFTED + " ;"))
+        assert beacon_idx < lines.index("M106 P2 S0") < lines.index("G1 Z40 F900")
 
     @pytest.mark.parametrize("bed_drop", [None, 50.0], ids=["drop-off", "drop-on"])
     def test_sweep_beacon_sits_immediately_above_the_sweep_marker(self, bed_drop):
@@ -897,13 +1076,20 @@ class TestEstimateRuntimeSegments:
             assert seg.total_s == pytest.approx(merged.total_s), path.name
             assert seg.tail_s > 0.0, f"{path.name} scored an empty tail"
 
-    def test_drop_span_holds_exactly_the_bed_drop_motion(self):
-        # lift 40 → 290 → 40 at F900 = 500 mm of commanded travel, and nothing else in
-        # the drop-less block's span (M140 S0 costs no time).
-        drop = estimate_runtime_segments(generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY))
-        plain = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
-        assert plain.drop_span_s == 0.0
-        assert drop.drop_span_s == pytest.approx(500.0 / 900.0 * 60.0, abs=0.01)
+    def test_drop_span_holds_the_first_z_move_the_home_and_the_return(self):
+        # The span the drop-lane deadline is armed on. One Z flow: the drop (unknown
+        # origin, so bounded at 290 mm), the home's allowance, the 250 mm return to 40.
+        block = generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
+        drop = estimate_runtime_segments(block, z_travel_mm=340.0)
+        assert drop.drop_span_s == pytest.approx((290.0 + 250.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
+        # Seeded from the cooldown hold the drop leg is 2 mm shorter, and measured.
+        seeded = estimate_runtime_segments(block, start_z=2.0, z_travel_mm=340.0)
+        assert seeded.drop_span_s == pytest.approx((288.0 + 250.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
+        # A drop-LESS block's span is no longer empty — it holds that block's own lift
+        # and its home. Dispatch still leaves the lane disarmed for such profiles (see
+        # BuiltEject.drop_span_s); the estimator states the truth either way.
+        plain = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY), z_travel_mm=340.0)
+        assert plain.drop_span_s == pytest.approx(300.0 / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
 
     def test_drop_span_includes_the_floor_dwell_and_jitter(self):
         # Both act AT the drop floor, so both are inside the phase the watchdog bounds —
@@ -915,19 +1101,26 @@ class TestEstimateRuntimeSegments:
         bare = estimate_runtime_segments(generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY))
         assert seg.drop_span_s - bare.drop_span_s == pytest.approx(5.0 + 2 * 3 * 10.0 / 900.0 * 60.0, abs=0.01)
 
-    def test_pre_segment_carries_the_unmeasurable_lift_only(self):
-        # The prologue's first Z move has no known origin (G28 never homes Z with a part
-        # on the plate), so it scores 0 — and the overhead belongs to no phase.
-        seg = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
-        assert seg.pre_s == 0.0
-        assert seg.sweep_span_s > 0.0
+    def test_pre_segment_is_empty_for_every_generated_block(self):
+        # The P5 beacon is emitted before the first Z move, so nothing between the block
+        # start and the beacon moves at all. ``pre_s`` survives as a field only for a
+        # hand-edited or legacy block that does move there.
+        for geometry in (H2S_GEOMETRY, H2S_GEOMETRY_Z_REFERENCED):
+            seg = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, geometry))
+            assert seg.pre_s == 0.0, geometry.model_key
+            assert seg.sweep_span_s > 0.0
 
     def test_the_park_beacon_closes_the_sweep_and_the_epilogue_hundred_does_not(self):
         # Only the three exact beacon literals split. M73 P100 R0 must stay inside
         # tail_s: it is the stock epilogue's own progress line, not a phase boundary.
         gcode = "G28 X Y\nM73 P5\nG1 Z100 F900\nG1 Z50 F900\nM73 P50\nM400 S3\nM73 P75\nM73 P100 R0\nM400 S4\n"
         seg = estimate_runtime_segments(gcode)
-        assert seg.drop_span_s == pytest.approx(50.0 / 900.0 * 60.0, abs=0.01)
+        # The home sits BEFORE P5 in this hand-built fixture, so its allowance lands in
+        # pre_s — which is exactly what the segment split is for.
+        assert seg.pre_s == pytest.approx(HOMING_ALLOWANCE_S)
+        # Z100 from an unknown origin is bounded at 100 mm (no z_travel given), then the
+        # measured 50 mm step down.
+        assert seg.drop_span_s == pytest.approx((100.0 + 50.0) / 900.0 * 60.0, abs=0.01)
         assert seg.sweep_span_s == pytest.approx(3.0)
         assert seg.tail_s == pytest.approx(4.0)
 
@@ -938,7 +1131,7 @@ class TestEstimateRuntimeSegments:
         # treats as plate-contact time.
         gcode = "G28 X Y\nM73 P5\nG1 Z100 F900\nM73 P50\nM73 P5\nM400 S9\n"
         seg = estimate_runtime_segments(gcode)
-        assert seg.drop_span_s == 0.0
+        assert seg.drop_span_s == pytest.approx(100.0 / 900.0 * 60.0, abs=0.01)
         assert seg.sweep_span_s == pytest.approx(9.0)
         replayed = estimate_runtime_segments("M73 P5\nM73 P50\nM73 P75\nM73 P50\nM400 S9\n")
         assert replayed.sweep_span_s == 0.0
@@ -1085,20 +1278,24 @@ class TestZReferencePrologue:
         off = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
         assert off.reference_s is None
 
-    def test_the_total_grows_by_the_drive_and_the_lift_it_makes_measurable(self):
-        on = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY_Z_REFERENCED))
-        off = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
-        # The drive itself...
+    def test_the_total_grows_by_the_drive_and_nothing_else(self):
+        block_on = generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY_Z_REFERENCED)
+        on = estimate_runtime_segments(block_on, z_travel_mm=340.0)
+        off = estimate_runtime_segments(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY), z_travel_mm=340.0)
+        # The drive itself, and nothing else: the recipe adds a prologue, not motion.
         assert on.reference_s == pytest.approx(19.5)
-        # ...plus the prologue lift, which was UNMEASURABLE before (no known Z) and is
-        # now a real 340 -> 40 mm move at F900. Both are commanded time the machine
-        # genuinely spends; neither is a re-fit of EJECT_RUNTIME_OVERHEAD_S.
-        assert off.pre_s == 0.0
-        assert on.pre_s == pytest.approx(300.0 / 900.0 * 60.0)
-        assert on.total_s == pytest.approx(off.total_s + on.reference_s + on.pre_s)
-        # The sweep and the tail are untouched: the recipe adds a prologue, not motion.
+        # Neither block moves before the P5 beacon, and the first Z move sits in the drop
+        # span for both. DECLARED (G92 Z340) it is a real 340 -> 40 mm move; UNDECLARED
+        # it is bounded at the longest it could be — here the same 300 mm.
+        assert (on.pre_s, off.pre_s) == (0.0, 0.0)
+        assert on.drop_span_s == pytest.approx(off.drop_span_s)
+        assert on.total_s == pytest.approx(off.total_s + on.reference_s)
         assert on.sweep_span_s == pytest.approx(off.sweep_span_s)
         assert on.tail_s == pytest.approx(off.tail_s)
+        # A declaration OUTRANKS the caller's seed: the machine's own statement about
+        # the frame beats anyone's belief about where the plate was.
+        seeded = estimate_runtime_segments(block_on, start_z=2.0, z_travel_mm=340.0)
+        assert seeded.drop_span_s == pytest.approx(on.drop_span_s)
 
     def test_a_relative_move_is_scored_as_a_displacement(self):
         # The generator emits no relative G0/G1 (the validator forbids one), so this
@@ -1108,17 +1305,25 @@ class TestZReferencePrologue:
         seg = estimate_runtime_segments("G90\nG92 Z340\nG91\nG1 Z10 F600\nG90\n")
         assert seg.pre_s == pytest.approx(10.0 / 600.0 * 60.0)
 
-    def test_g92_makes_z_measurable_and_g380_makes_it_unknown_again(self):
-        # Without a declaration the first Z move is real but unmeasurable (0 mm); the
-        # guarded drive leaves the machine somewhere this model cannot know, and the
-        # G92 that follows is what makes it knowable.
-        undeclared = estimate_runtime_segments("G1 Z40 F900\nM73 P5\n")
-        assert undeclared.pre_s == 0.0
-        declared = estimate_runtime_segments("G92 Z340\nG1 Z40 F900\nM73 P5\n")
+    def test_g92_declares_z_and_g380_makes_it_unknown_again(self):
+        # Without a declaration the first Z move is BOUNDED (the longest it could be);
+        # the guarded drive leaves the machine somewhere this model cannot know, and the
+        # G92 that follows is what makes it knowable again.
+        undeclared = estimate_runtime_segments("G1 Z40 F900\nM73 P5\n", z_travel_mm=340.0)
+        assert undeclared.pre_s == pytest.approx(300.0 / 900.0 * 60.0)
+        declared = estimate_runtime_segments("G92 Z340\nG1 Z40 F900\nM73 P5\n", z_travel_mm=340.0)
         assert declared.pre_s == pytest.approx(300.0 / 900.0 * 60.0)
-        after_drive = estimate_runtime_segments("G92 Z340\nG91\nG380 S2 Z390 F1200\nG90\nG1 Z40 F900\nM73 P5\n")
-        # The G380's own 390 mm is counted; the move after it is not, Z being unknown.
-        assert after_drive.pre_s == pytest.approx(390.0 / 1200.0 * 60.0)
+        after_drive = estimate_runtime_segments(
+            "G92 Z340\nG91\nG380 S2 Z390 F1200\nG90\nG1 Z40 F900\nM73 P5\n", z_travel_mm=340.0
+        )
+        # The G380's own 390 mm is counted, and the move after it is bounded again.
+        assert after_drive.pre_s == pytest.approx(390.0 / 1200.0 * 60.0 + 300.0 / 900.0 * 60.0)
+
+    def test_a_declaration_outranks_the_callers_seed(self):
+        seeded = estimate_runtime_segments("G1 Z40 F900\nM73 P5\n", start_z=100.0)
+        assert seeded.pre_s == pytest.approx(60.0 / 900.0 * 60.0)
+        declared = estimate_runtime_segments("G92 Z340\nG1 Z40 F900\nM73 P5\n", start_z=100.0)
+        assert declared.pre_s == pytest.approx(300.0 / 900.0 * 60.0)
 
     def test_the_build_line_names_the_gate(self, caplog):
         with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):

@@ -21,13 +21,13 @@ from sqlalchemy import select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.services.eject.build_cache import EjectBuildError, get_or_build_eject_file
+from backend.app.services.eject.donor import read_max_z
 from backend.app.services.eject.generator import (
     EjectGenerationError,
     estimate_runtime_segments,
     generate_eject_gcode,
 )
 from backend.app.services.eject.validator import validate_eject_gcode
-from backend.app.utils.threemf_tools import read_plate_gcode_header
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,11 +48,19 @@ class BuiltEject:
     whether the sweep can be trusted. Dispatch threads it onto the
     :class:`~backend.app.services.eject.remote.PendingEject` that survives until then.
 
-    ``drop_span_s`` is the bed-drop phase's own budget (the commanded time between the
-    M73 phase beacons), and is set ONLY for a profile that actually drops the bed. A
-    drop-less block's pre-sweep motion is just the prologue lift, which cannot stall
-    against an under-bed obstruction, so it carries None and the watchdog's edge lane
-    stays disarmed rather than timing a phase that does not exist.
+    ``drop_span_s`` is the P5→P50 phase's own budget (the commanded time between the
+    M73 phase beacons), and is set ONLY for a profile that actually drops the bed.
+
+    That is now a DECISION rather than a description. Since the block became one Z flow,
+    an assist-OFF block's P5→P50 span is no longer empty: it holds the 63 mm open-loop
+    lift to the sweep height plus the X/Y home — real motion this lane could bound. It
+    is left DISARMED for such profiles this wave anyway: no SKU runs an assist-off
+    profile, so the lane would gain no coverage today, and arming it cannot make an
+    existing eject safer while it can make a healthy one killable. The alternative,
+    for the wave that wants it, is to arm on the SPAN rather than on the profile flag —
+    the ``_EDGE_LANE_MIN_LEAD_S`` test in ``remote.py`` already refuses a span too close
+    to the whole-job deadline to be worth timing, which is the same question asked
+    honestly.
 
     ``sweep_span_s`` and ``tail_s`` are the two post-drop budgets, and unlike the drop
     they are unconditional: every generated block sweeps and every generated block ends
@@ -63,6 +71,13 @@ class BuiltEject:
     it is conditional — ``None`` for every model whose ladder has not opened
     ``z_reference_validated``, which is all of them until one does. A block without that
     phase must leave the watchdog's lane DISARMED rather than arm a zero-length deadline.
+
+    ``start_z`` is the plate height the estimate was SEEDED with, or None when the build
+    could not know where the plate was. It rides along because ``expected_runtime_s`` is
+    a function of it: a seeded estimate MEASURES the block's first Z move, an unseeded
+    one BOUNDS it. "Seeded" and "unseeded" are therefore two populations of one
+    instrument, and a runtime series that mixes them without saying which is which
+    cannot be read.
     """
 
     path: Path
@@ -71,18 +86,7 @@ class BuiltEject:
     sweep_span_s: float
     tail_s: float
     reference_s: float | None = None
-
-
-def _parse_max_z_height(source_path: Path, plate_id: int) -> float | None:
-    """Read `max_z_height` (mm) from the plate's 3MF gcode header, or None."""
-    header = read_plate_gcode_header(source_path, plate_id)
-    raw = header.get("max_z_height")
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
+    start_z: float | None = None
 
 
 async def resolve_cooldown_override(db: AsyncSession, batch_id: int | None) -> float | None:
@@ -109,17 +113,18 @@ async def build_part_present_eject_file(
     profile: EjectProfile,
     geometry: ModelGeometry,
     max_z_override: float | None = None,
+    plate_z: float | None = None,
 ) -> BuiltEject:
     """Build a standalone PART-PRESENT, MOTION-ONLY eject-only ``.gcode.3mf`` for ``plate_id``.
 
     The plate's G-code is REPLACED ENTIRELY (via ``repack_3mf_with_gcode``, MD5
-    recomputed) by the generated eject block: prologue ``M17`` → home X/Y only —
-    single-nozzle models use ``G28 X Y``, dual-nozzle (H2C/H2D/X2D) models use the
-    torque-parameterized ``G28 X T300`` / ``G28 Y T300`` forms (a bare ``G28 X Y``
-    stall-loops that firmware). NEVER a bare ``G28`` / ``G28 Z`` — the part sits on
-    the plate, so the block relies on the retained Z datum. Then ``M140 S0``, the
-    optional bed-drop release assist, the sweep, the park, then the completion
-    epilogue. There is NO in-file cooldown wait: the eject monitor
+    recomputed) by the generated eject block: ``M17`` → ``M140 S0`` / ``M106 P2 S0``
+    → ONE Z move to the bed-drop floor (or, assist-off, to the lift height) → home X/Y
+    only → the sweep, the park, then the completion epilogue. The home is
+    single-nozzle ``G28 X Y`` or the dual-nozzle (H2C/H2D/X2D) torque-parameterized
+    ``G28 X T300`` / ``G28 Y T300`` pair (a bare ``G28 X Y`` stall-loops that firmware),
+    and NEVER a bare ``G28`` / ``G28 Z`` — the part sits on the plate, so the block
+    relies on the retained Z datum. There is NO in-file cooldown wait: the eject monitor
     already held the plate gate until the live bed reached the release threshold
     before this motion-only job is dispatched. The generator emits exactly that
     shape; the validator re-checks geometry / homing / tool-state.
@@ -143,13 +148,19 @@ async def build_part_present_eject_file(
     ``max_part_height_mm`` guard stays the one authority on a refusable height, so no
     validation is duplicated here.
 
+    ``plate_z`` is where the bed IS when the block starts, when the caller knows: the
+    cooldown hold parks the plate at a height the server commanded, so a seeded estimate
+    measures the block's first Z move instead of bounding it. It changes no G-code — only
+    what the watchdog's deadlines are computed from — and its absence is honest rather
+    than fatal (the estimate is then the longest the move could take).
+
     Returns a :class:`BuiltEject` — the temp ``.gcode.3mf`` path (caller cleans it
     up) plus the runtime the block is expected to take. The estimate is taken from
     the EJECT BLOCK text, which is exactly what replaces the plate G-code, i.e.
     exactly what the printer executes; anything else in the archive is inert. Raises
     :class:`EjectGenerationError` on any failure.
     """
-    max_z = max_z_override if max_z_override is not None else _parse_max_z_height(Path(source_path), plate_id)
+    max_z = max_z_override if max_z_override is not None else read_max_z(Path(source_path), plate_id)
     if max_z is None:
         raise EjectGenerationError("Could not parse max_z_height from the 3MF gcode header")
 
@@ -157,11 +168,11 @@ async def build_part_present_eject_file(
     validation = validate_eject_gcode(block, profile, max_z, geometry)
     if not validation.ok:
         raise EjectGenerationError("Part-present eject validation failed: " + "; ".join(validation.errors))
-    segments = estimate_runtime_segments(block)
-    # The drop span is only meaningful when the block actually drops the bed — see
-    # BuiltEject.drop_span_s. Between the beacons a drop-less block holds nothing but
-    # `M140 S0`, so publishing its ~0 s span would arm the edge lane on a phase that
-    # cannot stall.
+    segments = estimate_runtime_segments(block, start_z=plate_z, z_travel_mm=geometry.z_travel_mm)
+    # The edge lane is armed only for a profile that actually drops the bed — see
+    # BuiltEject.drop_span_s for why that is now a decision rather than a description
+    # (an assist-off block's P5→P50 span holds its lift and its home, and could be
+    # bounded; it is deliberately not, this wave).
     drop_span_s = segments.drop_span_s if profile.bed_drop_clearance_mm is not None else None
 
     try:
@@ -169,13 +180,15 @@ async def build_part_present_eject_file(
     except EjectBuildError as exc:
         raise EjectGenerationError(f"Failed to repack the part-present eject 3mf: {exc}") from exc
     logger.info(
-        "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r, z_ref=%s) — "
-        "expected runtime %.0fs (z-reference %s, pre %.0fs, bed-drop span %s, sweep span %.0fs, tail %.0fs)",
+        "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r, z_ref=%s, "
+        "start_z=%s) — expected runtime %.0fs (z-reference %s, pre %.0fs, bed-drop span %s, sweep span %.0fs, "
+        "tail %.0fs)",
         Path(source_path).name,
         plate_id,
         max_z,
         profile.name,
         "on" if geometry.z_reference_validated else "off",
+        f"{plate_z:g}" if plate_z is not None else "unseeded",
         segments.total_s,
         f"{segments.reference_s:.0f}s" if segments.reference_s is not None else "off",
         segments.pre_s,
@@ -190,4 +203,5 @@ async def build_part_present_eject_file(
         sweep_span_s=segments.sweep_span_s,
         tail_s=segments.tail_s,
         reference_s=segments.reference_s,
+        start_z=plate_z,
     )

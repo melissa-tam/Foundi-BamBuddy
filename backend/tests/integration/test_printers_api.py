@@ -801,6 +801,7 @@ class TestPrintersAPI:
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
             patch.object(eject_cooldown_monitor, "active_watch", return_value=33.0),
+            patch.object(eject_cooldown_monitor, "hold_z", return_value=2.0),
         ):
             mock_pm.get_status = MagicMock(return_value=state)
             mock_pm.is_awaiting_plate_clear = MagicMock(return_value=True)
@@ -808,7 +809,9 @@ class TestPrintersAPI:
             mock_pm.model_mismatch_reason = MagicMock(return_value=None)
             response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
         assert response.status_code == 200
-        assert response.json()["eject_watch"] == {"threshold_c": 33.0}
+        # ``hold_z`` must survive the REST lane's Pydantic serialisation exactly as the
+        # WS lane's raw dump carries it — the card's "plate raised" chip reads it.
+        assert response.json()["eject_watch"] == {"threshold_c": 33.0, "hold_z": 2.0}
 
         # Unarmed watch → null (mirrors _eject_watch_payload returning None).
         with (
@@ -4388,31 +4391,37 @@ class TestSetFanSpeedAPI:
         """Verify each fan name maps to the correct hardware fan-id."""
         printer = await printer_factory(name="P", model="X1C")
         mock_client = MagicMock()
-        mock_client.set_fan_speed.return_value = True
+        mock_client.set_fan_percent.return_value = True
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/fan-speed?fan={fan_name}&speed=100")
         assert response.status_code == 200
-        called_fan_id, called_pwm = mock_client.set_fan_speed.call_args.args
+        called_fan_id, _called_percent = mock_client.set_fan_percent.call_args.args
         assert called_fan_id == expected_fan_id
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    @pytest.mark.parametrize(
-        "speed_pct,expected_pwm",
-        [(0, 0), (50, 128), (100, 255)],
-    )
-    async def test_pwm_conversion(self, async_client: AsyncClient, printer_factory, speed_pct, expected_pwm):
-        """0-100% must convert to 0-255 PWM (round-to-nearest)."""
+    @pytest.mark.parametrize("speed_pct", [0, 50, 100])
+    async def test_percent_is_delegated_verbatim(self, async_client: AsyncClient, printer_factory, speed_pct):
+        """The route hands the PERCENT straight to the client and converts nothing.
+
+        The 0-100 -> 0-255 PWM conversion used to be inline here; it now has a single
+        origin in ``BambuMQTTClient.set_fan_percent`` (shared with the eject cooldown's
+        aux-fan prep) and is pinned there, in
+        ``test_bambu_mqtt.py::TestSetFanPercent``. Asserting the raw percent at this
+        boundary is what keeps a second, drifting copy from reappearing in the route.
+        """
         printer = await printer_factory(name="P", model="X1C")
         mock_client = MagicMock()
-        mock_client.set_fan_speed.return_value = True
+        mock_client.set_fan_percent.return_value = True
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/fan-speed?fan=part&speed={speed_pct}")
         assert response.status_code == 200
-        _called_fan_id, called_pwm = mock_client.set_fan_speed.call_args.args
-        assert called_pwm == expected_pwm
+        _called_fan_id, called_percent = mock_client.set_fan_percent.call_args.args
+        assert called_percent == speed_pct
+        # The route must not reach past the percent seam.
+        mock_client.set_fan_speed.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.integration

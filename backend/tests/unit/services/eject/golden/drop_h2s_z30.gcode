@@ -1,14 +1,15 @@
 ; ===== FARM EJECT BLOCK profile=drop =====
-; --- prologue: re-engage motors, home X/Y (never Z) ---
+; --- prologue: re-engage motors ---
 M17
-G28 X Y
 G90
-G1 Z40 F900
-M73 P5 ; phase beacon: prologue done - eject runtime watchdog
-; --- bed heater off ---
+M73 P5 ; phase beacon: drop phase begins - eject runtime watchdog
+; --- bed heater off, aux fan off ---
 M140 S0
-; --- bed-drop release assist: full down + return ---
+M106 P2 S0
+; --- first Z move: one flow from wherever the plate is (vendor park or the cooldown hold) ---
 G1 Z290 F900
+; --- home X/Y (never Z) at the block's clearest point ---
+G28 X Y
 G1 Z40 F900
 M73 P50 ; phase beacon: sweep begins - eject runtime watchdog
 ; --- sweep: push part off the front edge ---

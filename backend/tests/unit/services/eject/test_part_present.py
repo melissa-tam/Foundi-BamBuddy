@@ -1,5 +1,6 @@
 """Tests for the part-present eject-only file builder (remote first-article eject)."""
 
+import logging
 import os
 import re
 import tempfile
@@ -12,6 +13,7 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.services.eject.dispatch import BuiltEject, build_part_present_eject_file
 from backend.app.services.eject.generator import (
     EJECT_RUNTIME_OVERHEAD_S,
+    HOMING_ALLOWANCE_S,
     EjectGenerationError,
     estimate_runtime_s,
     estimate_runtime_segments,
@@ -186,7 +188,14 @@ class TestBuildPartPresentEjectFile:
             # The estimate is of the EJECT BLOCK — what actually replaced the plate
             # G-code — so it must exceed the fixed overhead by the sweep's motion.
             assert built.expected_runtime_s > EJECT_RUNTIME_OVERHEAD_S
-            assert built.expected_runtime_s == estimate_runtime_s(_read_plate_gcode(built.path))
+            # Re-deriving it needs the SAME inputs the build walked with — the model's
+            # z_travel bounds the block's unknown-origin first Z move — which is exactly
+            # why the seed travels on the BuiltEject rather than being guessed later.
+            assert built.expected_runtime_s == estimate_runtime_s(
+                _read_plate_gcode(built.path), z_travel_mm=H2S_GEOMETRY.z_travel_mm
+            )
+            # Unseeded by construction: this caller cannot say where the plate is.
+            assert built.start_z is None
         finally:
             src.unlink(missing_ok=True)
             if built:
@@ -279,19 +288,70 @@ class TestBuiltEjectDropSpan:
             built = await build_part_present_eject_file(src, 1, _profile(bed_drop_clearance_mm=50.0), H2S_GEOMETRY)
             dropless = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
 
-            # With the assist on: the block's own P5→P50 span. The donor's part is
-            # 18 mm, so the lift is 28 and the drop floor 340-50=290 → 524 mm at F900.
-            assert built.drop_span_s == pytest.approx(2 * (290.0 - 28.0) / 900.0 * 60.0, abs=0.01)
+            # With the assist on: the block's own P5→P50 span, which since the block
+            # became one Z flow is the drop, the home and the return. The donor's part is
+            # 18 mm, so the lift is 28 and the drop floor 340-50=290; the drop leg is
+            # bounded at 290 mm (unknown origin) and the return is 262 mm, both at F900.
+            assert built.drop_span_s == pytest.approx((290.0 + 262.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
             assert built.drop_span_s == pytest.approx(
-                estimate_runtime_segments(_read_plate_gcode(built.path)).drop_span_s
+                estimate_runtime_segments(
+                    _read_plate_gcode(built.path), z_travel_mm=H2S_GEOMETRY.z_travel_mm
+                ).drop_span_s
             )
-            # Without it, the pre-sweep motion is just the prologue lift, which cannot
-            # stall against an under-bed obstruction — so the edge lane stays disarmed
-            # rather than timing a ~0 s phase.
+            # Without the assist the lane stays disarmed — a decision, not a description:
+            # that block's span holds its own lift and home and could be timed, but no
+            # SKU runs such a profile and arming it can only add ways to be wrong.
             assert dropless.drop_span_s is None
         finally:
             src.unlink(missing_ok=True)
             for artifact in (built, dropless):
+                if artifact:
+                    artifact.path.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_a_seeded_build_measures_the_first_z_move(self):
+        # The cooldown hold parks the plate at a height the server COMMANDED, so a
+        # seeded build knows where the block's first Z move starts from instead of
+        # bounding it. It changes no G-code — only what the watchdog's deadlines are
+        # computed from — so the two builds differ in their estimate and in nothing else.
+        src = _make_3mf()
+        seeded = unseeded = None
+        try:
+            profile = _profile(bed_drop_clearance_mm=50.0)
+            seeded = await build_part_present_eject_file(src, 1, profile, H2S_GEOMETRY, plate_z=2.0)
+            unseeded = await build_part_present_eject_file(src, 1, profile, H2S_GEOMETRY)
+            assert seeded.start_z == 2.0
+            assert unseeded.start_z is None
+            assert _read_plate_gcode(seeded.path) == _read_plate_gcode(unseeded.path)
+            # 290 - 2 measured against 290 bounded: the seed is 2 mm of F900 travel.
+            assert unseeded.expected_runtime_s - seeded.expected_runtime_s == pytest.approx(
+                2.0 / 900.0 * 60.0, abs=0.01
+            )
+            assert seeded.expected_runtime_s == estimate_runtime_s(
+                _read_plate_gcode(seeded.path), start_z=2.0, z_travel_mm=H2S_GEOMETRY.z_travel_mm
+            )
+        finally:
+            src.unlink(missing_ok=True)
+            for artifact in (seeded, unseeded):
+                if artifact:
+                    artifact.path.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_the_build_line_says_which_population_the_estimate_belongs_to(self, caplog):
+        # A runtime series that mixes seeded and unseeded estimates without saying which
+        # is which cannot be read — so the build line names it either way.
+        src = _make_3mf()
+        built = plain = None
+        try:
+            with caplog.at_level(logging.INFO, logger="backend.app.services.eject.dispatch"):
+                built = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY, plate_z=2.0)
+                plain = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
+            messages = [r.getMessage() for r in caplog.records]
+            assert any("start_z=2)" in m for m in messages), messages
+            assert any("start_z=unseeded)" in m for m in messages), messages
+        finally:
+            src.unlink(missing_ok=True)
+            for artifact in (built, plain):
                 if artifact:
                     artifact.path.unlink(missing_ok=True)
 
@@ -302,7 +362,9 @@ class TestBuiltEjectDropSpan:
         try:
             built = await build_part_present_eject_file(src, 1, _profile(bed_drop_clearance_mm=50.0), H2S_GEOMETRY)
             assert 0 < built.drop_span_s < built.expected_runtime_s
-            assert built.expected_runtime_s == estimate_runtime_s(_read_plate_gcode(built.path))
+            assert built.expected_runtime_s == estimate_runtime_s(
+                _read_plate_gcode(built.path), z_travel_mm=H2S_GEOMETRY.z_travel_mm
+            )
         finally:
             src.unlink(missing_ok=True)
             if built:

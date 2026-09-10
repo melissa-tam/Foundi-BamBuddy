@@ -573,8 +573,11 @@ class TestEjectProfileDryRun:
         assert "M190" not in gcode
         assert "M106 S255" not in gcode
         assert "M140 S0" in gcode
-        # But the sweep + centre park geometry is still present.
-        assert "G1 X170 Y160 Z10 F9000" in gcode
+        # But the sweep + centre park geometry is still present. The park is TWO moves
+        # (bed clear first, then the traverse to centre) and its Z is proportional to the
+        # part: max_z 20 + clearance 10 = 30, floored at PARK_Z_MM.
+        assert "G1 Z30 F900" in gcode
+        assert "G1 X170 Y160 F9000" in gcode
         # Header/config comment block preserved.
         assert "; max_z_height: 20.00" in gcode
         # The block self-completes via its stock machine-end FINISH epilogue, so the
@@ -670,7 +673,8 @@ class TestEjectProfileDryRun:
         assert lines.count("G28 Z P0 T250") == 1  # dry-run prepend only, never in-block
         # Thermal-less dry-run shape unchanged; H2C centre park (bed 330x320).
         assert "M190" not in gcode
-        assert "G1 X165 Y160 Z10 F9000" in gcode
+        assert "G1 Z30 F900" in gcode
+        assert "G1 X165 Y160 F9000" in gcode
 
     async def test_dry_run_unknown_profile_404(self, async_client: AsyncClient, db_session, tmp_path):
         lib = await _add_library_file(db_session, tmp_path, name="d404.gcode.3mf")

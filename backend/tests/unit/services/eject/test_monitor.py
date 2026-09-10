@@ -47,6 +47,78 @@ from backend.app.services.plate_occupancy import (
 )
 
 
+def _settings(**overrides) -> monitor_mod.CooldownWatchSettings:
+    """The watch's arm-time settings, with the plateau/cap machinery and the aux fan
+    OFF — every test that uses this is about something else, and reading the real
+    settings DB would couple it to a table it never writes."""
+    defaults = {
+        "stall_window_s": 0,
+        "stall_epsilon_c": 1.0,
+        "max_hold_s": 0,
+        "plateau_eject_margin_c": 3.0,
+        "aux_fan_percent": 0,
+    }
+    defaults.update(overrides)
+    return monitor_mod.CooldownWatchSettings(**defaults)
+
+
+class _PrepRecorder:
+    """Stand-in for the cooldown prep: records the arm, and how it was retired.
+
+    A double, not a re-implementation — what ``begin`` decides is pinned end-to-end in
+    ``test_cooldown_prep.py``. What matters HERE is only the wiring: that the watch
+    arms the prep before it polls, seeds ``hold_z`` from it, and retires it exactly
+    once on every exit path.
+    """
+
+    def __init__(self, *, hold: str = "skipped:no_numbers", hold_z: float | None = None) -> None:
+        self.hold = hold
+        self.hold_z = hold_z
+        self.begun: list[tuple[int, int | None, int]] = []
+        self.ended: list[bool] = []
+        self.order: list[str] = []
+
+    def install(self, monkeypatch) -> None:
+        recorder = self
+
+        class _Prep:
+            hold = recorder.hold
+            hold_z = recorder.hold_z
+
+            async def observe_start(self) -> None:
+                recorder.order.append("observe")
+
+            def end(self, *, fan_off: bool) -> None:
+                recorder.ended.append(fan_off)
+                recorder.order.append("end")
+
+        async def fake_begin(printer_id, *, queue_item_id, aux_fan_percent, **kwargs):
+            recorder.begun.append((printer_id, queue_item_id, aux_fan_percent))
+            recorder.order.append("begin")
+            return _Prep()
+
+        monkeypatch.setattr(monitor_mod.cooldown_prep, "begin", fake_begin)
+
+
+@pytest.fixture
+def stub_prep(monkeypatch):
+    """A cooldown prep that touches no hardware. Returns the recorder."""
+    recorder = _PrepRecorder()
+    recorder.install(monkeypatch)
+    return recorder
+
+
+@pytest.fixture(autouse=True)
+def _printer_connected(monkeypatch):
+    """Every watch here runs against a CONNECTED printer unless the test says otherwise.
+
+    ``_watch`` waits for the MQTT session before it arms the cooldown prep (a restart
+    re-arms watches from the hydrated plates BEFORE the lifespan opens the sessions),
+    so without an ambient answer a test about anything else would sit in that wait for
+    its full bound. The wait itself is pinned in ``TestCooldownPrepWiring``."""
+    monkeypatch.setattr(monitor_mod.printer_manager, "is_connected", lambda printer_id: True)
+
+
 @pytest.fixture(autouse=True)
 def _clean_occupancy():
     """Every test starts with an empty fleet and NO injected callables.
@@ -1119,7 +1191,7 @@ class TestArmedWatchResolution:
         from writing over its successor's threshold."""
         mon._armed[printer_id] = _ArmedWatch(policy=policy, task=asyncio.current_task())
 
-    async def test_cooldown_watch_exposes_threshold_then_clears(self, monkeypatch):
+    async def test_cooldown_watch_exposes_threshold_then_clears(self, monkeypatch, stub_prep):
         mon = EjectCooldownMonitor()
         seen: dict[str, float | None] = {}
 
@@ -1129,7 +1201,7 @@ class TestArmedWatchResolution:
             return 33.0
 
         async def fake_settings():
-            return (0, 1.0, 0, 3.0)  # isolate from the settings DB — not under test here
+            return _settings()
 
         async def fake_watch(pid, threshold, **kwargs):
             # Mid-watch, the threshold is visible to status consumers.
@@ -1170,7 +1242,7 @@ class TestArmedWatchResolution:
         assert held == [7]
         assert mon.active_watch(7) is None
 
-    async def test_fa_watch_resolves_fa_threshold_and_releases_into_fa_dispatch(self, monkeypatch):
+    async def test_fa_watch_resolves_fa_threshold_and_releases_into_fa_dispatch(self, monkeypatch, stub_prep):
         """A FirstArticleEject policy → _watch(purpose='fa'): the FA guard is skipped
         (for_first_article=True) and the release action is the FA dispatcher."""
         mon = EjectCooldownMonitor()
@@ -1181,15 +1253,16 @@ class TestArmedWatchResolution:
             return 33.0
 
         async def fake_settings():
-            return (0, 1.0, 0, 3.0)  # isolate from the settings DB — not under test here
+            return _settings()
 
         async def fake_watch(pid, threshold, **kwargs):
             seen["threshold"] = threshold
             await kwargs["on_release"]()  # release fires the bound FA dispatch
             return "released"
 
-        async def fake_fa_dispatch(*, printer_id, queue_item_id, run_id):
+        async def fake_fa_dispatch(*, printer_id, queue_item_id, run_id, plate_z=None):
             seen["fa_dispatch"] = (printer_id, queue_item_id, run_id)
+            seen["fa_plate_z"] = plate_z
 
         monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", fake_resolve)
         monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", fake_settings)
@@ -1202,9 +1275,10 @@ class TestArmedWatchResolution:
         assert seen["resolve"] == (42, True)
         assert seen["threshold"] == 33.0
         assert seen["fa_dispatch"] == (7, 42, 9)
+        assert seen["fa_plate_z"] is None  # the stubbed prep held nothing — nothing to seed
         assert mon.active_watch(7) is None  # dropped on exit
 
-    async def test_foreign_watch_uses_direct_threshold_and_releases_into_foreign_dispatch(self, monkeypatch):
+    async def test_foreign_watch_uses_direct_threshold_and_releases_into_foreign_dispatch(self, monkeypatch, stub_prep):
         """A ForeignAutoEject policy → _watch(purpose='foreign'): the threshold is
         passed DIRECTLY (no queue item, so _resolve_eject_threshold is NEVER called),
         the watch exposes it, and the release action is the foreign-plate dispatcher
@@ -1220,7 +1294,7 @@ class TestArmedWatchResolution:
             return 99.0
 
         async def fake_settings():
-            return (0, 1.0, 0, 3.0)  # isolate from the settings DB
+            return _settings()
 
         async def fake_watch(pid, threshold, **kwargs):
             seen["threshold"] = threshold
@@ -1255,15 +1329,16 @@ class TestArmedWatchResolution:
             raise RuntimeError("settings DB unavailable")
 
         monkeypatch.setattr(db_mod, "async_session", broken_session)
-        window_s, epsilon, max_hold_s, margin = await monitor_mod._resolve_stall_settings()
+        settings = await monitor_mod._resolve_stall_settings()
         fields = AppSettings.model_fields
-        assert window_s == int(fields["farm_cooldown_stall_window_minutes"].default) * 60
-        assert epsilon == float(fields["farm_cooldown_stall_epsilon_c"].default)
-        assert max_hold_s == int(fields["farm_cooldown_max_hold_minutes"].default) * 60
-        assert margin == float(fields["farm_cooldown_plateau_eject_margin_c"].default)
+        assert settings.stall_window_s == int(fields["farm_cooldown_stall_window_minutes"].default) * 60
+        assert settings.stall_epsilon_c == float(fields["farm_cooldown_stall_epsilon_c"].default)
+        assert settings.max_hold_s == int(fields["farm_cooldown_max_hold_minutes"].default) * 60
+        assert settings.plateau_eject_margin_c == float(fields["farm_cooldown_plateau_eject_margin_c"].default)
+        assert settings.aux_fan_percent == int(fields["farm_cooldown_aux_fan_percent"].default)
 
     def test_printer_state_payload_helper(self):
-        # printer_manager exposes the armed watch as {"threshold_c": t} / None.
+        # printer_manager exposes the armed watch as {"threshold_c", "hold_z"} / None.
         from backend.app.services.eject.monitor import eject_cooldown_monitor
         from backend.app.services.printer_manager import _eject_watch_payload
 
@@ -1272,11 +1347,30 @@ class TestArmedWatchResolution:
         armed = _ArmedWatch(policy=CooldownEject(unit_id=1, run_id=None), task=_FakeTask("x"), threshold_c=33.0)
         eject_cooldown_monitor._armed[901] = armed
         try:
-            assert _eject_watch_payload(901) == {"threshold_c": 33.0}
+            # An unheld plate still reports its threshold — hold_z is simply absent.
+            assert _eject_watch_payload(901) == {"threshold_c": 33.0, "hold_z": None}
+            armed.hold_z = 2.0
+            assert _eject_watch_payload(901) == {"threshold_c": 33.0, "hold_z": 2.0}
             armed.threshold_c = None  # escalation-only hold / still resolving
             assert _eject_watch_payload(901) is None
         finally:
             eject_cooldown_monitor._armed.pop(901, None)
+
+    def test_payload_values_are_json_primitives(self):
+        """The WS lane serialises this dict with a bare ``json.dumps`` — a non-primitive
+        here killed every status broadcast on the socket for a day (2026-08-31)."""
+        import json
+
+        from backend.app.services.eject.monitor import eject_cooldown_monitor
+        from backend.app.services.printer_manager import _eject_watch_payload
+
+        eject_cooldown_monitor._armed[902] = _ArmedWatch(
+            policy=CooldownEject(unit_id=1, run_id=None), task=_FakeTask("x"), threshold_c=33.0, hold_z=2.0
+        )
+        try:
+            assert json.dumps(_eject_watch_payload(902)) == '{"threshold_c": 33.0, "hold_z": 2.0}'
+        finally:
+            eject_cooldown_monitor._armed.pop(902, None)
 
 
 class TestResolveStallSettings:
@@ -1297,12 +1391,13 @@ class TestResolveStallSettings:
         from backend.app.schemas.settings import AppSettings
 
         self._patch_session(monkeypatch, db_session)
-        window_s, epsilon, max_hold_s, margin = await monitor_mod._resolve_stall_settings()
+        settings = await monitor_mod._resolve_stall_settings()
         fields = AppSettings.model_fields
-        assert window_s == fields["farm_cooldown_stall_window_minutes"].default * 60
-        assert epsilon == fields["farm_cooldown_stall_epsilon_c"].default
-        assert max_hold_s == fields["farm_cooldown_max_hold_minutes"].default * 60
-        assert margin == fields["farm_cooldown_plateau_eject_margin_c"].default  # default 3.0 fallback
+        assert settings.stall_window_s == fields["farm_cooldown_stall_window_minutes"].default * 60
+        assert settings.stall_epsilon_c == fields["farm_cooldown_stall_epsilon_c"].default
+        assert settings.max_hold_s == fields["farm_cooldown_max_hold_minutes"].default * 60
+        assert settings.plateau_eject_margin_c == fields["farm_cooldown_plateau_eject_margin_c"].default  # 3.0
+        assert settings.aux_fan_percent == fields["farm_cooldown_aux_fan_percent"].default == 100
 
     async def test_reads_settings_rows_and_converts_minutes(self, db_session, monkeypatch):
         from backend.app.api.routes.settings import set_setting
@@ -1312,11 +1407,381 @@ class TestResolveStallSettings:
         await set_setting(db_session, "farm_cooldown_stall_epsilon_c", "2.5")
         await set_setting(db_session, "farm_cooldown_max_hold_minutes", "0")  # 0 disables the cap
         await set_setting(db_session, "farm_cooldown_plateau_eject_margin_c", "4.5")
-        window_s, epsilon, max_hold_s, margin = await monitor_mod._resolve_stall_settings()
-        assert window_s == 10 * 60
-        assert epsilon == 2.5
-        assert max_hold_s == 0
-        assert margin == 4.5
+        await set_setting(db_session, "farm_cooldown_aux_fan_percent", "60")
+        settings = await monitor_mod._resolve_stall_settings()
+        assert settings.stall_window_s == 10 * 60
+        assert settings.stall_epsilon_c == 2.5
+        assert settings.max_hold_s == 0
+        assert settings.plateau_eject_margin_c == 4.5
+        assert settings.aux_fan_percent == 60
+
+
+class TestCooldownPrepWiring:
+    """The cooldown prep is armed before the bed poll and retired in a ``finally``
+    around it — on EVERY exit, because a fan left running under an idle printer and a
+    plate left held under no watch are both states nothing else in the farm clears."""
+
+    @staticmethod
+    async def _threshold(qid, *, for_first_article=False):
+        return 33.0
+
+    @staticmethod
+    async def _settings_100():
+        return _settings(aux_fan_percent=100)
+
+    def _patch_deps(self, monkeypatch, *, watch, prep: _PrepRecorder):
+        """Everything ``_watch`` reaches for, replaced — but ``_watch`` itself is real."""
+        prep.install(monkeypatch)
+        monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", self._threshold)
+        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", self._settings_100)
+        monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", watch)
+
+    def _install(self, monkeypatch, mon, *, watch, prep: _PrepRecorder):
+        self._patch_deps(monkeypatch, watch=watch, prep=prep)
+        mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=42, run_id=None), task=asyncio.current_task())
+
+    async def test_waits_for_the_mqtt_session_before_arming(self, monkeypatch):
+        """A restart re-arms this watch from its hydrated plate BEFORE the lifespan
+        opens the MQTT sessions (``hydrate()`` runs first, deliberately), so arming the
+        prep straight away would publish a hold and a fan command into a closed socket
+        — observed live as ``not connected — plate not held``. The prep must arm only
+        once the wire is up."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        answers = [False, False, False, True]
+
+        def fake_connected(printer_id):
+            # Recorded into the SAME list as the prep events, so the ordering between
+            # "the session came up" and "the prep armed" is proven, not inferred.
+            answer = answers.pop(0) if answers else True
+            prep.order.append(f"connected={answer}")
+            return answer
+
+        async def fake_watch(pid, threshold, **kwargs):
+            prep.order.append("poll")
+            return "released"
+
+        monkeypatch.setattr(monitor_mod, "_PREP_CONNECT_POLL_S", 0.001)
+        monkeypatch.setattr(monitor_mod, "_PREP_CONNECT_WAIT_S", 1.0)
+        monkeypatch.setattr(monitor_mod.printer_manager, "is_connected", fake_connected)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        # Four polls — three refusals, then the session — and the arm strictly after it.
+        assert prep.order == [
+            "connected=False",
+            "connected=False",
+            "connected=False",
+            "connected=True",
+            "begin",
+            "observe",
+            "poll",
+            "end",
+        ]
+        assert answers == []  # every scripted answer was consumed: 4 polls, no more
+
+    async def test_arms_anyway_at_the_bound_and_still_polls_the_bed(self, monkeypatch):
+        """A printer that never comes back must not park its watch forever: the bed
+        poll's max-hold cap and escalation are the only things that will ever page a
+        human about that plate, so the wait is bounded and the prep records an honest
+        ``skipped:disconnected`` from there."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            prep.order.append("poll")
+            return "released"
+
+        monkeypatch.setattr(monitor_mod, "_PREP_CONNECT_POLL_S", 0.001)
+        monkeypatch.setattr(monitor_mod, "_PREP_CONNECT_WAIT_S", 0.005)
+        monkeypatch.setattr(monitor_mod.printer_manager, "is_connected", lambda printer_id: False)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.order == ["begin", "observe", "poll", "end"]
+
+    async def test_a_connected_printer_never_waits(self, monkeypatch):
+        """The steady-state path — a terminal on a live session — pays nothing for the
+        restart case: the first answer is the only question asked."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        async def fake_watch(pid, threshold, **kwargs):
+            prep.order.append("poll")
+            return "released"
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(monitor_mod.printer_manager, "is_connected", lambda printer_id: True)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert slept == []
+        assert prep.order == ["begin", "observe", "poll", "end"]
+
+    async def test_cancel_during_the_connect_wait_arms_nothing(self, monkeypatch):
+        """A gate cleared while we wait for the wire cancels the watch exactly as it
+        does mid-poll — and nothing was armed, so there is nothing to retire."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        waiting = asyncio.Event()
+
+        def never_connected(printer_id):
+            waiting.set()
+            return False
+
+        async def fake_watch(pid, threshold, **kwargs):
+            prep.order.append("poll")
+            return "released"
+
+        monkeypatch.setattr(monitor_mod, "_PREP_CONNECT_POLL_S", 0.01)
+        monkeypatch.setattr(monitor_mod.printer_manager, "is_connected", never_connected)
+        self._patch_deps(monkeypatch, watch=fake_watch, prep=prep)
+
+        task = asyncio.create_task(mon._watch(7, 42, release_now=asyncio.Event()))
+        mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=42, run_id=None), task=task)
+        await waiting.wait()
+        mon._cancel(7, "plate cleared by an operator")
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert prep.begun == []  # nothing was armed …
+        assert prep.ended == []  # … so there is nothing to switch back off
+        assert prep.order == []
+        assert mon._armed.get(7) is None  # and the record is released
+
+    async def test_begins_before_the_poll_and_ends_after_it(self, monkeypatch):
+        """The whole point is to shorten the wait the poll is about to sit through, so
+        the actuators go on FIRST — and the settings the watch resolved carry the
+        operator's fan percent into them."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            prep.order.append("poll")
+            return "released"
+
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.order == ["begin", "observe", "poll", "end"]
+        assert prep.begun == [(7, 42, 100)]
+
+    async def test_retired_when_the_poll_raises(self, monkeypatch):
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            raise RuntimeError("bed poll exploded")
+
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())  # swallowed by the watch body
+
+        assert prep.ended == [True]  # nothing succeeded us → the fan goes off
+
+    async def _cancelled_watch(self, monkeypatch, mon, prep: _PrepRecorder) -> asyncio.Task:
+        """Start a real watch parked in its bed poll, and return the task."""
+        started = asyncio.Event()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            started.set()
+            await asyncio.sleep(3600)  # park here until the driver cancels us
+
+        prep.install(monkeypatch)
+        monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", self._threshold)
+        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", self._settings_100)
+        monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", fake_watch)
+        task = asyncio.create_task(mon._watch(7, 42, release_now=asyncio.Event()))
+        mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=42, run_id=None), task=task)
+        await started.wait()
+        return task
+
+    async def test_retired_when_the_watch_is_cancelled(self, monkeypatch):
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        task = await self._cancelled_watch(monkeypatch, mon, prep)
+
+        mon._cancel(7, "plate cleared")  # no successor
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert prep.ended == [True]
+
+    @pytest.mark.parametrize("successor_begins_first", [True, False])
+    async def test_cancel_with_a_cooldown_successor_hands_the_fan_over(self, monkeypatch, successor_begins_first):
+        """Order-independent by construction: the driver installs the successor's
+        RECORD synchronously inside the same ``on_occupancy_change`` call that
+        cancelled us, long before our CancelledError is delivered — so whether the
+        successor's own ``begin`` published its fan before or after our exit, the
+        answer to "does this printer still want its fan" is the same."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        task = await self._cancelled_watch(monkeypatch, mon, prep)
+
+        mon._cancel(7, "policy changed to CooldownEject")
+        mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=43, run_id=None), task=_FakeTask("successor"))
+        if successor_begins_first:
+            await monitor_mod.cooldown_prep.begin(7, queue_item_id=43, aux_fan_percent=100)
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        if not successor_begins_first:
+            await monitor_mod.cooldown_prep.begin(7, queue_item_id=43, aux_fan_percent=100)
+
+        assert prep.ended == [False]  # the fan stays on for the successor
+        assert prep.order.count("begin") == 2
+
+    async def test_cancel_with_an_escalation_successor_switches_the_fan_off(self, monkeypatch):
+        """An escalation-only hold is a plate waiting for a HUMAN — nothing is cooling
+        toward a release, so nothing wants the fan."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        task = await self._cancelled_watch(monkeypatch, mon, prep)
+
+        mon._cancel(7, "policy changed to EscalationOnly")
+        mon._armed[7] = _ArmedWatch(policy=EscalationOnly(), task=_FakeTask("successor"))
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert prep.ended == [True]
+
+    @pytest.mark.parametrize(
+        ("hold", "hold_z", "expected"),
+        [("sent", 2.0, 2.0), ("skipped:no_numbers", None, None), ("skipped:keepout", None, None)],
+    )
+    async def test_hold_z_is_published_only_for_a_hold_that_happened(self, monkeypatch, hold, hold_z, expected):
+        """The seed and the UI chip come from the same store, and only a SENT hold
+        writes it — a computed-but-unsent height would tell the eject's watchdog the
+        bed is 120 mm closer to the nozzle than it really is."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder(hold=hold, hold_z=hold_z)
+        seen: dict[str, object] = {}
+
+        async def fake_watch(pid, threshold, **kwargs):
+            seen["mid"] = mon.hold_z(pid)
+            await kwargs["on_release"]()
+            return "released"
+
+        async def fake_dispatch(*, printer_id, queue_item_id, plate_z=None):
+            seen["plate_z"] = plate_z
+
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        monkeypatch.setattr(monitor_mod, "_dispatch_production_eject", fake_dispatch)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert seen["mid"] == expected  # visible to the status payload mid-watch
+        assert seen["plate_z"] == expected  # and it is what the eject is seeded with
+        assert mon.hold_z(7) is None  # the record is dropped when the watch exits
+
+    async def test_hold_z_reaches_the_status_payload(self, monkeypatch):
+        """End to end: the watch's own store → ``hold_z()`` → the eject_watch payload
+        the printer card renders its "plate raised" chip from."""
+        from backend.app.services.printer_manager import _eject_watch_payload
+
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder(hold="sent", hold_z=2.0)
+        seen: dict[str, object] = {}
+
+        async def fake_watch(pid, threshold, **kwargs):
+            seen["payload"] = _eject_watch_payload(pid)
+            return "released"
+
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        # The payload helper resolves the singleton lazily, at call time.
+        monkeypatch.setattr(monitor_mod, "eject_cooldown_monitor", mon)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert seen["payload"] == {"threshold_c": 33.0, "hold_z": 2.0}
+
+
+class TestCooldownArmedArbiter:
+    """``_cooldown_armed`` is the ONE answer to "does this printer still want its aux
+    fan" at a watch's exit. Four cases, and only one of them keeps the fan on."""
+
+    def test_our_own_record_is_not_a_successor(self):
+        mon = EjectCooldownMonitor()
+        task = _FakeTask("mine")
+        mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=1, run_id=None), task=task)
+        assert mon._cooldown_armed(7, other_than=task) is False
+
+    def test_a_cooldown_successor_keeps_the_fan(self):
+        mon = EjectCooldownMonitor()
+        mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=1, run_id=None), task=_FakeTask("theirs"))
+        assert mon._cooldown_armed(7, other_than=_FakeTask("mine")) is True
+
+    def test_a_first_article_successor_keeps_the_fan(self):
+        mon = EjectCooldownMonitor()
+        mon._armed[7] = _ArmedWatch(policy=FirstArticleEject(unit_id=1, run_id=2), task=_FakeTask("theirs"))
+        assert mon._cooldown_armed(7, other_than=_FakeTask("mine")) is True
+
+    def test_a_foreign_successor_keeps_the_fan(self):
+        mon = EjectCooldownMonitor()
+        mon._armed[7] = _ArmedWatch(policy=ForeignAutoEject(profile_id=5, threshold_c=33.0), task=_FakeTask("t"))
+        assert mon._cooldown_armed(7, other_than=_FakeTask("mine")) is True
+
+    def test_an_escalation_only_successor_releases_the_fan(self):
+        mon = EjectCooldownMonitor()
+        mon._armed[7] = _ArmedWatch(policy=EscalationOnly(), task=_FakeTask("theirs"))
+        assert mon._cooldown_armed(7, other_than=_FakeTask("mine")) is False
+
+    def test_no_record_releases_the_fan(self):
+        assert EjectCooldownMonitor()._cooldown_armed(7, other_than=_FakeTask("mine")) is False
+
+
+class TestPlateZThreading:
+    """The held height reaches the eject dispatcher, which is the only consumer that
+    can turn it into a runtime budget."""
+
+    @staticmethod
+    def _patch_session(monkeypatch):
+        @contextlib.asynccontextmanager
+        async def fake_session():
+            yield SimpleNamespace(get=_get)
+
+        async def _get(model, pk):
+            return SimpleNamespace(batch_id=9)
+
+        monkeypatch.setattr("backend.app.core.database.async_session", fake_session, raising=False)
+
+    async def test_production_dispatch_forwards_plate_z(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(db, *, printer_id, queue_item_id, purpose, run_id, plate_z=None):
+            seen.update(printer_id=printer_id, purpose=purpose, run_id=run_id, plate_z=plate_z)
+
+        self._patch_session(monkeypatch)
+        monkeypatch.setattr(eject_remote, "dispatch_part_present_eject", fake_dispatch)
+        await monitor_mod._dispatch_production_eject(printer_id=7, queue_item_id=42, plate_z=2.0)
+
+        assert seen == {"printer_id": 7, "purpose": "production", "run_id": 9, "plate_z": 2.0}
+
+    async def test_fa_dispatch_forwards_plate_z(self, monkeypatch):
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(db, *, printer_id, queue_item_id, purpose, run_id, plate_z=None):
+            seen.update(purpose=purpose, run_id=run_id, plate_z=plate_z)
+
+        self._patch_session(monkeypatch)
+        monkeypatch.setattr(eject_remote, "dispatch_part_present_eject", fake_dispatch)
+        await monitor_mod._dispatch_fa_eject(printer_id=7, queue_item_id=42, run_id=3, plate_z=4.0)
+
+        assert seen == {"purpose": "fa", "run_id": 3, "plate_z": 4.0}
+
+    async def test_unheld_plate_dispatches_unseeded(self, monkeypatch):
+        """None is the honest answer for every unheld lane, and the estimator then
+        costs the first Z move at its longest possible travel instead."""
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(db, *, printer_id, queue_item_id, purpose, run_id, plate_z=None):
+            seen["plate_z"] = plate_z
+
+        self._patch_session(monkeypatch)
+        monkeypatch.setattr(eject_remote, "dispatch_part_present_eject", fake_dispatch)
+        await monitor_mod._dispatch_production_eject(printer_id=7, queue_item_id=42)
+
+        assert seen["plate_z"] is None
 
 
 class TestManualReleaseNow:
