@@ -138,6 +138,76 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_update_farm_cooldown_hold(self, async_client: AsyncClient):
+        """The cooldown plate hold's switch and target round-trip TYPED (bool/int)
+        through the coercion whitelists — without the entries a stored setting reads back
+        as a string, and the watch would arm every cooldown with a truthy ``"false"``.
+
+        The target is the signed height of the PART'S TOP above the nozzle plane, so
+        negative values are ordinary (the fan blowing above the part) and must survive
+        the round trip as themselves.
+        """
+        # Schema defaults when never written: the hold is on, held as high as the part
+        # allows within the model's measured clear height.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_cooldown_hold_enabled"] is True
+        assert response.json()["farm_cooldown_hold_part_top_mm"] == 100
+
+        response = await async_client.put(
+            "/api/v1/settings/",
+            json={"farm_cooldown_hold_enabled": False, "farm_cooldown_hold_part_top_mm": -20},
+        )
+        assert response.status_code == 200
+        assert response.json()["farm_cooldown_hold_enabled"] is False
+        assert response.json()["farm_cooldown_hold_part_top_mm"] == -20
+
+        # Persisted read-back through the bool + int parse whitelists.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_cooldown_hold_enabled"] is False
+        assert response.json()["farm_cooldown_hold_part_top_mm"] == -20
+
+        # 0 is a legitimate value (the part top level with the plane), not "unset".
+        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_hold_part_top_mm": 0})
+        assert response.status_code == 200
+        assert (await async_client.get("/api/v1/settings/")).json()["farm_cooldown_hold_part_top_mm"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_farm_cooldown_hold_part_top_bounds(self, async_client: AsyncClient):
+        """-50..200, both ends inclusive.
+
+        The floor is the load-bearing one: at -50 the deepest reachable hold is still
+        ``max_z + 50`` (<= 105 mm) against the vendor end block's own park of
+        ``max_z/2 + 98`` (>= 108 mm), so a hold is ALWAYS a raised plate and the printer
+        card's "plate raised" chip cannot lie. A value past it would need a z_travel
+        bound the generator deliberately does not carry.
+        """
+        for accepted in (-50, 200):
+            response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_hold_part_top_mm": accepted})
+            assert response.status_code == 200, accepted
+            assert response.json()["farm_cooldown_hold_part_top_mm"] == accepted
+        for refused in (-51, 201):
+            response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_hold_part_top_mm": refused})
+            assert response.status_code == 422, refused
+
+    @pytest.mark.integration
+    def test_the_hold_target_default_still_means_as_high_as_the_part_allows(self):
+        """``default=100`` duplicates the H2S clear height BY VALUE, which is what makes
+        it mean "hold the part as high as the machine allows" rather than some mid-range
+        number nobody chose.
+
+        The coincidence is pinned rather than derived (the setting is fleet-wide, the
+        clearance is per model), so a future RE-MEASURE past 100 fails here and the
+        default is revisited deliberately — instead of the default silently becoming a
+        cap that quietly stops meaning "maximal".
+        """
+        from backend.app.core.database import _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM
+        from backend.app.schemas.settings import AppSettings
+
+        assert AppSettings.model_fields["farm_cooldown_hold_part_top_mm"].default >= _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_respool_auto_enabled_is_gone_and_unsettable(self, async_client: AsyncClient):
         """The Tier-2 toggle cannot be re-introduced through the API (WS3, 2026-08-19).
 

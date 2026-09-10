@@ -4,9 +4,9 @@ finished plate cools.
 Two actuators, both armed by :func:`begin` at the top of the cooldown watch and
 retired by :meth:`CooldownPrep.end` when that watch exits:
 
-* the **plate hold** (production / first-article units only) — the bed is raised so
-  the part top sits just under the nozzle plane with the toolhead parked at the
-  chute; and
+* the **plate hold** (production / first-article units only) — the bed is raised so the
+  part top sits where ``farm_cooldown_hold_part_top_mm`` asks for it relative to the
+  nozzle plane, with the toolhead parked at the chute; and
 * the **auxiliary fan** — ``M106 P2`` at ``farm_cooldown_aux_fan_percent``.
 
 **Why the plate is moved at all.** The aux fan is a fixed duct on the left wall
@@ -35,15 +35,26 @@ generator decides WHERE.
 
 **The operator rulings this rests on** (eyewitness, 2026-09-10, authoritative): with
 the toolhead parked at the chute the space above the nozzle plane over the part area
-is clear to at least 50 mm, and that clearance is a PHYSICAL machine limit rather
-than an operator setting — so both numbers live in the ``printer_model_geometry``
-registry as seed-only columns (H2S ``clear_above_mm=51.0`` / ``keepout_y_mm=285.0``,
-INTERNAL PLACEHOLDERS until the true maximum is measured; every other model NULL,
-which means fan only). Red line 2 (the hardware ladder) was WAIVED by the operator
-for this wave: the first production cooldown + eject is the witness, with the eject
-runtime watchdog and the human-clear plate gate as the net. Do not re-ladder it.
-The standing operator rule while a plate is held: do not jog the toolhead from the
-touchscreen — the whole safety case is that the toolhead is AT the chute.
+is clear to 100 mm, and that clearance is a PHYSICAL machine limit rather than an
+operator setting — so both numbers live in the ``printer_model_geometry`` registry as
+seed-only columns (H2S ``clear_above_mm=100.0`` MEASURED / ``keepout_y_mm=285.0``;
+every other model NULL, which means fan only). Red line 2 (the hardware ladder) was
+WAIVED by the operator for this wave: the first production cooldown + eject is the
+witness, with the eject runtime watchdog and the human-clear plate gate as the net.
+Do not re-ladder it. The standing operator rule while a plate is held: do not jog the
+toolhead from the touchscreen — the whole safety case is that the toolhead is AT the
+chute.
+
+**What the operator chooses, and what the machine keeps.** The registry number is the
+CEILING; where inside it the part is held is ``farm_cooldown_hold_part_top_mm``, the
+signed height of the part's TOP above the nozzle plane (100 = as high as the part
+allows, the plate right at the fan; 0 = the fan blows across the top; negative = the
+fan blows above the part), and ``farm_cooldown_hold_enabled`` switches the hold off
+altogether without a deploy. Both are read ONCE per arm, by the watch, and handed in
+here — and the record below stores what was actually SENT, so an operator changing the
+setting mid-cooldown can never desynchronise the eject's ``start_z`` seed from the
+plate's real position. A lower hold costs the eject nothing either: its first Z move
+simply starts from farther away, and the drop-span deadline follows the seed.
 
 **Re-entry is safe by construction.** A server restart re-arms the watch, so
 ``begin`` can run again on a plate that is ALREADY held at ~Z2. That needs no special
@@ -87,6 +98,7 @@ _AUX_FAN = 2
 HoldOutcome = Literal[
     "sent",
     "skipped:foreign",  # queue_item_id is None — the foreign auto-eject watch never holds
+    "skipped:disabled",  # farm_cooldown_hold_enabled is off — INFO, a deliberate operator state
     "skipped:item_missing",
     "skipped:profile_missing",
     "skipped:geometry",  # GeometryUnavailable (no row, or not hardware-validated)
@@ -258,6 +270,8 @@ async def begin(
     *,
     queue_item_id: int | None,
     aux_fan_percent: int,
+    hold_enabled: bool,
+    hold_part_top_mm: int,
     settle_s: float = 3.0,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> CooldownPrep:
@@ -271,10 +285,14 @@ async def begin(
     ``queue_item_id`` is None for the foreign auto-eject watch, whose plate carries no
     farm unit: no unit means no donor, no profile and no measured part height, so
     there is nothing to hold the plate SAFELY at and the foreign lane gets the fan
-    alone. ``settle_s``/``sleep`` are injected only so tests need not wait.
+    alone. ``hold_enabled``/``hold_part_top_mm`` are the operator's switch and target,
+    resolved once by the watch that arms this prep and never re-read here.
+    ``settle_s``/``sleep`` are injected only so tests need not wait.
     """
     started_at = time.monotonic()
-    hold, hold_z, max_z = await _hold_plate(printer_id, queue_item_id)
+    hold, hold_z, max_z = await _hold_plate(
+        printer_id, queue_item_id, hold_enabled=hold_enabled, part_top_mm=hold_part_top_mm
+    )
     # The fan publish is the LAST thing before the handle is returned — nothing is
     # awaited after it (the witness wait lives in ``CooldownPrep.observe_start``), so
     # a cancellation can never separate an ON that was sent from the ``end`` that
@@ -293,7 +311,9 @@ async def begin(
     )
 
 
-async def _hold_plate(printer_id: int, queue_item_id: int | None) -> tuple[HoldOutcome, float | None, float | None]:
+async def _hold_plate(
+    printer_id: int, queue_item_id: int | None, *, hold_enabled: bool, part_top_mm: int
+) -> tuple[HoldOutcome, float | None, float | None]:
     """Send the plate hold, or return the reason it was skipped.
 
     Returns ``(outcome, hold_z, max_z)``. ``hold_z`` is non-None ONLY on ``sent`` —
@@ -301,13 +321,21 @@ async def _hold_plate(printer_id: int, queue_item_id: int | None) -> tuple[HoldO
     did not happen would tell the runtime watchdog the bed is 120 mm closer to the
     nozzle than it is. ``max_z`` is returned whenever it was read, sent or not.
 
-    The gate order is cheapest-and-most-permanent first: a model with no registry
-    numbers can never hold, so it is not worth opening a 3MF for; the admission pair
+    The gate order is cheapest-and-most-permanent first: the two refusals that need no
+    state at all come before the session is even opened, a model with no registry
+    numbers can never hold so it is not worth opening a 3MF for, and the admission pair
     (connected → ``ejectable``) is last because it is the only fact that can change
     between now and the publish, so it is asked as late as it can be.
     """
     if queue_item_id is None:
         return "skipped:foreign", None, None
+    if not hold_enabled:
+        # INFO, not WARN: an operator who switched the hold off gets the cooldown they
+        # asked for (fan only), and a warning would put a chosen state in the channel
+        # they triage. The switch exists because red line 2 is waived for this motion —
+        # it has to be reachable from the Farm tab in the minute a hold misbehaves.
+        logger.info("[cooldown-prep] printer %s: plate hold switched off — fan only", printer_id)
+        return "skipped:disabled", None, None
 
     from backend.app.core.database import async_session
     from backend.app.models.eject_profile import EjectProfile
@@ -400,7 +428,7 @@ async def _hold_plate(printer_id: int, queue_item_id: int | None) -> tuple[HoldO
                 return "skipped:keepout", None, max_z
 
             try:
-                lines = generator.cooldown_hold_lines(max_z, profile, clear_above)
+                lines, placement = generator.cooldown_hold_lines(max_z, profile, clear_above, part_top_mm)
             except EjectGenerationError as exc:
                 logger.warning("[cooldown-prep] printer %s: %s — plate not held", printer_id, exc)
                 return "skipped:over_height", None, max_z
@@ -423,18 +451,22 @@ async def _hold_plate(printer_id: int, queue_item_id: int | None) -> tuple[HoldO
                 logger.warning("[cooldown-prep] printer %s: hold publish refused — plate not held", printer_id)
                 return "skipped:publish", None, max_z
 
-            held_at = generator.hold_z(max_z, clear_above)
+            # The placement the generator EVALUATED for the lines just published — not a
+            # second evaluation, so the recorded Z is by construction the commanded one.
             logger.info(
                 "[cooldown-prep] printer %s: plate hold sent "
-                "(max_z=%s hold_z=%s clear_above=%s keepout_y=%s bbox_y_max=%s)",
+                "(max_z=%s hold_z=%s part_top=%s target=%s bound=%s clear_above=%s keepout_y=%s bbox_y_max=%s)",
                 printer_id,
                 _mm(max_z),
-                _mm(held_at),
+                _mm(placement.z),
+                _mm(placement.part_top_mm),
+                part_top_mm,
+                placement.bound,
                 _mm(clear_above),
                 _mm(keepout_y),
                 _mm(box[0][3] if box is not None else None),
             )
-            return "sent", held_at, max_z
+            return "sent", placement.z, max_z
     except Exception:  # noqa: BLE001 — a hold failure never costs the cooldown its watch
         logger.exception("[cooldown-prep] printer %s: plate hold failed", printer_id)
         return "skipped:error", None, max_z

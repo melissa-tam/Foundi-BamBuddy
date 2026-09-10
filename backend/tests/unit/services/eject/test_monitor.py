@@ -57,6 +57,8 @@ def _settings(**overrides) -> monitor_mod.CooldownWatchSettings:
         "max_hold_s": 0,
         "plateau_eject_margin_c": 3.0,
         "aux_fan_percent": 0,
+        "hold_enabled": True,
+        "hold_part_top_mm": 100,
     }
     defaults.update(overrides)
     return monitor_mod.CooldownWatchSettings(**defaults)
@@ -75,6 +77,9 @@ class _PrepRecorder:
         self.hold = hold
         self.hold_z = hold_z
         self.begun: list[tuple[int, int | None, int]] = []
+        # The operator's two hold inputs as they arrived — the wiring this double exists
+        # to prove, since what ``begin`` DOES with them is pinned in test_cooldown_prep.
+        self.holds: list[tuple[bool | None, int | None]] = []
         self.ended: list[bool] = []
         self.order: list[str] = []
 
@@ -94,6 +99,7 @@ class _PrepRecorder:
 
         async def fake_begin(printer_id, *, queue_item_id, aux_fan_percent, **kwargs):
             recorder.begun.append((printer_id, queue_item_id, aux_fan_percent))
+            recorder.holds.append((kwargs.get("hold_enabled"), kwargs.get("hold_part_top_mm")))
             recorder.order.append("begin")
             return _Prep()
 
@@ -1336,6 +1342,8 @@ class TestArmedWatchResolution:
         assert settings.max_hold_s == int(fields["farm_cooldown_max_hold_minutes"].default) * 60
         assert settings.plateau_eject_margin_c == float(fields["farm_cooldown_plateau_eject_margin_c"].default)
         assert settings.aux_fan_percent == int(fields["farm_cooldown_aux_fan_percent"].default)
+        assert settings.hold_enabled is bool(fields["farm_cooldown_hold_enabled"].default)
+        assert settings.hold_part_top_mm == int(fields["farm_cooldown_hold_part_top_mm"].default)
 
     def test_printer_state_payload_helper(self):
         # printer_manager exposes the armed watch as {"threshold_c", "hold_z"} / None.
@@ -1398,6 +1406,8 @@ class TestResolveStallSettings:
         assert settings.max_hold_s == fields["farm_cooldown_max_hold_minutes"].default * 60
         assert settings.plateau_eject_margin_c == fields["farm_cooldown_plateau_eject_margin_c"].default  # 3.0
         assert settings.aux_fan_percent == fields["farm_cooldown_aux_fan_percent"].default == 100
+        assert settings.hold_enabled is fields["farm_cooldown_hold_enabled"].default is True
+        assert settings.hold_part_top_mm == fields["farm_cooldown_hold_part_top_mm"].default == 100
 
     async def test_reads_settings_rows_and_converts_minutes(self, db_session, monkeypatch):
         from backend.app.api.routes.settings import set_setting
@@ -1408,12 +1418,38 @@ class TestResolveStallSettings:
         await set_setting(db_session, "farm_cooldown_max_hold_minutes", "0")  # 0 disables the cap
         await set_setting(db_session, "farm_cooldown_plateau_eject_margin_c", "4.5")
         await set_setting(db_session, "farm_cooldown_aux_fan_percent", "60")
+        await set_setting(db_session, "farm_cooldown_hold_part_top_mm", "-20")
         settings = await monitor_mod._resolve_stall_settings()
         assert settings.stall_window_s == 10 * 60
         assert settings.stall_epsilon_c == 2.5
         assert settings.max_hold_s == 0
         assert settings.plateau_eject_margin_c == 4.5
         assert settings.aux_fan_percent == 60
+        # Negative targets are legal: the top of the part held UNDER the nozzle plane.
+        assert settings.hold_part_top_mm == -20
+
+    @pytest.mark.parametrize(
+        ("stored", "expected"),
+        [("true", True), ("TRUE", True), ("false", False), ("False", False), ("", False), ("1", False)],
+    )
+    async def test_the_hold_switch_is_read_as_a_string_not_cast(self, db_session, monkeypatch, stored, expected):
+        """``bool("false")`` is True, so the switch cannot ride ``_setting_num``.
+
+        The store keeps whatever the PUT route wrote ("true"/"false"), and the only
+        correct read is the same case-insensitive ``== "true"`` test every other boolean
+        setting in the app is read with — anything else is OFF, which is the safe
+        direction for a value nothing here wrote."""
+        from backend.app.api.routes.settings import set_setting
+
+        self._patch_session(monkeypatch, db_session)
+        await set_setting(db_session, "farm_cooldown_hold_enabled", stored)
+        settings = await monitor_mod._resolve_stall_settings()
+        assert settings.hold_enabled is expected
+
+    async def test_an_absent_switch_row_is_the_schema_default_not_false(self, db_session, monkeypatch):
+        """Fail-open on absence: an install that never wrote the key holds plates."""
+        self._patch_session(monkeypatch, db_session)
+        assert (await monitor_mod._resolve_stall_settings()).hold_enabled is True
 
 
 class TestCooldownPrepWiring:
@@ -1499,6 +1535,27 @@ class TestCooldownPrepWiring:
         await mon._watch(7, 42, release_now=asyncio.Event())
 
         assert prep.order == ["begin", "observe", "poll", "end"]
+
+    async def test_the_watch_hands_the_prep_the_operators_hold_settings(self, monkeypatch):
+        """Resolved ONCE at arm and passed in, so a setting changed mid-cooldown cannot
+        move a plate that is already held (or desynchronise the eject's start_z seed
+        from it). The prep reads no settings of its own."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_settings():
+            return _settings(aux_fan_percent=100, hold_enabled=False, hold_part_top_mm=-20)
+
+        async def fake_watch(pid, threshold, **kwargs):
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_manager, "is_connected", lambda printer_id: True)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", fake_settings)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.begun == [(7, 42, 100)]
+        assert prep.holds == [(False, -20)]
 
     async def test_a_connected_printer_never_waits(self, monkeypatch):
         """The steady-state path — a terminal on a live session — pays nothing for the

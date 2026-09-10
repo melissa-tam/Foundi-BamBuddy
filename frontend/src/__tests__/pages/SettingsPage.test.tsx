@@ -954,6 +954,162 @@ describe('SettingsPage', () => {
       fireEvent.change(auxFan, { target: { value: '-5' } });
       expect(auxFan.value).toBe('0');
     });
+
+    // The cooldown plate hold: the switch is the operator's off (no deploy
+    // needed) and the signed number is where the part's top is held relative to
+    // the nozzle plane the aux fan blows across.
+    it('renders the plate hold on by default and saves the off state', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const toggle = await waitFor(
+        () =>
+          screen.getByRole('checkbox', {
+            name: 'Hold the plate at the fan during cooldown',
+          }) as HTMLInputElement,
+      );
+      // mockSettings omits the key, so the component's `?? true` fallback shows.
+      expect(toggle.checked).toBe(true);
+
+      await user.click(toggle);
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_cooldown_hold_enabled).toBe(false);
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('renders the part-top target at its default with the explanation in a tooltip', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const partTop = await waitFor(
+        () => screen.getByLabelText('Part top above the nozzle plane (mm)') as HTMLInputElement,
+      );
+      expect(partTop.value).toBe('100');
+      expect(partTop).toHaveAttribute('min', '-50');
+      expect(partTop).toHaveAttribute('max', '200');
+
+      // The mechanism copy is reachable from the field's InfoHint trigger (the
+      // operator asked for a tooltip explaining the number).
+      const hint = screen.getByRole('button', { name: /Sets where the plate is held/ });
+      await user.click(hint);
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(
+        /100 holds the plate at the fan/,
+      );
+    });
+
+    it('disables the part-top target while the plate hold is off', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const toggle = await waitFor(() =>
+        screen.getByRole('checkbox', { name: 'Hold the plate at the fan during cooldown' }),
+      );
+      await user.click(toggle);
+
+      // The hold position is meaningless while the hold is off.
+      await waitFor(() => {
+        expect(
+          (screen.getByLabelText('Part top above the nozzle plane (mm)') as HTMLInputElement)
+            .disabled,
+        ).toBe(true);
+      });
+    });
+
+    it('clamps the part-top target to -50..200 and round-trips it', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const partTop = await waitFor(
+        () => screen.getByLabelText('Part top above the nozzle plane (mm)') as HTMLInputElement,
+      );
+
+      // 0 is a real target ("fan across the top of the part"), not a falsy
+      // value to be replaced by the default.
+      fireEvent.change(partTop, { target: { value: '0' } });
+      expect(partTop.value).toBe('0');
+      fireEvent.change(partTop, { target: { value: '250' } });
+      expect(partTop.value).toBe('200');
+      fireEvent.change(partTop, { target: { value: '-80' } });
+      expect(partTop.value).toBe('-50');
+
+      fireEvent.change(partTop, { target: { value: '-20' } });
+      expect(partTop.value).toBe('-20');
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_cooldown_hold_part_top_mm).toBe(-20);
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('keeps a half-typed negative target instead of snapping back to the default', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const partTop = await waitFor(
+        () => screen.getByLabelText('Part top above the nozzle plane (mm)') as HTMLInputElement,
+      );
+
+      // A number input reports a lone "-" as "". Without the draft buffer the
+      // controlled value would overwrite the keystroke with the stored target
+      // and a negative value could never be typed.
+      fireEvent.change(partTop, { target: { value: '-' } });
+      expect(partTop.value).not.toBe('100');
+      fireEvent.change(partTop, { target: { value: '-35' } });
+      expect(partTop.value).toBe('-35');
+
+      // Leaving the field drops the draft and shows the stored target.
+      fireEvent.blur(partTop);
+      expect(partTop.value).toBe('-35');
+    });
   });
 
   describe('API Keys tab', () => {

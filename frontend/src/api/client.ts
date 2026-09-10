@@ -1416,6 +1416,16 @@ export interface AppSettings {
   // Auxiliary-fan speed (%) held from the end of the print until the eject
   // dispatches, to pull heat off the plate during the cooldown wait. 0 = off.
   farm_cooldown_aux_fan_percent: number;
+  // Cooldown plate hold: while the part cools the plate is raised toward the
+  // nozzle plane with the toolhead parked at the chute, so the aux fan's stream
+  // reaches the part. Off leaves the plate where the print ended.
+  farm_cooldown_hold_enabled: boolean;
+  // Where the plate is held, as the signed height of the part's TOP above the
+  // nozzle plane (positive = the part rises into the clear zone above the
+  // nozzle; 0 = flush with the fan; negative = the top sits that far below it).
+  // Capped per model by the registry's measured clear height, and floored by
+  // the plate's own minimum Z (-50..200).
+  farm_cooldown_hold_part_top_mm: number;
   // USB storage-low auto-cleanup: on a "USB full" HMS fault, auto-delete old
   // camera recordings then oldest unused print files so dispatch keeps working.
   farm_usb_auto_cleanup: boolean;

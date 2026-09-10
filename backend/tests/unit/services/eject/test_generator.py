@@ -21,11 +21,12 @@ from backend.app.services.eject.generator import (
     UNMODELLED_EPILOGUE_ALLOWANCE_S,
     Z_REFERENCE_OVERTRAVEL_MM,
     EjectGenerationError,
+    HoldPlacement,
     cooldown_hold_lines,
     estimate_runtime_s,
     estimate_runtime_segments,
     generate_eject_gcode,
-    hold_z,
+    hold_placement,
     lift_z,
     park_z,
     part_height_error,
@@ -868,24 +869,68 @@ class TestCooldownHoldLines:
     Sent while a finished plate waits out its cooldown, so the eject that follows starts
     its one Z flow from a KNOWN height instead of from the vendor's parked bed. It is
     not an eject block and deliberately does not pass the eject validator — its safety
-    is the two functions it shares with the eject (park_z, hold_z) and the one refusal
-    it shares with the generator (part_height_error)."""
+    is the two functions it shares with the eject (park_z, hold_placement) and the one
+    refusal it shares with the generator (part_height_error)."""
 
-    def test_hold_height_is_the_part_top_under_the_chute_headroom(self):
-        # 50 mm part under 51 mm of headroom lands on the floor; 55 mm under the same
-        # headroom sits 4 mm above it.
-        assert hold_z(50.0, 51.0) == pytest.approx(HOLD_Z_MIN_MM)
-        assert hold_z(55.0, 51.0) == pytest.approx(4.0)
+    # (max_z, clear_above, target) -> (z, part_top, bound). The plan's own table, which
+    # is the contract for what each of the three constraints does.
+    @pytest.mark.parametrize(
+        ("max_z", "clear", "target", "z", "part_top", "bound"),
+        [
+            # The fleet's parts today: the target asks for more than the part has, so
+            # the PLATE floor decides and the top lands wherever that leaves it.
+            pytest.param(50.1, 100.0, 100, HOLD_Z_MIN_MM, 48.1, "floor", id="floor-default-target"),
+            # Flush: the fan blows across the top surface.
+            pytest.param(50.1, 100.0, 0, 50.1, 0.0, "target", id="target-flush"),
+            # Negative: the top sits 20 mm UNDER the plane, the fan blows above it.
+            pytest.param(50.1, 100.0, -20, 70.1, -20.0, "target", id="target-below-the-plane"),
+            # A part exactly as tall as the clear zone still cannot beat the floor.
+            pytest.param(100.0, 100.0, 100, HOLD_Z_MIN_MM, 98.0, "floor", id="floor-tall-part"),
+            # Only a part taller than the clear zone can reach the ceiling at all.
+            pytest.param(120.0, 100.0, 150, 20.0, 100.0, "ceiling", id="ceiling-target-past-the-zone"),
+            # And asking for MORE changes nothing: 100 is 100.
+            pytest.param(120.0, 100.0, 999, 20.0, 100.0, "ceiling", id="ceiling-absurd-target"),
+            # The old 51 mm placeholder: same hold as today for a 50.1 mm part.
+            pytest.param(50.1, 51.0, 100, HOLD_Z_MIN_MM, 48.1, "floor", id="floor-old-placeholder"),
+        ],
+    )
+    def test_placement_table(self, max_z, clear, target, z, part_top, bound):
+        placement = hold_placement(max_z, clear, target)
+        assert placement.z == pytest.approx(z)
+        assert placement.part_top_mm == pytest.approx(part_top)
+        assert placement.bound == bound
 
-    def test_the_floor_is_never_breached(self):
-        # However short the part, the plate never rides closer than the floor — the
-        # margin the frame's own slop has to fit inside.
-        assert hold_z(0.0, 51.0) == pytest.approx(HOLD_Z_MIN_MM)
+    def test_a_target_that_exactly_equals_the_ceiling_reports_target(self):
+        """The tie is reported as ``target``, because nothing was clamped away.
+
+        ``bound`` answers "which constraint DECIDED this Z" so a reader can tell the
+        operator's own number from a clamp. When the target and the ceiling coincide the
+        operator got exactly what was asked for, so calling it ``ceiling`` would report a
+        cap that took nothing. (The plan's table labels this row ``ceiling``; its code —
+        the normative half, stated twice — labels it ``target``. Reported as a divergence
+        rather than reconciled here.)"""
+        assert hold_placement(120.0, 100.0, 100).bound == "target"
+        # One millimetre more and the ceiling genuinely binds.
+        assert hold_placement(120.0, 100.0, 101).bound == "ceiling"
+
+    def test_the_part_never_rises_past_the_measured_clear_height(self):
+        """The invariant, over the whole reachable input space: ``max_z - z <= clear``.
+
+        It has to survive the FLOOR too, which is the non-obvious half — the floor can
+        only bind when the part is shorter than ``target + HOLD_Z_MIN_MM``, and the
+        target is already capped, so the top it leaves is under the ceiling as well."""
+        for max_z in range(1, 151):
+            for clear in (51.0, 100.0):
+                for target in range(-50, 201, 5):
+                    placement = hold_placement(float(max_z), clear, target)
+                    assert placement.z >= HOLD_Z_MIN_MM
+                    assert max_z - placement.z <= clear + 1e-9
+                    assert placement.part_top_mm == pytest.approx(max_z - placement.z)
 
     def test_the_block_is_pinned_line_by_line(self):
-        # A 50.1 mm part under a 55 mm guard: transit at the park height (lift 60.1),
-        # the vendor macro, then the hold at the floor.
-        lines = cooldown_hold_lines(50.1, _profile(max_part_height_mm=55.0), 51.0)
+        # A 50.1 mm part under a 100 mm clear zone with the default target: transit at
+        # the park height (lift 60.1), the vendor macro, then the hold at the floor.
+        lines, placement = cooldown_hold_lines(50.1, _profile(max_part_height_mm=55.0), 100.0, 100)
         assert lines == [
             "M17",
             "G90",
@@ -893,23 +938,49 @@ class TestCooldownHoldLines:
             "M400",
             "G150.3 ; vendor macro: toolhead to the chute park (the end block's own last travel)",
             "M400",
-            "G1 Z2 F900 ; hold: part top 51 mm above the nozzle plane at most",
+            "G1 Z2 F900 ; hold: part top 48.1 mm above the nozzle plane (target 100, clear 100, bound floor)",
             "M400",
             "M18",
         ]
+        assert placement == HoldPlacement(z=2.0, part_top_mm=pytest.approx(48.1), bound="floor")
+
+    def test_the_emitted_z_is_the_returned_placement(self):
+        """ONE evaluation: the commanded Z and the recorded Z cannot diverge, whatever
+        the target — that is the whole reason the placement rides back with the lines."""
+        profile = _profile(max_part_height_mm=55.0)
+        for target in (-50, 0, 37, 100, 200):
+            lines, placement = cooldown_hold_lines(50.1, profile, 100.0, target)
+            hold_line = next(ln for ln in lines if "; hold:" in ln)
+            assert hold_line.startswith(f"G1 Z{placement.z:g} F900")
+
+    def test_the_hold_comment_names_the_target_and_the_bound(self):
+        """The emitted comment states the ACTUAL geometry plus what produced it, so a
+        captured block is readable without re-deriving it from the settings of the day."""
+        lines, _ = cooldown_hold_lines(50.1, _profile(max_part_height_mm=55.0), 100.0, 0)
+        assert lines[6] == (
+            "G1 Z50.1 F900 ; hold: part top 0 mm above the nozzle plane (target 0, clear 100, bound target)"
+        )
 
     def test_the_transit_is_the_blocks_own_park_height(self):
         # Never tighter than the vendor's own G150.3 precondition (its end block runs
         # the macro at max_layer_z + 10), and the same height the eject parks at.
         profile = _profile(max_part_height_mm=55.0)
-        transit = cooldown_hold_lines(50.1, profile, 51.0)[2]
+        transit = cooldown_hold_lines(50.1, profile, 100.0, 100)[0][2]
         assert transit.startswith(f"G1 Z{park_z(50.1, profile):g} F900")
 
     def test_it_refuses_an_over_height_part_in_the_generators_own_words(self):
         profile = _profile(max_part_height_mm=42.0)
         with pytest.raises(EjectGenerationError) as raised:
-            cooldown_hold_lines(50.0, profile, 51.0)
+            cooldown_hold_lines(50.0, profile, 100.0, 100)
         assert str(raised.value) == part_height_error(50.0, profile)
+
+    def test_the_bare_hold_z_helper_is_gone(self):
+        """Deleted, not deprecated: it was a bare float evaluated at TWO sites (the
+        emitted line and the prep's recorded value), which is exactly the divergence
+        ``HoldPlacement`` exists to make impossible."""
+        from backend.app.services.eject import generator
+
+        assert not hasattr(generator, "hold_z")
 
 
 class TestBuildSummaryLog:
