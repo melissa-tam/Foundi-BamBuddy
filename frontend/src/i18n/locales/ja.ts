@@ -4897,7 +4897,11 @@ export default {
       slot: 'このスロットで最後に使用',
       ams: 'この AMS で最後に使用',
     },
-    assignEmptyHidden: '空のスプール {{count}} 件を非表示',
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '空のスプール {{count}} 件を非表示',
+    assignEmptyHidden_other: '空のスプール {{count}} 件を非表示',
     spoolmanSpools: 'Spoolman スプール',
     allMaterials: 'すべての素材',
     filterByBrand: 'ブランドで絞り込み...',

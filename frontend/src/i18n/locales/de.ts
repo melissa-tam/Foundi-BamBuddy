@@ -4898,7 +4898,11 @@ export default {
       slot: 'Zuletzt in diesem Fach',
       ams: 'Zuletzt in diesem AMS',
     },
-    assignEmptyHidden: '{{count}} leere Spulen ausgeblendet',
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} leere Spule ausgeblendet',
+    assignEmptyHidden_other: '{{count}} leere Spulen ausgeblendet',
     spoolmanSpools: 'Spoolman-Spulen',
     allMaterials: 'Alle Materialien',
     filterByBrand: 'Nach Marke filtern...',

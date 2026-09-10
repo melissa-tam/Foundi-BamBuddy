@@ -4885,7 +4885,11 @@ export default {
       slot: 'Ultima in questo slot',
       ams: 'Ultima in questo AMS',
     },
-    assignEmptyHidden: '{{count}} bobine vuote nascoste',
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} bobina vuota nascosta',
+    assignEmptyHidden_other: '{{count}} bobine vuote nascoste',
     spoolmanSpools: 'Bobine Spoolman',
     allMaterials: 'Tutti i Materiali',
     filterByBrand: 'Filtra per marchio...',

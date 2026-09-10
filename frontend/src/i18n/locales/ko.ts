@@ -4686,7 +4686,11 @@ export default {
       slot: '이 슬롯에서 마지막',
       ams: '이 AMS에서 마지막',
     },
-    assignEmptyHidden: '빈 스풀 {{count}}개 숨김',
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '빈 스풀 {{count}}개 숨김',
+    assignEmptyHidden_other: '빈 스풀 {{count}}개 숨김',
     spoolmanSpools: 'Spoolman 스풀',
     allMaterials: '모든 재료',
     filterByBrand: '브랜드로 필터...',

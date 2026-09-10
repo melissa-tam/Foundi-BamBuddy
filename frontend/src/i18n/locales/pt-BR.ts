@@ -4885,7 +4885,11 @@ export default {
       slot: 'Último neste compartimento',
       ams: 'Último neste AMS',
     },
-    assignEmptyHidden: '{{count}} carretéis vazios ocultos',
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} carretel vazio oculto',
+    assignEmptyHidden_other: '{{count}} carretéis vazios ocultos',
     spoolmanSpools: 'Bobinas Spoolman',
     allMaterials: 'Todos os Materiais',
     filterByBrand: 'Filtrar por marca...',

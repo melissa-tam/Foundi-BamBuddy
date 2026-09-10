@@ -4891,7 +4891,11 @@ export default {
       slot: '上次位於此槽位',
       ams: '上次位於此 AMS',
     },
-    assignEmptyHidden: '已隱藏 {{count}} 個空耗材盤',
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '已隱藏 {{count}} 個空耗材盤',
+    assignEmptyHidden_other: '已隱藏 {{count}} 個空耗材盤',
     spoolmanSpools: 'Spoolman 線軸',
     allMaterials: '所有材料',
     filterByBrand: '按品牌篩選...',

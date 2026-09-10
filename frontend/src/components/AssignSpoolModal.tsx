@@ -545,8 +545,15 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
               <div className="text-center py-8 text-bambu-gray">
                 <p>{t('inventory.noSpoolsMatch')}</p>
                 {availableSpools && (
+                  // `filteredSpools` is the list BEFORE the emptiness gate, so
+                  // the tray-match figure stays honest; the rolls the gate took
+                  // are named separately. Without that clause this line claims
+                  // "0 filtered by tray match" over an empty picker whenever the
+                  // gate is what emptied it.
                   <p className="text-[10px] mt-2 opacity-60">
-                    {availableSpools.length} unassigned spools — {(availableSpools.length) - (filteredSpools?.length ?? 0)} filtered by tray match. Try "Show all spools".
+                    {`${availableSpools.length} unassigned spools — ${availableSpools.length - (filteredSpools?.length ?? 0)} filtered by tray match`}
+                    {hiddenEmpty > 0 ? `, ${t('inventory.assignEmptyHidden', { count: hiddenEmpty })}` : ''}
+                    {'. Try "Show all spools".'}
                   </p>
                 )}
               </div>
@@ -597,7 +604,10 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
             <label htmlFor="disable-filtering-toggle" className="text-xs text-bambu-gray select-none cursor-pointer">
               {t('inventory.showAllSpools')}
             </label>
-            {hiddenEmpty > 0 && !disableFiltering && (
+            {/* `pickerSpools` is the ONE origin for this count — it already
+                returns 0 under "Show all spools", so there is no second guard
+                on the toggle here. */}
+            {hiddenEmpty > 0 && (
               <span className="text-xs text-bambu-gray-light">
                 {t('inventory.assignEmptyHidden', { count: hiddenEmpty })}
               </span>

@@ -4886,7 +4886,11 @@ export default {
       slot: 'Bu yuvadaki sonuncu',
       ams: 'Bu AMS içindeki sonuncu',
     },
-    assignEmptyHidden: '{{count}} boş makara gizlendi',
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} boş makara gizlendi',
+    assignEmptyHidden_other: '{{count}} boş makara gizlendi',
     spoolmanSpools: 'Spoolman Makaraları',
     allMaterials: 'Tüm Malzemeler',
     filterByBrand: 'Markaya göre filtrele...',

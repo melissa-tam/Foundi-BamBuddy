@@ -634,12 +634,14 @@ describe('AssignSpoolModal — empty rolls and slot recency', () => {
     });
   });
 
-  it('renders the hidden-empty count beside the toggle, and drops it when the toggle is on', async () => {
+  // i18next JSON v4 plurals (`_one` / `_other`) — the repo's older `_plural`
+  // keys are dead under i18next 25 and render the singular for every count.
+  it('renders the hidden-empty count beside the toggle in the SINGULAR at 1, and drops it when the toggle is on', async () => {
     (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, spentSpool]);
 
     render(<AssignSpoolModal {...defaultProps} />);
 
-    const count = await screen.findByText(/1 empty spools hidden/);
+    const count = await screen.findByText('1 empty spool hidden');
     expect(count).toBeInTheDocument();
     // Same footer row as the toggle.
     expect(count.parentElement).toContainElement(screen.getByLabelText(/show all spools/i));
@@ -649,6 +651,29 @@ describe('AssignSpoolModal — empty rolls and slot recency', () => {
     await waitFor(() => {
       expect(screen.queryByText(/empty spools hidden/)).not.toBeInTheDocument();
     });
+  });
+
+  it('pluralises the hidden-empty count at 2', async () => {
+    const secondSpent = { ...spentSpool, id: 5, brand: 'Eryone' };
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, spentSpool, secondSpent]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    expect(await screen.findByText('2 empty spools hidden')).toBeInTheDocument();
+  });
+
+  // The tray-match diagnostic used to claim "0 filtered by tray match" over an
+  // empty picker whenever the emptiness gate was what emptied it.
+  it('names the hidden empty rolls in the no-match diagnostic', async () => {
+    const secondSpent = { ...spentSpool, id: 5, brand: 'Eryone' };
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([spentSpool, secondSpent]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    const diagnostic = await screen.findByText(
+      /2 unassigned spools — 0 filtered by tray match, 2 empty spools hidden\. Try "Show all spools"\./,
+    );
+    expect(diagnostic).toBeInTheDocument();
   });
 
   it('ranks the roll last released from this slot first and labels it once', async () => {
