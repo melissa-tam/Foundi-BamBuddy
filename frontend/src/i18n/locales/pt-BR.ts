@@ -4879,6 +4879,13 @@ export default {
     assigning: 'Atribuindo...',
     searchSpools: 'Pesquisar carretéis...',
     showAllSpools: 'Mostrar todos os carretéis',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Último neste compartimento',
+      ams: 'Último neste AMS',
+    },
+    assignEmptyHidden: '{{count}} carretéis vazios ocultos',
     spoolmanSpools: 'Bobinas Spoolman',
     allMaterials: 'Todos os Materiais',
     filterByBrand: 'Filtrar por marca...',

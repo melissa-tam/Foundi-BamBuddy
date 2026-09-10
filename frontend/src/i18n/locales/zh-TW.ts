@@ -4885,6 +4885,13 @@ export default {
     assigning: '分配中...',
     searchSpools: '搜尋耗材...',
     showAllSpools: '顯示所有耗材',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: '上次位於此槽位',
+      ams: '上次位於此 AMS',
+    },
+    assignEmptyHidden: '已隱藏 {{count}} 個空耗材盤',
     spoolmanSpools: 'Spoolman 線軸',
     allMaterials: '所有材料',
     filterByBrand: '按品牌篩選...',

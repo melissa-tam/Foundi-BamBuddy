@@ -4896,6 +4896,13 @@ export default {
     assigning: 'Asignando...',
     searchSpools: 'Buscar bobinas...',
     showAllSpools: 'Mostrar todas las bobinas',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Última en esta ranura',
+      ams: 'Última en este AMS',
+    },
+    assignEmptyHidden: '{{count}} bobinas vacías ocultas',
     spoolmanSpools: 'Bobinas de Spoolman',
     allMaterials: 'Todos los materiales',
     filterByBrand: 'Filtrar por marca...',

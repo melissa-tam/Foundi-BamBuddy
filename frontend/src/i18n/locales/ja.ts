@@ -4891,6 +4891,13 @@ export default {
     assigning: '割り当て中...',
     searchSpools: 'スプールを検索...',
     showAllSpools: 'すべてのスプールを表示',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'このスロットで最後に使用',
+      ams: 'この AMS で最後に使用',
+    },
+    assignEmptyHidden: '空のスプール {{count}} 件を非表示',
     spoolmanSpools: 'Spoolman スプール',
     allMaterials: 'すべての素材',
     filterByBrand: 'ブランドで絞り込み...',

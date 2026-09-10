@@ -1,17 +1,58 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { X, Loader2, Package, Search, MinusCircle } from 'lucide-react';
+import { X, Loader2, Package, Search } from 'lucide-react';
 import { api } from '../api/client';
 import type { InventorySpool, SpoolAssignment } from '../api/client';
 import { Button } from './Button';
 import { Modal } from './ui/Modal';
 import { ConfirmModal } from './ConfirmModal';
+import { SpoolPickerCard } from './SpoolPickerCard';
 import { useToast } from '../contexts/ToastContext';
 import { formatAssignmentSlotLabel } from '../utils/amsHelpers';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
-import { getSwatchStyle } from '../utils/colors';
-import { remainingGrams } from '../utils/spoolGrams';
+import { pickerSpools } from '../utils/spoolPicker';
+
+// --- Material/profile matching helpers -------------------------------------
+// Module-scope pure functions: they close over nothing, and keeping them out of
+// the component body keeps them out of the memo dependency lists below.
+
+const normalizeValue = (value: string | undefined | null) =>
+  (value ?? '').trim().toUpperCase();
+
+// Bambu Studio / OrcaSlicer profile names carry a printer/nozzle/variant qualifier after
+// `@` (e.g. "Devil Design PLA Basic @Bambu Lab H2D 0.4 nozzle (Custom)"), while the tray's
+// profile is typically the bare base name. Strip the qualifier before comparing so identical
+// base profiles don't trigger a mismatch warning (#1047).
+const stripProfileQualifier = (value: string) => value.split('@')[0].trim();
+
+const checkMaterialMatch = (
+  spoolMaterial: string | undefined | null,
+  trayMaterial: string | undefined | null
+): 'exact' | 'partial' | 'none' => {
+  const normalizedSpool = normalizeValue(spoolMaterial);
+  const normalizedTray = normalizeValue(trayMaterial);
+
+  if (!normalizedSpool || !normalizedTray) return 'none';
+  if (normalizedSpool === normalizedTray) return 'exact';
+  if (normalizedTray.includes(normalizedSpool) || normalizedSpool.includes(normalizedTray)) {
+    return 'partial';
+  }
+
+  return 'none';
+};
+
+const checkProfileMatch = (
+  spoolProfile: string | undefined | null,
+  trayProfile: string | undefined | null
+): boolean => {
+  const normalizedSpoolProfile = stripProfileQualifier(normalizeValue(spoolProfile));
+  const normalizedTrayProfile = stripProfileQualifier(normalizeValue(trayProfile));
+
+  if (!normalizedSpoolProfile || !normalizedTrayProfile) return false;
+
+  return normalizedSpoolProfile === normalizedTrayProfile;
+};
 
 interface AssignSpoolModalProps {
   isOpen: boolean;
@@ -196,47 +237,8 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
     },
   });
 
-  // --- Material/profile mismatch logic ---
-  const normalizeValue = (value: string | undefined | null) =>
-    (value ?? '').trim().toUpperCase();
-
-  const checkMaterialMatch = (
-    spoolMaterial: string | undefined | null,
-    trayMaterial: string | undefined | null
-  ): 'exact' | 'partial' | 'none' => {
-    const normalizedSpool = normalizeValue(spoolMaterial);
-    const normalizedTray = normalizeValue(trayMaterial);
-
-    if (!normalizedSpool || !normalizedTray) return 'none';
-    if (normalizedSpool === normalizedTray) return 'exact';
-    if (normalizedTray.includes(normalizedSpool) || normalizedSpool.includes(normalizedTray)) {
-      return 'partial';
-    }
-
-    return 'none';
-  };
-
-  // Bambu Studio / OrcaSlicer profile names carry a printer/nozzle/variant qualifier after
-  // `@` (e.g. "Devil Design PLA Basic @Bambu Lab H2D 0.4 nozzle (Custom)"), while the tray's
-  // profile is typically the bare base name. Strip the qualifier before comparing so identical
-  // base profiles don't trigger a mismatch warning (#1047).
-  const stripProfileQualifier = (value: string) => value.split('@')[0].trim();
-
-  const checkProfileMatch = (
-    spoolProfile: string | undefined | null,
-    trayProfile: string | undefined | null
-  ): boolean => {
-    const normalizedSpoolProfile = stripProfileQualifier(normalizeValue(spoolProfile));
-    const normalizedTrayProfile = stripProfileQualifier(normalizeValue(trayProfile));
-
-    if (!normalizedSpoolProfile || !normalizedTrayProfile) return false;
-
-    return normalizedSpoolProfile === normalizedTrayProfile;
-  };
-
-  if (!isOpen) return null;
-
-  // Bindings held by OTHER slots, split by whether the roll is physically there.
+  // Bindings held by OTHER slots, split by whether the roll is physically there,
+  // plus the roll bound to THIS slot (which the picker floats to the top).
   //
   // W5b: a binding whose tray reports `present === false` is a claim on a spool
   // that is sitting on a SHELF, not filament loaded in another printer. Hiding
@@ -249,24 +251,36 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
   // `present` true / null / absent keep the historical hide. Unknown presence
   // (printer offline, partial push, a dialect that never reports it) is never
   // treated as evidence of absence.
-  const notInsertedElsewhere = new Map<number, SpoolAssignment>();
-  const assignedSpoolIds = new Set<number>();
-  for (const a of assignments || []) {
-    if (a.printer_id === printerId && a.ams_id === amsId && a.tray_id === trayId) continue;
-    if (a.present === false) {
-      // Defensive: a present binding elsewhere outranks an absent one. The
-      // one-spool-one-slot unique index makes a same-spool pair impossible, so
-      // this only guards a stale cache mid-rebind.
-      if (!assignedSpoolIds.has(a.spool_id)) notInsertedElsewhere.set(a.spool_id, a);
-    } else {
-      assignedSpoolIds.add(a.spool_id);
-      notInsertedElsewhere.delete(a.spool_id);
+  const { notInsertedElsewhere, assignedSpoolIds, boundSpoolId } = useMemo(() => {
+    const notInserted = new Map<number, SpoolAssignment>();
+    const assigned = new Set<number>();
+    let bound: number | null = null;
+    for (const a of assignments || []) {
+      if (a.printer_id === printerId && a.ams_id === amsId && a.tray_id === trayId) {
+        bound = a.spool_id;
+        continue;
+      }
+      if (a.present === false) {
+        // Defensive: a present binding elsewhere outranks an absent one. The
+        // one-spool-one-slot unique index makes a same-spool pair impossible, so
+        // this only guards a stale cache mid-rebind.
+        if (!assigned.has(a.spool_id)) notInserted.set(a.spool_id, a);
+      } else {
+        assigned.add(a.spool_id);
+        notInserted.delete(a.spool_id);
+      }
     }
-  }
+    return { notInsertedElsewhere: notInserted, assignedSpoolIds: assigned, boundSpoolId: bound };
+  }, [assignments, printerId, amsId, trayId]);
 
-  /** "Rocket A1" — where a not-inserted binding is currently parked. */
-  const claimLocation = (a: SpoolAssignment) =>
-    `${a.printer_name || `${t('common.printer')} ${a.printer_id}`} ${formatAssignmentSlotLabel(a)}`;
+  // A roll bound (or claiming a binding) elsewhere is still offered, but it
+  // never ranks or labels by this slot's residue — the frontend spelling of the
+  // backend's `bound_elsewhere` refusal.
+  const blockedIds = useMemo(
+    () => new Set<number>([...assignedSpoolIds, ...notInsertedElsewhere.keys()]),
+    [assignedSpoolIds, notInsertedElsewhere],
+  );
+
   // Show every spool that isn't already taken by another slot — including
   // RFID-tagged Bambu Lab spools (#1133). The earlier "manual spools only"
   // gate (tag_uid && tray_uuid both null) blocked the workflow where a
@@ -285,9 +299,18 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
   // (printer, ams, tray), so picking a spool that's currently taken by
   // a different slot creates a second assignment row; that's a foot-gun
   // for normal flows but exactly the recovery path the toggle is for.
-  const availableSpools = spools?.filter((spool: InventorySpool) =>
-    !spool.archived_at &&
-    (disableFiltering || !assignedSpoolIds.has(spool.id))
+  //
+  // Toggle asymmetry, stated once: on the LOCAL branch the toggle bypasses
+  // every gate (assignment, tray match, emptiness). On the SPOOLMAN branch it
+  // bypasses ONLY the emptiness gate — that branch has no assignment/tray-match
+  // gate of its own, so before the emptiness gate existed the toggle had zero
+  // effect there.
+  const availableSpools = useMemo(
+    () => spools?.filter((spool: InventorySpool) =>
+      !spool.archived_at &&
+      (disableFiltering || !assignedSpoolIds.has(spool.id))
+    ),
+    [spools, disableFiltering, assignedSpoolIds],
   );
 
   // Filtering logic with toggle: search filter always applies, AMS tray profile filter is optional.
@@ -295,30 +318,67 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
   // tray's material (partial-match both directions — "PLA" spool accepts a "PLA Basic" slot and
   // vice versa). Manually-added inventory spools typically have no slicer_filament_name; gating
   // on strict profile equality alone hid them even when the material matched (#1047).
-  let filteredSpools = availableSpools;
-  if (!disableFiltering) {
-    const trayProfile = stripProfileQualifier(normalizeValue(trayInfo?.profile));
-    const trayMaterial = normalizeValue(trayInfo?.material || trayInfo?.type);
-    if (trayProfile || trayMaterial) {
-      filteredSpools = filteredSpools?.filter((spool: InventorySpool) => {
-        const spoolProfile = stripProfileQualifier(normalizeValue(spool.slicer_filament_name || spool.slicer_filament));
-        const spoolMaterial = normalizeValue(spool.material);
-        if (trayProfile && spoolProfile && spoolProfile === trayProfile) return true;
-        if (trayMaterial && spoolMaterial) {
-          return (
-            spoolMaterial === trayMaterial ||
-            trayMaterial.includes(spoolMaterial) ||
-            spoolMaterial.includes(trayMaterial)
-          );
-        }
-        // Neither side has filterable info on whatever dimension remains — show it.
-        return !spoolProfile && !spoolMaterial;
-      });
+  const filteredSpools = useMemo(() => {
+    let rows = availableSpools;
+    if (!disableFiltering) {
+      const trayProfile = stripProfileQualifier(normalizeValue(trayInfo?.profile));
+      const trayMaterial = normalizeValue(trayInfo?.material || trayInfo?.type);
+      if (trayProfile || trayMaterial) {
+        rows = rows?.filter((spool: InventorySpool) => {
+          const spoolProfile = stripProfileQualifier(normalizeValue(spool.slicer_filament_name || spool.slicer_filament));
+          const spoolMaterial = normalizeValue(spool.material);
+          if (trayProfile && spoolProfile && spoolProfile === trayProfile) return true;
+          if (trayMaterial && spoolMaterial) {
+            return (
+              spoolMaterial === trayMaterial ||
+              trayMaterial.includes(spoolMaterial) ||
+              spoolMaterial.includes(trayMaterial)
+            );
+          }
+          // Neither side has filterable info on whatever dimension remains — show it.
+          return !spoolProfile && !spoolMaterial;
+        });
+      }
     }
-  }
-  if (searchFilter && filteredSpools) {
-    filteredSpools = filterSpoolsByQuery(filteredSpools, searchFilter);
-  }
+    if (searchFilter && rows) {
+      rows = filterSpoolsByQuery(rows, searchFilter);
+    }
+    return rows;
+  }, [availableSpools, disableFiltering, trayInfo?.profile, trayInfo?.material, trayInfo?.type, searchFilter]);
+
+  // The ONE list rule — emptiness gate, slot-recency order, hidden count and
+  // the at-most-one-row recency labels (`utils/spoolPicker`).
+  const localPicked = useMemo(
+    () => pickerSpools({
+      spools: filteredSpools ?? [],
+      slot: { printerId, amsId, trayId },
+      showAll: disableFiltering,
+      boundSpoolId,
+      blockedIds,
+    }),
+    [filteredSpools, printerId, amsId, trayId, disableFiltering, boundSpoolId, blockedIds],
+  );
+
+  // Spoolman rows carry no residue, so they all land in tier 3 — the projection
+  // is applied for the emptiness gate and so the two branches share one rule.
+  const spoolmanPicked = useMemo(() => {
+    const rows = (spoolmanSpools ?? []).filter(s => !s.archived_at && !assignedSpoolmanSpoolIds.has(s.id));
+    return pickerSpools({
+      spools: filterSpoolsByQuery(rows, searchFilter),
+      slot: { printerId, amsId, trayId },
+      showAll: disableFiltering,
+      boundSpoolId: null,
+      blockedIds: assignedSpoolmanSpoolIds,
+    });
+  }, [spoolmanSpools, assignedSpoolmanSpoolIds, searchFilter, printerId, amsId, trayId, disableFiltering]);
+
+  const hiddenEmpty = spoolmanEnabled ? spoolmanPicked.hiddenEmpty : localPicked.hiddenEmpty;
+
+  if (!isOpen) return null;
+
+  /** "Rocket A1" — where a not-inserted binding is currently parked. */
+  const claimLocation = (a: SpoolAssignment) =>
+    `${a.printer_name || `${t('common.printer')} ${a.printer_id}`} ${formatAssignmentSlotLabel(a)}`;
 
   const handleAssign = () => {
     if (selectedSpoolmanSpoolId !== null) {
@@ -436,58 +496,26 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
               <div className="flex justify-center py-8">
                 <Loader2 className="w-6 h-6 text-bambu-green animate-spin" />
               </div>
-            ) : filteredSpools && filteredSpools.length > 0 ? (
+            ) : localPicked.rows.length > 0 ? (
               <div className="max-h-96 overflow-y-auto grid grid-cols-2 sm:grid-cols-3 gap-2">
-                {filteredSpools.map((spool: InventorySpool) => {
+                {localPicked.rows.map((spool: InventorySpool) => {
                   // A binding this spool still holds on a slot that reads empty
                   // (W5b). Listed rather than hidden, but the operator has to be
                   // told the claim exists — picking it here MOVES the binding.
                   const staleClaim = notInsertedElsewhere.get(spool.id);
                   return (
-                  <button
-                    key={spool.id}
-                    onClick={() => { setSelectedSpoolId(spool.id); setSelectedSpoolmanSpoolId(null); }}
-                    title={spool.note || undefined}
-                    className={`p-2.5 rounded-lg border text-left transition-colors ${
-                      selectedSpoolId === spool.id
-                        ? 'bg-bambu-green/20 border-bambu-green'
-                        : 'bg-bambu-dark border-bambu-dark-tertiary hover:border-bambu-gray'
-                    }`}
-                  >
-                    <p className="text-white text-sm font-medium truncate">
-                      {spool.brand ? `${spool.brand} ` : ''}{spool.material}{spool.subtype ? ` ${spool.subtype}` : ''}
-                    </p>
-                    <div className="flex items-center gap-1.5 mt-1">
-                      {spool.rgba && (
-                        <span
-                          className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={getSwatchStyle(spool.rgba)}
-                        />
-                      )}
-                      <span className="text-xs text-bambu-gray truncate">{spool.color_name || ''}</span>
-                    </div>
-                    {spool.label_weight && (
-                      <p className="text-xs text-bambu-gray mt-1">
-                        {Math.round(remainingGrams(spool))} / {spool.label_weight}g
-                      </p>
-                    )}
-                    {staleClaim && (
-                      <p
-                        className="text-[10px] text-amber-400/90 mt-1 flex items-center gap-1"
-                        title={t('ams.emptySlotBinding.elsewhereHint', { location: claimLocation(staleClaim) })}
-                      >
-                        <MinusCircle className="w-3 h-3 shrink-0" aria-hidden="true" />
-                        <span className="truncate">
-                          {t('ams.emptySlotBinding.elsewhereHint', { location: claimLocation(staleClaim) })}
-                        </span>
-                      </p>
-                    )}
-                    {spool.note && (
-                      <p className="text-[10px] text-bambu-gray/70 mt-1 truncate" title={spool.note}>
-                        {spool.note}
-                      </p>
-                    )}
-                  </button>
+                    <SpoolPickerCard
+                      key={spool.id}
+                      spool={spool}
+                      selected={selectedSpoolId === spool.id}
+                      onSelect={() => { setSelectedSpoolId(spool.id); setSelectedSpoolmanSpoolId(null); }}
+                      staleClaimLabel={
+                        staleClaim
+                          ? t('ams.emptySlotBinding.elsewhereHint', { location: claimLocation(staleClaim) })
+                          : undefined
+                      }
+                      recency={localPicked.recency.get(spool.id)}
+                    />
                   );
                 })}
               </div>
@@ -530,51 +558,24 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                   <div className="flex justify-center py-4">
                     <Loader2 className="w-5 h-5 text-bambu-green animate-spin" />
                   </div>
-                ) : spoolmanSpools && spoolmanSpools.filter(s => !s.archived_at && !assignedSpoolmanSpoolIds.has(s.id)).length > 0 ? (
+                ) : spoolmanPicked.rows.length > 0 ? (
                   <>
                     <p className="text-xs font-medium text-bambu-gray uppercase tracking-wide pt-1">
                       {t('inventory.spoolmanSpools')}
                     </p>
                     <div className="max-h-64 overflow-y-auto grid grid-cols-2 sm:grid-cols-3 gap-2">
-                      {filterSpoolsByQuery(spoolmanSpools.filter(s => !s.archived_at && !assignedSpoolmanSpoolIds.has(s.id)), searchFilter)
-                        .map((spool: InventorySpool) => (
-                          <button
-                            key={`spoolman-${spool.id}`}
-                            onClick={() => {
-                              setSelectedSpoolmanSpoolId(spool.id);
-                              setSelectedSpoolId(null);
-                            }}
-                            title={spool.note || undefined}
-                            className={`p-2.5 rounded-lg border text-left transition-colors ${
-                              selectedSpoolmanSpoolId === spool.id
-                                ? 'bg-bambu-green/20 border-bambu-green'
-                                : 'bg-bambu-dark border-bambu-dark-tertiary hover:border-bambu-gray'
-                            }`}
-                          >
-                            <p className="text-white text-sm font-medium truncate">
-                              {spool.brand ? `${spool.brand} ` : ''}{spool.material}{spool.subtype ? ` ${spool.subtype}` : ''}
-                            </p>
-                            <div className="flex items-center gap-1.5 mt-1">
-                              {spool.rgba && (
-                                <span
-                                  className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                                  style={getSwatchStyle(spool.rgba)}
-                                />
-                              )}
-                              <span className="text-xs text-bambu-gray truncate">{spool.color_name || ''}</span>
-                            </div>
-                            {spool.label_weight && (
-                              <p className="text-xs text-bambu-gray mt-1">
-                                {Math.round(remainingGrams(spool))} / {spool.label_weight}g
-                              </p>
-                            )}
-                            {spool.note && (
-                              <p className="text-[10px] text-bambu-gray/70 mt-1 truncate" title={spool.note}>
-                                {spool.note}
-                              </p>
-                            )}
-                          </button>
-                        ))}
+                      {spoolmanPicked.rows.map((spool: InventorySpool) => (
+                        <SpoolPickerCard
+                          key={`spoolman-${spool.id}`}
+                          spool={spool}
+                          selected={selectedSpoolmanSpoolId === spool.id}
+                          onSelect={() => {
+                            setSelectedSpoolmanSpoolId(spool.id);
+                            setSelectedSpoolId(null);
+                          }}
+                          recency={spoolmanPicked.recency.get(spool.id)}
+                        />
+                      ))}
                     </div>
                   </>
                 ) : null}
@@ -596,6 +597,11 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
             <label htmlFor="disable-filtering-toggle" className="text-xs text-bambu-gray select-none cursor-pointer">
               {t('inventory.showAllSpools')}
             </label>
+            {hiddenEmpty > 0 && !disableFiltering && (
+              <span className="text-xs text-bambu-gray-light">
+                {t('inventory.assignEmptyHidden', { count: hiddenEmpty })}
+              </span>
+            )}
           </div>
           <div className="flex gap-2">
             <Button variant="secondary" onClick={onClose}>

@@ -4680,6 +4680,13 @@ export default {
     assigning: '할당 중...',
     searchSpools: '스풀 검색...',
     showAllSpools: '모든 스풀 표시',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: '이 슬롯에서 마지막',
+      ams: '이 AMS에서 마지막',
+    },
+    assignEmptyHidden: '빈 스풀 {{count}}개 숨김',
     spoolmanSpools: 'Spoolman 스풀',
     allMaterials: '모든 재료',
     filterByBrand: '브랜드로 필터...',

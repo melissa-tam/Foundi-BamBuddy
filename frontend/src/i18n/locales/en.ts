@@ -4917,6 +4917,13 @@ export default {
     assigning: 'Assigning...',
     searchSpools: 'Search spools...',
     showAllSpools: 'Show all spools',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Last in this slot',
+      ams: 'Last in this AMS',
+    },
+    assignEmptyHidden: '{{count}} empty spools hidden',
     spoolmanSpools: 'Spoolman Spools',
     allMaterials: 'All Materials',
     filterByBrand: 'Filter by brand...',
