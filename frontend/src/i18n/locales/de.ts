@@ -4892,6 +4892,17 @@ export default {
     assigning: 'Wird zugewiesen...',
     searchSpools: 'Spulen suchen...',
     showAllSpools: 'Alle Spulen anzeigen',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Zuletzt in diesem Fach',
+      ams: 'Zuletzt in diesem AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} leere Spule ausgeblendet',
+    assignEmptyHidden_other: '{{count}} leere Spulen ausgeblendet',
     spoolmanSpools: 'Spoolman-Spulen',
     allMaterials: 'Alle Materialien',
     filterByBrand: 'Nach Marke filtern...',

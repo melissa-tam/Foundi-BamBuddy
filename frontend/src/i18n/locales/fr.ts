@@ -4880,6 +4880,17 @@ export default {
     assigning: 'Assignation...',
     searchSpools: 'Chercher bobines...',
     showAllSpools: 'Afficher toutes les bobines',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Dernière dans cet emplacement',
+      ams: 'Dernière dans cet AMS',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} bobine vide masquée',
+    assignEmptyHidden_other: '{{count}} bobines vides masquées',
     spoolmanSpools: 'Bobines Spoolman',
     allMaterials: 'Tous Matériaux',
     filterByBrand: 'Filtrer par marque...',

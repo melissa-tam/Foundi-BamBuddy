@@ -4880,6 +4880,17 @@ export default {
     assigning: 'Atanıyor...',
     searchSpools: 'Makaralarda ara...',
     showAllSpools: 'Tüm makaraları göster',
+    // Slot-recency breadcrumb on an Assign-spool card. At most one row carries
+    // each of these — see `utils/spoolPicker.ts`.
+    assignRecency: {
+      slot: 'Bu yuvadaki sonuncu',
+      ams: 'Bu AMS içindeki sonuncu',
+    },
+    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
+    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
+    // `_plural` key is silently dead and renders the singular for every count.
+    assignEmptyHidden_one: '{{count}} boş makara gizlendi',
+    assignEmptyHidden_other: '{{count}} boş makara gizlendi',
     spoolmanSpools: 'Spoolman Makaraları',
     allMaterials: 'Tüm Malzemeler',
     filterByBrand: 'Markaya göre filtrele...',

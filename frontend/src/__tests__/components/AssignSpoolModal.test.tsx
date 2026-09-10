@@ -582,3 +582,141 @@ describe('AssignSpoolModal — Spoolman enabled (T-Gap 7)', () => {
     expect(screen.queryByText(/Prusa/)).not.toBeInTheDocument();
   });
 });
+
+// ── Emptiness gate + slot-recency order (`utils/spoolPicker`) ────────────────
+//
+// The picker used to offer every unarchived roll in server order, so prod's 187
+// unarchived spent rows were all listed at "0 / 1000g" and the roll that had
+// just left this very slot was buried alphabetically.
+describe('AssignSpoolModal — empty rolls and slot recency', () => {
+  const spentSpool = {
+    id: 4,
+    material: 'PLA',
+    subtype: 'Basic',
+    brand: 'Sunlu',
+    color_name: 'Grey',
+    rgba: '808080FF',
+    label_weight: 1000,
+    weight_used: 1000,
+    tag_uid: null,
+    tray_uuid: null,
+    slicer_filament_name: 'PLA',
+    spent_at: '2026-09-01T00:00:00Z',
+  };
+
+  /** Residue naming the modal's own slot (printer 1 / AMS 0 / tray 0). */
+  const thisSlotResidue = {
+    last_location_printer_id: 1,
+    last_location_ams_id: 0,
+    last_location_tray_id: 0,
+    last_location_at: '2026-09-09T12:00:00Z',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  });
+
+  it('hides a spent roll by default and lists it under "Show all spools"', async () => {
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, spentSpool]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Polymaker/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Sunlu/)).not.toBeInTheDocument();
+
+    screen.getByLabelText(/show all spools/i).click();
+
+    await waitFor(() => {
+      expect(screen.getByText(/Sunlu/)).toBeInTheDocument();
+    });
+  });
+
+  // i18next JSON v4 plurals (`_one` / `_other`) — the repo's older `_plural`
+  // keys are dead under i18next 25 and render the singular for every count.
+  it('renders the hidden-empty count beside the toggle in the SINGULAR at 1, and drops it when the toggle is on', async () => {
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, spentSpool]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    const count = await screen.findByText('1 empty spool hidden');
+    expect(count).toBeInTheDocument();
+    // Same footer row as the toggle.
+    expect(count.parentElement).toContainElement(screen.getByLabelText(/show all spools/i));
+
+    screen.getByLabelText(/show all spools/i).click();
+
+    await waitFor(() => {
+      expect(screen.queryByText(/empty spools hidden/)).not.toBeInTheDocument();
+    });
+  });
+
+  it('pluralises the hidden-empty count at 2', async () => {
+    const secondSpent = { ...spentSpool, id: 5, brand: 'Eryone' };
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([manualSpool, spentSpool, secondSpent]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    expect(await screen.findByText('2 empty spools hidden')).toBeInTheDocument();
+  });
+
+  // The tray-match diagnostic used to claim "0 filtered by tray match" over an
+  // empty picker whenever the emptiness gate was what emptied it.
+  it('names the hidden empty rolls in the no-match diagnostic', async () => {
+    const secondSpent = { ...spentSpool, id: 5, brand: 'Eryone' };
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([spentSpool, secondSpent]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    const diagnostic = await screen.findByText(
+      /2 unassigned spools — 0 filtered by tray match, 2 empty spools hidden\. Try "Show all spools"\./,
+    );
+    expect(diagnostic).toBeInTheDocument();
+  });
+
+  it('ranks the roll last released from this slot first and labels it once', async () => {
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([
+      manualSpool,
+      { ...anotherManualSpool, ...thisSlotResidue },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Overture/)).toBeInTheDocument();
+    });
+
+    // Exactly one row carries the breadcrumb — the "single newest residue" half
+    // of the backend contract, rendered.
+    expect(screen.getAllByText('Last in this slot')).toHaveLength(1);
+
+    const cards = screen.getAllByRole('button').map(b => b.textContent ?? '');
+    const overture = cards.findIndex(text => text.includes('Overture'));
+    const polymaker = cards.findIndex(text => text.includes('Polymaker'));
+    expect(overture).toBeGreaterThanOrEqual(0);
+    expect(overture).toBeLessThan(polymaker);
+  });
+
+  it('gives no recency label to a roll whose binding still claims another slot', async () => {
+    // Its residue names THIS slot, but the roll is bound elsewhere (stale claim)
+    // — `blockedIds` bars it from the residue tiers, so it neither ranks nor
+    // labels by the breadcrumb.
+    (api.getSpools as ReturnType<typeof vi.fn>).mockResolvedValue([
+      manualSpool,
+      { ...anotherManualSpool, ...thisSlotResidue },
+    ]);
+    (api.getAssignments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 99, spool_id: 3, printer_id: 4, printer_name: 'Rocket', ams_id: 0, tray_id: 1, present: false },
+    ]);
+
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Overture/)).toBeInTheDocument();
+    });
+    expect(await screen.findByText(/not inserted — assigned to Rocket A2/)).toBeInTheDocument();
+    expect(screen.queryByText('Last in this slot')).not.toBeInTheDocument();
+  });
+});
