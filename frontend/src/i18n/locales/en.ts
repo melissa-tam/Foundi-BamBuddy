@@ -889,6 +889,8 @@ export default {
     phase: {
       printing: 'Printing',
       cooling: 'Cooling to {{threshold}}°C',
+      coolingHeld: 'Cooling to {{threshold}}°C · plate raised',
+      coolingHeldHint: 'Plate held at the nozzle plane with the toolhead parked at the chute. Do not jog the toolhead until the eject runs.',
       awaitingPlateClear: 'Awaiting plate clear',
     },
     ejectPhase: {
@@ -2690,6 +2692,8 @@ export default {
     farmCooldownMaxHoldHelp: 'If the bed is still warmer than the eject temperature after this long, eject anyway. 0 = keep waiting.',
     farmCooldownPlateauMargin: 'Close-enough margin (°C)',
     farmCooldownPlateauMarginHelp: 'If cooling stalls but the bed is within this many degrees of the eject temperature, treat it as cooled and eject; stuck hotter than that quarantines the printer.',
+    farmCooldownAuxFan: 'Aux fan during cooldown (%)',
+    farmCooldownAuxFanHelp: 'Runs the printer\'s auxiliary fan at this speed from the end of the print until the eject dispatches. 0 turns it off.',
     respoolPromptThreshold: 'Re-spool observation threshold (g)',
     respoolPromptThresholdHelp: 'Log a re-spool observation when a reused Bambu tag arrives with this many grams or fewer left on the donor spool and no hardware-certain spent marker (0–1000).',
     farmUsbAutoCleanup: 'Auto-clean USB when full',

@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: 'Druckt',
       cooling: 'Kühlt auf {{threshold}}°C ab',
+      coolingHeld: 'Kühlt auf {{threshold}}°C ab · Platte angehoben',
+      coolingHeldHint: 'Die Platte wird auf Düsenhöhe gehalten, der Druckkopf steht an der Rutsche. Den Druckkopf erst nach dem Auswurf bewegen.',
       awaitingPlateClear: 'Wartet auf Plattenfreigabe',
     },
     ejectPhase: {
@@ -2671,6 +2673,8 @@ export default {
     farmCooldownMaxHoldHelp: 'Ist das Bett nach dieser Zeit noch wärmer als die Auswurftemperatur, wird trotzdem ausgeworfen. 0 = weiter warten.',
     farmCooldownPlateauMargin: 'Nah-genug-Spielraum (°C)',
     farmCooldownPlateauMarginHelp: 'Stockt die Abkühlung, liegt das Bett aber innerhalb dieser Grad zur Auswurftemperatur, wird es als abgekühlt behandelt und ausgeworfen; bleibt es heißer, wird der Drucker unter Quarantäne gestellt.',
+    farmCooldownAuxFan: 'Hilfslüfter beim Abkühlen (%)',
+    farmCooldownAuxFanHelp: 'Betreibt den Hilfslüfter des Druckers mit dieser Drehzahl vom Druckende bis zum Absenden des Auswurfs. 0 schaltet ihn aus.',
     respoolPromptThreshold: 'Umspul-Beobachtungsschwelle (g)',
     respoolPromptThresholdHelp: 'Eine Umspul-Beobachtung protokollieren, wenn ein wiederverwendeter Bambu-Tag auftaucht, während die Spenderspule so viele Gramm oder weniger übrig hat und keine hardware-sichere Leer-Markierung vorliegt (0–1000).',
     farmUsbAutoCleanup: 'USB bei vollem Speicher automatisch bereinigen',

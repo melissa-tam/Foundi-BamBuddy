@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: '打印中',
       cooling: '正在冷却至 {{threshold}}°C',
+      coolingHeld: '正在冷却至 {{threshold}}°C · 打印板已抬升',
+      coolingHeldHint: '打印板保持在喷嘴高度，工具头停在滑槽处。取件执行前请勿移动工具头。',
       awaitingPlateClear: '等待清理打印板',
     },
     ejectPhase: {
@@ -2672,6 +2674,8 @@ export default {
     farmCooldownMaxHoldHelp: '超过这段时间后热床仍高于取件温度，则照常取件。0 = 一直等待。',
     farmCooldownPlateauMargin: '足够接近余量（°C）',
     farmCooldownPlateauMarginHelp: '若降温停滞但热床处于取件温度的该温差范围内，则视为已冷却并取件；若卡在更高温度，则将打印机隔离。',
+    farmCooldownAuxFan: '冷却期间的辅助风扇 (%)',
+    farmCooldownAuxFanHelp: '从打印结束到取件下发期间，以此转速运行打印机的辅助风扇。0 表示关闭。',
     respoolPromptThreshold: '重新绑定观察阈值 (g)',
     respoolPromptThresholdHelp: '当重复使用的 Bambu 标签出现、供体料卷剩余不超过这么多克且没有硬件确认的用尽标记时，记录一条重新绑定观察日志（0–1000）。',
     farmUsbAutoCleanup: '存储满时自动清理 USB',

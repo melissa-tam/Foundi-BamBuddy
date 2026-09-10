@@ -6059,6 +6059,24 @@ class BambuMQTTClient:
         speed = max(0, min(255, speed))  # Clamp to 0-255
         return self.send_gcode(f"M106 P{fan} S{speed}")
 
+    def set_fan_percent(self, fan: int, percent: int) -> bool:
+        """Set a fan speed by PERCENT — the ONE origin of the percent→PWM conversion.
+
+        The wire speaks PWM (``M106 P<fan> S<0-255>``, :meth:`set_fan_speed`) while every
+        surface above it speaks percent: the ``/fan-speed`` route and the eject cooldown's
+        aux-fan prep both call THIS method, so the 0-100 → 0-255 mapping is written once
+        and cannot drift between them (it previously lived inline in the route).
+
+        Args:
+            fan: Fan index (1=part cooling, 2=auxiliary, 3=chamber)
+            percent: Speed 0-100, clamped (0=off, 100=full)
+
+        Returns:
+            True if the command was sent, False otherwise
+        """
+        percent = max(0, min(100, percent))
+        return self.set_fan_speed(fan, round(percent * 255 / 100))
+
     def set_part_fan(self, speed: int) -> bool:
         """Set part cooling fan speed (0-255)."""
         return self.set_fan_speed(1, speed)

@@ -7,6 +7,7 @@ import pytest
 
 from backend.app.services.eject.geometry import (
     GeometryUnavailable,
+    ModelGeometry,
     get_geometry,
     get_geometry_required,
     list_geometries,
@@ -80,3 +81,95 @@ class TestListGeometries:
         by_key = {g.model_key: g for g in geos}
         assert by_key["H2S"].validated is True
         assert by_key["H2C"].validated is False
+
+
+class TestCooldownHoldPair:
+    """The two cooldown plate-hold limits are ONE fact in two numbers.
+
+    Both are PHYSICAL model limits (the toolhead's chute-park keep-out line in bed Y, and
+    the clear height above the nozzle plane there), seeded by migration and never
+    operator-settable. Both NULL = the hold is off for that model, which is where every
+    model starts.
+    """
+
+    async def test_mapper_carries_both_numbers(self, db_session):
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="H2X",
+                bed_x=340,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=340,
+                env_y_min=-16,
+                env_y_max=325,
+                max_part_height_mm=42,
+                z_travel_mm=340,
+                validated=True,
+                cooldown_hold_keepout_y_mm=285.0,
+                cooldown_hold_clear_above_mm=51.0,
+                notes="test seed",
+            )
+        )
+        await db_session.commit()
+
+        geo = await get_geometry(db_session, "H2X")
+        assert geo is not None
+        assert geo.cooldown_hold_keepout_y_mm == 285.0
+        assert geo.cooldown_hold_clear_above_mm == 51.0
+
+    async def test_unseeded_row_maps_to_hold_off(self, db_session):
+        """The shared fixture seeds neither number — a model with no measured clearance
+        must read as hold OFF, not as an unbounded hold."""
+        geo = await get_geometry(db_session, "H2S")
+        assert geo is not None
+        assert geo.cooldown_hold_keepout_y_mm is None
+        assert geo.cooldown_hold_clear_above_mm is None
+
+    async def test_default_construction_is_hold_off(self):
+        """Load-bearing default: every transient geometry and unmigrated fixture reads as
+        hold OFF, so the hold can never appear on a model by omission."""
+        geo = ModelGeometry(
+            model_key="H2S",
+            bed=(340.0, 320.0),
+            envelope=(0.0, 340.0, -16.0, 325.0),
+            max_part_height_mm=42.0,
+            validated=True,
+        )
+        assert geo.cooldown_hold_keepout_y_mm is None
+        assert geo.cooldown_hold_clear_above_mm is None
+
+    @pytest.mark.parametrize(
+        ("keepout", "clear"),
+        [(285.0, None), (None, 51.0)],
+    )
+    async def test_one_sided_pair_is_refused(self, keepout, clear):
+        """A keep-out line with no clear height (or the reverse) describes no hold at all.
+        Treating the missing half as "unbounded" would authorise holding a plate under a
+        clearance nobody measured, so it raises instead of half-honouring the pair."""
+        with pytest.raises(ValueError) as exc:
+            ModelGeometry(
+                model_key="H2S",
+                bed=(340.0, 320.0),
+                envelope=(0.0, 340.0, -16.0, 325.0),
+                max_part_height_mm=42.0,
+                validated=True,
+                cooldown_hold_keepout_y_mm=keepout,
+                cooldown_hold_clear_above_mm=clear,
+            )
+        assert "both be set or both be None" in str(exc.value)
+        assert "H2S" in str(exc.value)
+
+    async def test_both_set_is_accepted(self):
+        geo = ModelGeometry(
+            model_key="H2S",
+            bed=(340.0, 320.0),
+            envelope=(0.0, 340.0, -16.0, 325.0),
+            max_part_height_mm=42.0,
+            validated=True,
+            cooldown_hold_keepout_y_mm=285.0,
+            cooldown_hold_clear_above_mm=51.0,
+        )
+        assert geo.cooldown_hold_keepout_y_mm == 285.0
+        assert geo.cooldown_hold_clear_above_mm == 51.0

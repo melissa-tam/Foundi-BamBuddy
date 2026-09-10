@@ -104,6 +104,40 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_update_farm_cooldown_aux_fan_percent(self, async_client: AsyncClient):
+        """The eject cooldown's aux-fan speed round-trips TYPED through the int coercion
+        whitelist — without the whitelist entry a stored setting reads back as a string.
+
+        Percent, not PWM: the wire's 0-255 conversion has a single origin
+        (``BambuMQTTClient.set_fan_percent``), so every surface above it stores percent.
+        """
+        # Schema default when never written: full speed.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_cooldown_aux_fan_percent"] == 100
+
+        # 0 is a legitimate value and means OFF — it must not be read as "unset".
+        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 0})
+        assert response.status_code == 200
+        assert response.json()["farm_cooldown_aux_fan_percent"] == 0
+
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_cooldown_aux_fan_percent"] == 0
+
+        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 100})
+        assert response.status_code == 200
+        assert response.json()["farm_cooldown_aux_fan_percent"] == 100
+
+        # Bounds are enforced by the schema (0-100) — the value is a PERCENT, so a PWM
+        # figure typed in by mistake must be refused rather than silently clamped.
+        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 101})
+        assert response.status_code == 422
+        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 255})
+        assert response.status_code == 422
+        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": -1})
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_respool_auto_enabled_is_gone_and_unsettable(self, async_client: AsyncClient):
         """The Tier-2 toggle cannot be re-introduced through the API (WS3, 2026-08-19).
 

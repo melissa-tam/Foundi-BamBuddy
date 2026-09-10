@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,7 +54,7 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.utils.printer_models import canon_model
-from backend.app.utils.threemf_tools import list_gcode_plate_ids, read_plate_gcode_header
+from backend.app.utils.threemf_tools import list_gcode_plate_ids, read_plate_gcode_header, read_plate_json
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -217,6 +218,65 @@ def read_max_z(donor_path: Path, plate_id: int) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _plate_filament_count(plate_json: dict, donor_path: Path, plate_id: int) -> int:
+    """How many DISTINCT filaments the plate uses; 0 when nothing can answer.
+
+    Primary source is the sidecar's ``filament_ids`` — measured on the production corpus
+    as a flat list with one entry per filament the plate uses (``[0]`` on every
+    single-filament plate there). Falls back to the plate G-code header's ``filament``
+    key, which carries the same set as a comma-separated string (measured: ``'1'``); the
+    header has no ``filament_ids`` key at all, so that is the only header spelling.
+
+    Returns 0 — meaning UNKNOWN — when neither source answers, never a fabricated 1: a
+    caller that may only trust a single-filament plate must not be handed a guess.
+    """
+    ids = plate_json.get("filament_ids")
+    if isinstance(ids, (list, tuple)):
+        distinct = {str(i) for i in ids if i is not None}
+        if distinct:
+            return len(distinct)
+    raw = read_plate_gcode_header(donor_path, plate_id).get("filament")
+    distinct = {part.strip() for part in str(raw or "").split(",") if part.strip()}
+    return len(distinct)
+
+
+def read_plate_bbox(donor_path: Path, plate_id: int) -> tuple[tuple[float, float, float, float], int] | None:
+    """The plate's OBJECT footprint plus its distinct-filament count, or None.
+
+    Returns ``((x_min, y_min, x_max, y_max), n_filaments)`` — the sidecar's ``bbox_all``
+    in bed coordinates (``Metadata/plate_{plate_id}.json``, read through the one shared
+    parser :func:`~backend.app.utils.threemf_tools.read_plate_json`) beside the number of
+    distinct filaments the plate uses. None when the file is unreadable, the sidecar is
+    absent, or ``bbox_all`` is missing/malformed — the caller then knows NOTHING about
+    where the parts sit and must fail closed rather than assume a clear bed.
+
+    **``bbox_all`` covers OBJECTS ONLY.** Measured on the production corpus: it is the
+    union of the per-object ``bbox_objects`` rectangles, and it carries no purge tower,
+    no skirt, no brim and no wipe/prime line. A caller may therefore read it as "the
+    whole footprint on this plate" on a SINGLE-FILAMENT plate only — a multi-filament
+    plate puts a purge tower on the bed that this rectangle does not describe. That is
+    exactly why the filament count is returned HERE, beside the box, instead of being
+    left to a second lookup a caller could forget to make.
+    """
+    try:
+        with zipfile.ZipFile(donor_path, "r") as zf:
+            plate_json = read_plate_json(zf, plate_id)
+    except (OSError, zipfile.BadZipFile) as exc:
+        logger.debug("[donor] plate %s bbox unreadable in %s: %s", plate_id, donor_path, exc)
+        return None
+    if plate_json is None:
+        return None
+    raw = plate_json.get("bbox_all")
+    if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+        return None
+    try:
+        x_min, y_min, x_max, y_max = (float(v) for v in raw[:4])
+    except (TypeError, ValueError):
+        logger.debug("[donor] plate %s bbox_all is not four numbers in %s", plate_id, donor_path)
+        return None
+    return (x_min, y_min, x_max, y_max), _plate_filament_count(plate_json, donor_path, plate_id)
 
 
 async def _fetch_donor(printer: Printer, filename: str | None) -> Path | None:

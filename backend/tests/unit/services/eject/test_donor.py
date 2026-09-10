@@ -12,6 +12,7 @@ and these tests pin the three things that made the extraction worth doing:
   persistence and can hold a dead key after a failed persist.
 """
 
+import json
 import os
 import tempfile
 import zipfile
@@ -33,6 +34,7 @@ from backend.app.services.eject.donor import (
     DonorContext,
     GateSubtaskArchive,
     LastFarmItemFile,
+    read_plate_bbox,
     resolve_donor,
 )
 
@@ -488,3 +490,139 @@ class TestChainComposition:
         # would silently widen what an unattended sweep may build from.
         assert list(AUTO_DONOR_CHAIN) == [GateSubtaskArchive]
         assert list(MANUAL_DONOR_CHAIN) == [GateSubtaskArchive, LastFarmItemFile, ContainerLibraryFile]
+
+
+# --------------------------------------------------------------------------- #
+# read_plate_bbox — the plate's object footprint + its distinct-filament count
+# --------------------------------------------------------------------------- #
+
+# The production corpus lives in the SIBLING tooling repo, not in this one, so the
+# real-file pin skips cleanly wherever the corpus is absent (CI, the farm host). The
+# synthetic tests below carry the same measured shape and always run.
+_PRODUCTION_3MF = (
+    Path(__file__).resolve().parents[6]
+    / "foundi-FarmManager"
+    / "Print Files"
+    / "_6_Half_Shell_PCO-M18-2656_top_surface_gcode.3mf"
+)
+# That file's only G-code-bearing plate is 3 (its siblings carry sidecars but no gcode).
+_PRODUCTION_PLATE_ID = 3
+
+
+def _plate_json_3mf(payload, *, plate: int = 1, gcode: bool = True) -> Path:
+    """A ``.gcode.3mf`` whose plate sidecar is ``payload`` (raw bytes or a dict)."""
+    fd, name = tempfile.mkstemp(suffix=".gcode.3mf")
+    os.close(fd)
+    path = Path(name)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        if gcode:
+            zf.writestr(f"Metadata/plate_{plate}.gcode", _PLATE_GCODE)
+        if payload is not None:
+            body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+            zf.writestr(f"Metadata/plate_{plate}.json", body)
+        zf.writestr("3D/3dmodel.model", "<model/>")
+    return path
+
+
+class TestReadPlateBbox:
+    """``bbox_all`` is the OBJECT footprint, and the filament count rides beside it.
+
+    The measured sidecar shape (production corpus, 2026-09-10): ``bbox_all`` is a flat
+    ``[x_min, y_min, x_max, y_max]`` list and ``filament_ids`` is a flat list with one
+    entry per filament the plate uses.
+    """
+
+    @pytest.mark.skipif(not _PRODUCTION_3MF.exists(), reason="production corpus not present on this host")
+    async def test_production_plate_measured_footprint(self, tmp_path):
+        """Pins the real production plate. Read from a COPY — the corpus is never touched."""
+        donor = tmp_path / _PRODUCTION_3MF.name
+        donor.write_bytes(_PRODUCTION_3MF.read_bytes())
+
+        result = read_plate_bbox(donor, _PRODUCTION_PLATE_ID)
+        assert result is not None
+        bbox, n_filaments = result
+        assert tuple(round(v, 2) for v in bbox) == (13.66, 52.31, 325.20, 261.97)
+        # Single-filament plate — the only shape whose bbox_all may be read as "the whole
+        # footprint on the plate" (no purge tower).
+        assert n_filaments == 1
+        # The keep-out placeholder (Y >= 285) clears this plate's rear edge by ~23 mm.
+        assert bbox[3] < 285.0
+
+    async def test_bbox_and_filament_count_from_sidecar(self):
+        donor = _plate_json_3mf({"bbox_all": [10.0, 20.0, 30.0, 40.0], "filament_ids": [0]})
+        try:
+            assert read_plate_bbox(donor, 1) == ((10.0, 20.0, 30.0, 40.0), 1)
+        finally:
+            donor.unlink(missing_ok=True)
+
+    async def test_distinct_filament_ids_are_counted_once(self):
+        """A repeated id is ONE filament — the count answers "how many rolls feed this
+        plate", which is what decides whether bbox_all describes everything on the bed."""
+        donor = _plate_json_3mf({"bbox_all": [0, 0, 1, 1], "filament_ids": [0, 1, 0, 1, 2]})
+        try:
+            assert read_plate_bbox(donor, 1)[1] == 3
+        finally:
+            donor.unlink(missing_ok=True)
+
+    async def test_falls_back_to_gcode_header_filament_key(self):
+        """No usable ``filament_ids`` in the sidecar → the plate G-code header's own
+        ``filament`` key (measured spelling; the header has no ``filament_ids``)."""
+        fd, name = tempfile.mkstemp(suffix=".gcode.3mf")
+        os.close(fd)
+        donor = Path(name)
+        header_gcode = (
+            "; HEADER_BLOCK_START\n; filament: 1,2,3\n; HEADER_BLOCK_END\n"
+            "; EXECUTABLE_BLOCK_START\nG1 X10 Y10\n; EXECUTABLE_BLOCK_END\n"
+        )
+        try:
+            with zipfile.ZipFile(donor, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("Metadata/plate_1.gcode", header_gcode)
+                zf.writestr("Metadata/plate_1.json", json.dumps({"bbox_all": [0, 0, 1, 1]}))
+            assert read_plate_bbox(donor, 1)[1] == 3
+        finally:
+            donor.unlink(missing_ok=True)
+
+    async def test_unknown_filament_count_reports_zero_never_one(self):
+        """Neither source answers ⇒ 0 = UNKNOWN. A fabricated 1 would tell a caller that
+        may only trust single-filament plates exactly the lie it fails closed on."""
+        donor = _plate_json_3mf({"bbox_all": [0, 0, 1, 1]}, gcode=False)
+        try:
+            assert read_plate_bbox(donor, 1) == ((0.0, 0.0, 1.0, 1.0), 0)
+        finally:
+            donor.unlink(missing_ok=True)
+
+    @pytest.mark.parametrize(
+        ("payload", "why"),
+        [
+            (None, "no sidecar member at all"),
+            (b"{not json", "sidecar is not parseable JSON"),
+            (b'["a", "list"]', "sidecar is JSON but not an object"),
+            ({"filament_ids": [0]}, "sidecar carries no bbox_all"),
+            ({"bbox_all": [1.0, 2.0]}, "bbox_all is too short"),
+            ({"bbox_all": "13,52,325,261"}, "bbox_all is not a list"),
+            ({"bbox_all": [1.0, 2.0, "x", 4.0]}, "bbox_all carries a non-number"),
+            ({"bbox_all": None}, "bbox_all is null"),
+        ],
+    )
+    async def test_unusable_sidecar_returns_none(self, payload, why):
+        """Every malformed shape fails CLOSED: the caller learns nothing about the
+        footprint rather than being handed a partial box it might trust."""
+        donor = _plate_json_3mf(payload)
+        try:
+            assert read_plate_bbox(donor, 1) is None, why
+        finally:
+            donor.unlink(missing_ok=True)
+
+    async def test_wrong_plate_id_returns_none(self):
+        donor = _plate_json_3mf({"bbox_all": [0, 0, 1, 1], "filament_ids": [0]}, plate=1)
+        try:
+            assert read_plate_bbox(donor, 7) is None
+        finally:
+            donor.unlink(missing_ok=True)
+
+    async def test_missing_and_corrupt_files_return_none(self, tmp_path):
+        """An unreadable container is a None, never an exception out of the eject lane."""
+        assert read_plate_bbox(tmp_path / "nope.gcode.3mf", 1) is None
+        corrupt = tmp_path / "corrupt.gcode.3mf"
+        corrupt.write_bytes(b"this is not a zip archive")
+        assert read_plate_bbox(corrupt, 1) is None

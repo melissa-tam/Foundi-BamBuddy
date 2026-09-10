@@ -352,9 +352,15 @@ class FilaSwitchResponse(BaseModel):
 
 class EjectWatchInfo(BaseModel):
     """In-flight eject cooldown watch summary (Phase 4.3c): the bed temperature
-    (°C) the server-side plate-clear gate releases at."""
+    (°C) the server-side plate-clear gate releases at, and — since the cooldown
+    prep (2026-09-10) — the Z the plate is HELD at for the wait (None when the hold
+    was skipped or the model has no clearance numbers). Declared here because the
+    REST ``/status`` lane serialises through this model with ``extra="ignore"``
+    while the WS lane dumps the same dict raw: a field missing here would flip the
+    card's "plate raised" chip between the two lanes (the C5 class)."""
 
     threshold_c: float
+    hold_z: float | None = None
 
 
 class PlateInfo(BaseModel):

@@ -1359,6 +1359,7 @@ async def dispatch_part_present_eject(
     queue_item_id: int,
     purpose: EjectPurpose,
     run_id: int | None,
+    plate_z: float | None = None,
 ) -> None:
     """Build + FTPS-upload + dispatch a part-present motion-only eject for one unit.
 
@@ -1372,6 +1373,11 @@ async def dispatch_part_present_eject(
     eject costs seconds of FTPS work that a refused sweep must not spend; the claim
     afterwards re-runs the identical gate, so a race that opened during the upload is
     still caught.
+
+    ``plate_z`` is where the bed IS when the sweep starts, when the caller knows (the
+    cooldown hold parked the plate there). It changes no G-code — only whether the
+    watchdog's deadlines are computed from a MEASUREMENT of the block's first Z move or
+    from a BOUND on it. Callers that cannot answer pass nothing.
 
     Raises :class:`EjectDispatchError` on any precondition (409) or transport (502)
     failure, leaving no half state (nothing is claimed unless ``start_print``
@@ -1409,7 +1415,7 @@ async def dispatch_part_present_eject(
     plate_id = item.plate_id or 1
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="building")
     try:
-        built = await build_part_present_eject_file(source_path, plate_id, profile, geometry)
+        built = await build_part_present_eject_file(source_path, plate_id, profile, geometry, plate_z=plate_z)
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
@@ -1425,6 +1431,7 @@ async def dispatch_part_present_eject(
         drop_span_s=built.drop_span_s,
         sweep_span_s=built.sweep_span_s,
         tail_s=built.tail_s,
+        start_z=built.start_z,
     )
     # The eject file's FTPS upload transiently drops the H2S sdcard flag; mark the
     # printer upload-in-flight so the USB-drop verifier ignores that dispatch blip.
@@ -1514,6 +1521,7 @@ async def dispatch_foreign_eject(
         drop_span_s=built.drop_span_s,
         sweep_span_s=built.sweep_span_s,
         tail_s=built.tail_s,
+        start_z=built.start_z,
     )
     # Same as the production path: the FTPS upload transiently drops the H2S sdcard
     # flag; mark the printer upload-in-flight so the USB-drop verifier ignores the blip.

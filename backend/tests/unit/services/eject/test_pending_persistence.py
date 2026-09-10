@@ -316,6 +316,53 @@ class TestDispatchStampsOnDispatch:
         finally:
             source.unlink(missing_ok=True)
 
+    async def test_the_builds_start_z_rides_onto_the_pending(self, db_session, monkeypatch, scheduled, seed_geometry):
+        """The seed must survive to the terminal, because that is where it is read.
+
+        ``expected_runtime_s`` is a function of the seed, so a pending that carried the
+        estimate without saying whether it was measured or bounded would make the
+        terminal's runtime series unreadable."""
+        source = self._make_source_3mf()
+        try:
+            printer = await _mk_printer(db_session, "PSEED")
+            lib = LibraryFile(
+                filename="s.gcode.3mf",
+                file_path=str(source),
+                file_type="gcode.3mf",
+                file_size=source.stat().st_size,
+                is_external=True,
+            )
+            db_session.add(lib)
+            await db_session.flush()
+            prof = EjectProfile(name="pd-seed")
+            db_session.add(prof)
+            await db_session.flush()
+            item = await _mk_item(db_session, printer_id=printer.id)
+            item.library_file_id = lib.id
+            item.eject_profile_id = prof.id
+            await db_session.commit()
+            _patch_session(monkeypatch, db_session)
+            _wire_persist()
+            _gate(printer.id)
+
+            c1, c2, c3, c4 = self._dispatch_patches()
+            with c1, c2, c3, c4:
+                await remote.dispatch_part_present_eject(
+                    db_session,
+                    printer_id=printer.id,
+                    queue_item_id=item.id,
+                    purpose="production",
+                    run_id=None,
+                    plate_z=2.0,
+                )
+            await _drain(scheduled)
+            pending = plate_occupancy.pending_eject_view(printer.id)
+            assert pending is not None
+            assert pending.start_z == 2.0
+            assert pending.expected_runtime_s is not None
+        finally:
+            source.unlink(missing_ok=True)
+
     async def test_a_refused_dispatch_leaves_no_stamp(self, db_session, monkeypatch, scheduled, seed_geometry):
         # The occupancy gate refuses before the build, so nothing is claimed — and a
         # durable stamp for a sweep that never went out would gate the printer forever.

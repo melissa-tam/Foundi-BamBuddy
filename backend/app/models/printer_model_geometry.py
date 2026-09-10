@@ -86,6 +86,28 @@ class PrinterModelGeometry(Base):
     # ``server_default`` for the same reason as the column above — the seed omits it.
     hold_lift_mm: Mapped[float] = mapped_column(Float, default=12.0, server_default=text("12.0"), nullable=False)
 
+    # --- Cooldown plate-hold (2026-09-10) — two PHYSICAL model limits, not settings. ---
+    #
+    # The farm can hold the finished plate at the nozzle plane through the eject cooldown
+    # with the toolhead parked at the chute. Whether that is safe on a given machine is a
+    # fact about the machine, so both numbers live here and NEITHER is exposed on
+    # ``ModelGeometryUpdate`` or in the geometry-manager UI: an operator cannot type a new
+    # physical clearance into existence. They change by changing the migration seed.
+    #
+    # They are one fact in two numbers and are written together — both NULL means the hold
+    # is simply OFF for that model, which is the state every model but H2S ships in (fan
+    # only) until its own clearance is measured.
+
+    # The toolhead's chute-park keep-out strip, as a bed-Y line: a plate whose OBJECT
+    # bounding box ends past this Y is never held, because a part there sits under the
+    # parked toolhead. NULL ⇒ hold off for this model.
+    cooldown_hold_keepout_y_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # The clear height (mm) physically available above the nozzle plane with the toolhead
+    # at the chute — the tallest part that can be held there without contact. NULL ⇒ hold
+    # off for this model.
+    cooldown_hold_clear_above_mm: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

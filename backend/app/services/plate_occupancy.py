@@ -331,10 +331,15 @@ class PendingEject:
     of its own — the machine cannot be stopped on one criterion and judged on
     another (the 2026-07-31 gouged-plate ordering).
 
+    ``start_z`` is the plate height the build SEEDED its estimate with, or None when the
+    build could not know it — the one field that says whether ``expected_runtime_s``
+    measured the block's first Z move or merely bounded it, which is what makes the
+    terminal's runtime series readable.
+
     ``hydrated`` marks a record rebuilt at startup from the queue unit's
     ``eject_dispatched_at`` stamp rather than minted by a live dispatch. Such a
-    record is None on ``expected_runtime_s``, ``started_at`` and every phase budget by
-    construction — the durable mirror is a single timestamp column, not the built
+    record is None on ``expected_runtime_s``, ``started_at``, ``start_z`` and every
+    phase budget by construction — the durable mirror is a single timestamp column, not the built
     artifact — so no watchdog can arm and the farm has already admitted it cannot
     verify the sweep. That is why an operator eject SUPERSEDES a hydrated pending
     instead of being refused by it (see :meth:`PlateOccupancy.claim_for_eject`).
@@ -350,6 +355,7 @@ class PendingEject:
     drop_span_s: float | None = None
     sweep_span_s: float | None = None
     tail_s: float | None = None
+    start_z: float | None = None
     dispatched_at: datetime | None = None
     hydrated: bool = False
 

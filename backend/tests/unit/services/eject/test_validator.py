@@ -5,7 +5,12 @@ from dataclasses import replace
 import pytest
 
 from backend.app.models.eject_profile import EjectProfile
-from backend.app.services.eject.generator import generate_eject_gcode
+from backend.app.services.eject.generator import (
+    SWEEP_PHASE_MARKER,
+    EjectGenerationError,
+    generate_eject_gcode,
+    part_height_error,
+)
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import (
@@ -407,7 +412,7 @@ class TestZReferenceModalRules:
         profile = _profile()
         gcode = (
             f"; ===== FARM EJECT BLOCK profile={profile.name} =====\n"
-            f"M17\n{body}\nG28 X Y\nG90\nG1 Z40 F900\nG1 X170 Y160 F9000\n"
+            f"M17\n{body}\nG90\nG1 Z40 F900\nG28 X Y\nG1 X170 Y160 F9000\n"
         )
         return validate_eject_gcode(gcode, profile, 30.0, geometry).errors
 
@@ -466,7 +471,7 @@ class TestZReferenceModalRules:
         profile = _profile()
         gcode = (
             f"; ===== FARM EJECT BLOCK profile={profile.name} =====\n"
-            f"M17\nG28 X Y\nG90\nG1 Z40 F900\n{line}\nG1 X170 Y160 F9000\n"
+            f"M17\nG90\nG1 Z40 F900\nG28 X Y\n{line}\nG1 X170 Y160 F9000\n"
         )
         errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY_Z_REFERENCED).errors
         assert any(fragment in e for e in errors), errors
@@ -494,3 +499,97 @@ class TestZReferenceModalRules:
         profile = _profile()
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         assert validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).ok
+
+
+class TestHomeOrderGuard:
+    """WHERE the X/Y home runs, checked independently of the generator.
+
+    The block may start from the vendor's parked bed OR from the cooldown hold's ~2 mm,
+    so a home emitted before the first Z move would sweep X/Y past a part standing above
+    the nozzle plane — safe only if Y homes rearward, which is vendor-suggested and
+    unproven here. Homing after the first Z move is safe whatever the starting Z, which
+    is why it is a validator rule and not merely a generator habit."""
+
+    @staticmethod
+    def _block(profile, body: str) -> str:
+        return f"; ===== FARM EJECT BLOCK profile={profile.name} =====\nM17\nG90\n{body}\n"
+
+    def test_the_generated_order_is_accepted(self):
+        for geometry in (H2S_GEOMETRY, H2C_GEOMETRY):
+            for bed_drop in (None, 50.0):
+                profile = _profile(bed_drop_clearance_mm=bed_drop)
+                gcode = generate_eject_gcode(profile, 30.0, geometry)
+                result = validate_eject_gcode(gcode, profile, 30.0, geometry)
+                assert result.ok, (geometry.model_key, bed_drop, result.errors)
+
+    def test_a_home_before_the_first_z_move_is_rejected(self):
+        profile = _profile()
+        gcode = self._block(
+            profile,
+            f"G28 X Y\nG1 Z40 F900\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).errors
+        assert any("home precedes the block's first Z move" in e for e in errors), errors
+
+    def test_the_guarded_z_drive_does_not_count_as_the_first_z_move(self):
+        # G380 is a guarded relative drive that ends the bed at its stop — it places the
+        # bed, but the rule is phrased on G0/G1 moves that carry Z so the dormant
+        # re-reference prologue cannot satisfy it by accident.
+        profile = _profile()
+        gcode = (
+            f"; ===== FARM EJECT BLOCK profile={profile.name} =====\n"
+            "M17\nM211 Z0\nG91\nG380 S2 Z390 F1200\nG90\nG92 Z340\nM211 Z1\n"
+            f"G28 X Y\nG1 Z40 F900\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n"
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY_Z_REFERENCED).errors
+        assert any("home precedes the block's first Z move" in e for e in errors), errors
+
+    def test_a_second_home_is_rejected(self):
+        profile = _profile()
+        gcode = self._block(
+            profile,
+            f"G1 Z40 F900\nG28 X Y\nG28 X Y\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).errors
+        assert any("more than one X/Y home" in e for e in errors), errors
+
+    def test_a_repeated_torque_form_is_rejected_on_a_dual_model(self):
+        # Dual blocks home twice by design (one command per axis), so the count rule is
+        # per FORM there — two X homes is still one home too many.
+        profile = _profile()
+        body = "G1 Z40 F900\n" + "\n".join(DUAL_NOZZLE_HOME) + "\nG28 X T300\n"
+        gcode = self._block(profile, f"{body}{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n")
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY).errors
+        assert any("more than one X/Y home" in e for e in errors), errors
+
+    def test_a_home_after_the_sweep_marker_is_rejected(self):
+        profile = _profile()
+        gcode = self._block(
+            profile,
+            f"G1 Z40 F900\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG28 X Y\nG1 Z40 F900\n",
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).errors
+        assert any("home after the sweep marker" in e for e in errors), errors
+
+
+class TestPartHeightRefusalIsOneSentence:
+    """The generator's raise and the validator's error are the SAME string.
+
+    An operator meets one message however the refusal reached them, and the two can
+    never drift into disagreeing about what they refused."""
+
+    def test_generator_and_validator_speak_with_one_voice(self):
+        profile = _profile(max_part_height_mm=42.0)
+        expected = part_height_error(50.0, profile)
+        assert expected is not None
+        with pytest.raises(EjectGenerationError) as raised:
+            generate_eject_gcode(profile, 50.0, H2S_GEOMETRY)
+        assert str(raised.value) == expected
+        # The validator cannot generate the block, so it checks a legal one at a legal
+        # height against an over-height claim — the same sentence must come back.
+        gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        errors = validate_eject_gcode(gcode, profile, 50.0, H2S_GEOMETRY).errors
+        assert expected in errors
+
+    def test_a_legal_height_refuses_nothing(self):
+        assert part_height_error(42.0, _profile(max_part_height_mm=42.0)) is None

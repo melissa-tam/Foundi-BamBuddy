@@ -659,7 +659,10 @@ export interface PrinterStatus {
   // Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
   // release threshold. Present while the farm waits for the bed to cool before
   // auto-clearing the plate gate; null/absent otherwise.
-  eject_watch?: { threshold_c: number } | null;
+  // `hold_z` is the height the plate is being HELD at for the duration of that
+  // wait (nozzle plane, toolhead parked at the chute) — non-null means an
+  // operator must not jog the toolhead until the eject runs; null = not held.
+  eject_watch?: { threshold_c: number; hold_z: number | null } | null;
   // Open printer-hold incident (WS2b): the fault this printer is currently held
   // by. Present for FOREIGN prints too — those have no queue unit, so this chip
   // is the only place their hold is visible. Null/absent when clear.
@@ -1410,6 +1413,9 @@ export interface AppSettings {
   // When cooling plateaus within this many °C of the release threshold, eject
   // (bed equilibrated at ambient) instead of quarantining the printer.
   farm_cooldown_plateau_eject_margin_c: number;
+  // Auxiliary-fan speed (%) held from the end of the print until the eject
+  // dispatches, to pull heat off the plate during the cooldown wait. 0 = off.
+  farm_cooldown_aux_fan_percent: number;
   // USB storage-low auto-cleanup: on a "USB full" HMS fault, auto-delete old
   // camera recordings then oldest unused print files so dispatch keeps working.
   farm_usb_auto_cleanup: boolean;

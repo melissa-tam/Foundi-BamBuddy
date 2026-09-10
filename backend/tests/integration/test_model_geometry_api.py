@@ -256,3 +256,81 @@ class TestModelGeometryPermissions:
 
         resp = await async_client.get("/api/v1/model-geometry", headers={"X-API-Key": full_key})
         assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+class TestCooldownHoldFieldsAreReadOnly:
+    """The two cooldown plate-hold limits ride the RESPONSE and nothing else.
+
+    They are PHYSICAL facts about a machine (the toolhead's chute-park keep-out line in
+    bed Y, and the clear height above the nozzle plane there), so they are seeded by
+    migration and are deliberately absent from ``ModelGeometryUpdate`` and from the
+    geometry-manager UI — an operator cannot type a new physical clearance into
+    existence.
+    """
+
+    async def test_get_carries_both_fields(self, async_client: AsyncClient, db_session):
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        db_session.add(
+            PrinterModelGeometry(
+                model_key="H2X",
+                bed_x=340,
+                bed_y=320,
+                env_x_min=0,
+                env_x_max=340,
+                env_y_min=-16,
+                env_y_max=325,
+                max_part_height_mm=42,
+                z_travel_mm=340,
+                validated=True,
+                cooldown_hold_keepout_y_mm=285.0,
+                cooldown_hold_clear_above_mm=51.0,
+                notes="hold seed",
+            )
+        )
+        await db_session.commit()
+
+        resp = await async_client.get("/api/v1/model-geometry")
+        assert resp.status_code == 200, resp.text
+        by_key = {g["model_key"]: g for g in resp.json()["geometries"]}
+        assert by_key["H2X"]["cooldown_hold_keepout_y_mm"] == 285.0
+        assert by_key["H2X"]["cooldown_hold_clear_above_mm"] == 51.0
+        # A model with no measured clearance reads as hold OFF, not as an unbounded hold.
+        assert by_key["H2C"]["cooldown_hold_keepout_y_mm"] is None
+        assert by_key["H2C"]["cooldown_hold_clear_above_mm"] is None
+
+    async def test_put_ignores_both_fields(self, async_client: AsyncClient):
+        """Same treatment the derived ``bedslinger`` field gets: neither is part of
+        ``ModelGeometryUpdate``, so Pydantic drops them and the row is untouched."""
+        resp = await async_client.put(
+            "/api/v1/model-geometry/H2S",
+            json={
+                "cooldown_hold_keepout_y_mm": 10.0,
+                "cooldown_hold_clear_above_mm": 999.0,
+                "notes": "still h2s",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["notes"] == "still h2s"  # the legitimate field applied
+        # The physical limits did NOT move — the seed fixture leaves them unset.
+        assert body["cooldown_hold_keepout_y_mm"] is None
+        assert body["cooldown_hold_clear_above_mm"] is None
+
+    async def test_put_cannot_create_a_one_sided_pair(self, async_client: AsyncClient, db_session):
+        """A one-sided pair is what ``ModelGeometry`` refuses outright. Because the PUT
+        body cannot carry either field, the API has no way to produce that state."""
+        from sqlalchemy import select
+
+        from backend.app.models.printer_model_geometry import PrinterModelGeometry
+
+        resp = await async_client.put("/api/v1/model-geometry/H2S", json={"cooldown_hold_keepout_y_mm": 285.0})
+        assert resp.status_code == 200, resp.text
+
+        row = (
+            await db_session.execute(select(PrinterModelGeometry).where(PrinterModelGeometry.model_key == "H2S"))
+        ).scalar_one()
+        assert row.cooldown_hold_keepout_y_mm is None
+        assert row.cooldown_hold_clear_above_mm is None

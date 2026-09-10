@@ -1031,6 +1031,43 @@ def repack_3mf_eject(source_path: Path, plate_id: int, gcode_text: str, *, zero_
         return None
 
 
+def read_plate_json(zf: zipfile.ZipFile, plate_idx: int) -> dict | None:
+    """Parse ``Metadata/plate_{plate_idx}.json`` out of an OPEN 3MF, or None.
+
+    The ONE parser for the slicer's per-plate metadata sidecar — the member carrying
+    ``bbox_all`` / ``bbox_objects`` (object footprints in bed coordinates),
+    ``filament_ids``, ``bed_type`` and ``nozzle_diameter``. Both consumers read it
+    through here (the archive's printable-object extraction, which wants the per-object
+    boxes, and the eject lane's plate-footprint check, which wants ``bbox_all``), so the
+    "absent or unreadable ⇒ None" contract is stated once instead of twice.
+
+    Never raises: returns None when the member is absent, is not valid JSON/UTF-8, or
+    does not decode to a JSON object. A plate legitimately has no sidecar (older slicer
+    output, hand-assembled containers), so absence is ordinary — it logs at debug, not
+    warning, and callers treat None as "nothing is known about this plate", never as an
+    error to surface.
+
+    Takes an already-open :class:`zipfile.ZipFile` rather than a path because every
+    caller is already inside one, and reopening a container that can run to hundreds of
+    MB just to read one small member is pure cost.
+    """
+    name = f"Metadata/plate_{plate_idx}.json"
+    try:
+        raw = zf.read(name)
+    except KeyError:
+        logger.debug("3MF carries no %s", name)
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="ignore"))
+    except json.JSONDecodeError:
+        logger.debug("3MF member %s is not parseable JSON", name)
+        return None
+    if not isinstance(parsed, dict):
+        logger.debug("3MF member %s is valid JSON but not an object", name)
+        return None
+    return parsed
+
+
 def read_plate_gcode_header(source_path: Path, plate_id: int, max_bytes: int = 65536) -> dict[str, str]:
     """Parse the HEADER_BLOCK of plate `plate_id`'s G-code into a normalised dict.
 

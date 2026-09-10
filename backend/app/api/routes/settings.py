@@ -350,6 +350,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "farm_pause_stall_minutes",
             "farm_cooldown_stall_window_minutes",
             "farm_cooldown_max_hold_minutes",
+            "farm_cooldown_aux_fan_percent",
             "farm_idle_park_percent",
             "respool_prompt_threshold_g",
             "erp_db_port",

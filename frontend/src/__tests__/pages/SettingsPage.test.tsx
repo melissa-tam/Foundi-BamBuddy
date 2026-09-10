@@ -883,6 +883,79 @@ describe('SettingsPage', () => {
     });
   });
 
+  describe('Farm tab — eject cooldown', () => {
+    // The aux fan runs from the end of the print until the eject dispatches, so
+    // it sits with the other cooldown-wait controls. 0 is the off state — there
+    // is deliberately no separate toggle.
+    it('renders the aux fan control seeded to its default', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const auxFan = await waitFor(
+        () => screen.getByLabelText('Aux fan during cooldown (%)') as HTMLInputElement,
+      );
+      // mockSettings omits the key, so the component's `?? 100` fallback shows.
+      expect(auxFan.value).toBe('100');
+      expect(auxFan).toHaveAttribute('min', '0');
+      expect(auxFan).toHaveAttribute('max', '100');
+    });
+
+    it('round-trips the aux fan speed through the save endpoint', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const auxFan = await waitFor(() => screen.getByLabelText('Aux fan during cooldown (%)'));
+      fireEvent.change(auxFan, { target: { value: '60' } });
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_cooldown_aux_fan_percent).toBe(60);
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('clamps the aux fan speed to 0-100', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const auxFan = await waitFor(
+        () => screen.getByLabelText('Aux fan during cooldown (%)') as HTMLInputElement,
+      );
+      // Step off the default first so each clamp below is a real state change.
+      fireEvent.change(auxFan, { target: { value: '50' } });
+      expect(auxFan.value).toBe('50');
+      fireEvent.change(auxFan, { target: { value: '150' } });
+      expect(auxFan.value).toBe('100');
+      fireEvent.change(auxFan, { target: { value: '-5' } });
+      expect(auxFan.value).toBe('0');
+    });
+  });
+
   describe('API Keys tab', () => {
     it('can switch to API Keys tab', async () => {
       const user = userEvent.setup();

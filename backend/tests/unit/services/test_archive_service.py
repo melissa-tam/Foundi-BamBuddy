@@ -1,5 +1,8 @@
 """Unit tests for the archive service."""
 
+import io
+import json
+import zipfile
 from datetime import datetime
 
 
@@ -1270,3 +1273,99 @@ class TestPlateCapabilities:
             }
         ]
         assert caps["nozzle_diameters"] == [0.6]
+
+
+class TestPrintableObjectPositions:
+    """The positions lane reads the plate sidecar through the SHARED parser.
+
+    ``extract_printable_objects_from_3mf(..., include_positions=True)`` used to inline its
+    own ``Metadata/plate_N.json`` read; it now calls
+    ``threemf_tools.read_plate_json``, the one parser the eject lane's plate-footprint
+    check also uses. These pin the behaviour across that cut-over — the existing tests in
+    this file reimplement the XML walk rather than calling the function, so none of them
+    would have caught a regression here.
+    """
+
+    _SLICE_INFO = """<?xml version="1.0" encoding="UTF-8"?>
+        <config>
+            <plate plate_idx="1">
+                <metadata key="index" value="1" />
+                <object identify_id="11" name="Part_A.stl" skipped="false" />
+                <object identify_id="12" name="Part_B.stl" skipped="false" />
+            </plate>
+        </config>
+        """
+
+    @staticmethod
+    def _threemf(members: dict) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, body in members.items():
+                zf.writestr(name, body if isinstance(body, bytes) else body)
+        return buf.getvalue()
+
+    def test_positions_and_bbox_all_come_through(self):
+        from backend.app.services.archive import extract_printable_objects_from_3mf
+
+        sidecar = {
+            "bbox_all": [13.66, 52.31, 325.2, 261.97],
+            "bbox_objects": [
+                {"name": "Part_A.stl", "bbox": [10.0, 20.0, 30.0, 40.0]},
+                {"name": "Part_B.stl", "bbox": [50.0, 60.0, 70.0, 80.0]},
+            ],
+        }
+        data = self._threemf(
+            {
+                "Metadata/slice_info.config": self._SLICE_INFO,
+                "Metadata/plate_1.json": json.dumps(sidecar),
+            }
+        )
+        objects, bbox_all = extract_printable_objects_from_3mf(data, include_positions=True)
+
+        assert bbox_all == [13.66, 52.31, 325.2, 261.97]
+        # x/y are the CENTRE of each object's own bbox.
+        assert objects[11]["name"] == "Part_A.stl"
+        assert objects[11]["x"] == 20.0
+        assert objects[11]["y"] == 30.0
+        assert objects[12]["x"] == 60.0
+        assert objects[12]["y"] == 70.0
+
+    def test_missing_sidecar_degrades_to_objects_without_positions(self):
+        from backend.app.services.archive import extract_printable_objects_from_3mf
+
+        data = self._threemf({"Metadata/slice_info.config": self._SLICE_INFO})
+        objects, bbox_all = extract_printable_objects_from_3mf(data, include_positions=True)
+
+        assert bbox_all is None
+        assert objects[11]["name"] == "Part_A.stl"
+        assert objects[11]["x"] is None
+        assert objects[11]["y"] is None
+
+    def test_unparseable_sidecar_degrades_instead_of_raising(self):
+        """Position data is optional: a corrupt sidecar must still yield the objects."""
+        from backend.app.services.archive import extract_printable_objects_from_3mf
+
+        data = self._threemf({"Metadata/slice_info.config": self._SLICE_INFO, "Metadata/plate_1.json": "{ not json"})
+        objects, bbox_all = extract_printable_objects_from_3mf(data, include_positions=True)
+
+        assert bbox_all is None
+        assert set(objects) == {11, 12}
+
+    def test_undecodable_sidecar_no_longer_loses_every_object(self):
+        """Before the shared parser this lost the WHOLE extraction, silently.
+
+        The inline read caught ``JSONDecodeError`` but decoded strictly, so a non-UTF-8
+        sidecar raised ``UnicodeDecodeError`` past that handler into the function's outer
+        blanket ``except Exception: pass`` — which returns the objects dict as it stood,
+        i.e. EMPTY, because the objects are parsed after the sidecar block. A cosmetic
+        sidecar problem therefore erased every printable object. The shared parser
+        confines the failure to the positions it actually affects."""
+        from backend.app.services.archive import extract_printable_objects_from_3mf
+
+        data = self._threemf(
+            {"Metadata/slice_info.config": self._SLICE_INFO, "Metadata/plate_1.json": b"\xff\xfe{\x00"}
+        )
+        objects, bbox_all = extract_printable_objects_from_3mf(data, include_positions=True)
+
+        assert bbox_all is None
+        assert set(objects) == {11, 12}

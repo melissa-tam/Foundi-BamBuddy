@@ -79,7 +79,7 @@ registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
 registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position', anchor: 'card-farm-production' });
-registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine', anchor: 'card-farm-cooldown' });
+registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine aux fan auxiliary speed percent', anchor: 'card-farm-cooldown' });
 registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
 registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool observation prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
@@ -1065,6 +1065,7 @@ export function SettingsPage() {
       (settings.farm_cooldown_stall_epsilon_c ?? 1) !== (localSettings.farm_cooldown_stall_epsilon_c ?? 1) ||
       (settings.farm_cooldown_max_hold_minutes ?? 180) !== (localSettings.farm_cooldown_max_hold_minutes ?? 180) ||
       (settings.farm_cooldown_plateau_eject_margin_c ?? 3) !== (localSettings.farm_cooldown_plateau_eject_margin_c ?? 3) ||
+      (settings.farm_cooldown_aux_fan_percent ?? 100) !== (localSettings.farm_cooldown_aux_fan_percent ?? 100) ||
       (settings.farm_usb_auto_cleanup ?? true) !== (localSettings.farm_usb_auto_cleanup ?? true) ||
       (settings.farm_idle_park_enabled ?? true) !== (localSettings.farm_idle_park_enabled ?? true) ||
       (settings.farm_idle_park_percent ?? 75) !== (localSettings.farm_idle_park_percent ?? 75) ||
@@ -1187,6 +1188,7 @@ export function SettingsPage() {
         farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
         farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
         farm_cooldown_plateau_eject_margin_c: localSettings.farm_cooldown_plateau_eject_margin_c,
+        farm_cooldown_aux_fan_percent: localSettings.farm_cooldown_aux_fan_percent,
         farm_usb_auto_cleanup: localSettings.farm_usb_auto_cleanup,
         farm_idle_park_enabled: localSettings.farm_idle_park_enabled,
         farm_idle_park_percent: localSettings.farm_idle_park_percent,
@@ -5259,6 +5261,27 @@ export function SettingsPage() {
                   />
                   <p className="text-xs text-bambu-gray mt-1">
                     {t('settings.farmCooldownPlateauMarginHelp', 'If cooling stalls but the bed is within this many degrees of the eject temperature, treat it as cooled and eject; stuck hotter than that quarantines the printer.')}
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <label htmlFor="farm-cooldown-aux-fan" className="block text-xs text-bambu-gray">
+                      {t('settings.farmCooldownAuxFan', 'Aux fan during cooldown (%)')}
+                    </label>
+                    <InfoHint text={t('settings.farmCooldownAuxFanHelp')} />
+                  </div>
+                  <input
+                    id="farm-cooldown-aux-fan"
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={localSettings.farm_cooldown_aux_fan_percent ?? 100}
+                    onChange={(e) => updateSetting('farm_cooldown_aux_fan_percent', Math.max(0, Math.min(100, Math.round(parseInt(e.target.value, 10) || 0))))}
+                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                  />
+                  <p className="text-xs text-bambu-gray mt-1">
+                    {t('settings.farmCooldownAuxFanHelp', "Runs the printer's auxiliary fan at this speed from the end of the print until the eject dispatches. 0 turns it off.")}
                   </p>
                 </div>
               </div>

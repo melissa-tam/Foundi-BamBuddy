@@ -858,6 +858,8 @@ export default {
     phase: {
       printing: '인쇄 중',
       cooling: '{{threshold}}°C까지 냉각 중',
+      coolingHeld: '{{threshold}}°C까지 냉각 중 · 플레이트 상승',
+      coolingHeldHint: '플레이트가 노즐 높이에서 유지되고 툴헤드는 슈트에 대기 중입니다. 배출이 실행될 때까지 툴헤드를 움직이지 마십시오.',
       awaitingPlateClear: '플레이트 비움 대기 중',
     },
     ejectPhase: {
@@ -2554,6 +2556,8 @@ export default {
     farmCooldownMaxHoldHelp: '이 시간이 지나도 베드가 배출 온도보다 따뜻하면 그래도 배출합니다. 0 = 계속 대기합니다.',
     farmCooldownPlateauMargin: '허용 여유값 (°C)',
     farmCooldownPlateauMarginHelp: '냉각이 멈춰도 베드가 배출 온도에서 이 정도 이내이면 식은 것으로 보고 배출합니다. 그보다 더 뜨거운 채로 멈추면 프린터를 격리합니다.',
+    farmCooldownAuxFan: '냉각 중 보조 팬 (%)',
+    farmCooldownAuxFanHelp: '인쇄 종료부터 배출이 전송될 때까지 프린터의 보조 팬을 이 속도로 가동합니다. 0이면 끔니다.',
     respoolPromptThreshold: '재스풀 관찰 임계값 (g)',
     respoolPromptThresholdHelp: '재사용된 Bambu 태그가 나타나고 도너 스풀의 남은 양이 이 그램 수 이하이며 하드웨어로 확인된 소진 표시가 없을 때 재스풀 관찰을 로그에 기록합니다 (0–1000).',
     farmUsbAutoCleanup: '가득 차면 USB 자동 정리',

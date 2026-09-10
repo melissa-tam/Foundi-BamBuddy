@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: 'Yazdırılıyor',
       cooling: '{{threshold}}°C\'ye soğutuluyor',
+      coolingHeld: '{{threshold}}°C\'ye soğutuluyor · plaka yukarıda',
+      coolingHeldHint: 'Plaka nozul hizasında tutuluyor, kafa oluk konumunda bekliyor. Çıkarma çalışana kadar kafayı hareket ettirmeyin.',
       awaitingPlateClear: 'Plakanın temizlenmesi bekleniyor',
     },
     ejectPhase: {
@@ -2675,6 +2677,8 @@ export default {
     farmCooldownMaxHoldHelp: 'Bu süreden sonra tabla hâlâ çıkarma sıcaklığından sıcaksa yine de çıkar. 0 = beklemeye devam et.',
     farmCooldownPlateauMargin: 'Yeterince yakın payı (°C)',
     farmCooldownPlateauMarginHelp: 'Soğuma durursa ancak tabla çıkarma sıcaklığının bu kadar derece içindeyse, soğumuş kabul edilip çıkarılır; bundan daha sıcak takılı kalırsa yazıcı karantinaya alınır.',
+    farmCooldownAuxFan: 'Soğuma sırasında yardımcı fan (%)',
+    farmCooldownAuxFanHelp: 'Baskı bittiğinden çıkarma gönderilene kadar yazıcının yardımcı fanını bu hızda çalıştırır. 0 kapatır.',
     respoolPromptThreshold: 'Yeniden makara gözlem eşiği (g)',
     respoolPromptThresholdHelp: 'Yeniden kullanılan bir Bambu etiketi geldiğinde kaynak makarada bu kadar veya daha az gram kaldıysa ve donanımla kesinleşmiş tükenme işareti yoksa bir yeniden makara gözlemi günlüğe yazılır (0–1000).',
     farmUsbAutoCleanup: 'Dolduğunda USB\'yi otomatik temizle',

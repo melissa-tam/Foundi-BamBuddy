@@ -13,9 +13,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from backend.app.services.eject.generator import (
-    PARK_Z_MM,
     SWEEP_BAND_MIN_WIDTH_MM,
+    SWEEP_PHASE_MARKER,
     block_start_marker,
+    lift_z,
+    park_z,
+    part_height_error,
 )
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME, is_bedslinger_model, is_dual_nozzle_model
 
@@ -74,9 +77,19 @@ def validate_eject_gcode(
     PARK_Z_MM)``) clear of the nozzle, so a surviving part is not dragged into;
     all X/Y inside the model's machine travel envelope (``geometry.envelope``);
     prologue present with no bare ``G28`` and no ``G28 Z`` (dual-nozzle models
-    require both parameterized home forms); no standalone tool-change. ``geometry`` is the
+    require both parameterized home forms); the X/Y home sits AFTER the block's first
+    Z-bearing ``G0``/``G1`` move and BEFORE the sweep marker, exactly once; no
+    standalone tool-change. ``geometry`` is the
     resolved :class:`~backend.app.services.eject.geometry.ModelGeometry` — the
     caller resolves it from the registry, so the validator does no model lookup.
+
+    The HOME-ORDER guard is the block's one-Z-flow contract expressed independently of
+    the generator. The block may begin from the vendor's parked bed OR from the cooldown
+    hold's ~2 mm, so a home emitted before the first Z move would sweep X/Y past a part
+    standing above the nozzle plane — safe only if Y homes rearward, which is
+    vendor-suggested and unproven here. It is phrased on ``G0``/``G1`` moves that CARRY
+    Z so the dormant Z re-reference prologue's ``G380`` (a guarded relative drive that
+    ends the bed at its stop) does not satisfy it.
 
     The Z RE-REFERENCE prologue (2026-09-04) is checked as MODAL RULES over the emitted
     text, never as a comparison against an expected string, so a hand-edited or
@@ -98,9 +111,10 @@ def validate_eject_gcode(
     bed_x, bed_y = geometry.bed
     env_x_min, env_x_max, env_y_min, env_y_max = geometry.envelope
 
-    # Guard 1: part-height ceiling.
-    if max_z_height > profile.max_part_height_mm:
-        errors.append(f"Part height {max_z_height} mm exceeds max_part_height_mm {profile.max_part_height_mm} mm")
+    # Guard 1: part-height ceiling — one origin, shared with the generator's own raise.
+    height_error = part_height_error(max_z_height, profile)
+    if height_error is not None:
+        errors.append(height_error)
 
     # Guard 1b: X sweep sub-band consistency (mirrors the generator's resolution).
     band_lo = getattr(profile, "sweep_x_min_mm", None)
@@ -138,8 +152,8 @@ def validate_eject_gcode(
     # still admits the park Z10. When the bed-drop release assist is on, the ceiling
     # opens up to the (deeper) drop target; a missing z_travel_mm or a drop that is
     # not below the lift is itself an error (mirrors the generator's fail-closed).
-    lift_z = max_z_height + profile.clearance_mm
-    z_ceiling = max(lift_z, PARK_Z_MM)
+    lift = lift_z(max_z_height, profile)
+    ceiling = park_z(max_z_height, profile)
     bed_drop = getattr(profile, "bed_drop_clearance_mm", None)
     if bed_drop is not None:
         if is_bedslinger_model(geometry.model_key):
@@ -153,11 +167,11 @@ def validate_eject_gcode(
             errors.append(f"bed-drop release assist is enabled but model {geometry.model_key!r} has no z_travel_mm")
         else:
             drop_z = geometry.z_travel_mm - bed_drop
-            if drop_z <= lift_z:
-                errors.append(f"bed-drop target Z{drop_z:g} is not below the lift height Z{lift_z:g} — degenerate drop")
+            if drop_z <= lift:
+                errors.append(f"bed-drop target Z{drop_z:g} is not below the lift height Z{lift:g} — degenerate drop")
             else:
-                z_ceiling = max(drop_z, z_ceiling)
-    z_hi = z_ceiling + _EPS
+                ceiling = max(drop_z, ceiling)
+    z_hi = ceiling + _EPS
 
     # Guard 1e: the Z re-reference gate's own preconditions, mirroring the generator's
     # fail-closed refusals so a block cannot reach a printer through a hand-edited path
@@ -186,6 +200,12 @@ def validate_eject_gcode(
     # parameterized commands, so both must be present.
     required_home = {tuple(tok.upper() for tok in line.split()): line for line in DUAL_NOZZLE_HOME}
     found_home: set[tuple[str, ...]] = set()
+    # Home POSITION + COUNT (see the home-order guard in the docstring). Every X/Y home
+    # line is counted, whichever dialect wrote it, so a stray extra home is caught on a
+    # single-nozzle block as surely as on a dual one.
+    home_forms: dict[tuple[str, ...], int] = {}
+    homes_before_first_z = 0
+    homes_after_sweep = 0
 
     has_m17 = False
     has_g90 = False
@@ -197,6 +217,11 @@ def validate_eject_gcode(
     relative_mode = False  # G91 open?
     soft_limits_off = False  # M211 Z0 seen with no matching M211 Z1 yet?
     first_move_seen = False
+    # The first ``G0``/``G1`` that CARRIES Z — the move the home must follow. Distinct
+    # from ``first_move_seen`` (any move) because the prologue's modal rules and the
+    # home-order rule are answered by different lines.
+    first_z_move_seen = False
+    sweep_marker_seen = False
     g92_count = 0
     # The Z of the most recent Z-bearing G0/G1 move — the block's END STATE. The
     # generator now parks the bed proportional to part height so a surviving part
@@ -205,6 +230,11 @@ def validate_eject_gcode(
     last_z: float | None = None
 
     for raw in gcode.splitlines():
+        # The sweep marker is a COMMENT, so it has to be read before comments are
+        # stripped. It is the one origin the generator emits it from, never a re-spelt
+        # literal, so the two cannot drift about where the sweep starts.
+        if raw.strip() == SWEEP_PHASE_MARKER:
+            sweep_marker_seen = True
         tokens = _tokens(raw)
         if not tokens:
             continue
@@ -290,6 +320,12 @@ def validate_eject_gcode(
             norm = tuple(t.upper() for t in tokens)
             if norm in required_home:
                 found_home.add(norm)
+            if axes and "Z" not in axes:
+                home_forms[norm] = home_forms.get(norm, 0) + 1
+                if not first_z_move_seen:
+                    homes_before_first_z += 1
+                if sweep_marker_seen:
+                    homes_after_sweep += 1
             if not axes:
                 errors.append("G28 with no axis letters homes all axes (incl. Z) — forbidden with a part on the plate")
             elif "Z" in axes:
@@ -310,10 +346,11 @@ def validate_eject_gcode(
                     errors.append("soft end stops left off (M211 Z0 with no M211 Z1) at the first move")
             if "Z" in params:
                 last_z = params["Z"]
+                first_z_move_seen = True
             if "Z" in params and params["Z"] < z_floor:
                 errors.append(f"Move Z{params['Z']:g} is below the z_offset floor {profile.z_offset_mm:g}")
             if "Z" in params and params["Z"] > z_hi:
-                errors.append(f"Move Z{params['Z']:g} exceeds the eject Z ceiling {z_ceiling:g} mm")
+                errors.append(f"Move Z{params['Z']:g} exceeds the eject Z ceiling {ceiling:g} mm")
             if "X" in params and not (x_lo <= params["X"] <= x_hi):
                 errors.append(
                     f"Move X{params['X']:g} is outside the {geometry.model_key} travel envelope [{env_x_min:g}, {env_x_max:g}]"
@@ -339,13 +376,25 @@ def validate_eject_gcode(
     elif not has_g28_xy:
         errors.append("Prologue missing 'G28 X Y' home")
 
+    # Guard 5b: WHERE the home runs, and how many times. A block homes X/Y exactly once
+    # (dual-nozzle: each torque form exactly once), after its first Z-bearing move and
+    # before the sweep begins — the clearest point in the block, and the only point
+    # that is clear whatever Z the block started from.
+    if homes_before_first_z:
+        errors.append("X/Y home precedes the block's first Z move — the home must run at the eject's clearest point")
+    if homes_after_sweep:
+        errors.append("X/Y home after the sweep marker")
+    home_count = sum(home_forms.values())
+    if home_count > (len(required_home) if dual else 1) or any(count > 1 for count in home_forms.values()):
+        errors.append("more than one X/Y home")
+
     # Guard 6: end-state clearance. Independent of the ceiling check: the block's
     # LAST Z-bearing move must leave the bed at least the park Z (part top +
     # clearance, floored at PARK_Z_MM) below the nozzle, so a part that survived
     # the sweep clears the toolhead. A block ending bed-high (e.g. a legacy fixed
     # ``Z10`` park under a taller part) is rejected here even though every
     # individual move sits under the ceiling.
-    if last_z is not None and last_z < max(lift_z, PARK_Z_MM) - _EPS:
+    if last_z is not None and last_z < park_z(max_z_height, profile) - _EPS:
         errors.append(
             f"block ends with the bed at Z{last_z:g} while the part top is {max_z_height:g} mm "
             "— end state must clear the part"

@@ -8746,3 +8746,75 @@ class TestIdleFromPauseCompletion:
         )
 
         assert complete_data.get("status") == "aborted"
+
+
+class TestSetFanPercent:
+    """``set_fan_percent`` is the ONE origin of the percent→PWM conversion.
+
+    The wire takes ``M106 P<fan> S<0-255>``; every surface above it (the ``/fan-speed``
+    route, the eject cooldown's aux-fan prep) speaks percent. These pin the mapping at
+    the boundaries and in the middle, so a second inline ``* 255 / 100`` cannot be
+    reintroduced somewhere else and quietly disagree.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(ip_address="192.168.1.100", serial_number="FAN123", access_code="12345678")
+        # send_gcode publishes only when it believes it has a live session.
+        client._client = MagicMock()
+        client.state.connected = True
+        return client
+
+    @staticmethod
+    def _published_gcode(client) -> list[str]:
+        """Every G-code param this client published, in order."""
+        return [json.loads(call.args[1])["print"]["param"] for call in client._client.publish.call_args_list]
+
+    @pytest.mark.parametrize(
+        ("percent", "expected"),
+        [
+            (100, "M106 P2 S255"),  # full
+            (50, "M106 P2 S128"),  # 127.5 rounds to 128
+            (0, "M106 P2 S0"),  # off
+        ],
+    )
+    def test_percent_maps_to_pwm(self, mqtt_client, percent, expected):
+        assert mqtt_client.set_fan_percent(2, percent) is True
+        assert self._published_gcode(mqtt_client) == [expected]
+
+    @pytest.mark.parametrize(
+        ("percent", "expected"),
+        [
+            (101, "M106 P2 S255"),
+            (5000, "M106 P2 S255"),
+            (-1, "M106 P2 S0"),
+            (-5000, "M106 P2 S0"),
+        ],
+    )
+    def test_out_of_range_percent_clamps(self, mqtt_client, percent, expected):
+        """Clamped, never scaled past the wire's 0-255 — an out-of-range percent must not
+        become an out-of-range PWM the firmware would reject or misread."""
+        assert mqtt_client.set_fan_percent(2, percent) is True
+        assert self._published_gcode(mqtt_client) == [expected]
+
+    def test_fan_index_rides_through_to_the_command(self, mqtt_client):
+        # 1 = part cooling, 2 = auxiliary, 3 = chamber.
+        mqtt_client.set_fan_percent(1, 100)
+        mqtt_client.set_fan_percent(3, 100)
+        assert self._published_gcode(mqtt_client) == ["M106 P1 S255", "M106 P3 S255"]
+
+    def test_invalid_fan_index_is_refused_without_publishing(self, mqtt_client):
+        """The validity gate lives in set_fan_speed; set_fan_percent must not bypass it."""
+        assert mqtt_client.set_fan_percent(4, 100) is False
+        assert self._published_gcode(mqtt_client) == []
+
+    def test_disconnected_client_reports_failure(self, mqtt_client):
+        """send_gcode is fail-loud (2026-07-21): a disconnected printer cannot eat a
+        command silently, so the percent wrapper must propagate the False."""
+        mqtt_client.state.connected = False
+        assert mqtt_client.set_fan_percent(2, 100) is False
+        assert self._published_gcode(mqtt_client) == []

@@ -883,6 +883,8 @@ export default {
     phase: {
       printing: '印刷中',
       cooling: '{{threshold}}°C まで冷却中',
+      coolingHeld: '{{threshold}}°C まで冷却中・プレート保持中',
+      coolingHeldHint: 'プレートはノズル高さで保持され、ツールヘッドはシュート位置で待機しています。排出が実行されるまでツールヘッドを動かさないでください。',
       awaitingPlateClear: 'プレートのクリア待ち',
     },
     ejectPhase: {
@@ -2670,6 +2672,8 @@ export default {
     farmCooldownMaxHoldHelp: 'この時間が過ぎてもベッドが排出温度より高い場合は、そのまま排出します。0 = 待ち続けます。',
     farmCooldownPlateauMargin: '許容マージン（°C）',
     farmCooldownPlateauMarginHelp: '冷却が停滞しても、ベッドが排出温度からこの度数以内であれば、冷却済みとして排出します。それより高温のまま止まっている場合はプリンターを隔離します。',
+    farmCooldownAuxFan: '冷却中の補助ファン (%)',
+    farmCooldownAuxFanHelp: '印刷終了から排出が送信されるまで、プリンターの補助ファンをこの速度で回します。0 で停止します。',
     respoolPromptThreshold: '付け替え観測のしきい値 (g)',
     respoolPromptThresholdHelp: '再利用された Bambu タグが現れ、ドナースプールの残量がこのグラム数以下で、ハードウェアで確定した使い切りマーカーがない場合に、付け替えの観測をログに記録します（0〜1000）。',
     farmUsbAutoCleanup: '満杯時にUSBを自動クリーンアップ',

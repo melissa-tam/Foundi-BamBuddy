@@ -25,7 +25,53 @@ describe('deriveFarmPhase', () => {
         awaiting_plate_clear: true,
         eject_watch: { threshold_c: 33 },
       }),
-    ).toEqual({ kind: 'cooling', threshold: 33 });
+    ).toEqual({ kind: 'cooling', threshold: 33, held: false });
+  });
+
+  it('reports a HELD plate when the watch carries a hold_z', () => {
+    // hold_z means the plate is parked at the nozzle plane for the whole wait —
+    // the operator must not jog the toolhead until the eject runs.
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: 33, hold_z: 2 },
+      }),
+    ).toEqual({ kind: 'cooling', threshold: 33, held: true });
+    // A hold at Z0 is still a hold — only a non-finite/absent value is "not held".
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: 33, hold_z: 0 },
+      }),
+    ).toEqual({ kind: 'cooling', threshold: 33, held: true });
+  });
+
+  it('is not held when hold_z is null, absent, or non-finite', () => {
+    const notHeld = { kind: 'cooling', threshold: 33, held: false };
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: 33, hold_z: null },
+      }),
+    ).toEqual(notHeld);
+    // Older status payloads carry no hold_z at all.
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: 33 },
+      }),
+    ).toEqual(notHeld);
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: 33, hold_z: Number.NaN },
+      }),
+    ).toEqual(notHeld);
   });
 
   it('reports awaiting plate clear when the gate is raised with NO watch', () => {

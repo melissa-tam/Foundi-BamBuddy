@@ -47,6 +47,18 @@ export interface ModelGeometry {
    *  held after a confirmed plate-check trip. A hardware number the code cannot
    *  know, so it lives in the registry; 12 is the vendor's own value. */
   hold_lift_mm: number;
+  /** Cooldown plate-hold keep-out line (mm, bed Y): the strip the toolhead occupies
+   *  when parked at the chute. A plate whose object bounding box ends past this Y is
+   *  never held through the cooldown. Null ⇒ the hold is off for this model.
+   *
+   *  READ-ONLY: a PHYSICAL limit of the machine, not an operator setting — seeded by
+   *  migration, absent from `ModelGeometryUpdate` and from the geometry-manager UI. */
+  cooldown_hold_keepout_y_mm: number | null;
+  /** Cooldown plate-hold clear height (mm): the space physically available above the
+   *  nozzle plane with the toolhead parked at the chute. Null ⇒ hold off for this
+   *  model. Read-only for the same reason as `cooldown_hold_keepout_y_mm`; the two are
+   *  one fact in two numbers and are always both set or both null. */
+  cooldown_hold_clear_above_mm: number | null;
   /** Derived (read-only): true when this model is a bed-slinger — the bed is
    *  FIXED in Z and the gantry carries the Z axis, so the bed-drop release
    *  assist is physically meaningless and unavailable on it. Computed by the

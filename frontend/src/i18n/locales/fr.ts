@@ -884,6 +884,8 @@ export default {
     phase: {
       printing: 'Impression',
       cooling: 'Refroidissement jusqu\'à {{threshold}}°C',
+      coolingHeld: 'Refroidissement jusqu\'à {{threshold}}°C · plateau relevé',
+      coolingHeldHint: 'Le plateau est maintenu au niveau de la buse, la tête stationnée à la goulotte. Ne pas déplacer la tête avant l\'exécution de l\'éjection.',
       awaitingPlateClear: 'En attente du dégagement du plateau',
     },
     ejectPhase: {
@@ -2627,6 +2629,8 @@ export default {
     farmCooldownMaxHoldHelp: 'Si le plateau est encore plus chaud que la température d\'éjection après ce délai, éjecter quand même. 0 = continuer d\'attendre.',
     farmCooldownPlateauMargin: 'Marge de tolérance (°C)',
     farmCooldownPlateauMarginHelp: 'Si le refroidissement stagne mais que le plateau est à moins de ce nombre de degrés de la température d\'éjection, le considérer comme refroidi et éjecter ; s\'il reste plus chaud, l\'imprimante est mise en quarantaine.',
+    farmCooldownAuxFan: 'Ventilateur auxiliaire pendant le refroidissement (%)',
+    farmCooldownAuxFanHelp: 'Fait tourner le ventilateur auxiliaire de l\'imprimante à cette vitesse depuis la fin de l\'impression jusqu\'à l\'envoi de l\'éjection. 0 le désactive.',
     respoolPromptThreshold: 'Seuil d\'observation de réaffectation (g)',
     respoolPromptThresholdHelp: 'Consigner une observation de réaffectation lorsqu\'une étiquette Bambu réutilisée arrive alors que la bobine d\'origine n\'a plus que ce nombre de grammes ou moins et sans marqueur d\'épuisement certifié matériel (0–1000).',
     farmUsbAutoCleanup: 'Nettoyer automatiquement l\'USB lorsqu\'il est plein',

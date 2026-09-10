@@ -3574,6 +3574,15 @@ async def run_migrations(conn):
         conn, f"ALTER TABLE printer_model_geometry ADD COLUMN z_reference_validated BOOLEAN NOT NULL DEFAULT {_false}"
     )
     await _safe_execute(conn, "ALTER TABLE printer_model_geometry ADD COLUMN hold_lift_mm FLOAT NOT NULL DEFAULT 12.0")
+    # Cooldown plate-hold (2026-09-10): two PHYSICAL per-model limits for holding the
+    # finished plate at the nozzle plane through the eject cooldown, toolhead parked at
+    # the chute. Nullable with NO default — both NULL means the hold is OFF for that
+    # model, which is where every model starts and where all but H2S stay (fan only)
+    # until its own clearance is measured. Not operator-settable (absent from
+    # ModelGeometryUpdate): a physical clearance is not a preference, so these change by
+    # changing the seed below.
+    await _safe_execute(conn, "ALTER TABLE printer_model_geometry ADD COLUMN cooldown_hold_keepout_y_mm FLOAT")
+    await _safe_execute(conn, "ALTER TABLE printer_model_geometry ADD COLUMN cooldown_hold_clear_above_mm FLOAT")
     # H2S — operator-witnessed dry run on 001-H2S (2026-07-04): validated.
     # z_travel_mm 340 = printable height (spec); machine bottom for the bed-drop assist.
     await _safe_execute(
@@ -3606,6 +3615,24 @@ async def run_migrations(conn):
         )
         await conn.execute(
             text("UPDATE printer_model_geometry SET z_travel_mm = 325 WHERE model_key = 'H2C' AND z_travel_mm IS NULL")
+        )
+        # Cooldown plate-hold seed — H2S ONLY, and both numbers are PLACEHOLDERS.
+        # Operator ruling 2026-09-10 (eyewitness): the space above the nozzle plane with
+        # the toolhead parked at the chute is clear to AT LEAST 50 mm, so 51 is seeded as
+        # a witnessed-safe floor; the TRUE maximum has still to be measured, and this seed
+        # is where it lands when it is. The keep-out line is the vendor's rear service
+        # area (Y295) minus 10 mm of margin = 285; for reference the production plate's
+        # own bbox_all ends at Y 261.97, well clear of it.
+        # Every OTHER model stays NULL — unmeasured, so hold OFF and fan only (H2C
+        # explicitly gets no numbers). Idempotent via the IS NULL guard, exactly like the
+        # z_travel backfill above: re-runs no-op, and the pair is written together so a
+        # row can never carry one half (ModelGeometry rejects a one-sided pair).
+        await conn.execute(
+            text(
+                "UPDATE printer_model_geometry "
+                "SET cooldown_hold_keepout_y_mm = 285.0, cooldown_hold_clear_above_mm = 51.0 "
+                "WHERE model_key = 'H2S' AND cooldown_hold_clear_above_mm IS NULL"
+            )
         )
 
     # Additional fleet geometry rows (published-spec provisional envelopes, all

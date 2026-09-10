@@ -2189,7 +2189,14 @@ function PrinterCard({
       setRetainedPrintJob(null);
     }
   }, [activePrintName, needsPlateClear, status?.cover_url]);
-  const plateStatus = (() => {
+  /** The plate pill: its one-line label, its tone, and any supplementary detail. */
+  interface PlateStatusPill {
+    label: string;
+    className: string;
+    /** Supplementary constraint (never inline in the pill) — omitted when none. */
+    title?: string;
+  }
+  const plateStatus: PlateStatusPill | null = (() => {
     if (!status?.connected) return null;
     // A raised gate always surfaces its "not cleared" state (it blocks dispatch
     // regardless of the toggle); the informational In-Use / Cleared pills stay
@@ -2212,10 +2219,19 @@ function PrinterCard({
         eject_watch: status.eject_watch,
       });
       if (phase?.kind === 'cooling') {
-        return {
-          label: t('printers.phase.cooling', { threshold: Math.round(phase.threshold) }),
-          className: 'bg-blue-500/20 text-blue-400',
-        };
+        // A HELD plate (hold_z) keeps the toolhead parked at the chute for the
+        // whole wait — that constraint is the operator's, so it rides a tooltip
+        // on the pill rather than the pill's own one-line label.
+        return phase.held
+          ? {
+              label: t('printers.phase.coolingHeld', { threshold: Math.round(phase.threshold) }),
+              className: 'bg-blue-500/20 text-blue-400',
+              title: t('printers.phase.coolingHeldHint'),
+            }
+          : {
+              label: t('printers.phase.cooling', { threshold: Math.round(phase.threshold) }),
+              className: 'bg-blue-500/20 text-blue-400',
+            };
       }
       return {
         label: t('printers.plateStatus.notCleared'),
@@ -2228,7 +2244,10 @@ function PrinterCard({
     };
   })();
   const plateStatusPill = plateStatus ? (
-    <span className={`inline-flex flex-shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${plateStatus.className}`}>
+    <span
+      className={`inline-flex flex-shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${plateStatus.className}`}
+      title={plateStatus.title}
+    >
       {plateStatus.label}
     </span>
   ) : null;
