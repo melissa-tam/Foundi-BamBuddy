@@ -635,11 +635,10 @@ export default {
     progress: '{{percent}}% 完了',
     timeRemaining: '残り {{time}}',
     deleteConfirm: '「{{name}}」を削除しますか？',
-    maintenanceOk: 'メンテナンス正常',
-    maintenanceWarning: '{{count}}件の警告',
-    maintenanceWarning_plural: '{{count}}件の警告',
-    maintenanceDue: '{{count}}件のメンテナンス期限',
-    maintenanceDue_plural: '{{count}}件の期限',
+    maintenanceWarning_one: '{{count}}件の警告',
+    maintenanceWarning_other: '{{count}}件の警告',
+    maintenanceDue_one: '{{count}}件のメンテナンス期限',
+    maintenanceDue_other: '{{count}}件のメンテナンス期限',
     // Sort options
     sort: {
       name: '名前',
@@ -958,8 +957,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: 'キュー内 {{count}} 件',
-      inQueue_plural: '{{count}}件がキュー内',
+      inQueue_one: 'キュー内 {{count}} 件',
+      inQueue_other: 'キュー内 {{count}} 件',
     },
     // Controls section
     controls: 'コントロール',
@@ -1445,8 +1444,8 @@ export default {
       title: 'プレビューするプレートを選択',
       hint: 'このアーカイブには複数のプレートがあります。GCodeビューアで開くプレートを選択してください。',
       plateLabel: 'プレート {{index}}',
-      objectCount: '{{count}} オブジェクト',
-      objectCount_plural: '{{count}} オブジェクト',
+      objectCount_one: '{{count}} オブジェクト',
+      objectCount_other: '{{count}} オブジェクト',
       noGcode: 'このアーカイブにはプレビュー可能なスライス済みGコードがありません。まずBambu Studioで開いてスライスしてください。',
     },
     card: {
@@ -1671,8 +1670,8 @@ export default {
     printingInProgress: '印刷中...',
     viewArchive: 'アーカイブを表示',
     viewInFileManager: 'ファイルマネージャーで表示',
-    itemCount: '{{count}}件',
-    itemCount_plural: '{{count}}件のアイテム',
+    itemCount_one: '{{count}}件',
+    itemCount_other: '{{count}}件',
     dragToReorder: 'ドラッグして並べ替え（ASAPのみ）',
     reorderHint: '順番はASAPアイテムのみに影響します。スケジュール済みアイテムは設定時刻に実行されます。',
     sjf: {
@@ -1694,10 +1693,10 @@ export default {
     cancelBatchConfirmMessage: 'このバッチの残りの保留中アイテムをすべてキャンセルしますか？',
     batch: {
       defaultName: 'バッチ',
-      label: '{{count}}件',
-      label_plural: '{{count}}件',
-      pendingCount: '{{count}}件待機中',
-      pendingCount_plural: '{{count}}件待機中',
+      label_one: '{{count}}件',
+      label_other: '{{count}}件',
+      pendingCount_one: '{{count}}件待機中',
+      pendingCount_other: '{{count}}件待機中',
       expand: 'バッチを展開',
       collapse: 'バッチを折りたたむ',
       groupAsBatch: 'バッチとしてグループ化…',
@@ -1726,8 +1725,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}}件',
-      batch: '{{name}}（{{count}}部）',
-      batch_plural: '{{name}}（{{count}}部）',
+      batch_one: '{{name}}（{{count}}部）',
+      batch_other: '{{name}}（{{count}}部）',
     },
     // Sections
     sections: {
@@ -1811,8 +1810,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: '{{count}}件のアイテムを編集',
-      title_plural: '{{count}}件のアイテムを編集',
+      title_one: '{{count}}件のアイテムを編集',
+      title_other: '{{count}}件のアイテムを編集',
       description: '変更した設定のみが選択されたアイテムに適用されます。',
       printer: 'プリンター',
       noChange: '— 変更なし —',
@@ -2042,10 +2041,10 @@ export default {
     title: 'メンテナンス',
     overview: '概要',
     allOk: 'すべてのメンテナンスは最新です',
-    dueCount: '{{count}}件の期限到来',
-    dueCount_plural: '{{count}}件の期限到来',
-    warningCount: '{{count}}件の警告',
-    warningCount_plural: '{{count}}件の警告',
+    dueCount_one: '{{count}}件の期限到来',
+    dueCount_other: '{{count}}件の期限到来',
+    warningCount_one: '{{count}}件の警告',
+    warningCount_other: '{{count}}件の警告',
     totalPrintTime: '総印刷時間',
     nextMaintenance: '次回メンテナンス',
     nothingDue: '予定なし',
@@ -4901,9 +4900,6 @@ export default {
       slot: 'このスロットで最後に使用',
       ams: 'この AMS で最後に使用',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '空のスプール {{count}} 件を非表示',
     assignEmptyHidden_other: '空のスプール {{count}} 件を非表示',
     spoolmanSpools: 'Spoolman スプール',
@@ -5821,11 +5817,11 @@ export default {
     plates: 'プレート',
     allPlates: '全プレート',
     plateNumber: 'プレート {{number}}',
-    plateCount: '{{count}} プレート',
+    plateCount_one: '{{count}} プレート',
     plateCount_other: '{{count}} プレート',
-    objectCount: '{{count}} オブジェクト',
+    objectCount_one: '{{count}} オブジェクト',
     objectCount_other: '{{count}} オブジェクト',
-    filamentCount: '{{count}} フィラメント',
+    filamentCount_one: '{{count}} フィラメント',
     filamentCount_other: '{{count}} フィラメント',
     eta: '予想時間 {{minutes}} 分',
     noPreview: 'このファイルのプレビューは利用できません',

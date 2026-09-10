@@ -636,11 +636,10 @@ export default {
     progress: '{{percent}}% abgeschlossen',
     timeRemaining: 'Noch {{time}}',
     deleteConfirm: 'Möchten Sie "{{name}}" wirklich löschen?',
-    maintenanceOk: 'Wartung OK',
-    maintenanceWarning: '{{count}} Warnung',
-    maintenanceWarning_plural: '{{count}} Warnungen',
-    maintenanceDue: '{{count}} fällig',
-    maintenanceDue_plural: '{{count}} fällig',
+    maintenanceWarning_one: '{{count}} Warnung',
+    maintenanceWarning_other: '{{count}} Warnungen',
+    maintenanceDue_one: '{{count}} fällig',
+    maintenanceDue_other: '{{count}} fällig',
     // Sort options
     sort: {
       name: 'Name',
@@ -959,8 +958,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: '{{count}} Druck in Warteschlange',
-      inQueue_plural: '{{count}} Drucke in Warteschlange',
+      inQueue_one: '{{count}} Druck in Warteschlange',
+      inQueue_other: '{{count}} Drucke in Warteschlange',
     },
     // Controls section
     controls: 'Steuerung',
@@ -1446,8 +1445,8 @@ export default {
       title: 'Platte zur Vorschau auswählen',
       hint: 'Dieses Archiv enthält mehrere Platten. Wähle eine, um sie im GCode-Viewer zu öffnen.',
       plateLabel: 'Platte {{index}}',
-      objectCount: '{{count}} Objekt',
-      objectCount_plural: '{{count}} Objekte',
+      objectCount_one: '{{count}} Objekt',
+      objectCount_other: '{{count}} Objekte',
       noGcode: 'Dieses Archiv enthält keinen geschnittenen G-Code zur Vorschau. Öffne es zuerst in Bambu Studio zum Slicen.',
     },
     card: {
@@ -1672,8 +1671,8 @@ export default {
     printingInProgress: 'Druck läuft...',
     viewArchive: 'Archiv anzeigen',
     viewInFileManager: 'Im Dateimanager anzeigen',
-    itemCount: '{{count}} Element',
-    itemCount_plural: '{{count}} Elemente',
+    itemCount_one: '{{count}} Element',
+    itemCount_other: '{{count}} Elemente',
     dragToReorder: 'Ziehen zum Neuordnen (nur Sofort)',
     reorderHint: 'Position betrifft nur Sofort-Elemente. Geplante Elemente werden zur festgelegten Zeit ausgeführt.',
     sjf: {
@@ -1695,10 +1694,10 @@ export default {
     cancelBatchConfirmMessage: 'Alle verbleibenden ausstehenden Einträge in diesem Stapel abbrechen?',
     batch: {
       defaultName: 'Stapel',
-      label: '{{count}} Eintrag',
-      label_plural: '{{count}} Einträge',
-      pendingCount: '{{count}} ausstehend',
-      pendingCount_plural: '{{count}} ausstehend',
+      label_one: '{{count}} Eintrag',
+      label_other: '{{count}} Einträge',
+      pendingCount_one: '{{count}} ausstehend',
+      pendingCount_other: '{{count}} ausstehend',
       expand: 'Stapel ausklappen',
       collapse: 'Stapel einklappen',
       groupAsBatch: 'Als Stapel gruppieren…',
@@ -1727,8 +1726,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}} Einträge',
-      batch: '{{name}} ({{count}} Kopie)',
-      batch_plural: '{{name}} ({{count}} Kopien)',
+      batch_one: '{{name}} ({{count}} Kopie)',
+      batch_other: '{{name}} ({{count}} Kopien)',
     },
     // Sections
     sections: {
@@ -1812,8 +1811,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: '{{count}} Element bearbeiten',
-      title_plural: '{{count}} Elemente bearbeiten',
+      title_one: '{{count}} Element bearbeiten',
+      title_other: '{{count}} Elemente bearbeiten',
       description: 'Nur geänderte Einstellungen werden auf ausgewählte Elemente angewendet.',
       printer: 'Drucker',
       noChange: '— Keine Änderung —',
@@ -2043,10 +2042,10 @@ export default {
     title: 'Wartung',
     overview: 'Übersicht',
     allOk: 'Alle Wartungen aktuell',
-    dueCount: '{{count}} Aufgabe fällig',
-    dueCount_plural: '{{count}} Aufgaben fällig',
-    warningCount: '{{count}} Warnung',
-    warningCount_plural: '{{count}} Warnungen',
+    dueCount_one: '{{count}} Aufgabe fällig',
+    dueCount_other: '{{count}} Aufgaben fällig',
+    warningCount_one: '{{count}} Warnung',
+    warningCount_other: '{{count}} Warnungen',
     totalPrintTime: 'Gesamtdruckzeit',
     nextMaintenance: 'Nächste Wartung',
     nothingDue: 'Nichts fällig',
@@ -4902,9 +4901,6 @@ export default {
       slot: 'Zuletzt in diesem Fach',
       ams: 'Zuletzt in diesem AMS',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '{{count}} leere Spule ausgeblendet',
     assignEmptyHidden_other: '{{count}} leere Spulen ausgeblendet',
     spoolmanSpools: 'Spoolman-Spulen',
@@ -5820,11 +5816,11 @@ export default {
     plates: 'Platten',
     allPlates: 'Alle Platten',
     plateNumber: 'Platte {{number}}',
-    plateCount: '{{count}} Platte',
+    plateCount_one: '{{count}} Platte',
     plateCount_other: '{{count}} Platten',
-    objectCount: '{{count}} Objekt',
+    objectCount_one: '{{count}} Objekt',
     objectCount_other: '{{count}} Objekte',
-    filamentCount: '{{count}} Filament',
+    filamentCount_one: '{{count}} Filament',
     filamentCount_other: '{{count}} Filamente',
     eta: 'ETA {{minutes}} Min',
     noPreview: 'Keine Vorschau für diese Datei verfügbar',

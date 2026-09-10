@@ -625,11 +625,10 @@ export default {
     progress: '{{percent}}% 완료',
     timeRemaining: '{{time}} 남음',
     deleteConfirm: '"{{name}}"을(를) 삭제하시겠습니까?',
-    maintenanceOk: '유지보수 정상',
-    maintenanceWarning: '{{count}}개 경고',
-    maintenanceWarning_plural: '{{count}}개 경고',
-    maintenanceDue: '{{count}}개 예정',
-    maintenanceDue_plural: '{{count}}개 예정',
+    maintenanceWarning_one: '{{count}}개 경고',
+    maintenanceWarning_other: '{{count}}개 경고',
+    maintenanceDue_one: '{{count}}개 예정',
+    maintenanceDue_other: '{{count}}개 예정',
     sort: {
       name: '이름',
       status: '상태',
@@ -932,8 +931,8 @@ export default {
       }
     },
     queue: {
-      inQueue: '대기열에 {{count}}개',
-      inQueue_plural: '대기열에 {{count}}개'
+      inQueue_one: '대기열에 {{count}}개',
+      inQueue_other: '대기열에 {{count}}개'
     },
     controls: '제어',
     rfid: {
@@ -1403,8 +1402,8 @@ export default {
       title: '미리 볼 플레이트 선택',
       hint: '이 아카이브에는 여러 플레이트가 있습니다. G코드 뷰어에서 열 플레이트를 선택하세요.',
       plateLabel: '플레이트 {{index}}',
-      objectCount: '{{count}}개 객체',
-      objectCount_plural: '{{count}}개 객체',
+      objectCount_one: '{{count}}개 객체',
+      objectCount_other: '{{count}}개 객체',
       noGcode: '이 아카이브에는 미리 볼 슬라이싱된 G코드가 없습니다. Bambu Studio에서 먼저 슬라이싱하세요.'
     },
     card: {
@@ -1596,8 +1595,8 @@ export default {
     printingInProgress: '인쇄 중...',
     viewArchive: '아카이브 보기',
     viewInFileManager: '파일 관리자에서 보기',
-    itemCount: '{{count}}개 항목',
-    itemCount_plural: '{{count}}개 항목',
+    itemCount_one: '{{count}}개 항목',
+    itemCount_other: '{{count}}개 항목',
     dragToReorder: '드래그하여 순서 변경 (즉시만)',
     reorderHint: '위치는 즉시 항목에만 영향을 줍니다. 예약된 항목은 설정된 시간에 실행됩니다.',
     sjf: {
@@ -1618,10 +1617,10 @@ export default {
     cancelBatchConfirmMessage: '이 배치의 남은 대기 항목을 모두 취소하시겠습니까?',
     batch: {
       defaultName: '배치',
-      label: '{{count}}개 항목',
-      label_plural: '{{count}}개 항목',
-      pendingCount: '{{count}}개 대기 중',
-      pendingCount_plural: '{{count}}개 대기 중',
+      label_one: '{{count}}개 항목',
+      label_other: '{{count}}개 항목',
+      pendingCount_one: '{{count}}개 대기 중',
+      pendingCount_other: '{{count}}개 대기 중',
       expand: '배치 펼치기',
       collapse: '배치 접기',
       groupAsBatch: '배치로 묶기…',
@@ -1650,8 +1649,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}}개 항목',
-      batch: '{{name}} ({{count}}부)',
-      batch_plural: '{{name}} ({{count}}부)',
+      batch_one: '{{name}} ({{count}}부)',
+      batch_other: '{{name}} ({{count}}부)',
     },
     sections: {
       currentlyPrinting: '현재 인쇄 중',
@@ -1725,8 +1724,8 @@ export default {
       requeue: '재대기'
     },
     bulkEdit: {
-      title: '{{count}}개 항목 편집',
-      title_plural: '{{count}}개 항목 편집',
+      title_one: '{{count}}개 항목 편집',
+      title_other: '{{count}}개 항목 편집',
       description: '변경된 설정만 선택된 항목에 적용됩니다.',
       printer: '프린터',
       noChange: '— 변경 없음 —',
@@ -1973,10 +1972,10 @@ export default {
     title: '유지보수',
     overview: '개요',
     allOk: '모든 유지보수 최신 상태',
-    dueCount: '{{count}}개 항목 예정',
-    dueCount_plural: '{{count}}개 항목 예정',
-    warningCount: '{{count}}개 경고',
-    warningCount_plural: '{{count}}개 경고',
+    dueCount_one: '{{count}}개 항목 예정',
+    dueCount_other: '{{count}}개 항목 예정',
+    warningCount_one: '{{count}}개 경고',
+    warningCount_other: '{{count}}개 경고',
     totalPrintTime: '총 인쇄 시간',
     nextMaintenance: '다음 유지보수',
     nothingDue: '예정 없음',
@@ -4690,9 +4689,6 @@ export default {
       slot: '이 슬롯에서 마지막',
       ams: '이 AMS에서 마지막',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '빈 스풀 {{count}}개 숨김',
     assignEmptyHidden_other: '빈 스풀 {{count}}개 숨김',
     spoolmanSpools: 'Spoolman 스풀',
@@ -5558,11 +5554,11 @@ export default {
     plates: '플레이트',
     allPlates: '모든 플레이트',
     plateNumber: '플레이트 {{number}}',
-    plateCount: '플레이트 {{count}}개',
+    plateCount_one: '플레이트 {{count}}개',
     plateCount_other: '플레이트 {{count}}개',
-    objectCount: '개체 {{count}}개',
+    objectCount_one: '개체 {{count}}개',
     objectCount_other: '개체 {{count}}개',
-    filamentCount: '필라멘트 {{count}}개',
+    filamentCount_one: '필라멘트 {{count}}개',
     filamentCount_other: '필라멘트 {{count}}개',
     eta: '예상 {{minutes}}분',
     noPreview: '이 파일에 대한 미리보기를 사용할 수 없습니다',

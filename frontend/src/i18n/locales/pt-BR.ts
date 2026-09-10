@@ -636,11 +636,10 @@ export default {
     progress: '{{percent}}% concluído',
     timeRemaining: '{{time}} restante',
     deleteConfirm: 'Tem certeza de que deseja excluir "{{name}}"?',
-    maintenanceOk: 'Manutenção OK',
-    maintenanceWarning: '{{count}} aviso',
-    maintenanceWarning_plural: '{{count}} avisos',
-    maintenanceDue: '{{count}} devido',
-    maintenanceDue_plural: '{{count}} devido',
+    maintenanceWarning_one: '{{count}} aviso',
+    maintenanceWarning_other: '{{count}} avisos',
+    maintenanceDue_one: '{{count}} devido',
+    maintenanceDue_other: '{{count}} devido',
     // Sort options
     sort: {
       name: 'Nome',
@@ -959,8 +958,8 @@ export default {
     },
     // Queue info
     queue: {
-      inQueue: '{{count}} impressão na fila',
-      inQueue_plural: '{{count}} impressões na fila',
+      inQueue_one: '{{count}} impressão na fila',
+      inQueue_other: '{{count}} impressões na fila',
     },
     // Controls section
     controls: 'Controles',
@@ -1446,8 +1445,8 @@ export default {
       title: 'Selecione a placa para visualizar',
       hint: 'Este arquivo contém várias placas. Escolha uma para abrir no visualizador GCode.',
       plateLabel: 'Placa {{index}}',
-      objectCount: '{{count}} objeto',
-      objectCount_plural: '{{count}} objetos',
+      objectCount_one: '{{count}} objeto',
+      objectCount_other: '{{count}} objetos',
       noGcode: 'Este arquivo não contém G-code fatiado para visualizar. Abra-o no Bambu Studio para fatiar primeiro.',
     },
     card: {
@@ -1672,8 +1671,8 @@ export default {
     printingInProgress: 'Impressão em andamento...',
     viewArchive: 'Ver Arquivo',
     viewInFileManager: 'Ver no Gerenciador de Arquivos',
-    itemCount: '{{count}} item',
-    itemCount_plural: '{{count}} itens',
+    itemCount_one: '{{count}} item',
+    itemCount_other: '{{count}} itens',
     dragToReorder: 'Arraste para reordenar (apenas ASAP)',
     reorderHint: 'A posição afeta apenas itens ASAP. Itens agendados são executados no horário definido.',
     sjf: {
@@ -1695,10 +1694,10 @@ export default {
     cancelBatchConfirmMessage: 'Cancelar todos os itens pendentes restantes neste lote?',
     batch: {
       defaultName: 'Lote',
-      label: '{{count}} item',
-      label_plural: '{{count}} itens',
-      pendingCount: '{{count}} pendente',
-      pendingCount_plural: '{{count}} pendentes',
+      label_one: '{{count}} item',
+      label_other: '{{count}} itens',
+      pendingCount_one: '{{count}} pendente',
+      pendingCount_other: '{{count}} pendentes',
       expand: 'Expandir lote',
       collapse: 'Recolher lote',
       groupAsBatch: 'Agrupar como lote…',
@@ -1727,8 +1726,8 @@ export default {
     },
     dragGhost: {
       multiCount: '{{count}} itens',
-      batch: '{{name}} ({{count}} cópia)',
-      batch_plural: '{{name}} ({{count}} cópias)',
+      batch_one: '{{name}} ({{count}} cópia)',
+      batch_other: '{{name}} ({{count}} cópias)',
     },
     // Sections
     sections: {
@@ -1812,8 +1811,8 @@ export default {
     },
     // Bulk edit
     bulkEdit: {
-      title: 'Editar {{count}} Item',
-      title_plural: 'Editar {{count}} Itens',
+      title_one: 'Editar {{count}} Item',
+      title_other: 'Editar {{count}} Itens',
       description: 'Apenas as configurações alteradas serão aplicadas aos itens selecionados.',
       printer: 'Impressora',
       noChange: '— Sem alterações —',
@@ -2043,10 +2042,10 @@ export default {
     title: 'Manutenção',
     overview: 'Visão Geral',
     allOk: 'Todas as manutenções estão em dia',
-    dueCount: '{{count}} item pendente',
-    dueCount_plural: '{{count}} itens pendentes',
-    warningCount: '{{count}} aviso',
-    warningCount_plural: '{{count}} avisos',
+    dueCount_one: '{{count}} item pendente',
+    dueCount_other: '{{count}} itens pendentes',
+    warningCount_one: '{{count}} aviso',
+    warningCount_other: '{{count}} avisos',
     totalPrintTime: 'Tempo Total de Impressão',
     nextMaintenance: 'Próxima Manutenção',
     nothingDue: 'Nada pendente',
@@ -4889,9 +4888,6 @@ export default {
       slot: 'Último neste compartimento',
       ams: 'Último neste AMS',
     },
-    // i18next JSON v4 plural suffixes. NOT `_plural`: this app runs i18next 25
-    // with `compatibilityJSON` unset, where only `_one`/`_other` resolve — a
-    // `_plural` key is silently dead and renders the singular for every count.
     assignEmptyHidden_one: '{{count}} carretel vazio oculto',
     assignEmptyHidden_other: '{{count}} carretéis vazios ocultos',
     spoolmanSpools: 'Bobinas Spoolman',
@@ -5809,11 +5805,11 @@ export default {
     plates: 'Placas',
     allPlates: 'Todas as Placas',
     plateNumber: 'Placa {{number}}',
-    plateCount: '{{count}} placa',
+    plateCount_one: '{{count}} placa',
     plateCount_other: '{{count}} placas',
-    objectCount: '{{count}} objeto',
+    objectCount_one: '{{count}} objeto',
     objectCount_other: '{{count}} objetos',
-    filamentCount: '{{count}} filamento',
+    filamentCount_one: '{{count}} filamento',
     filamentCount_other: '{{count}} filamentos',
     eta: 'ETA {{minutes}} min',
     noPreview: 'Pré-visualização não disponível para este arquivo',
