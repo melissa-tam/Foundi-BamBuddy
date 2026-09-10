@@ -15,7 +15,6 @@ internals — is what's under test.
 from __future__ import annotations
 
 import asyncio
-import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -131,9 +130,7 @@ async def test_slow_printer_does_not_delay_fast_printer(pd_scheduler, db_session
     item_a = await _pinned_item(db_session, printer_id=a_id, pos=1)
     item_b = await _pinned_item(db_session, printer_id=b_id, pos=2)
 
-    started = time.monotonic()
     await pd_scheduler.check_queue()
-    elapsed = time.monotonic() - started
 
     # Both dispatched in this single pass.
     db_session.expire_all()
@@ -144,10 +141,13 @@ async def test_slow_printer_does_not_delay_fast_printer(pd_scheduler, db_session
     assert rows[a_id] == "printing"
     assert rows[b_id] == "printing"
 
-    # B (fast) completed before A (slow) — it did NOT wait for A's slow upload.
+    # B (fast) completed before A (slow) — it did NOT wait for A's slow upload. This
+    # ORDER is the whole proof of parallelism: a serialized gather would finish A
+    # first, whatever the clock says. There is deliberately no wall-clock bound
+    # here — only A is slowed, so a serial tick would ALSO take ~one upload, and the
+    # old ``elapsed < 0.45`` discriminated nothing while failing the ship gate on a
+    # loaded machine (2026-09-10, a 46-minute serial run).
     assert order == [b_id, a_id]
-    # And the whole tick took ~one slow upload, not two serialized ones.
-    assert elapsed < 0.45
     # Two concurrent dispatches ran on two DISTINCT sessions (isolation).
     assert len(set(sessions)) == 2
 
