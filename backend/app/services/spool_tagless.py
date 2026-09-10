@@ -596,6 +596,28 @@ class DefaultRowIdentity(NamedTuple):
     subtype: str | None
 
 
+def _default_row_pair(default: dict) -> DefaultRowIdentity:
+    """The default dict's ``brand``/``subtype``, read UNCONDITIONALLY.
+
+    The one spelling of "what row identity does this default state?" — strip, and an
+    empty string is no statement rather than a blank one. Both callers need exactly
+    this and differ only in whether they are ENTITLED to it: :func:`default_row_identity`
+    asks the eligibility and same-subtype questions first, while the mint's default arm
+    is minting the default itself and is trivially entitled. Extracted because the two
+    had grown the same two expressions side by side, which is the drift the pair-or-
+    nothing rule exists to prevent — a fix here (a new field, a different empty rule)
+    must not be applicable to one arm and forgotten in the other.
+
+    A default carrying neither field answers ``(None, None)``: a conclusion with
+    nothing to stamp, which is not the same answer as "this is not the default
+    filament" — see :func:`default_row_identity`'s ``None``.
+    """
+    return DefaultRowIdentity(
+        (default.get("brand") or "").strip() or None,
+        (default.get("subtype") or "").strip() or None,
+    )
+
+
 def default_row_identity(
     default: dict | None,
     *,
@@ -640,15 +662,14 @@ def default_row_identity(
     if not _eligible_for_default_identity(default, slicer_filament=slicer_filament, material=material, rgba=rgba):
         return None
 
-    d_sub = (default.get("subtype") or "").strip() or None
-    d_brand = (default.get("brand") or "").strip() or None
+    pair = _default_row_pair(default)
 
     stated = (subtype or "").strip()
-    if stated and stated.casefold() != (d_sub or "").casefold():
+    if stated and stated.casefold() != (pair.subtype or "").casefold():
         # The tray asserts a DIFFERENT variant — an operator statement about which
         # filament this is (doctrine rule 2), and the pair is never split.
         return None
-    return DefaultRowIdentity(d_brand, d_sub)
+    return pair
 
 
 def _tray_canonical_delta(default: dict | None, tray: dict) -> dict | None:
@@ -821,14 +842,11 @@ async def mint_tagless_spool(
         material = default_filament.get("material") or "PLA"
         color_name = None
         rgba = default_filament.get("rgba")
-        # The SAME projection as the tray arm, built unconditionally: this row's
-        # filament is the default by construction, so the pair is trivially owed.
-        # One composition means the two arms cannot drift apart again.
-        _default_identity = DefaultRowIdentity(
-            (default_filament.get("brand") or "").strip() or None,
-            (default_filament.get("subtype") or "").strip() or None,
-        )
-        brand, subtype = _default_identity.brand, _default_identity.subtype
+        # The SAME projection the tray arm reaches through `default_row_identity`,
+        # taken unconditionally: this row's filament IS the default by construction,
+        # so the pair is trivially owed and there is no eligibility to test. One
+        # spelling (:func:`_default_row_pair`) means the two arms cannot drift.
+        brand, subtype = _default_row_pair(default_filament)
         core_weight = 250
         slicer_filament = default_filament.get("slicer_filament") or None
         slicer_filament_name = None

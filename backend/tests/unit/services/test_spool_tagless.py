@@ -809,6 +809,39 @@ class TestMintRowIdentity:
         assert "brand=Bambu Lab" in caplog.text
 
 
+class TestDefaultRowPair:
+    """The unconditional projection both arms share. Pinned directly because the two
+    arms differ only in ENTITLEMENT — if this ever grew a third field or a different
+    empty rule, a per-arm copy would take it in one place and not the other."""
+
+    def test_reads_both_fields(self):
+        assert spool_tagless._default_row_pair(_CANONICAL_DEFAULT) == spool_tagless.DefaultRowIdentity(
+            "Bambu Lab", "HF"
+        )
+
+    def test_blank_and_whitespace_are_no_statement(self):
+        """An empty or whitespace-only value in the setting is the operator not having
+        said anything, not a blank brand to stamp on every row."""
+        assert spool_tagless._default_row_pair({"brand": "", "subtype": "   "}) == spool_tagless.DefaultRowIdentity(
+            None, None
+        )
+
+    def test_missing_keys_are_no_statement(self):
+        assert spool_tagless._default_row_pair({"material": "PETG"}) == spool_tagless.DefaultRowIdentity(None, None)
+
+    def test_values_are_stripped(self):
+        assert spool_tagless._default_row_pair(
+            {"brand": "  Bambu Lab  ", "subtype": " HF "}
+        ) == spool_tagless.DefaultRowIdentity("Bambu Lab", "HF")
+
+    def test_it_is_the_projection_default_row_identity_returns(self):
+        """The two must not merely agree today — the eligible path must literally BE
+        this helper's answer, which is what makes the extraction load-bearing."""
+        assert spool_tagless.default_row_identity(
+            _CANONICAL_DEFAULT, slicer_filament="GFG02", material="PETG", rgba="000000FF", subtype=None
+        ) == spool_tagless._default_row_pair(_CANONICAL_DEFAULT)
+
+
 class TestDefaultRowIdentity:
     """Direct pins on the projection — it is pure and synchronous, so it is testable
     without a mint around it."""
