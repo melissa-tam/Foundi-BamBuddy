@@ -161,7 +161,11 @@ class TestMint:
         assert spool.material == "PETG"
         assert spool.subtype == "HF"
         assert spool.rgba == "112233FF"
-        assert spool.brand is None  # tagless: brand unknown until the operator sets it
+        # 112233FF is ~63.6 RGB-distance from the default's 000000FF — outside
+        # colors_similar's 50 — so this is NOT the fleet default filament and the row
+        # gets no brand projected onto it. An honest unknown, for the operator to
+        # answer once (the pair-or-nothing rule in `default_row_identity`).
+        assert spool.brand is None
         assert spool.label_weight == 1000  # tray_weight "0" → Spool model default
 
     async def test_from_default_filament(self, db_session):
@@ -655,6 +659,10 @@ class TestMintIdentityW4:
         assert spool.slicer_filament == "GFG02"  # overridden to the default's specific id
         assert spool.slicer_filament_name is None
         assert spool.nozzle_temp_min == 230 and spool.nozzle_temp_max == 270
+        # ...and the ROW-side half of that same identity: an eligible tray takes the
+        # default's brand/subtype instead of minting the blank row the form can't save.
+        assert spool.brand == "Bambu Lab"
+        assert spool.subtype == "HF"
 
     async def test_tray_generic_id_no_fingerprint_match_keeps_generic(self, db_session, env, monkeypatch):
         # Different material -> does NOT fingerprint-match the PETG default -> no override.
@@ -702,6 +710,8 @@ class TestMintIdentityW4:
         assert spool.slicer_filament == "GFG02"
         assert spool.slicer_filament_name == "Bambu PETG HF"  # id unchanged -> name kept
         assert (spool.nozzle_temp_min, spool.nozzle_temp_max) == (230, 270)
+        assert spool.brand == "Bambu Lab"  # eligible on the fuzzy test -> the row identity too
+        assert spool.subtype == "HF"
 
     async def test_tray_far_colour_keeps_its_own(self, db_session, env, monkeypatch):
         """Not a widening: a colour OUTSIDE ``colors_similar``'s tolerance is a different
@@ -723,6 +733,146 @@ class TestMintIdentityW4:
         monkeypatch.setattr(spool_tagless, "parse_tray_fields", AsyncMock(return_value=parsed))
         spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", color="FF0000FF"))
         assert spool.rgba == "FF0000FF"
+
+
+# --- Row identity: the default's brand/subtype, projected once -------------
+
+
+class TestMintRowIdentity:
+    """The 2026-09-10 defect: one mint, two identities.
+
+    The TRAY arm hardcoded ``brand = None`` while the DEFAULT arm read the setting's
+    brand, so the same black PETG produced two different rows depending on whether the
+    AMS had a filament type to report — 208 of 269 live ``ams_auto`` rows carried
+    neither brand nor subtype, and the inventory form (brand + subtype required on
+    save) refused every weight edit on them.
+    """
+
+    async def test_wire_shaped_tray_takes_the_defaults_pair(self, db_session, env):
+        """The PRODUCTION wire shape. Every farm-configured tagless tray reports
+        ``tray_sub_brands=""``, so the parse yields no subtype and the row used to land
+        with both fields NULL — this is the row the operator could not save."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", sub_brands="", color="000000FF"))
+        assert (spool.brand, spool.subtype) == ("Bambu Lab", "HF")
+
+    async def test_tray_stating_the_defaults_own_subtype_takes_the_pair(self, db_session, env):
+        """A tray that agrees with the default is not a different statement."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        spool = await spool_tagless.mint_tagless_spool(
+            db_session, tray=_tray("PETG", sub_brands="PETG HF", color="000000FF")
+        )
+        assert (spool.brand, spool.subtype) == ("Bambu Lab", "HF")
+
+    async def test_tray_asserting_a_different_subtype_gets_no_brand(self, db_session, env):
+        """PAIR-OR-NOTHING. ``tray_sub_brands="PETG Basic"`` on a black GFG02 tray IS
+        the tray saying otherwise (doctrine rule 2), so the row keeps its own variant
+        and no brand — stamping "Bambu Lab" beside "Basic" would mint an identity
+        neither the wire nor the setting ever stated."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        tray = _tray("PETG", sub_brands="PETG Basic", color="000000FF")
+        tray["tray_info_idx"] = "GFG02"
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=tray)
+        assert spool.subtype == "Basic"  # the tray's own statement survives
+        assert spool.brand is None
+
+    async def test_other_filament_keeps_brand_unknown(self, db_session, env):
+        """A grey PLA roll on a GFA00 tray is a third-party roll as far as the farm
+        knows. The residual is deliberate: the edit form asks the operator once."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        tray = _tray("PLA", sub_brands="", color="808080FF")
+        tray["tray_info_idx"] = "GFA00"
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=tray)
+        assert spool.brand is None
+        assert spool.subtype is None
+
+    async def test_default_arm_still_carries_the_pair(self, db_session, env):
+        """The arm that was already right stays right — one composition, two arms."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        spool = await spool_tagless.mint_tagless_spool(db_session, default_filament=_CANONICAL_DEFAULT)
+        assert (spool.brand, spool.subtype) == ("Bambu Lab", "HF")
+
+    async def test_feature_off_projects_nothing(self, db_session, env):
+        """No default configured ⇒ no default identity to project. The mint still
+        succeeds; the row is simply the honest unknown it has always been."""
+        env.settings["tagless_default_filament"] = ""
+        spool = await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", sub_brands="", color="000000FF"))
+        assert spool.brand is None
+
+    async def test_log_line_names_the_brand(self, db_session, env, caplog):
+        """The mint's INFO line is how a blank-identity regression is spotted in prod
+        without a DB query — it said everything about the row except the field that
+        was missing."""
+        env.settings["tagless_default_filament"] = json.dumps(_CANONICAL_DEFAULT)
+        with caplog.at_level(logging.INFO):
+            await spool_tagless.mint_tagless_spool(db_session, tray=_tray("PETG", sub_brands="", color="000000FF"))
+        assert "brand=Bambu Lab" in caplog.text
+
+
+class TestDefaultRowIdentity:
+    """Direct pins on the projection — it is pure and synchronous, so it is testable
+    without a mint around it."""
+
+    def test_returns_the_pair_when_the_subtype_is_unstated(self):
+        row = spool_tagless.default_row_identity(
+            _CANONICAL_DEFAULT, slicer_filament="", material="PETG", rgba="000000FF", subtype=None
+        )
+        assert row == spool_tagless.DefaultRowIdentity("Bambu Lab", "HF")
+
+    def test_subtype_match_is_case_insensitive(self):
+        """``hf`` and ``HF`` are the same variant; a case difference is a spelling, not
+        a statement (the same reasoning that makes eligibility fuzzy on colour)."""
+        row = spool_tagless.default_row_identity(
+            _CANONICAL_DEFAULT, slicer_filament="GFG02", material="PETG", rgba="000000FF", subtype="hf"
+        )
+        assert row == spool_tagless.DefaultRowIdentity("Bambu Lab", "HF")
+
+    def test_differing_subtype_answers_none_not_a_half_pair(self):
+        assert (
+            spool_tagless.default_row_identity(
+                _CANONICAL_DEFAULT, slicer_filament="GFG02", material="PETG", rgba="000000FF", subtype="Basic"
+            )
+            is None
+        )
+
+    def test_ineligible_identity_answers_none(self):
+        # A different SPECIFIC preset is an operator statement; a far colour and a
+        # different material are different filaments. None of the three is the default.
+        assert (
+            spool_tagless.default_row_identity(
+                _CANONICAL_DEFAULT, slicer_filament="GFG00", material="PETG", rgba="000000FF", subtype=None
+            )
+            is None
+        )
+        assert (
+            spool_tagless.default_row_identity(
+                _CANONICAL_DEFAULT, slicer_filament="", material="PETG", rgba="FF0000FF", subtype=None
+            )
+            is None
+        )
+        assert (
+            spool_tagless.default_row_identity(
+                _CANONICAL_DEFAULT, slicer_filament="", material="PLA", rgba="000000FF", subtype=None
+            )
+            is None
+        )
+
+    def test_no_default_answers_none(self):
+        assert (
+            spool_tagless.default_row_identity(
+                None, slicer_filament="GFG02", material="PETG", rgba="000000FF", subtype=None
+            )
+            is None
+        )
+
+    def test_a_default_with_no_brand_answers_a_none_pair_not_a_refusal(self):
+        """ "The default states no brand" and "this is not the default filament" are
+        different answers: the first still concludes (there is simply nothing to
+        stamp), which is what keeps the caller from re-asking every push."""
+        bare = {"material": "PETG", "rgba": "000000FF", "slicer_filament": "GFG02"}
+        assert spool_tagless.default_row_identity(
+            bare, slicer_filament="GFG02", material="PETG", rgba="000000FF", subtype=None
+        ) == spool_tagless.DefaultRowIdentity(None, None)
 
 
 # --- W1: bare-tray spent-binding guard -------------------------------------
