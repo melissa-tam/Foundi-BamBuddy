@@ -475,6 +475,37 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("model", "supported"),
+        [("H2S", True), ("A1", False)],
+    )
+    async def test_disconnected_status_reports_model_capabilities(
+        self, async_client: AsyncClient, printer_factory, db_session, model, supported
+    ):
+        """A DISCONNECTED printer's status must still carry the hardware capabilities.
+
+        They are facts about the MODEL, not about the MQTT session — unlike
+        ``supports_drying*``, which needs the firmware version a session reports.
+        Load-bearing: the card's chamber-fan and airduct widgets read these flags
+        instead of their own model-name lists, and must keep rendering while the
+        printer is offline exactly as those lists made them.
+        """
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name=f"Offline {model}", model=model)
+
+        with patch.object(printer_manager, "get_status", return_value=None):
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["connected"] is False
+        assert body["supports_chamber_heater"] is supported
+        assert body["has_chamber_fan"] is supported
+        assert body["supports_airduct"] is supported
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_connected_status_reports_the_occupancy_projection(
         self, async_client: AsyncClient, printer_factory, db_session
     ):

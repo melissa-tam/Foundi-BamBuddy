@@ -494,6 +494,16 @@ async def get_printer_status(
             # and must not offer itself on an already-gated plate.
             awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
             occupancy=occupancy_payload(printer_id),
+            # Hardware capabilities are facts about the MODEL, not about the MQTT
+            # session, so they are reportable with no session — same as the sticky
+            # flags above. Load-bearing: the printer card's chamber-fan and airduct
+            # widgets derive from these flags, and an offline printer must keep
+            # rendering them exactly as the model-name lists they replaced did.
+            # (``supports_drying*`` is deliberately NOT here — it needs the firmware
+            # version, which only a live session reports.)
+            supports_chamber_heater=supports_chamber_heater(printer.model),
+            has_chamber_fan=has_chamber_fan(printer.model),
+            supports_airduct=supports_airduct(printer.model),
         )
 
     # Determine cover URL if there's an active print (including paused)
