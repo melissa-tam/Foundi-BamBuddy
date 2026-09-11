@@ -427,7 +427,6 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
     for p in printer_rows:
         connected = printer_manager.is_connected(p.id)
         waiting_reason = _derive_printer_unit_context(p.id, items)["waiting_reason"]
-        incident = printer_incidents.snapshot(p.id)
         state = {
             "printer_id": p.id,
             "name": p.name,
@@ -437,7 +436,7 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
             "model_mismatch": printer_manager.is_model_mismatch(p.id),
             "model_mismatch_reason": printer_manager.model_mismatch_reason(p.id),
             "stalled": waiting_reason == _WAIT_STALLED,
-            "vision_hold": incident is not None and incident.get("kind") == KIND_PLATE_VISION,
+            "vision_hold": printer_incidents.snapshot(p.id, kind=KIND_PLATE_VISION) is not None,
         }
         disconnected = printer_manager.get_status(p.id) is not None and not connected
         if (

@@ -374,6 +374,42 @@ class TestInterruptedEject:
         assert rows[0].item_id is None
         page.assert_awaited_once()
 
+    async def test_the_lost_z_hold_opens_beside_an_ams_fault(self, monkeypatch, db_session):
+        """Multi-alarm rule (2026-09-11). Before it, ``open_new`` handed this lane
+        ``None`` on a printer already holding a jam, and ``z_reference_evidence`` then
+        let an eject run against a fabricated Z datum (the 2026-09-04 bed-past-the-
+        floor mechanism)."""
+        from backend.app.models.printer_incident import KIND_JAM
+        from backend.app.services.eject.remote import z_reference_evidence
+
+        await _printer(db_session, 10)
+        await _geometry(db_session)
+        assert (
+            await printer_incidents.open_new(
+                db_session,
+                printer_id=10,
+                job_id="task-1",
+                item_id=None,
+                kind=KIND_JAM,
+                code="0700_8010",
+                codes="0700_8010",
+                slot_global_tray=None,
+                status=STATUS_ESCALATED,
+            )
+            is not None
+        )
+        monkeypatch.setattr("backend.app.services.eject.remote.redrive_eject_stop", AsyncMock(return_value=True))
+        page = _spy(monkeypatch, "on_z_reference_lost")
+        state = _make_state()
+        _wire(monkeypatch, state, FakeClient(state))
+        self._claim_eject(10)
+
+        await _drive(10, state)
+
+        assert {r.kind for r in await _open_incidents(db_session, 10)} == {KIND_JAM, KIND_Z_REFERENCE_LOST}
+        page.assert_awaited_once()
+        assert z_reference_evidence(10) is False  # asked BY KIND, so the jam cannot hide it
+
     async def test_a_laddered_model_earns_no_lost_z_hold(self, monkeypatch, db_session):
         await _printer(db_session, 8)
         await _geometry(db_session, z_reference_validated=True)
@@ -899,16 +935,16 @@ class TestPlateVisionTrip:
 
         assert plate_occupancy.is_plate_occupied(36) is False
 
-    async def test_an_open_incident_makes_the_lane_stand_aside(self, monkeypatch, db_session):
+    async def test_an_open_plate_vision_row_makes_the_lane_stand_aside(self, monkeypatch, db_session):
         await _printer(db_session, 37)
         await printer_incidents.open_new(
             db_session,
             printer_id=37,
             job_id="task-1",
             item_id=None,
-            kind=KIND_RUNOUT,
-            code="0700_8011",
-            codes="0700_8011",
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="0500_808C",
             slot_global_tray=None,
             status=STATUS_ESCALATED,
         )
@@ -921,6 +957,33 @@ class TestPlateVisionTrip:
         assert calls == []
         await db_session.refresh(item)
         assert item.stop_source is None
+
+    async def test_an_ams_hold_beside_the_trip_does_not_own_the_plate(self, monkeypatch, db_session):
+        """Multi-alarm rule (2026-09-11): an asset carries concurrent alarms. A runout
+        standing on this printer owns the AMS, not the plate — the trip decides its
+        own row beside it, and the stop still goes out."""
+        await _printer(db_session, 38)
+        await printer_incidents.open_new(
+            db_session,
+            printer_id=38,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_RUNOUT,
+            code="0700_8011",
+            codes="0700_8011",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+        )
+        item = await _farm_item(db_session, 38)
+        state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
+        calls = _wire(monkeypatch, state, None)
+
+        assert await pause_recovery.on_plate_vision_trip(38, {"0500_808C"}) is True
+
+        assert calls == [("stop", 38)]
+        assert {row.kind for row in await _open_incidents(db_session, 38)} == {KIND_RUNOUT, KIND_PLATE_VISION}
+        await db_session.refresh(item)
+        assert item.stop_source is not None
 
     async def test_the_hook_never_raises(self, monkeypatch, caplog):
         monkeypatch.setattr(

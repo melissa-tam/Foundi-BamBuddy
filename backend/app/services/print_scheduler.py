@@ -20,7 +20,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.settings import Settings
 from backend.app.models.smart_plug import SmartPlug
-from backend.app.services import notify_dedup
+from backend.app.services import notify_dedup, printer_incidents
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     cleanup_downloaded_3mf,
@@ -29,6 +29,7 @@ from backend.app.services.bambu_ftp import (
     upload_file_async,
     with_ftp_retry,
 )
+from backend.app.services.bambu_mqtt import ams_mid_filament_change
 from backend.app.services.dispatch_kick import DispatchKick, dispatch_kick
 from backend.app.services.dispatch_target import DispatchTarget, TargetKind, target_of
 from backend.app.services.eject import progress as dispatch_progress
@@ -40,6 +41,7 @@ from backend.app.services.filament_deficit import (
     live_unread_slots,
     request_unread_reads,
 )
+from backend.app.services.hms_errors import live_candidates
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import (
     ACTIVE_PRINT_STATES as _ACTIVE_PRINT_STATES,
@@ -182,27 +184,32 @@ def _busy_cause(
     if view.plate_occupied:
         causes.append(f"plate occupied ({type(view.plate_policy).__name__})")
     if state is not None:
-        from backend.app.services.spool_recovery import live_candidates
-
         faults = live_candidates(state)
         if faults:
-            causes.append("standing fault " + ",".join(sorted(c.short_code for c in faults)))
+            causes.append("standing fault " + ",".join(sorted({c.short_code for c in faults})))
+        if ams_mid_filament_change(state):
+            causes.append("AMS mid filament-change (ams_status_main=1)")
+    if printer_incidents.hold_blocks_dispatch(printer_id):
+        causes.append("open incident(s) " + ",".join(sorted(printer_incidents.open_kinds(printer_id))))
     return "; ".join(causes) if causes else "unattributed"
 
 
 def _incident_summary(printer_id: int) -> str:
-    """The printer's OPEN AMS incident as one log token, or ``-``.
+    """The printer's OPEN incidents as one log token (``kind/status[@slot]+…``), or ``-``.
 
-    Reads the projection cache (``printer_incidents.snapshot`` — sync, DB-free,
+    Reads the projection cache (``printer_incidents.snapshots`` — sync, DB-free,
     built for exactly this kind of read), so the diagnostic never costs a query.
+    EVERY open row, highest precedence first: since 2026-09-11 a printer can hold
+    more than one, and a line that named only the first would explain half a refusal.
     """
-    from backend.app.services import printer_incidents
-
-    snap = printer_incidents.snapshot(printer_id)
-    if not snap:
+    snaps = printer_incidents.snapshots(printer_id)
+    if not snaps:
         return "-"
-    slot = snap.get("slot_desc")
-    return f"{snap.get('kind')}/{snap.get('status')}" + (f"@{slot}" if slot else "")
+    parts = []
+    for snap in snaps:
+        slot = snap.get("slot_desc")
+        parts.append(f"{snap.get('kind')}/{snap.get('status')}" + (f"@{slot}" if slot else ""))
+    return "+".join(parts)
 
 
 def _present_candidates(loaded: list[dict]) -> list[dict]:
@@ -306,6 +313,15 @@ class PrintScheduler:
         # restart — acceptable. Discarded on real dispatch; pruned each tick against
         # the pending set so terminal items drop out.
         self._held_pool_items: set[int] = set()
+        # Why the idle gate last said no, per printer — written on EVERY exit of
+        # ``_is_printer_idle`` (``None`` when it said yes) and read by the tick's
+        # change log and by the "Busy:" waiting reason. ONE owner for the cause, so
+        # the log line, the operator's reason and the gate can never disagree: on
+        # 2026-08-29 the per-printer line printed 1,800 times over 15 h without ever
+        # naming what was holding the printer, because the cause was never recorded.
+        self._idle_refusal: dict[int, str | None] = {}
+        # The cause last LOGGED, so the INFO line fires on change only.
+        self._last_logged_refusal: dict[int, str | None] = {}
 
     async def run(self):
         """Main loop — event-driven with a periodic timeout as the fallback poll.
@@ -409,6 +425,17 @@ class PrintScheduler:
                 await check_dead_dispatch_claims(db)
             except Exception:
                 logger.exception("Dead dispatch-claim watch failed (non-fatal)")
+
+            # AMS wedged-idle watch (2026-09-11): the gate below refuses to dispatch
+            # onto an AMS latched mid filament-change, and that refusal is silent —
+            # no print, no incident, no HMS. Runs beside the sibling watch so the one
+            # class of hold this wave introduces cannot become a new #60.
+            try:
+                from backend.app.services.farm_stall import check_ams_wedged_idle
+
+                await check_ams_wedged_idle(db)
+            except Exception:
+                logger.exception("AMS wedged-idle watch failed (non-fatal)")
 
             # Attention-reminder nag (W3): the offline / pause-stall / recovery /
             # runout escalations each alert only ONCE per incident, so a printer left
@@ -1267,6 +1294,11 @@ class PrintScheduler:
                         _incident_summary(pid),
                     )
 
+            # Sibling of the block above, and deliberately NOT inside it: the line
+            # worth having is the TRANSITION, which includes a printer leaving the
+            # busy set entirely (``cause=none``). Silent on a tick where nothing moved.
+            self._log_refusal_changes()
+
             # Auto-drying: start drying on idle printers that have no pending queue items
             await self._check_auto_drying(db, items, busy_printers)
 
@@ -1379,7 +1411,15 @@ class PrintScheduler:
                             missing_colors,
                         )
                         continue
-                printers_busy.append(printer.name)
+                # The rendered reason is a backend-authored SENTENCE, not a token the
+                # frontend translates (``utils/waitingReason.ts`` passes anything that
+                # is not ``^[a-z0-9_]+$`` through verbatim), so the cause can be named
+                # here without a frontend change. Read from the gate's own record —
+                # never re-derived — so the reason and the refusal cannot disagree.
+                if self._idle_refusal.get(printer.id) == "ams_filament_change":
+                    printers_busy.append(f"{printer.name} (AMS mid filament-change)")
+                else:
+                    printers_busy.append(printer.name)
                 continue
 
             # Validate filament compatibility if required types are specified
@@ -1975,25 +2015,25 @@ class PrintScheduler:
         """
         if not printer_manager.is_connected(printer_id):
             logger.debug("Printer %d: not connected", printer_id)
-            return False
+            return self._refuse(printer_id, "not_connected")
 
         # Quarantined printers (farm failure policy) are excluded from ALL
         # dispatch until an operator clears the quarantine (#Phase3).
         if printer_manager.is_quarantined(printer_id):
             logger.debug("Printer %d: not idle — quarantined", printer_id)
-            return False
+            return self._refuse(printer_id, "quarantined")
 
         # Device-vs-declared model mismatch (Phase 2): eject geometry keyed on the
         # wrong model could drive the toolhead outside the real bed, so block ALL
         # dispatch until the registration is corrected (mirrors the quarantine gate).
         if printer_manager.is_model_mismatch(printer_id):
             logger.debug("Printer %d: not idle — model mismatch", printer_id)
-            return False
+            return self._refuse(printer_id, "model_mismatch")
 
         state = printer_manager.get_status(printer_id)
         if not state:
             logger.debug("Printer %d: no status available", printer_id)
-            return False
+            return self._refuse(printer_id, "no_status")
 
         # Standing AMS fault (2026-08-29): a printer whose wire still carries an
         # ACTIONABLE fault takes no new print, whether or not an incident row exists
@@ -2006,25 +2046,54 @@ class PrintScheduler:
         # Same classification the recovery entry gate uses (``live_candidates`` over
         # the taxonomy — invariant 1, never a second code list), so it can only block
         # where the alternative is dispatch-then-immediate-fault: informational codes
-        # are excluded by the taxonomy and never reach here. Function-level import:
-        # ``spool_recovery`` reaches back into this module (``scheduler``) at call
-        # time, and a module-level edge would close that loop.
+        # are excluded by the taxonomy and never reach here.
         #
         # Deliberately NOT applied to the eject lane (2026-08-29 W4 gotcha d): this
         # gate is scheduler-internal, the eject dispatcher never routes through it, and
         # gating a filament-less sweep behind an AMS fault would deadlock the very
         # plate that is holding the printer.
-        from backend.app.services.spool_recovery import live_candidates
-
         faults = live_candidates(state)
         if faults:
+            codes = sorted({c.short_code for c in faults})
             logger.debug(
                 "Printer %d: not idle — standing AMS fault(s) %s (state=%s)",
                 printer_id,
-                sorted(c.short_code for c in faults),
+                codes,
                 state.state,
             )
-            return False
+            return self._refuse(printer_id, "standing_fault:" + ",".join(codes))
+
+        # AMS wedged mid filament-change (002-H2S 2026-09-11). A DIFFERENT question
+        # from the one above and invisible to it: the wedge outlives the jam code
+        # that caused it, so the wire can read clean while the AMS still drops every
+        # filament move. Dispatching there is what happened at 31 s after the stop —
+        # the print cannot feed, and the firmware only leaves this state on a CONTINUE
+        # somebody presses. Value-1-only by measurement; see the predicate.
+        if ams_mid_filament_change(state):
+            logger.debug(
+                "Printer %d: not idle — AMS mid filament-change (ams_status_main=1, state=%s)",
+                printer_id,
+                state.state,
+            )
+            return self._refuse(printer_id, "ams_filament_change")
+
+        # The EQUIPMENT RECORD (2026-09-11, 003-H2S). The union of two facts with one
+        # owner each: the wire (above) owns "a fault stands NOW", the incident row owns
+        # "an unresolved hold exists". Neither answers the other's question — on
+        # 003-H2S the firmware wiped its HMS list at every terminal, so the wire read
+        # clean while filament was still physically stuck in the shared PTFE path, and
+        # the next unit dispatched into it. Three times. ``hold_blocks_dispatch`` is
+        # the ONE origin (every open kind blocks: a plate-vision or lost-Z row is
+        # already plate-gated, a power-loss row is an unanswered prompt, an AMS row is
+        # a fault the wire may have stopped reporting). This also holds the auto-drying
+        # idle arm off a held printer. The eject lane stays UNGATED (08-29 gotcha d):
+        # ``plate_occupancy.ejectable`` never consults this — a sweep is filament-less,
+        # and gating it behind a filament fault would deadlock the plate that holds
+        # the printer.
+        if printer_incidents.hold_blocks_dispatch(printer_id):
+            kinds = ",".join(sorted(printer_incidents.open_kinds(printer_id)))
+            logger.debug("Printer %d: not idle — open incident(s) %s (state=%s)", printer_id, kinds, state.state)
+            return self._refuse(printer_id, f"incident:{kinds}")
 
         # Ownership, in one question. ``plate_occupied`` is the unconditional gate
         # (Phase 1, P1-B) — it no longer keys on the global require_plate_clear
@@ -2034,15 +2103,48 @@ class PrintScheduler:
         refusal = plate_occupancy.dispatchable(printer_id, Evidence(live_state=state.state, db_claim=db_claim))
         if refusal is not None:
             logger.debug("Printer %d: not idle — %s (state=%s)", printer_id, refusal, state.state)
-            return False
+            return self._refuse(printer_id, f"occupancy:{refusal}")
 
         # ``dispatchable`` refuses the ACTIVE states, but "not active" is not the same
         # as "ready": "", UNKNOWN, OFFLINE and every other value the wire can hold must
         # refuse too, so the positive test stays here.
-        idle = state.state in ("IDLE", "FINISH", "FAILED")
-        if not idle:
+        if state.state not in ("IDLE", "FINISH", "FAILED"):
             logger.debug("Printer %d: not idle — state=%s", printer_id, state.state)
-        return idle
+            return self._refuse(printer_id, f"state:{state.state}")
+        self._idle_refusal[printer_id] = None
+        return True
+
+    def _refuse(self, printer_id: int, cause: str) -> bool:
+        """Record WHY the idle gate said no and answer False.
+
+        The single write point for :attr:`_idle_refusal`, so every exit of
+        :meth:`_is_printer_idle` records a cause by construction rather than by each
+        branch remembering to — the omission that made the 001-H2S line say nothing.
+        """
+        self._idle_refusal[printer_id] = cause
+        return False
+
+    def _log_refusal_changes(self) -> None:
+        """One INFO line per printer whose dispatch-refusal cause CHANGED this tick.
+
+        Level-triggered logging is what made the 2026-08-29 incident invisible: the
+        per-printer line repeated 1,800 times over 15 h and every copy said the same
+        thing, so nothing in the log marked the moment the printer stopped taking
+        work. Edge-triggered, the transitions are the only lines — including the one
+        back to ``cause=none`` when the printer recovers.
+        """
+        for printer_id, cause in self._idle_refusal.items():
+            previous = self._last_logged_refusal.get(printer_id)
+            if previous == cause:
+                continue
+            logger.info(
+                "Queue: printer %d dispatch refusal changed — cause=%s (was %s), incident=%s",
+                printer_id,
+                cause or "none",
+                previous or "none",
+                _incident_summary(printer_id),
+            )
+            self._last_logged_refusal[printer_id] = cause
 
     async def _get_setting(self, db: AsyncSession, key: str) -> str | None:
         """Read a setting value from the database."""
@@ -2281,6 +2383,11 @@ class PrintScheduler:
             model = printer_manager.get_model(pid)
             firmware = state.firmware_version
 
+            # NB (stated, pre-existing): the mid-print arm deliberately bypasses
+            # ``_is_printer_idle`` below, so it is NOT covered by the AMS-busy gate —
+            # drying a wedged-mid-change AMS is a different hazard from dispatching a
+            # print into one, and the drying lane has its own write choke
+            # (``_ams_write_refusal``).
             mid_print = (
                 pid in busy_printers and print_drying_enabled and supports_drying_while_printing(model, firmware)
             )

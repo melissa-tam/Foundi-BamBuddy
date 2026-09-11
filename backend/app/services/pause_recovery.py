@@ -59,9 +59,12 @@ import time
 from dataclasses import dataclass, field
 
 from backend.app.models.printer_incident import (
+    AMS_FAULT_KINDS,
     KIND_PLATE_VISION,
     KIND_POWER_LOSS,
     KIND_Z_REFERENCE_LOST,
+    RESOLUTION_OPERATOR,
+    RESOLUTION_REPAIR,
     RESOLVE_OPERATOR,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
@@ -284,8 +287,14 @@ async def _recover_power_loss(printer_id: int, observed_subtask: str | None) -> 
 
         from backend.app.core.database import async_session
 
+        # The AMS-kind rows and this lane's OWN: a runout's refill lane answers the
+        # prompt on its own (the printer-8 proof), a physical hold means the path is
+        # still broken, and a standing ``power_loss`` row means this printer's resume
+        # was already refused or failed and a human owns the prompt. A plate-vision
+        # or lost-Z row is not a reason to leave a resumable print sitting on the
+        # firmware's prompt.
         async with async_session() as db:
-            incident = await printer_incidents.get_open(db, printer_id)
+            incident = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS | {KIND_POWER_LOSS})
         if incident is not None:
             logger.info(
                 "[pause-recovery] printer %s held by an open %s incident (%s) — standing aside, "
@@ -660,7 +669,9 @@ async def on_plate_vision_trip(printer_id: int, codes: set[str]) -> bool:
         ordered = sorted(codes)
 
         async with async_session() as db:
-            open_incident = await printer_incidents.get_open(db, printer_id)
+            # Its OWN kind only: an AMS fault standing beside a plate-check trip does
+            # not own the plate — the trip decides its own row (multi-alarm rule).
+            open_incident = await printer_incidents.get_open(db, printer_id, kinds={KIND_PLATE_VISION})
             if open_incident is not None:
                 logger.info(
                     "[pause-recovery] printer %s plate check tripped %s but an open %s incident already owns "
@@ -731,41 +742,57 @@ async def _stop_for_vision(printer_id: int) -> bool:
 # --- entry point 3: the operator's clear --------------------------------------------
 
 
-async def on_plate_cleared(printer_id: int) -> bool:
-    """Close a hold whose resolution IS the operator taking the part off the plate.
+async def on_plate_cleared(printer_id: int, *, recover: bool = False) -> bool:
+    """Close the holds whose resolution IS the operator's act. True when any closed.
 
-    Called from the clear-plate and operator-recover routes. Scoped by the incident
-    model's own ``RESOLVES_ON`` table rather than by a kind list spelled here: the two
-    kinds that resolve on an operator act (``plate_vision`` confirmed and
-    ``z_reference_lost``) are exactly the ones whose evidence a human produces, and the
-    wire-resolved kinds must NOT be closed by this — a runout hold is not answered by
-    somebody clearing a plate.
+    Called from the clear-plate route (routine, ``recover=False``) and from
+    ``farm_policy.recover_printer`` (``recover=True``). Scoped by the incident model's
+    own ``RESOLVES_ON`` table through ``printer_incidents.resolution_class``, per row
+    — a printer can hold several — and never by a kind list spelled here:
+
+    * ``operator`` rows (a confirmed plate-check trip, a lost Z frame) close on BOTH
+      verbs: the evidence a human produces is the part coming off the plate;
+    * ``repair`` rows (an AMS physical fault) close on RECOVER only. Recover means
+      "an operator inspected the machine" (it discards every stored belief about the
+      plate too), which is exactly the third return-to-normal the repair class
+      admits. A routine clear-plate says nothing about the filament path;
+    * ``wire`` rows are never closed here — a runout hold is not answered by somebody
+      clearing a plate.
     """
     try:
         from backend.app.core.database import async_session
 
+        closed: list[tuple[int, str]] = []
         async with async_session() as db:
-            incident = await printer_incidents.get_open(db, printer_id)
-            if incident is None:
-                return False
-            # Read off the row BEFORE the close commits — an expiring session would
-            # otherwise make the log line re-fetch a row it no longer needs.
-            kind = incident.kind
-            if not printer_incidents.resolves_on_operator(kind):
-                logger.info(
-                    "[pause-recovery] printer %s plate cleared, but its open %s incident resolves on the "
-                    "wire — left standing",
-                    printer_id,
-                    kind,
+            for incident in await printer_incidents.open_rows(db, printer_id):
+                resolution = printer_incidents.resolution_class(
+                    incident.kind, external=printer_incidents.row_external(incident)
                 )
-                return False
-            await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OPERATOR)
-        logger.info(
-            "[pause-recovery] printer %s %s hold closed — the operator cleared the plate",
-            printer_id,
-            kind,
-        )
-        return True
+                if resolution == RESOLUTION_OPERATOR or (recover and resolution == RESOLUTION_REPAIR):
+                    row = await printer_incidents.close(
+                        db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OPERATOR
+                    )
+                    if row is not None:
+                        closed.append((row.id, row.kind))
+                    continue
+                logger.info(
+                    "[pause-recovery] printer %s plate cleared (%s), but its open %s incident %s resolves on %s "
+                    "— left standing",
+                    printer_id,
+                    "recover" if recover else "clear-plate",
+                    incident.kind,
+                    incident.id,
+                    resolution,
+                )
+        for incident_id, kind in closed:
+            logger.info(
+                "[pause-recovery] printer %s %s hold %s closed — the operator %s",
+                printer_id,
+                kind,
+                incident_id,
+                "recovered the printer" if recover else "cleared the plate",
+            )
+        return bool(closed)
     except Exception:  # noqa: BLE001 — an operator verb must never fail on its hold cleanup
         logger.exception("[pause-recovery] plate-cleared hold close failed for printer %s", printer_id)
         return False

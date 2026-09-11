@@ -1,9 +1,9 @@
-"""The durable AMS-incident store — open, close and read one printer's fault hold.
+"""The durable EQUIPMENT-FAULT store — open, close and read a printer's fault holds.
 
 ``spool_recovery`` owns the *machine* (what to do about a fault); this module owns
 its *record* (:class:`~backend.app.models.printer_incident.PrinterIncident`) —
-creation under the one-open-per-printer rule, the close transitions, the queries the
-watchdogs ask, and the in-memory projection the WebSocket payload reads.
+creation under the one-open-per-kind rule, the close and UPGRADE transitions, the
+queries the watchdogs ask, and the in-memory projection the WebSocket payload reads.
 
 Why a separate module rather than more of ``spool_recovery``: three unrelated
 callers need incident FACTS without wanting the state machine — ``farm_stall``
@@ -13,17 +13,28 @@ lifespan (startup rehydration). Routing those through the machine would drag the
 whole recovery import graph — and its printer_manager dependency — into a WS
 serializer.
 
-**Exclusivity is the database's job.** ``ux_printer_incident_open`` is a partial
-UNIQUE index over ``printer_id WHERE resolved_at IS NULL``, so a second open
-incident for one printer cannot exist even if two callbacks race: the loser gets an
-IntegrityError, which :func:`open_new` reports as "someone else owns it" instead of
+**Exclusivity is the database's job, and it is now PER KIND.**
+``ux_printer_incident_open`` is a partial UNIQUE index over
+``(printer_id, kind) WHERE resolved_at IS NULL`` and ``ux_printer_incident_open_ams``
+a second partial one over ``printer_id`` restricted to the AMS kinds — so a printer
+may carry a lost-Z hold BESIDE a jam (an asset carries concurrent alarms), while the
+three AMS kinds stay mutually exclusive among themselves because they are three
+readings of one AMS. Either index firing means a race, and the loser gets an
+IntegrityError which :func:`open_new` reports as "someone else owns it" instead of
 crashing. The pre-WS2b exclusivity (a process-lifetime ``_active_tasks`` dict) was
 erased by every restart while the standing HMS came straight back.
 
-**The snapshot cache** (:func:`snapshot`) mirrors the open row per printer so the
-~1 Hz WS serializer never queries. It is a projection, never a source: every write
-path here refreshes it, and :func:`rehydrate` rebuilds it from the DB at startup.
-A cache miss renders no chip — it can never invent a hold.
+**The snapshot cache** mirrors EVERY open row per printer so the ~1 Hz WS serializer
+never queries. It is a projection, never a source: every write path here refreshes
+it, and :func:`rehydrate` rebuilds it from the DB at startup.
+
+Its failure direction INVERTED on 2026-09-11, and that is worth stating plainly.
+While it only fed a chip, a stale-empty cache under-reported and could never invent
+a hold. It now also GATES DISPATCH (:func:`hold_blocks_dispatch`), so a miss
+UN-GATES a printer that is held — which is why every mutator here refreshes it and
+:func:`rehydrate` rebuilds it at startup, and why the scheduler reads the WIRE
+beside it: the wire owns "a fault stands NOW", this row owns "an unresolved hold
+exists", and neither is derivable from the other.
 """
 
 from __future__ import annotations
@@ -36,12 +47,19 @@ from sqlalchemy import func as sa_func, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.models.printer_incident import (
+    AMS_FAULT_KINDS,
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
     KIND_POWER_LOSS,
+    KIND_PRECEDENCE,
     KIND_RUNOUT,
     KIND_Z_REFERENCE_LOST,
+    RESOLUTION_WIRE,
+    RESOLVE_AUTO_RESUME,
+    RESOLVE_DRIVER_SELF_HEAL,
+    RESOLVE_DRIVER_SWAP,
+    RESOLVE_TERMINAL,
     RESOLVES_ON,
     STATUS_ABORTED,
     STATUS_ESCALATED,
@@ -51,6 +69,8 @@ from backend.app.models.printer_incident import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -60,9 +80,12 @@ logger = logging.getLogger(__name__)
 # and never of this tuple.
 CLOSED_STATUSES: tuple[str, ...] = (STATUS_RESOLVED, STATUS_ABORTED)
 
-# printer_id -> the WS/REST projection of that printer's OPEN incident. Rebuilt from
-# the DB at startup (:func:`rehydrate`) and maintained by every write below.
-_open_cache: dict[int, dict] = {}
+# printer_id -> {incident_id -> the WS/REST projection of that OPEN row}. Rebuilt
+# from the DB at startup (:func:`rehydrate`) and maintained by every write below.
+# Keyed by incident id rather than by kind because :func:`cached_kind` — how a live
+# recovery driver learns its own row was re-classified — must be able to ask about
+# ONE row while the kind under it changes.
+_open_cache: dict[int, dict[int, dict]] = {}
 
 
 # --- waiting_reason vocabulary (rendered by the queue UI, mapped in waitingReason.ts) ---
@@ -145,16 +168,46 @@ RECOVERY_WAITING_REASONS = (
 )
 
 
-def resolves_on_operator(kind: str) -> bool:
-    """Does an incident of ``kind`` end ONLY when a human acts?
+def resolution_class(kind: str, *, external: bool = False) -> str:
+    """What ENDS a hold of this kind on this hardware: ``wire`` / ``repair`` / ``operator``.
 
-    The one reading of the model's ``RESOLVES_ON`` table, so the ``"operator"`` literal
-    is spelled once and the two close paths that must honour it (``on_job_terminal`` and
-    ``sweep_open_incidents``) cannot drift apart. An unregistered kind answers False —
-    the pre-existing behaviour for every AMS kind, and the safe direction: a hold that
-    closes too readily is visible, one that never closes blocks the printer forever.
+    The one reading of the model's ``RESOLVES_ON`` table, so the three literals are
+    spelled once and every close path reads the same rule. It REPLACED the boolean
+    ``resolves_on_operator``, which could only ever answer one of three questions:
+    both of its callers were in fact asking "may the WIRE close this?", and with a
+    third class that is no longer the complement of "does a human close this?".
+
+    ``external`` is the HARDWARE the fault sits on (:func:`row_external` derives it
+    from a row), because the same class returns to normal differently on the two: an
+    AMS physical fault is repaired by hands and the wire never says so, while an
+    external-holder one is a firmware PROMPT whose clearing IS the human's answer.
+    An unregistered ``(kind, True)`` falls back to that kind's own rule rather than
+    raising — the pause-cause kinds have no holder variant at all, so asking for one
+    is a caller being uniform, not a caller being wrong.
+
+    An unregistered KIND answers ``wire`` — the pre-existing safe direction: a hold
+    that closes too readily is visible, one that never closes blocks the printer
+    forever.
     """
-    return RESOLVES_ON.get(kind) == "operator"
+    resolution = RESOLVES_ON.get((kind, external))
+    if resolution is not None:
+        return resolution
+    return RESOLVES_ON.get((kind, False), RESOLUTION_WIRE)
+
+
+def row_external(incident: PrinterIncident) -> bool:
+    """Is this row's fault on the EXTERNAL spool holder?
+
+    ONE derivation, read from the taxonomy's own verdict over the row's durable
+    ``code`` (doctrine invariant 1: the classifier decides what hardware a code
+    names, never a second test at a call site). :func:`_slot_desc` calls it, and so
+    does every consumer that has to pick a ``RESOLVES_ON`` row.
+    """
+    # Function-level import: spool_recovery imports THIS module at module level.
+    from backend.app.services.hms_errors import classify_short_code
+
+    verdict = classify_short_code(incident.code or "")
+    return verdict is not None and verdict.external
 
 
 def waiting_reason_for(kind: str, *, external: bool = False) -> str:
@@ -186,7 +239,12 @@ def _reset_state() -> None:
     _open_cache.clear()
 
 
-def _slot_desc(incident: PrinterIncident) -> str | None:
+def is_known_kind(kind: str) -> bool:
+    """Is ``kind`` a registered incident kind? (The projection table is the registry.)"""
+    return kind in _WAITING_REASON_BY_KIND
+
+
+def slot_desc(incident: PrinterIncident) -> str | None:
     """Human slot name for the incident's fault, or ``None`` when it names none.
 
     ``"external"`` for ANY fault on the external spool holder: those name no AMS slot
@@ -210,44 +268,155 @@ def _slot_desc(incident: PrinterIncident) -> str | None:
         from backend.app.services.spool_recovery import runout_slot_desc
 
         return runout_slot_desc(incident.slot_global_tray)
-    from backend.app.services.hms_errors import classify_short_code
-
-    verdict = classify_short_code(incident.code or "")
-    if verdict is not None and verdict.external:
-        return "external"
-    return None
+    return "external" if row_external(incident) else None
 
 
 def _payload(incident: PrinterIncident) -> dict:
-    """The projection the printer card renders."""
+    """The projection the printer card renders.
+
+    ``id`` rides along so a reader can ask about ONE row rather than about whatever
+    is open now (see :func:`cached_kind`); the UI ignores it.
+    """
     return {
+        "id": incident.id,
         "kind": incident.kind,
         "status": incident.status,
-        "slot_desc": _slot_desc(incident),
+        "slot_desc": slot_desc(incident),
         "created_at": incident.created_at.isoformat() if incident.created_at else None,
     }
 
 
-def snapshot(printer_id: int | None) -> dict | None:
-    """The printer's OPEN incident as a wire dict, or ``None``.
+def _precedence(kind: str | None) -> int:
+    """Where ``kind`` sits in :data:`KIND_PRECEDENCE`; unregistered kinds sort last."""
+    try:
+        return KIND_PRECEDENCE.index(kind or "")
+    except ValueError:
+        return len(KIND_PRECEDENCE)
 
-    Pure and DB-free — this is read by ``printer_state_to_dict`` on every status
-    broadcast. A stale-empty cache under-reports (no chip) and never invents a hold.
+
+def snapshot(printer_id: int | None, *, kind: str | None = None) -> dict | None:
+    """One of the printer's OPEN rows as a wire dict, or ``None``.
+
+    With ``kind``, that kind's row — the question every consumer that cares about a
+    SPECIFIC hold asks (``eject.remote.z_reference_evidence``, the plate-vision
+    readers), and the one they could not ask while a printer had a single row.
+    Without it, the highest-:data:`KIND_PRECEDENCE` open row: the printer card shows
+    ONE chip, and it should name the fault that interrupted the work.
+
+    Pure and DB-free — read by ``printer_state_to_dict`` on every status broadcast.
     """
     if not printer_id:
         return None
-    return _open_cache.get(printer_id)
+    rows = _open_cache.get(printer_id)
+    if not rows:
+        return None
+    if kind is not None:
+        return next((payload for payload in rows.values() if payload.get("kind") == kind), None)
+    return min(rows.values(), key=lambda payload: _precedence(payload.get("kind")))
 
 
-async def get_open(db: AsyncSession, printer_id: int) -> PrinterIncident | None:
-    """The printer's OPEN incident row (``resolved_at IS NULL``), or None."""
+def snapshots(printer_id: int | None) -> list[dict]:
+    """EVERY open row of the printer as wire dicts, highest precedence first.
+
+    The diagnostic-line reader (``print_scheduler._incident_summary``): a printer
+    holding a jam AND a lost-Z frame must name both, or the line that is supposed to
+    explain a refusal explains half of it. Pure, DB-free, sync.
+    """
+    if not printer_id:
+        return []
+    rows = _open_cache.get(printer_id)
+    if not rows:
+        return []
+    return sorted(rows.values(), key=lambda payload: _precedence(payload.get("kind")))
+
+
+def open_kinds(printer_id: int | None) -> frozenset[str]:
+    """The kinds this printer currently holds open. Pure, DB-free, sync."""
+    if not printer_id:
+        return frozenset()
+    return frozenset(payload["kind"] for payload in _open_cache.get(printer_id, {}).values() if payload.get("kind"))
+
+
+def hold_blocks_dispatch(printer_id: int | None) -> bool:
+    """Does this printer carry an unresolved hold? Pure, DB-free, sync.
+
+    THE one origin of that question, on the model of
+    ``eject.remote.z_reference_evidence``: the scheduler reads it beside the WIRE
+    gate, and the two are a union of two facts with one owner each — the wire owns
+    "a fault stands right now", this row owns "an unresolved hold exists". Neither
+    can answer the other's question: on 003-H2S the firmware wiped the HMS list at
+    every terminal, so the wire read clean while filament was still physically stuck
+    in the shared PTFE path, and the next unit dispatched into it. Three times.
+
+    EVERY open kind blocks, deliberately. A ``plate_vision`` or ``z_reference_lost``
+    row is already plate-gated, so this only makes the refusal legible rather than
+    changing it; a ``power_loss`` row means the firmware's prompt is still
+    unanswered, which is not a printer to put work on.
+    """
+    if not printer_id:
+        return False
+    return bool(_open_cache.get(printer_id))
+
+
+def cached_kind(printer_id: int, incident_id: int) -> str | None:
+    """The KIND the open-incident cache holds for ``incident_id``, or ``None``.
+
+    Sync and DB-free (the :func:`snapshot` idiom — this is read from poll loops that
+    run once a second), and deliberately IDENTITY-SCOPED: it answers only while the
+    printer's open row is still the one the caller names. A live recovery driver
+    carries an immutable context resolved at its entry gate, and this is how it learns
+    that the store re-classified THAT row underneath it (a jam the taxonomy later
+    upgraded to a physical fault). A reader that answered about "whatever is open now"
+    would report a re-classification every time a different incident opened.
+
+    ``None`` for a closed row, a different open row, or an empty cache. None of those
+    is a re-classification, and each already has its own lifecycle path — a driver
+    learns a CLOSED row through the wire (the job ended, the printer resumed), never
+    by inferring it from an absent projection.
+    """
+    cached = _open_cache.get(printer_id, {}).get(incident_id)
+    if cached is None:
+        return None
+    return cached.get("kind")
+
+
+async def open_rows(db: AsyncSession, printer_id: int) -> list[PrinterIncident]:
+    """Every OPEN row this printer carries, oldest first.
+
+    The shape every lifecycle path uses now that a printer can hold more than one
+    hold: each row is adjudicated on its own ``RESOLVES_ON`` rule, in Python, with a
+    named verdict — never filtered away in SQL, where a row that is invisible reads
+    as a row that is absent.
+    """
     result = await db.execute(
         select(PrinterIncident)
         .where(PrinterIncident.printer_id == printer_id)
         .where(PrinterIncident.resolved_at.is_(None))
-        .limit(1)
+        .order_by(PrinterIncident.created_at, PrinterIncident.id)
     )
-    return result.scalar_one_or_none()
+    return list(result.scalars().all())
+
+
+async def get_open(db: AsyncSession, printer_id: int, *, kinds: Iterable[str] | None = None) -> PrinterIncident | None:
+    """The printer's highest-precedence OPEN row, or None.
+
+    ``kinds`` narrows it to the holds the CALLER means, and every call site says
+    which: an AMS-fault lane must not be answered with a plate-vision row (it would
+    refuse to open a real fault), and the plate-vision lane must not be answered with
+    a jam (it would leave its own hold undecided). Both happened while a printer
+    could only carry one row, and both were invisible because the wrong answer was
+    always a plausible one.
+
+    Precedence is applied in PYTHON over :data:`KIND_PRECEDENCE` rather than in SQL:
+    a printer holds at most six rows, and the one order lives in the model.
+    """
+    rows = await open_rows(db, printer_id)
+    if kinds is not None:
+        wanted = frozenset(kinds)
+        rows = [row for row in rows if row.kind in wanted]
+    if not rows:
+        return None
+    return min(rows, key=lambda row: _precedence(row.kind))
 
 
 async def all_open(db: AsyncSession) -> list[PrinterIncident]:
@@ -337,13 +506,19 @@ async def open_new(
     slot_global_tray: int | None,
     status: str = STATUS_RECOVERING,
 ) -> PrinterIncident | None:
-    """Create the printer's open incident, or ``None`` when one already exists.
+    """Create an open incident for this printer, or ``None`` when one already owns it.
 
     Two guards, deliberately both: a pre-check (the ordinary case, so the common path
-    logs a reason instead of raising) and the partial unique index (the race). A
-    caller that gets ``None`` must treat the printer as already owned.
+    logs a reason instead of raising) and the partial unique indexes (the race). A
+    caller that gets ``None`` must treat the printer as already owned FOR THIS KIND.
+
+    The pre-check is kind-SCOPED and mirrors the database exactly: an AMS kind is
+    refused by any open AMS row (the three are readings of one AMS), and every other
+    kind only by an open row of its own kind — so a lost-Z hold opens beside a jam,
+    which is the collision that let an eject run against a fabricated Z datum.
     """
-    if await get_open(db, printer_id) is not None:
+    scope = AMS_FAULT_KINDS if kind in AMS_FAULT_KINDS else {kind}
+    if await get_open(db, printer_id, kinds=scope) is not None:
         return None
     now = datetime.utcnow()
     incident = PrinterIncident(
@@ -362,9 +537,10 @@ async def open_new(
     try:
         await db.commit()
     except IntegrityError:
-        # The partial unique index fired: another callback opened this printer's
-        # incident between the pre-check and the flush. Not an error — the other
-        # actor owns it.
+        # One of the two partial unique indexes fired: another callback opened this
+        # printer's incident between the pre-check and the flush. Not an error — the
+        # other actor owns it. Either index reports as the same race, because both
+        # mean "somebody else already holds this printer for this fault".
         await db.rollback()
         logger.info(
             "printer_incidents: printer %s already has an open incident (index race) — %s %s not opened",
@@ -373,7 +549,7 @@ async def open_new(
             code,
         )
         return None
-    _open_cache[printer_id] = _payload(incident)
+    _open_cache.setdefault(printer_id, {})[incident.id] = _payload(incident)
     logger.info(
         "printer_incidents: printer %s incident %s OPENED kind=%s status=%s code=%s codes=%s item=%s slot=%s job=%s",
         printer_id,
@@ -405,7 +581,58 @@ async def mark_escalated(db: AsyncSession, incident_id: int) -> PrinterIncident 
     incident.status = STATUS_ESCALATED
     incident.escalated_at = datetime.utcnow()
     await db.commit()
-    _open_cache[incident.printer_id] = _payload(incident)
+    _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident)
+    return incident
+
+
+async def upgrade(
+    db: AsyncSession,
+    incident_id: int,
+    *,
+    kind: str,
+    code: str,
+    codes: str,
+    slot_global_tray: int | None,
+) -> PrinterIncident | None:
+    """Re-classify an OPEN row onto a worse fault. ``None`` when it is gone or closed.
+
+    003-H2S 2026-09-11: ``0700_0012`` arrived 1.2 s before ``0700_8004`` (filament
+    physically stuck in the shared PTFE path), so the row opened ``jam`` — and
+    because an open incident could never be re-classified, the swap machine ran a
+    CONTINUE, stamped a healthy spool out of rotation and sent two unloads against
+    filament that cannot retract. The alternative to upgrading is not "refuse the
+    worse fault"; it is "act on the milder classification for the rest of the hold".
+
+    A COMPARE-AND-SET on openness, and it writes the LIVE fingerprint — kind, code,
+    codes and slot together — because ``_reenter_recovering_incident`` already states
+    the rule this depends on: the stored fault and the live one must name the same
+    thing, or the aborted-close ledger and the wire sampler loop against each other.
+
+    The row keeps its ID, its ``created_at`` and its ``escalated_at``: it is the same
+    equipment fault, better understood. A live recovery driver learns of the change
+    through :func:`cached_kind` (the ``reclassified`` takeover token) and hands over
+    without aborting.
+    """
+    incident = await db.get(PrinterIncident, incident_id)
+    if incident is None or incident.resolved_at is not None:
+        return None
+    previous = incident.kind
+    incident.kind = kind
+    incident.code = code or ""
+    incident.codes = codes[:256]
+    incident.slot_global_tray = slot_global_tray
+    await db.commit()
+    _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident)
+    logger.info(
+        "printer_incidents: printer %s incident %s UPGRADED kind=%s->%s code=%s codes=%s slot=%s",
+        incident.printer_id,
+        incident.id,
+        previous,
+        kind,
+        incident.code,
+        incident.codes,
+        slot_global_tray,
+    )
     return incident
 
 
@@ -439,8 +666,13 @@ async def close(
     incident.resolved_at = datetime.utcnow()
     incident.resolve_source = source
     await db.commit()
-    if _open_cache.get(incident.printer_id) is not None:
-        _open_cache.pop(incident.printer_id, None)
+    rows = _open_cache.get(incident.printer_id)
+    if rows is not None:
+        # ONE row, not the printer's whole entry: closing a jam must not take the
+        # lost-Z hold standing beside it out of the chip and out of the dispatch gate.
+        rows.pop(incident.id, None)
+        if not rows:
+            _open_cache.pop(incident.printer_id, None)
     logger.info(
         "printer_incidents: printer %s incident %s CLOSED status=%s source=%s kind=%s code=%s",
         incident.printer_id,
@@ -454,13 +686,118 @@ async def close(
 
 
 async def close_open_for_printer(
-    db: AsyncSession, printer_id: int, *, source: str, status: str = STATUS_RESOLVED
-) -> PrinterIncident | None:
-    """Close whatever incident this printer has open. ``None`` when it has none."""
-    incident = await get_open(db, printer_id)
-    if incident is None:
-        return None
-    return await close(db, incident.id, status=status, source=source)
+    db: AsyncSession,
+    printer_id: int,
+    *,
+    source: str,
+    status: str = STATUS_RESOLVED,
+    kinds: Iterable[str] | None = None,
+) -> list[PrinterIncident]:
+    """Close EVERY open incident this printer carries (of ``kinds``, when given).
+
+    Returns the rows THIS CALL closed, empty when it closed none — a printer-scoped
+    verb over a printer that can now hold several holds, so a single-row answer would
+    silently leave the rest standing.
+    """
+    closed: list[PrinterIncident] = []
+    for incident in await open_rows(db, printer_id):
+        if kinds is not None and incident.kind not in frozenset(kinds):
+            continue
+        row = await close(db, incident.id, status=status, source=source)
+        if row is not None:
+            closed.append(row)
+    return closed
+
+
+# --- the outcome ledger (2026-09-11) ------------------------------------------------
+#
+# WHAT a closed row means, derived from three stored facts and nothing else:
+# ``status`` (resolved / aborted), ``escalated_at`` (did a human get paged) and
+# ``resolve_source`` (who produced the close). The 2026-09-11 audit had to hand-count
+# "how many holds did the farm end by itself" from logs and a SELECT; this table is
+# that count's ONE origin, and ``GET /api/v1/incidents`` its query surface.
+OUTCOME_RECOVERING = "recovering"  # open; the machine is acting
+OUTCOME_HELD = "held"  # open; escalated — a human's
+OUTCOME_AUTO_RECOVERED = "auto_recovered"  # closed without ever paging, by the farm's own act
+OUTCOME_HUMAN_RESOLVED = "human_resolved"  # paged, then closed — a human was in the loop
+OUTCOME_RESOLVED_UNPAGED = "resolved_unpaged"  # closed without a page, on wire/terminal/rearm evidence
+OUTCOME_TAKEN_OVER = "taken_over"  # aborted: an external actor took over mid-procedure
+OUTCOME_TRANSIENT = "transient"  # aborted with no source: it never held the printer
+
+OUTCOMES: tuple[str, ...] = (
+    OUTCOME_RECOVERING,
+    OUTCOME_HELD,
+    OUTCOME_AUTO_RECOVERED,
+    OUTCOME_HUMAN_RESOLVED,
+    OUTCOME_RESOLVED_UNPAGED,
+    OUTCOME_TAKEN_OVER,
+    OUTCOME_TRANSIENT,
+)
+
+# The closes the FARM performed. A refill auto-resume on a row that was never paged
+# cannot happen today (a runout escalates before its refill lane can fire), so its
+# membership here is the rule, not an observed count.
+_FARM_CLOSES: frozenset[str] = frozenset({RESOLVE_DRIVER_SWAP, RESOLVE_DRIVER_SELF_HEAL, RESOLVE_AUTO_RESUME})
+
+
+def outcome_of(incident: PrinterIncident) -> str:
+    """Which :data:`OUTCOMES` bucket this row is in. Pure; total over every row shape.
+
+    ``escalated_at`` is the human axis: once a page went out, the close — whatever
+    produced it — had a human in the loop (they refilled, resumed, fixed the path,
+    stopped the print, or pressed Recover). Only a row that closed WITHOUT paging can
+    be the farm's own recovery, and only when the close came from the farm's own act
+    (:data:`_FARM_CLOSES`) or, for a plate-vision trip, from the terminal of the stop
+    the farm itself sent — the first-trip re-check that requeues without a page.
+    Everything else that closed unpaged closed on evidence nobody produced (a wire
+    edge, a job ending, a restart) and is counted honestly as neither.
+    """
+    if incident.resolved_at is None:
+        return OUTCOME_HELD if incident.status == STATUS_ESCALATED else OUTCOME_RECOVERING
+    if incident.status == STATUS_ABORTED:
+        return OUTCOME_TAKEN_OVER if incident.resolve_source else OUTCOME_TRANSIENT
+    if incident.escalated_at is not None:
+        return OUTCOME_HUMAN_RESOLVED
+    if incident.resolve_source in _FARM_CLOSES:
+        return OUTCOME_AUTO_RECOVERED
+    if incident.kind == KIND_PLATE_VISION and incident.resolve_source == RESOLVE_TERMINAL:
+        return OUTCOME_AUTO_RECOVERED
+    return OUTCOME_RESOLVED_UNPAGED
+
+
+def summary(rows: list[PrinterIncident]) -> dict:
+    """The tally over ``rows``: total, zero-human count, and counts by outcome and by kind."""
+    by_outcome = dict.fromkeys(OUTCOMES, 0)
+    by_kind: dict[str, dict[str, int]] = {}
+    for row in rows:
+        outcome = outcome_of(row)
+        by_outcome[outcome] += 1
+        by_kind.setdefault(row.kind, dict.fromkeys(OUTCOMES, 0))[outcome] += 1
+    return {
+        "total": len(rows),
+        "zero_human": by_outcome[OUTCOME_AUTO_RECOVERED],
+        "by_outcome": by_outcome,
+        "by_kind": by_kind,
+    }
+
+
+async def list_recent(
+    db: AsyncSession,
+    *,
+    since: datetime,
+    kind: str | None = None,
+    printer_id: int | None = None,
+    limit: int = 200,
+) -> list[PrinterIncident]:
+    """Rows opened at or after ``since``, newest first, optionally narrowed."""
+    stmt = select(PrinterIncident).where(PrinterIncident.created_at >= since)
+    if kind is not None:
+        stmt = stmt.where(PrinterIncident.kind == kind)
+    if printer_id is not None:
+        stmt = stmt.where(PrinterIncident.printer_id == printer_id)
+    # id DESC is the tiebreak, not decoration: rows opened in one push share a stamp.
+    stmt = stmt.order_by(PrinterIncident.created_at.desc(), PrinterIncident.id.desc()).limit(limit)
+    return list((await db.execute(stmt)).scalars().all())
 
 
 async def rehydrate(db: AsyncSession) -> int:
@@ -472,5 +809,5 @@ async def rehydrate(db: AsyncSession) -> int:
     _open_cache.clear()
     rows = await all_open(db)
     for incident in rows:
-        _open_cache[incident.printer_id] = _payload(incident)
+        _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident)
     return len(rows)

@@ -964,7 +964,7 @@ class TestAmsFaultTaxonomyCollisionPins:
         """Spent evidence must not double-consume as a fault class — the rule that kept
         0x00030002 out of the table since it was written. Promoting 0x00030001 to spent
         evidence therefore removed its INFORMATIONAL row, which is behaviour-neutral:
-        nothing consumes that class (``spool_recovery.ACTIONABLE_CLASSES`` excludes it),
+        nothing consumes that class (``ACTIONABLE_CLASSES`` excludes it),
         and the short lane still bans ``07xx_0001`` so the entry classifies None on both
         lanes rather than falling through to a jam trigger."""
         from backend.app.services.hms_errors import (

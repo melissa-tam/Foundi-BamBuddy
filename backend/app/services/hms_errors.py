@@ -1718,6 +1718,105 @@ def classify_hms_entry(e) -> ClassifiedAmsFault | None:
         return None
 
 
+# ------------------------------------------------------------------------- #
+# The ACTIONABLE view over the taxonomy: what a live status push is FAULTING on
+# ------------------------------------------------------------------------- #
+# Pure, DB-free readers over :func:`classify_hms_entry`. They live here rather
+# than in ``spool_recovery`` because two independent consumers ask the same
+# question of the same wire — the recovery driver's entry gate and the
+# scheduler's dispatch gate — and ``spool_recovery`` imports the scheduler, so
+# the scheduler could only reach them through a function-level import that hid
+# the cycle instead of breaking it. The taxonomy is the shared concern; one
+# origin for it, per invariant 1.
+# The fault classes an incident owns. Everything else the taxonomy names
+# (RFID_READ, INFORMATIONAL, and the unclassified None) belongs to the generic
+# notify lane — an incident would add a hold nobody can clear.
+ACTIONABLE_CLASSES: frozenset[AmsFaultClass] = frozenset(
+    {
+        AmsFaultClass.RUNOUT,
+        AmsFaultClass.RUNOUT_EXTERNAL,
+        AmsFaultClass.MECHANICAL_FEED,
+        AmsFaultClass.PHYSICAL_FAULT,
+    }
+)
+
+
+@dataclass(frozen=True)
+class FaultCandidate:
+    """One live AMS fault the taxonomy classified as actionable.
+
+    The tuple the entry gate reasons over: WHAT kind of fault (``fault_class``),
+    WHICH code names it (``short_code`` — what the notifications say), WHERE it is
+    (``slot``, only the attr-aware ``hms[]`` lane can supply one), whether the
+    EXTRUDER is the common factor, and whether the hardware is the EXTERNAL spool
+    holder rather than an AMS (``external``, straight from the taxonomy's verdict —
+    never re-derived from the code string here, doctrine invariant 1).
+    """
+
+    fault_class: AmsFaultClass
+    short_code: str
+    slot: tuple[int, int] | None
+    extruder_side: bool
+    external: bool = False
+
+
+def live_candidates(state) -> frozenset[FaultCandidate]:
+    """Every ACTIONABLE AMS fault standing on the printer right now.
+
+    Derived from ALL live ``state.hms_errors`` entries through the WS2a taxonomy
+    (``hms_errors.classify_hms_entry``, which resolves the two wire lanes), not from
+    the notification dedup's "new codes". That decoupling is the fix for the silent
+    class: a code STANDING at restart (``notify_dedup.seed_standing`` marks it
+    already-seen) or one flapping inside the 600 s re-notify window never appeared in
+    ``new_error_codes``, so the old spawn never fired and never logged — 9 runout
+    episodes passed in total silence.
+
+    Pure and DB-free: this runs on every status push, and a malformed entry is
+    skipped rather than raised (invariant 10).
+    """
+    out: set[FaultCandidate] = set()
+    for e in getattr(state, "hms_errors", None) or []:
+        verdict = classify_hms_entry(e)
+        if verdict is None or verdict.fault_class not in ACTIONABLE_CLASSES:
+            continue
+        try:
+            short = hms_short_code(e.attr, e.code)
+        except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the scan
+            continue
+        out.add(
+            FaultCandidate(
+                fault_class=verdict.fault_class,
+                short_code=short,
+                slot=verdict.slot,
+                extruder_side=verdict.extruder_side,
+                external=verdict.external,
+            )
+        )
+    return frozenset(out)
+
+
+def fault_tokens(candidates) -> frozenset[str]:
+    """The individual ``class:short[@ams-tray]`` tokens a fingerprint is built from.
+
+    Slot-QUALIFIED on purpose: the short code alone is slot-agnostic
+    (``0700_8011`` is "an AMS slot ran dry", not "slot 3 ran dry"), so a second roll
+    emptying later in the same job would have looked like the fault already closed
+    and been swallowed.
+    """
+    return frozenset(
+        f"{c.fault_class.value}:{c.short_code}" + (f"@{c.slot[0]}-{c.slot[1]}" if c.slot is not None else "")
+        for c in candidates
+    )
+
+
+def candidate_fingerprint(candidates) -> str:
+    """The stable identity of a set of live faults, for the already-handled test.
+
+    Sorted so set iteration order can never change it, and truncated to the column
+    width — deterministically, so a truncated fingerprint still matches itself."""
+    return ",".join(sorted(fault_tokens(candidates)))[:256]
+
+
 def _code_word(code: int | str) -> int:
     """Parse an HMSError ``code`` (int or hex string like ``"0x20001"``) to its full
     32-bit int — the form :func:`runout_slot_from_hms` expects."""

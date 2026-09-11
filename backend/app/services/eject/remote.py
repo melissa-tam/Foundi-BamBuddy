@@ -1304,8 +1304,10 @@ def z_reference_evidence(printer_id: int) -> bool | None:
     from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
     from backend.app.services import printer_incidents
 
-    incident = printer_incidents.snapshot(printer_id)
-    if incident is not None and incident.get("kind") == KIND_Z_REFERENCE_LOST:
+    # Asked BY KIND (2026-09-11): a printer can now hold a lost-Z frame BESIDE an
+    # AMS fault, and the single-slot reading used to hand back whichever row ranked
+    # higher — which is how the hold could be open and this still answer None.
+    if printer_incidents.snapshot(printer_id, kind=KIND_Z_REFERENCE_LOST) is not None:
         return False
     return None
 

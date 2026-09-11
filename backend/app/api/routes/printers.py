@@ -53,6 +53,7 @@ from backend.app.services.bambu_ftp import (
     get_storage_info_async,
     list_files_async,
 )
+from backend.app.services.bambu_mqtt import ams_mid_filament_change
 from backend.app.services.hms_errors import current_runout_demand, hms_error_payload, runout_hold_active
 from backend.app.services.pause_recovery import on_plate_cleared
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
@@ -4099,6 +4100,23 @@ async def ams_load(
             ),
         )
 
+    # Mid-filament-change gate (002-H2S 2026-09-11). A layer-0 jam parked the AMS at
+    # ams_status_main == 1 behind a PAUSE; the operator clicked Load on slot 1 twice,
+    # both returned 200, and the firmware dropped both — it drops EVERY
+    # ams_change_filament in this state and only its own CONTINUE moves it on. A
+    # different cause from the runout hold above and not covered by it (no runout code
+    # need be standing), but the same defect: a 200 that moves nothing.
+    if ams_mid_filament_change(state):
+        raise HTTPException(
+            409,
+            (
+                f"{printer.name}'s AMS is mid filament-change (ams_status_main=1). The firmware drops "
+                "every load in this state — the click would return 200 and move nothing "
+                "(002-H2S 2026-09-11). Press Retry/Continue on the printer screen (or resume the "
+                "print) so the change completes, then load."
+            ),
+        )
+
     # Mark this as an operator-commanded load so the backup-swap detector does not
     # mistake the resulting tray_now edge for a firmware runout and spend the
     # departed spool (spool_respool commanded-swap suppression).
@@ -4125,7 +4143,10 @@ async def ams_unload(
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
-    """Unload the currently loaded filament."""
+    """Unload the currently loaded filament.
+
+    Refused with 409 while the AMS is mid filament-change — see the gate below.
+    """
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
     if not printer:
@@ -4134,6 +4155,21 @@ async def ams_unload(
     client = printer_manager.get_client(printer_id)
     if not client:
         raise HTTPException(400, "Printer not connected")
+
+    # Mid-filament-change gate — the unload half of the same firmware fact. 009-H2S
+    # 2026-07-20 spent FOUR unloads here (recovery's two and the operator's two), all
+    # silently dropped, before a resume unwedged the state machine; this route had no
+    # gate at all until 2026-09-11.
+    if ams_mid_filament_change(printer_manager.get_status(printer_id)):
+        raise HTTPException(
+            409,
+            (
+                f"{printer.name}'s AMS is mid filament-change (ams_status_main=1). The firmware drops "
+                "every unload in this state — the click would return 200 and move nothing "
+                "(009-H2S 2026-07-20: four unloads, all ignored). Press Retry/Continue on the printer "
+                "screen (or resume the print) so the change completes, then unload."
+            ),
+        )
 
     success = client.ams_unload_filament()
     if not success:

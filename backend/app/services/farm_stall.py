@@ -26,6 +26,12 @@ reconcile / operator resolves the true outcome.
   could retire such a row — no terminal echo ever arrives for a print that never
   began (2026-08-29, 001-H2S item 1010: 15 h, seven units queued behind it).
 
+* ``check_ams_wedged_idle`` — the printer is CONNECTED, IDLE and taking no work
+  because its AMS is latched mid filament-change (``ams_status_main == 1``), a state
+  in which the firmware drops every load and unload. Nothing else can see it: no
+  print, no incident row, no HMS code once the jam that caused it clears (002-H2S
+  2026-09-11). One WARNING + one ``on_ams_wedged_idle`` page per episode.
+
 Invoked as guarded calls from the scheduler's ``check_queue`` tick (mirroring the
 stagger consumer), so there is no new periodic loop / lifespan task. State (edge
 timestamps + notified sets) is module-level, matching the other event-edge
@@ -50,6 +56,7 @@ from backend.app.models.printer_incident import (
     KIND_RUNOUT,
     KIND_Z_REFERENCE_LOST,
     STATUS_ESCALATED,
+    STATUS_RECOVERING,
 )
 from backend.app.services import notify_dedup
 from backend.app.services.hms_errors import current_runout_demand
@@ -139,6 +146,8 @@ def _reset_state() -> None:
     _foreign_paused_at.clear()
     _foreign_notified.clear()
     _dead_claim_since.clear()
+    _ams_wedged_since.clear()
+    _ams_wedged_paged.clear()
 
 
 async def _grace_seconds(db: AsyncSession, key: str, default: int) -> float:
@@ -547,7 +556,14 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
                 _dead_claim_since.pop(item.id, None)
                 continue
 
-            if await printer_incidents.get_open(db, pid) is not None or spool_recovery.has_live_recovery(pid):
+            # Guard 6, narrowed 2026-09-11: stand down only while somebody is ACTING
+            # on the printer — a ``recovering`` row (a driver, or the startup re-entry's
+            # own lane) or a live recovery task. An ESCALATED hold is a human's, not an
+            # actor that can land a print, and under the equipment-fault model it can
+            # be PERMANENT: 003-H2S's item 1988 (dispatched, never started, behind a
+            # physical hold the terminal no longer launders) must still be released.
+            acting = any(row.status == STATUS_RECOVERING for row in await printer_incidents.open_rows(db, pid))
+            if acting or spool_recovery.has_live_recovery(pid):
                 _dead_claim_since.pop(item.id, None)
                 continue
 
@@ -582,6 +598,107 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
             )
         except Exception:  # noqa: BLE001 — one bad item must not abort the watch
             logger.exception("farm_stall: dead-claim watch failed for printer %s item %s", pid, item.id)
+
+
+# --------------------------------------------------------------------------- #
+# The AMS wedged mid filament-change on an idle printer (2026-09-11, 002-H2S)
+# --------------------------------------------------------------------------- #
+# printer_id -> the ts the wedge was first observed (episode start), and the
+# printers already paged for the current episode. An EPISODE is the predicate
+# holding continuously: the moment it drops, both are popped, so a wedge that
+# clears and recurs pages again. Process-lifetime, like the sibling dwells — a
+# restart just restarts the dwell, which is the safe direction.
+_ams_wedged_since: dict[int, float] = {}
+_ams_wedged_paged: set[int] = set()
+
+# How long the wedge must hold before it is worth a human's attention. Generous on
+# purpose: a legitimate filament change occupies this state for tens of seconds,
+# and the recovery driver's own rounds pass through it.
+_AMS_WEDGED_IDLE_DWELL_S = 600.0
+
+
+async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
+    """One bounded page for an AMS latched mid filament-change on an IDLE printer.
+
+    At ``ams_status_main == 1`` the firmware drops every ``ams_change_filament``
+    (:func:`bambu_mqtt.ams_mid_filament_change` carries the wire evidence), and since
+    2026-09-11 the scheduler's idle gate refuses to dispatch there. That refusal is
+    correct and it is also SILENT: with no print running and no incident open, a
+    latched wedge holds the printer out of the queue with nothing anywhere saying so
+    — literally incident #60's shape (2026-08-29: 15 h, seven pending units, zero
+    notifications) transplanted into a new field. A gate that can hold forever needs a
+    watch that says so once.
+
+    The predicate is ALL of: connected with a live state; that state NOT in
+    ``print_scheduler.ACTIVE_PRINT_STATES`` (value 1 during a print is the ordinary
+    mid-print change, the firmware's own business); the AMS reading mid-change; and
+    nobody else already owning the printer — no OPEN ``printer_incident`` and no live
+    recovery task, whose resume rounds pass through this state by design.
+
+    Never writes: no queue row, no incident, no quarantine. The WARNING and the single
+    ``on_ams_wedged_idle`` page are the whole surface, and the fix is one press of
+    Retry/Continue on the printer's screen.
+    """
+    now = time.time() if now is None else now
+
+    from backend.app.models.printer import Printer
+    from backend.app.services import printer_incidents, spool_recovery
+    from backend.app.services.bambu_mqtt import ams_mid_filament_change
+    from backend.app.services.notification_service import notification_service
+    from backend.app.services.print_scheduler import ACTIVE_PRINT_STATES
+
+    def _drop(printer_id: int) -> None:
+        _ams_wedged_since.pop(printer_id, None)
+        _ams_wedged_paged.discard(printer_id)
+
+    result = await db.execute(select(Printer).where(Printer.is_active.is_(True)))
+    for printer in result.scalars().all():
+        pid = printer.id
+        try:
+            if not manager.is_connected(pid):
+                _drop(pid)
+                continue
+
+            st = manager.get_status(pid)
+            if st is None or (getattr(st, "state", None) or "").upper() in ACTIVE_PRINT_STATES:
+                _drop(pid)
+                continue
+
+            if not ams_mid_filament_change(st):
+                _drop(pid)
+                continue
+
+            if await printer_incidents.get_open(db, pid) is not None or spool_recovery.has_live_recovery(pid):
+                _drop(pid)
+                continue
+
+            first = _ams_wedged_since.get(pid)
+            if first is None:
+                _ams_wedged_since[pid] = now
+                continue
+            if now - first < _AMS_WEDGED_IDLE_DWELL_S or pid in _ams_wedged_paged:
+                continue
+
+            minutes = (now - first) / 60.0
+            _ams_wedged_paged.add(pid)
+            logger.warning(
+                "farm_stall: printer %s AMS latched mid filament-change for %.0f min with no print running and "
+                "no incident open (state=%s tray_now=%s pending_tray_target=%s) — it drops every load/unload "
+                "and dispatch is held until it clears; Retry/Continue on the printer screen",
+                pid,
+                minutes,
+                getattr(st, "state", None),
+                getattr(st, "tray_now", None),
+                getattr(st, "pending_tray_target", None),
+            )
+            await notification_service.on_ams_wedged_idle(
+                printer_id=pid,
+                printer_name=printer.name,
+                minutes=int(minutes),
+                db=db,
+            )
+        except Exception:  # noqa: BLE001 — one bad printer must not abort the watch
+            logger.exception("farm_stall: AMS wedged-idle watch failed for printer %s", pid)
 
 
 # --------------------------------------------------------------------------- #
@@ -730,9 +847,13 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
     KIND_RUNOUT: (
         "Filament runout STILL not resolved — the printer remains held awaiting a same-slot refill." + _IDLE_HELD_SUFFIX
     ),
+    # The REPAIR class (2026-09-11): the wire never reports a repaired path, so the
+    # suffix's "until the fault clears on the wire" would send the operator to wait for
+    # an event that cannot happen. Name the two exits instead.
     KIND_PHYSICAL: (
-        "A physical filament fault is STILL unresolved — the printer remains held and no swap can clear it."
-        + _IDLE_HELD_SUFFIX
+        "A physical filament fault is STILL unresolved — the printer remains held and no swap can clear it. "
+        "The printer is not paused — it is idle and will take no work until a filament change completes "
+        "through the path (load a slot on the printer) or an operator presses Recover."
     ),
     # The three pause-cause kinds hold an IDLE printer as their NORMAL shape — the farm
     # stopped the print (plate check) or never had one running (a lost Z reference on an

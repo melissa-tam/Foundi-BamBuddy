@@ -7,7 +7,7 @@ so each HMSAction case publishes the expected JSON.
 """
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -278,3 +278,47 @@ class TestExecuteHmsActionDispatch:
         client.execute_hms_action("03008070", HMSAction.RESUME_PRINTING)
         payloads = [json.loads(c.args[1]) for c in client._client.publish.call_args_list]
         assert any("pushing" in p for p in payloads)
+
+
+class TestAmsControlBranchesDelegateToTheOnePublisher:
+    """The modal's three ``ams_control`` branches used to publish through a closure
+    that duplicated ``BambuMQTTClient.ams_control``'s frame. They now delegate, and
+    the wire must not have moved a byte."""
+
+    @pytest.fixture
+    def client(self):
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="03W-TEST", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        return c
+
+    def _raw(self, client):
+        return [call.args[1] for call in client._client.publish.call_args_list]
+
+    @pytest.mark.parametrize(
+        "action,param",
+        [
+            (HMSAction.FILAMENT_EXTRUDED, "done"),
+            (HMSAction.RETRY_FILAMENT_EXTRUDED, "resume"),
+            (HMSAction.ABORT, "abort"),
+        ],
+    )
+    def test_the_published_bytes_are_unchanged(self, client, action, param):
+        client.execute_hms_action("07008029", action)
+        expected = json.dumps({"print": {"command": "ams_control", "param": param, "sequence_id": "0"}})
+        assert self._raw(client)[0] == expected
+
+    @pytest.mark.parametrize(
+        "action,param",
+        [
+            (HMSAction.FILAMENT_EXTRUDED, "done"),
+            (HMSAction.RETRY_FILAMENT_EXTRUDED, "resume"),
+            (HMSAction.ABORT, "abort"),
+        ],
+    )
+    def test_it_goes_through_the_method_and_asks_for_a_pushall(self, client, action, param):
+        """The modal's underlying status query refreshes off that full report — which
+        is why the branch asks for one where a bare ``ams_control`` does not."""
+        with patch.object(BambuMQTTClient, "ams_control", return_value=True) as pub:
+            client.execute_hms_action("07008029", action)
+        pub.assert_called_once_with(param, request_pushall=True)

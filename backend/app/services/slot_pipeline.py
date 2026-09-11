@@ -1018,7 +1018,9 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
         if donor is not None:
             debounce_candidate = _spool_view(donor)
             reseat_within_window = ams_presence.reseat_within_window(printer_id, ams_id, tray_id)
-            runout_suspect = _runout_suspect(obs, deps, await printer_incidents.get_open(deps.db, printer_id))
+            runout_suspect = _runout_suspect(
+                obs, deps, await printer_incidents.get_open(deps.db, printer_id, kinds={KIND_RUNOUT})
+            )
 
     return ResolutionContext(
         binding=binding,

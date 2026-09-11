@@ -313,6 +313,21 @@ class TestFindIdlePrinterForTarget:
         assert found is None
         assert reason == "Busy: 001-H2S, 003-H2S"
 
+    async def test_an_ams_wedged_member_is_named_in_the_busy_list(self, db_session, printer_factory, monkeypatch):
+        """A printer held out by a wedged AMS (002-H2S 2026-09-11) is still "busy",
+        but it will NOT free itself — somebody has to press Continue on the screen.
+        The rendered reason is a backend-authored sentence (the frontend passes
+        anything non-token-shaped through verbatim), so the cause is named inline,
+        read from the idle gate's own record rather than re-derived."""
+        a = await printer_factory(model="H2S", name="002-H2S")
+        b = await printer_factory(model="H2S", name="003-H2S")
+        s = self._sched(monkeypatch, idle={a.id: False, b.id: False})
+        s._idle_refusal[a.id] = "ams_filament_change"
+
+        found, reason = await s._find_idle_printer_for_target(db_session, DispatchTarget.printers([a.id, b.id]), set())
+        assert found is None
+        assert reason == "Busy: 002-H2S (AMS mid filament-change), 003-H2S"
+
     async def test_inactive_pool_names_its_members(self, db_session, printer_factory, monkeypatch):
         """Nothing survives the membership+active filter, so the sentence has to name
         the pool itself — a model string could not describe one."""

@@ -3499,6 +3499,13 @@ async def run_migrations(conn):
         # printer ran out twice in 28 h with a full roll one slot over. The farm cannot
         # rewrite an RFID or operator-bound tray, so the operator is the fix.
         ("on_backup_group_split", "1", "TRUE"),
+        # AMS wedged mid filament-change on an IDLE printer (002-H2S 2026-09-11): at
+        # ams_status_main == 1 the firmware drops every load and unload, and since the
+        # scheduler's idle gate refuses to dispatch there, a latched wedge holds the
+        # printer out of the queue with nothing else anywhere saying so — no print, no
+        # incident row, no HMS code once the jam that caused it clears. Only a human
+        # pressing Retry/Continue on the screen frees it.
+        ("on_ams_wedged_idle", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still
@@ -4160,16 +4167,67 @@ async def run_migrations(conn):
         )
         """,
     )
-    # ONE open incident per printer, enforced by a PARTIAL unique index (supported by
-    # SQLite >= 3.8 and PostgreSQL alike) — the durable successor of the in-memory
-    # exclusivity a restart used to erase. Closed incidents accumulate as history
-    # because they carry a resolved_at and fall outside the predicate. Same name the
-    # model declares, so create_all and this DDL converge on ONE index object.
-    await _safe_execute(
-        conn,
+    # Re-key (2026-09-11, 003-H2S): an equipment fault and a job hold are different
+    # records with different lifecycles, so exclusivity moves from "one open row per
+    # printer" to "one open row per printer PER KIND" — a lost-Z hold has to be able
+    # to stand beside an AMS fault (before this it silently could not, and the eject
+    # lane's z_reference_evidence then let a sweep run against a fabricated Z datum).
+    # The AMS kinds keep their mutual exclusion in a SECOND partial index, built from
+    # the model's own predicate so the two spellings cannot drift.
+    #
+    # Guarded, marker-keyed and one-time (the _pool_cutover_marker shape below), and
+    # placed BEFORE the unconditional DDL so an OLD database is re-keyed on the same
+    # boot the new DDL runs. Existing data satisfies both new indexes — today every
+    # printer has at most one open row of any kind.
+    # The AMS-exclusion predicate comes from the MODEL, built there from
+    # ``sorted(AMS_FAULT_KINDS)`` — one origin, so this DDL and ``create_all`` can
+    # never disagree about which kinds are mutually exclusive.
+    from backend.app.models.printer_incident import AMS_OPEN_PREDICATE as _ams_open_predicate
+
+    _incident_per_kind_sql = (
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_printer_incident_open "
-        "ON printer_incident (printer_id) WHERE resolved_at IS NULL",
+        "ON printer_incident (printer_id, kind) WHERE resolved_at IS NULL"
     )
+    _incident_ams_sql = (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_printer_incident_open_ams "
+        f"ON printer_incident (printer_id) WHERE {_ams_open_predicate}"
+    )
+    _incident_index_marker = "migration_incident_index_per_kind_20260911"
+    _incident_index_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _incident_index_marker})
+    ).scalar()
+    if not _incident_index_done:
+        try:
+            async with conn.begin_nested():
+                await conn.execute(text("DROP INDEX IF EXISTS ux_printer_incident_open"))
+                await conn.execute(text(_incident_per_kind_sql))
+                await conn.execute(text(_incident_ams_sql))
+                await conn.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _incident_index_marker},
+                )
+            logger.info(
+                "[MIGRATION] %s: printer_incident open-row exclusivity re-keyed to (printer_id, kind), "
+                "with the AMS kinds kept mutually exclusive by ux_printer_incident_open_ams",
+                _incident_index_marker,
+            )
+        except Exception:  # noqa: BLE001 — a re-key must never take startup down for every install
+            logger.exception(
+                "[MIGRATION] %s failed and was rolled back (non-fatal); the marker stays unwritten so a "
+                "later boot retries it",
+                _incident_index_marker,
+            )
+
+    # ONE open incident per printer PER KIND, enforced by a PARTIAL unique index
+    # (supported by SQLite >= 3.8 and PostgreSQL alike) — the durable successor of the
+    # in-memory exclusivity a restart used to erase. Closed incidents accumulate as
+    # history because they carry a resolved_at and fall outside the predicate. Same
+    # names the model declares, so create_all and this DDL converge on ONE index each.
+    await _safe_execute(conn, _incident_per_kind_sql)
+    await _safe_execute(conn, _incident_ams_sql)
     await _safe_execute(
         conn,
         "CREATE INDEX IF NOT EXISTS ix_printer_incident_job ON printer_incident (printer_id, job_id)",

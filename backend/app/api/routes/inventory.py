@@ -1065,6 +1065,15 @@ async def update_spool(
     if "weight_used" in update_data and "weight_locked" not in update_data:
         update_data["weight_locked"] = True
 
+    # "Return to rotation" is ONE verb with one owner: a null ``feed_fault_at`` clears
+    # the PAIR (the flag and the code it was stamped with) through ``spool_recovery``,
+    # so a stale diagnosis cannot outlive the flag it explained (002-H2S 2026-09-11).
+    if "feed_fault_at" in update_data and update_data["feed_fault_at"] is None:
+        from backend.app.services import spool_recovery
+
+        update_data.pop("feed_fault_at")
+        spool_recovery.clear_out_of_rotation(spool)
+
     for field, value in update_data.items():
         setattr(spool, field, value)
 

@@ -1789,41 +1789,63 @@ class TestZReferenceEvidence:
 
     Reads the durable ``z_reference_lost`` hold through the incident store's process
     cache (the same projection the printer card's chip renders), so the answer is
-    identical at the automatic release boundary and in the operator's dialog."""
+    identical at the automatic release boundary and in the operator's dialog. Seeded
+    through the REAL cache rather than a mocked ``snapshot``: since 2026-09-11 a
+    printer can hold several rows and the evidence is asked BY KIND, which a mock
+    that ignores its ``kind`` argument cannot pin."""
 
     @staticmethod
-    def _snapshot(payload):
+    def _held(printer_id, *kinds):
         from backend.app.services import printer_incidents
 
-        return patch.object(printer_incidents, "snapshot", MagicMock(return_value=payload))
+        printer_incidents._reset_state()
+        printer_incidents._open_cache[printer_id] = {
+            n: {"id": n, "kind": kind, "status": "escalated", "slot_desc": None, "created_at": None}
+            for n, kind in enumerate(kinds, start=1)
+        }
+
+    @pytest.fixture(autouse=True)
+    def _clean_cache(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
 
     async def test_an_open_z_reference_hold_reads_false(self):
         from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
 
-        with self._snapshot({"kind": KIND_Z_REFERENCE_LOST, "status": "escalated"}):
-            assert remote.z_reference_evidence(7) is False
+        self._held(7, KIND_Z_REFERENCE_LOST)
+        assert remote.z_reference_evidence(7) is False
 
     async def test_no_incident_reads_unknown_never_true(self):
         # None, not True: the farm has no POSITIVE evidence that Z is referenced, and
         # inventing one would make the gate assert something it cannot know.
-        with self._snapshot(None):
-            assert remote.z_reference_evidence(7) is None
+        assert remote.z_reference_evidence(7) is None
 
     async def test_another_kind_of_hold_does_not_gate_the_eject(self):
         # 2026-08-29 gotcha (d): the eject lane stays ungated by AMS faults — an eject
         # is filament-less, and holding the plate behind one deadlocks the printer.
         from backend.app.models.printer_incident import KIND_RUNOUT
 
-        with self._snapshot({"kind": KIND_RUNOUT, "status": "escalated"}):
-            assert remote.z_reference_evidence(7) is None
+        self._held(7, KIND_RUNOUT)
+        assert remote.z_reference_evidence(7) is None
+
+    async def test_a_z_hold_beside_an_ams_fault_still_refuses(self):
+        """Multi-alarm rule (2026-09-11): the runout ranks higher on the chip, and a
+        single-slot read used to hand back the runout and let the sweep through —
+        the 2026-09-04 bed-past-the-floor mechanism. Asked by kind, the jam cannot
+        hide the Z hold."""
+        from backend.app.models.printer_incident import KIND_RUNOUT, KIND_Z_REFERENCE_LOST
+
+        self._held(7, KIND_RUNOUT, KIND_Z_REFERENCE_LOST)
+        assert remote.z_reference_evidence(7) is False
 
     async def test_the_live_evidence_builder_carries_it(self):
         from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
 
-        with (
-            patch.object(printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="IDLE"))),
-            self._snapshot({"kind": KIND_Z_REFERENCE_LOST, "status": "escalated"}),
-        ):
+        self._held(7, KIND_Z_REFERENCE_LOST)
+        with patch.object(printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="IDLE"))):
             ev = remote._live_evidence(7)
         assert ev.live_state == "IDLE"
         assert ev.z_reference is False
