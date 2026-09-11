@@ -123,9 +123,9 @@ async def test_bed_drop_defaults_to_null(engine):
                 "INSERT INTO eject_profiles "
                 "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
-                "eject_speed_mm_min, skim_speed_mm_min, cooling_fan_assist, max_part_height_mm, "
+                "eject_speed_mm_min, skim_speed_mm_min, max_part_height_mm, "
                 "sweep_start_frac, final_skim) "
-                "VALUES ('migrated', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42, 1.0, 1)"
+                "VALUES ('migrated', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42, 1.0, 1)"
             )
         )
     async with engine.connect() as conn:
@@ -144,10 +144,10 @@ async def test_bed_drop_value_round_trips(engine):
                 "INSERT INTO eject_profiles "
                 "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
-                "eject_speed_mm_min, skim_speed_mm_min, cooling_fan_assist, max_part_height_mm, "
+                "eject_speed_mm_min, skim_speed_mm_min, max_part_height_mm, "
                 "sweep_start_frac, final_skim, "
                 f"{_NEW_COLUMN}) "
-                "VALUES ('dropper', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42, 1.0, 1, 50)"
+                "VALUES ('dropper', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42, 1.0, 1, 50)"
             )
         )
     async with engine.connect() as conn:

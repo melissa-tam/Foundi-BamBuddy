@@ -74,7 +74,6 @@ _DEFAULTS = {
     "back_overhang_mm": 2.0,
     "eject_speed_mm_min": 3000,
     "skim_speed_mm_min": 1500,
-    "cooling_fan_assist": True,
     "final_skim": True,
     "max_part_height_mm": 42.0,
     "sweep_x_min_mm": None,

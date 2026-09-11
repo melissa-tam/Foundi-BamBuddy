@@ -651,11 +651,51 @@ class AppSettings(BaseModel):
         "°C of the release threshold (bed equilibrated at ambient). Above threshold+margin the bed is genuinely "
         "stuck hot and the printer is quarantined with NO eject.",
     )
+    # Cooldown fans — two lanes (auxiliary + chamber exhaust), each with its own
+    # on/off switch and its own speed.
+    #
+    # Every percent below keeps ``ge=0`` even where the operator-facing bound is 1:
+    # ``_build_settings_response`` (routes/settings.py) builds this model with
+    # ``AppSettings(**settings_dict)``, so a legacy ``'0'`` still sitting in the
+    # settings table would raise HERE and 500 EVERY GET and PUT of /settings. A
+    # response model has to be able to represent what the store actually holds; the
+    # operator-input bound belongs on AppSettingsUpdate, the only place a 0 can
+    # arrive from a human.
+    farm_cooldown_aux_fan_enabled: bool = Field(
+        default=True,
+        description="Run the auxiliary fan from the end of a farm print until its eject dispatches",
+    )
     farm_cooldown_aux_fan_percent: int = Field(
         default=100,
         ge=0,
         le=100,
-        description="Auxiliary fan speed (%) held from the end of a farm print until its eject dispatches; 0 = off",
+        description="Auxiliary fan speed (%) — ONE speed for the whole cooldown wait (end of print until the "
+        "eject dispatches). The on/off switch is farm_cooldown_aux_fan_enabled. There is deliberately NO aux "
+        "'sustain' speed: this fan works by raising the cooling-rate constant, and the time left to the eject "
+        "temperature is logarithmic in the excess — so the minutes saved per boost-minute are the same from the "
+        "first minute to the last and no step-down point is better than any other (see cooldown_prep)",
+    )
+    farm_cooldown_chamber_fan_enabled: bool = Field(
+        default=True,
+        description="Set the air duct to cooling and run the chamber exhaust fan from the end of a farm print "
+        "until its eject dispatches; printer models without a chamber fan skip it",
+    )
+    farm_cooldown_chamber_fan_percent: int = Field(
+        default=100,
+        ge=0,
+        le=100,
+        description="Chamber fan BOOST speed (%) — held while the chamber air is still above the eject "
+        "threshold. Unlike the aux fan this one barely changes the cooling-rate constant; it lowers the air "
+        "temperature the bed decays TOWARD, and trapped ~35 °C chamber air is what keeps the bed's asymptote "
+        "above a 33 °C eject line, so exhausting it is front-loaded work with a measurable end",
+    )
+    farm_cooldown_chamber_fan_sustain_percent: int = Field(
+        default=50,
+        ge=0,
+        le=100,
+        description="Chamber fan speed (%) once the chamber reads at or below the eject threshold, held until "
+        "the eject dispatches; 0 stops the fan there. 50 is the vendor's own chamber-cooling figure "
+        "(M106 P3 S127 in every Bambu H2 start block)",
     )
     farm_cooldown_hold_enabled: bool = Field(
         default=True,
@@ -865,7 +905,16 @@ class AppSettingsUpdate(BaseModel):
     farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
     farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)
     farm_cooldown_plateau_eject_margin_c: float | None = Field(default=None, ge=0.0, le=50.0)
-    farm_cooldown_aux_fan_percent: int | None = Field(default=None, ge=0, le=100)
+    farm_cooldown_aux_fan_enabled: bool | None = None
+    # The speeds are 1..100 on INPUT: 0 is refused because the ``_enabled`` switch is
+    # the off. (AppSettings keeps ge=0 so a legacy stored 0 can still be PROJECTED —
+    # see the comment on that block.)
+    farm_cooldown_aux_fan_percent: int | None = Field(default=None, ge=1, le=100)
+    farm_cooldown_chamber_fan_enabled: bool | None = None
+    farm_cooldown_chamber_fan_percent: int | None = Field(default=None, ge=1, le=100)
+    # 0 is legitimate HERE: the sustain is a step TARGET (the fan stops when the boost
+    # ends and stays off until dispatch), not a switch.
+    farm_cooldown_chamber_fan_sustain_percent: int | None = Field(default=None, ge=0, le=100)
     farm_cooldown_hold_enabled: bool | None = None
     farm_cooldown_hold_part_top_mm: int | None = Field(default=None, ge=-50, le=200)
     farm_idle_park_enabled: bool | None = None

@@ -67,7 +67,6 @@ class EjectProfileBase(BaseModel):
     back_overhang_mm: float = Field(default=15.0, ge=0)
     eject_speed_mm_min: int = Field(default=3000, gt=0)
     skim_speed_mm_min: int = Field(default=1500, gt=0)
-    cooling_fan_assist: bool = True
     # Append the final slow skim pass after the descent sweeps (True = prior
     # behaviour); False pushes exactly once.
     final_skim: bool = True
@@ -140,7 +139,6 @@ class EjectProfileUpdate(BaseModel):
     back_overhang_mm: float | None = Field(default=None, ge=0)
     eject_speed_mm_min: int | None = Field(default=None, gt=0)
     skim_speed_mm_min: int | None = Field(default=None, gt=0)
-    cooling_fan_assist: bool | None = None
     final_skim: bool | None = None
     max_part_height_mm: float | None = Field(default=None, gt=0)
     # NULL = off; explicit null in an update clears the bed-drop assist.

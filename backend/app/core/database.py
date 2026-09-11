@@ -851,6 +851,17 @@ async def run_migrations(conn):
     if await _column_exists(conn, "eject_profiles", "cooldown_retries"):
         await _safe_execute(conn, "ALTER TABLE eject_profiles DROP COLUMN cooldown_retries")
 
+    # Migration: Drop eject_profiles.cooling_fan_assist (2026-09-11). The column
+    # backed an operator toggle on the Eject Profiles page promising "runs the
+    # part-cooling fan during the sweep" that NO backend code ever read — the
+    # generator never emitted an M106 for it and the dispatcher never looked at it,
+    # so the switch did nothing in either position. A control that does nothing is
+    # deleted end-to-end rather than left to mislead. The cooling that DOES happen
+    # is the cooldown prep's own fan lanes, which are farm settings, not per-profile.
+    # Presence-guarded for the same cross-dialect reason as the drop above.
+    if await _column_exists(conn, "eject_profiles", "cooling_fan_assist"):
+        await _safe_execute(conn, "ALTER TABLE eject_profiles DROP COLUMN cooling_fan_assist")
+
     # Migration: Enforce uniqueness on user_oidc_links for existing rows.
     # create_all() is idempotent and does not add constraints to existing tables,
     # so we create covering unique indexes explicitly here.
@@ -5092,6 +5103,50 @@ async def run_migrations(conn):
             "one-time, a later re-measure is never rewritten",
             _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM,
             _hold_clear_lifted.rowcount,
+        )
+
+    # Cooldown aux fan (2026-09-11): fold the retired "0 = off" encoding onto the
+    # ``farm_cooldown_aux_fan_enabled`` switch. The speed setting used to carry both
+    # facts — how fast, and whether at all — and now carries only the speed, with the
+    # switch owning on/off for both cooldown fan lanes.
+    #
+    # MANDATORY rather than cosmetic: ``AppSettingsUpdate`` now refuses 0 for that key
+    # (``ge=1``), and the Settings -> Farm card PUTs ALL of its farm settings in one
+    # payload — so an install still storing '0' would 422 every save of that card,
+    # including saves that change something else entirely.
+    #
+    # Deliberately NOT marker-guarded, unlike the one-time repairs above: this is
+    # idempotent BY CONSTRUCTION because the mis-typed datum IS the '0' value. Once the
+    # row is deleted there is nothing left to fold, and a 0 an operator somehow writes
+    # later cannot exist (the input schema refuses it). A marker would add a row and a
+    # branch to guard a condition that already cannot recur.
+    #
+    # Deleting rather than rewriting the percent row is the one-origin choice: an absent
+    # settings row materialises the schema default (100), so the fold leaves exactly one
+    # place that says what "full speed" means. Non-fatal by this file's contract and safe
+    # to be — if it never runs, a stale 0 with the switch on degrades to ``M106 P2 S0``,
+    # which is the fan off: the exact behaviour the operator had before.
+    #
+    # SQLite + Postgres neutral: plain DML in the same shapes already used above (the
+    # ``min_start_spool_g`` UPDATE and the guarded INSERT ... SELECT ... WHERE NOT EXISTS).
+    _aux_fan_legacy_off = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = 'farm_cooldown_aux_fan_percent' AND value = '0'"))
+    ).scalar()
+    if _aux_fan_legacy_off:
+        async with conn.begin_nested():
+            # Never overwrite a switch row that already exists — an operator who has
+            # since set the switch owns it, and their value wins over this inference.
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) SELECT 'farm_cooldown_aux_fan_enabled', 'false' "
+                    "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = 'farm_cooldown_aux_fan_enabled')"
+                )
+            )
+            await conn.execute(text("DELETE FROM settings WHERE key = 'farm_cooldown_aux_fan_percent' AND value = '0'"))
+        logger.warning(
+            "[MIGRATION] cooldown aux fan: stored speed '0' folded onto "
+            "farm_cooldown_aux_fan_enabled=false and the '0' row deleted (the speed setting no longer "
+            "encodes off; an absent row now means the schema default)"
         )
 
 
