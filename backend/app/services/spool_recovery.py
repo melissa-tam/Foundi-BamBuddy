@@ -133,18 +133,24 @@ from sqlalchemy.orm import selectinload
 
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer_incident import (
+    AMS_FAULT_KINDS,
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_RUNOUT,
+    RESOLUTION_OPERATOR,
+    RESOLUTION_REPAIR,
+    RESOLUTION_WIRE,
     RESOLVE_AUTO_RESUME,
     RESOLVE_OBSERVED_RUNNING,
     RESOLVE_OPERATOR,
+    RESOLVE_REPAIR_OBSERVED,
     RESOLVE_TERMINAL,
     RESOLVE_WIRE_CLEAR,
     STATUS_ABORTED,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
     STATUS_RESOLVED,
+    PrinterIncident,
 )
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
@@ -163,6 +169,7 @@ from backend.app.services.hms_errors import (
     mechanical_feed_short_codes,
     power_loss_prompt_standing,
 )
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.printer_incidents import (
     RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
@@ -248,6 +255,31 @@ _CLASS_PRECEDENCE: tuple[AmsFaultClass, ...] = (
     AmsFaultClass.RUNOUT_EXTERNAL,
     AmsFaultClass.MECHANICAL_FEED,
 )
+
+# kind -> the BEST class that maps onto it — the inverse of _KIND_BY_CLASS, built
+# from it so the two cannot drift, and taking the first (highest-precedence) class
+# for a kind two classes share (``runout`` is reached by both RUNOUT and
+# RUNOUT_EXTERNAL). Used only to RANK an open row against a live classification:
+# :func:`_outranks`.
+_CLASS_BY_KIND: dict[str, AmsFaultClass] = {}
+for _class in _CLASS_PRECEDENCE:
+    _CLASS_BY_KIND.setdefault(_KIND_BY_CLASS[_class], _class)
+
+
+def _outranks(fault_class: AmsFaultClass, kind: str) -> bool:
+    """Is a live ``fault_class`` WORSE than the kind an open row already carries?
+
+    The upgrade test. 003-H2S 2026-09-11: ``0700_0012`` (mechanical) arrived 1.2 s
+    before ``0700_8004`` (physical), so the incident opened ``jam`` — and because an
+    open incident was never re-classified, the swap machine spent the whole hold
+    acting on the milder reading: a firmware CONTINUE, an out-of-rotation stamp on a
+    healthy spool, and two unloads against filament that cannot retract.
+    """
+    existing = _CLASS_BY_KIND.get(kind)
+    if existing is None:
+        return False
+    return _CLASS_PRECEDENCE.index(fault_class) < _CLASS_PRECEDENCE.index(existing)
+
 
 # --- waiting_reason tokens -------------------------------------------------
 # The kind -> token table and its tokens live in ``printer_incidents`` (the store that
@@ -520,12 +552,14 @@ _EVAL_THROTTLE_S = 10.0
 _guidance_sent: set[tuple[int, int]] = set()
 
 # printer_id -> the last per-push wire sample :func:`note_demand_watch` took, as
-# (gcode_state, demanded slot or None, live actionable short codes, connection_epoch).
-# Edges over this sample drive the refill auto-resume and the "the printer is running
-# again" close. The epoch rides along because a sample from a PREVIOUS MQTT session
-# cannot be compared for a code DISAPPEARING — a reboot wipes the standing HMS list, so
-# every negative edge fires at once (2026-09-04, printer 8).
-_wire_sample: dict[int, tuple[str, tuple[int, int] | None, frozenset[str], int]] = {}
+# (gcode_state, demanded slot or None, live actionable short codes, connection_epoch,
+# feeding tray or None). Edges over this sample drive the refill auto-resume, the
+# "the printer is running again" close, and the completed-load edge that is a
+# ``physical`` hold's repair evidence. The epoch rides along because a sample from a
+# PREVIOUS MQTT session cannot be compared for a code DISAPPEARING — a reboot wipes
+# the standing HMS list, so every negative edge fires at once (2026-09-04, printer 8)
+# — and for the same reason it cannot be compared for a tray CHANGING.
+_wire_sample: dict[int, tuple[str, tuple[int, int] | None, frozenset[str], int, int | None]] = {}
 
 # (printer_id, job_id) -> fault fingerprints an ABORTED close barred from re-entry,
 # while they are STILL the same standing fault. The loop bound the per-push entry
@@ -562,6 +596,29 @@ _stuck_resets: dict[tuple[int, str], int] = {}
 # never republishes anything), so this is the bound that keeps holding if that
 # ordering is ever changed — not a second spelling of it.
 _ams_control_tiers: dict[tuple[int, str], int] = {}
+
+# printer_id -> when this process last observed a filament change COMPLETE onto a
+# real feeder (naive UTC, matching the incident row's own clock). THE repair
+# evidence: a ``physical`` hold — a broken filament, a clog, a failed pull-back —
+# ends when filament demonstrably moves through the path again, and this is the
+# cheapest positive statement of that the wire makes.
+#
+# It has to be an EDGE. The LEVEL "``tray_now`` names a slot" is not evidence of
+# anything: 003-H2S read ``tray_now == 1`` before, during and after its fault, with
+# the filament stuck in the shared PTFE path the whole time. What the sampler stamps
+# is the TRANSITION onto a feeder, which only happens when the AMS carried a change
+# to completion.
+#
+# Process-lifetime by design, and the safe direction: a restart empties it, so the
+# only repair evidence left after one is a RUNNING print — which is why the startup
+# rearm cannot close a physical hold on an idle printer however clean the wire reads.
+_load_completed_at: dict[int, datetime] = {}
+
+# Incidents whose self-heal resume has already gone out. One per incident: the
+# resume is published on the FIRST sighting of repair evidence, before the sweep's
+# dwell, and the row then closes on that same evidence ~120 s later — so without
+# this the dwell window would publish one resume per tick.
+_repair_resume_sent: set[int] = set()
 
 # incident_id -> the monotonic instant :func:`sweep_open_incidents` FIRST saw every
 # one of its close guards hold. The dwell that stops a momentary reading closing a
@@ -644,6 +701,8 @@ def _reset_state() -> None:
     _wire_sample.clear()
     _blocked.clear()
     _hold_over_since.clear()
+    _load_completed_at.clear()
+    _repair_resume_sent.clear()
     printer_incidents._reset_state()
 
 
@@ -1373,18 +1432,25 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 _note_outcome(printer_id, job_id, fingerprint, "not owned — recovery disabled by setting")
                 return None
 
-            existing = await printer_incidents.get_open(db, printer_id)
-            if existing is not None:
+            # The AMS-kind row only: a pause-cause hold (power loss, plate vision, a
+            # lost Z frame) standing beside an AMS fault never blocks the fault from
+            # being owned — that is the multi-alarm rule.
+            existing = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
+            if existing is not None and not _outranks(fault_class, existing.kind):
                 _note_outcome(
                     printer_id,
                     job_id,
                     fingerprint,
-                    "not opened — this printer already has an open incident",
+                    "not opened — this printer already has an open AMS incident",
                     detail=f"incident {existing.id} {existing.status} kind={existing.kind}",
                 )
                 return None
 
-            if await _fault_already_closed(db, printer_id, job_id, fingerprint):
+            # The upgrade branch below runs BEFORE the aborted-re-entry bar on purpose:
+            # an upgrade escalates the row that already owns the printer, it never
+            # re-enters a machine, so a barred fingerprint is not a reason to leave
+            # the row on its milder reading.
+            if existing is None and await _fault_already_closed(db, printer_id, job_id, fingerprint):
                 # Aborted = an external actor took over, or the fault proved transient
                 # (it never held the printer). Re-entering would fight the operator, or
                 # loop on a code the firmware leaves standing after it healed itself.
@@ -1405,20 +1471,43 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 db, printer_id=printer_id, job_id=job_id, kind=kind, external=external, verdict=verdict, tray=tray
             )
 
-            row = await printer_incidents.open_new(
-                db,
-                printer_id=printer_id,
-                job_id=job_id,
-                item_id=item.id if item is not None else None,
-                kind=kind,
-                code=code,
-                codes=fingerprint,
-                slot_global_tray=tray,
-                status=STATUS_ESCALATED if escalate_reason is not None else STATUS_RECOVERING,
-            )
-            if row is None:
-                _note_outcome(printer_id, job_id, fingerprint, "not opened — lost the open-incident race")
-                return None
+            upgraded_from: str | None = None
+            if existing is not None:
+                # UPGRADE: the live set now carries a class that OUTRANKS the open row
+                # (003-H2S 2026-09-11 — ``0700_0012`` opened a jam 1.2 s before
+                # ``0700_8004`` said the filament was physically stuck in the path,
+                # and the swap machine spent the whole hold on the milder reading).
+                # Every kind that outranks a jam escalates AT ENTRY, so an upgrade
+                # always lands ESCALATED with one page and never a driverless
+                # ``recovering`` row: a runout routes ``None`` only because the DRIVER
+                # escalates it after confirming the PAUSE, and no driver is spawned
+                # here, so its held-runout reason is supplied directly.
+                if escalate_reason is None:
+                    escalate_reason = "external_spool_runout" if external else "runout_needs_refill"
+                # Read BEFORE the CAS: ``existing`` is the same identity-mapped row the
+                # store is about to mutate in this session.
+                upgraded_from = existing.kind
+                row = await printer_incidents.upgrade(
+                    db, existing.id, kind=kind, code=code, codes=fingerprint, slot_global_tray=tray
+                )
+                if row is None:
+                    _note_outcome(printer_id, job_id, fingerprint, "not upgraded — the open incident closed underneath")
+                    return None
+            else:
+                row = await printer_incidents.open_new(
+                    db,
+                    printer_id=printer_id,
+                    job_id=job_id,
+                    item_id=item.id if item is not None else None,
+                    kind=kind,
+                    code=code,
+                    codes=fingerprint,
+                    slot_global_tray=tray,
+                    status=STATUS_ESCALATED if escalate_reason is not None else STATUS_RECOVERING,
+                )
+                if row is None:
+                    _note_outcome(printer_id, job_id, fingerprint, "not opened — lost the open-incident race")
+                    return None
 
             printer = await db.get(Printer, printer_id)
             printer_name = (printer.name if printer else None) or f"printer {printer_id}"
@@ -1446,7 +1535,8 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
             printer_id,
             job_id,
             fingerprint,
-            f"incident {incident.incident_id} opened",
+            f"incident {incident.incident_id} "
+            + (f"UPGRADED {upgraded_from}->{kind}" if upgraded_from is not None else "opened"),
             detail=f"kind={kind} {'foreign' if incident.item_id is None else f'item={incident.item_id}'}"
             + (f" escalating={escalate_reason}" if escalate_reason else ""),
         )
@@ -1490,7 +1580,9 @@ async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
             return False
         if not await _read_bool(db, "spool_recovery_enabled", _DEFAULT_ENABLED):
             return False
-        if await printer_incidents.get_open(db, printer_id) is not None:
+        # The AMS-kind row: a pause-cause hold is not an AMS fault's owner, and a
+        # plate-vision row standing beside a jam must not silence the jam's raw alert.
+        if await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS) is not None:
             return True
         job_id = (getattr(state, "subtask_id", None) or "").strip()
         # A barred fault will never be owned again — let the raw alert through
@@ -1537,6 +1629,13 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             logger.info("spool_recovery: printer %s never PAUSEd (firmware rescue / transient) — incident closed", pid)
             return
 
+        # The PAUSE landed. Before the FIRST write about this incident (the projection
+        # onto the unit), ask whether the row is still ours to write about: an upgrade
+        # that arrived while we waited (003-H2S) has already projected the WORSE kind's
+        # token, and a stop that arrived (002-H2S) has already ended the job.
+        if await _takeover_exit(incident, awaiting="PAUSE", step="paused"):
+            return
+
         # (2) Show the operator a live status. Out-of-rotation stamping/notification
         #     is DEFERRED to the swap-commit boundary in the loop below (feed-fault
         #     incidents only — a runout spool is SPENT): a no-swap firmware self-heal
@@ -1567,6 +1666,8 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         # at entry — so a no-swap self-heal leaves the spool untouched.
         oor_stamped = False
         for _round in range(_MAX_CANDIDATES):
+            if await _takeover_exit(incident, awaiting="PAUSE", step="round_start"):
+                return
             # W1: reset an AMS wedged mid filament-change before touching the unload.
             reset = await _reset_stuck_change(incident, client)
             if reset == "abort":
@@ -1856,6 +1957,30 @@ def _note_takeover(incident: RecoveryIncident, token: str, step: str) -> str:
     return "handover" if token == "reclassified" else "abort"
 
 
+async def _takeover_exit(incident: RecoveryIncident, *, awaiting: str | None, step: str) -> bool:
+    """Ask :func:`_takeover` at a driver BOUNDARY and, when it answers, end the driver.
+
+    True means the caller must ``return``: the takeover was logged, and the row was
+    either aborted (six tokens) or handed over (``reclassified``). The step helpers
+    ask inside their own poll loops; this is for the two boundaries where the driver
+    is about to WRITE something about a spool or a unit — right after the PAUSE it
+    waited for lands, and at the top of every round — because a takeover that lands
+    BETWEEN two steps must not be answered by the next step's first write. 002-H2S
+    2026-09-11: the operator's stop landed between a load and a resume and the
+    machine stamped a healthy spool out of rotation; 003-H2S: an upgrade must beat
+    the round's out-of-rotation stamp and first unload, or the swap machine acts on
+    the milder reading for one more round.
+    """
+    token = _takeover(incident, _get_state(incident.printer_id), awaiting=awaiting)
+    if token is None:
+        return False
+    if _note_takeover(incident, token, step) == "handover":
+        _hand_over(incident)
+    else:
+        await _abort(incident, token=token)
+    return True
+
+
 def _hand_over(incident: RecoveryIncident) -> None:
     """The one takeover that is NOT an abort: the store re-classified this row.
 
@@ -1937,10 +2062,13 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
     key = (pid, incident.job_id)
 
     st = _get_state(pid)
-    if st is None:
-        return "skipped"
-    if getattr(st, "state", None) != "PAUSE":
-        return "skipped"
+    # A lost state (or any takeover) at THIS read ends the round through the one
+    # predicate — never a "skipped" that falls through to the out-of-rotation stamp
+    # and an unload nobody can confirm. After a None answer the state is PAUSE or
+    # RUNNING, and RUNNING while a step awaits PAUSE is the ``resumed`` token.
+    token = _takeover(incident, st, awaiting="PAUSE")
+    if token is not None:
+        return _note_takeover(incident, token, "reset_stuck_change")
     if not ams_mid_filament_change(st):
         return "skipped"
     initial_ams = getattr(st, "ams_status_main", None)
@@ -3141,8 +3269,10 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
                 logger.exception("spool_recovery: failed notification error for printer %s", incident.printer_id)
 
             # W2: durably record this escalation and quarantine the printer if its
-            # AMS keeps escalating within the window (reuse the SAME session).
-            await _record_escalation_and_maybe_quarantine(db, incident, reason)
+            # AMS keeps escalating within the window (reuse the SAME session). ONE
+            # ledger row per incident: an upgrade re-escalates a row that may already
+            # have paged and been recorded, and the ledger — not a flag — says so.
+            await _record_escalation_and_maybe_quarantine(db, incident, reason, opened_at=row.created_at)
         logger.warning("spool_recovery: printer %s ESCALATED (%s) — left PAUSED", incident.printer_id, reason)
         # A HELD runout's escalation IS the durable exhaustion record. The three
         # edge-driven spent lanes hang off `hms_edges` appearance edges, which every
@@ -3172,7 +3302,9 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
         logger.exception("spool_recovery: escalate handler failed for printer %s", incident.printer_id)
 
 
-async def _record_escalation_and_maybe_quarantine(db: AsyncSession, incident: RecoveryIncident, reason: str) -> None:
+async def _record_escalation_and_maybe_quarantine(
+    db: AsyncSession, incident: RecoveryIncident, reason: str, *, opened_at: datetime | None = None
+) -> None:
     """Record one durable ``recovery_escalation`` row, then quarantine the printer
     when its JAM-MACHINE escalations have crossed :data:`_JAM_QUARANTINE_THRESHOLD`
     within :data:`_JAM_QUARANTINE_WINDOW_H` hours — a recurring AMS jam is hardware
@@ -3203,6 +3335,31 @@ async def _record_escalation_and_maybe_quarantine(db: AsyncSession, incident: Re
 
     try:
         now = datetime.utcnow()
+        if opened_at is not None:
+            # One row per INCIDENT, derived from the ledger itself (derive-don't-store):
+            # a row for this printer stamped at or after the incident opened IS this
+            # incident's row — the AMS kinds are mutually exclusive per printer, so no
+            # other incident can have written one inside that window. An UPGRADE
+            # re-escalates the same row with a worse kind and a fresh page (the operator
+            # must learn the fault is now physical), but must not count twice toward
+            # the 2-in-24 h quarantine — that is how 006-H2S (shape 36) was quarantined
+            # for one jam.
+            prior = await db.scalar(
+                select(RecoveryEscalation.id)
+                .where(RecoveryEscalation.printer_id == incident.printer_id)
+                .where(RecoveryEscalation.created_at >= opened_at)
+                .limit(1)
+            )
+            if prior is not None:
+                logger.info(
+                    "spool_recovery: printer %s incident %s re-escalated (%s) — page sent, ledger row %s already "
+                    "records this incident; the row and the quarantine count are not repeated",
+                    incident.printer_id,
+                    incident.incident_id,
+                    reason,
+                    prior,
+                )
+                return
         db.add(
             RecoveryEscalation(
                 printer_id=incident.printer_id,
@@ -3365,7 +3522,15 @@ async def on_observed_running(printer_id: int) -> bool:
     Pause-recovery incidents (``pause_recovery.py`` — power loss, plate vision) never
     register in ``_active_tasks`` at all, so their screen-resume close is unchanged.
 
-    Returns True when an incident was closed. Never raises (invariant 10).
+    It closes only the printer's WIRE-resolved rows, and it may be several: a printer
+    can hold more than one fault, and each carries its own return-to-normal rule.
+    A ``repair`` row is deliberately NOT closed here even though RUNNING is one of its
+    two evidences — an EJECT sweep produces a PREPARE->RUNNING edge, and that sweep is
+    filament-less, so this edge alone would close a stuck-filament hold seconds after
+    the terminal that protected it. The sweep's own arm asks the authority whether an
+    eject owns the printer and then waits out the dwell.
+
+    Returns True when at least one incident was closed. Never raises (invariant 10).
     """
     try:
         if has_live_recovery(printer_id):
@@ -3378,76 +3543,150 @@ async def on_observed_running(printer_id: int) -> bool:
 
         from backend.app.core.database import async_session
 
+        closed: list[tuple[int, str, str, bool]] = []
         async with async_session() as db:
-            incident = await printer_incidents.get_open(db, printer_id)
-            if incident is None:
-                return False
-            item_id = incident.item_id
-            kind, status = incident.kind, incident.status
-            await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
-            cleared = await _clear_hold_projection(db, item_id)
-        logger.info(
-            "spool_recovery: printer %s observed RUNNING — %s incident closed (was %s)%s",
-            printer_id,
-            kind,
-            status,
-            "; hold token cleared" if cleared else "",
-        )
-        return True
+            for incident in await printer_incidents.open_rows(db, printer_id):
+                resolution = printer_incidents.resolution_class(
+                    incident.kind, external=printer_incidents.row_external(incident)
+                )
+                if resolution == RESOLUTION_REPAIR:
+                    logger.info(
+                        "spool_recovery: printer %s RUNNING edge — %s incident %s left OPEN: a RUNNING edge is "
+                        "not repair evidence (an eject sweep makes one and moves no filament); the sweep closes "
+                        "it after the dwell",
+                        printer_id,
+                        incident.kind,
+                        incident.id,
+                    )
+                    continue
+                if resolution == RESOLUTION_OPERATOR:
+                    continue
+                item_id, kind, status = incident.item_id, incident.kind, incident.status
+                if await printer_incidents.close(
+                    db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING
+                ):
+                    closed.append((incident.id, kind, status, await _clear_hold_projection(db, item_id)))
+        for incident_id, kind, status, cleared in closed:
+            logger.info(
+                "spool_recovery: printer %s observed RUNNING — %s incident %s closed (was %s)%s",
+                printer_id,
+                kind,
+                incident_id,
+                status,
+                "; hold token cleared" if cleared else "",
+            )
+        return bool(closed)
     except Exception:  # noqa: BLE001 — a lifecycle hook must never crash the status flow
         logger.exception("spool_recovery: observed-running close failed for printer %s", printer_id)
         return False
 
 
 async def on_job_terminal(printer_id: int) -> bool:
-    """The print on this printer reached a terminal — close any open incident.
+    """The print reached a terminal — close the holds the JOB was holding.
 
-    A fault cannot outlive the job it interrupted: whatever the outcome (completed,
-    failed, cancelled), the hold is over and the next print must not inherit it. The
-    farm unit's own ``waiting_reason`` hygiene is ``farm_policy.on_terminal``'s job
-    (W4b) — this only closes the incident, so the two never fight over one row.
+    A JOB HOLD cannot outlive the job; an EQUIPMENT FAULT can. That distinction is
+    the whole of 003-H2S 2026-09-11: the row was both at once, so the operator's stop
+    ended the equipment fault along with the job — the firmware wiped its HMS list at
+    the same terminal, and two minutes later the scheduler dispatched the next unit
+    onto the same printer and the same filament, still stuck in the shared PTFE path.
+    Three times.
 
-    ONE exception, by kind: an incident whose ``RESOLVES_ON`` is ``"operator"`` stays
-    open. Those kinds are held on a PHYSICAL fact a print ending cannot change — a part
-    still on the plate after a confirmed plate-check trip, a Z datum destroyed by a
-    reboot — and the terminal is frequently the farm's OWN stop of that very print, so
-    closing here would let the hold close itself seconds after being raised and take the
-    chip dark with the plate still occupied. They close when the human acts
-    (``clear_plate`` / operator recover).
+    So the close is BY RESOLUTION CLASS, per row (a printer can hold several):
+
+    * ``wire`` — closed. The hold was on a fault the wire reports, and a terminal is
+      as good a statement as the wire makes that the job it interrupted is over.
+    * ``repair`` — LEFT OPEN. Nothing about a print ending says filament can move
+      again, and the terminal is very often the operator stopping the very print the
+      fault broke. It ends on motion (:func:`_repaired`), not on a status change.
+    * ``operator`` — LEFT OPEN, unchanged: a part still on the plate after a confirmed
+      plate-check trip, a Z datum destroyed by a reboot. The terminal is frequently
+      the farm's OWN stop of that print, so closing here would let the hold close
+      itself seconds after being raised and take the chip dark with the plate still
+      occupied. They close when the human acts (``clear_plate`` / operator recover).
+
+    The farm unit's own ``waiting_reason`` hygiene stays ``farm_policy.on_terminal``'s
+    job (W4b) — this only closes incidents, so the two never fight over one row.
 
     Called (guarded) from ``main.on_print_complete``'s per-print reset block.
     """
     try:
         from backend.app.core.database import async_session
 
+        closed: list[PrinterIncident] = []
         async with async_session() as db:
-            open_incident = await printer_incidents.get_open(db, printer_id)
-            if open_incident is None:
-                return False
-            if printer_incidents.resolves_on_operator(open_incident.kind):
-                logger.info(
-                    "spool_recovery: printer %s reached a terminal — %s incident %s left OPEN "
-                    "(resolves on an operator act, not on a job ending)",
-                    printer_id,
-                    open_incident.kind,
-                    open_incident.id,
+            for incident in await printer_incidents.open_rows(db, printer_id):
+                resolution = printer_incidents.resolution_class(
+                    incident.kind, external=printer_incidents.row_external(incident)
                 )
-                return False
-            closed = await printer_incidents.close(
-                db, open_incident.id, status=STATUS_RESOLVED, source=RESOLVE_TERMINAL
+                if resolution != RESOLUTION_WIRE:
+                    logger.info(
+                        "spool_recovery: printer %s reached a terminal — %s incident %s left OPEN "
+                        "(resolves on %s, not on a job ending)",
+                        printer_id,
+                        incident.kind,
+                        incident.id,
+                        resolution,
+                    )
+                    continue
+                row = await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_TERMINAL)
+                if row is not None:
+                    closed.append(row)
+        for row in closed:
+            logger.info(
+                "spool_recovery: printer %s reached a terminal — %s incident %s closed",
+                printer_id,
+                row.kind,
+                row.id,
             )
-        if closed is None:
-            return False
-        logger.info(
-            "spool_recovery: printer %s reached a terminal — %s incident %s closed",
-            printer_id,
-            closed.kind,
-            closed.id,
-        )
-        return True
+        return bool(closed)
     except Exception:  # noqa: BLE001 — a lifecycle hook must never crash the completion flow
         logger.exception("spool_recovery: terminal close failed for printer %s", printer_id)
         return False
+
+
+# The two repair evidences, named so the self-heal arm can ask WHICH one answered
+# without matching on prose.
+_REPAIR_EVIDENCE_LOAD = "load completed after the fault"
+_REPAIR_EVIDENCE_RUNNING = "print running through the path"
+
+
+def _repaired(incident, state) -> tuple[bool, str]:
+    """Has the filament PATH been repaired since this fault opened, and how do we know?
+
+    The ``repair`` class's return-to-normal test, and the answer to the question an
+    empty HMS list cannot answer. 003-H2S 2026-09-11: the firmware wipes its standing
+    HMS list at every terminal, so a stuck filament and a cleared one read identically
+    on the wire — which is how a stop-and-dispatch cycle laundered the same physical
+    obstruction three times. Silence is not evidence; MOTION is.
+
+    Two admissible evidences, either sufficient, both preceded by the same liveness
+    guard — whatever moved, the fault must not be standing NOW, and the AMS must not
+    be wedged mid filament-change (a wedge outlives the code that caused it and drops
+    every subsequent move):
+
+    (a) a completed-load EDGE stamped after this incident opened
+        (:data:`_load_completed_at`) — the AMS carried a filament change through to a
+        real feeder, which is the operator's commonest repair: free the path by hand,
+        then load a slot;
+    (b) the printer is RUNNING and no eject owns it — a print is feeding through the
+        same path. The eject exclusion is not incidental: a sweep is filament-LESS,
+        so a toolhead crossing the plate says nothing about whether filament moves.
+
+    Pure but for the module's own edge ledger and the plate-occupancy authority's
+    in-memory record; returns ``(verdict, the sentence that decided it)`` so the close
+    line names the evidence rather than asserting a conclusion.
+    """
+    if live_candidates(state):
+        return False, "fault live"
+    if ams_mid_filament_change(state):
+        return False, "AMS mid change"
+    loaded_at = _load_completed_at.get(incident.printer_id)
+    if loaded_at is not None and incident.created_at is not None and loaded_at > incident.created_at:
+        return True, _REPAIR_EVIDENCE_LOAD
+    live = ((getattr(state, "state", None) or "") if state is not None else "").upper()
+    if live == "RUNNING" and plate_occupancy.eject_identity(incident.printer_id) is None:
+        return True, _REPAIR_EVIDENCE_RUNNING
+    return False, "no repair evidence"
 
 
 def _hold_over(incident, state) -> tuple[bool, str]:
@@ -3485,11 +3724,16 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
     printers held up to 426 min each), or forever when there was no next print,
     because the hold is what blocks dispatch (001-H2S #60).
 
-    SIX guards, every one required, evaluated in this order:
+    Two lanes, because "the wire went quiet" means opposite things for different
+    kinds — ``printer_incidents.resolution_class`` over the row's kind and hardware
+    picks which, and an ``operator`` kind takes neither.
 
-    0. The kind resolves on the WIRE (``printer_incidents.resolves_on_operator`` False).
-       An operator-resolved kind is held on a fact the wire never reports, so the
-       "clean and idle" evidence below is its normal reading, not its clearance.
+    **The WIRE lane** (jam, runout, power loss, and a physical fault on the EXTERNAL
+    holder, whose codes are firmware PROMPTS a human answers on the screen):
+
+    0. The kind resolves on the WIRE. An operator-resolved kind is held on a fact the
+       wire never reports, so the "clean and idle" evidence below is its normal
+       reading, not its clearance.
     1. ``escalated`` only. A ``recovering`` row has a live driver — or, after a
        restart, ``_reenter_recovering_incident``'s own lane — and closing it from
        underneath would race the machine that is acting on it.
@@ -3500,12 +3744,24 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
        incident that motivated this carried the pair ``0700_8006`` + ``0700_0006``,
        and a per-code test would have closed the hold with the sibling fault still
        standing. Whole-printer, through the ONE taxonomy classifier the entry gate
-       uses (invariant 1 — never a new HMS frozenset). A physical fault still live on
-       an IDLE printer is a REAL hold and keeps holding.
+       uses (invariant 1 — never a new HMS frozenset).
     5. Dwell — all four held continuously for :data:`_HOLD_OVER_DWELL_S`. The fault
        that opened #60 was evaluated 78 ms after a dispatch, when the printer read
        non-PAUSE for an instant; a level-triggered close with no dwell would make the
        same mistake in the opposite direction.
+
+    **The REPAIR lane** (an AMS physical fault: a broken filament, a clog, a failed
+    pull-back) keeps guards 1, 2 and 5 and replaces 3 and 4 with :func:`_repaired`.
+    Guards 3+4 cannot serve there: the firmware wipes its standing HMS list at every
+    terminal, so "idle and clean" is what a printer with filament still jammed in its
+    PTFE path looks like — 003-H2S 2026-09-11 dispatched into exactly that reading,
+    three times. A ``physical`` hold ends on MOTION, not on silence.
+
+    The repair lane also SELF-HEALS (doctrine rule 1): when the evidence is a
+    completed load and the printer is still PAUSEd on the very job the fault
+    interrupted, the operator freed the path and reloaded a slot by hand, and making
+    them walk back to a screen is the deferral that rule forbids. One resume per
+    incident, published on the FIRST sighting; the close still waits out the dwell.
 
     Guarded end to end and per incident: this runs from the scheduler tick and must
     never kill it (invariant 10).
@@ -3516,32 +3772,55 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
         from backend.app.core.database import async_session
 
         async with async_session() as db:
-            open_rows = await printer_incidents.all_open(db)
-            live_ids = {inc.id for inc in open_rows}
+            rows = await printer_incidents.all_open(db)
+            live_ids = {inc.id for inc in rows}
             for stale in [iid for iid in _hold_over_since if iid not in live_ids]:
                 _hold_over_since.pop(stale, None)
+            for stale in [iid for iid in _repair_resume_sent if iid not in live_ids]:
+                _repair_resume_sent.discard(stale)
 
-            for incident in open_rows:
+            for incident in rows:
                 try:
                     if incident.status != STATUS_ESCALATED:
                         _hold_over_since.pop(incident.id, None)
                         continue
-                    if printer_incidents.resolves_on_operator(incident.kind):
+                    resolution = printer_incidents.resolution_class(
+                        incident.kind, external=printer_incidents.row_external(incident)
+                    )
+                    if resolution == RESOLUTION_OPERATOR:
                         # Guard 0 (kind): the wire cannot answer this hold at all. A
                         # part on the plate and a lost Z datum are physical facts no HMS
                         # list reports, so "IDLE with no actionable fault" — the very
-                        # shape the four guards below look for — is the NORMAL reading
-                        # of a printer holding for exactly those reasons. Closing on it
-                        # would take the chip dark with the plate still occupied.
+                        # shape the wire guards look for — is the NORMAL reading of a
+                        # printer holding for exactly those reasons. Closing on it would
+                        # take the chip dark with the plate still occupied.
                         _hold_over_since.pop(incident.id, None)
                         continue
                     pid = incident.printer_id
                     state = _get_state(pid) if printer_manager.is_connected(pid) else None
-                    over, live = _hold_over(incident, state)
-                    faults = live_candidates(state) if over else frozenset()
-                    if not over or faults:
-                        _hold_over_since.pop(incident.id, None)
-                        continue
+                    live = ((getattr(state, "state", None) or "") if state is not None else "").upper()
+
+                    if resolution == RESOLUTION_REPAIR:
+                        # Guard 2 only: the printer must be speaking to us and reporting
+                        # something. _repaired then answers guards 3+4 together, on
+                        # MOTION rather than on the absence of a code.
+                        if not live or live == "UNKNOWN":
+                            _hold_over_since.pop(incident.id, None)
+                            continue
+                        repaired, evidence = _repaired(incident, state)
+                        if not repaired:
+                            _hold_over_since.pop(incident.id, None)
+                            continue
+                        await _maybe_self_heal_after_repair(incident, state, evidence=evidence, live=live)
+                        source, why = RESOLVE_REPAIR_OBSERVED, evidence
+                    else:
+                        over, reported = _hold_over(incident, state)
+                        faults = live_candidates(state) if over else frozenset()
+                        if not over or faults:
+                            _hold_over_since.pop(incident.id, None)
+                            continue
+                        source, why = RESOLVE_WIRE_CLEAR, "no actionable fault"
+                        live = reported
 
                     first = _hold_over_since.get(incident.id)
                     if first is None:
@@ -3550,25 +3829,67 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
                     if now - first < _HOLD_OVER_DWELL_S:
                         continue
 
-                    await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_WIRE_CLEAR)
+                    await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=source)
                     cleared = await _clear_hold_projection(db, incident.item_id)
                     _hold_over_since.pop(incident.id, None)
+                    _repair_resume_sent.discard(incident.id)
                     closed += 1
                     logger.info(
-                        "spool_recovery: printer %s incident %s (%s) closed — wire clear "
-                        "(state=%s, no actionable fault for %.0fs)%s",
+                        "spool_recovery: printer %s incident %s (%s) closed — %s (state=%s, %s for %.0fs)%s",
                         pid,
                         incident.id,
                         incident.kind,
+                        source,
                         live,
+                        why,
                         now - first,
                         "; hold token cleared" if cleared else "",
                     )
                 except Exception:  # noqa: BLE001 — one bad incident must not abort the sweep
-                    logger.exception("spool_recovery: wire-clear sweep failed for incident %s", incident.id)
+                    logger.exception("spool_recovery: incident sweep failed for incident %s", incident.id)
     except Exception:  # noqa: BLE001 — a scheduler-tick watch must never kill the tick
         logger.exception("spool_recovery: wire-clear incident sweep failed")
     return closed
+
+
+async def _maybe_self_heal_after_repair(incident, state, *, evidence: str, live: str) -> None:
+    """Resume a print whose path the operator just repaired by hand. Never raises.
+
+    The shape: a ``physical`` hold, the printer still PAUSEd on the very job the fault
+    interrupted, and a filament change completed onto a real feeder AFTER the fault
+    opened. That is somebody freeing the path at the printer and loading a slot — the
+    repair itself is their "go", and doctrine rule 1 says the farm does not make them
+    walk back to a screen for the button.
+
+    Bounded to ONE resume per incident (:data:`_repair_resume_sent`): the evidence
+    holds for the whole of the sweep's dwell, so an unbounded arm would publish one
+    resume per tick. It is deliberately sent BEFORE the dwell — the dwell exists to
+    stop a momentary reading CLOSING a hold, not to delay acting on a repair — and
+    the row still closes the ordinary way, through the sweep, on the same evidence.
+
+    Evidence (b) is excluded by construction: it requires RUNNING, and this requires
+    PAUSE.
+    """
+    if evidence != _REPAIR_EVIDENCE_LOAD or live != "PAUSE":
+        return
+    job = (getattr(state, "subtask_id", None) or "").strip()
+    if not job or job != (incident.job_id or ""):
+        return
+    if incident.id in _repair_resume_sent:
+        return
+    _repair_resume_sent.add(incident.id)
+    from backend.app.core.tasks import spawn_background_task
+
+    logger.info(
+        "spool_recovery: printer %s incident %s — the filament path was repaired and the print is still "
+        "PAUSEd on the same job; resuming it",
+        incident.printer_id,
+        incident.id,
+    )
+    spawn_background_task(
+        _resume_after_repair(incident.printer_id, incident.id),
+        name=f"repair-resume-p{incident.printer_id}",
+    )
 
 
 async def rearm_incidents_on_startup() -> int:
@@ -3580,7 +3901,7 @@ async def rearm_incidents_on_startup() -> int:
 
     * live state is a positive NON-PAUSE (RUNNING / FINISH / IDLE …) → the hold is
       over; close it ``observed_running``. Without this a stale open row would block
-      every future incident on that printer (one-open-per-printer). The reading is
+      every future incident of its kind on that printer. The reading is
       :func:`_hold_over`, shared with the per-tick :func:`sweep_open_incidents` — one
       predicate, two occasions, so the restart and the running process can never
       disagree about what "the hold is over" means. The startup occasion deliberately
@@ -3591,12 +3912,21 @@ async def rearm_incidents_on_startup() -> int:
     * no live state at all (the printer has not reported yet) → leave it OPEN and
       decide later. The wire sampler closes it on the first RUNNING transition.
 
-    A row still reading ``recovering`` is the one shape none of those three answers
+    That ladder is the WIRE class's. The other two take their own:
+
+    * ``operator`` → always left open. A restart is not a human clearing a plate.
+    * ``repair`` → closed only on :func:`_repaired`, with no dwell (the restart IS
+      the fresh derivation the dwell substitutes for elsewhere). After a restart the
+      completed-load edge ledger is empty by construction, so in practice only a
+      RUNNING print can close one — which is correct: ``tray_now`` naming a slot is a
+      LEVEL that a stuck-filament printer reports just as readily.
+
+    A row still reading ``recovering`` is the one shape none of the wire answers
     fits, and it is handled separately (:func:`_reenter_recovering_incident`): that
     status is a PROMISE that a task is acting, and the restart broke it. Left alone
-    the row would sit open forever with nothing driving it — and because exclusivity
-    is one-open-per-printer, it would also block every future incident on that
-    printer for good.
+    the row would sit open forever with nothing driving it — and because the AMS
+    kinds are mutually exclusive, it would also block every future AMS incident on
+    that printer for good.
 
     Returns the number of incidents closed. Never raises — startup must not block.
     """
@@ -3608,20 +3938,33 @@ async def rearm_incidents_on_startup() -> int:
         async with async_session() as db:
             for incident in await printer_incidents.all_open(db):
                 st = _get_state(incident.printer_id)
-                over, live = _hold_over(incident, st)
-                if not over:
-                    if incident.status == STATUS_RECOVERING:
-                        driverless.append((incident.id, incident.printer_id))
+                resolution = printer_incidents.resolution_class(
+                    incident.kind, external=printer_incidents.row_external(incident)
+                )
+                if resolution == RESOLUTION_OPERATOR:
                     continue
+                if resolution == RESOLUTION_REPAIR:
+                    repaired, evidence = _repaired(incident, st)
+                    if not repaired:
+                        if incident.status == STATUS_RECOVERING:
+                            driverless.append((incident.id, incident.printer_id))
+                        continue
+                else:
+                    over, reported = _hold_over(incident, st)
+                    if not over:
+                        if incident.status == STATUS_RECOVERING:
+                            driverless.append((incident.id, incident.printer_id))
+                        continue
+                    evidence = f"printer is {reported} not PAUSE"
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
                 await _clear_hold_projection(db, incident.item_id)
                 closed += 1
                 logger.info(
-                    "spool_recovery: startup — printer %s incident %s (%s) closed, printer is %s not PAUSE",
+                    "spool_recovery: startup — printer %s incident %s (%s) closed — %s",
                     incident.printer_id,
                     incident.id,
                     incident.kind,
-                    live,
+                    evidence,
                 )
             open_now = await printer_incidents.rehydrate(db)
         # After the cache rebuild, so a re-entry's own escalate/close writes are the
@@ -3663,7 +4006,7 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
         from backend.app.models.printer import Printer
 
         async with async_session() as db:
-            row = await printer_incidents.get_open(db, printer_id)
+            row = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
             if row is None or row.id != incident_id or row.status != STATUS_RECOVERING:
                 return None  # another lane resolved it between the sweep and here
             settings = await _read_settings(db)
@@ -3744,10 +4087,7 @@ async def _open_runout_incident(db: AsyncSession, printer_id: int):
     WAITING_REASON_RUNOUT", so a foreign print's runout could be neither re-guided
     nor auto-resumed however clearly the wire said what it needed.
     """
-    incident = await printer_incidents.get_open(db, printer_id)
-    if incident is None or incident.kind != KIND_RUNOUT:
-        return None
-    return incident
+    return await printer_incidents.get_open(db, printer_id, kinds={KIND_RUNOUT})
 
 
 async def maybe_refresh_runout_guidance(printer_id: int, new_full_codes, state) -> bool:
@@ -3909,6 +4249,74 @@ async def _resume_ready(db: AsyncSession, printer_id: int, gained: tuple[int, in
     return "ready" if await _open_runout_incident(db, printer_id) is not None else "no"
 
 
+async def _resume_after_evidence(printer_id: int, *, ready, name: str) -> bool:
+    """Settle, re-check, publish ONE resume, confirm RUNNING. Never raises.
+
+    The shared body behind every evidence-driven auto-resume — the runout refill
+    (006-H2S 2026-07-26) and the repaired filament path (003-H2S 2026-09-11). What it
+    owns is the SHAPE, which is the part that must not be re-derived per lane: settle
+    before publishing (a resume sent on the edge itself races the firmware's own
+    settle and is simply rejected), re-ask the caller's evidence AFTER the settle
+    because the world moves, send exactly ONE resume, and stand aside on ANY doubt —
+    no retry, no quarantine, no stamp, the escalation's guidance untouched, so the
+    operator's manual resume stays the reliable path.
+
+    ``ready`` is the lane's own evidence, asked twice; ``name`` names the occasion in
+    every stand-aside line. Returns True only on a CONFIRMED RUNNING — the caller
+    owns what that success means for its own bookkeeping.
+    """
+    try:
+        if not await ready():
+            return False
+
+        # Let the printer register what just happened; see the docstring.
+        await asyncio.sleep(_RUNOUT_RESUME_SETTLE_S)
+
+        st = _get_state(printer_id)
+        if st is not None and getattr(st, "state", None) == "RUNNING":
+            logger.info(
+                "spool_recovery: printer %s already RUNNING after the %s (operator resumed) — auto-resume stood down",
+                printer_id,
+                name,
+            )
+            return False
+        if not await ready():
+            logger.info(
+                "spool_recovery: printer %s %s auto-resume stood down after settle (state/wire/hold changed)",
+                printer_id,
+                name,
+            )
+            return False
+
+        client = printer_manager.get_client(printer_id)
+        if client is None:
+            logger.info("spool_recovery: printer %s has no client — %s auto-resume skipped", printer_id, name)
+            return False
+        if not client.resume_print():
+            logger.info(
+                "spool_recovery: printer %s resume_print send returned False (offline?) — "
+                "%s auto-resume stands aside, escalation guidance stands",
+                printer_id,
+                name,
+            )
+            return False
+        if not await printer_manager.await_state(
+            printer_id, {"RUNNING"}, _RUNOUT_RESUME_CONFIRM_S, poll_interval_s=_POLL_INTERVAL_S
+        ):
+            logger.info(
+                "spool_recovery: printer %s did not reach RUNNING within %.0fs after the %s resume — "
+                "standing aside (no retry); the escalation guidance stands",
+                printer_id,
+                _RUNOUT_RESUME_CONFIRM_S,
+                name,
+            )
+            return False
+        return True
+    except Exception:  # noqa: BLE001 — an assist lane must never crash its caller
+        logger.exception("spool_recovery: %s auto-resume failed for printer %s", name, printer_id)
+        return False
+
+
 async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) -> bool:
     """Resume a runout-held print once the wire says the filament is back.
 
@@ -3917,19 +4325,18 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
     waiting for someone to press Resume. Doctrine rule 1 (minimal human interaction):
     the recoverable half of this state is recoverable without hands.
 
-    ONE body behind TWO spawn sources — the ``ams_presence`` presence-GAIN edge (a
-    roll went in) and :func:`note_demand_watch`'s wire edges (the firmware stopped
+    ONE evidence behind TWO spawn sources — the ``ams_presence`` presence-GAIN edge
+    (a roll went in) and :func:`note_demand_watch`'s wire edges (the firmware stopped
     asking). Before WS2b only the gain edge existed, so the 006 class — a demand
     naming a slot that was ALREADY loaded — could never resume, and auto-resume had
     never fired in production at all.
 
-    Acts only when :func:`_resume_ready` holds on the edge AND again after the
-    settle. On any failure it stands aside — no retry, no quarantine, no
-    out-of-rotation stamp, and the escalation's guidance stays exactly as it was, so
-    the operator's manual resume is still the reliable path. Returns True only on a
-    confirmed RUNNING. Never raises — invariant 10.
+    The resume MECHANICS are :func:`_resume_after_evidence`'s; this owns the evidence
+    (``runout_auto_resume_enabled`` + :func:`_resume_ready`) and the success
+    bookkeeping. Returns True only on a confirmed RUNNING.
     """
-    try:
+
+    async def _ready() -> bool:
         # Cheap, DB-free pre-gate FIRST. This runs on every physical spool insert on
         # every printer, and almost none of them are a runout refill — opening a
         # session before knowing that is pure waste (it showed up as a measurable
@@ -3943,63 +4350,67 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
         async with async_session() as db:
             if not await _read_bool(db, "runout_auto_resume_enabled", _DEFAULT_RUNOUT_AUTO_RESUME):
                 return False
-            if await _resume_ready(db, printer_id, slot) != "ready":
-                return False
+            return await _resume_ready(db, printer_id, slot) == "ready"
 
-        # Let the AMS register the insert; a resume published on the edge itself
-        # races the firmware's tray-state settle and is simply rejected.
-        await asyncio.sleep(_RUNOUT_RESUME_SETTLE_S)
+    if not await _resume_after_evidence(printer_id, ready=_ready, name="refill"):
+        return False
+    await _close_runout_hold_and_notify(printer_id, slot)
+    logger.info(
+        "spool_recovery: printer %s RESUMED automatically after the filament refill (slot %s)",
+        printer_id,
+        slot,
+    )
+    return True
+
+
+async def _resume_after_repair(printer_id: int, incident_id: int) -> bool:
+    """Resume a print whose filament path the operator repaired by hand. Never raises.
+
+    The 003-H2S self-heal, and the other half of what the ``repair`` resolution class
+    means: the commonest fix for a physical fault on this farm is somebody freeing
+    the path and loading a slot at the printer — 23 of the AMS-side physical rows
+    closed on a resume with no filament change at all — after which the print sits
+    PAUSEd for a button nobody is standing there to press.
+
+    Deliberately NOT gated on ``runout_auto_resume_enabled``: that setting is the
+    operator's control over the RUNOUT lane (a refill they may want to inspect before
+    the print continues), and reading it here would make one switch govern two
+    different decisions. The evidence is the gate.
+
+    Its ``ready`` re-asks everything that could have moved: the printer is still
+    PAUSEd, the row is still open and still repair-resolved, it is still the SAME job
+    the fault interrupted, and :func:`_repaired` still holds. On a confirmed RUNNING
+    it logs and does nothing else — the sweep's own (b) arm closes the row after the
+    dwell, so there stays ONE closer.
+    """
+
+    async def _ready() -> bool:
+        st = _get_state(printer_id)
+        if st is None or (getattr(st, "state", None) or "") != "PAUSE":
+            return False
+        job = (getattr(st, "subtask_id", None) or "").strip()
+
+        from backend.app.core.database import async_session
 
         async with async_session() as db:
-            verdict = await _resume_ready(db, printer_id, slot)
-        if verdict == "running":
-            logger.info(
-                "spool_recovery: printer %s already RUNNING after the refill (operator resumed) — "
-                "auto-resume stood down",
-                printer_id,
-            )
-            return False
-        if verdict != "ready":
-            logger.info(
-                "spool_recovery: printer %s refill auto-resume stood down after settle "
-                "(state/wire/hold changed) — slot %s",
-                printer_id,
-                slot,
-            )
-            return False
+            row = await db.get(PrinterIncident, incident_id)
+            if row is None or row.resolved_at is not None:
+                return False
+            if not job or job != (row.job_id or ""):
+                return False
+            resolution = printer_incidents.resolution_class(row.kind, external=printer_incidents.row_external(row))
+            if resolution != RESOLUTION_REPAIR:
+                return False
+            return _repaired(row, st)[0]
 
-        client = printer_manager.get_client(printer_id)
-        if client is None:
-            logger.info("spool_recovery: printer %s has no client — refill auto-resume skipped", printer_id)
-            return False
-        if not client.resume_print():
-            logger.info(
-                "spool_recovery: printer %s resume_print send returned False (offline?) — "
-                "refill auto-resume stands aside, escalation guidance stands",
-                printer_id,
-            )
-            return False
-        if not await printer_manager.await_state(
-            printer_id, {"RUNNING"}, _RUNOUT_RESUME_CONFIRM_S, poll_interval_s=_POLL_INTERVAL_S
-        ):
-            logger.info(
-                "spool_recovery: printer %s did not reach RUNNING within %.0fs after the refill resume — "
-                "standing aside (no retry); the escalation guidance stands",
-                printer_id,
-                _RUNOUT_RESUME_CONFIRM_S,
-            )
-            return False
-
-        await _close_runout_hold_and_notify(printer_id, slot)
-        logger.info(
-            "spool_recovery: printer %s RESUMED automatically after the filament refill (slot %s)",
-            printer_id,
-            slot,
-        )
-        return True
-    except Exception:  # noqa: BLE001 — an assist lane must never crash its caller
-        logger.exception("spool_recovery: refill auto-resume failed for printer %s", printer_id)
+    if not await _resume_after_evidence(printer_id, ready=_ready, name="path repair"):
         return False
+    logger.info(
+        "spool_recovery: printer %s RESUMED automatically after the path repair (incident %s)",
+        printer_id,
+        incident_id,
+    )
+    return True
 
 
 async def maybe_auto_resume_on_refill(printer_id: int, ams_id: int, tray_id: int) -> bool:
@@ -4054,8 +4465,9 @@ def note_demand_watch(printer_id: int, state) -> None:
         # farm must not double-drive (see the docstring).
         externals = frozenset(c.short_code for c in candidates if c.fault_class is AmsFaultClass.RUNOUT_EXTERNAL)
         epoch = int(getattr(state, "connection_epoch", 0) or 0)
+        feeder = _valid_feeder(getattr(state, "tray_now", None))
         prev = _wire_sample.get(printer_id)
-        _wire_sample[printer_id] = (live, demand, externals, epoch)
+        _wire_sample[printer_id] = (live, demand, externals, epoch, feeder)
 
         # Re-arm the faults an aborted close barred, on either wire edge that proves
         # "this is no longer the same standing fault" (see :data:`_blocked`).
@@ -4069,7 +4481,20 @@ def note_demand_watch(printer_id: int, state) -> None:
             # First sample after a (re)start seeds only — a demand that was already
             # gone before we looked is not an edge we witnessed.
             return
-        prev_state, prev_demand, prev_externals, prev_epoch = prev
+        prev_state, prev_demand, prev_externals, prev_epoch, prev_feeder = prev
+
+        # A filament change COMPLETED onto a real feeder — the repair evidence a
+        # ``physical`` hold ends on (:func:`_repaired`). Scoped to one MQTT session
+        # for the same reason every negative edge is: a reconnect re-seeds every wire
+        # fact at once, so a tray "changing" across it is a reading, not an event.
+        if epoch == prev_epoch and feeder is not None and prev_feeder != feeder:
+            _load_completed_at[printer_id] = datetime.utcnow()
+            logger.info(
+                "spool_recovery: printer %s load completed edge tray_now %s->%s",
+                printer_id,
+                prev_feeder if prev_feeder is not None else "none",
+                feeder,
+            )
 
         from backend.app.core.tasks import spawn_background_task
 

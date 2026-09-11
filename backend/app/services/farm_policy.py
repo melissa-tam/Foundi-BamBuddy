@@ -438,8 +438,7 @@ async def on_terminal(
         #    hold, the gate, the page and the bed lift are owed all the same. Gated on
         #    the DB-free projection first, so the ordinary terminal pays nothing.
         if printer_id is not None and queue_item_id is None:
-            projection = printer_incidents.snapshot(printer_id)
-            if projection is not None and projection.get("kind") == KIND_PLATE_VISION:
+            if printer_incidents.snapshot(printer_id, kind=KIND_PLATE_VISION) is not None:
                 await _on_plate_vision_terminal(db, batch=None, item=None, printer_id=printer_id)
                 return
 
@@ -830,17 +829,11 @@ async def _on_plate_vision_terminal(
         logger.info("farm_policy: plate-check terminal with no printer — nothing to decide")
         return
 
-    incident = await printer_incidents.get_open(db, printer_id)
-    if incident is not None and incident.kind != KIND_PLATE_VISION:
-        # Another fault took the printer between the stop and the terminal; it owns the
-        # hold now (one open incident per printer) and this lane must not re-decide it.
-        logger.info(
-            "farm_policy: printer %s plate-check terminal, but an open %s incident owns the printer — "
-            "leaving the hold to it",
-            printer_id,
-            incident.kind,
-        )
-        return
+    # Its OWN row: since 2026-09-11 a printer can hold more than one incident, so an
+    # AMS fault standing beside the trip neither owns the plate nor pre-empts this
+    # decision (the "another kind owns the printer" stand-aside was an artifact of
+    # one-open-per-printer and is gone).
+    incident = await printer_incidents.get_open(db, printer_id, kinds={KIND_PLATE_VISION})
     if incident is None and item is None:
         return  # the foreign hold was already decided (idempotent re-entry)
     if incident is not None and incident.status == STATUS_ESCALATED:
@@ -1208,7 +1201,7 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
     # keep the chip lit and the eject lane refusing on a printer a human just cleared.
     # Scoped by the incident model's own RESOLVES_ON table inside the lane: a
     # wire-resolved hold (a runout, say) is NOT answered by somebody clearing a plate.
-    await pause_recovery.on_plate_cleared(printer_id)
+    await pause_recovery.on_plate_cleared(printer_id, recover=True)
 
     # 2. Quarantine — idempotent; report whether it was actually set.
     quarantine_cleared = bool(printer.quarantined)

@@ -56,6 +56,7 @@ from backend.app.models.printer_incident import (
     KIND_RUNOUT,
     KIND_Z_REFERENCE_LOST,
     STATUS_ESCALATED,
+    STATUS_RECOVERING,
 )
 from backend.app.services import notify_dedup
 from backend.app.services.hms_errors import current_runout_demand
@@ -555,7 +556,14 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
                 _dead_claim_since.pop(item.id, None)
                 continue
 
-            if await printer_incidents.get_open(db, pid) is not None or spool_recovery.has_live_recovery(pid):
+            # Guard 6, narrowed 2026-09-11: stand down only while somebody is ACTING
+            # on the printer — a ``recovering`` row (a driver, or the startup re-entry's
+            # own lane) or a live recovery task. An ESCALATED hold is a human's, not an
+            # actor that can land a print, and under the equipment-fault model it can
+            # be PERMANENT: 003-H2S's item 1988 (dispatched, never started, behind a
+            # physical hold the terminal no longer launders) must still be released.
+            acting = any(row.status == STATUS_RECOVERING for row in await printer_incidents.open_rows(db, pid))
+            if acting or spool_recovery.has_live_recovery(pid):
                 _dead_claim_since.pop(item.id, None)
                 continue
 
@@ -839,9 +847,13 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
     KIND_RUNOUT: (
         "Filament runout STILL not resolved — the printer remains held awaiting a same-slot refill." + _IDLE_HELD_SUFFIX
     ),
+    # The REPAIR class (2026-09-11): the wire never reports a repaired path, so the
+    # suffix's "until the fault clears on the wire" would send the operator to wait for
+    # an event that cannot happen. Name the two exits instead.
     KIND_PHYSICAL: (
-        "A physical filament fault is STILL unresolved — the printer remains held and no swap can clear it."
-        + _IDLE_HELD_SUFFIX
+        "A physical filament fault is STILL unresolved — the printer remains held and no swap can clear it. "
+        "The printer is not paused — it is idle and will take no work until a filament change completes "
+        "through the path (load a slot on the printer) or an operator presses Recover."
     ),
     # The three pause-cause kinds hold an IDLE printer as their NORMAL shape — the farm
     # stopped the print (plate check) or never had one running (a lost Z reference on an

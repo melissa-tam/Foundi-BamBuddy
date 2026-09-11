@@ -20,7 +20,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.settings import Settings
 from backend.app.models.smart_plug import SmartPlug
-from backend.app.services import notify_dedup
+from backend.app.services import notify_dedup, printer_incidents
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     cleanup_downloaded_3mf,
@@ -189,22 +189,27 @@ def _busy_cause(
             causes.append("standing fault " + ",".join(sorted({c.short_code for c in faults})))
         if ams_mid_filament_change(state):
             causes.append("AMS mid filament-change (ams_status_main=1)")
+    if printer_incidents.hold_blocks_dispatch(printer_id):
+        causes.append("open incident(s) " + ",".join(sorted(printer_incidents.open_kinds(printer_id))))
     return "; ".join(causes) if causes else "unattributed"
 
 
 def _incident_summary(printer_id: int) -> str:
-    """The printer's OPEN AMS incident as one log token, or ``-``.
+    """The printer's OPEN incidents as one log token (``kind/status[@slot]+…``), or ``-``.
 
-    Reads the projection cache (``printer_incidents.snapshot`` — sync, DB-free,
+    Reads the projection cache (``printer_incidents.snapshots`` — sync, DB-free,
     built for exactly this kind of read), so the diagnostic never costs a query.
+    EVERY open row, highest precedence first: since 2026-09-11 a printer can hold
+    more than one, and a line that named only the first would explain half a refusal.
     """
-    from backend.app.services import printer_incidents
-
-    snap = printer_incidents.snapshot(printer_id)
-    if not snap:
+    snaps = printer_incidents.snapshots(printer_id)
+    if not snaps:
         return "-"
-    slot = snap.get("slot_desc")
-    return f"{snap.get('kind')}/{snap.get('status')}" + (f"@{slot}" if slot else "")
+    parts = []
+    for snap in snaps:
+        slot = snap.get("slot_desc")
+        parts.append(f"{snap.get('kind')}/{snap.get('status')}" + (f"@{slot}" if slot else ""))
+    return "+".join(parts)
 
 
 def _present_candidates(loaded: list[dict]) -> list[dict]:
@@ -2071,6 +2076,24 @@ class PrintScheduler:
                 state.state,
             )
             return self._refuse(printer_id, "ams_filament_change")
+
+        # The EQUIPMENT RECORD (2026-09-11, 003-H2S). The union of two facts with one
+        # owner each: the wire (above) owns "a fault stands NOW", the incident row owns
+        # "an unresolved hold exists". Neither answers the other's question — on
+        # 003-H2S the firmware wiped its HMS list at every terminal, so the wire read
+        # clean while filament was still physically stuck in the shared PTFE path, and
+        # the next unit dispatched into it. Three times. ``hold_blocks_dispatch`` is
+        # the ONE origin (every open kind blocks: a plate-vision or lost-Z row is
+        # already plate-gated, a power-loss row is an unanswered prompt, an AMS row is
+        # a fault the wire may have stopped reporting). This also holds the auto-drying
+        # idle arm off a held printer. The eject lane stays UNGATED (08-29 gotcha d):
+        # ``plate_occupancy.ejectable`` never consults this — a sweep is filament-less,
+        # and gating it behind a filament fault would deadlock the plate that holds
+        # the printer.
+        if printer_incidents.hold_blocks_dispatch(printer_id):
+            kinds = ",".join(sorted(printer_incidents.open_kinds(printer_id)))
+            logger.debug("Printer %d: not idle — open incident(s) %s (state=%s)", printer_id, kinds, state.state)
+            return self._refuse(printer_id, f"incident:{kinds}")
 
         # Ownership, in one question. ``plate_occupied`` is the unconditional gate
         # (Phase 1, P1-B) — it no longer keys on the global require_plate_clear

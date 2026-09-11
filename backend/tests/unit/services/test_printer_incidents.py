@@ -48,7 +48,11 @@ async def _open(db, printer_id, **kw):
 
 
 class TestOneOpenIncidentPerPrinter:
-    async def test_a_second_open_incident_is_refused(self, db_session, printer_factory):
+    """Exclusivity is per (printer, KIND) since 2026-09-11 — an asset carries
+    concurrent alarms — with the three AMS kinds still mutually exclusive among
+    themselves, because they are three readings of ONE AMS."""
+
+    async def test_a_second_open_AMS_incident_is_refused(self, db_session, printer_factory):
         printer = await printer_factory()
         first = await _open(db_session, printer.id)
         assert first is not None
@@ -59,11 +63,12 @@ class TestOneOpenIncidentPerPrinter:
         rows = (await db_session.execute(text("SELECT COUNT(*) FROM printer_incident"))).scalar()
         assert rows == 1
 
-    async def test_the_partial_index_refuses_a_bypassing_write(self, db_session, printer_factory):
+    async def test_the_ams_index_refuses_a_bypassing_write(self, db_session, printer_factory):
         """The real enforcement: a caller that bypasses ``open_new`` dies loudly.
 
-        A dict could be emptied by a restart; this cannot. The index is PARTIAL, so
-        it constrains only rows with ``resolved_at IS NULL``."""
+        A dict could be emptied by a restart; this cannot. Both indexes are PARTIAL,
+        so they constrain only rows with ``resolved_at IS NULL`` — and this one is
+        what keeps ONE AMS from carrying a jam row and a physical row at once."""
         from datetime import datetime
 
         printer = await printer_factory()
@@ -77,6 +82,48 @@ class TestOneOpenIncidentPerPrinter:
                 kind=KIND_JAM,
                 code="0700_8010",
                 codes="jam:0700_8010",
+                status=STATUS_RECOVERING,
+                created_at=datetime.utcnow(),
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await db_session.commit()
+        await db_session.rollback()
+
+    async def test_a_pause_cause_hold_opens_beside_an_ams_fault(self, db_session, printer_factory):
+        """THE 2026-09-04 collision, closed. ``pause_recovery._open_z_reference_hold``
+        used to get ``None`` from ``open_new`` on a printer that already carried a jam
+        — and ``eject.remote.z_reference_evidence`` then let a sweep run against a Z
+        datum the reboot had destroyed."""
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        assert await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010") is not None
+
+        z_hold = await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+
+        assert z_hold is not None
+        assert {row.kind for row in await printer_incidents.open_rows(db_session, printer.id)} == {
+            KIND_JAM,
+            KIND_Z_REFERENCE_LOST,
+        }
+
+    async def test_a_second_row_of_the_SAME_kind_is_still_refused(self, db_session, printer_factory):
+        from datetime import datetime
+
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="0500_808C")
+
+        db_session.add(
+            PrinterIncident(
+                printer_id=printer.id,
+                job_id="task-2",
+                item_id=None,
+                kind=KIND_PLATE_VISION,
+                code="0500_806E",
+                codes="0500_806E",
                 status=STATUS_RECOVERING,
                 created_at=datetime.utcnow(),
             )
@@ -154,7 +201,36 @@ class TestClose:
 
     async def test_close_open_for_printer_reports_nothing_to_close(self, db_session, printer_factory):
         printer = await printer_factory()
-        assert await printer_incidents.close_open_for_printer(db_session, printer.id, source="terminal") is None
+        assert await printer_incidents.close_open_for_printer(db_session, printer.id, source="terminal") == []
+
+    async def test_close_open_for_printer_closes_every_open_row(self, db_session, printer_factory):
+        """It is a printer-scoped verb, and a printer can now hold more than one."""
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:x")
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+
+        closed = await printer_incidents.close_open_for_printer(db_session, printer.id, source="terminal")
+
+        assert {row.kind for row in closed} == {KIND_JAM, KIND_Z_REFERENCE_LOST}
+        assert await printer_incidents.open_rows(db_session, printer.id) == []
+
+    async def test_close_open_for_printer_can_be_scoped_to_kinds(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import AMS_FAULT_KINDS, KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:x")
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+
+        closed = await printer_incidents.close_open_for_printer(
+            db_session, printer.id, source="terminal", kinds=AMS_FAULT_KINDS
+        )
+
+        assert [row.kind for row in closed] == [KIND_JAM]
+        assert [row.kind for row in await printer_incidents.open_rows(db_session, printer.id)] == [
+            KIND_Z_REFERENCE_LOST
+        ]
 
 
 class TestAlreadyHandledAndFlapCap:
@@ -298,6 +374,124 @@ class TestMigration:
         finally:
             await engine.dispose()
 
+    async def test_an_old_single_column_index_is_re_keyed_once(self, tmp_path):
+        """The 2026-09-11 re-key, against a database carrying the OLD shape.
+
+        ``ux_printer_incident_open`` was ``(printer_id) WHERE resolved_at IS NULL``,
+        which is what made a lost-Z hold unopenable beside an AMS fault. The migration
+        drops it, re-creates it on ``(printer_id, kind)`` and adds the AMS-exclusion
+        index beside it — once, marker-keyed, on the same boot the new DDL runs."""
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        import backend.app.core.database as core_db
+
+        db_path = tmp_path / "rekey.db"
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(core_db.Base.metadata.create_all)
+                # Re-create the PRE-cutover shape the way the old code left it.
+                await conn.execute(text("DROP INDEX IF EXISTS ux_printer_incident_open"))
+                await conn.execute(text("DROP INDEX IF EXISTS ux_printer_incident_open_ams"))
+                await conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX ux_printer_incident_open "
+                        "ON printer_incident (printer_id) WHERE resolved_at IS NULL"
+                    )
+                )
+
+            async with engine.begin() as conn:
+                await core_db.run_migrations(conn)
+
+            async with engine.connect() as conn:
+                cols = {
+                    name: [r[2] for r in (await conn.execute(text(f"PRAGMA index_info('{name}')"))).all()]
+                    for (_seq, name, _unique, _origin, _partial) in (
+                        await conn.execute(text("PRAGMA index_list('printer_incident')"))
+                    ).all()
+                }
+                ams_sql = (
+                    await conn.execute(
+                        text("SELECT sql FROM sqlite_master WHERE type='index' AND name='ux_printer_incident_open_ams'")
+                    )
+                ).scalar()
+                marker = (
+                    await conn.execute(
+                        text("SELECT COUNT(*) FROM settings WHERE key = 'migration_incident_index_per_kind_20260911'")
+                    )
+                ).scalar()
+
+            assert cols["ux_printer_incident_open"] == ["printer_id", "kind"]
+            assert cols["ux_printer_incident_open_ams"] == ["printer_id"]
+            for kind in ("jam", "physical", "runout"):
+                assert f"'{kind}'" in (ams_sql or "")
+            assert marker == 1
+
+            # A second boot is a no-op: the marker is written, nothing is dropped.
+            async with engine.begin() as conn:
+                await core_db.run_migrations(conn)
+            async with engine.connect() as conn:
+                again = {
+                    name: [r[2] for r in (await conn.execute(text(f"PRAGMA index_info('{name}')"))).all()]
+                    for (_seq, name, _unique, _origin, _partial) in (
+                        await conn.execute(text("PRAGMA index_list('printer_incident')"))
+                    ).all()
+                }
+                marker_again = (
+                    await conn.execute(
+                        text("SELECT COUNT(*) FROM settings WHERE key = 'migration_incident_index_per_kind_20260911'")
+                    )
+                ).scalar()
+            assert again == cols
+            assert marker_again == 1
+        finally:
+            await engine.dispose()
+
+    async def test_the_migrated_indexes_enforce_the_new_contract(self, tmp_path):
+        """The indexes are the ENFORCEMENT, so the pin is what the database refuses:
+        a second open AMS row dies, a pause-cause row beside a jam commits."""
+        from datetime import datetime
+
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        import backend.app.core.database as core_db
+
+        db_path = tmp_path / "enforce.db"
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(core_db.Base.metadata.create_all)
+                await core_db.run_migrations(conn)
+
+            def _row(kind: str, code: str) -> dict:
+                return {
+                    "printer_id": 1,
+                    "job_id": "task-1",
+                    "kind": kind,
+                    "code": code,
+                    "codes": code,
+                    "status": STATUS_RECOVERING,
+                    "created_at": datetime.utcnow(),
+                }
+
+            insert = text(
+                "INSERT INTO printer_incident (printer_id, job_id, kind, code, codes, status, created_at) "
+                "VALUES (:printer_id, :job_id, :kind, :code, :codes, :status, :created_at)"
+            )
+            # No ``printers`` row: the fork sets no ``PRAGMA foreign_keys=ON`` (see
+            # ``core/database`` ~4042), and what is under test here is the two partial
+            # UNIQUE indexes, not referential integrity.
+            async with engine.begin() as conn:
+                await conn.execute(insert, _row(KIND_JAM, "0700_8010"))
+                # A pause-cause hold beside it: this is the collision the re-key opens.
+                await conn.execute(insert, _row("z_reference_lost", ""))
+
+            with pytest.raises(IntegrityError):
+                async with engine.begin() as conn:
+                    await conn.execute(insert, _row(KIND_PHYSICAL, "0700_8004"))
+        finally:
+            await engine.dispose()
+
 
 class TestWaitingReasonVocabulary:
     """The kind -> token table, moved here 2026-09-04 from ``spool_recovery``.
@@ -356,25 +550,77 @@ class TestWaitingReasonVocabulary:
         assert printer_incidents.WAITING_REASON_PLATE_VISION == "plate_not_empty_printer_detected"
 
 
-class TestResolvesOnOperator:
+class TestResolutionClass:
+    """``RESOLVES_ON`` keyed on ``(kind, external)`` — the return-to-normal rule.
+
+    ``resolves_on_operator`` is DELETED: with three classes a boolean could only ever
+    answer one of the three questions, and the two paths that used it were already
+    asking "may the wire close this?", which is not the complement of "does a human
+    close this?" any more.
+    """
+
     async def test_the_pause_cause_kinds_that_need_hands_are_operator_resolved(self):
-        from backend.app.models.printer_incident import KIND_PLATE_VISION, KIND_Z_REFERENCE_LOST
+        from backend.app.models.printer_incident import (
+            KIND_PLATE_VISION,
+            KIND_Z_REFERENCE_LOST,
+            RESOLUTION_OPERATOR,
+        )
 
-        assert printer_incidents.resolves_on_operator(KIND_PLATE_VISION) is True
-        assert printer_incidents.resolves_on_operator(KIND_Z_REFERENCE_LOST) is True
+        assert printer_incidents.resolution_class(KIND_PLATE_VISION) == RESOLUTION_OPERATOR
+        assert printer_incidents.resolution_class(KIND_Z_REFERENCE_LOST) == RESOLUTION_OPERATOR
 
-    async def test_wire_resolved_kinds_are_not(self):
+    async def test_wire_resolved_kinds(self):
         """Power loss included: the prompt clearing IS a wire fact, so that hold closes
         itself when the printer starts printing again."""
-        from backend.app.models.printer_incident import KIND_POWER_LOSS
+        from backend.app.models.printer_incident import KIND_POWER_LOSS, RESOLUTION_WIRE
 
-        for kind in (KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL, KIND_POWER_LOSS):
-            assert printer_incidents.resolves_on_operator(kind) is False
+        for kind in (KIND_JAM, KIND_RUNOUT, KIND_POWER_LOSS):
+            assert printer_incidents.resolution_class(kind) == RESOLUTION_WIRE
+
+    async def test_an_ams_physical_fault_resolves_on_REPAIR(self):
+        """The 003-H2S finding: every AMS-side physical row ever closed on this farm
+        closed at a TERMINAL (the laundering) or at a resume — never because the wire
+        went quiet, which it does at every terminal whether or not anything was
+        fixed."""
+        from backend.app.models.printer_incident import RESOLUTION_REPAIR
+
+        assert printer_incidents.resolution_class(KIND_PHYSICAL) == RESOLUTION_REPAIR
+        assert printer_incidents.resolution_class(KIND_PHYSICAL, external=False) == RESOLUTION_REPAIR
+
+    async def test_an_EXTERNAL_physical_fault_resolves_on_the_wire(self):
+        """All 8 physical rows ever closed ``wire_clear`` were external-holder PROMPT
+        codes (``07FF_C012`` x3, ``07FF_C011`` x4, ``07FF_0004`` x1, each open
+        126-254 s): the human presses Continue on the screen and the code clears, so
+        the wire IS their return-to-normal."""
+        from backend.app.models.printer_incident import RESOLUTION_WIRE
+
+        assert printer_incidents.resolution_class(KIND_PHYSICAL, external=True) == RESOLUTION_WIRE
+
+    async def test_an_external_variant_falls_back_to_the_registered_kind(self):
+        """The pause-cause kinds have no external row at all — asking for one must not
+        raise, it must answer the kind's own rule."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION, RESOLUTION_OPERATOR
+
+        assert printer_incidents.resolution_class(KIND_PLATE_VISION, external=True) == RESOLUTION_OPERATOR
 
     async def test_an_unregistered_kind_is_wire_resolved(self):
-        """The safe direction: a hold that closes too readily is visible, one that never
-        closes blocks the printer forever."""
-        assert printer_incidents.resolves_on_operator("no_such_kind") is False
+        """The safe direction, unchanged: a hold that closes too readily is visible,
+        one that never closes blocks the printer forever."""
+        from backend.app.models.printer_incident import RESOLUTION_WIRE
+
+        assert printer_incidents.resolution_class("no_such_kind") == RESOLUTION_WIRE
+
+    async def test_row_external_is_read_from_the_taxonomy(self, db_session, printer_factory):
+        """ONE derivation of a row's externality — the classifier's own verdict over
+        the row's durable ``code`` (doctrine invariant 1), the same one the chip's
+        ``slot_desc`` reads."""
+        printer = await printer_factory()
+        ams = await _open(db_session, printer.id, kind=KIND_PHYSICAL, code="0700_8004", codes="physical_fault:x")
+        assert printer_incidents.row_external(ams) is False
+
+        await printer_incidents.close(db_session, ams.id, status=STATUS_RESOLVED, source="terminal")
+        holder = await _open(db_session, printer.id, kind=KIND_PHYSICAL, code="07FF_C011", codes="physical_fault:y")
+        assert printer_incidents.row_external(holder) is True
 
 
 class TestCountRecent:
@@ -474,3 +720,158 @@ class TestCachedKind:
         await printer_incidents.rehydrate(db_session)
 
         assert printer_incidents.cached_kind(printer.id, row.id) == KIND_PHYSICAL
+
+
+class TestPrecedenceAndDispatchGate:
+    """A printer may hold several faults; a SINGLE-SLOT reader must pick one, always
+    the same one. ``KIND_PRECEDENCE`` is that order, and its AMS head mirrors
+    ``spool_recovery._CLASS_PRECEDENCE``."""
+
+    async def test_get_open_returns_the_highest_precedence_row(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+        await _open(db_session, printer.id, kind=KIND_JAM, code="0700_8010", codes="jam:x")
+
+        # The AMS fault interrupted the running print — it is named first.
+        assert (await printer_incidents.get_open(db_session, printer.id)).kind == KIND_JAM
+
+    async def test_get_open_can_be_scoped_to_kinds(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import AMS_FAULT_KINDS, KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+        await _open(db_session, printer.id, kind=KIND_JAM, code="0700_8010", codes="jam:x")
+
+        scoped = await printer_incidents.get_open(db_session, printer.id, kinds={KIND_Z_REFERENCE_LOST})
+        assert scoped.kind == KIND_Z_REFERENCE_LOST
+        assert (await printer_incidents.get_open(db_session, printer.id, kinds=AMS_FAULT_KINDS)).kind == KIND_JAM
+        assert await printer_incidents.get_open(db_session, printer.id, kinds={KIND_RUNOUT}) is None
+
+    async def test_open_rows_is_oldest_first(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        printer = await printer_factory()
+        first = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="a")
+        second = await _open(db_session, printer.id, kind=KIND_JAM, code="0700_8010", codes="b")
+
+        assert [row.id for row in await printer_incidents.open_rows(db_session, printer.id)] == [
+            first.id,
+            second.id,
+        ]
+
+    async def test_snapshot_picks_by_precedence_and_can_be_asked_by_kind(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+        await _open(db_session, printer.id, kind=KIND_PHYSICAL, code="0700_8004", codes="physical_fault:x")
+
+        assert printer_incidents.snapshot(printer.id)["kind"] == KIND_PHYSICAL
+        assert printer_incidents.snapshot(printer.id, kind=KIND_Z_REFERENCE_LOST)["kind"] == KIND_Z_REFERENCE_LOST
+        assert printer_incidents.snapshot(printer.id, kind=KIND_RUNOUT) is None
+
+    async def test_open_kinds_and_the_dispatch_gate(self, db_session, printer_factory):
+        """``hold_blocks_dispatch`` is THE one origin of "this printer carries an
+        unresolved hold", read by the scheduler beside the WIRE gate. EVERY open kind
+        blocks: a plate-vision or lost-Z row is already plate-gated, and a power-loss
+        row means the prompt is still unanswered."""
+        from backend.app.models.printer_incident import KIND_POWER_LOSS
+
+        printer = await printer_factory()
+        assert printer_incidents.open_kinds(printer.id) == frozenset()
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is False
+
+        row = await _open(db_session, printer.id, kind=KIND_POWER_LOSS, code="0300_8007", codes="0300_8007")
+
+        assert printer_incidents.open_kinds(printer.id) == frozenset({KIND_POWER_LOSS})
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is True
+
+        await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source="terminal")
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is False
+
+    async def test_the_cache_holds_every_open_row_of_a_printer(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="a")
+        jam = await _open(db_session, printer.id, kind=KIND_JAM, code="0700_8010", codes="b")
+        assert printer_incidents.open_kinds(printer.id) == frozenset({KIND_PLATE_VISION, KIND_JAM})
+
+        await printer_incidents.close(db_session, jam.id, status=STATUS_RESOLVED, source="terminal")
+
+        # Closing ONE row must not take the printer's other hold out of the chip.
+        assert printer_incidents.open_kinds(printer.id) == frozenset({KIND_PLATE_VISION})
+        assert printer_incidents.snapshot(printer.id)["kind"] == KIND_PLATE_VISION
+
+    async def test_rehydrate_rebuilds_every_open_row(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_JAM, code="0700_8010", codes="b")
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+        printer_incidents._reset_state()  # the restart
+
+        assert await printer_incidents.rehydrate(db_session) == 2
+
+        assert printer_incidents.open_kinds(printer.id) == frozenset({KIND_JAM, KIND_Z_REFERENCE_LOST})
+
+
+class TestUpgrade:
+    """A standing fault that turns out to be WORSE re-classifies the row it is already
+    carrying instead of being refused. 003-H2S: ``0700_0012`` arrived 1.2 s before
+    ``0700_8004``, so the row opened ``jam`` — CONTINUE, an out-of-rotation stamp on a
+    healthy spool, two unloads against filament that cannot retract."""
+
+    async def test_it_rewrites_the_live_fingerprint_and_refreshes_the_cache(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, code="0700_0012", codes="mechanical_feed:0700_0012")
+
+        upgraded = await printer_incidents.upgrade(
+            db_session,
+            row.id,
+            kind=KIND_PHYSICAL,
+            code="0700_8004",
+            codes="physical_fault:0700_8004,mechanical_feed:0700_0012",
+            slot_global_tray=1,
+        )
+
+        assert upgraded is not None
+        assert (upgraded.kind, upgraded.code, upgraded.slot_global_tray) == (KIND_PHYSICAL, "0700_8004", 1)
+        assert upgraded.codes == "physical_fault:0700_8004,mechanical_feed:0700_0012"
+        # A live driver learns of the re-classification through exactly this reader.
+        assert printer_incidents.cached_kind(printer.id, row.id) == KIND_PHYSICAL
+        assert printer_incidents.snapshot(printer.id)["kind"] == KIND_PHYSICAL
+
+    async def test_it_keeps_the_row_open_and_its_id(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, code="0700_0012", codes="a")
+
+        upgraded = await printer_incidents.upgrade(
+            db_session, row.id, kind=KIND_PHYSICAL, code="0700_8004", codes="b", slot_global_tray=None
+        )
+
+        assert upgraded.id == row.id
+        assert upgraded.resolved_at is None
+        assert len(await printer_incidents.open_rows(db_session, printer.id)) == 1
+
+    async def test_a_closed_row_cannot_be_upgraded(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, code="0700_0012", codes="a")
+        await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source="terminal")
+
+        assert (
+            await printer_incidents.upgrade(
+                db_session, row.id, kind=KIND_PHYSICAL, code="0700_8004", codes="b", slot_global_tray=None
+            )
+            is None
+        )
+
+    async def test_a_missing_row_answers_none(self, db_session):
+        assert (
+            await printer_incidents.upgrade(
+                db_session, 987654, kind=KIND_PHYSICAL, code="0700_8004", codes="b", slot_global_tray=None
+            )
+            is None
+        )

@@ -957,12 +957,40 @@ class TestDeadDispatchClaims:
         db_session.expunge_all()
         assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
 
-    async def test_an_open_incident_owns_the_printer(self, db_session):
-        """Guard 6 — and the reason the wire-clear sweep runs FIRST in the tick: an
-        incident can only DELAY a release, never cause a wrong one."""
+    async def test_an_escalated_hold_no_longer_delays_the_release(self, db_session):
+        """Guard 6, narrowed 2026-09-11: an ESCALATED hold is a human's, not an actor
+        that can land a print, and a physical one can now be PERMANENT — 003-H2S's
+        item 1988 (dispatched, never started, behind such a hold) must still be
+        released."""
         item = await _add_claim(db_session, 29)
         await _add_incident_held(db_session, 29, "physical", item=False, pos=2)
         mgr = _FakeManager({29: True}, {29: _FakeState("IDLE")})
+
+        await _mature(db_session, mgr)
+
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).status == "pending"
+
+    async def test_a_recovering_incident_owns_the_printer(self, db_session):
+        """Guard 6 — the half that stays: a ``recovering`` row is a driver (or the
+        startup re-entry's own lane) ACTING on the printer, and the sweep can only
+        DELAY a release, never cause a wrong one."""
+        from backend.app.models.printer_incident import STATUS_RECOVERING
+        from backend.app.services import printer_incidents
+
+        item = await _add_claim(db_session, 30)
+        await printer_incidents.open_new(
+            db_session,
+            printer_id=30,
+            job_id="task-1",
+            item_id=None,
+            kind="jam",
+            code="0700_8010",
+            codes="jam:seeded",
+            slot_global_tray=None,
+            status=STATUS_RECOVERING,
+        )
+        mgr = _FakeManager({30: True}, {30: _FakeState("IDLE")})
 
         await _mature(db_session, mgr)
 
@@ -1049,7 +1077,9 @@ class TestDeadDispatchClaims:
             core_db, "async_session", async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         )
         item = await _add_claim(db_session, 41)
-        await _add_incident_held(db_session, 41, "physical", item=False, pos=2)
+        # A JAM (the WIRE resolution class): since 2026-09-11 an AMS physical fault is
+        # REPAIR-resolved and does not close on a clean wire alone.
+        await _add_incident_held(db_session, 41, "jam", item=False, pos=2)
         state = _FakeState("IDLE")  # connected, idle, wire CLEAN
         monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: state)
         monkeypatch.setattr(spool_recovery.printer_manager, "is_connected", lambda _pid: True)
