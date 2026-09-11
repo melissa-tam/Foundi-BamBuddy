@@ -789,8 +789,9 @@ describe('SettingsPage', () => {
       });
       await user.click(screen.getByText('Farm'));
 
+      // The switch carries its caption as its accessible name (SettingSwitch).
       await waitFor(() => {
-        expect(screen.getByText('Idle bed park')).toBeInTheDocument();
+        expect(screen.getByRole('checkbox', { name: 'Idle bed park' })).toBeInTheDocument();
       });
 
       // mockSettings omits both keys, so the component's `?? default` fallbacks show.
@@ -847,12 +848,10 @@ describe('SettingsPage', () => {
       });
       await user.click(screen.getByText('Farm'));
 
-      const row = await waitFor(() => {
-        const found = screen.getByText('Idle bed park').closest('.justify-between');
-        expect(found).not.toBeNull();
-        return found as HTMLElement;
-      });
-      await user.click(within(row).getByRole('checkbox'));
+      const toggle = await waitFor(() =>
+        screen.getByRole('checkbox', { name: 'Idle bed park' }),
+      );
+      await user.click(toggle);
 
       await waitFor(
         () => {
@@ -884,25 +883,36 @@ describe('SettingsPage', () => {
   });
 
   describe('Farm tab — eject cooldown', () => {
-    // The aux fan runs from the end of the print until the eject dispatches, so
-    // it sits with the other cooldown-wait controls. 0 is the off state — there
-    // is deliberately no separate toggle.
-    it('renders the aux fan control seeded to its default', async () => {
-      const user = userEvent.setup();
-      render(<SettingsPage />);
-
+    // Both cooldown fans run from the end of the print until the eject
+    // dispatches, each behind its own switch (the switch is the off — a speed
+    // of 0 no longer means "off"). The aux fan holds one speed throughout; the
+    // chamber fan boosts while the chamber air is still above the eject
+    // temperature, then steps to its sustain speed.
+    const openFarmTab = async (user: ReturnType<typeof userEvent.setup>) => {
       await waitFor(() => {
         expect(screen.getByText('Farm')).toBeInTheDocument();
       });
       await user.click(screen.getByText('Farm'));
+    };
 
-      const auxFan = await waitFor(
-        () => screen.getByLabelText('Aux fan during cooldown (%)') as HTMLInputElement,
+    it('renders the aux fan switch and speed seeded to their defaults', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const toggle = await waitFor(
+        () =>
+          screen.getByRole('checkbox', { name: 'Aux fan during cooldown' }) as HTMLInputElement,
       );
-      // mockSettings omits the key, so the component's `?? 100` fallback shows.
+      // mockSettings omits the keys, so the component's `??` fallbacks show.
+      expect(toggle.checked).toBe(true);
+
+      const auxFan = screen.getByLabelText('Aux fan speed (%)') as HTMLInputElement;
       expect(auxFan.value).toBe('100');
-      expect(auxFan).toHaveAttribute('min', '0');
+      // 1 is the floor now: the switch owns off, not the speed.
+      expect(auxFan).toHaveAttribute('min', '1');
       expect(auxFan).toHaveAttribute('max', '100');
+      expect(auxFan.disabled).toBe(false);
     });
 
     it('round-trips the aux fan speed through the save endpoint', async () => {
@@ -916,13 +926,9 @@ describe('SettingsPage', () => {
 
       const user = userEvent.setup();
       render(<SettingsPage />);
+      await openFarmTab(user);
 
-      await waitFor(() => {
-        expect(screen.getByText('Farm')).toBeInTheDocument();
-      });
-      await user.click(screen.getByText('Farm'));
-
-      const auxFan = await waitFor(() => screen.getByLabelText('Aux fan during cooldown (%)'));
+      const auxFan = await waitFor(() => screen.getByLabelText('Aux fan speed (%)'));
       fireEvent.change(auxFan, { target: { value: '60' } });
 
       await waitFor(
@@ -934,17 +940,13 @@ describe('SettingsPage', () => {
       );
     });
 
-    it('clamps the aux fan speed to 0-100', async () => {
+    it('clamps the aux fan speed to 1-100', async () => {
       const user = userEvent.setup();
       render(<SettingsPage />);
-
-      await waitFor(() => {
-        expect(screen.getByText('Farm')).toBeInTheDocument();
-      });
-      await user.click(screen.getByText('Farm'));
+      await openFarmTab(user);
 
       const auxFan = await waitFor(
-        () => screen.getByLabelText('Aux fan during cooldown (%)') as HTMLInputElement,
+        () => screen.getByLabelText('Aux fan speed (%)') as HTMLInputElement,
       );
       // Step off the default first so each clamp below is a real state change.
       fireEvent.change(auxFan, { target: { value: '50' } });
@@ -952,7 +954,161 @@ describe('SettingsPage', () => {
       fireEvent.change(auxFan, { target: { value: '150' } });
       expect(auxFan.value).toBe('100');
       fireEvent.change(auxFan, { target: { value: '-5' } });
-      expect(auxFan.value).toBe('0');
+      expect(auxFan.value).toBe('1');
+    });
+
+    it('switching the aux fan off saves and disables its speed', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const toggle = await waitFor(() =>
+        screen.getByRole('checkbox', { name: 'Aux fan during cooldown' }),
+      );
+      await user.click(toggle);
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_cooldown_aux_fan_enabled).toBe(false);
+        },
+        { timeout: 5000 },
+      );
+      expect((screen.getByLabelText('Aux fan speed (%)') as HTMLInputElement).disabled).toBe(true);
+    });
+
+    it('renders the chamber fan switch with its boost and sustain speeds', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const toggle = await waitFor(
+        () =>
+          screen.getByRole('checkbox', {
+            name: 'Chamber fan during cooldown',
+          }) as HTMLInputElement,
+      );
+      expect(toggle.checked).toBe(true);
+
+      const boost = screen.getByLabelText('Chamber fan boost speed (%)') as HTMLInputElement;
+      expect(boost.value).toBe('100');
+      expect(boost).toHaveAttribute('min', '1');
+      expect(boost).toHaveAttribute('max', '100');
+
+      // The sustain speed may legitimately be 0 ("stop the fan once the
+      // chamber is at the eject temperature"), so its floor is 0, not 1.
+      const sustain = screen.getByLabelText('Chamber fan speed after boost (%)') as HTMLInputElement;
+      expect(sustain.value).toBe('50');
+      expect(sustain).toHaveAttribute('min', '0');
+      expect(sustain).toHaveAttribute('max', '100');
+    });
+
+    it('accepts 0 as the chamber sustain speed and saves it', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const sustain = await waitFor(
+        () => screen.getByLabelText('Chamber fan speed after boost (%)') as HTMLInputElement,
+      );
+      fireEvent.change(sustain, { target: { value: '0' } });
+      // 0 is a real step target, not a falsy value replaced by the default.
+      expect(sustain.value).toBe('0');
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_cooldown_chamber_fan_sustain_percent).toBe(0);
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('switching the chamber fan off disables both of its speeds', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const toggle = await waitFor(() =>
+        screen.getByRole('checkbox', { name: 'Chamber fan during cooldown' }),
+      );
+      await user.click(toggle);
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_cooldown_chamber_fan_enabled).toBe(false);
+        },
+        { timeout: 5000 },
+      );
+      expect(
+        (screen.getByLabelText('Chamber fan boost speed (%)') as HTMLInputElement).disabled,
+      ).toBe(true);
+      expect(
+        (screen.getByLabelText('Chamber fan speed after boost (%)') as HTMLInputElement).disabled,
+      ).toBe(true);
+    });
+
+    it('carries every cooldown fan key in the save payload', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      // Speeds first — a switched-off column's numbers are disabled.
+      const auxFan = await waitFor(() => screen.getByLabelText('Aux fan speed (%)'));
+      fireEvent.change(auxFan, { target: { value: '60' } });
+      fireEvent.change(screen.getByLabelText('Chamber fan boost speed (%)'), {
+        target: { value: '80' },
+      });
+      fireEvent.change(screen.getByLabelText('Chamber fan speed after boost (%)'), {
+        target: { value: '30' },
+      });
+      await user.click(screen.getByRole('checkbox', { name: 'Chamber fan during cooldown' }));
+      await user.click(screen.getByRole('checkbox', { name: 'Aux fan during cooldown' }));
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_cooldown_aux_fan_enabled).toBe(false);
+          expect(receivedBody!.farm_cooldown_aux_fan_percent).toBe(60);
+          expect(receivedBody!.farm_cooldown_chamber_fan_enabled).toBe(false);
+          expect(receivedBody!.farm_cooldown_chamber_fan_percent).toBe(80);
+          expect(receivedBody!.farm_cooldown_chamber_fan_sustain_percent).toBe(30);
+        },
+        { timeout: 5000 },
+      );
     });
 
     // The cooldown plate hold: the switch is the operator's off (no deploy
