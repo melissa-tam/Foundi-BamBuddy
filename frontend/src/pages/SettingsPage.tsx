@@ -5155,7 +5155,9 @@ export function SettingsPage() {
                 {t('settings.farmEjectCooldown', 'Eject Cooldown')}
               </h3>
             </CardHeader>
-            <CardContent className="space-y-3">
+            {/* `@container` so the actuator row below can size itself against
+                THIS CARD rather than the viewport — see the comment there. */}
+            <CardContent className="space-y-3 @container">
               <p className="text-xs text-bambu-gray">
                 {t('settings.farmEjectCooldownDescription', 'How the farm waits for the bed to cool before sweeping a finished plate off, and when it gives up or quarantines a printer that will not cool.')}
               </p>
@@ -5262,12 +5264,21 @@ export function SettingsPage() {
               </div>
               {/* The three things the farm DOES to a printer during the
                   cooldown wait, as peers: the auxiliary fan, the chamber
-                  exhaust fan, and the plate hold. Each column is a switch (the
+                  exhaust fan, and the plate hold. Each group is a switch (the
                   operator's off — no deploy needed) over the numbers that
                   switch governs, so the numbers dim and disable with it. No
                   heading over the row: every switch label already says "during
-                  cooldown". */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  cooldown".
+
+                  The breakpoint is a CONTAINER query, not a viewport one: the
+                  Farm tab puts its cards in a `lg:w-1/2` column, so at a 1280px
+                  viewport `lg:` is active while this card is only ~399px wide —
+                  a viewport `lg:grid-cols-3` rendered three ~120px columns
+                  inside it, wrapping the hold caption over four lines and
+                  putting a switch pill on top of its own label. Stacked
+                  full-width groups (the idle bed park idiom) until the CARD
+                  itself has 48rem to spend. */}
+              <div className="grid grid-cols-1 gap-4 @3xl:grid-cols-3">
                 <div className="space-y-2">
                   <SettingSwitch
                     label={t('settings.farmCooldownAuxFanEnabled', 'Aux fan during cooldown')}
