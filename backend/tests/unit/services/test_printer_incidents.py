@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from backend.app.models.printer_incident import (
     KIND_JAM,
     KIND_PHYSICAL,
+    KIND_PLATE_VISION,
     KIND_RUNOUT,
     RESOLVE_OBSERVED_RUNNING,
     STATUS_ABORTED,
@@ -875,3 +876,99 @@ class TestUpgrade:
             )
             is None
         )
+
+
+class TestOutcomeDerivation:
+    """The zero-human tally's ONE origin (2026-09-11). Pure over the three stored facts:
+    status, escalated_at, resolve_source — and total over every token the model
+    defines, so a new close token cannot fall into a bucket by accident."""
+
+    @staticmethod
+    def _row(*, status, escalated=False, source=None, resolved=True, kind=KIND_JAM):
+        from datetime import datetime, timedelta
+
+        now = datetime.utcnow()
+        return PrinterIncident(
+            printer_id=1,
+            job_id="task-1",
+            item_id=None,
+            kind=kind,
+            code="0700_8010",
+            codes="x",
+            status=status,
+            created_at=now - timedelta(minutes=5),
+            escalated_at=now - timedelta(minutes=4) if escalated else None,
+            resolved_at=now if resolved else None,
+            resolve_source=source,
+        )
+
+    def test_open_rows(self):
+        from backend.app.models.printer_incident import STATUS_RECOVERING
+
+        assert printer_incidents.outcome_of(self._row(status=STATUS_RECOVERING, resolved=False)) == "recovering"
+        assert (
+            printer_incidents.outcome_of(self._row(status=STATUS_ESCALATED, escalated=True, resolved=False)) == "held"
+        )
+
+    def test_the_farm_recovered_it_only_when_nobody_was_paged(self):
+        from backend.app.models.printer_incident import (
+            RESOLVE_AUTO_RESUME,
+            RESOLVE_DRIVER_SELF_HEAL,
+            RESOLVE_DRIVER_SWAP,
+        )
+
+        for source in (RESOLVE_DRIVER_SWAP, RESOLVE_DRIVER_SELF_HEAL, RESOLVE_AUTO_RESUME):
+            assert printer_incidents.outcome_of(self._row(status=STATUS_RESOLVED, source=source)) == "auto_recovered"
+            # The same close AFTER a page had a human in the loop (a refill, a fix).
+            assert (
+                printer_incidents.outcome_of(self._row(status=STATUS_RESOLVED, escalated=True, source=source))
+                == "human_resolved"
+            )
+
+    def test_a_first_trip_recheck_is_the_farms_own(self):
+        from backend.app.models.printer_incident import RESOLVE_TERMINAL
+
+        row = self._row(status=STATUS_RESOLVED, source=RESOLVE_TERMINAL, kind=KIND_PLATE_VISION)
+        assert printer_incidents.outcome_of(row) == "auto_recovered"
+        # ...but a jam closed by a terminal without a page closed on nobody's act.
+        row = self._row(status=STATUS_RESOLVED, source=RESOLVE_TERMINAL, kind=KIND_JAM)
+        assert printer_incidents.outcome_of(row) == "resolved_unpaged"
+
+    def test_every_paged_close_is_human_resolved(self):
+        import backend.app.models.printer_incident as model
+
+        tokens = [getattr(model, name) for name in dir(model) if name.startswith("RESOLVE_")]
+        assert len(tokens) >= 8
+        for token in tokens:
+            row = self._row(status=STATUS_RESOLVED, escalated=True, source=token)
+            assert printer_incidents.outcome_of(row) == "human_resolved", token
+
+    def test_aborts(self):
+        from backend.app.models.printer_incident import RESOLVE_OPERATOR
+
+        assert printer_incidents.outcome_of(self._row(status=STATUS_ABORTED, source=RESOLVE_OPERATOR)) == "taken_over"
+        assert printer_incidents.outcome_of(self._row(status=STATUS_ABORTED, source=None)) == "transient"
+
+    def test_every_token_lands_in_exactly_one_bucket(self):
+        import backend.app.models.printer_incident as model
+
+        tokens = [getattr(model, name) for name in dir(model) if name.startswith("RESOLVE_")]
+        for token in tokens:
+            for status in (STATUS_RESOLVED, STATUS_ABORTED):
+                for escalated in (False, True):
+                    outcome = printer_incidents.outcome_of(self._row(status=status, escalated=escalated, source=token))
+                    assert outcome in printer_incidents.OUTCOMES, (token, status, escalated)
+
+    def test_summary_counts_by_outcome_and_kind(self):
+        from backend.app.models.printer_incident import RESOLVE_DRIVER_SWAP
+
+        rows = [
+            self._row(status=STATUS_RESOLVED, source=RESOLVE_DRIVER_SWAP),
+            self._row(status=STATUS_ESCALATED, escalated=True, resolved=False, kind=KIND_PHYSICAL),
+        ]
+        tally = printer_incidents.summary(rows)
+        assert tally["total"] == 2
+        assert tally["zero_human"] == 1
+        assert tally["by_outcome"]["auto_recovered"] == 1
+        assert tally["by_outcome"]["held"] == 1
+        assert tally["by_kind"][KIND_PHYSICAL]["held"] == 1

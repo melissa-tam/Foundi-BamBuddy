@@ -56,6 +56,10 @@ from backend.app.models.printer_incident import (
     KIND_RUNOUT,
     KIND_Z_REFERENCE_LOST,
     RESOLUTION_WIRE,
+    RESOLVE_AUTO_RESUME,
+    RESOLVE_DRIVER_SELF_HEAL,
+    RESOLVE_DRIVER_SWAP,
+    RESOLVE_TERMINAL,
     RESOLVES_ON,
     STATUS_ABORTED,
     STATUS_ESCALATED,
@@ -235,7 +239,12 @@ def _reset_state() -> None:
     _open_cache.clear()
 
 
-def _slot_desc(incident: PrinterIncident) -> str | None:
+def is_known_kind(kind: str) -> bool:
+    """Is ``kind`` a registered incident kind? (The projection table is the registry.)"""
+    return kind in _WAITING_REASON_BY_KIND
+
+
+def slot_desc(incident: PrinterIncident) -> str | None:
     """Human slot name for the incident's fault, or ``None`` when it names none.
 
     ``"external"`` for ANY fault on the external spool holder: those name no AMS slot
@@ -272,7 +281,7 @@ def _payload(incident: PrinterIncident) -> dict:
         "id": incident.id,
         "kind": incident.kind,
         "status": incident.status,
-        "slot_desc": _slot_desc(incident),
+        "slot_desc": slot_desc(incident),
         "created_at": incident.created_at.isoformat() if incident.created_at else None,
     }
 
@@ -698,6 +707,97 @@ async def close_open_for_printer(
         if row is not None:
             closed.append(row)
     return closed
+
+
+# --- the outcome ledger (2026-09-11) ------------------------------------------------
+#
+# WHAT a closed row means, derived from three stored facts and nothing else:
+# ``status`` (resolved / aborted), ``escalated_at`` (did a human get paged) and
+# ``resolve_source`` (who produced the close). The 2026-09-11 audit had to hand-count
+# "how many holds did the farm end by itself" from logs and a SELECT; this table is
+# that count's ONE origin, and ``GET /api/v1/incidents`` its query surface.
+OUTCOME_RECOVERING = "recovering"  # open; the machine is acting
+OUTCOME_HELD = "held"  # open; escalated — a human's
+OUTCOME_AUTO_RECOVERED = "auto_recovered"  # closed without ever paging, by the farm's own act
+OUTCOME_HUMAN_RESOLVED = "human_resolved"  # paged, then closed — a human was in the loop
+OUTCOME_RESOLVED_UNPAGED = "resolved_unpaged"  # closed without a page, on wire/terminal/rearm evidence
+OUTCOME_TAKEN_OVER = "taken_over"  # aborted: an external actor took over mid-procedure
+OUTCOME_TRANSIENT = "transient"  # aborted with no source: it never held the printer
+
+OUTCOMES: tuple[str, ...] = (
+    OUTCOME_RECOVERING,
+    OUTCOME_HELD,
+    OUTCOME_AUTO_RECOVERED,
+    OUTCOME_HUMAN_RESOLVED,
+    OUTCOME_RESOLVED_UNPAGED,
+    OUTCOME_TAKEN_OVER,
+    OUTCOME_TRANSIENT,
+)
+
+# The closes the FARM performed. A refill auto-resume on a row that was never paged
+# cannot happen today (a runout escalates before its refill lane can fire), so its
+# membership here is the rule, not an observed count.
+_FARM_CLOSES: frozenset[str] = frozenset({RESOLVE_DRIVER_SWAP, RESOLVE_DRIVER_SELF_HEAL, RESOLVE_AUTO_RESUME})
+
+
+def outcome_of(incident: PrinterIncident) -> str:
+    """Which :data:`OUTCOMES` bucket this row is in. Pure; total over every row shape.
+
+    ``escalated_at`` is the human axis: once a page went out, the close — whatever
+    produced it — had a human in the loop (they refilled, resumed, fixed the path,
+    stopped the print, or pressed Recover). Only a row that closed WITHOUT paging can
+    be the farm's own recovery, and only when the close came from the farm's own act
+    (:data:`_FARM_CLOSES`) or, for a plate-vision trip, from the terminal of the stop
+    the farm itself sent — the first-trip re-check that requeues without a page.
+    Everything else that closed unpaged closed on evidence nobody produced (a wire
+    edge, a job ending, a restart) and is counted honestly as neither.
+    """
+    if incident.resolved_at is None:
+        return OUTCOME_HELD if incident.status == STATUS_ESCALATED else OUTCOME_RECOVERING
+    if incident.status == STATUS_ABORTED:
+        return OUTCOME_TAKEN_OVER if incident.resolve_source else OUTCOME_TRANSIENT
+    if incident.escalated_at is not None:
+        return OUTCOME_HUMAN_RESOLVED
+    if incident.resolve_source in _FARM_CLOSES:
+        return OUTCOME_AUTO_RECOVERED
+    if incident.kind == KIND_PLATE_VISION and incident.resolve_source == RESOLVE_TERMINAL:
+        return OUTCOME_AUTO_RECOVERED
+    return OUTCOME_RESOLVED_UNPAGED
+
+
+def summary(rows: list[PrinterIncident]) -> dict:
+    """The tally over ``rows``: total, zero-human count, and counts by outcome and by kind."""
+    by_outcome = dict.fromkeys(OUTCOMES, 0)
+    by_kind: dict[str, dict[str, int]] = {}
+    for row in rows:
+        outcome = outcome_of(row)
+        by_outcome[outcome] += 1
+        by_kind.setdefault(row.kind, dict.fromkeys(OUTCOMES, 0))[outcome] += 1
+    return {
+        "total": len(rows),
+        "zero_human": by_outcome[OUTCOME_AUTO_RECOVERED],
+        "by_outcome": by_outcome,
+        "by_kind": by_kind,
+    }
+
+
+async def list_recent(
+    db: AsyncSession,
+    *,
+    since: datetime,
+    kind: str | None = None,
+    printer_id: int | None = None,
+    limit: int = 200,
+) -> list[PrinterIncident]:
+    """Rows opened at or after ``since``, newest first, optionally narrowed."""
+    stmt = select(PrinterIncident).where(PrinterIncident.created_at >= since)
+    if kind is not None:
+        stmt = stmt.where(PrinterIncident.kind == kind)
+    if printer_id is not None:
+        stmt = stmt.where(PrinterIncident.printer_id == printer_id)
+    # id DESC is the tiebreak, not decoration: rows opened in one push share a stamp.
+    stmt = stmt.order_by(PrinterIncident.created_at.desc(), PrinterIncident.id.desc()).limit(limit)
+    return list((await db.execute(stmt)).scalars().all())
 
 
 async def rehydrate(db: AsyncSession) -> int:

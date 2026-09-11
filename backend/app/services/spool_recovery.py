@@ -141,8 +141,11 @@ from backend.app.models.printer_incident import (
     RESOLUTION_REPAIR,
     RESOLUTION_WIRE,
     RESOLVE_AUTO_RESUME,
+    RESOLVE_DRIVER_SELF_HEAL,
+    RESOLVE_DRIVER_SWAP,
     RESOLVE_OBSERVED_RUNNING,
     RESOLVE_OPERATOR,
+    RESOLVE_REARM,
     RESOLVE_REPAIR_OBSERVED,
     RESOLVE_TERMINAL,
     RESOLVE_WIRE_CLEAR,
@@ -3109,14 +3112,16 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
     # The durable close IS the bookkeeping: a RESOLVED incident re-arms this fault
     # for the job (a genuine second tangle must still be recovered) and counts toward
     # the per-job flap cap, which ``printer_incidents.count_resolved`` reads back.
-    # ``observed_running`` is the literal evidence: _resume_and_confirm watched the
-    # printer reach RUNNING and hold it.
+    # The source names WHO produced the outcome — the driver, by a swap or by the
+    # firmware CONTINUE self-healing the same feeder — so the outcome ledger can tell
+    # the farm's own recoveries from a touchscreen resume (``outcome_of``).
     #
     # It is also the OWNERSHIP test. Everything below is a claim about this incident
     # — the swapped ``ams_mapping`` written back onto the unit, its hold token
     # cleared, a "recovered" page — and a row somebody else already closed (an
     # operator STOP mid-round, say) has had its verdict given by them.
-    if not await _close_incident(incident, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING):
+    source = RESOLVE_DRIVER_SWAP if swapped else RESOLVE_DRIVER_SELF_HEAL
+    if not await _close_incident(incident, status=STATUS_RESOLVED, source=source):
         logger.warning(
             "spool_recovery: printer %s incident %s closed under the driver — success stands down",
             incident.printer_id,
@@ -3956,7 +3961,7 @@ async def rearm_incidents_on_startup() -> int:
                             driverless.append((incident.id, incident.printer_id))
                         continue
                     evidence = f"printer is {reported} not PAUSE"
-                await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
+                await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_REARM)
                 await _clear_hold_projection(db, incident.item_id)
                 closed += 1
                 logger.info(
@@ -4575,6 +4580,23 @@ async def _close_runout_hold_and_notify(printer_id: int, slot: tuple[int, int] |
 # --- out-of-rotation clear (from the ams_presence presence-GAIN edge) --------
 
 
+def clear_out_of_rotation(spool: Spool) -> bool:
+    """Return a spool to rotation: NULL both feed-fault columns. True when it changed.
+
+    THE one owner of what "back in rotation" WRITES — the flag and the code it was
+    stamped with, together. The operator's "Return to rotation" (``PATCH
+    /inventory/spools/{id} {"feed_fault_at": null}``) used to null only the column it
+    named, leaving ``feed_fault_code`` standing as a stale diagnosis on a healthy
+    roll (002-H2S's spool 599, 2026-09-11). Callers own the commit and the
+    ``inventory_changed`` broadcast — they already do.
+    """
+    if spool.feed_fault_at is None and spool.feed_fault_code is None:
+        return False
+    spool.feed_fault_at = None
+    spool.feed_fault_code = None
+    return True
+
+
 async def clear_on_reinsert(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int, tray: dict) -> None:
     """Clear a spool's out-of-rotation flag when it is physically re-inserted.
 
@@ -4643,8 +4665,7 @@ async def _clear_out_of_rotation_for_slot(
     if spool is None:
         return False
 
-    spool.feed_fault_at = None
-    spool.feed_fault_code = None
+    clear_out_of_rotation(spool)
     await db.commit()
     logger.info(
         "spool_recovery: cleared out-of-rotation on spool %d — printer %d AMS%d-T%d",

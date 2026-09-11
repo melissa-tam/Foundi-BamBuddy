@@ -186,6 +186,18 @@ RESOLVE_WIRE_CLEAR = "wire_clear"
 # ``repair`` kind's HMS list goes quiet at every terminal whether or not anything was
 # fixed, so "no code standing" is not evidence there and positive motion is.
 RESOLVE_REPAIR_OBSERVED = "repair_observed"
+# The recovery DRIVER produced the outcome itself (``spool_recovery._succeed``): the
+# jammed feeder was swapped for a replacement and the print resumed, or the firmware
+# CONTINUE self-healed the wedged change on the SAME feeder. Their own tokens rather
+# than ``observed_running`` — which they used to share with a touchscreen resume —
+# because the outcome ledger has to tell "the farm recovered it" from "a human
+# resumed it": the zero-human tally the 2026-09-11 audit could only reconstruct from
+# a day of log reading is now ``printer_incidents.outcome_of``.
+RESOLVE_DRIVER_SWAP = "driver_swap"
+RESOLVE_DRIVER_SELF_HEAL = "driver_self_heal"
+# The startup rearm found the printer positive and closed the row: a RESTART's
+# reconciliation, not a witnessed resume — the edge itself was never observed.
+RESOLVE_REARM = "startup_rearm"
 
 
 class PrinterIncident(Base):

@@ -5125,12 +5125,13 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
                 await closer
 
         # The driver's own repause path ran on a row it still OWNED at every step,
-        # and closed it itself at the success.
+        # and closed it itself at the success — under its OWN token (2026-09-11), so
+        # the outcome ledger can tell this from a touchscreen resume.
         assert row_open and all(row_open)
         assert [t.result() for t in reentries] == [None]
         assert _only_driver(driver_slots) == {id(task)}
         rows = await _incident_rows(db_session, printer.id)
-        assert [(r.status, r.resolve_source) for r in rows] == [("resolved", "observed_running")]
+        assert [(r.status, r.resolve_source) for r in rows] == [("resolved", "driver_swap")]
         # TWO edges, both the driver's own: the resume that did not stick and the one
         # after the extra pause/resume cycle. Every one of them was deferred.
         answers = _closer_answers(spawned)
