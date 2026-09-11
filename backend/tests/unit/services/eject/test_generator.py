@@ -486,14 +486,19 @@ class TestBedDropReleaseAssist:
         lines = [ln.strip() for ln in gcode.splitlines()]
         heater_idx = lines.index("M140 S0")
         aux_idx = lines.index("M106 P2 S0")
+        # The chamber fan-off is pinned by POSITION, never by membership: the appended
+        # vendor epilogue emits its own ``M106 P3 S0``, so the first occurrence is the
+        # only one that says anything about this block.
+        chamber_idx = lines.index("M106 P3 S0")
         home_idx = lines.index("G28 X Y")
         sweep_idx = lines.index("; --- sweep: push part off the front edge ---")
         assert heater_idx < aux_idx < home_idx < sweep_idx
-        first_move = next(ln for ln in lines[aux_idx + 1 :] if ln and not ln.startswith(";"))
+        assert chamber_idx == aux_idx + 1
+        first_move = next(ln for ln in lines[chamber_idx + 1 :] if ln and not ln.startswith(";"))
         assert first_move == "G1 Z290 F900"
         assert lines[home_idx + 1] == "G1 Z40 F900"
         # Nothing moves Z before the drop.
-        assert not any(ln.startswith("G1 Z") for ln in lines[:aux_idx])
+        assert not any(ln.startswith("G1 Z") for ln in lines[:chamber_idx])
 
     def test_drop_zero_clearance_goes_to_full_travel(self):
         # clearance 0 (still "set", not None) -> drop to the machine bottom z_travel.
@@ -544,7 +549,11 @@ class TestBedDropDwellAndJitter:
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
         aux_idx = lines.index("M106 P2 S0")
-        block = [ln for ln in lines[aux_idx + 1 :] if ln and not ln.startswith(";")]
+        # First occurrence only — the vendor epilogue repeats ``M106 P3 S0`` later, so
+        # the position directly after the aux line is what pins the block's own emission.
+        chamber_idx = lines.index("M106 P3 S0")
+        assert chamber_idx == aux_idx + 1
+        block = [ln for ln in lines[chamber_idx + 1 :] if ln and not ln.startswith(";")]
         assert block[:10] == [
             "G1 Z290 F900",  # drop to the floor — the block's FIRST Z move
             "G1 Z280 F900",  # jitter 1: up (away from the machine bottom) ...
@@ -563,7 +572,11 @@ class TestBedDropDwellAndJitter:
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
         aux_idx = lines.index("M106 P2 S0")
-        block = [ln for ln in lines[aux_idx + 1 :] if ln and not ln.startswith(";")]
+        # First occurrence only (the vendor epilogue repeats the line); its position
+        # directly after the aux fan-off is the assertion.
+        chamber_idx = lines.index("M106 P3 S0")
+        assert chamber_idx == aux_idx + 1
+        block = [ln for ln in lines[chamber_idx + 1 :] if ln and not ln.startswith(";")]
         assert block[:4] == ["G1 Z290 F900", "M400 S7", "G28 X Y", "G1 Z40 F900"]
 
     def test_dwell_is_m400_never_g4(self):
@@ -1040,15 +1053,25 @@ class TestPhaseBeacons:
         # Nothing before it moves at all, which is what makes the span complete.
         assert not any(ln.startswith(("G0 ", "G1 ", "G380")) for ln in lines[:beacon_idx])
         # ...and it precedes the heater-off section.
-        assert beacon_idx < lines.index("; --- bed heater off, aux fan off ---")
+        assert beacon_idx < lines.index("; --- bed heater off, cooldown fans off ---")
 
-    def test_the_aux_fan_stop_sits_between_the_beacon_and_the_first_move(self):
-        # The cooldown prep runs the aux fan during the wait and its server-side OFF is
-        # best-effort (a restart orphans it), so the eject file — the one writer that
-        # cannot be lost — commands it off too. Non-motion, so it costs the span nothing.
+    def test_the_cooldown_fan_stops_sit_between_the_beacon_and_the_first_move(self):
+        # The cooldown prep runs the aux and chamber fans during the wait and its
+        # server-side OFF is best-effort (a restart orphans them), so the eject file —
+        # the one writer that cannot be lost — commands both off too. Non-motion, so
+        # they cost the span nothing.
+        #
+        # The chamber line is pinned POSITIONALLY and never by membership: the appended
+        # vendor epilogue emits its own ``M106 P3 S0``, so "is it in the file" is true
+        # whatever this block does. The first occurrence, directly after the aux line and
+        # ahead of the first move, is the only thing that can fail.
         lines = self._lines(generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY))
         beacon_idx = next(i for i, ln in enumerate(lines) if ln.startswith(PHASE_BEACON_LIFTED + " ;"))
-        assert beacon_idx < lines.index("M106 P2 S0") < lines.index("G1 Z40 F900")
+        aux_idx = lines.index("M106 P2 S0")
+        chamber_idx = lines.index("M106 P3 S0")
+        assert beacon_idx < aux_idx < lines.index("G1 Z40 F900")
+        assert chamber_idx == aux_idx + 1
+        assert chamber_idx < lines.index("G1 Z40 F900")
 
     @pytest.mark.parametrize("bed_drop", [None, 50.0], ids=["drop-off", "drop-on"])
     def test_sweep_beacon_sits_immediately_above_the_sweep_marker(self, bed_drop):
