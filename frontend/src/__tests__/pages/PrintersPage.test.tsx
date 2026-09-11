@@ -248,24 +248,30 @@ describe('PrintersPage', () => {
   describe('fan badges', () => {
     // Chamber fan only exists on enclosed Bambu models. Open-frame printers
     // (A1, A1 Mini, A2L, P1P) have no chamber fan — the firmware reports
-    // big_fan2_speed as 0 there and the widget would be dead UI.
-    const statusWithFans = {
+    // big_fan2_speed as 0 there and the widget would be dead UI. The BACKEND
+    // answers the capability (`has_chamber_fan` on the status payload, the same
+    // predicate the cooldown fan lane gates on); the page no longer carries its
+    // own model list, so these render the flag rather than a model name.
+    const statusWithFans = (hasChamberFan: boolean) => ({
       ...mockPrinterStatus,
       cooling_fan_speed: 53,
       big_fan1_speed: 53,
       big_fan2_speed: 53,
-    };
+      has_chamber_fan: hasChamberFan,
+    });
 
-    const renderWithPrinter = (printer: typeof mockPrinters[number]) => {
+    const renderWithCapability = (hasChamberFan: boolean) => {
       server.use(
-        http.get('/api/v1/printers/', () => HttpResponse.json([printer])),
-        http.get('/api/v1/printers/:id/status', () => HttpResponse.json(statusWithFans)),
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json(statusWithFans(hasChamberFan)),
+        ),
       );
       render(<PrintersPage />);
     };
 
-    it('hides chamber fan badge on A1 Mini (open-frame, no chamber fan)', async () => {
-      renderWithPrinter({ ...mockPrinters[0], model: 'A1 Mini' });
+    it('hides the chamber fan badge when the printer reports no chamber fan', async () => {
+      renderWithCapability(false);
 
       await waitFor(() => {
         // Part-cooling badge confirms the fan row rendered.
@@ -275,26 +281,8 @@ describe('PrintersPage', () => {
       expect(screen.queryByTitle('Chamber Fan')).not.toBeInTheDocument();
     });
 
-    it('hides chamber fan badge on A1 (open-frame)', async () => {
-      renderWithPrinter({ ...mockPrinters[0], model: 'A1' });
-
-      await waitFor(() => {
-        expect(screen.getByTitle('Part Cooling Fan')).toBeInTheDocument();
-      });
-      expect(screen.queryByTitle('Chamber Fan')).not.toBeInTheDocument();
-    });
-
-    it('hides chamber fan badge on P1P (open-frame)', async () => {
-      renderWithPrinter({ ...mockPrinters[0], model: 'P1P' });
-
-      await waitFor(() => {
-        expect(screen.getByTitle('Part Cooling Fan')).toBeInTheDocument();
-      });
-      expect(screen.queryByTitle('Chamber Fan')).not.toBeInTheDocument();
-    });
-
-    it('shows chamber fan badge on X1C (enclosed)', async () => {
-      renderWithPrinter({ ...mockPrinters[0], model: 'X1C' });
+    it('shows the chamber fan badge when the printer reports one', async () => {
+      renderWithCapability(true);
 
       await waitFor(() => {
         expect(screen.getByTitle('Chamber Fan')).toBeInTheDocument();
@@ -303,12 +291,57 @@ describe('PrintersPage', () => {
       expect(screen.getByTitle('Auxiliary Fan')).toBeInTheDocument();
     });
 
-    it('shows chamber fan badge on P1S (enclosed)', async () => {
-      renderWithPrinter({ ...mockPrinters[0], model: 'P1S' });
+    it('hides the chamber fan badge when the capability is absent from the payload', async () => {
+      // An older/partial status payload must fail closed, not render a control
+      // the machine may not have.
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({
+            ...mockPrinterStatus,
+            cooling_fan_speed: 53,
+            big_fan1_speed: 53,
+            big_fan2_speed: 53,
+          }),
+        ),
+      );
+      render(<PrintersPage />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Part Cooling Fan')).toBeInTheDocument();
+      });
+      expect(screen.queryByTitle('Chamber Fan')).not.toBeInTheDocument();
+    });
+
+    const renderWithAirduct = (supportsAirduct: boolean) => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({
+            ...statusWithFans(true),
+            supports_airduct: supportsAirduct,
+            airduct_mode: 0,
+          }),
+        ),
+      );
+      render(<PrintersPage />);
+    };
+
+    it('renders the airduct control when the printer supports one', async () => {
+      renderWithAirduct(true);
+
+      await waitFor(() => {
+        expect(screen.getByTitle(/Airduct Mode/)).toBeInTheDocument();
+      });
+    });
+
+    it('hides the airduct control when the printer does not support one', async () => {
+      renderWithAirduct(false);
 
       await waitFor(() => {
         expect(screen.getByTitle('Chamber Fan')).toBeInTheDocument();
       });
+      expect(screen.queryByTitle(/Airduct Mode/)).not.toBeInTheDocument();
     });
   });
 

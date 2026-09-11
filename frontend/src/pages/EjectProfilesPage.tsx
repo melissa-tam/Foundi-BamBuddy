@@ -134,9 +134,6 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
     }
     return seed;
   });
-  const [fanAssist, setFanAssist] = useState<boolean>(
-    profile ? profile.cooling_fan_assist : DEFAULT_EJECT_PROFILE_PARAMS.cooling_fan_assist,
-  );
   const [finalSkim, setFinalSkim] = useState<boolean>(
     profile ? profile.final_skim : DEFAULT_EJECT_PROFILE_PARAMS.final_skim,
   );
@@ -280,7 +277,6 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
       const safe = Number.isFinite(parsed) ? parsed : (DEFAULT_EJECT_PROFILE_PARAMS[f.key] as number);
       (params[f.key] as number) = safe;
     }
-    params.cooling_fan_assist = fanAssist;
     params.final_skim = finalSkim;
     // Percent (1-100) -> fraction (0.01-1.0), clamped; backend re-validates.
     const pct = Number(startPct);
@@ -649,19 +645,6 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
                   {bedDropBedslingerWarning}
                 </p>
               )}
-            </div>
-
-            {/* Cooling fan assist toggle */}
-            <div className="flex items-center justify-between gap-3">
-              <span className="flex items-center gap-1.5">
-                <span className="text-sm text-white">{t('ejectProfiles.fields.coolingFanAssist')}</span>
-                <InfoHint text={t('ejectProfiles.tooltips.coolingFanAssist')} />
-              </span>
-              <Toggle
-                checked={fanAssist}
-                onChange={setFanAssist}
-                aria-label={t('ejectProfiles.fields.coolingFanAssist')}
-              />
             </div>
 
             {/* Final skim pass toggle */}
