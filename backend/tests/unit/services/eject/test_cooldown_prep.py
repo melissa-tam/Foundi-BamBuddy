@@ -57,9 +57,13 @@ HOLD_PART_TOP_DEFAULT = int(AppSettings.model_fields["farm_cooldown_hold_part_to
 # The eject threshold the fleet runs (~2 °C above shop ambient) — and, since this wave,
 # the line the chamber lane steps its boost down at.
 THRESHOLD_C = 33.0
-# A model with a chamber fan and a duct, and one with neither (the open-frame family).
+# The fleet's model: a chamber fan AND a switchable duct.
 MODEL = "H2S"
+# No chamber fan at all (the open-frame family).
 MODEL_WITHOUT_CHAMBER_FAN = "A1"
+# A chamber fan behind a FIXED duct — enclosed, but no flap to open. ``AIRDUCT_MODELS``
+# is a strict subset of ``CHAMBER_FAN_MODELS``, and this is the difference.
+MODEL_WITHOUT_AIRDUCT = "P1S"
 
 _UNSET = object()
 
@@ -631,7 +635,7 @@ class TestCooldownFans:
         assert prep.lane(fan.name).start == "skipped:disabled"
         assert prep.lane(other.name).start == "sent"
         assert [index for index, _pct in env.client.fans] == [other.index]
-        if fan.airduct_cooling:
+        if fan.airduct_cooling(MODEL):
             # A disabled chamber lane never opens the duct: the prelude belongs to the
             # fan it precedes, not to the cooldown.
             assert env.client.airduct == []
@@ -661,6 +665,24 @@ class TestCooldownFans:
         await env.begin()
         assert env.client.airduct == [AIRDUCT_COOLING_GCODE]
         assert env.client.calls.index("gcode:M145 P0") < env.client.calls.index("fan:3")
+
+    async def test_a_fixed_duct_model_runs_the_chamber_fan_with_no_prelude(self, env):
+        """ "Has a chamber fan" and "pairs it with a duct prelude" are DIFFERENT per-model
+        questions, and the second is narrower: an enclosed P1S has the fan and no flap to
+        open, so sending ``M145 P0`` there would be a command firmware swallows."""
+        prep = await env.begin(model=MODEL_WITHOUT_AIRDUCT)
+        assert prep.lane("chamber").start == "sent"
+        assert env.client.fans == [(2, 100), (3, 100)]
+        assert env.client.airduct == []
+        assert env.client.calls == ["hold", "fan:2", "fan:3"]  # no prelude in between
+
+    async def test_a_fixed_duct_model_cannot_fail_on_an_airduct_it_never_sends(self, env):
+        """The refusal only exists where the command does: a P1S never reaches the
+        ``skipped:airduct`` arm, however the client would have answered."""
+        env.client.airduct_ok = False
+        prep = await env.begin(model=MODEL_WITHOUT_AIRDUCT)
+        assert prep.lane("chamber").start == "sent"
+        assert env.client.fans == [(2, 100), (3, 100)]
 
     async def test_a_refused_airduct_never_spins_the_chamber_fan(self, env, caplog):
         """The pair is the actuator's two-command contract: a pair that half-lands
@@ -1070,6 +1092,33 @@ class TestEnd:
         assert "chamber_boost_ended_after=0 s" in summary
         assert "chamber_at_arm=38.0 bed_at_arm=61.0" in summary
         assert "chamber=100%→50% start=sent step=sent off=sent" in summary
+
+    async def test_a_stepping_lane_keeps_its_shape_when_the_two_speeds_are_equal(self, env, caplog):
+        """The grep shape per lane is a property of the FAN, not of the numbers. An
+        operator who sets the chamber sustain to its boost still gets the arrow form and
+        a ``step=`` field — otherwise the measurement would change shape exactly when
+        someone had been experimenting with the setting."""
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin(fans=_fans(chamber_sustain=100))
+            prep.note_sample({"bed": 40.0, "chamber": 33.0})
+            prep.end(fan_off=True)
+        # The numeric no-op is still reported honestly as a step that did nothing …
+        assert prep.lane("chamber").step == "skipped:same"
+        assert env.client.fans == [(2, 100), (3, 100), (2, 0), (3, 0)]  # no step published
+        # … and the segment keeps the stepping shape.
+        assert "chamber=100%→100% start=sent step=skipped:same off=sent" in _summary(caplog)
+
+    async def test_the_aux_lane_never_renders_a_step_field(self, env, caplog):
+        """It has no sustain setting to step to, so a ``step=`` there would be a field
+        no operator can act on."""
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin()
+            prep.note_sample({"bed": 40.0, "chamber": 33.0})
+            prep.end(fan_off=True)
+        summary = _summary(caplog)
+        aux_segment = next(part for part in summary.split(", ") if part.startswith("aux="))
+        assert "step=" not in aux_segment
+        assert aux_segment == "aux=100% start=sent off=sent observed=none"
 
     async def test_summary_fields_when_the_hold_was_skipped(self, env, caplog):
         """Same shape on the fans-only path — one line whatever happened, so the

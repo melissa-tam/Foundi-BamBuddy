@@ -78,14 +78,21 @@ half does not land: the pair is the actuator's own two-command contract, and a p
 half-lands is not-landed. ``generator.COMPLETION_EPILOGUE`` carries the same ``M145 P0``
 verbatim.
 
-**Model capability.** The chamber lane is gated per model by
-:func:`~backend.app.services.printer_manager.has_chamber_fan` (``CooldownFan.supported``):
-firmware silently swallows ``M106 P3`` on an open-frame machine, and a swallowed command
-is indistinguishable on the wire from a working one, so the farm refuses rather than
-pretends. The AUX lane is deliberately UNGATED — every model seeded in the geometry
-registry has an auxiliary fan, and the A-series (the family that does not) is not
-seeded. An A-series capability set is the named next step, and it belongs beside the
-other two predicates in ``printer_manager`` rather than here.
+**Two per-model questions, not one.** "Does this machine have this fan?"
+(``CooldownFan.supported``) and "does the vendor pair this fan with a duct prelude
+here?" (``CooldownFan.airduct_cooling``) are different facts, and the second is the
+narrower: ``AIRDUCT_MODELS`` is a strict SUBSET of ``CHAMBER_FAN_MODELS`` (pinned by a
+test in ``printer_manager``). An enclosed machine with a FIXED duct — X1, X1C, X1E,
+P1S — has a chamber fan and no flap to open, so its lane spins the fan with no prelude
+at all; sending one anyway would be a command firmware swallows, and a swallowed
+command is indistinguishable on the wire from a working one. The chamber lane's own
+capability gate is
+:func:`~backend.app.services.printer_manager.has_chamber_fan`: on an open-frame machine
+it refuses rather than pretends. The AUX lane is deliberately UNGATED on both questions
+— it never had a prelude, and every model seeded in the geometry registry has an
+auxiliary fan, the A-series (the family that does not) not being seeded. An A-series
+capability set is the named next step, and it belongs beside the other predicates in
+``printer_manager`` rather than here.
 
 **The measured precondition.** ``begin`` runs on a printer whose job has just ended,
 and the FINISH terminal it rides in on arrives AFTER the stock end block has run to
@@ -151,7 +158,7 @@ from backend.app.services.eject import donor, generator, remote as eject_remote
 from backend.app.services.eject.generator import EjectGenerationError
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
-from backend.app.services.printer_manager import has_chamber_fan, printer_manager
+from backend.app.services.printer_manager import has_chamber_fan, printer_manager, supports_airduct
 from backend.app.utils.printer_models import is_bedslinger_model
 
 if TYPE_CHECKING:
@@ -175,14 +182,41 @@ class CooldownFan:
     name: FanName
     index: int  # ``M106 P<index>``: 1 = part cooling, 2 = auxiliary, 3 = chamber
     witness: str  # the ``PrinterState`` field the wire reports it back on
-    airduct_cooling: bool  # vendor precondition: ``M145 P0`` precedes the ON
-    supported: Callable[[str | None], bool]  # per-MODEL capability
+    supported: Callable[[str | None], bool]  # per-MODEL capability: has this fan at all
+    # Per-MODEL too, and a DIFFERENT question from ``supported``: does the vendor pair
+    # this fan with an ``M145 P0`` duct-to-cooling prelude on this machine? Only where a
+    # SWITCHABLE duct exists. ``AIRDUCT_MODELS`` is a strict subset of
+    # ``CHAMBER_FAN_MODELS`` (pinned by a test in ``printer_manager``), so an enclosed
+    # model with a FIXED duct — X1, X1C, X1E, P1S — runs its chamber fan with no
+    # prelude at all, because there is no flap to open and firmware would swallow the
+    # command.
+    airduct_cooling: Callable[[str | None], bool]
+    # Does this lane have a sustain speed of its own to step down to? A property of the
+    # FAN (the aux lane has no such setting, by the cooling-law argument in the module
+    # docstring), never of the numbers an operator happened to enter — so the summary
+    # line's shape per lane is stable and greppable even when a chamber sustain is set
+    # equal to its boost.
+    steps: bool
 
 
 # The aux fan is deliberately ungated by model — see the module docstring's "Model
 # capability" note for why, and for the A-series set that is the named next step.
-AUX_FAN = CooldownFan("aux", 2, "big_fan1_speed", False, lambda _model: True)
-CHAMBER_FAN = CooldownFan("chamber", 3, "big_fan2_speed", True, has_chamber_fan)
+AUX_FAN = CooldownFan(
+    name="aux",
+    index=2,
+    witness="big_fan1_speed",
+    supported=lambda _model: True,
+    airduct_cooling=lambda _model: False,
+    steps=False,
+)
+CHAMBER_FAN = CooldownFan(
+    name="chamber",
+    index=3,
+    witness="big_fan2_speed",
+    supported=has_chamber_fan,
+    airduct_cooling=supports_airduct,
+    steps=True,
+)
 # Emission order on the wire: the aux fan first (it needs no prelude and is the one
 # every model has), then the duct, then the chamber fan.
 COOLDOWN_FANS = (AUX_FAN, CHAMBER_FAN)
@@ -205,8 +239,10 @@ class FanRequest:
     ``enabled``, the ONE switch, so a stored legacy ``0`` needs no special arm here and
     simply publishes ``S0``. ``sustain_percent`` is 0..100, where 0 means the fan STOPS
     when the boost ends: a step target, not a second switch. On the aux lane
-    ``sustain_percent == boost_percent`` by construction (no setting exists), which is
-    what makes its step a no-op the summary line does not bother to render.
+    ``sustain_percent == boost_percent`` by construction (no setting exists), which
+    makes its step a numeric no-op (``skipped:same``) — but whether a lane RENDERS a
+    step at all is ``CooldownFan.steps``, a property of the fan, so these numbers never
+    change the shape of the log line.
     """
 
     enabled: bool
@@ -368,18 +404,22 @@ def _observed_fan(printer_id: int, fan: CooldownFan) -> int | None:
 def _fan_summary(lane: FanLane, observed: int | None) -> str:
     """One lane's segment of the summary line. The ONE renderer, so the two cannot drift.
 
-    A lane whose sustain equals its boost (the aux lane, by construction) renders one
-    speed and no ``step=`` field: its step is a no-op the operator has no decision to
-    make about. A lane that genuinely steps renders ``boost%→sustain%`` and the step's
-    own outcome, with ``none`` for a boost that never ended.
+    The shape is decided by the FAN (``CooldownFan.steps``), never by the numbers an
+    operator happened to enter. A non-stepping lane — the aux fan, which has no sustain
+    setting at all — renders one speed and no ``step=`` field. A stepping lane always
+    renders ``boost%→sustain%`` and its step outcome, even when the two speeds are
+    equal: an operator who sets the chamber sustain to its boost still gets
+    ``chamber=100%→100% … step=skipped:same``, because a per-lane grep shape that
+    changed with a setting would make the measurement unreadable exactly when someone
+    had been experimenting with it.
     """
     request = lane.request
-    if request.sustain_percent == request.boost_percent:
-        speeds = f"{request.boost_percent}%"
-        step = ""
-    else:
+    if lane.fan.steps:
         speeds = f"{request.boost_percent}%→{request.sustain_percent}%"
         step = f" step={lane.step if lane.step is not None else 'none'}"
+    else:
+        speeds = f"{request.boost_percent}%"
+        step = ""
     return (
         f"{lane.fan.name}={speeds} start={lane.start}{step} "
         f"off={lane.off if lane.off is not None else 'none'} observed={_speed(observed)}"
@@ -694,7 +734,7 @@ def _start_fan(printer_id: int, fan: CooldownFan, request: FanRequest, model: st
         if client is None:
             logger.warning("[cooldown-prep] printer %s: no MQTT client — %s fan not commanded", printer_id, fan.name)
             return "skipped:no_client"
-        if fan.airduct_cooling and not client.send_gcode(AIRDUCT_COOLING_GCODE):
+        if fan.airduct_cooling(model) and not client.send_gcode(AIRDUCT_COOLING_GCODE):
             # The vendor's pair is this actuator's two-command contract: spinning the
             # exhaust up behind a closed flap moves air around a closed box, so a pair
             # that half-lands reports not-landed and the fan is never published.
