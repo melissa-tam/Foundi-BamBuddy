@@ -16,13 +16,18 @@ from backend.app.services.plate_occupancy import (
     plate_occupancy,
 )
 from backend.app.services.printer_manager import (
+    AIRDUCT_MODELS,
+    CHAMBER_FAN_MODELS,
+    CHAMBER_HEATER_MODELS,
     PrinterManager,
     get_derived_status_name,
+    has_chamber_fan,
     has_stg_cur_idle_bug,
     init_printer_connections,
     occupancy_payload,
     parse_plate_id,
     printer_state_to_dict,
+    supports_airduct,
     supports_chamber_temp,
     supports_drying,
     supports_drying_while_printing,
@@ -1464,6 +1469,92 @@ class TestSupportsChamberTemp:
         assert supports_chamber_temp("N2S") is False
         # A1 Mini
         assert supports_chamber_temp("N1") is False
+
+
+class TestHasChamberFan:
+    """Tests for has_chamber_fan — the ONE backend origin for "M106 P3 moves air".
+
+    Replaces the frontend's hardcoded MODELS_WITH_CHAMBER_FAN list; consumed by
+    the cooldown prep's chamber lane and projected on the status payload.
+    """
+
+    @pytest.mark.parametrize(
+        "model",
+        ["X1", "X1C", "X1E", "X2D", "P1S", "P2S", "H2C", "H2D", "H2DPRO", "H2D Pro", "H2S"],
+    )
+    def test_enclosed_display_names_supported(self, model):
+        """Every enclosed model in the seeded list has a chamber fan."""
+        assert has_chamber_fan(model) is True
+
+    @pytest.mark.parametrize("model", sorted(CHAMBER_FAN_MODELS))
+    def test_every_member_matches(self, model):
+        """Each spelling in the set — display name and internal code — resolves True."""
+        assert has_chamber_fan(model) is True
+
+    @pytest.mark.parametrize("model", ["h2s", "H2s", " H2S ", "\th2d pro\n"])
+    def test_case_and_surrounding_whitespace_insensitive(self, model):
+        """Matching normalises with .strip().upper(), like its two neighbours."""
+        assert has_chamber_fan(model) is True
+
+    @pytest.mark.parametrize("model", [None, "", "   "])
+    def test_unknown_model_not_supported(self, model):
+        """An absent or blank model can never claim the capability."""
+        assert has_chamber_fan(model) is False
+
+    @pytest.mark.parametrize("model", ["A1", "A1MINI", "A2L", "P1P", "C11", "N1", "N2S", "N9"])
+    def test_open_frame_models_not_supported(self, model):
+        """Open-frame machines have no chamber to exhaust.
+
+        C11 is read as P1P by this module (STG_CUR_IDLE_BUG_MODELS). The repo
+        disagrees with itself about that code — utils.printer_models maps it to
+        X1C — so it stays OUT: a code that might name an open-frame machine must
+        never claim a fan.
+        """
+        assert has_chamber_fan(model) is False
+
+
+class TestSupportsAirduct:
+    """Tests for supports_airduct — the gate on M145 P0/P1 and JSON set_airduct."""
+
+    @pytest.mark.parametrize("model", ["P2S", "X2D", "H2D", "H2DPRO", "H2D Pro", "H2C", "H2S"])
+    def test_duct_models_supported(self, model):
+        """P2S, X2D and the whole H2 family steer the duct."""
+        assert supports_airduct(model) is True
+
+    @pytest.mark.parametrize("model", sorted(AIRDUCT_MODELS))
+    def test_every_member_matches(self, model):
+        """Each spelling in the set — display name and internal code — resolves True."""
+        assert supports_airduct(model) is True
+
+    @pytest.mark.parametrize("model", ["p2s", "H2s", " H2S ", "\th2d pro\n"])
+    def test_case_and_surrounding_whitespace_insensitive(self, model):
+        assert supports_airduct(model) is True
+
+    @pytest.mark.parametrize("model", [None, "", "   "])
+    def test_unknown_model_not_supported(self, model):
+        assert supports_airduct(model) is False
+
+    @pytest.mark.parametrize("model", ["A1", "A1MINI", "A2L", "P1P", "C11", "N1", "N2S", "N9"])
+    def test_open_frame_models_not_supported(self, model):
+        assert supports_airduct(model) is False
+
+    @pytest.mark.parametrize("model", ["X1", "X1C", "X1E", "P1S", "BL-P001", "C12", "C13"])
+    def test_fixed_duct_enclosed_models_not_supported(self, model):
+        """An enclosed model without the switchable duct: fan yes, M145 no."""
+        assert has_chamber_fan(model) is True
+        assert supports_airduct(model) is False
+
+
+class TestCapabilityContainment:
+    """The three capability sets are ordered by hardware, and must stay that way."""
+
+    def test_chamber_heater_implies_chamber_fan(self):
+        """A model that can HEAT its chamber necessarily has one to exhaust."""
+        assert CHAMBER_HEATER_MODELS <= CHAMBER_FAN_MODELS
+
+    def test_airduct_implies_chamber_fan(self):
+        """A switchable duct steers the chamber fan's air — no fan, nothing to steer."""
+        assert AIRDUCT_MODELS <= CHAMBER_FAN_MODELS
 
 
 class TestSupportsDrying:

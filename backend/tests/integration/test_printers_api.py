@@ -904,6 +904,45 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("model", "chamber_fan", "airduct"),
+        [
+            ("H2S", True, True),  # enclosed, switchable duct
+            ("X1C", True, False),  # enclosed, fixed duct
+            ("A1", False, False),  # open frame — neither
+        ],
+    )
+    async def test_get_printer_status_projects_fan_capabilities(
+        self, async_client: AsyncClient, printer_factory, db_session, model, chamber_fan, airduct
+    ):
+        """The status payload is the ONE origin the frontend reads for the chamber
+        fan / air duct capability — it used to keep two hardcoded model lists of its
+        own (PrintersPage.tsx), which could and did disagree with the backend."""
+        from unittest.mock import MagicMock, patch
+
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        printer = await printer_factory(name="P", model=model)
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "IDLE"
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["has_chamber_fan"] is chamber_fan
+        assert result["supports_airduct"] is airduct
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_get_printer_status_includes_fila_switch_when_installed(
         self, async_client: AsyncClient, printer_factory, db_session
     ):
@@ -2330,7 +2369,48 @@ class TestChamberLightAPI:
 
 
 class TestAirductModeAPI:
-    """Integration tests for the airduct mode endpoint (P2S/H2*)."""
+    """Integration tests for the airduct mode endpoint (P2S/H2*).
+
+    Gated on supports_airduct(model): a model with a FIXED duct swallows M145 /
+    set_airduct at the firmware level, so the route 400s rather than sending a
+    no-op — the same contract the chamber-temperature route has.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_not_found(self, async_client: AsyncClient):
+        response = await async_client.post("/api/v1/printers/99999/airduct-mode?mode=cooling")
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("fixed_duct_model", ["A1", "P1S", "X1C"])
+    async def test_model_without_duct_rejected(self, async_client: AsyncClient, printer_factory, fixed_duct_model):
+        """A model with no switchable duct must 400 before any client call."""
+        printer = await printer_factory(name="P", model=fixed_duct_model)
+        mock_client = MagicMock()
+        mock_client.set_airduct_mode.return_value = True
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/airduct-mode?mode=cooling")
+        assert response.status_code == 400
+        assert fixed_duct_model in response.json()["detail"]
+        # The command must never reach a printer that cannot act on it.
+        mock_client.set_airduct_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("duct_model", ["P2S", "X2D", "H2C", "H2D", "H2DPRO", "H2S"])
+    async def test_success_per_duct_model(self, async_client: AsyncClient, printer_factory, duct_model):
+        """Every model with a switchable duct accepts the command."""
+        printer = await printer_factory(name="P", model=duct_model)
+        mock_client = MagicMock()
+        mock_client.set_airduct_mode.return_value = True
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/airduct-mode?mode=cooling")
+        assert response.status_code == 200
+        mock_client.set_airduct_mode.assert_called_once_with("cooling")
 
     @pytest.mark.asyncio
     @pytest.mark.integration
