@@ -7,6 +7,7 @@ These tests focus on timelapse tracking during prints.
 import json
 import logging
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -8818,3 +8819,119 @@ class TestSetFanPercent:
         mqtt_client.state.connected = False
         assert mqtt_client.set_fan_percent(2, 100) is False
         assert self._published_gcode(mqtt_client) == []
+
+
+class TestAmsMidFilamentChange:
+    """The ONE predicate for "the AMS is mid filament-change and drops every write".
+
+    002-H2S 2026-09-11: a layer-0 jam left the AMS at ``ams_status_main == 1`` behind
+    a PAUSE, the operator's two Load clicks returned 200 and moved nothing, and the
+    scheduler dispatched onto that AMS 31 s after the stop. The value is what makes
+    it decidable — and value 1 ONLY: a fleet sample the same day read
+    ``ams_status_main = 3`` on every RUNNING H2S (assist) and 0 on an idle H2C, so a
+    "non-idle" reading of this question would refuse dispatch on every healthy print
+    in the farm.
+    """
+
+    def test_value_one_is_mid_change(self):
+        from backend.app.services.bambu_mqtt import ams_mid_filament_change
+
+        assert ams_mid_filament_change(SimpleNamespace(ams_status_main=1)) is True
+
+    @pytest.mark.parametrize("value", [0, 2, 3, 4, 9])
+    def test_no_other_value_is_mid_change(self, value):
+        """3 is ASSIST — the steady state of every RUNNING H2S in the fleet. Reading
+        this predicate as "not idle" would hold the whole farm out of dispatch."""
+        from backend.app.services.bambu_mqtt import ams_mid_filament_change
+
+        assert ams_mid_filament_change(SimpleNamespace(ams_status_main=value)) is False
+
+    def test_no_state_is_not_mid_change(self):
+        """Startup race / a printer with no status yet: a gate that cannot read the
+        wire must never refuse an operator."""
+        from backend.app.services.bambu_mqtt import ams_mid_filament_change
+
+        assert ams_mid_filament_change(None) is False
+
+    def test_a_state_without_the_field_is_not_mid_change(self):
+        from backend.app.services.bambu_mqtt import ams_mid_filament_change
+
+        assert ams_mid_filament_change(SimpleNamespace()) is False
+
+    def test_it_is_the_only_place_the_magic_value_is_compared(self):
+        """One origin (invariant 1). Every consumer asks the predicate; a direct
+        comparison anywhere else is a second, drift-prone copy of a wire fact that
+        took an incident to establish.
+
+        Scans COMPARISON nodes, not source text: the prose that records the
+        evidence (module docstrings, the constant's own comment) names the value on
+        purpose and must stay readable.
+        """
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[4] / "backend" / "app"
+        offenders = []
+        for path in root.rglob("*.py"):
+            if path.name == "bambu_mqtt.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Compare):
+                    continue
+                expr = ast.unparse(node)
+                names_the_constant = "AMS_STATUS_FILAMENT_CHANGE" in expr
+                against_literal_one = "ams_status_main" in expr and any(
+                    isinstance(c, ast.Constant) and c.value == 1 for c in node.comparators
+                )
+                if names_the_constant or against_literal_one:
+                    offenders.append(f"{path.relative_to(root)}:{node.lineno}: {expr}")
+        assert offenders == []
+
+
+class TestAmsControlPublisher:
+    """ONE publisher for ``ams_control``. The HMS modal used to carry its own inline
+    copy of the frame, so the action vocabulary the printer's own error dialog needs
+    (``done``, ``abort``) was reachable from there and NOT from the method that is
+    supposed to own the command."""
+
+    @pytest.fixture
+    def client(self):
+        from unittest.mock import MagicMock
+
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        c = BambuMQTTClient(ip_address="192.168.1.100", serial_number="03W-TEST", access_code="12345678")
+        c._client = MagicMock()
+        c.state.connected = True
+        return c
+
+    def _payloads(self, client):
+        return [call.args[1] for call in client._client.publish.call_args_list]
+
+    @pytest.mark.parametrize("action", ["resume", "reset", "pause", "done", "abort"])
+    def test_the_whitelist_covers_every_action_the_hms_modal_dispatches(self, client, action):
+        assert client.ams_control(action) is True
+        assert json.loads(self._payloads(client)[0]) == {
+            "print": {"command": "ams_control", "param": action, "sequence_id": "0"}
+        }
+
+    def test_an_unknown_action_is_refused(self, client):
+        assert client.ams_control("detonate") is False
+        assert self._payloads(client) == []
+
+    def test_a_bare_call_carries_no_pushall(self, client):
+        """The recovery driver reads the AMS state machine off the next ~1 Hz push
+        anyway; asking for a full report per command would be pure wire cost."""
+        client.ams_control("resume")
+        assert len(self._payloads(client)) == 1
+
+    def test_request_pushall_appends_the_full_report_ask(self, client):
+        client.ams_control("resume", request_pushall=True)
+        payloads = [json.loads(p) for p in self._payloads(client)]
+        assert payloads[1] == {"pushing": {"command": "pushall", "sequence_id": "0"}}
+
+    def test_disconnected_is_fail_loud(self, client):
+        client.state.connected = False
+        assert client.ams_control("resume") is False
+        assert self._payloads(client) == []

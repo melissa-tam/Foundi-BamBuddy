@@ -1262,3 +1262,163 @@ class TestAttendedPauseDerivation:
         from backend.app.services import printer_incidents
 
         assert printer_incidents.WAITING_REASON_RECOVERING not in farm_stall._ATTENDED_PAUSE_REASONS
+
+
+# --------------------------------------------------------------------------- #
+# The AMS wedged mid filament-change on an idle printer (2026-09-11, 002-H2S)
+# --------------------------------------------------------------------------- #
+_WEDGE_DWELL = farm_stall._AMS_WEDGED_IDLE_DWELL_S
+
+
+class _WedgedState(_FakeState):
+    """A live status that also carries the AMS state machine plus the two tray
+    fields the page names."""
+
+    def __init__(self, state, ams_status_main, tray_now=1, pending_tray_target=None):
+        super().__init__(state)
+        self.ams_status_main = ams_status_main
+        self.tray_now = tray_now
+        self.pending_tray_target = pending_tray_target
+
+
+async def _add_printer(db, name="002-H2S"):
+    from backend.app.models.printer import Printer
+
+    p = Printer(name=name, ip_address="192.168.2.9", access_code="1234", serial_number=f"SN-{name}", model="H2S")
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return p
+
+
+class TestAmsWedgedIdle:
+    """A latched ``ams_status_main == 1`` on an IDLE printer is 002-H2S's wedge with
+    the jam code gone: the AMS drops every load and unload, the dispatch gate refuses
+    the printer forever, and NOTHING else in the farm can see it — no incident row, no
+    print, no HMS. The #60 shape in a new field, so it gets the same bounded page.
+    """
+
+    async def _mature(self, db, mgr, *, base=_NOW):
+        await farm_stall.check_ams_wedged_idle(db, manager=mgr, now=base)
+        await farm_stall.check_ams_wedged_idle(db, manager=mgr, now=base + _WEDGE_DWELL + 1)
+
+    async def test_pages_once_after_the_dwell(self, db_session):
+        printer = await _add_printer(db_session)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await self._mature(db_session, mgr)
+            await farm_stall.check_ams_wedged_idle(db_session, manager=mgr, now=_NOW + _WEDGE_DWELL + 600)
+
+        mock_n.assert_awaited_once()
+        assert mock_n.await_args.kwargs["printer_id"] == printer.id
+        assert mock_n.await_args.kwargs["minutes"] >= 10
+
+    async def test_does_not_page_before_the_dwell(self, db_session):
+        printer = await _add_printer(db_session)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_ams_wedged_idle(db_session, manager=mgr, now=_NOW)
+            await farm_stall.check_ams_wedged_idle(db_session, manager=mgr, now=_NOW + _WEDGE_DWELL - 5)
+
+        mock_n.assert_not_awaited()
+
+    async def test_a_running_printer_is_never_paged(self, db_session):
+        """Value 1 DURING a print is the ordinary mid-print filament change — the
+        firmware's own business, not a wedge."""
+        printer = await _add_printer(db_session)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("RUNNING", 1)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await self._mature(db_session, mgr)
+
+        mock_n.assert_not_awaited()
+
+    @pytest.mark.parametrize("ams_status_main", [0, 3])
+    async def test_an_idle_or_assisting_ams_is_never_paged(self, db_session, ams_status_main):
+        printer = await _add_printer(db_session)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", ams_status_main)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await self._mature(db_session, mgr)
+
+        mock_n.assert_not_awaited()
+
+    async def test_an_open_incident_owns_the_printer(self, db_session):
+        """Somebody else is already telling the operator about this printer."""
+        printer = await _add_printer(db_session)
+        await _add_incident_held(db_session, printer.id, "jam", item=False)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await self._mature(db_session, mgr)
+
+        mock_n.assert_not_awaited()
+
+    async def test_a_live_recovery_driver_owns_the_printer(self, db_session):
+        """The driver's own resume is what leaves the AMS at 1 between rounds."""
+        printer = await _add_printer(db_session)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
+
+        with (
+            patch("backend.app.services.spool_recovery.has_live_recovery", return_value=True),
+            patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n,
+        ):
+            await self._mature(db_session, mgr)
+
+        mock_n.assert_not_awaited()
+
+    async def test_a_disconnected_printer_is_never_paged(self, db_session):
+        printer = await _add_printer(db_session)
+        mgr = _FakeManager({printer.id: False}, {printer.id: _WedgedState("IDLE", 1)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await self._mature(db_session, mgr)
+
+        mock_n.assert_not_awaited()
+
+    async def test_the_dwell_must_hold_continuously(self, db_session):
+        printer = await _add_printer(db_session)
+        wedged = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
+        clear = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 0)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_ams_wedged_idle(db_session, manager=wedged, now=_NOW)
+            await farm_stall.check_ams_wedged_idle(db_session, manager=clear, now=_NOW + 10)
+            assert farm_stall._ams_wedged_since == {}
+            await farm_stall.check_ams_wedged_idle(db_session, manager=wedged, now=_NOW + _WEDGE_DWELL)
+
+        mock_n.assert_not_awaited()
+
+    async def test_a_second_episode_pages_again(self, db_session):
+        """The paged mark is per EPISODE, not per printer: a wedge that clears and
+        recurs is a new thing to tell the operator about."""
+        printer = await _add_printer(db_session)
+        wedged = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
+        clear = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 0)})
+
+        with patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n:
+            await self._mature(db_session, wedged)
+            await farm_stall.check_ams_wedged_idle(db_session, manager=clear, now=_NOW + _WEDGE_DWELL + 10)
+            assert farm_stall._ams_wedged_paged == set()
+            await self._mature(db_session, wedged, base=_NOW + _WEDGE_DWELL + 20)
+
+        assert mock_n.await_count == 2
+
+    async def test_the_state_resets_between_runs(self):
+        """The module's reset hook must own the two new dicts, or a later test file
+        inherits a half-matured episode."""
+        farm_stall._ams_wedged_since[99] = 1.0
+        farm_stall._ams_wedged_paged.add(99)
+        farm_stall._reset_state()
+        assert farm_stall._ams_wedged_since == {}
+        assert farm_stall._ams_wedged_paged == set()
+
+    async def test_the_scheduler_tick_calls_it(self):
+        import inspect
+
+        from backend.app.services.print_scheduler import PrintScheduler
+
+        src = inspect.getsource(PrintScheduler.check_queue)
+        assert "check_ams_wedged_idle(db)" in src

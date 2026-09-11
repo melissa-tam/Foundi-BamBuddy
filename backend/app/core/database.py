@@ -3488,6 +3488,13 @@ async def run_migrations(conn):
         # printer ran out twice in 28 h with a full roll one slot over. The farm cannot
         # rewrite an RFID or operator-bound tray, so the operator is the fix.
         ("on_backup_group_split", "1", "TRUE"),
+        # AMS wedged mid filament-change on an IDLE printer (002-H2S 2026-09-11): at
+        # ams_status_main == 1 the firmware drops every load and unload, and since the
+        # scheduler's idle gate refuses to dispatch there, a latched wedge holds the
+        # printer out of the queue with nothing else anywhere saying so — no print, no
+        # incident row, no HMS code once the jam that caused it clears. Only a human
+        # pressing Retry/Continue on the screen frees it.
+        ("on_ams_wedged_idle", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
         # Cooldown escalation: post-print eject cooldown is running long (bed still

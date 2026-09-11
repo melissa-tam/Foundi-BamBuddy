@@ -68,6 +68,30 @@ AMS_STATUS_IDLE = 0
 # this one origin.
 AMS_STATUS_FILAMENT_CHANGE = 1
 
+
+def ams_mid_filament_change(state) -> bool:
+    """Whether this printer's AMS is mid filament-change, and therefore DEAF.
+
+    At ``ams_status_main == 1`` the firmware drops every ``ams_change_filament`` —
+    load and unload alike — and only the firmware CONTINUE (``print.resume`` /
+    ``ams_control resume``) moves the state machine on: 009-H2S 2026-07-20 (four
+    unloads silently ignored until a resume unwedged it) and 002-H2S 2026-09-11
+    (a layer-0 jam parked the AMS here behind a PAUSE; the operator's two Load
+    clicks returned HTTP 200 and moved nothing, and the scheduler dispatched onto
+    that AMS 31 s after the stop).
+
+    Value 1 ONLY, by measurement, never "non-idle": a fleet sample on 2026-09-11
+    read ``ams_status_main = 3`` (assist) on every RUNNING H2S and 0 on an idle H2C,
+    so 3 is the steady state of a healthy print — a "non-idle" reading of this
+    question would hold the whole farm out of dispatch.
+
+    The ONE origin for that comparison. Pure, DB-free and total: a ``None`` state (no
+    status yet) and a state without the field both answer False, because a gate that
+    cannot read the wire must never refuse an operator.
+    """
+    return getattr(state, "ams_status_main", None) == AMS_STATUS_FILAMENT_CHANGE
+
+
 # The AMS write commands the firmware ACKs on the REPORT topic. An echo is the
 # request's own `command` string plus a `result` ("success"/"fail"), and it is the
 # ONLY statement the wire ever makes about whether a config write was accepted —
@@ -6389,11 +6413,21 @@ class BambuMQTTClient:
 
         return True
 
-    def ams_control(self, action: str) -> bool:
-        """Control AMS operations.
+    def ams_control(self, action: str, *, request_pushall: bool = False) -> bool:
+        """Control AMS operations — the ONE publisher of the ``ams_control`` frame.
 
         Args:
-            action: "resume", "reset", or "pause"
+            action: ``"resume"``, ``"reset"``, ``"pause"``, ``"done"`` or ``"abort"``.
+                The last two are the printer's own filament-change dialog verbs
+                (``FILAMENT_EXTRUDED`` / ``ABORT`` in the HMS action catalog); they
+                were reachable only from ``execute_hms_action``'s private copy of this
+                frame until 2026-09-11.
+            request_pushall: also ask the printer for a FULL status report. A bare
+                ``ams_control`` deliberately carries none — the recovery driver reads
+                the state machine off the next ~1 Hz push anyway, so a per-command
+                full report would be pure wire cost. The HMS-modal path asks for one
+                because the modal's underlying status query is a one-shot read that
+                must reflect the new error list immediately.
 
         Returns:
             True if command was sent, False otherwise
@@ -6402,12 +6436,16 @@ class BambuMQTTClient:
             logger.warning("[%s] Cannot control AMS: not connected", self.serial_number)
             return False
 
-        if action not in ("resume", "reset", "pause"):
+        if action not in ("resume", "reset", "pause", "done", "abort"):
             logger.warning("[%s] Invalid AMS action: %s", self.serial_number, action)
             return False
 
         command = {"print": {"command": "ams_control", "param": action, "sequence_id": "0"}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        if request_pushall:
+            self._client.publish(
+                self.topic_publish, json.dumps({"pushing": {"command": "pushall", "sequence_id": "0"}}), qos=1
+            )
         logger.info("[%s] AMS control: %s", self.serial_number, action)
         return True
 
@@ -6985,17 +7023,6 @@ class BambuMQTTClient:
                 }
             )
 
-        def ams_control(param: str):
-            publish(
-                {
-                    "print": {
-                        "command": "ams_control",
-                        "param": param,
-                        "sequence_id": "0",
-                    }
-                }
-            )
-
         def clean_print_error():
             # Matches the existing `clear_hms_errors` shape — Bambu does not
             # expect `print_error` in the body; the command clears whatever
@@ -7047,7 +7074,7 @@ class BambuMQTTClient:
                 hms_ignore(persistent=True)
 
             case HMSAction.FILAMENT_EXTRUDED | HMSAction.DBL_CHECK_DONE:
-                ams_control("done")
+                self.ams_control("done", request_pushall=True)
 
             case (
                 HMSAction.RETRY_FILAMENT_EXTRUDED
@@ -7055,10 +7082,10 @@ class BambuMQTTClient:
                 | HMSAction.RETRY_PROBLEM_SOLVED
                 | HMSAction.DBL_CHECK_RETRY
             ):
-                ams_control("resume")
+                self.ams_control("resume", request_pushall=True)
 
             case HMSAction.ABORT:
-                ams_control("abort")
+                self.ams_control("abort", request_pushall=True)
 
             case HMSAction.OK_BUTTON:
                 clean_print_error()

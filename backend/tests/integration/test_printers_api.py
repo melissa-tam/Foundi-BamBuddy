@@ -4699,3 +4699,92 @@ class TestAMSLoadRunoutHoldGate:
 
         assert response.status_code == 200
         mock_client.ams_load_filament.assert_called_once_with(5)
+
+
+class TestAmsMidFilamentChangeGate:
+    """002-H2S 2026-09-11: a layer-0 jam (``0700_0012`` + ``0700_8005``) left the AMS
+    at ``ams_status_main == 1``. In that state the firmware drops every
+    ``ams_change_filament``, so the operator's two Load-slot-1 clicks returned HTTP
+    200 and moved nothing — the same "a 200 that does nothing" failure the runout-hold
+    gate beside this one closes, from a different cause. Unload had no gate at all.
+    """
+
+    def _state(self, ams_status_main, gcode_state="PAUSE"):
+        return SimpleNamespace(state=gcode_state, hms_errors=[], ams_status_main=ams_status_main)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_load_409s_while_the_ams_is_mid_change(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory(name="002-H2S")
+        mock_client = MagicMock()
+        mock_client.ams_load_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = self._state(1)
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=0")
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "mid filament-change" in detail
+        assert "002-H2S 2026-09-11" in detail  # the incident that proved the firmware fact
+        assert "printer screen" in detail  # the on-printer action that clears it
+        mock_client.ams_load_filament.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_unload_409s_while_the_ams_is_mid_change(self, async_client: AsyncClient, printer_factory):
+        """Unload is dropped by exactly the same firmware state — 009-H2S 2026-07-20
+        burned four of them before a resume unwedged it."""
+        printer = await printer_factory(name="002-H2S")
+        mock_client = MagicMock()
+        mock_client.ams_unload_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = self._state(1)
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/unload")
+
+        assert response.status_code == 409
+        assert "mid filament-change" in response.json()["detail"]
+        mock_client.ams_unload_filament.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("ams_status_main", [0, 3])
+    async def test_an_idle_or_assisting_ams_loads_normally(
+        self, async_client: AsyncClient, printer_factory, ams_status_main
+    ):
+        """3 is ASSIST — the steady state of every RUNNING H2S in the fleet. A
+        "non-idle" gate here would refuse every mid-print load on the farm."""
+        printer = await printer_factory(name="P")
+        mock_client = MagicMock()
+        mock_client.ams_load_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = self._state(ams_status_main, gcode_state="RUNNING")
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
+
+        assert response.status_code == 200
+        mock_client.ams_load_filament.assert_called_once_with(5)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_unload_with_no_live_status_still_works(self, async_client: AsyncClient, printer_factory):
+        """A gate that cannot read the wire must never refuse an operator."""
+        printer = await printer_factory(name="P")
+        mock_client = MagicMock()
+        mock_client.ams_unload_filament.return_value = True
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = None
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/unload")
+
+        assert response.status_code == 200
+        mock_client.ams_unload_filament.assert_called_once()

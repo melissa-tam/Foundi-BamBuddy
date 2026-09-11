@@ -2371,6 +2371,53 @@ class NotificationService:
             variables=variables,
         )
 
+    async def on_ams_wedged_idle(
+        self,
+        printer_id: int | None,
+        printer_name: str,
+        minutes: int,
+        db: AsyncSession,
+    ):
+        """Fire when a printer sits IDLE with its AMS latched mid filament-change.
+
+        At ``ams_status_main == 1`` the firmware drops every ``ams_change_filament``,
+        load and unload alike, and only its own CONTINUE moves it on. 002-H2S
+        2026-09-11: a layer-0 jam parked the AMS there, the operator's two Load clicks
+        returned 200 and moved nothing, and the printer would have taken no work until
+        somebody touched its screen.
+
+        Its own event rather than a reuse of the pause-stall copy, because the printer
+        is NOT paused — it is idle, looks healthy on every surface, and is held out of
+        dispatch by a gate no operator can see. That invisibility is the whole reason
+        it pages: the same shape as incident #60 (2026-08-29), where a standing fault
+        held a printer for 15 h with seven units queued behind it and zero
+        notifications.
+
+        One page per EPISODE — the caller (``farm_stall.check_ams_wedged_idle``) owns
+        the dwell and the once-guard, and drops both the moment the wedge clears.
+        """
+        providers = await self._get_providers_for_event(db, "on_ams_wedged_idle", printer_id)
+        if not providers:
+            return
+
+        variables = {
+            "printer_name": printer_name,
+            "minutes": str(minutes),
+        }
+
+        title, message = await self._build_message_from_template(db, "ams_wedged_idle", variables)
+        await self._send_to_providers(
+            providers,
+            title,
+            message,
+            db,
+            "ams_wedged_idle",
+            printer_id,
+            printer_name,
+            force_immediate=True,
+            variables=variables,
+        )
+
     async def on_zero_gram_charge(
         self,
         printer_id: int | None,
