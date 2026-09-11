@@ -32,7 +32,6 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
     back_overhang_mm: 2,
     eject_speed_mm_min: 3000,
     skim_speed_mm_min: 1500,
-    cooling_fan_assist: true,
     final_skim: true,
     max_part_height_mm: 42,
     sweep_x_min_mm: null,

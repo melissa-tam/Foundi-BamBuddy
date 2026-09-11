@@ -32,8 +32,6 @@ export interface EjectProfileParams {
   eject_speed_mm_min: number;
   /** Feedrate (mm/min) for the skim passes. */
   skim_speed_mm_min: number;
-  /** Whether to run the part-cooling fan during the sweep. */
-  cooling_fan_assist: boolean;
   /** Append the final slow skim pass after the descent sweeps; false pushes once. */
   final_skim: boolean;
   /** Maximum part height (mm) this profile is validated for. */
@@ -91,7 +89,6 @@ export const DEFAULT_EJECT_PROFILE_PARAMS: EjectProfileParams = {
   back_overhang_mm: 15,
   eject_speed_mm_min: 3000,
   skim_speed_mm_min: 1500,
-  cooling_fan_assist: true,
   final_skim: true,
   max_part_height_mm: 42,
   sweep_x_min_mm: null,

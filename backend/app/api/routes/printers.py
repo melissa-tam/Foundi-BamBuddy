@@ -61,9 +61,11 @@ from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
     _eject_watch_payload,
     get_derived_status_name,
+    has_chamber_fan,
     occupancy_payload,
     printer_manager,
     resolve_plate_id,
+    supports_airduct,
     supports_chamber_heater,
     supports_chamber_temp,
     supports_drying,
@@ -493,6 +495,16 @@ async def get_printer_status(
             # and must not offer itself on an already-gated plate.
             awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
             occupancy=occupancy_payload(printer_id),
+            # Hardware capabilities are facts about the MODEL, not about the MQTT
+            # session, so they are reportable with no session — same as the sticky
+            # flags above. Load-bearing: the printer card's chamber-fan and airduct
+            # widgets derive from these flags, and an offline printer must keep
+            # rendering them exactly as the model-name lists they replaced did.
+            # (``supports_drying*`` is deliberately NOT here — it needs the firmware
+            # version, which only a live session reports.)
+            supports_chamber_heater=supports_chamber_heater(printer.model),
+            has_chamber_fan=has_chamber_fan(printer.model),
+            supports_airduct=supports_airduct(printer.model),
         )
 
     # Determine cover URL if there's an active print (including paused)
@@ -826,6 +838,8 @@ async def get_printer_status(
         supports_drying=supports_drying(printer.model, state.firmware_version),
         supports_drying_while_printing=supports_drying_while_printing(printer.model, state.firmware_version),
         supports_chamber_heater=supports_chamber_heater(printer.model),
+        has_chamber_fan=has_chamber_fan(printer.model),
+        supports_airduct=supports_airduct(printer.model),
         current_archive_id=current_archive_id,
         current_plate_id=current_plate_id,
         fila_switch=(
@@ -3233,7 +3247,13 @@ async def set_airduct_mode(
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set the airduct mode (cooling/heating) on supported printers (P2S/H2*)."""
+    """Set the airduct mode (cooling/heating) on supported printers (P2S/H2*).
+
+    Gated on `supports_airduct(model)`: only P2S, X2D and the H2 family have a
+    switchable duct. Every other model swallows the command at the firmware
+    level, so we 400 here rather than send a no-op — the same contract the
+    chamber-temperature route has for sensor-only models.
+    """
     if mode not in ("cooling", "heating"):
         raise HTTPException(400, "Mode must be 'cooling' or 'heating'")
 
@@ -3241,6 +3261,9 @@ async def set_airduct_mode(
     printer = result.scalar_one_or_none()
     if not printer:
         raise HTTPException(404, "Printer not found")
+
+    if not supports_airduct(printer.model):
+        raise HTTPException(400, f"Model {printer.model or 'unknown'} has no switchable air duct")
 
     client = printer_manager.get_client(printer_id)
     if not client:

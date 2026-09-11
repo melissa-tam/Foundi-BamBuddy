@@ -161,6 +161,131 @@ def supports_chamber_heater(model: str | None) -> bool:
     return model.strip().upper() in CHAMBER_HEATER_MODELS
 
 
+# Models with a chamber (exhaust) fan — the fan ``M106 P3`` drives.
+#
+# ENCLOSURE is the discriminator: an enclosed Bambu ships the chamber
+# exhaust/filtration fan; an open-frame one (A1, A1 Mini, A2L, P1P) has no
+# chamber to exhaust, so ``M106 P3`` there is a no-op. Seeded from the
+# frontend's ``MODELS_WITH_CHAMBER_FAN`` (``PrintersPage.tsx``), which this set
+# REPLACES as the single origin — the frontend now reads the projected
+# ``has_chamber_fan`` status flag instead of keeping its own list.
+#
+# Internal codes are taken ONLY where a set in THIS module already attributes
+# them to one of the display names above (no code is invented here):
+#   BL-P001 = X1/X1C, C13 = X1E, N6 = X2D, N7 = P2S, O1C/O1C2 = H2C,
+#   O1D = H2D, O1E/O2D = H2D Pro, O1S = H2S   (CHAMBER_TEMP_SUPPORTED_MODELS)
+#   C12 = P1S                                  (STG_CUR_IDLE_BUG_MODELS)
+#
+# C11 is deliberately ABSENT. This module reads it as P1P (open-frame, no
+# chamber fan) while ``utils.printer_models.PRINTER_MODEL_ID_MAP`` reads it as
+# X1C (enclosed) — the repo genuinely disagrees, so the fail-closed answer wins:
+# a code that MIGHT name an open-frame machine never claims a fan. C12 is safe
+# under both readings (P1S here, X1 there — both enclosed), so it is included.
+#
+# Spellings: the predicate normalises with ``.strip().upper()`` only (the shape
+# of its two neighbours), so the space form "H2D PRO" is carried beside
+# "H2DPRO" — the same verbatim-spellings device ``A1_FAMILY_MODELS`` uses for
+# callers that do not strip inner spaces.
+CHAMBER_FAN_MODELS = frozenset(
+    [
+        # Display names
+        "X1",
+        "X1C",
+        "X1E",  # X1 series
+        "X2D",  # X2 series
+        "P1S",  # P1 series (enclosed; P1P is the open-frame sibling)
+        "P2S",  # P2 series
+        "H2C",
+        "H2D",
+        "H2DPRO",
+        "H2D PRO",  # space form — see the spellings note above
+        "H2S",  # H2 series
+        # Internal codes (from MQTT/SSDP)
+        "BL-P001",  # X1/X1C
+        "C12",  # P1S
+        "C13",  # X1E
+        "N6",  # X2D
+        "N7",  # P2S
+        "O1C",  # H2C
+        "O1C2",  # H2C (dual nozzle variant)
+        "O1D",  # H2D
+        "O1E",  # H2D Pro
+        "O2D",  # H2D Pro (alternate code)
+        "O1S",  # H2S
+    ]
+)
+
+
+# Models with the SWITCHABLE cooling/heating air duct — the flap ``M145 P0``
+# (cooling) / ``M145 P1`` (heating) moves, and the JSON ``set_airduct`` command
+# has an addressee. A chamber fan without a duct blows through a fixed path;
+# these models steer it, which is why the cooldown prelude opens the flap to
+# cooling BEFORE spinning the chamber fan up.
+#
+# Seeded from the inline list the airduct control in ``PrintersPage.tsx`` used
+# to carry (P2S, X2D, H2D, H2C, H2S) — again replaced by this set as the one
+# origin. H2D Pro is ADDED to it: the route's own docstring scopes the feature
+# as "P2S/H2*", and the Pro is the H2D variant sharing its duct hardware, so the
+# frontend list omitting it was an oversight rather than a hardware fact.
+#
+# Codes by the same attribution rule as CHAMBER_FAN_MODELS. A duct implies a
+# chamber fan, so this set is a strict subset of it (pinned by test).
+AIRDUCT_MODELS = frozenset(
+    [
+        # Display names
+        "X2D",  # X2 series
+        "P2S",  # P2 series
+        "H2C",
+        "H2D",
+        "H2DPRO",
+        "H2D PRO",  # space form — see CHAMBER_FAN_MODELS' spellings note
+        "H2S",  # H2 series
+        # Internal codes (from MQTT/SSDP)
+        "N6",  # X2D
+        "N7",  # P2S
+        "O1C",  # H2C
+        "O1C2",  # H2C (dual nozzle variant)
+        "O1D",  # H2D
+        "O1E",  # H2D Pro
+        "O2D",  # H2D Pro (alternate code)
+        "O1S",  # H2S
+    ]
+)
+
+
+def has_chamber_fan(model: str | None) -> bool:
+    """Check if a printer model has a chamber (exhaust) fan — ``M106 P3`` moves air.
+
+    The ONE backend origin for this capability. Enclosed models (X1 family, P1S,
+    P2S, X2D, H2 family) have one; the open-frame A1 family, A2L and P1P do not,
+    and firmware silently swallows ``M106 P3`` there.
+
+    Consumers: the cooldown prep's chamber-fan lane (an unsupported model logs
+    ``skipped:unsupported`` instead of publishing a no-op), and the printer card's
+    chamber-fan widget through the ``has_chamber_fan`` status flag.
+    """
+    if not model:
+        return False
+    return model.strip().upper() in CHAMBER_FAN_MODELS
+
+
+def supports_airduct(model: str | None) -> bool:
+    """Check if a printer model has the switchable cooling/heating air duct.
+
+    ``M145 P0`` (cooling) / ``M145 P1`` (heating) and the JSON ``set_airduct``
+    command only have an effect on P2S, X2D and the H2 family; every other model
+    swallows them at the firmware level.
+
+    Consumers: ``POST /printers/{id}/airduct-mode`` (400s here rather than
+    sending a no-op, mirroring the chamber-heater gate), the cooldown prep's
+    duct-to-cooling prelude before the chamber fan spins up, and the printer
+    card's airduct control through the ``supports_airduct`` status flag.
+    """
+    if not model:
+        return False
+    return model.strip().upper() in AIRDUCT_MODELS
+
+
 def has_stg_cur_idle_bug(model: str | None) -> bool:
     """Check if a printer model may incorrectly report stg_cur=0 when idle.
 

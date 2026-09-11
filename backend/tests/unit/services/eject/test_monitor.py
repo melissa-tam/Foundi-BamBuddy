@@ -48,20 +48,38 @@ from backend.app.services.plate_occupancy import (
 
 
 def _settings(**overrides) -> monitor_mod.CooldownWatchSettings:
-    """The watch's arm-time settings, with the plateau/cap machinery and the aux fan
-    OFF — every test that uses this is about something else, and reading the real
-    settings DB would couple it to a table it never writes."""
+    """The watch's arm-time settings, with the plateau/cap machinery and BOTH cooldown
+    fans switched off — every test that uses this is about something else, and reading
+    the real settings DB would couple it to a table it never writes.
+
+    The fans are off by their SWITCHES, not by a zero speed: the switch is the one
+    on/off owner since the two-fan wave, and a speed of 0 is no longer an encoding of
+    "off" anywhere."""
     defaults = {
         "stall_window_s": 0,
         "stall_epsilon_c": 1.0,
         "max_hold_s": 0,
         "plateau_eject_margin_c": 3.0,
-        "aux_fan_percent": 0,
+        "aux_fan_enabled": False,
+        "aux_fan_percent": 100,
+        "chamber_fan_enabled": False,
+        "chamber_fan_percent": 100,
+        "chamber_fan_sustain_percent": 50,
         "hold_enabled": True,
         "hold_part_top_mm": 100,
     }
     defaults.update(overrides)
     return monitor_mod.CooldownWatchSettings(**defaults)
+
+
+def _settings_with_fans(**overrides) -> monitor_mod.CooldownWatchSettings:
+    """The same, with both fan switches ON — the production shape."""
+    return _settings(aux_fan_enabled=True, chamber_fan_enabled=True, **overrides)
+
+
+# What ``CooldownWatchSettings.fans`` composes for the production shape: the value the
+# watch hands the prep, asserted against rather than re-spelled at each call site.
+FANS_ON = _settings_with_fans().fans
 
 
 class _PrepRecorder:
@@ -76,10 +94,17 @@ class _PrepRecorder:
     def __init__(self, *, hold: str = "skipped:no_numbers", hold_z: float | None = None) -> None:
         self.hold = hold
         self.hold_z = hold_z
-        self.begun: list[tuple[int, int | None, int]] = []
+        self.begun: list[tuple[int, int | None, object]] = []
         # The operator's two hold inputs as they arrived — the wiring this double exists
         # to prove, since what ``begin`` DOES with them is pinned in test_cooldown_prep.
         self.holds: list[tuple[bool | None, int | None]] = []
+        # The other two resolve-once inputs of the two-fan wave: the printer's model
+        # (the chamber lane's capability gate) and the release threshold (its step-down
+        # line). Both are the watch's to resolve, never the prep's to look up.
+        self.models: list[str | None] = []
+        self.thresholds: list[float | None] = []
+        # Every temperature map the bed poll handed the prep — the boost-end lane.
+        self.samples: list[dict] = []
         self.ended: list[bool] = []
         self.order: list[str] = []
 
@@ -93,13 +118,18 @@ class _PrepRecorder:
             async def observe_start(self) -> None:
                 recorder.order.append("observe")
 
+            def note_sample(self, temperatures) -> None:
+                recorder.samples.append(dict(temperatures))
+
             def end(self, *, fan_off: bool) -> None:
                 recorder.ended.append(fan_off)
                 recorder.order.append("end")
 
-        async def fake_begin(printer_id, *, queue_item_id, aux_fan_percent, **kwargs):
-            recorder.begun.append((printer_id, queue_item_id, aux_fan_percent))
+        async def fake_begin(printer_id, *, queue_item_id, fans, release_threshold_c, model, **kwargs):
+            recorder.begun.append((printer_id, queue_item_id, fans))
             recorder.holds.append((kwargs.get("hold_enabled"), kwargs.get("hold_part_top_mm")))
+            recorder.models.append(model)
+            recorder.thresholds.append(release_threshold_c)
             recorder.order.append("begin")
             return _Prep()
 
@@ -690,6 +720,72 @@ class TestWatchBedAndClear:
         assert rel.calls == 1  # dispatched exactly once
         assert plate_occupancy.is_plate_occupied(7) is True  # monitor NEVER clears the gate now
         assert stall.reasons == []
+
+    async def test_on_sample_sees_every_readable_tick(self):
+        """The cooldown prep's chamber-boost lane rides THIS poll — it is handed the
+        whole live ``temperatures`` map, not just the bed, because the chamber reading
+        is what ends the boost."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(60), _status(40), _status(27)])
+        seen: list[dict] = []
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=100,
+            check_interval_s=20,
+            sleep=_noop_sleep,
+            on_release=_ReleaseRecorder(),
+            on_sample=seen.append,
+        )
+        assert outcome == "released"
+        assert seen == [{"bed": 60}, {"bed": 40}, {"bed": 27}]
+
+    @pytest.mark.parametrize(
+        ("first", "label"),
+        [(None, "no-status"), (_status(60, connected=False), "disconnected")],
+    )
+    async def test_on_sample_is_not_called_for_an_unreadable_tick(self, first, label):
+        """An unreadable tick carries no measurement — sampling a stale map would feed
+        the boost decision a reading this poll never actually took."""
+        _gate_up(7)
+        mgr = _FakeManager([first, _status(27)])
+        seen: list[dict] = []
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=100,
+            check_interval_s=20,
+            sleep=_noop_sleep,
+            on_release=_ReleaseRecorder(),
+            on_sample=seen.append,
+        )
+        assert outcome == "released"
+        assert seen == [{"bed": 27}]
+
+    async def test_a_sampler_that_raises_never_kills_the_watch(self):
+        """Fire-and-forget by contract: a plate's watch is worth more than a
+        measurement, so the poll logs and carries on to its release."""
+
+        def boom(_temperatures):
+            raise RuntimeError("sampler boom")
+
+        _gate_up(7)
+        mgr = _FakeManager([_status(60), _status(27)])
+        rel = _ReleaseRecorder()
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=100,
+            check_interval_s=20,
+            sleep=_noop_sleep,
+            on_release=rel,
+            on_sample=boom,
+        )
+        assert outcome == "released"
+        assert rel.calls == 1
 
     async def test_releases_at_exact_threshold(self):
         _gate_up(3)
@@ -1341,7 +1437,11 @@ class TestArmedWatchResolution:
         assert settings.stall_epsilon_c == float(fields["farm_cooldown_stall_epsilon_c"].default)
         assert settings.max_hold_s == int(fields["farm_cooldown_max_hold_minutes"].default) * 60
         assert settings.plateau_eject_margin_c == float(fields["farm_cooldown_plateau_eject_margin_c"].default)
+        assert settings.aux_fan_enabled is bool(fields["farm_cooldown_aux_fan_enabled"].default)
         assert settings.aux_fan_percent == int(fields["farm_cooldown_aux_fan_percent"].default)
+        assert settings.chamber_fan_enabled is bool(fields["farm_cooldown_chamber_fan_enabled"].default)
+        assert settings.chamber_fan_percent == int(fields["farm_cooldown_chamber_fan_percent"].default)
+        assert settings.chamber_fan_sustain_percent == int(fields["farm_cooldown_chamber_fan_sustain_percent"].default)
         assert settings.hold_enabled is bool(fields["farm_cooldown_hold_enabled"].default)
         assert settings.hold_part_top_mm == int(fields["farm_cooldown_hold_part_top_mm"].default)
 
@@ -1405,9 +1505,25 @@ class TestResolveStallSettings:
         assert settings.stall_epsilon_c == fields["farm_cooldown_stall_epsilon_c"].default
         assert settings.max_hold_s == fields["farm_cooldown_max_hold_minutes"].default * 60
         assert settings.plateau_eject_margin_c == fields["farm_cooldown_plateau_eject_margin_c"].default  # 3.0
+        assert settings.aux_fan_enabled is fields["farm_cooldown_aux_fan_enabled"].default is True
         assert settings.aux_fan_percent == fields["farm_cooldown_aux_fan_percent"].default == 100
+        assert settings.chamber_fan_enabled is fields["farm_cooldown_chamber_fan_enabled"].default is True
+        assert settings.chamber_fan_percent == fields["farm_cooldown_chamber_fan_percent"].default == 100
+        # The vendor's own chamber-cooling figure (``M106 P3 S127``).
+        assert settings.chamber_fan_sustain_percent == fields["farm_cooldown_chamber_fan_sustain_percent"].default == 50
         assert settings.hold_enabled is fields["farm_cooldown_hold_enabled"].default is True
         assert settings.hold_part_top_mm == fields["farm_cooldown_hold_part_top_mm"].default == 100
+
+    async def test_the_fans_property_composes_the_preps_value(self, db_session, monkeypatch):
+        """The ONE place the five settings become the prep's two requests — and the
+        aux lane's sustain is its own speed, by construction rather than by a setting."""
+        self._patch_session(monkeypatch, db_session)
+        fans = (await monitor_mod._resolve_stall_settings()).fans
+        prep_mod = monitor_mod.cooldown_prep
+        assert fans.aux == prep_mod.FanRequest(True, 100, 100)
+        assert fans.chamber == prep_mod.FanRequest(True, 100, 50)
+        assert fans.for_fan(prep_mod.AUX_FAN) is fans.aux
+        assert fans.for_fan(prep_mod.CHAMBER_FAN) is fans.chamber
 
     async def test_reads_settings_rows_and_converts_minutes(self, db_session, monkeypatch):
         from backend.app.api.routes.settings import set_setting
@@ -1418,6 +1534,8 @@ class TestResolveStallSettings:
         await set_setting(db_session, "farm_cooldown_max_hold_minutes", "0")  # 0 disables the cap
         await set_setting(db_session, "farm_cooldown_plateau_eject_margin_c", "4.5")
         await set_setting(db_session, "farm_cooldown_aux_fan_percent", "60")
+        await set_setting(db_session, "farm_cooldown_chamber_fan_percent", "80")
+        await set_setting(db_session, "farm_cooldown_chamber_fan_sustain_percent", "0")
         await set_setting(db_session, "farm_cooldown_hold_part_top_mm", "-20")
         settings = await monitor_mod._resolve_stall_settings()
         assert settings.stall_window_s == 10 * 60
@@ -1425,31 +1543,50 @@ class TestResolveStallSettings:
         assert settings.max_hold_s == 0
         assert settings.plateau_eject_margin_c == 4.5
         assert settings.aux_fan_percent == 60
+        assert settings.chamber_fan_percent == 80
+        # 0 is a legal SUSTAIN: the chamber fan stops when the air reaches the eject
+        # line. It is a step target, not an off switch — that is ``..._enabled``.
+        assert settings.chamber_fan_sustain_percent == 0
+        assert settings.chamber_fan_enabled is True
         # Negative targets are legal: the top of the part held UNDER the nozzle plane.
         assert settings.hold_part_top_mm == -20
 
     @pytest.mark.parametrize(
+        ("key", "attribute"),
+        [
+            ("farm_cooldown_hold_enabled", "hold_enabled"),
+            ("farm_cooldown_aux_fan_enabled", "aux_fan_enabled"),
+            ("farm_cooldown_chamber_fan_enabled", "chamber_fan_enabled"),
+        ],
+    )
+    @pytest.mark.parametrize(
         ("stored", "expected"),
         [("true", True), ("TRUE", True), ("false", False), ("False", False), ("", False), ("1", False)],
     )
-    async def test_the_hold_switch_is_read_as_a_string_not_cast(self, db_session, monkeypatch, stored, expected):
-        """``bool("false")`` is True, so the switch cannot ride ``_setting_num``.
+    async def test_a_switch_is_read_as_a_string_not_cast(
+        self, db_session, monkeypatch, key, attribute, stored, expected
+    ):
+        """``bool("false")`` is True, so a switch cannot ride ``_setting_num``.
 
         The store keeps whatever the PUT route wrote ("true"/"false"), and the only
         correct read is the same case-insensitive ``== "true"`` test every other boolean
         setting in the app is read with — anything else is OFF, which is the safe
-        direction for a value nothing here wrote."""
+        direction for a value nothing here wrote. Parametrized across ALL three switches
+        because each one is now the sole on/off owner of its actuator: a speed of 0 is
+        not an off anywhere since the two-fan wave."""
         from backend.app.api.routes.settings import set_setting
 
         self._patch_session(monkeypatch, db_session)
-        await set_setting(db_session, "farm_cooldown_hold_enabled", stored)
+        await set_setting(db_session, key, stored)
         settings = await monitor_mod._resolve_stall_settings()
-        assert settings.hold_enabled is expected
+        assert getattr(settings, attribute) is expected
 
-    async def test_an_absent_switch_row_is_the_schema_default_not_false(self, db_session, monkeypatch):
-        """Fail-open on absence: an install that never wrote the key holds plates."""
+    @pytest.mark.parametrize("attribute", ["hold_enabled", "aux_fan_enabled", "chamber_fan_enabled"])
+    async def test_an_absent_switch_row_is_the_schema_default_not_false(self, db_session, monkeypatch, attribute):
+        """Fail-open on absence: an install that never wrote the key holds plates and
+        cools them — every one of these three defaults to on."""
         self._patch_session(monkeypatch, db_session)
-        assert (await monitor_mod._resolve_stall_settings()).hold_enabled is True
+        assert getattr(await monitor_mod._resolve_stall_settings(), attribute) is True
 
 
 class TestCooldownPrepWiring:
@@ -1462,14 +1599,14 @@ class TestCooldownPrepWiring:
         return 33.0
 
     @staticmethod
-    async def _settings_100():
-        return _settings(aux_fan_percent=100)
+    async def _settings_fans_on():
+        return _settings_with_fans()
 
     def _patch_deps(self, monkeypatch, *, watch, prep: _PrepRecorder):
         """Everything ``_watch`` reaches for, replaced — but ``_watch`` itself is real."""
         prep.install(monkeypatch)
         monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", self._threshold)
-        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", self._settings_100)
+        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", self._settings_fans_on)
         monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", watch)
 
     def _install(self, monkeypatch, mon, *, watch, prep: _PrepRecorder):
@@ -1544,7 +1681,7 @@ class TestCooldownPrepWiring:
         prep = _PrepRecorder()
 
         async def fake_settings():
-            return _settings(aux_fan_percent=100, hold_enabled=False, hold_part_top_mm=-20)
+            return _settings_with_fans(hold_enabled=False, hold_part_top_mm=-20)
 
         async def fake_watch(pid, threshold, **kwargs):
             return "released"
@@ -1554,8 +1691,61 @@ class TestCooldownPrepWiring:
         monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", fake_settings)
         await mon._watch(7, 42, release_now=asyncio.Event())
 
-        assert prep.begun == [(7, 42, 100)]
+        assert prep.begun == [(7, 42, FANS_ON)]
         assert prep.holds == [(False, -20)]
+
+    async def test_the_watch_resolves_the_model_and_the_threshold_for_the_prep(self, monkeypatch):
+        """The prep gates its chamber lane on the MODEL and steps its boost down at the
+        release THRESHOLD, and looks up neither: both are the watch's, resolved once at
+        arm beside the settings, so nothing inside the prep can disagree with what this
+        cooldown is actually waiting for."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_manager, "get_model", lambda printer_id: "H2S")
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.models == ["H2S"]
+        # The same threshold the poll below it releases on — one resolution, two users.
+        assert prep.thresholds == [33.0]
+
+    async def test_an_uncached_model_still_arms_the_prep(self, monkeypatch):
+        """``get_model`` answers None for a printer the manager has not cached; that is
+        the prep's ``skipped:unsupported`` to decide, never a reason not to arm."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            prep.order.append("poll")
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_manager, "get_model", lambda printer_id: None)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.models == [None]
+        assert prep.order == ["begin", "observe", "poll", "end"]
+
+    async def test_the_bed_poll_feeds_the_preps_sampler(self, monkeypatch):
+        """ONE poll, two consumers: the reading that decides the release is the same
+        reading that ends the chamber boost. No second timer is wired anywhere."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            prep.order.append("poll")
+            kwargs["on_sample"]({"bed": 61.0, "chamber": 38.0})
+            kwargs["on_sample"]({"bed": 40.0, "chamber": 33.0})
+            return "released"
+
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.samples == [{"bed": 61.0, "chamber": 38.0}, {"bed": 40.0, "chamber": 33.0}]
 
     async def test_a_connected_printer_never_waits(self, monkeypatch):
         """The steady-state path — a terminal on a live session — pays nothing for the
@@ -1625,7 +1815,7 @@ class TestCooldownPrepWiring:
         await mon._watch(7, 42, release_now=asyncio.Event())
 
         assert prep.order == ["begin", "observe", "poll", "end"]
-        assert prep.begun == [(7, 42, 100)]
+        assert prep.begun == [(7, 42, FANS_ON)]
 
     async def test_retired_when_the_poll_raises(self, monkeypatch):
         mon = EjectCooldownMonitor()
@@ -1649,7 +1839,7 @@ class TestCooldownPrepWiring:
 
         prep.install(monkeypatch)
         monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", self._threshold)
-        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", self._settings_100)
+        monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", self._settings_fans_on)
         monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", fake_watch)
         task = asyncio.create_task(mon._watch(7, 42, release_now=asyncio.Event()))
         mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=42, run_id=None), task=task)
@@ -1681,11 +1871,15 @@ class TestCooldownPrepWiring:
         mon._cancel(7, "policy changed to CooldownEject")
         mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=43, run_id=None), task=_FakeTask("successor"))
         if successor_begins_first:
-            await monitor_mod.cooldown_prep.begin(7, queue_item_id=43, aux_fan_percent=100)
+            await monitor_mod.cooldown_prep.begin(
+                7, queue_item_id=43, fans=FANS_ON, release_threshold_c=33.0, model="H2S"
+            )
         with contextlib.suppress(asyncio.CancelledError):
             await task
         if not successor_begins_first:
-            await monitor_mod.cooldown_prep.begin(7, queue_item_id=43, aux_fan_percent=100)
+            await monitor_mod.cooldown_prep.begin(
+                7, queue_item_id=43, fans=FANS_ON, release_threshold_c=33.0, model="H2S"
+            )
 
         assert prep.ended == [False]  # the fan stays on for the successor
         assert prep.order.count("begin") == 2

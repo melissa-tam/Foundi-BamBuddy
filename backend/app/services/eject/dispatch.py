@@ -118,9 +118,9 @@ async def build_part_present_eject_file(
     """Build a standalone PART-PRESENT, MOTION-ONLY eject-only ``.gcode.3mf`` for ``plate_id``.
 
     The plate's G-code is REPLACED ENTIRELY (via ``repack_3mf_with_gcode``, MD5
-    recomputed) by the generated eject block: ``M17`` → ``M140 S0`` / ``M106 P2 S0``
-    → ONE Z move to the bed-drop floor (or, assist-off, to the lift height) → home X/Y
-    only → the sweep, the park, then the completion epilogue. The home is
+    recomputed) by the generated eject block: ``M17`` → ``M140 S0`` / ``M106 P2 S0`` /
+    ``M106 P3 S0`` → ONE Z move to the bed-drop floor (or, assist-off, to the lift
+    height) → home X/Y only → the sweep, the park, then the completion epilogue. The home is
     single-nozzle ``G28 X Y`` or the dual-nozzle (H2C/H2D/X2D) torque-parameterized
     ``G28 X T300`` / ``G28 Y T300`` pair (a bare ``G28 X Y`` stall-loops that firmware),
     and NEVER a bare ``G28`` / ``G28 Z`` — the part sits on the plate, so the block

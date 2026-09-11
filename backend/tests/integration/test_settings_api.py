@@ -104,37 +104,91 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_update_farm_cooldown_aux_fan_percent(self, async_client: AsyncClient):
-        """The eject cooldown's aux-fan speed round-trips TYPED through the int coercion
-        whitelist — without the whitelist entry a stored setting reads back as a string.
+    async def test_get_farm_cooldown_fan_defaults(self, async_client: AsyncClient):
+        """Both cooldown fan lanes default ON at their shipped speeds when nothing has
+        ever been written — the operator gets cooling without configuring anything.
+
+        The chamber sustain is 50 because that is the vendor's own chamber-cooling
+        figure (``M106 P3 S127`` in every Bambu H2 start block).
+        """
+        result = (await async_client.get("/api/v1/settings/")).json()
+        assert result["farm_cooldown_aux_fan_enabled"] is True
+        assert result["farm_cooldown_aux_fan_percent"] == 100
+        assert result["farm_cooldown_chamber_fan_enabled"] is True
+        assert result["farm_cooldown_chamber_fan_percent"] == 100
+        assert result["farm_cooldown_chamber_fan_sustain_percent"] == 50
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_update_farm_cooldown_fans(self, async_client: AsyncClient):
+        """All five cooldown-fan keys round-trip TYPED (bool/int) through the coercion
+        whitelists — without the entries a stored setting reads back as a string, and the
+        watch would arm every cooldown with a truthy ``"false"``.
 
         Percent, not PWM: the wire's 0-255 conversion has a single origin
         (``BambuMQTTClient.set_fan_percent``), so every surface above it stores percent.
         """
-        # Schema default when never written: full speed.
-        response = await async_client.get("/api/v1/settings/")
-        assert response.json()["farm_cooldown_aux_fan_percent"] == 100
+        payload = {
+            "farm_cooldown_aux_fan_enabled": False,
+            "farm_cooldown_aux_fan_percent": 70,
+            "farm_cooldown_chamber_fan_enabled": False,
+            "farm_cooldown_chamber_fan_percent": 80,
+            "farm_cooldown_chamber_fan_sustain_percent": 30,
+        }
+        response = await async_client.put("/api/v1/settings/", json=payload)
+        assert response.status_code == 200
+        assert {k: response.json()[k] for k in payload} == payload
 
-        # 0 is a legitimate value and means OFF — it must not be read as "unset".
-        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 0})
+        # Persisted read-back through the bool + int parse whitelists.
+        result = (await async_client.get("/api/v1/settings/")).json()
+        assert {k: result[k] for k in payload} == payload
+        assert result["farm_cooldown_aux_fan_enabled"] is False
+        assert result["farm_cooldown_chamber_fan_enabled"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_cooldown_fan_speed_bounds(self, async_client: AsyncClient):
+        """0 is REFUSED for both fan SPEEDS: the ``_enabled`` switches own on/off, so a
+        speed of zero would be a second, silent encoding of the same fact.
+
+        The chamber SUSTAIN keeps 0 because it is a step TARGET, not a switch — the fan
+        stops when the boost ends and stays off until the eject dispatches.
+        """
+        for key in ("farm_cooldown_aux_fan_percent", "farm_cooldown_chamber_fan_percent"):
+            assert (await async_client.put("/api/v1/settings/", json={key: 0})).status_code == 422
+            assert (await async_client.put("/api/v1/settings/", json={key: 1})).status_code == 200
+            # A PWM figure typed in by mistake is refused rather than silently clamped.
+            assert (await async_client.put("/api/v1/settings/", json={key: 101})).status_code == 422
+            assert (await async_client.put("/api/v1/settings/", json={key: 255})).status_code == 422
+            assert (await async_client.put("/api/v1/settings/", json={key: -1})).status_code == 422
+
+        sustain = "farm_cooldown_chamber_fan_sustain_percent"
+        assert (await async_client.put("/api/v1/settings/", json={sustain: 0})).status_code == 200
+        assert (await async_client.get("/api/v1/settings/")).json()[sustain] == 0
+        assert (await async_client.put("/api/v1/settings/", json={sustain: 101})).status_code == 422
+        assert (await async_client.put("/api/v1/settings/", json={sustain: -1})).status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_get_settings_tolerates_a_legacy_stored_zero_aux_fan(self, async_client: AsyncClient, db_session):
+        """A legacy '0' in the settings TABLE must still PROJECT, not 500.
+
+        The store predates the ``_enabled`` switch, so a row saying "0 = off" can exist
+        on any install the startup fold has not yet run against (and the fold is
+        non-fatal by its file's contract). ``_build_settings_response`` constructs
+        ``AppSettings(**settings_dict)``, so narrowing the response model to match the
+        update model's ``ge=1`` would raise there and take out EVERY GET and PUT of
+        /settings. The bound belongs on the input schema, which is the only place a 0
+        can arrive from a human.
+        """
+        from backend.app.api.routes.settings import set_setting
+
+        await set_setting(db_session, "farm_cooldown_aux_fan_percent", "0")
+        await db_session.commit()
+
+        response = await async_client.get("/api/v1/settings/")
         assert response.status_code == 200
         assert response.json()["farm_cooldown_aux_fan_percent"] == 0
-
-        response = await async_client.get("/api/v1/settings/")
-        assert response.json()["farm_cooldown_aux_fan_percent"] == 0
-
-        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 100})
-        assert response.status_code == 200
-        assert response.json()["farm_cooldown_aux_fan_percent"] == 100
-
-        # Bounds are enforced by the schema (0-100) — the value is a PERCENT, so a PWM
-        # figure typed in by mistake must be refused rather than silently clamped.
-        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 101})
-        assert response.status_code == 422
-        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": 255})
-        assert response.status_code == 422
-        response = await async_client.put("/api/v1/settings/", json={"farm_cooldown_aux_fan_percent": -1})
-        assert response.status_code == 422
 
     @pytest.mark.asyncio
     @pytest.mark.integration
