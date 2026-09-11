@@ -431,3 +431,46 @@ class TestCountRecent:
 
         since = datetime.utcnow() - timedelta(hours=1)
         assert await printer_incidents.count_recent(db_session, printer.id, KIND_PLATE_VISION, since) == 0
+
+
+class TestCachedKind:
+    """The identity-scoped read a LIVE recovery driver uses to learn that the store
+    re-classified the row it is working on. It answers about ONE row — the driver's
+    own — because a driver holds an immutable context resolved at its entry gate, and
+    a projection that answered about "whatever is open now" would report a re-class
+    every time a different incident opened on that printer."""
+
+    async def test_the_payload_carries_the_row_id(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:x")
+
+        assert printer_incidents.snapshot(printer.id)["id"] == row.id
+
+    async def test_it_answers_for_the_row_the_caller_names(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:x")
+
+        assert printer_incidents.cached_kind(printer.id, row.id) == KIND_JAM
+
+    async def test_it_answers_none_for_a_different_row(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:x")
+
+        assert printer_incidents.cached_kind(printer.id, row.id + 1) is None
+
+    async def test_it_answers_none_with_no_open_row(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:x")
+        await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source="terminal")
+
+        assert printer_incidents.cached_kind(printer.id, row.id) is None
+
+    async def test_an_upgraded_kind_is_what_comes_back(self, db_session, printer_factory):
+        """The point of the reader: the row's kind CHANGED while its id did not."""
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:x")
+        row.kind = KIND_PHYSICAL
+        await db_session.commit()
+        await printer_incidents.rehydrate(db_session)
+
+        assert printer_incidents.cached_kind(printer.id, row.id) == KIND_PHYSICAL

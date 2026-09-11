@@ -278,6 +278,13 @@ _RECOVERY_HARD_MIN_G = 5
 # ignored. Bounded-by-evidence at 1: a reset that did not free the AMS means it is
 # genuinely wedged and needs hands, so a second resume would only loop, not heal.
 _MAX_STUCK_RESETS = 1
+# Second unwedge tier per (printer, job). Tier 1 is ``print.resume`` — the verb that
+# freed 009-H2S. The fork has a SECOND spelling of the same firmware CONTINUE,
+# ``ams_control("resume")`` (what the HMS modal's CONTINUE / RETRY actions publish,
+# per the vendored hms_actions catalog), and the swap machine had never sent it:
+# 002-H2S 2026-09-11 spent tier 1, re-PAUSEd still wedged, and escalated with the
+# other CONTINUE untried. Bounded at 1 for the same evidence reason as _MAX_STUCK_RESETS.
+_MAX_AMS_CONTROL_TIERS = 1
 
 # Refill auto-resume timing (code constants, NOT operator knobs — precedent
 # _UNLOAD_GRACE_S). The AMS needs to register the freshly-inserted filament before a
@@ -340,13 +347,22 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "insert filament and resume on the printer."
     ),
     "candidates_exhausted": "Tried every eligible replacement spool without a stable resume. Left PAUSED for a human.",
+    # The two wedged-change reasons state the FIRMWARE FACT and then the action that
+    # ends it, in that order: at ams_status_main=1 the firmware drops every load and
+    # unload, so "try again from the farm" is never the answer and "check the
+    # buffer/feeder" (the pre-2026-09-11 copy) sent the operator to inspect hardware
+    # before pressing the one button that frees it. 002-H2S 2026-09-11.
     "unload_failed": (
-        "The AMS ignored the unload while stuck mid filament-change and the firmware reset (resume) did not "
-        "free it — physical intervention at the printer is likely required (check the filament buffer/feeder)."
+        "The AMS is wedged mid filament-change (ams_status_main=1): the firmware drops every load and unload in "
+        "this state, so the unloads were dropped, and the farm's CONTINUE (resume, then ams_control resume) did "
+        "not move it. On the printer screen press Retry/Continue on the standing filament error; if it re-fails, "
+        "open the AMS, free the filament at the feeder, then Retry. The farm swaps or resumes from there."
     ),
     "stuck_reset_failed": (
-        "The AMS is stuck mid filament-change and did not respond to the firmware reset (resume) — physical "
-        "intervention at the printer is likely required (check the filament buffer/feeder)."
+        "The AMS is wedged mid filament-change (ams_status_main=1): the firmware drops every load and unload in "
+        "this state, and the farm's CONTINUE (resume, then ams_control resume) did not move it. On the printer "
+        "screen press Retry/Continue on the standing filament error; if it re-fails, open the AMS, free the "
+        "filament at the feeder, then Retry. The farm swaps or resumes from there."
     ),
     "repeated_jams": (
         "Auto-recovered several times this job but the fault keeps returning — likely an "
@@ -540,6 +556,13 @@ _blocked: dict[tuple[int, str], set[str]] = {}
 # one bounded reset again, which is safe.
 _stuck_resets: dict[tuple[int, str], int] = {}
 
+# (printer_id, job_id) -> ``ams_control("resume")`` tiers already published for that
+# JOB. Same key, same lifetime and same reasoning as _stuck_resets above. Tier 1's own
+# budget already gates the path that reaches tier 2 (a second wedged round in one job
+# never republishes anything), so this is the bound that keeps holding if that
+# ordering is ever changed — not a second spelling of it.
+_ams_control_tiers: dict[tuple[int, str], int] = {}
+
 # incident_id -> the monotonic instant :func:`sweep_open_incidents` FIRST saw every
 # one of its close guards hold. The dwell that stops a momentary reading closing a
 # real hold: an incident closes only once the whole constellation (connected,
@@ -615,6 +638,7 @@ def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
     _active_tasks.clear()
     _stuck_resets.clear()
+    _ams_control_tiers.clear()
     _last_eval.clear()
     _guidance_sent.clear()
     _wire_sample.clear()
@@ -739,14 +763,16 @@ def _eval_throttled(printer_id: int, job_id: str, fingerprint: str) -> bool:
 
 
 def _log_candidate_outcome(incident: RecoveryIncident, *, gtid: int | None, verdict: str) -> None:
-    """One parseable INFO line after a non-ok unload/load confirm and at candidate-
-    loop end, carrying the live telemetry that explains WHY a step didn't take —
-    candidate global tray, verdict, live tray_now, ams_status_main/sub, and the
-    pending tray target the firmware is honoring."""
+    """One parseable INFO line after a non-ok unload/load confirm, at each unwedge
+    tier and at candidate-loop end, carrying the live telemetry that explains WHY a
+    step didn't take — candidate global tray, verdict, live tray_now,
+    ams_status_main/sub, the pending tray target the firmware is honoring, and the
+    recoverable codes STILL standing (without them a wedge line says the AMS did not
+    move but never which fault it is holding)."""
     st = _get_state(incident.printer_id)
     logger.info(
         "[spool_recovery] candidate outcome printer=%s gtid=%s verdict=%s tray_now=%s "
-        "ams_status=%s/%s pending_target=%s",
+        "ams_status=%s/%s pending_target=%s codes=%s",
         incident.printer_id,
         gtid,
         verdict,
@@ -754,6 +780,7 @@ def _log_candidate_outcome(incident: RecoveryIncident, *, gtid: int | None, verd
         getattr(st, "ams_status_main", None) if st is not None else None,
         getattr(st, "ams_status_sub", None) if st is not None else None,
         getattr(st, "pending_tray_target", None) if st is not None else None,
+        sorted(_active_recoverable_codes(st)),
     )
 
 
@@ -1545,6 +1572,9 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             if reset == "abort":
                 await _abort(incident)
                 return
+            if reset == "handover":
+                _hand_over(incident)
+                return
             if reset == "fail":
                 # The feeder is genuinely wedged — hands are needed and the jammed
                 # spool is legitimately out of rotation. Commit the stamp (once) at
@@ -1584,6 +1614,9 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             if unload == "abort":
                 await _abort(incident)
                 return
+            if unload == "handover":
+                _hand_over(incident)
+                return
             if unload == "drying":
                 await _escalate(incident, "ams_drying")
                 return
@@ -1595,12 +1628,16 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
 
             target, only_low = await _select_replacement(incident, tried)
             if target is None:
-                # An external RESUME during the (possibly bounded) selection /
-                # forced bare-tray sweep means someone took over — abort rather
-                # than escalate, mirroring the other steps' abort semantics.
-                st = _get_state(pid)
-                if st is not None and getattr(st, "state", None) == "RUNNING":
-                    await _abort(incident)
+                # A takeover during the (possibly bounded) selection / forced
+                # bare-tray sweep means someone else is in control — abort rather
+                # than escalate, mirroring every other step.
+                token = _takeover(incident, _get_state(pid), awaiting="PAUSE")
+                if token is not None:
+                    verdict = _note_takeover(incident, token, "select_replacement")
+                    if verdict == "handover":
+                        _hand_over(incident)
+                    else:
+                        await _abort(incident, token=token)
                     return
                 if only_low:
                     # At/after the protected layers the floor is the hard minimum, so
@@ -1624,6 +1661,9 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             if load == "abort":
                 await _abort(incident)
                 return
+            if load == "handover":
+                _hand_over(incident)
+                return
             if load == "drying":
                 await _escalate(incident, "ams_drying")
                 return
@@ -1635,12 +1675,17 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             if resume == "abort":
                 await _abort(incident)
                 return
+            if resume == "handover":
+                _hand_over(incident)
+                return
             if resume == "success":
                 await _succeed(incident, target)
                 return
 
-            # resume == "repause": one extra pause/resume cycle (mirrors the live
-            # 16:21:24 → 16:22:57 recovery where the first resume didn't stick).
+            # resume in ("repause", "not_taken"): one extra pause/resume cycle (mirrors
+            # the live 16:21:24 → 16:22:57 recovery where the first resume didn't
+            # stick). The two verdicts differ only in what the SECOND cycle's answer is
+            # allowed to conclude about the spool, below.
             if client.pause_print():
                 await printer_manager.await_state(
                     pid, {"PAUSE"}, incident.settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
@@ -1656,24 +1701,52 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             if resume2 == "abort":
                 await _abort(incident)
                 return
+            if resume2 == "handover":
+                _hand_over(incident)
+                return
             if resume2 == "success":
                 await _succeed(incident, target)
                 return
+            if resume2 == "not_taken":
+                # The print never ran, so nothing faulted and there is NOTHING to
+                # conclude about this spool. 002-H2S 2026-09-11: this branch used to be
+                # spelled the same as a re-jam and stamped the operator's healthy
+                # slot-1 roll out of rotation against a printer they had just stopped.
+                logger.info(
+                    "spool_recovery: printer %s resume never took on tray %s — no fault evidence, replacement "
+                    "kept in rotation; trying the next candidate",
+                    pid,
+                    target,
+                )
+                continue
 
-            # Still stuck → this replacement re-jammed too. Only take it out of
-            # rotation when the fault is AMS-side; on an extruder-side fault the
-            # extruder is the common factor, so the replacement is probably
-            # healthy — keep it in rotation (``tried`` already bars re-selecting it
-            # this job). Then try the next candidate.
-            if not incident.extruder_side_only:
+            # resume2 == "repause": the print RAN and a recoverable fault stopped it
+            # again — the ONE path on which a replacement may be stamped. Ask the WIRE
+            # which tray it blames (the same evidence order the entry gate used;
+            # ``item=None`` because the dispatch mapping now names the replacement
+            # itself, so it cannot corroborate anything). Only take the replacement out
+            # of rotation when the firmware names IT, and never on an extruder-side
+            # fault, where the extruder is the common factor and the spool is probably
+            # healthy (``tried`` already bars re-selecting it this job).
+            st = _get_state(pid)
+            jammed_now, _verdict = _resolve_jammed_tray(st, candidates=live_candidates(st), item=None, printer_id=pid)
+            if jammed_now == target and not incident.extruder_side_only:
                 await _mark_out_of_rotation(incident, target, notify=True)
-            else:
+            elif incident.extruder_side_only:
                 logger.info(
                     "spool_recovery: printer %s replacement tray %s kept IN rotation — "
                     "extruder-side fault %s is the common factor, not the spool",
                     pid,
                     target,
                     incident.code,
+                )
+            else:
+                logger.info(
+                    "spool_recovery: printer %s re-PAUSEd with the fault attributed to tray %s, not the "
+                    "replacement %s — kept in rotation",
+                    pid,
+                    jammed_now,
+                    target,
                 )
 
         # (4) Every candidate exhausted.
@@ -1702,6 +1775,101 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
 
 # --- step helpers -----------------------------------------------------------
 
+# The only two live states that can be THIS driver's own doing. The W1 reset moves
+# PAUSE→RUNNING and the self-pause moves RUNNING→PAUSE, so every verb the machine
+# publishes lands inside this pair — which is what lets everything OUTSIDE it be read
+# as somebody else's action without a single per-step exception.
+_DRIVER_STATES: tuple[str, ...] = ("PAUSE", "RUNNING")
+
+
+def _takeover(incident: RecoveryIncident, st, *, awaiting: str | None, target: int | None = None) -> str | None:
+    """Has this driver lost the job it was bound to? The token that says so, else None.
+
+    ONE predicate for every poll loop in the machine (precedent :func:`_hold_over` —
+    pure, DB-free, and taking the incident so the call site reads as a question about
+    THIS recovery rather than about the printer in the abstract). Before it there were
+    seven inline spellings of "somebody else is in control", and the set of things they
+    noticed differed per step: one checked ``st is None``, another added RUNNING, a
+    third a ``pending_tray_target`` hijack, and NONE of them asked whether the job was
+    still there. 002-H2S 2026-09-11 is what that costs — the operator STOPPED the
+    print, ``on_job_terminal`` closed the incident row, nothing told the driver, and it
+    went on to load a slot, publish resume/pause/resume at a FAILED printer and stamp
+    the operator's healthy spool out of rotation.
+
+    ``awaiting`` is the state THIS step is waiting for, so a loop can tell its own
+    intermediate reading from someone else's action; ``target`` is the tray this step
+    commanded, when it commanded one.
+
+    Tokens, FIRST match wins:
+
+    ``state_lost``
+        No live state, or a state the printer has not positively reported (``""`` /
+        ``UNKNOWN``). The rearm's own evidence rule (:func:`_hold_over`): absence of
+        evidence is not evidence of a terminal, so a disconnect folds in HERE and is
+        deliberately not reported as ``job_ended``.
+    ``reclassified``
+        The durable row this context names is open with a DIFFERENT kind — the store
+        upgraded it under us (a jam the taxonomy re-read as a physical fault). The one
+        token that is NOT an abort; see :func:`_hand_over`.
+    ``job_changed``
+        The printer is echoing a different ``subtask_id``. Whatever this driver was
+        recovering, it is not what is on the wire now.
+    ``job_ended``
+        The live state is neither PAUSE nor RUNNING — IDLE / FINISH / FAILED / PREPARE.
+        It cannot fire on the driver's own verbs (see :data:`_DRIVER_STATES`).
+    ``hijacked_load``
+        The firmware is honouring a load for a tray that is not the one we commanded.
+    ``resumed``
+        A step waiting for PAUSE found the printer RUNNING: someone resumed the print
+        while we were mid-procedure.
+    """
+    if st is None:
+        return "state_lost"
+    live = (getattr(st, "state", None) or "").upper()
+    if live in ("", "UNKNOWN"):
+        return "state_lost"
+    kind = printer_incidents.cached_kind(incident.printer_id, incident.incident_id)
+    if kind is not None and kind != incident.kind:
+        return "reclassified"
+    job = (getattr(st, "subtask_id", None) or "").strip()
+    if incident.job_id and job and job != incident.job_id:
+        return "job_changed"
+    if live not in _DRIVER_STATES:
+        return "job_ended"
+    ptt = getattr(st, "pending_tray_target", None)
+    if target is not None and ptt is not None and ptt != target:
+        return "hijacked_load"
+    if awaiting == "PAUSE" and live == "RUNNING":
+        return "resumed"
+    return None
+
+
+def _note_takeover(incident: RecoveryIncident, token: str, step: str) -> str:
+    """Log a takeover ONCE, where it was noticed, and map it onto the step's verdict.
+
+    Every step answers a takeover the same way — ``abort``, except the one token that
+    means the row is still ours to leave alone. The line names the token and the step
+    because "why did recovery stop" was previously answerable only by reading the code
+    for which inline test that particular helper happened to carry.
+    """
+    logger.info("spool_recovery: printer %s recovery aborted (%s) during %s", incident.printer_id, token, step)
+    return "handover" if token == "reclassified" else "abort"
+
+
+def _hand_over(incident: RecoveryIncident) -> None:
+    """The one takeover that is NOT an abort: the store re-classified this row.
+
+    No abort, no stamp, no close, no re-entry bar — the row stays OPEN under its NEW
+    kind and that kind's owner produces the outcome. Aborting here would close a row
+    that is no longer ours and bar re-entry for a fault nobody has handled (the
+    ``_blocked`` ledger is keyed by the fault, not by who gave up on it).
+    """
+    logger.info(
+        "spool_recovery: printer %s incident %s re-classified under the driver — handing over (no abort, no stamp)",
+        incident.printer_id,
+        incident.incident_id,
+    )
+
 
 def _feed_fault_live(state) -> bool:
     """True while a FEED-FAULT HMS code is standing on the live printer state."""
@@ -1716,26 +1884,32 @@ def _change_completed(state) -> bool:
 
 
 async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
-    """Reset an AMS wedged mid filament-change by re-issuing the firmware's own
-    CONTINUE (a ``resume``), then read the outcome. Runs at the TOP of every
-    candidate round, BEFORE the unload.
+    """Free an AMS wedged mid filament-change, then read the outcome. Runs at the TOP
+    of every candidate round, BEFORE the unload.
+
+    TWO TIERS of the same firmware verb, because the fork has two spellings of it and
+    only one had ever been sent. Tier 1 is ``print.resume`` — the touchscreen CONTINUE
+    that freed 009-H2S 2026-07-20 after four unloads were silently ignored. Tier 2 is
+    ``ams_control("resume")``, the frame the HMS modal's own CONTINUE / RETRY actions
+    publish (vendored ``hms_actions.json``), and it is what 002-H2S 2026-09-11 never
+    got: tier 1 moved the printer, the AMS stayed in the change, and the machine
+    escalated with the other CONTINUE untried.
 
     Returns one of:
 
-    ``skipped`` — not applicable this round: the AMS is idle (a normal round, no
-        wedge) OR the per-incident reset budget (:data:`_MAX_STUCK_RESETS`) is
-        spent. The caller falls through to the unload UNCHANGED — zero behaviour
-        change on a healthy AMS.
-    ``ok`` — the state machine moved and is back at PAUSE: proceed to the swap
-        round. Covers the firmware re-faulting and auto-pausing on its own (a) and
-        the hung case (c) where the change never completed so we re-paused it.
-    ``recovered`` — the firmware fully self-healed: fault gone, RUNNING stable, and
-        the pending change completed (a real tray feeds) or the AMS returned to
-        idle. No swap needed — the caller clears the jammed spool's out-of-rotation
-        flag and closes the incident as a success.
-    ``fail`` — the reset did NOT free the AMS (still wedged at the deadline, or the
-        resume send failed): the caller escalates ``stuck_reset_failed``.
-    ``abort`` — live state was lost mid-reset (disconnect / external actor).
+    ``skipped`` — not applicable this round: the AMS is not wedged (a normal round).
+        The caller falls through to the unload UNCHANGED — zero behaviour change on a
+        healthy AMS.
+    ``ok`` — the state machine moved, the AMS is OUT of the filament change, and the
+        printer is back at PAUSE: proceed to the swap round.
+    ``recovered`` — the firmware fully self-healed: fault gone, RUNNING stable, and the
+        pending change completed (a real tray feeds) or the AMS returned to idle. No
+        swap needed — the caller clears the jammed spool's out-of-rotation flag and
+        closes the incident as a success.
+    ``fail`` — the AMS is still wedged (both tiers), the resume send failed, or the
+        budget was already spent on this job: the caller escalates ``stuck_reset_failed``.
+    ``abort`` / ``handover`` — :func:`_takeover` (an external actor, a job that ended,
+        or a re-classified row).
 
     The resume this publishes is the driver's OWN, and the printer answers it on the
     wire like any other: the per-push sampler sees a PAUSE→RUNNING transition and
@@ -1749,34 +1923,39 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
 
     Entry gate (else ``skipped``): the wedge must be LIVE — gcode_state PAUSE AND
     ``ams_status_main == 1`` (filament_change). Non-idle alone is NOT a wedge: only
-    main=1 is resume-resettable. Wire evidence (009-H2S 2026-07-20): a resume is the
-    ONLY verb that unwedged the stuck change after FOUR unloads (recovery's two + the
-    operator's two) were silently ignored — it is literally the touchscreen CONTINUE
-    for the standing 07008010. Counter-evidence (006-H2S 2026-07-21): an extruder
+    main=1 is resume-resettable. Counter-evidence (006-H2S 2026-07-21): an extruder
     ``0300_801E`` fault with ``ams_status_main == 3`` (assist) and the feeder still
     engaged is NOT a stuck change — the unload is accepted immediately, so that round
     skips this reset and runs the unload→swap machine directly.
+
+    The budget test comes AFTER the wedge test, and that ordering is the 002 fix: a
+    round that finds the AMS wedged with the budget already spent is not a "skip", it
+    is a round whose every unload the firmware will drop, so it FAILS into the
+    escalation instead of feeding the swap machine commands that cannot land.
     """
     pid = incident.printer_id
     key = (pid, incident.job_id)
-
-    if _stuck_resets.get(key, 0) >= _MAX_STUCK_RESETS:
-        return "skipped"  # budget spent — one bounded reset per incident
 
     st = _get_state(pid)
     if st is None:
         return "skipped"
     if getattr(st, "state", None) != "PAUSE":
         return "skipped"
-    initial_ams = getattr(st, "ams_status_main", None)
     if not ams_mid_filament_change(st):
-        # Only main=1 is resume-resettable (009-H2S 2026-07-20 evidence). idle(0),
-        # assist(3), identifying(2), calibration(4) and any unknown value are NOT
-        # stuck filament-changes — the unload→swap machine owns those rounds and its
-        # verbs ARE accepted there (006-H2S 2026-07-21: 0300_801E with the feeder
-        # still engaged at ams_status_main=3 — the operator's unload/load/resume all
-        # took while this branch had been giving up on a resume that could not help).
         return "skipped"
+    initial_ams = getattr(st, "ams_status_main", None)
+
+    if _stuck_resets.get(key, 0) >= _MAX_STUCK_RESETS:
+        logger.warning(
+            "spool_recovery: printer %s still wedged mid filament-change (ams_status_main=%s tray_now=%s) with the "
+            "reset budget spent (%d/%d) — the firmware drops every load and unload in this state",
+            pid,
+            initial_ams,
+            getattr(st, "tray_now", None),
+            _stuck_resets.get(key, 0),
+            _MAX_STUCK_RESETS,
+        )
+        return "fail"
 
     # The AMS is wedged mid-change. Spend a reset and re-issue the firmware CONTINUE.
     _stuck_resets[key] = _stuck_resets.get(key, 0) + 1
@@ -1795,13 +1974,69 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
         )
         return "fail"
 
+    verdict = await _await_unwedge(incident, client, initial_ams=initial_ams, allow_self_pause=True)
+    if verdict != "fail":
+        return verdict
+    return await _ams_control_tier(incident, client, key=key, initial_ams=initial_ams)
+
+
+def _unwedged_verdict(incident: RecoveryIncident, *, stage: str) -> str:
+    """``ok`` only when a FRESH read says the AMS has LEFT the filament change.
+
+    THE 002-H2S 2026-09-11 HOLE. "The state machine moved and is back at PAUSE" was
+    read as "the swap round can run", and those are not the same statement: the printer
+    had retried the same slot, stalled and re-PAUSEd with ``ams_status_main`` still 1,
+    where the firmware DROPS every load and unload
+    (:func:`bambu_mqtt.ams_mid_filament_change`). The round's two unloads went nowhere,
+    it escalated ``unload_failed``, and the one fact that explained it — the AMS never
+    left the change — appeared in no log line at all.
+
+    Gates EVERY ``ok`` exit of :func:`_await_unwedge`, so there is no path by which the
+    caller learns "proceed" without that read having been taken.
+    """
+    st = _get_state(incident.printer_id)
+    if not ams_mid_filament_change(st):
+        return "ok"
+    logger.warning(
+        "spool_recovery: printer %s %s but the AMS did not leave the filament change "
+        "(ams_status_main=%s tray_now=%s) — the firmware drops every load and unload in this state",
+        incident.printer_id,
+        stage,
+        getattr(st, "ams_status_main", None),
+        getattr(st, "tray_now", None),
+    )
+    return "fail"
+
+
+async def _await_unwedge(incident: RecoveryIncident, client, *, initial_ams: int, allow_self_pause: bool) -> str:
+    """Read the outcome of ONE unwedge attempt, bounded by ``step_timeout_s``.
+
+    The reader both tiers share, so a second verb cannot grow a second, subtly
+    different reading of the same wire. Four outcomes, all from the 009/002 wire:
+
+    (a) the firmware moves and then re-faults / re-PAUSEs on its own → ``ok``;
+    (b) it fully self-heals — RUNNING, fault clear, change completed or AMS idle, held
+        stable for :data:`_POST_RESUME_STABLE_S` → ``recovered``;
+    (c) it hangs RUNNING in an incomplete change (the live 009 case, ~2.5 min) → we
+        re-pause it ourselves and proceed → ``ok``;
+    (d) it never moves at all → ``fail``.
+
+    Every ``ok`` — (a), (c) and the deadline's re-PAUSE — is gated by
+    :func:`_unwedged_verdict`, because all three say only that the PRINTER moved, and
+    the question the caller is actually asking is whether the AMS will accept a command.
+
+    ``allow_self_pause`` is (c)'s arm: a tier that must not take the print back to PAUSE
+    reports ``fail`` there instead and leaves the decision to the caller.
+    """
+    pid = incident.printer_id
     deadline = _now() + incident.settings.step_timeout_s
     saw_leave = False  # observed the machine leave PAUSE or change ams_status — the (a)/(d) discriminator
     healthy_since: float | None = None
     while _now() < deadline:
         st = _get_state(pid)
-        if st is None:
-            return "abort"
+        token = _takeover(incident, st, awaiting=None)  # RUNNING is expected here
+        if token is not None:
+            return _note_takeover(incident, token, "await_unwedge")
         state = getattr(st, "state", None)
         ams = getattr(st, "ams_status_main", None)
         if state != "PAUSE" or ams != initial_ams:
@@ -1826,17 +2061,18 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
             if state == "PAUSE" and saw_leave:
                 logger.info(
                     "spool_recovery: printer %s state machine moved then re-PAUSEd after the reset "
-                    "(ams_status_main=%s) — proceeding to the swap round",
+                    "(ams_status_main=%s)",
                     pid,
                     ams,
                 )
-                return "ok"
+                return _unwedged_verdict(incident, stage="moved then re-PAUSEd after the reset")
         await asyncio.sleep(_POLL_INTERVAL_S)
 
     # Deadline reached.
     st = _get_state(pid)
-    if st is None:
-        return "abort"
+    token = _takeover(incident, st, awaiting=None)
+    if token is not None:
+        return _note_takeover(incident, token, "await_unwedge")
     state = getattr(st, "state", None)
     ams = getattr(st, "ams_status_main", None)
     if state == "RUNNING":
@@ -1852,6 +2088,15 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
         # (c) THE LIVE 009 HUNG CASE: RUNNING but the change never completed and the
         #     fault stands (it sat like this ~2.5 min). Re-pause it ourselves so the
         #     proven unload→swap→resume round can run.
+        if not allow_self_pause:
+            logger.warning(
+                "spool_recovery: printer %s hung RUNNING in an incomplete filament-change "
+                "(tray_now=%s ams_status_main=%s) and this tier does not self-pause",
+                pid,
+                getattr(st, "tray_now", None),
+                ams,
+            )
+            return "fail"
         logger.info(
             "spool_recovery: printer %s hung RUNNING in an incomplete filament-change after the reset "
             "(tray_now=%s ams_status_main=%s fault_live=%s) — self-pausing to run the swap round",
@@ -1863,21 +2108,84 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
         if client.pause_print() and await printer_manager.await_state(
             pid, {"PAUSE"}, incident.settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
         ):
-            return "ok"
+            return _unwedged_verdict(incident, stage="self-paused the hung change")
         logger.warning("spool_recovery: printer %s could not re-pause after the reset — escalating", pid)
         return "fail"
     if state == "PAUSE" and saw_leave:
-        return "ok"  # re-faulted and re-paused right at the deadline
+        # Re-faulted and re-paused right at the deadline.
+        return _unwedged_verdict(incident, stage="re-PAUSEd at the reset deadline")
     # (d) the state machine never moved — still wedged (PAUSE + non-idle) at the
-    #     deadline without ever leaving. A resume cannot free it; hands are needed.
+    #     deadline without ever leaving. A resume cannot free it.
     logger.warning(
-        "spool_recovery: printer %s AMS never left the wedged change after the reset (state=%s ams_status_main=%s) "
-        "— escalating stuck_reset_failed",
+        "spool_recovery: printer %s AMS never left the wedged change after the reset (state=%s ams_status_main=%s)",
         pid,
         state,
         ams,
     )
     return "fail"
+
+
+async def _ams_control_tier(incident: RecoveryIncident, client, *, key: tuple[int, str], initial_ams: int) -> str:
+    """Tier 2: the OTHER firmware CONTINUE, ``ams_control("resume")``.
+
+    Entry is EVIDENCE, not a record of why tier 1 gave up: a fresh read must still show
+    the printer PAUSEd AND the AMS inside the filament change. That one reading excludes
+    both fail modes a second publish cannot help — an offline client (which returned
+    False before any wait, so nothing reached the wire) and a self-pause that did not
+    take (the printer is RUNNING, not PAUSE, and an AMS frame published at a running
+    printer is not the operator's CONTINUE) — without storing a reason code
+    (derive-don't-store).
+
+    ``ams_control("reset")`` is deliberately NOT a third tier. The fork has no HMS
+    mapping for it, and its firmware meaning is "end the filament change" — which is
+    the very operation the paused print is waiting on, so a reset that succeeds might
+    leave the print resumable only by a human anyway. Deferred, logged at the decision
+    point, and the next real jam decides.
+    """
+    pid = incident.printer_id
+    st = _get_state(pid)
+    if getattr(st, "state", None) != "PAUSE" or not ams_mid_filament_change(st):
+        return "fail"
+
+    spent = _ams_control_tiers.get(key, 0)
+    if spent >= _MAX_AMS_CONTROL_TIERS:
+        logger.warning(
+            "spool_recovery: printer %s still wedged with the ams_control tier spent (%d/%d) — hands are needed",
+            pid,
+            spent,
+            _MAX_AMS_CONTROL_TIERS,
+        )
+        return "fail"
+    _ams_control_tiers[key] = spent + 1
+
+    logger.info(
+        "spool_recovery: printer %s print.resume did not free the filament change (ams_status_main=%s tray_now=%s) "
+        "— publishing ams_control(resume), the firmware's other CONTINUE (tier %d/%d)",
+        pid,
+        getattr(st, "ams_status_main", None),
+        getattr(st, "tray_now", None),
+        _ams_control_tiers[key],
+        _MAX_AMS_CONTROL_TIERS,
+    )
+    _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict="unwedge_tier2_sent")
+    if not client.ams_control("resume"):
+        logger.warning(
+            "spool_recovery: printer %s ams_control(resume) send returned False (offline?) — tier 2 failed", pid
+        )
+        return "fail"
+
+    verdict = await _await_unwedge(incident, client, initial_ams=initial_ams, allow_self_pause=True)
+    if verdict in ("ok", "recovered"):
+        _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict="unwedge_tier2_ok")
+        return verdict
+    if verdict == "fail":
+        _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict="unwedge_tier2_fail")
+        logger.info(
+            'spool_recovery: printer %s both firmware CONTINUEs left the AMS wedged — ams_control("reset") deferred: '
+            "no HMS mapping in the fork and it may end the change the print is waiting on; the next real jam decides",
+            pid,
+        )
+    return verdict
 
 
 def _unload_skippable(state) -> bool:
@@ -1970,7 +2278,8 @@ async def _unload_and_confirm(incident: RecoveryIncident, client) -> str:
 
 
 async def _confirm_unloaded(incident: RecoveryIncident) -> str:
-    """Wait for the commanded unload to COMPLETE. ``ok`` / ``timeout`` / ``abort``.
+    """Wait for the commanded unload to COMPLETE.
+    ``ok`` / ``timeout`` / ``abort`` / ``handover``.
 
     ``tray_now == 255`` alone is not completion: after a feed fault it already reads
     255 before the unload, so the old criterion returned instantly and the load then
@@ -1992,10 +2301,9 @@ async def _confirm_unloaded(incident: RecoveryIncident) -> str:
     settled_since: float | None = None
     while True:
         st = _get_state(incident.printer_id)
-        if st is None:
-            return "abort"
-        if getattr(st, "state", None) == "RUNNING":
-            return "abort"  # someone else resumed the print
+        token = _takeover(incident, st, awaiting="PAUSE")
+        if token is not None:
+            return _note_takeover(incident, token, "confirm_unloaded")
         idle = getattr(st, "ams_status_main", None) == AMS_STATUS_IDLE
         empty = getattr(st, "tray_now", None) == _NO_FILAMENT
         if not idle:
@@ -2052,7 +2360,10 @@ async def _select_replacement(incident: RecoveryIncident, tried: set[int]) -> tu
     # then re-scan a single time. Still nothing → escalate exactly as before.
     forced_slots = await _force_bare_tray_config(incident, status)
     if forced_slots:
-        status2 = await _await_bare_tray_configured(incident, forced_slots)
+        # The token is the sweep's own reason for stopping (already logged); the
+        # driver re-derives the takeover from LIVE state at its own check below, so
+        # nothing here acts on a reading this old.
+        status2, _token = await _await_bare_tray_configured(incident, forced_slots)
         if status2 is not None:
             pick2, only_low2 = await _match_candidates(incident, status2, requirement, tried)
             if pick2 is not None:
@@ -2336,22 +2647,26 @@ def _any_slot_configured(status, slots: list[tuple[int, int]]) -> bool:
 
 async def _await_bare_tray_configured(incident: RecoveryIncident, forced_slots: list[tuple[int, int]]):
     """Poll (≤ ``step_timeout_s``) for a forced bare slot to gain a ``tray_type``.
-    Returns the live state on success, or ``None`` on timeout / lost state / an
-    external RESUME (the driver then aborts rather than escalates)."""
+
+    Returns ``(live state, takeover token)``: the state on success, else ``(None,
+    token)`` when :func:`_takeover` ended the wait and ``(None, None)`` on a plain
+    timeout. The caller's own path is unchanged — a ``None`` state means "no candidate
+    from this sweep" either way — but the TOKEN is what names WHY the sweep stopped,
+    which is otherwise lost in a helper that answers with an absence."""
     deadline = _now() + incident.settings.step_timeout_s
     while _now() < deadline:
         st = _get_state(incident.printer_id)
-        if st is None:
-            return None
-        if getattr(st, "state", None) == "RUNNING":
-            return None  # external actor resumed — driver aborts
+        token = _takeover(incident, st, awaiting="PAUSE")
+        if token is not None:
+            _note_takeover(incident, token, "await_bare_tray_configured")
+            return None, token
         if _any_slot_configured(st, forced_slots):
-            return st
+            return st, None
         await asyncio.sleep(_POLL_INTERVAL_S)
     st = _get_state(incident.printer_id)
     if st is not None and _any_slot_configured(st, forced_slots):
-        return st
-    return None
+        return st, None
+    return None, None
 
 
 async def _log_tray_snapshot(incident: RecoveryIncident) -> None:
@@ -2436,14 +2751,13 @@ async def _load_and_confirm(incident: RecoveryIncident, client, target: int) -> 
 
 
 async def _confirm_loaded(incident: RecoveryIncident, target: int) -> str:
+    """Wait for ``tray_now == target``. ``ok`` / ``timeout`` / ``abort`` / ``handover``."""
     deadline = _now() + incident.settings.step_timeout_s
     while _now() < deadline:
         st = _get_state(incident.printer_id)
-        if st is None:
-            return "abort"
-        ptt = getattr(st, "pending_tray_target", None)
-        if ptt is not None and ptt != target:
-            return "abort"  # operator/other actor hijacked the load
+        token = _takeover(incident, st, awaiting="PAUSE", target=target)
+        if token is not None:
+            return _note_takeover(incident, token, "confirm_loaded")
         if getattr(st, "tray_now", None) == target:
             return "ok"
         await asyncio.sleep(_POLL_INTERVAL_S)
@@ -2451,57 +2765,63 @@ async def _confirm_loaded(incident: RecoveryIncident, target: int) -> str:
 
 
 async def _resume_and_confirm(incident: RecoveryIncident, client, target: int) -> str:
-    """Resume and confirm RUNNING held stable. ``success`` / ``repause`` / ``abort``.
+    """Resume and confirm RUNNING held stable.
+    ``success`` / ``repause`` / ``not_taken`` / ``abort`` / ``handover``.
 
-    A re-PAUSE while a recoverable code is still live ⇒ ``repause`` (the caller
-    runs one extra pause/resume cycle). A re-PAUSE with no recoverable code, or a
-    ``pending_tray_target`` hijack, ⇒ ``abort`` (an external actor is in control).
+    ``repause`` and ``not_taken`` were ONE word until 002-H2S 2026-09-11, and the caller
+    treats them identically (an extra pause/resume cycle) — but they are opposite
+    statements about the SPOOL, and the second cycle's verdict is what the re-jam stamp
+    reads:
+
+    * ``repause`` — the resume TOOK (RUNNING was observed) and a recoverable fault
+      re-PAUSEd the print. That is evidence: something jammed again.
+    * ``not_taken`` — RUNNING never arrived, or the send never went out. NOTHING
+      faulted; the printer simply did not act on the command. On 002 that printer was
+      FAILED (the operator had stopped it) and the machine read "the replacement
+      re-jammed", stamping a healthy spool out of rotation with zero fault evidence.
+
+    A re-PAUSE with NO recoverable code is still ``abort``: a print that pauses without
+    a fault paused because somebody paused it.
     """
     if not client.resume_print():
-        # Offline / rejected send: RUNNING will never arrive — treat it as a
-        # resume that did not take (``repause``) without burning the confirm wait.
-        # The caller's extra pause/resume cycle then next-candidate path is the
-        # existing fail route; no new escalation reason is introduced.
+        # Offline / rejected send: RUNNING will never arrive — nothing acted, so this
+        # is the empty verdict, not a re-jam. No confirm wait is burned.
         logger.warning(
             "spool_recovery: printer %s resume_print send returned False (offline?) — resume not taken",
             incident.printer_id,
         )
-        return "repause"
+        return "not_taken"
 
     # Phase 1: reach RUNNING.
     reach_deadline = _now() + min(incident.settings.step_timeout_s, _REPAUSE_WATCH_S)
     reached = False
     while _now() < reach_deadline:
         st = _get_state(incident.printer_id)
-        if st is None:
-            return "abort"
-        ptt = getattr(st, "pending_tray_target", None)
-        if ptt is not None and ptt != target:
-            return "abort"
-        s = getattr(st, "state", None)
-        if s == "RUNNING":
+        # FINISH FIRST: a print that completes inside the resume window is a success,
+        # not a job that ended under us.
+        if getattr(st, "state", None) == "FINISH":
+            return "success"
+        token = _takeover(incident, st, awaiting="RUNNING", target=target)
+        if token is not None:
+            return _note_takeover(incident, token, "resume_reach_running")
+        if getattr(st, "state", None) == "RUNNING":
             reached = True
             break
-        if s == "FINISH":
-            return "success"  # completed during the resume window
         await asyncio.sleep(_POLL_INTERVAL_S)
     if not reached:
-        return "repause"  # resume didn't take — give the extra cycle a chance
+        return "not_taken"  # RUNNING never arrived and nothing faulted
 
     # Phase 2: hold RUNNING stable.
     hold_deadline = _now() + _POST_RESUME_STABLE_S
     while _now() < hold_deadline:
         st = _get_state(incident.printer_id)
-        if st is None:
-            return "abort"
-        ptt = getattr(st, "pending_tray_target", None)
-        if ptt is not None and ptt != target:
-            return "abort"
-        s = getattr(st, "state", None)
-        if s == "PAUSE":
-            return "repause" if _active_recoverable_codes(st) else "abort"
-        if s == "FINISH":
+        if getattr(st, "state", None) == "FINISH":
             return "success"
+        token = _takeover(incident, st, awaiting="RUNNING", target=target)
+        if token is not None:
+            return _note_takeover(incident, token, "resume_hold_running")
+        if getattr(st, "state", None) == "PAUSE":
+            return "repause" if _active_recoverable_codes(st) else "abort"
         await asyncio.sleep(_POLL_INTERVAL_S)
     return "success"
 
@@ -2919,9 +3239,13 @@ async def _record_escalation_and_maybe_quarantine(db: AsyncSession, incident: Re
         logger.exception("spool_recovery: repeat-jam quarantine bookkeeping failed for printer %s", incident.printer_id)
 
 
-async def _abort(incident: RecoveryIncident) -> None:
-    """Silent abort — an external actor took over mid-recovery. Stop acting and
-    drop our stale ``recovering`` flag (the print is being handled elsewhere).
+async def _abort(incident: RecoveryIncident, *, token: str = "external_interference") -> None:
+    """Silent abort — somebody else owns this printer now. Stop acting and drop our
+    stale ``recovering`` flag (the print is being handled elsewhere).
+
+    ``token`` is :func:`_takeover`'s verdict where the caller has it, so the closing
+    line names the same fact the step's own line named. The default covers the callers
+    that only ever see the step VERDICT.
 
     If that actor resumed ON the jammed feeder (live RUNNING with ``tray_now`` ==
     the jammed global tray), they declared that spool usable — clear its
@@ -2937,7 +3261,7 @@ async def _abort(incident: RecoveryIncident) -> None:
     # reaches this path.
     await _close_incident(incident, status=STATUS_ABORTED, source=RESOLVE_OPERATOR)
 
-    logger.info("spool_recovery: printer %s recovery aborted (external interference)", incident.printer_id)
+    logger.info("spool_recovery: printer %s recovery aborted (%s)", incident.printer_id, token)
     try:
         async with async_session() as db:
             item = await db.get(PrintQueueItem, incident.item_id) if incident.item_id is not None else None

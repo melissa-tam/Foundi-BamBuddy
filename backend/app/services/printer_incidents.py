@@ -219,8 +219,13 @@ def _slot_desc(incident: PrinterIncident) -> str | None:
 
 
 def _payload(incident: PrinterIncident) -> dict:
-    """The projection the printer card renders."""
+    """The projection the printer card renders.
+
+    ``id`` rides along so a reader can ask about ONE row rather than about whatever
+    is open now (see :func:`cached_kind`); the UI ignores it.
+    """
     return {
+        "id": incident.id,
         "kind": incident.kind,
         "status": incident.status,
         "slot_desc": _slot_desc(incident),
@@ -237,6 +242,28 @@ def snapshot(printer_id: int | None) -> dict | None:
     if not printer_id:
         return None
     return _open_cache.get(printer_id)
+
+
+def cached_kind(printer_id: int, incident_id: int) -> str | None:
+    """The KIND the open-incident cache holds for ``incident_id``, or ``None``.
+
+    Sync and DB-free (the :func:`snapshot` idiom — this is read from poll loops that
+    run once a second), and deliberately IDENTITY-SCOPED: it answers only while the
+    printer's open row is still the one the caller names. A live recovery driver
+    carries an immutable context resolved at its entry gate, and this is how it learns
+    that the store re-classified THAT row underneath it (a jam the taxonomy later
+    upgraded to a physical fault). A reader that answered about "whatever is open now"
+    would report a re-classification every time a different incident opened.
+
+    ``None`` for a closed row, a different open row, or an empty cache. None of those
+    is a re-classification, and each already has its own lifecycle path — a driver
+    learns a CLOSED row through the wire (the job ended, the printer resumed), never
+    by inferring it from an absent projection.
+    """
+    cached = _open_cache.get(printer_id)
+    if cached is None or cached.get("id") != incident_id:
+        return None
+    return cached.get("kind")
 
 
 async def get_open(db: AsyncSession, printer_id: int) -> PrinterIncident | None:
