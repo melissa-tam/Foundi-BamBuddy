@@ -6077,18 +6077,6 @@ class BambuMQTTClient:
         percent = max(0, min(100, percent))
         return self.set_fan_speed(fan, round(percent * 255 / 100))
 
-    def set_part_fan(self, speed: int) -> bool:
-        """Set part cooling fan speed (0-255)."""
-        return self.set_fan_speed(1, speed)
-
-    def set_aux_fan(self, speed: int) -> bool:
-        """Set auxiliary fan speed (0-255)."""
-        return self.set_fan_speed(2, speed)
-
-    def set_chamber_fan(self, speed: int) -> bool:
-        """Set chamber fan speed (0-255)."""
-        return self.set_fan_speed(3, speed)
-
     def set_airduct_mode(self, mode: str) -> bool:
         """Set air conditioning mode (cooling or heating).
 

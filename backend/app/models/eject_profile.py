@@ -56,8 +56,6 @@ class EjectProfile(Base):
     eject_speed_mm_min: Mapped[int] = mapped_column(Integer, default=3000, nullable=False)
     skim_speed_mm_min: Mapped[int] = mapped_column(Integer, default=1500, nullable=False)
 
-    cooling_fan_assist: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-
     # Append the final slow skim pass at the z_offset floor after the descent
     # sweeps. True (default) = prior behaviour (every sweep ends with a skim to
     # clear thin remnants); False pushes exactly once (e.g. a single mid-height
