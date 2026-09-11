@@ -909,6 +909,8 @@ def generate_eject_gcode(
                                               ;   deadline covers it
         M140 S0                               ; bed heater off (defensive)
         M106 P2 S0                            ; aux fan off (the cooldown prep runs it)
+        M106 P3 S0                            ; chamber fan off (ditto; the stock end
+                                              ;   block's own line — duct mode untouched)
         G1 Z{drop_z | lift_z} F900            ; the block's FIRST and only Z approach
         <jitter strokes / M400 S{dwell}>      ; assist only, at the drop floor
         <G28 X Y | DUAL_NOZZLE_HOME>          ; home X/Y (NEVER Z) at the clearest point
@@ -934,9 +936,9 @@ def generate_eject_gcode(
     There is NO in-file cooldown wait: the bed-cooldown gate moved OUT of the
     G-code into the eject monitor, which holds the plate-clear gate until the live
     ``bed_temper`` reaches the profile's ``cooldown_temp_c`` and only THEN dispatches
-    this motion-only job. ``M140 S0`` (heater off) is still emitted defensively, as is
-    the ``M106 P2 S0`` that stops the aux fan the cooldown prep ran; the old ``M190 R``
-    thermal wait is gone.
+    this motion-only job. ``M140 S0`` (heater off) is still emitted defensively, as are
+    the ``M106 P2 S0`` / ``M106 P3 S0`` pair that stops the cooldown fans the prep ran
+    (aux and chamber exhaust); the old ``M190 R`` thermal wait is gone.
 
     Args:
         profile: the eject profile (all tunable parameters).
@@ -1036,19 +1038,30 @@ def generate_eject_gcode(
     # estimator's ``pre_s`` is 0 for every block this generator emits.
     lines.append(f"{PHASE_BEACON_LIFTED} ; phase beacon: drop phase begins - eject runtime watchdog")
 
-    # --- bed heater off, aux fan off --------------------------------------
+    # --- bed heater off, cooldown fans off --------------------------------
     # Command the bed heater off defensively. The cooldown WAIT is no longer in
     # the G-code — the eject monitor already held the plate gate until the live
     # bed reached cooldown_temp_c before dispatching this motion-only job — so no
     # M190 R loop is emitted here.
     #
-    # ``M106 P2 S0`` stops the AUX fan the cooldown prep runs during that wait. The
-    # prep's own server-side OFF is best-effort (a restart between the prep and this
-    # job orphans the fan with nothing left to switch it off), and this file is the one
-    # writer that cannot be lost. Non-motion: it costs the drop span nothing.
-    lines.append("; --- bed heater off, aux fan off ---")
+    # The two fan lines stop the fans the cooldown prep runs during that wait: the
+    # AUX fan (``M106 P2 S0``) and the CHAMBER exhaust fan (``M106 P3 S0``, the stock
+    # end block's own line). The prep's own server-side OFF is best-effort (a restart
+    # between the prep and this job orphans both fans with nothing left to switch them
+    # off), and this file is the one writer that cannot be lost.
+    #
+    # The duct MODE (``M145``) is deliberately NOT touched here: the prep leaves the
+    # duct in cooling exactly as the vendor's own finish tail does, and the next print's
+    # start block sets the mode it wants. Note that the appended vendor epilogue's
+    # ``M622 J2`` branch may itself re-run ``M145 P0`` / ``M106 P3 S127`` for 180 s
+    # AFTER these lines on printers whose finish-filtration setting takes that branch —
+    # vendor behaviour inside the vendor tail, not ours to suppress.
+    #
+    # Non-motion: both lines cost the drop span nothing.
+    lines.append("; --- bed heater off, cooldown fans off ---")
     lines.append("M140 S0")
     lines.append("M106 P2 S0")
+    lines.append("M106 P3 S0")
 
     # --- bed-drop release assist (optional) -------------------------------
     # Drive the bed all the way DOWN to the machine bottom minus the profile's

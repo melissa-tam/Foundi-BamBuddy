@@ -74,7 +74,6 @@ _DEFAULTS = {
     "back_overhang_mm": 2.0,
     "eject_speed_mm_min": 3000,
     "skim_speed_mm_min": 1500,
-    "cooling_fan_assist": True,
     "final_skim": True,
     "max_part_height_mm": 42.0,
     "sweep_x_min_mm": None,
@@ -190,12 +189,19 @@ def test_every_golden_is_one_z_flow(name, geometry, overrides, max_z):
 
     beacon_idx = next(i for i, ln in enumerate(lines) if ln.startswith(PHASE_BEACON_LIFTED + " "))
     aux_idx = lines.index("M106 P2 S0")
+    # POSITION is the whole assertion for the chamber fan: the appended vendor epilogue
+    # carries its own ``M106 P3 S0``, so membership is true no matter what this block
+    # emits. The FIRST occurrence is the block's own, directly after the aux line and
+    # still ahead of every move.
+    chamber_idx = lines.index("M106 P3 S0")
     first_z_idx = next(i for i, ln in enumerate(lines) if ln.startswith("G1 Z"))
     sweep_idx = lines.index(SWEEP_PHASE_MARKER)
     homes = [i for i, ln in enumerate(lines) if ln.startswith("G28")]
 
-    # The beacon, then the two non-motion commands, then the first move.
+    # The beacon, then the three non-motion commands, then the first move.
     assert beacon_idx < lines.index("M140 S0") < aux_idx < first_z_idx
+    assert chamber_idx == aux_idx + 1
+    assert chamber_idx < first_z_idx
     # Exactly one home — one command per axis on a dual-nozzle model — after the first
     # Z move and before the sweep begins.
     assert len(homes) == (2 if is_dual_nozzle_model(geometry.model_key) else 1)

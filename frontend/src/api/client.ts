@@ -681,6 +681,12 @@ export interface PrinterStatus {
   supports_drying: boolean;
   // Active chamber heater (responds to M141). True only for H2C/H2D/H2DPro/H2S/X2D.
   supports_chamber_heater?: boolean;
+  // Enclosure chamber exhaust fan (firmware field `big_fan2_speed`). False on
+  // open-frame models, where the field is meaningless.
+  has_chamber_fan?: boolean;
+  // Switchable air duct (`M145 P0/P1`). The backend is the one origin for both
+  // capabilities — the page never re-derives them from the model name.
+  supports_airduct?: boolean;
 }
 
 export interface PrinterCreate {
@@ -1413,9 +1419,19 @@ export interface AppSettings {
   // When cooling plateaus within this many °C of the release threshold, eject
   // (bed equilibrated at ambient) instead of quarantining the printer.
   farm_cooldown_plateau_eject_margin_c: number;
-  // Auxiliary-fan speed (%) held from the end of the print until the eject
-  // dispatches, to pull heat off the plate during the cooldown wait. 0 = off.
+  // Cooldown fans: from the end of the print until the eject dispatches the
+  // farm runs the printer's auxiliary fan and its chamber exhaust fan, each
+  // switchable. The aux fan holds ONE speed for the whole wait (forced
+  // convection raises the cooling rate, which has no step-down point that beats
+  // any other). The chamber fan runs its BOOST speed while the chamber air is
+  // still above the eject temperature — trapped warm air is what keeps the bed
+  // from reaching the threshold — then steps to its SUSTAIN speed (0 = stop
+  // there) once the chamber has cooled. Models with no chamber fan skip it.
+  farm_cooldown_aux_fan_enabled: boolean;
   farm_cooldown_aux_fan_percent: number;
+  farm_cooldown_chamber_fan_enabled: boolean;
+  farm_cooldown_chamber_fan_percent: number;
+  farm_cooldown_chamber_fan_sustain_percent: number;
   // Cooldown plate hold: while the part cools the plate is raised toward the
   // nozzle plane with the toolhead parked at the chute, so the aux fan's stream
   // reaches the part. Off leaves the plate where the print ended.

@@ -3,9 +3,10 @@
 M17
 G90
 M73 P5 ; phase beacon: drop phase begins - eject runtime watchdog
-; --- bed heater off, aux fan off ---
+; --- bed heater off, cooldown fans off ---
 M140 S0
 M106 P2 S0
+M106 P3 S0
 ; --- first Z move: one flow from wherever the plate is (vendor park or the cooldown hold) ---
 G1 Z52 F900
 ; --- home X/Y (never Z) at the block's clearest point ---

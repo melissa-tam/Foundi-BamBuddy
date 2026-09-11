@@ -542,6 +542,12 @@ class PrinterStatus(BaseModel):
     supports_drying_while_printing: bool = False
     # Active chamber heater (responds to M141). True only for H2C/H2D/H2DPro/H2S/X2D.
     supports_chamber_heater: bool = False
+    # Chamber (exhaust) fan — M106 P3 moves air. True on every ENCLOSED model;
+    # false on the open-frame A1 family, A2L and P1P.
+    has_chamber_fan: bool = False
+    # Switchable cooling/heating air duct (M145 P0/P1, JSON set_airduct).
+    # True only for P2S/X2D and the H2 family.
+    supports_airduct: bool = False
     # Linked archive for the active print (resolved via subtask_id). Frontend uses
     # this to fetch plate metadata and show the plate name when the source 3MF is
     # multi-plate (#881 follow-up).

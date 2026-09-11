@@ -126,8 +126,8 @@ async def test_sweep_start_frac_defaults_to_one(engine):
                 "INSERT INTO eject_profiles "
                 "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
-                "eject_speed_mm_min, skim_speed_mm_min, cooling_fan_assist, max_part_height_mm) "
-                "VALUES ('migrated', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42)"
+                "eject_speed_mm_min, skim_speed_mm_min, max_part_height_mm) "
+                "VALUES ('migrated', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42)"
             )
         )
     async with engine.connect() as conn:
@@ -155,8 +155,8 @@ async def test_final_skim_defaults_to_true(engine):
                 "INSERT INTO eject_profiles "
                 "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
-                "eject_speed_mm_min, skim_speed_mm_min, cooling_fan_assist, max_part_height_mm) "
-                "VALUES ('skimdefault', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 1, 42)"
+                "eject_speed_mm_min, skim_speed_mm_min, max_part_height_mm) "
+                "VALUES ('skimdefault', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42)"
             )
         )
     async with engine.connect() as conn:

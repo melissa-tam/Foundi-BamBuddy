@@ -1477,23 +1477,6 @@ function getStatusDisplay(state: string | null | undefined, stg_cur_name: string
   }
 }
 
-// Bambu models that ship with an enclosure chamber fan (firmware field
-// `big_fan2_speed`). Open-frame models (A1 / A1 Mini / A2L / P1P) have no
-// chamber fan — `big_fan2_speed` is meaningless / always 0 there, so the
-// widget is hidden in fanItems instead of rendered greyed-out.
-const MODELS_WITH_CHAMBER_FAN: ReadonlySet<string> = new Set([
-  'X1C',
-  'X1',
-  'X1E',
-  'X2D',
-  'P1S',
-  'P2S',
-  'H2D',
-  'H2D Pro',
-  'H2C',
-  'H2S',
-]);
-
 /**
  * Registry-driven eject-qualification hint (farm eject, Phase 2), rendered
  * under the printer model dropdowns. A model whose geometry row is missing or
@@ -4418,9 +4401,10 @@ function PrinterCard({
               // Chamber fan only exists on enclosed Bambu models. Open-frame
               // printers (A1, A1 Mini, A2L, P1P) have no chamber fan — showing
               // the widget there is at best dead UI and at worst suggests a
-              // control that does nothing. Mirrors the enclosure-door badge
-              // gate above.
-              const hasChamberFan = MODELS_WITH_CHAMBER_FAN.has(printer.model ?? '');
+              // control that does nothing. The backend is the ONE origin of the
+              // capability (the cooldown fan lane gates on the same predicate);
+              // the page never re-derives it from the model name.
+              const hasChamberFan = status.has_chamber_fan === true;
               const fanItems = [
                 {
                   key: 'part',
@@ -4783,8 +4767,9 @@ function PrinterCard({
                         <ChamberLight on={status.chamber_light ?? false} className="w-4 h-4" />
                       </button>
 
-                      {/* Airduct Mode (P2S / X2D / H2*) */}
-                      {(['P2S', 'X2D', 'H2D', 'H2C', 'H2S'].includes(printer.model ?? '')) && (() => {
+                      {/* Airduct Mode — capability answered by the backend, the
+                          one origin the cooldown fan lane gates on too. */}
+                      {status.supports_airduct === true && (() => {
                         const isHeating = status.airduct_mode === 1;
                         const Icon = isHeating ? Flame : Snowflake;
                         const color = isHeating ? 'text-orange-400' : 'text-sky-400';
