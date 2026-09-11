@@ -63,7 +63,7 @@ from backend.app.services.plate_occupancy import (
 from backend.app.services.printer_manager import printer_manager
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +242,7 @@ async def watch_bed_and_clear(
     on_release: Callable[[], Awaitable[None]] | None = None,
     on_stall: Callable[[str], Awaitable[None]] | None = None,
     release_now: asyncio.Event | None = None,
+    on_sample: Callable[[Mapping[str, float | None]], None] | None = None,
 ) -> str:
     """Poll the live bed temperature and enact the cooldown → eject policy.
 
@@ -277,10 +278,17 @@ async def watch_bed_and_clear(
     Escalation is unchanged in timing: still above ``threshold_c`` after
     ``escalate_s`` fires ONE ``notify`` (the ``cooldown_escalation`` event, NOT
     plate_not_empty; failures tolerated) with the live bed, then keeps polling.
-    ``manager``, ``sleep``, ``notify``, ``on_release`` and ``on_stall`` are all
-    injectable for testing; ``manager`` supplies the BED reading only — whether the
-    plate is still occupied is read from the plate-occupancy authority, the one place
-    that knows.
+    ``on_sample`` is handed the live ``temperatures`` map on every tick the state was
+    READABLE, and is the cooldown prep's chamber-boost decision: this ONE poll feeds
+    it, so the boost ends off the same reading that decides the release and the wave
+    adds no second timer, no second cadence and no second connection check. It is
+    fire-and-forget by contract — a sampler that raises is logged and the poll carries
+    on, because a plate's watch is worth more than a measurement.
+
+    ``manager``, ``sleep``, ``notify``, ``on_release``, ``on_stall`` and ``on_sample``
+    are all injectable for testing; ``manager`` supplies the BED reading only — whether
+    the plate is still occupied is read from the plate-occupancy authority, the one
+    place that knows.
     """
     if notify is None:
         # The escalation means "bed never reached the release threshold", NOT
@@ -375,6 +383,15 @@ async def watch_bed_and_clear(
             bed_temp = None
         else:
             bed_temp = state.temperatures.get("bed")
+            if on_sample is not None:
+                # THIS poll is the whole sampling story: the cooldown prep's chamber
+                # boost ends off the same reading that decides the release, so there is
+                # no second timer, no second cadence and no second connection check. A
+                # sampler that throws must never cost the plate its watch.
+                try:
+                    on_sample(state.temperatures)
+                except Exception:  # noqa: BLE001 — a sampler never kills the watch feeding it
+                    logger.exception("Eject monitor: cooldown sampler for printer %s failed", printer_id)
         if anchor is None and bed_temp is not None:
             anchor = bed_temp
 
@@ -631,20 +648,48 @@ async def _setting_bool(db, key: str, default: bool) -> bool:
 class CooldownWatchSettings:
     """Everything a cooldown watch reads from farm settings, resolved ONCE at arm.
 
-    A value object rather than a tuple because the set grew a member that is not a
-    plateau/cap number at all (``aux_fan_percent`` is the prep's actuator), and a
-    five-tuple unpacked at every call site is a rename waiting to go silently wrong.
+    A value object rather than a tuple because most of the set is not a plateau/cap
+    number at all — the fan switches and speeds and the plate hold belong to the
+    cooldown PREP, this watch merely resolves them — and an ever-growing tuple
+    unpacked at every call site is a rename waiting to go silently wrong.
     """
 
     stall_window_s: int
     stall_epsilon_c: float
     max_hold_s: int
     plateau_eject_margin_c: float
+    # The two cooldown fans: a switch each, one speed for the aux lane and the
+    # boost/sustain pair for the chamber lane. Composed into the prep's own value
+    # object by :attr:`fans` — the ONE place the two spellings meet.
+    aux_fan_enabled: bool
     aux_fan_percent: int
+    chamber_fan_enabled: bool
+    chamber_fan_percent: int
+    chamber_fan_sustain_percent: int
     # The prep's other two operator inputs: whether the plate is raised at all, and
     # where the part's TOP should sit relative to the nozzle plane while it is.
     hold_enabled: bool
     hold_part_top_mm: int
+
+    @property
+    def fans(self) -> cooldown_prep.CooldownFanSettings:
+        """The five fan settings as the prep's ONE value. The single composition site.
+
+        The aux lane's sustain is its own speed, by construction rather than by a
+        setting nobody offers: the aux fan works by raising the cooling CONSTANT, and
+        the cooling law makes the minutes saved per boost-minute the same in the first
+        minute of a wait and the last — so there is no step-down point better than any
+        other, and one speed for the whole wait is the shortest wait. The chamber fan
+        works by lowering the AIR temperature instead, whose reward ends measurably
+        (the air reaches the eject line), which is the lane that genuinely steps. See
+        :mod:`~backend.app.services.eject.cooldown_prep` for the derivation.
+        """
+        return cooldown_prep.CooldownFanSettings(
+            aux=cooldown_prep.FanRequest(self.aux_fan_enabled, self.aux_fan_percent, self.aux_fan_percent),
+            chamber=cooldown_prep.FanRequest(
+                self.chamber_fan_enabled, self.chamber_fan_percent, self.chamber_fan_sustain_percent
+            ),
+        )
 
 
 async def _resolve_stall_settings() -> CooldownWatchSettings:
@@ -655,11 +700,13 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
     settings are converted to seconds. ``window == 0`` disables the plateau
     watchdog; ``max_hold == 0`` disables the cap. ``plateau_eject_margin_c`` is the
     °C-above-threshold band inside which a plateaued bed is RELEASED rather than
-    quarantined (equilibrated at ambient). ``aux_fan_percent`` is what
-    :mod:`~backend.app.services.eject.cooldown_prep` runs the auxiliary fan at for
-    the whole wait (0 = off); ``hold_enabled``/``hold_part_top_mm`` are that module's
-    other two operator inputs — the plate hold's switch, and where the part's top is
-    held relative to the nozzle plane (capped per model by the geometry registry).
+    quarantined (equilibrated at ambient). The five fan settings are
+    :mod:`~backend.app.services.eject.cooldown_prep`'s two actuators — a switch each,
+    the aux fan's one speed, and the chamber fan's boost/sustain pair; each switch is
+    the ONE on/off owner, so a speed is never read as an off. ``hold_enabled`` /
+    ``hold_part_top_mm`` are that module's other two operator inputs — the plate
+    hold's switch, and where the part's top is held relative to the nozzle plane
+    (capped per model by the geometry registry).
 
     A settings-store failure (DB unavailable at arm time) must NOT kill the
     watch — a dead watch strands the plate-clear gate and silently stalls the
@@ -673,7 +720,11 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
     epsilon = fields["farm_cooldown_stall_epsilon_c"].default
     max_hold_min = fields["farm_cooldown_max_hold_minutes"].default
     margin = fields["farm_cooldown_plateau_eject_margin_c"].default
+    aux_fan_enabled = fields["farm_cooldown_aux_fan_enabled"].default
     aux_fan = fields["farm_cooldown_aux_fan_percent"].default
+    chamber_fan_enabled = fields["farm_cooldown_chamber_fan_enabled"].default
+    chamber_fan = fields["farm_cooldown_chamber_fan_percent"].default
+    chamber_sustain = fields["farm_cooldown_chamber_fan_sustain_percent"].default
     hold_enabled = fields["farm_cooldown_hold_enabled"].default
     hold_part_top = fields["farm_cooldown_hold_part_top_mm"].default
     try:
@@ -682,7 +733,13 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
             epsilon = await _setting_num(db, "farm_cooldown_stall_epsilon_c", epsilon, float)
             max_hold_min = await _setting_num(db, "farm_cooldown_max_hold_minutes", max_hold_min, int)
             margin = await _setting_num(db, "farm_cooldown_plateau_eject_margin_c", margin, float)
+            aux_fan_enabled = await _setting_bool(db, "farm_cooldown_aux_fan_enabled", bool(aux_fan_enabled))
             aux_fan = await _setting_num(db, "farm_cooldown_aux_fan_percent", aux_fan, int)
+            chamber_fan_enabled = await _setting_bool(
+                db, "farm_cooldown_chamber_fan_enabled", bool(chamber_fan_enabled)
+            )
+            chamber_fan = await _setting_num(db, "farm_cooldown_chamber_fan_percent", chamber_fan, int)
+            chamber_sustain = await _setting_num(db, "farm_cooldown_chamber_fan_sustain_percent", chamber_sustain, int)
             hold_enabled = await _setting_bool(db, "farm_cooldown_hold_enabled", bool(hold_enabled))
             hold_part_top = await _setting_num(db, "farm_cooldown_hold_part_top_mm", hold_part_top, int)
     except Exception:  # noqa: BLE001 — arm with defaults rather than strand the gate
@@ -692,7 +749,11 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
         stall_epsilon_c=float(epsilon),
         max_hold_s=int(max_hold_min) * 60,
         plateau_eject_margin_c=float(margin),
+        aux_fan_enabled=bool(aux_fan_enabled),
         aux_fan_percent=int(aux_fan),
+        chamber_fan_enabled=bool(chamber_fan_enabled),
+        chamber_fan_percent=int(chamber_fan),
+        chamber_fan_sustain_percent=int(chamber_sustain),
         hold_enabled=bool(hold_enabled),
         hold_part_top_mm=int(hold_part_top),
     )
@@ -708,9 +769,10 @@ async def _await_printer_connected(printer_id: int) -> bool:
     hydration that had not run yet. The consequence is that EVERY watch a restart
     re-arms starts life on a printer that is not connected yet. Without this wait, each
     one calls ``cooldown_prep.begin`` into a closed socket and logs
-    ``not connected — plate not held`` plus ``aux fan publish refused`` (observed live,
-    with the virtual printer connecting 1.5 s later), so every deploy would drop both
-    actuators for every plate then mid-cooldown.
+    ``not connected — plate not held`` plus a refusal per cooldown fan (observed live as
+    ``aux fan publish refused`` when the aux lane was the only one, with the virtual
+    printer connecting 1.5 s later), so every deploy would drop every actuator for every
+    plate then mid-cooldown.
 
     The invisible half is worse than the lost minutes: a plate that WAS held before the
     restart is still physically at ~Z2 afterwards, but with no hold to report the card
@@ -746,7 +808,7 @@ async def _await_printer_connected(printer_id: int) -> bool:
             return True
     logger.warning(
         "Eject monitor: printer %s still disconnected after %.0f s — arming the cooldown prep without it "
-        "(the plate is not held and the aux fan is not commanded; the bed poll still runs)",
+        "(the plate is not held and the cooldown fans are not commanded; the bed poll still runs)",
         printer_id,
         waited,
     )
@@ -1146,11 +1208,13 @@ class EjectCooldownMonitor:
     def _cooldown_armed(self, printer_id: int, *, other_than: asyncio.Task | None) -> bool:
         """Is a RELEASING watch other than ``other_than``'s armed for this printer?
 
-        The one arbiter of "does this printer still want its aux fan" at a watch's
-        exit. Order-independent by construction: whether a successor's ``begin`` ran
-        before or after this exit, the record it installed is already in ``_armed``
-        when ``_cancel`` popped ours — so the fan ends ON under a cooldown-class
-        successor and OFF under an escalation-only hold or no watch at all.
+        The one arbiter of "does this printer still want its cooldown fans" at a
+        watch's exit — ONE answer for both lanes, because it is a question about the
+        PRINTER rather than about either fan. Order-independent by construction:
+        whether a successor's ``begin`` ran before or after this exit, the record it
+        installed is already in ``_armed`` when ``_cancel`` popped ours — so the fans
+        end ON under a cooldown-class successor and OFF under an escalation-only hold
+        or no watch at all.
         """
         armed = self._armed.get(printer_id)
         return armed is not None and armed.task is not other_than and not isinstance(armed.policy, EscalationOnly)
@@ -1215,15 +1279,19 @@ class EjectCooldownMonitor:
             # an honest skip and the bed poll below is what an offline printer's plate
             # actually needs.
             await _await_printer_connected(printer_id)
-            # Arm the cooldown actuators (plate hold + aux fan) BEFORE the first bed
-            # poll — the whole point is to shorten the wait this loop is about to sit
-            # through. ``begin`` never raises: a prep failure leaves the cooldown
+            # Arm the cooldown actuators (plate hold + cooldown fans) BEFORE the first
+            # bed poll — the whole point is to shorten the wait this loop is about to
+            # sit through. ``begin`` never raises: a prep failure leaves the cooldown
             # exactly as it was before this wave, which is a slower cooldown, not a
-            # stranded gate.
+            # stranded gate. Every input it needs is resolved HERE, once: the prep opens
+            # no settings session, and the model it gates the chamber fan on comes from
+            # the manager's own cache rather than a second lookup inside it.
             prep = await cooldown_prep.begin(
                 printer_id,
                 queue_item_id=queue_item_id,
-                aux_fan_percent=settings.aux_fan_percent,
+                fans=settings.fans,
+                release_threshold_c=threshold,
+                model=printer_manager.get_model(printer_id),
                 hold_enabled=settings.hold_enabled,
                 hold_part_top_mm=settings.hold_part_top_mm,
             )
@@ -1260,7 +1328,9 @@ class EjectCooldownMonitor:
             try:
                 # The fan witness waits INSIDE the guarded span: a cancel during its
                 # settle must still retire the prep below, or a fan commanded ON in
-                # ``begin`` would outlive the watch that switched it on.
+                # ``begin`` would outlive the watch that switched it on. The poll it
+                # guards also feeds the prep its samples, which is what ends the
+                # chamber lane's boost — one loop, two consumers, no second timer.
                 await prep.observe_start()
                 await watch_bed_and_clear(
                     printer_id,
@@ -1272,13 +1342,15 @@ class EjectCooldownMonitor:
                     on_release=on_release,
                     on_stall=on_stall,
                     release_now=release_now,
+                    on_sample=prep.note_sample,
                 )
             finally:
                 # Retire the prep however the poll ended — release, stall, gate clear,
                 # exception or cancellation. This inner ``finally`` runs BEFORE the
                 # outer one's ``_release_record``, so ``_armed[printer_id]`` still
                 # holds OUR record on a normal exit and the SUCCESSOR's (or nothing)
-                # on a cancel — which is exactly the question the fan-off asks.
+                # on a cancel — which is exactly the question the fans-off asks, for
+                # both lanes at once (it is a question about the printer).
                 prep.end(fan_off=not self._cooldown_armed(printer_id, other_than=asyncio.current_task()))
         except asyncio.CancelledError:
             raise  # the driver cancelled us because the policy changed — not a failure

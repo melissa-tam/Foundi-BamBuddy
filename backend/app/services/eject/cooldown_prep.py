@@ -1,13 +1,16 @@
 """Cooldown prep — the ONE owner of what the farm does to a printer while its
 finished plate cools.
 
-Two actuators, both armed by :func:`begin` at the top of the cooldown watch and
+Three actuators, all armed by :func:`begin` at the top of the cooldown watch and
 retired by :meth:`CooldownPrep.end` when that watch exits:
 
 * the **plate hold** (production / first-article units only) — the bed is raised so the
   part top sits where ``farm_cooldown_hold_part_top_mm`` asks for it relative to the
-  nozzle plane, with the toolhead parked at the chute; and
-* the **auxiliary fan** — ``M106 P2`` at ``farm_cooldown_aux_fan_percent``.
+  nozzle plane, with the toolhead parked at the chute;
+* the **auxiliary fan** — ``M106 P2``, forced convection over the part that the hold
+  has just brought into its stream; and
+* the **chamber exhaust fan** — ``M106 P3``, behind the vendor's own ``M145 P0``
+  duct-to-cooling prelude, on the models that have one.
 
 **Why the plate is moved at all.** The aux fan is a fixed duct on the left wall
 aimed at the layer being printed: its stream is centred on the nozzle plane (Z 0),
@@ -16,8 +19,73 @@ and the stock H2 end block parks the bed by the vendor template
 ends at Z123.05). A finished part therefore cools with its top ~73 mm and its plate
 ~123 mm under the stream — blowing on it is blowing on nothing. The hold brings the
 plate TO the stream, which is what makes the fan worth switching on. Baseline the
-pair is measured against: 84 armed→dispatch pairs 2026-09-05→09-10, median 63.4 min
-(p90 81.7) of pure natural convection, ~17 % of every production cycle.
+set is measured against: 84 armed→dispatch pairs 2026-09-05→09-10, median 63.4 min
+(p90 81.7) of pure natural convection, ~17 % of every production cycle; then 42
+aux-fan-and-hold cooldowns 2026-09-10→09-11, median 44 min.
+
+**Two fans, two mechanisms — and why only one of them steps down.** Newton's law of
+cooling is ``dT/dt = -k(T - T_air)``, so the excess decays as ``E0 * e^(-kt)`` and the
+time to the eject temperature is ``t = (1/k) * ln(E0/E_eject)`` — LOGARITHMIC in the
+excess. Two consequences the fan policy is built on. Every halving of the excess costs
+the same minutes at a given fan speed, so the minutes a boost SAVES per boost-minute
+are the constant ``k_boost/k_sustain - 1``, identical in the first minute of the wait
+and the last. A fan that works by raising ``k`` — the AUX fan, forced convection over
+the part — therefore has no step-down point that is better than any other: the shortest
+wait is one speed for the whole wait, and a lower speed costs the same throughput
+whenever it is applied. That is why there is no aux sustain SETTING and why
+``FanRequest.sustain_percent == boost_percent`` on that lane by construction.
+
+The CHAMBER exhaust fan is different in mechanism, not merely in degree. It barely
+changes ``k``; it lowers ``T_air`` by exhausting the chamber. With the chamber air at
+35-36 °C and the eject line at 33 °C the bed's asymptote sits ABOVE the eject line —
+which is the source of the "still above 33 °C after 5400 s" escalations. Once the
+chamber air reads at or below the eject threshold the exhaust's UNIQUE work is done,
+and holding the air there needs a fraction of full speed (the vendor's own
+chamber-cooling figure is 50 %, ``M106 P3 S127``). That is a genuinely front-loaded
+reward with a MEASURABLE end, so the chamber lane boosts and then steps down — on the
+first bed poll whose chamber reading is ``<= release_threshold_c``, the same threshold
+the operator already keeps ~2 °C above shop ambient. No fraction constant, no stored
+minute count and no second timer: one comparison per sample of the poll that was
+already running (:meth:`CooldownPrep.note_sample`). If the sensor never reads at or
+under the threshold the boost simply runs the whole wait, which errs toward cooling.
+
+**MEASURED** (production printer 1, 2026-09-11, 20 s sampler, aux 100 % + plate hold,
+chamber fan OFF throughout, eject threshold 33 °C, shop ~30-31 °C): FINISH at bed 61 /
+chamber 38; +7 min bed 46 / chamber 35; +16.5 min bed 40 / chamber 33 (the chamber air
+reached the eject line by convection alone only then); +23.5 min bed 36 / chamber 32;
++30 min bed 34 / chamber 31; dispatch at bed 33 after 36 min. The first 21 °C of bed
+excess took 16.5 min; the LAST 7 °C took 19.5 min while the chamber air crept 33 → 31 —
+that tail is what the exhaust is aimed at. During the print itself the firmware's own
+``M142`` autocooling ran the chamber fan at ~30 % (wire ``big_fan2_speed`` 27-33) and
+the vendor end block switched it off (``M106 P3 S0``) before the cooldown began.
+**UNMEASURED**, and stated as such rather than guessed: how many minutes 100 % exhaust
+takes to bring the chamber air down to the eject line. Single digits is the
+expectation — the air mass is small and the vendor's own post-print exhaust is 180 s at
+50 % — but the ``chamber boost ended after N s`` INFO line is the instrument, and the
+first production day is the measurement.
+
+**The duct prelude is vendor-verbatim, and load-bearing.** File-verified on the farm's
+own H2S and H2C sliced files: the START block's cooling branch is
+``M145 P0 ; set airduct mode to cooling`` → ``M106 P2 S178`` → ``M106 P3 S127``, and
+the finish tail's ``M622 J2`` branch is ``M145 P0 / M106 P3 S127 / M400 S180 /
+M106 P3 S0``. The sibling ``J1`` branch (``M145 P1`` plus the purifier) leaves the duct
+in HEATING/recirculation with the top flap closed — so a printer whose finish-filtration
+setting took J1 is sitting in heating mode at exactly the moment this module arms, and
+spinning the exhaust up without opening the flap would move air around a closed box.
+The lane therefore sends :data:`AIRDUCT_COOLING_GCODE` BEFORE the fan and on the SAME
+G-code queue, so the flap cannot lose the race, and reports ``skipped:airduct`` if that
+half does not land: the pair is the actuator's own two-command contract, and a pair that
+half-lands is not-landed. ``generator.COMPLETION_EPILOGUE`` carries the same ``M145 P0``
+verbatim.
+
+**Model capability.** The chamber lane is gated per model by
+:func:`~backend.app.services.printer_manager.has_chamber_fan` (``CooldownFan.supported``):
+firmware silently swallows ``M106 P3`` on an open-frame machine, and a swallowed command
+is indistinguishable on the wire from a working one, so the farm refuses rather than
+pretends. The AUX lane is deliberately UNGATED — every model seeded in the geometry
+registry has an auxiliary fan, and the A-series (the family that does not) is not
+seeded. An A-series capability set is the named next step, and it belongs beside the
+other two predicates in ``printer_manager`` rather than here.
 
 **The measured precondition.** ``begin`` runs on a printer whose job has just ended,
 and the FINISH terminal it rides in on arrives AFTER the stock end block has run to
@@ -38,7 +106,7 @@ the toolhead parked at the chute the space above the nozzle plane over the part 
 is clear to 100 mm, and that clearance is a PHYSICAL machine limit rather than an
 operator setting — so both numbers live in the ``printer_model_geometry`` registry as
 seed-only columns (H2S ``clear_above_mm=100.0`` MEASURED / ``keepout_y_mm=285.0``;
-every other model NULL, which means fan only). Red line 2 (the hardware ladder) was
+every other model NULL, which means fans only). Red line 2 (the hardware ladder) was
 WAIVED by the operator for this wave: the first production cooldown + eject is the
 witness, with the eject runtime watchdog and the human-clear plate gate as the net.
 Do not re-ladder it. The standing operator rule while a plate is held: do not jog the
@@ -54,7 +122,9 @@ altogether without a deploy. Both are read ONCE per arm, by the watch, and hande
 here — and the record below stores what was actually SENT, so an operator changing the
 setting mid-cooldown can never desynchronise the eject's ``start_z`` seed from the
 plate's real position. A lower hold costs the eject nothing either: its first Z move
-simply starts from farther away, and the drop-span deadline follows the seed.
+simply starts from farther away, and the drop-span deadline follows the seed. The same
+resolve-once rule covers the fans and the printer's MODEL: both arrive as arguments,
+and this module opens no settings session of its own.
 
 **Re-entry is safe by construction.** A server restart re-arms the watch, so
 ``begin`` can run again on a plate that is ALREADY held at ~Z2. That needs no special
@@ -64,7 +134,7 @@ BEFORE the toolhead is asked to move anywhere. Held, vendor-parked, or wherever 
 screen jog left it — every entry passes through the same clear transit height.
 
 Every failure is one log line naming the reason and a cooldown that proceeds without
-that actuator. :func:`begin` never raises: losing the fan or the hold costs minutes,
+that actuator. :func:`begin` never raises: losing a fan or the hold costs minutes,
 while an exception out of the watch's arm path would strand the plate-clear gate
 behind a dead watch — the armless-gate outcome 2026-07-18 / 07-21 forbids.
 """
@@ -81,17 +151,139 @@ from backend.app.services.eject import donor, generator, remote as eject_remote
 from backend.app.services.eject.generator import EjectGenerationError
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
-from backend.app.services.printer_manager import printer_manager
+from backend.app.services.printer_manager import has_chamber_fan, printer_manager
 from backend.app.utils.printer_models import is_bedslinger_model
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
-# The auxiliary fan's index on the wire (1 = part cooling, 2 = auxiliary, 3 = chamber).
-# Named because it appears three times below and a wrong index blows on the wrong thing.
-_AUX_FAN = 2
+FanName = Literal["aux", "chamber"]
+
+
+@dataclass(frozen=True)
+class CooldownFan:
+    """One fan this module can run during a cooldown — the machine facts, not the policy.
+
+    Everything here is a property of the HARDWARE and its wire encoding, so the two
+    lanes below are the same code parameterised by a frozen value rather than two
+    near-identical functions. What speed it runs at and whether it runs at all is
+    :class:`FanRequest`, which comes from the operator's settings.
+    """
+
+    name: FanName
+    index: int  # ``M106 P<index>``: 1 = part cooling, 2 = auxiliary, 3 = chamber
+    witness: str  # the ``PrinterState`` field the wire reports it back on
+    airduct_cooling: bool  # vendor precondition: ``M145 P0`` precedes the ON
+    supported: Callable[[str | None], bool]  # per-MODEL capability
+
+
+# The aux fan is deliberately ungated by model — see the module docstring's "Model
+# capability" note for why, and for the A-series set that is the named next step.
+AUX_FAN = CooldownFan("aux", 2, "big_fan1_speed", False, lambda _model: True)
+CHAMBER_FAN = CooldownFan("chamber", 3, "big_fan2_speed", True, has_chamber_fan)
+# Emission order on the wire: the aux fan first (it needs no prelude and is the one
+# every model has), then the duct, then the chamber fan.
+COOLDOWN_FANS = (AUX_FAN, CHAMBER_FAN)
+
+# Vendor-verbatim, from the start block's cooling branch and the finish tail's J2
+# branch alike. ``P0`` is cooling (top flap open); ``P1`` is heating/recirculation.
+AIRDUCT_COOLING_GCODE = "M145 P0"
+
+# There is no boost-end CONSTANT in this module, by design. The chamber lane steps
+# down the first poll whose chamber reading is at or under the eject threshold — a
+# live measurement of this cooldown, never a stored minute count. See the module
+# docstring for the cooling-law derivation, and for why the aux lane never steps.
+
+
+@dataclass(frozen=True)
+class FanRequest:
+    """What the operator asked of one fan: the switch and the two speeds.
+
+    ``boost_percent`` is 1..100 by the input schema — the on/off decision is
+    ``enabled``, the ONE switch, so a stored legacy ``0`` needs no special arm here and
+    simply publishes ``S0``. ``sustain_percent`` is 0..100, where 0 means the fan STOPS
+    when the boost ends: a step target, not a second switch. On the aux lane
+    ``sustain_percent == boost_percent`` by construction (no setting exists), which is
+    what makes its step a no-op the summary line does not bother to render.
+    """
+
+    enabled: bool
+    boost_percent: int
+    sustain_percent: int
+
+
+@dataclass(frozen=True)
+class CooldownFanSettings:
+    """Both lanes' requests as ONE value, composed once by the watch that resolves them."""
+
+    aux: FanRequest
+    chamber: FanRequest
+
+    def for_fan(self, fan: CooldownFan) -> FanRequest:
+        return self.aux if fan.name == "aux" else self.chamber
+
+
+# What arming one fan did. Every value but ``sent`` is a cooldown that ran without
+# that lane — never an error the caller has to handle.
+FanStartOutcome = Literal[
+    "sent",
+    "skipped:disabled",  # the operator's switch is off — INFO, a deliberate state
+    "skipped:unsupported",  # this model has no such fan (firmware would swallow it)
+    "skipped:active",
+    "skipped:no_client",
+    "skipped:airduct",  # the duct-to-cooling half of the pair did not land
+    "skipped:publish",
+    "skipped:error",
+]
+
+# What the boost→sustain step did, when the chamber reached the eject threshold.
+FanStepOutcome = Literal[
+    "sent",
+    "skipped:same",  # sustain == boost: the aux lane, which has no step by construction
+    "skipped:not_published",  # this lane never started, so there is nothing to step
+    "skipped:active",
+    "skipped:no_client",
+    "skipped:publish",
+]
+
+# What the end-of-cooldown fan OFF did. ``skipped:active`` is the normal release-path
+# value: by the time the watch exits, the eject job it dispatched is usually already
+# running — and that job's own prologue carries redundant ``M106 P2 S0`` / ``M106 P3 S0``
+# lines. ``skipped:already_off`` is the lane whose sustain was 0: the step stopped it.
+FanOffOutcome = Literal[
+    "sent",
+    "skipped:not_wanted",
+    "skipped:not_published",
+    "skipped:already_off",
+    "skipped:active",
+    "skipped:no_client",
+    "skipped:publish",
+]
+
+
+@dataclass
+class FanLane:
+    """One fan's whole story for one cooldown: what was asked, and what each step did.
+
+    ``start`` is set by :func:`begin`; ``step`` only if the chamber reached the eject
+    threshold while this prep was live; ``off`` by :meth:`CooldownPrep.end`. Both
+    later fields stay None when their moment never came, and the summary line renders
+    that as ``none`` rather than inventing an outcome.
+    """
+
+    fan: CooldownFan
+    request: FanRequest
+    start: FanStartOutcome
+    step: FanStepOutcome | None = None
+    off: FanOffOutcome | None = None
+
+    @property
+    def published(self) -> bool:
+        """Did this lane actually command its fan ON? The only licence to command it OFF."""
+        return self.start == "sent"
+
 
 # What the plate hold did. Every value but ``sent`` is a cooldown that ran with the
 # plate where the end block left it — never an error the caller has to handle.
@@ -114,29 +306,41 @@ HoldOutcome = Literal[
     "skipped:error",  # any other exception (logged with its traceback)
 ]
 
-# What the end-of-cooldown fan OFF did. ``skipped:active`` is the normal release-path
-# value: by the time the watch exits, the eject job it dispatched is usually already
-# running — and that job's own prologue carries a redundant ``M106 P2 S0``.
-FanOffOutcome = Literal[
-    "sent",
-    "skipped:not_wanted",
-    "skipped:not_published",
-    "skipped:active",
-    "skipped:no_client",
-    "skipped:publish",
-]
-
 
 def _mm(value: float | None) -> str:
     """A millimetre figure for the log line, or ``none``."""
     return "none" if value is None else f"{value:.2f}"
 
 
+def _c(value: float | None) -> str:
+    """A temperature figure for the log line, or ``none``."""
+    return "none" if value is None else f"{value:.1f}"
+
+
+def _speed(value: int | None) -> str:
+    """An observed fan speed for the log line, or ``none`` when the wire said nothing."""
+    return "none" if value is None else str(value)
+
+
+def _reading(temperatures: Mapping[str, float | None], key: str) -> float | None:
+    """One numeric temperature out of the live map, or None when it is not a number.
+
+    ``PrinterState.temperatures`` is a loose dict that also carries flags
+    (``chamber_heating``) and bookkeeping stamps, and a model with no chamber sensor
+    simply has no ``chamber`` key. None means "this cooldown has no such reading", which
+    every caller here treats as "decide nothing".
+    """
+    value = temperatures.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def _live_state(printer_id: int) -> str | None:
     """The printer's live ``gcode_state``, or None when nothing is readable.
 
     None is NOT active: an unreadable printer is one whose job cannot be observed to
-    own it, and both actuators here are safe on an idle machine. The active-state set
+    own it, and every actuator here is safe on an idle machine. The active-state set
     is the plate-occupancy authority's own (:data:`ACTIVE_PRINT_STATES`) — the one
     place that defines "a job owns this printer".
     """
@@ -144,16 +348,42 @@ def _live_state(printer_id: int) -> str | None:
     return getattr(state, "state", None) if state is not None else None
 
 
-def _observed_fan(printer_id: int) -> int | None:
-    """The live ``big_fan1_speed`` (aux fan), or None when unreadable.
+def _observed_fan(printer_id: int, fan: CooldownFan) -> int | None:
+    """The live speed the wire reports for ``fan``, or None when unreadable.
 
     A WITNESS, never a confirmation. The wire reports a 0-15 LEVEL that
     ``parse_fan_speed`` rescales to percent, so an observation is quantised to
     multiples of ~6.67 and need not equal the percent that was commanded. Nothing in
     this module (or its tests) may assert equality between the two.
+
+    ``airduct_mode`` is deliberately NOT logged beside it as a witness of the chamber
+    lane's prelude: its default 0 is "cooling" AND "nothing reported", so it cannot
+    distinguish a flap that opened from a printer that never mentioned one. The aux
+    witness is honest but coarse; that one would be honest-looking and empty.
     """
     state = printer_manager.get_status(printer_id)
-    return getattr(state, "big_fan1_speed", None) if state is not None else None
+    return getattr(state, fan.witness, None) if state is not None else None
+
+
+def _fan_summary(lane: FanLane, observed: int | None) -> str:
+    """One lane's segment of the summary line. The ONE renderer, so the two cannot drift.
+
+    A lane whose sustain equals its boost (the aux lane, by construction) renders one
+    speed and no ``step=`` field: its step is a no-op the operator has no decision to
+    make about. A lane that genuinely steps renders ``boost%→sustain%`` and the step's
+    own outcome, with ``none`` for a boost that never ended.
+    """
+    request = lane.request
+    if request.sustain_percent == request.boost_percent:
+        speeds = f"{request.boost_percent}%"
+        step = ""
+    else:
+        speeds = f"{request.boost_percent}%→{request.sustain_percent}%"
+        step = f" step={lane.step if lane.step is not None else 'none'}"
+    return (
+        f"{lane.fan.name}={speeds} start={lane.start}{step} "
+        f"off={lane.off if lane.off is not None else 'none'} observed={_speed(observed)}"
+    )
 
 
 @dataclass
@@ -163,9 +393,10 @@ class CooldownPrep:
     Deliberately a plain value the caller holds for the life of its watch: there is
     no holder token, no module-level registry and no reconcile loop, because the ONE
     thing that knows whether a printer is still cooling is the watch task itself. If
-    this process dies mid-cooldown the fan keeps running and the plate stays held —
-    both are recovered by the next watch's ``begin`` (re-entrant by construction) or
-    by the eject block's own ``M106 P2 S0``, not by anything remembered here.
+    this process dies mid-cooldown the fans keep running and the plate stays held —
+    all three are recovered by the next watch's ``begin`` (re-entrant by construction)
+    or by the eject block's own ``M106 P2 S0`` / ``M106 P3 S0``, not by anything
+    remembered here.
     """
 
     printer_id: int
@@ -176,44 +407,142 @@ class CooldownPrep:
     # The part height read from the donor, whenever it got that far (diagnostic: it is
     # what distinguishes an over-height refusal from a plate nobody could measure).
     max_z: float | None
-    fan_percent: int
-    fan_published: bool
+    # One per fan, in :data:`COOLDOWN_FANS` order.
+    fans: tuple[FanLane, ...]
+    # The eject threshold this cooldown is waiting for — the chamber lane's step-down
+    # line, resolved once by the watch and handed in with everything else.
+    release_threshold_c: float
     started_at: float  # time.monotonic()
+    # The first sample's readings, diagnostic: they are what makes a boost that ended
+    # "after 0 s" readable as a late re-arm rather than a broken comparison.
+    chamber_at_arm_c: float | None = None
+    bed_at_arm_c: float | None = None
+    sampled: bool = False
+    # When the chamber first read at or under the threshold (monotonic), or None for a
+    # cooldown whose chamber never got there. THE measurement this wave exists to take.
+    boost_ended_at: float | None = None
     # The arm-time witness's wait, carried here (not awaited inside :func:`begin`) so
-    # that NO await sits between "fan commanded ON" and the caller holding this handle:
+    # that NO await sits between "fans commanded ON" and the caller holding this handle:
     # a watch cancelled during the settle then still reaches its ``finally`` and
-    # :meth:`end`, which is what decides whether the fan goes back off. Injected for
+    # :meth:`end`, which is what decides whether the fans go back off. Injected for
     # tests only; production waits on the event loop's own sleep.
     settle_s: float = 3.0
     sleep: Callable[[float], Awaitable[None]] = field(default=asyncio.sleep, repr=False)
 
+    def lane(self, name: FanName) -> FanLane:
+        """The lane for one fan by name. Raises for an unknown name — there are two."""
+        for lane in self.fans:
+            if lane.fan.name == name:
+                return lane
+        raise KeyError(name)
+
     async def observe_start(self) -> None:
-        """Log the ONE arm-time witness of the fan command, after the wire settles.
+        """Log the ONE arm-time witness of the fan commands, after the wire settles.
 
         The only evidence that a published fan command reached the hardware at all,
         sampled after ``settle_s`` because a read taken before the next status push
         would witness the OLD value. Logged and never asserted on — see
-        :func:`_observed_fan` for why the two numbers legitimately differ. A no-op when
-        nothing was published. Cancellation propagates (the caller's ``finally`` owns
+        :func:`_observed_fan` for why the numbers legitimately differ. A no-op when
+        NEITHER lane published. Cancellation propagates (the caller's ``finally`` owns
         the retirement); every other failure is swallowed.
         """
-        if not self.fan_published:
+        if not any(lane.published for lane in self.fans):
             return
         await self.sleep(self.settle_s)
         try:
-            logger.info(
-                "[cooldown-prep] printer %s: fan_observed_at_start=%s", self.printer_id, _observed_fan(self.printer_id)
+            witnesses = " ".join(
+                f"{lane.fan.name}={_speed(_observed_fan(self.printer_id, lane.fan))}" for lane in self.fans
             )
+            logger.info("[cooldown-prep] printer %s: fan_observed_at_start %s", self.printer_id, witnesses)
         except Exception:  # noqa: BLE001 — a witness read never costs the cooldown its watch
             logger.exception("[cooldown-prep] printer %s: fan witness read failed", self.printer_id)
+
+    def note_sample(self, temperatures: Mapping[str, float | None]) -> None:
+        """Feed one bed-poll sample in. Sync, and never raises.
+
+        The ONE consumer of the chamber temperature, and the ONE place the boost ends:
+        the first sample reading at or under ``release_threshold_c`` stamps
+        :attr:`boost_ended_at`, logs THE measurement line, and steps every lane to its
+        sustain speed. Called from the poll that was already running, so there is no
+        second timer and no cadence of its own.
+
+        Three honest edge cases, all fail-open toward more cooling: a chamber already
+        under the threshold at arm (a restart re-arming late in a cooldown) steps on
+        the first sample and says so with ``after 0 s``; a chamber that never reads
+        under it never steps, and the summary says ``never``; a model with no chamber
+        reading at all is the same case as the second.
+        """
+        try:
+            chamber = _reading(temperatures, "chamber")
+            if not self.sampled:
+                self.sampled = True
+                self.chamber_at_arm_c = chamber
+                self.bed_at_arm_c = _reading(temperatures, "bed")
+            if self.boost_ended_at is not None:
+                return  # stamped once, by the FIRST qualifying sample
+            if chamber is None or chamber > self.release_threshold_c:
+                return
+            self.boost_ended_at = time.monotonic()
+            logger.info(
+                "[cooldown-prep] printer %s: chamber boost ended after %.0f s "
+                "(chamber=%s chamber_at_arm=%s bed=%s threshold=%s)",
+                self.printer_id,
+                self.boost_ended_at - self.started_at,
+                _c(chamber),
+                _c(self.chamber_at_arm_c),
+                _c(_reading(temperatures, "bed")),
+                _c(self.release_threshold_c),
+            )
+            for lane in self.fans:
+                lane.step = self._step_fan(lane)
+        except Exception:  # noqa: BLE001 — a sampler must never kill the watch that feeds it
+            logger.exception("[cooldown-prep] printer %s: cooldown sample failed", self.printer_id)
+
+    def _step_fan(self, lane: FanLane) -> FanStepOutcome:
+        """Take one lane from its boost speed to its sustain speed, or say why not.
+
+        No duct write: the farm owns the duct mode for the whole cooldown and it is
+        already in cooling — the prelude is an ON-time precondition, not a per-command
+        one. A sustain of 0 publishes ``S0`` and leaves the lane off from here, which
+        :meth:`_switch_fan_off` then reports as ``skipped:already_off``.
+        """
+        if lane.request.sustain_percent == lane.request.boost_percent:
+            return "skipped:same"
+        if not lane.published:
+            # Never commanded this fan ON, so stepping it would be this module driving
+            # a fan it does not own.
+            return "skipped:not_published"
+        if _live_state(self.printer_id) in ACTIVE_PRINT_STATES:
+            logger.warning(
+                "[cooldown-prep] printer %s: a job is active — %s fan not stepped to %s%%",
+                self.printer_id,
+                lane.fan.name,
+                lane.request.sustain_percent,
+            )
+            return "skipped:active"
+        client = printer_manager.get_client(self.printer_id)
+        if client is None:
+            logger.warning(
+                "[cooldown-prep] printer %s: no MQTT client — %s fan not stepped", self.printer_id, lane.fan.name
+            )
+            return "skipped:no_client"
+        if not client.set_fan_percent(lane.fan.index, lane.request.sustain_percent):
+            logger.warning("[cooldown-prep] printer %s: %s fan step publish refused", self.printer_id, lane.fan.name)
+            return "skipped:publish"
+        return "sent"
 
     def end(self, *, fan_off: bool) -> None:
         """Retire the prep and log the ONE summary line. Sync, and never raises.
 
-        ``fan_off`` is the caller's answer to "does this printer still want its aux
-        fan" — the monitor asks whether a successor cooldown-class watch is armed, so
-        a watch that was cancelled to make way for another printer's-plate policy
-        hands the fan over instead of switching it off under its successor.
+        ``fan_off`` is the caller's answer to "does this printer still want its
+        cooldown fans" — the monitor asks whether a successor cooldown-class watch is
+        armed, so a watch that was cancelled to make way for another printer's-plate
+        policy hands the fans over instead of switching them off under its successor.
+        It is ONE answer for both lanes because it is a question about the PRINTER.
+
+        Each lane is retired inside its own guard, so a throw on one can never skip the
+        other's OFF — the two fans are independent hardware and a fan left running under
+        an idle printer is a state nothing else in the farm clears.
 
         The plate is deliberately NOT lowered here. It stays held exactly where the
         hold left it and the eject block's own first Z move takes it from there in one
@@ -221,40 +550,48 @@ class CooldownPrep:
         parked at a safe height with the steppers released, which is the same state
         the stock end block leaves behind.
         """
-        try:
-            fan_off_outcome = self._switch_fan_off(fan_off)
-        except Exception:  # noqa: BLE001 — the summary line must still be written
-            logger.exception("[cooldown-prep] printer %s: fan off failed", self.printer_id)
-            # The publish is the only thing that can throw here, and it did not land.
-            fan_off_outcome = "skipped:publish"
-        try:
-            observed = _observed_fan(self.printer_id)
-        except Exception:  # noqa: BLE001 — an unreadable witness is not a failure
-            observed = None
+        segments: list[str] = []
+        for lane in self.fans:
+            try:
+                lane.off = self._switch_fan_off(lane, fan_off)
+            except Exception:  # noqa: BLE001 — the other lane, and the summary, must still run
+                logger.exception("[cooldown-prep] printer %s: %s fan off failed", self.printer_id, lane.fan.name)
+                # The publish is the only thing that can throw here, and it did not land.
+                lane.off = "skipped:publish"
+            try:
+                observed = _observed_fan(self.printer_id, lane.fan)
+            except Exception:  # noqa: BLE001 — an unreadable witness is not a failure
+                observed = None
+            segments.append(_fan_summary(lane, observed))
+        boosted = "never" if self.boost_ended_at is None else f"{self.boost_ended_at - self.started_at:.0f} s"
         # THE line the wave is measured by: one per cooldown, greppable as
         # ``[cooldown-prep]``, carrying every decision this module made.
         logger.info(
             "[cooldown-prep] printer %s: cooldown ended after %.0f s "
-            "(hold=%s max_z=%s hold_z=%s, fan=%s%%, fan_published=%s, fan_off=%s, fan_observed=%s)",
+            "(hold=%s max_z=%s hold_z=%s, chamber_boost_ended_after=%s chamber_at_arm=%s bed_at_arm=%s, %s)",
             self.printer_id,
             time.monotonic() - self.started_at,
             self.hold,
             _mm(self.max_z),
             _mm(self.hold_z),
-            self.fan_percent,
-            self.fan_published,
-            fan_off_outcome,
-            "none" if observed is None else observed,
+            boosted,
+            _c(self.chamber_at_arm_c),
+            _c(self.bed_at_arm_c),
+            ", ".join(segments),
         )
 
-    def _switch_fan_off(self, fan_off: bool) -> FanOffOutcome:
-        """Switch the aux fan off, or say why not. The only I/O :meth:`end` does."""
+    def _switch_fan_off(self, lane: FanLane, fan_off: bool) -> FanOffOutcome:
+        """Switch one fan off, or say why not. The only I/O :meth:`end` does."""
         if not fan_off:
             return "skipped:not_wanted"
-        if not self.fan_published:
+        if not lane.published:
             # Never turned it on — so turning it off would be this module commanding a
             # fan it does not own (an operator's manual /fan-speed, say).
             return "skipped:not_published"
+        if lane.step == "sent" and lane.request.sustain_percent == 0:
+            # The boost-end step already stopped this fan. Publishing S0 again would be
+            # a second command with no effect to report.
+            return "skipped:already_off"
         if _live_state(self.printer_id) in ACTIVE_PRINT_STATES:
             # The eject sweep this cooldown released into is already running. Its own
             # prologue carries the fan OFF; commanding one now would race that job.
@@ -262,14 +599,16 @@ class CooldownPrep:
         client = printer_manager.get_client(self.printer_id)
         if client is None:
             return "skipped:no_client"
-        return "sent" if client.set_fan_percent(_AUX_FAN, 0) else "skipped:publish"
+        return "sent" if client.set_fan_percent(lane.fan.index, 0) else "skipped:publish"
 
 
 async def begin(
     printer_id: int,
     *,
     queue_item_id: int | None,
-    aux_fan_percent: int,
+    fans: CooldownFanSettings,
+    release_threshold_c: float,
+    model: str | None,
     hold_enabled: bool,
     hold_part_top_mm: int,
     settle_s: float = 3.0,
@@ -277,38 +616,101 @@ async def begin(
 ) -> CooldownPrep:
     """Arm the cooldown actuators for ``printer_id``. NEVER raises.
 
-    Order is hold first, then fan: the hold is the one that moves the machine, and it
-    wants the printer in exactly the idle state the end block left — the fan changes
-    nothing about that, but doing it first would put a publish between the terminal
+    Order is hold first, then the fans: the hold is the one that moves the machine, and
+    it wants the printer in exactly the idle state the end block left — the fans change
+    nothing about that, but doing them first would put publishes between the terminal
     and the motion for no reason.
 
     ``queue_item_id`` is None for the foreign auto-eject watch, whose plate carries no
     farm unit: no unit means no donor, no profile and no measured part height, so
-    there is nothing to hold the plate SAFELY at and the foreign lane gets the fan
-    alone. ``hold_enabled``/``hold_part_top_mm`` are the operator's switch and target,
-    resolved once by the watch that arms this prep and never re-read here.
-    ``settle_s``/``sleep`` are injected only so tests need not wait.
+    there is nothing to hold the plate SAFELY at and the foreign lane gets the fans
+    alone. ``fans``, ``release_threshold_c``, ``model``, ``hold_enabled`` and
+    ``hold_part_top_mm`` are all resolved ONCE by the watch that arms this prep and
+    never re-read here — this module opens no settings session and asks the manager for
+    no model. ``settle_s``/``sleep`` are injected only so tests need not wait.
     """
     started_at = time.monotonic()
     hold, hold_z, max_z = await _hold_plate(
         printer_id, queue_item_id, hold_enabled=hold_enabled, part_top_mm=hold_part_top_mm
     )
-    # The fan publish is the LAST thing before the handle is returned — nothing is
-    # awaited after it (the witness wait lives in ``CooldownPrep.observe_start``), so
+    # The fan publishes are the LAST thing before the handle is returned — nothing is
+    # awaited after them (the witness wait lives in ``CooldownPrep.observe_start``), so
     # a cancellation can never separate an ON that was sent from the ``end`` that
     # decides whether it stays on.
-    fan_published = _start_aux_fan(printer_id, aux_fan_percent)
+    lanes = tuple(_start_fans(printer_id, fans, model))
     return CooldownPrep(
         printer_id=printer_id,
         hold=hold,
         hold_z=hold_z,
         max_z=max_z,
-        fan_percent=aux_fan_percent,
-        fan_published=fan_published,
+        fans=lanes,
+        release_threshold_c=release_threshold_c,
         started_at=started_at,
         settle_s=settle_s,
         sleep=sleep,
     )
+
+
+def _start_fans(printer_id: int, fans: CooldownFanSettings, model: str | None) -> list[FanLane]:
+    """Arm every lane, in :data:`COOLDOWN_FANS` order. Sync, and never raises."""
+    lanes: list[FanLane] = []
+    for fan in COOLDOWN_FANS:
+        request = fans.for_fan(fan)
+        lanes.append(FanLane(fan=fan, request=request, start=_start_fan(printer_id, fan, request, model)))
+    return lanes
+
+
+def _start_fan(printer_id: int, fan: CooldownFan, request: FanRequest, model: str | None) -> FanStartOutcome:
+    """Run one fan at its boost speed. Returns what happened, and never raises.
+
+    Published, not confirmed: MQTT publish acceptance is all the wire offers
+    synchronously. Deliberately SYNC — the arm-time witness is read later by
+    :meth:`CooldownPrep.observe_start`, so this function has no await for a
+    cancellation to land in between the ON and the handle that retires it.
+
+    Admission is this FAN's own predicate — an idle printer and a live client — and
+    NEVER the hold's ``ejectable()``: a printer that may not be swept (a lost Z
+    reference, say) is still a printer whose plate has to cool, and suppressing the
+    fans there would lengthen exactly the wait a human is already standing over.
+    """
+    if not request.enabled:
+        logger.info("[cooldown-prep] printer %s: %s fan switched off — not commanded", printer_id, fan.name)
+        return "skipped:disabled"
+    try:
+        if not fan.supported(model):
+            # INFO, not WARN: a model without this fan is a permanent by-design state,
+            # and firmware would silently swallow the command rather than report it.
+            logger.info(
+                "[cooldown-prep] printer %s: model %s has no %s fan — not commanded",
+                printer_id,
+                model or "unknown",
+                fan.name,
+            )
+            return "skipped:unsupported"
+        if _live_state(printer_id) in ACTIVE_PRINT_STATES:
+            logger.warning("[cooldown-prep] printer %s: a job is active — %s fan not commanded", printer_id, fan.name)
+            return "skipped:active"
+        client = printer_manager.get_client(printer_id)
+        if client is None:
+            logger.warning("[cooldown-prep] printer %s: no MQTT client — %s fan not commanded", printer_id, fan.name)
+            return "skipped:no_client"
+        if fan.airduct_cooling and not client.send_gcode(AIRDUCT_COOLING_GCODE):
+            # The vendor's pair is this actuator's two-command contract: spinning the
+            # exhaust up behind a closed flap moves air around a closed box, so a pair
+            # that half-lands reports not-landed and the fan is never published.
+            logger.warning(
+                "[cooldown-prep] printer %s: airduct-to-cooling publish refused — %s fan not commanded",
+                printer_id,
+                fan.name,
+            )
+            return "skipped:airduct"
+        if not client.set_fan_percent(fan.index, request.boost_percent):
+            logger.warning("[cooldown-prep] printer %s: %s fan publish refused", printer_id, fan.name)
+            return "skipped:publish"
+        return "sent"
+    except Exception:  # noqa: BLE001 — a fan failure never costs the cooldown its watch
+        logger.exception("[cooldown-prep] printer %s: %s fan start failed", printer_id, fan.name)
+        return "skipped:error"
 
 
 async def _hold_plate(
@@ -331,10 +733,10 @@ async def _hold_plate(
         return "skipped:foreign", None, None
     if not hold_enabled:
         # INFO, not WARN: an operator who switched the hold off gets the cooldown they
-        # asked for (fan only), and a warning would put a chosen state in the channel
+        # asked for (fans only), and a warning would put a chosen state in the channel
         # they triage. The switch exists because red line 2 is waived for this motion —
         # it has to be reachable from the Farm tab in the minute a hold misbehaves.
-        logger.info("[cooldown-prep] printer %s: plate hold switched off — fan only", printer_id)
+        logger.info("[cooldown-prep] printer %s: plate hold switched off — fans only", printer_id)
         return "skipped:disabled", None, None
 
     from backend.app.core.database import async_session
@@ -379,7 +781,7 @@ async def _hold_plate(
                 # but H2S ships in until its clearance is MEASURED, so warning would
                 # put a permanent by-design condition in the channel operators triage.
                 logger.info(
-                    "[cooldown-prep] printer %s: model %s has no cooldown-hold clearance — fan only",
+                    "[cooldown-prep] printer %s: model %s has no cooldown-hold clearance — fans only",
                     printer_id,
                     geometry.model_key,
                 )
@@ -388,7 +790,7 @@ async def _hold_plate(
                 # On a bedslinger Z moves the TOOLHEAD toward a fixed bed: "raise the
                 # plate toward the nozzle plane" is the nozzle descending onto the part.
                 logger.info(
-                    "[cooldown-prep] printer %s: model %s is a bedslinger — fan only",
+                    "[cooldown-prep] printer %s: model %s is a bedslinger — fans only",
                     printer_id,
                     geometry.model_key,
                 )
@@ -495,33 +897,3 @@ def _keepout_refusal(box: tuple[tuple[float, float, float, float], int] | None, 
     if y_max > keepout_y:
         return f"plate bbox y_max={_mm(y_max)} reaches the chute keep-out strip"
     return None
-
-
-def _start_aux_fan(printer_id: int, percent: int) -> bool:
-    """Run the auxiliary fan at ``percent``. Returns whether the command was PUBLISHED.
-
-    Published, not confirmed: MQTT publish acceptance is all the wire offers
-    synchronously. Deliberately SYNC — the arm-time witness is read later by
-    :meth:`CooldownPrep.observe_start`, so this function has no await for a
-    cancellation to land in between the ON and the handle that retires it.
-    """
-    if percent <= 0:
-        return False  # 0 = the operator switched the aux fan off for the fleet
-    try:
-        if _live_state(printer_id) in ACTIVE_PRINT_STATES:
-            logger.warning(
-                "[cooldown-prep] printer %s: a job is active — aux fan not commanded",
-                printer_id,
-            )
-            return False
-        client = printer_manager.get_client(printer_id)
-        if client is None:
-            logger.warning("[cooldown-prep] printer %s: no MQTT client — aux fan not commanded", printer_id)
-            return False
-        if not client.set_fan_percent(_AUX_FAN, percent):
-            logger.warning("[cooldown-prep] printer %s: aux fan publish refused", printer_id)
-            return False
-        return True
-    except Exception:  # noqa: BLE001 — a fan failure never costs the cooldown its watch
-        logger.exception("[cooldown-prep] printer %s: aux fan start failed", printer_id)
-        return False
