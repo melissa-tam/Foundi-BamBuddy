@@ -25,6 +25,17 @@ const DRYING_POPOVER_ESTIMATED_HEIGHT = 320;
 // Wider than RUNNING/PAUSE: PREPARE and SLICING precede the first layer but the
 // printer is already committed to the job.
 const ACTIVE_PRINT_STATES: readonly string[] = ['RUNNING', 'PAUSE', 'PREPARE', 'SLICING'];
+
+/**
+ * An in-flight eject claim's age as mm:ss. A sweep is a ~2-minute job, so the
+ * minute-rounding `formatDuration` applies elsewhere ("0m") would hide the
+ * whole signal the operator is watching; a stalled one reads "38:12".
+ */
+function formatEjectAge(ageS: number | null | undefined): string {
+  if (ageS == null || ageS < 0) return '--:--';
+  const total = Math.floor(ageS);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../contexts/ThemeContext';
@@ -97,7 +108,8 @@ import {
 
 import { useNavigate } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
-import { formatDateOnly, formatETA, formatDuration, parseUTCDate } from '../utils/date';
+import { formatDateOnly, formatETA, formatDuration, formatTimeOnly, parseUTCDate } from '../utils/date';
+import { OWN_SURFACE_INCIDENT_KINDS } from '../api/client';
 import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, SlotRecheckResult } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
@@ -2160,6 +2172,22 @@ function PrinterCard({
       : ejectWatchActive
         ? t('printers.plateStatus.markClearedCancelsEject')
         : t('printers.plateStatus.markCleared');
+  // The operator's maintenance hold. The fleet list is the primary origin — it
+  // carries the field on every card, including one whose status frame has not
+  // landed yet; the status frame is the fallback for a stale list. Never
+  // `is_active`: that flag means "this instance holds an MQTT session", and the
+  // hold deliberately keeps the session up.
+  const serviceHold = printer.service_hold ?? status?.service_hold ?? null;
+  const serviceHoldSince = serviceHold?.since ? parseUTCDate(serviceHold.since) : null;
+  // The plate authority's in-flight eject claim, and whether its watchdog has
+  // already given its verdict (no runtime owner is coming — Recover is the exit).
+  const inFlightEject = status?.occupancy?.eject ?? null;
+  // Anything the authority is holding on this printer: a raised plate gate, a
+  // dispatch lease, or an eject claim. Recover is the one override for all three.
+  const hasOccupancyClaim =
+    status?.occupancy?.plate.occupied === true ||
+    status?.occupancy?.lease_age_s != null ||
+    inFlightEject !== null;
 
   const activePrintName = status?.current_print && isPrintingOrPaused
     ? formatPrintName(status.subtask_name || status.current_print || null, status.gcode_file, t, activePlateLabel)
@@ -2624,35 +2652,60 @@ function PrinterCard({
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToUpdateSetting'), 'error'),
   });
 
-  // Maintenance mode toggle (#1476). Wraps the `is_active` backend field that
-  // already gates MQTT connection, queue dispatch, scheduler eligibility,
-  // metrics, and the print picker — so flipping this flag puts the printer
-  // out of service across every consumer in one place. Used from the
-  // overflow menu and EditPrinterModal.
-  const maintenanceMutation = useMutation({
-    mutationFn: (isActive: boolean) => api.updatePrinter(printer.id, { is_active: isActive }),
-    onSuccess: (_data, isActive) => {
+  // Re-activation: `is_active` keeps upstream's meaning — whether THIS instance
+  // holds an MQTT session for the printer — so the only affordance left for it
+  // on the card is turning a deactivated printer back on. Deactivating is an
+  // Edit-Printer act (it is a wiring decision: parallel installs,
+  // decommissioning), not a one-click verb; taking a printer out of the
+  // automatic lanes is the service hold below.
+  const activatePrinterMutation = useMutation({
+    mutationFn: () => api.updatePrinter(printer.id, { is_active: true }),
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['printers'] });
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
-      showToast(
-        isActive
-          ? t('printers.maintenance.toastExited', { name: printer.name })
-          : t('printers.maintenance.toastEntered', { name: printer.name }),
-        'success',
-      );
+      showToast(t('printers.deactivated.toastActivated', { name: printer.name }), 'success');
     },
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToUpdateSetting'), 'error'),
   });
 
-  // Confirm before entering maintenance on a printing printer (entering mode
-  // disconnects MQTT, which stops progress tracking + completion notifications
-  // for the in-flight job).
-  const [confirmMaintenanceEnter, setConfirmMaintenanceEnter] = useState(false);
-  const handleEnterMaintenance = () => {
-    if (status?.state === 'RUNNING' || status?.state === 'PAUSE') {
-      setConfirmMaintenanceEnter(true);
+  // Maintenance mode = the service hold. The session and every manual verb stay
+  // up; the farm takes the printer out of dispatch, auto-eject, cooldown and the
+  // recovery drivers. Entering quiesces whatever is live first, which is why the
+  // verb needs a confirm when live status shows something to stop.
+  const [confirmEnterHold, setConfirmEnterHold] = useState(false);
+  const enterServiceHoldMutation = useMutation({
+    mutationFn: () => api.enterServiceHold(printer.id),
+    onSuccess: () => {
+      setConfirmEnterHold(false);
+      queryClient.invalidateQueries({ queryKey: ['printers'] });
+      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
+      showToast(t('printers.maintenance.toastEntered', { name: printer.name }), 'success');
+    },
+    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+  });
+
+  const exitServiceHoldMutation = useMutation({
+    mutationFn: () => api.exitServiceHold(printer.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['printers'] });
+      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
+      showToast(t('printers.maintenance.toastExited', { name: printer.name }), 'success');
+    },
+    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToSendCommand'), 'error'),
+  });
+
+  // What entering the hold will stop, read off live status — the dialog body IS
+  // this list, and an empty list is why an idle printer enters on one click.
+  const serviceHoldEffects: string[] = [];
+  if (isActivePrintState) serviceHoldEffects.push(t('printers.maintenance.confirmEffectPrint'));
+  if (inFlightEject) serviceHoldEffects.push(t('printers.maintenance.confirmEffectEject'));
+  if (status?.eject_watch) serviceHoldEffects.push(t('printers.maintenance.confirmEffectCooldown'));
+
+  const handleEnterServiceHold = () => {
+    if (serviceHoldEffects.length > 0) {
+      setConfirmEnterHold(true);
     } else {
-      maintenanceMutation.mutate(false);
+      enterServiceHoldMutation.mutate();
     }
   };
 
@@ -3431,30 +3484,58 @@ function PrinterCard({
             <Info className="w-4 h-4" />
             {t('printers.printerInformation')}
           </button>
-          {/* Maintenance Mode toggle (#1476) — leverages backend is_active flag */}
+          {/* Maintenance mode (the service hold). `printers:control` and not
+              `printers:update`: entering stops prints, sweeps and fans. */}
           <button
             className={`w-full px-4 py-2 text-left text-sm flex items-center gap-2 ${
-              hasPermission('printers:update')
+              hasPermission('printers:control')
                 ? 'hover:bg-bambu-dark-tertiary'
                 : 'opacity-50 cursor-not-allowed'
             }`}
-            disabled={maintenanceMutation.isPending || !hasPermission('printers:update')}
+            disabled={
+              enterServiceHoldMutation.isPending ||
+              exitServiceHoldMutation.isPending ||
+              !hasPermission('printers:control')
+            }
             onClick={() => {
-              if (!hasPermission('printers:update')) return;
+              if (!hasPermission('printers:control')) return;
               setShowMenu(false);
-              if (printer.is_active !== false) {
-                handleEnterMaintenance();
+              if (serviceHold) {
+                exitServiceHoldMutation.mutate();
               } else {
-                maintenanceMutation.mutate(true);
+                handleEnterServiceHold();
               }
             }}
-            title={!hasPermission('printers:update') ? t('printers.permission.noEdit') : undefined}
+            title={!hasPermission('printers:control') ? t('printers.permission.noControl') : undefined}
           >
             <Wrench className="w-4 h-4" />
-            {printer.is_active !== false
-              ? t('printers.maintenance.menuEnter')
-              : t('printers.maintenance.menuExit')}
+            {serviceHold
+              ? t('printers.maintenance.menuExit')
+              : t('printers.maintenance.menuEnter')}
           </button>
+          {/* Operator override for the plate authority, offered whenever it holds
+              anything on this printer — a raised gate, a dispatch lease or an
+              eject claim. The quarantine banner carries the same verb, but a
+              stuck claim on an unquarantined printer had no surface at all. */}
+          {hasOccupancyClaim && (
+            <button
+              className={`w-full px-4 py-2 text-left text-sm flex items-center gap-2 ${
+                hasPermission('printers:recover')
+                  ? 'hover:bg-bambu-dark-tertiary'
+                  : 'opacity-50 cursor-not-allowed'
+              }`}
+              disabled={recoverMutation.isPending || !hasPermission('printers:recover')}
+              onClick={() => {
+                if (!hasPermission('printers:recover')) return;
+                setShowMenu(false);
+                setShowRecoverConfirm(true);
+              }}
+              title={!hasPermission('printers:recover') ? t('printers.permission.noControl') : undefined}
+            >
+              <RotateCw className="w-4 h-4" />
+              {t('printers.plateStatus.menuRecover')}
+            </button>
+          )}
           {/* Door 1 of the eject flow: offered on any connected printer that is
               not running a job, gate up or gate down. Gate DOWN it declares the
               plate occupied server-side and falls into the eject dialog via the
@@ -3685,6 +3766,55 @@ function PrinterCard({
             </p>
           </div>
         )}
+        {/* Maintenance-mode banner (the service hold). A hold is a STATE the card
+            reports beside the others, not a replacement for the status tree: the
+            session is up, so state, temps, fans, AMS and the plate pill all still
+            mean something and all still render beneath. Amber because this hold is
+            the operator's own doing — red is reserved for a farm-raised
+            quarantine. Compact collapses to the badge row. */}
+        {serviceHold && (
+          <div role="status" className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5">
+            <div className="flex items-start gap-2">
+              <Wrench className="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-400" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+                    {t('printers.maintenance.badge')}
+                  </span>
+                </div>
+                {viewMode === 'expanded' && (
+                  <p className="mt-1 text-xs text-amber-200/90">
+                    {t('printers.maintenance.since', {
+                      time: serviceHoldSince
+                        ? formatTimeOnly(serviceHoldSince, timeFormat)
+                        : t('time.unknown'),
+                    })}
+                  </p>
+                )}
+              </div>
+            </div>
+            {viewMode === 'expanded' && (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); exitServiceHoldMutation.mutate(); }}
+                  disabled={!hasPermission('printers:control') || exitServiceHoldMutation.isPending}
+                  title={
+                    !hasPermission('printers:control')
+                      ? t('printers.permission.noControl')
+                      : t('printers.maintenance.exitHint')
+                  }
+                  className="inline-flex items-center gap-1 rounded-md border border-amber-400/40 bg-amber-500/20 px-2 py-1 text-xs font-medium text-amber-200 hover:bg-amber-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
+                >
+                  {exitServiceHoldMutation.isPending ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : null}
+                  {t('printers.maintenance.exitButton')}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
         {/* Model-mismatch banner (farm device reconciliation, Phase 2) — the
             device self-reported a different model than the one declared here;
             the scheduler blocks dispatch until the declaration is corrected
@@ -3741,7 +3871,9 @@ function PrinterCard({
                           : tone === 'warning'
                             ? 'bg-status-warning'
                             : 'bg-status-ok';
-                      const pipTitle = !status?.connected
+                      const pipTitle = printer.is_active === false
+                        ? t('printers.deactivated.pillLabel')
+                        : !status?.connected
                         ? t('printers.connection.offline')
                         : hmsErrors.length > 0
                           ? `${hmsErrors.length} HMS ${hmsErrors.length === 1 ? 'error' : 'errors'}`
@@ -3870,19 +4002,17 @@ function PrinterCard({
           {viewMode === 'expanded' && (
             <div className="mt-2">
               <div className="flex flex-wrap items-center gap-2">
-              {/* Connection status badge (or Maintenance pill when out of service).
-                  Defensive: only swap when is_active is EXPLICITLY false. An
-                  undefined / missing field defaults to "active" so the regular
-                  pill renders — matches the backend default and prevents test
-                  fixtures (or stale clients) from accidentally tripping the
-                  maintenance UI. */}
+              {/* Connection pill. It reports the SESSION and nothing else: a
+                  printer in maintenance mode is still connected and says so (its
+                  hold is the banner above). A deactivated printer has no session
+                  by definition, so "Deactivated" replaces "Offline" — "Offline"
+                  there reads as a fault and sends operators looking for a network
+                  problem they do not have. Defensive `=== false`: an undefined
+                  field defaults to active, matching the backend. */}
               {printer.is_active === false ? (
-                <span
-                  className="flex items-center gap-1.5 px-2 py-1 rounded-full text-xs bg-amber-500/20 text-amber-400"
-                  title={t('printers.maintenance.subtitle')}
-                >
-                  <Wrench className="w-3 h-3" />
-                  {t('printers.maintenance.pillLabel')}
+                <span className="flex items-center gap-1.5 px-2 py-1 rounded-full text-xs bg-bambu-dark-tertiary text-bambu-gray">
+                  <Unlink className="w-3 h-3" />
+                  {t('printers.deactivated.pillLabel')}
                 </span>
               ) : (
                 <span
@@ -4060,8 +4190,11 @@ function PrinterCard({
                   queue unit — a foreign print's hold has no queue row, so without
                   this chip it is invisible in the UI entirely (12 foreign runouts
                   held printers with nothing on screen to say so). Amber while the
-                  machine is still acting, red once it escalated to a human. */}
-              {status?.open_incident && (
+                  machine is still acting, red once it escalated to a human.
+                  Kinds that own a surface of their own are skipped here — a
+                  service hold is the maintenance banner, and a second chip for
+                  the same fact is a duplicate surface. */}
+              {status?.open_incident && !OWN_SURFACE_INCIDENT_KINDS.includes(status.open_incident.kind) && (
                 <span
                   className={`flex items-center gap-1 px-2 py-1 rounded-full text-xs ${
                     status.open_incident.status === 'escalated'
@@ -4165,19 +4298,19 @@ function PrinterCard({
           </Modal>
         )}
 
-        {/* Status — see the equivalent defensive `=== false` check on the
-            header pill above for why this is not `!printer.is_active`. */}
+        {/* Status. A DEACTIVATED printer has no session, so there is no status
+            tree to draw — this panel stands in its place and offers the one verb
+            that gets it back. Maintenance mode does NOT come through here: the
+            session stays up, so the whole tree below renders as for any
+            connected printer and the hold rides its own banner. Defensive
+            `=== false` as on the header pill. */}
         {printer.is_active === false ? (
-          // Maintenance mode (#1476) — replaces the cover/progress container
-          // so the card keeps the same height. Renders for both compact and
-          // expanded view modes so the printer stays visible but plainly
-          // out-of-service.
           <>
             {viewMode === 'compact' ? (
-              <div className="mt-2 flex items-center gap-2 px-2 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/30">
-                <Wrench className="w-3 h-3 text-amber-400 shrink-0" />
-                <span className="text-[11px] text-amber-400 font-medium truncate">
-                  {t('printers.maintenance.pillLabel')}
+              <div className="mt-2 flex items-center gap-2 px-2 py-1.5 rounded-full bg-bambu-dark border border-bambu-dark-tertiary">
+                <Unlink className="w-3 h-3 text-bambu-gray shrink-0" />
+                <span className="text-[11px] text-bambu-gray font-medium truncate">
+                  {t('printers.deactivated.pillLabel')}
                 </span>
               </div>
             ) : (
@@ -4188,24 +4321,19 @@ function PrinterCard({
                   </span>
                   <div className="flex-1 h-[2px] bg-bambu-dark-tertiary" />
                 </div>
-                <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-[10px] flex items-center gap-3">
-                  <Wrench className="w-6 h-6 text-amber-400 shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-amber-400 font-medium">
-                      {t('printers.maintenance.title')}
-                    </p>
-                    <p className="text-xs text-bambu-gray mt-0.5">
-                      {t('printers.maintenance.subtitle')}
-                    </p>
-                  </div>
+                <div className="p-3 bg-bambu-dark border border-bambu-dark-tertiary rounded-[10px] flex items-center gap-3">
+                  <Unlink className="w-6 h-6 text-bambu-gray shrink-0" />
+                  <p className="flex-1 min-w-0 text-sm text-bambu-gray">
+                    {t('printers.deactivated.panelState')}
+                  </p>
                   <Button
                     variant="secondary"
                     size="sm"
-                    disabled={maintenanceMutation.isPending || !hasPermission('printers:update')}
-                    onClick={() => maintenanceMutation.mutate(true)}
+                    disabled={activatePrinterMutation.isPending || !hasPermission('printers:update')}
+                    onClick={() => activatePrinterMutation.mutate()}
                     title={!hasPermission('printers:update') ? t('printers.permission.noEdit') : undefined}
                   >
-                    {t('printers.maintenance.exitButton')}
+                    {t('printers.deactivated.activate')}
                   </Button>
                 </div>
               </>
@@ -4686,6 +4814,60 @@ function PrinterCard({
                 </>
               );
             })()}
+
+            {/* In-flight eject. The plate authority has owned this record since
+                the standalone-eject rework and nothing rendered it, which is how
+                two printers sat with a 40-minute claim and a clear-plate that
+                409'd with no way out on screen. Once the watchdog has given its
+                verdict (`runtime_exceeded`) no runtime owner is coming: the row
+                says so and offers the override. Age is mm:ss — a sweep is a
+                two-minute job. */}
+            {viewMode === 'expanded' && inFlightEject && (
+              <div
+                className={`mt-2 rounded-lg border p-2.5 ${
+                  inFlightEject.runtime_exceeded
+                    ? 'border-red-500/40 bg-red-500/10'
+                    : 'border-blue-500/40 bg-blue-500/10'
+                }`}
+              >
+                <div className="flex items-start gap-2">
+                  {inFlightEject.runtime_exceeded ? (
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
+                  ) : (
+                    <Wind className="w-4 h-4 flex-shrink-0 mt-0.5 text-blue-400" />
+                  )}
+                  <p
+                    className={`min-w-0 flex-1 text-xs ${
+                      inFlightEject.runtime_exceeded ? 'text-red-200/90' : 'text-blue-200/90'
+                    }`}
+                  >
+                    {inFlightEject.runtime_exceeded
+                      ? t('printers.plateStatus.ejectStalled', { age: formatEjectAge(inFlightEject.age_s) })
+                      : t('printers.plateStatus.ejectInProgress', { age: formatEjectAge(inFlightEject.age_s) })}
+                  </p>
+                </div>
+                {inFlightEject.runtime_exceeded && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); setShowRecoverConfirm(true); }}
+                      disabled={!hasPermission('printers:recover') || recoverMutation.isPending}
+                      title={
+                        !hasPermission('printers:recover')
+                          ? t('printers.permission.noControl')
+                          : t('printers.quarantine.recover')
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
+                    >
+                      {recoverMutation.isPending ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : null}
+                      {t('printers.quarantine.recover')}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {viewMode === 'expanded' && showClearPlateButton && (
               <div className="mt-2 flex gap-2">
@@ -6794,6 +6976,10 @@ function PrinterCard({
             + t('printers.quarantine.recoverEffectPlate')
             + '\n' + t('printers.quarantine.recoverEffectQuarantine')
             + '\n' + t('printers.quarantine.recoverEffectResume')
+            // Recover is also the only way out of a stuck eject claim, and
+            // dropping one is a consequence the operator must see BEFORE
+            // confirming — so it joins the effect list whenever one is owned.
+            + (inFlightEject ? '\n' + t('printers.quarantine.recoverEffectEject') : '')
           }
           confirmText={t('printers.quarantine.recover')}
           variant="warning"
@@ -6862,21 +7048,19 @@ function PrinterCard({
         />
       )}
 
-      {/* Maintenance Mode mid-print confirmation (#1476) — entering maintenance
-          disconnects MQTT, which stops progress tracking + completion
-          notifications for the in-flight job. Idle / FINISH / FAILED states
-          skip this dialog and toggle directly. */}
-      {confirmMaintenanceEnter && (
+      {/* Entering maintenance mode. The dialog exists only to show what the hold
+          will STOP, so it is raised only when live status shows something to
+          stop — an idle printer enters on one click. The body is that list and
+          nothing else; the consequences of each stop ride the bullets. */}
+      {confirmEnterHold && (
         <ConfirmModal
-          title={t('printers.maintenance.confirmMidPrintTitle')}
-          message={t('printers.maintenance.confirmMidPrintMessage', { name: printer.name })}
+          title={t('printers.maintenance.confirmTitle', { name: printer.name })}
+          message={serviceHoldEffects.join('\n')}
           confirmText={t('printers.maintenance.menuEnter')}
-          variant="danger"
-          onConfirm={() => {
-            maintenanceMutation.mutate(false);
-            setConfirmMaintenanceEnter(false);
-          }}
-          onCancel={() => setConfirmMaintenanceEnter(false)}
+          variant="warning"
+          isLoading={enterServiceHoldMutation.isPending}
+          onConfirm={() => enterServiceHoldMutation.mutate()}
+          onCancel={() => setConfirmEnterHold(false)}
         />
       )}
 
@@ -8283,25 +8467,27 @@ function EditPrinterModal({
                 {t('printers.modal.autoArchiveLabel')}
               </label>
             </div>
-            {/* Maintenance Mode toggle (#1476) — checkbox is the inverse of
-                is_active because the user-facing concept is "is this printer
-                in maintenance" not "is it active". */}
+            {/* Deactivation — the inverse of is_active, because the operator-side
+                concept is "is this printer switched off for this instance". It is
+                a wiring decision (parallel installs, decommissioning), not the
+                out-of-service verb: taking a printer out of the automatic lanes
+                is maintenance mode, on the card. */}
             <div>
               <div className="flex items-center gap-2">
                 <input
                   type="checkbox"
-                  id="edit_maintenance_mode"
+                  id="edit_deactivated"
                   checked={!form.is_active}
                   onChange={(e) => setForm({ ...form, is_active: !e.target.checked })}
-                  className="rounded border-bambu-dark-tertiary bg-bambu-dark text-amber-400 focus:ring-amber-400"
+                  className="rounded border-bambu-dark-tertiary bg-bambu-dark text-bambu-green focus:ring-bambu-green"
                 />
-                <label htmlFor="edit_maintenance_mode" className="text-sm text-bambu-gray flex items-center gap-1.5">
-                  <Wrench className="w-3.5 h-3.5 text-amber-400" />
-                  {t('printers.maintenance.editFieldLabel')}
+                <label htmlFor="edit_deactivated" className="text-sm text-bambu-gray flex items-center gap-1.5">
+                  <Unlink className="w-3.5 h-3.5 text-bambu-gray" />
+                  {t('printers.deactivated.editFieldLabel')}
                 </label>
               </div>
               <p className="text-xs text-bambu-gray/70 mt-1 ml-6">
-                {t('printers.maintenance.editFieldHelp')}
+                {t('printers.deactivated.editFieldHelp')}
               </p>
             </div>
             {saveWarning ? (

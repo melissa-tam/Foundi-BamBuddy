@@ -37,6 +37,11 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
   switch (reason) {
     case 'printer_offline_stalled':
       return t('productionRuns.detail.waiting.printerOfflineStalled');
+    case 'printer_service_hold':
+      // The operator took the printer out of every automatic lane. The
+      // humanized fallback ("Printer service hold") names an internal code; the
+      // operator knows this state by the card's own label, "maintenance mode".
+      return t('productionRuns.detail.waiting.printerServiceHold');
     case 'print_paused_stalled':
       return t('productionRuns.detail.waiting.printPausedStalled');
     case 'plate_not_empty_printer_detected':
