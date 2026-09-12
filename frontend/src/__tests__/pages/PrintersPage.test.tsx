@@ -573,86 +573,234 @@ describe('PrintersPage', () => {
     });
   });
 
-  describe('maintenance mode (#1476)', () => {
-    // Wraps the backend is_active flag — already gates MQTT, queue dispatch,
-    // scheduler, metrics, picker. These tests pin the UI surface: status
-    // panel swap, pill swap, and the PATCH on toggle.
-    const inMaintenancePrinter = { ...mockPrinters[0], is_active: false };
+  /**
+   * Maintenance mode is a SERVICE HOLD, not `is_active=false`: the session stays
+   * up, the whole status tree keeps rendering, and the hold is one banner beside
+   * the quarantine banner. These pin that projection — the banner's role and its
+   * one action, the confirm-only-when-something-is-live rule, and the fact that
+   * the generic incident chip does not double up on it.
+   */
+  describe('maintenance mode (service hold)', () => {
+    const heldPrinter = {
+      ...mockPrinters[0],
+      service_hold: { since: '2026-09-12T03:02:28Z' },
+    };
 
-    it('shows the maintenance status panel instead of the print container', async () => {
+    /** Serve exactly one printer card, with optional status-frame overrides. */
+    const serveOne = (printer: unknown, status: Record<string, unknown> = {}) => {
       server.use(
-        http.get('/api/v1/printers/', () => HttpResponse.json([inMaintenancePrinter])),
+        http.get('/api/v1/printers/', () => HttpResponse.json([printer])),
         http.get('/api/v1/printers/:id/status', () =>
-          HttpResponse.json({ ...mockPrinterStatus, connected: false }),
+          HttpResponse.json({ ...mockPrinterStatus, ...status }),
         ),
       );
+    };
+
+    it('renders the hold banner BESIDE the status tree, not instead of it', async () => {
+      serveOne(heldPrinter);
       render(<PrintersPage />);
 
-      await waitFor(() => {
-        expect(screen.getByText('In Maintenance')).toBeInTheDocument();
-      });
-      // Exit button rendered
-      expect(screen.getByRole('button', { name: /exit maintenance/i })).toBeInTheDocument();
-      // The "No active job" / "Ready to print" copy from the normal status
-      // panel must NOT be present — confirms the swap, not a stacked render.
-      expect(screen.queryByText(/no active job/i)).not.toBeInTheDocument();
-      expect(screen.queryByText(/ready to print/i)).not.toBeInTheDocument();
+      const exit = await screen.findByRole('button', { name: /exit maintenance mode/i });
+      // The banner is a live region (role=status) carrying the exit action.
+      expect(exit.closest('[role="status"]')).not.toBeNull();
+      // …and the status tree underneath still renders: a held printer is
+      // connected, so its state is real and stays on screen.
+      expect(await screen.findByText(/ready to print/i)).toBeInTheDocument();
     });
 
-    it('shows the amber Maintenance pill in the header (no Connected/Offline)', async () => {
+    it('releases the hold through DELETE when the banner action is used', async () => {
+      const released: string[] = [];
+      serveOne(heldPrinter);
       server.use(
-        http.get('/api/v1/printers/', () => HttpResponse.json([inMaintenancePrinter])),
-        http.get('/api/v1/printers/:id/status', () =>
-          HttpResponse.json({ ...mockPrinterStatus, connected: false }),
-        ),
-      );
-      render(<PrintersPage />);
-
-      // The header pill row contains "Maintenance" exactly once.
-      await waitFor(() => {
-        expect(screen.getAllByText('Maintenance').length).toBeGreaterThan(0);
-      });
-      // No connection diagnostic CTA (that's reserved for involuntary offline).
-      expect(screen.queryByRole('button', { name: /run.*diagnostic/i })).not.toBeInTheDocument();
-    });
-
-    it('PATCHes is_active=true when the Exit button is clicked', async () => {
-      const patchedBodies: unknown[] = [];
-      server.use(
-        http.get('/api/v1/printers/', () => HttpResponse.json([inMaintenancePrinter])),
-        http.get('/api/v1/printers/:id/status', () =>
-          HttpResponse.json({ ...mockPrinterStatus, connected: false }),
-        ),
-        http.patch('/api/v1/printers/:id', async ({ request }) => {
-          const body = await request.json();
-          patchedBodies.push(body);
-          return HttpResponse.json({ ...inMaintenancePrinter, is_active: true });
+        http.delete('/api/v1/printers/:id/service-hold', ({ params }) => {
+          released.push(String(params.id));
+          return HttpResponse.json({ released: true });
         }),
       );
       render(<PrintersPage />);
 
-      const exit = await screen.findByRole('button', { name: /exit maintenance/i });
-      fireEvent.click(exit);
+      fireEvent.click(await screen.findByRole('button', { name: /exit maintenance mode/i }));
 
-      await waitFor(() => {
-        expect(patchedBodies.length).toBeGreaterThan(0);
-      });
-      expect(patchedBodies[0]).toEqual(expect.objectContaining({ is_active: true }));
+      await waitFor(() => expect(released).toEqual(['1']));
     });
 
-    it('renders the regular status panel when is_active=true', async () => {
+    it('enters on one click when live status shows nothing to stop', async () => {
+      const entered: string[] = [];
+      serveOne(mockPrinters[0]);
       server.use(
-        http.get('/api/v1/printers/', () => HttpResponse.json([{ ...mockPrinters[0], is_active: true }])),
-        http.get('/api/v1/printers/:id/status', () => HttpResponse.json(mockPrinterStatus)),
+        http.post('/api/v1/printers/:id/service-hold', ({ params }) => {
+          entered.push(String(params.id));
+          return HttpResponse.json({
+            held: true,
+            already_held: false,
+            cooldown_ended: false,
+            eject_stopped: false,
+            job_stopped: false,
+            lease_revoked: false,
+          });
+        }),
+      );
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await user.click(await screen.findByRole('button', { name: /enter maintenance mode/i }));
+
+      await waitFor(() => expect(entered).toEqual(['1']));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    it('asks for confirmation first when a print is running', async () => {
+      const entered: string[] = [];
+      serveOne(mockPrinters[0], { state: 'RUNNING', progress: 42, current_print: 'part.3mf' });
+      server.use(
+        http.post('/api/v1/printers/:id/service-hold', ({ params }) => {
+          entered.push(String(params.id));
+          return HttpResponse.json({
+            held: true,
+            already_held: false,
+            cooldown_ended: false,
+            eject_stopped: false,
+            job_stopped: true,
+            lease_revoked: false,
+          });
+        }),
+      );
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await user.click(await screen.findByRole('button', { name: /enter maintenance mode/i }));
+
+      // A dialog, and nothing sent until it is confirmed.
+      const dialog = await screen.findByRole('dialog');
+      expect(entered).toEqual([]);
+
+      await user.click(within(dialog).getByRole('button', { name: /enter maintenance mode/i }));
+      await waitFor(() => expect(entered).toEqual(['1']));
+    });
+
+    it('does not render the generic incident chip for the hold kind', async () => {
+      serveOne(heldPrinter, {
+        open_incident: { kind: 'service_hold', status: 'escalated', slot_desc: null, created_at: null },
+      });
+      render(<PrintersPage />);
+      await screen.findByRole('button', { name: /exit maintenance mode/i });
+
+      // The chip looks its label up dynamically, so a rendered suppressed kind
+      // would print its own key (no locale leaf exists for it, by design).
+      expect(screen.queryByText('printers.incident.service_hold')).not.toBeInTheDocument();
+    });
+
+    it('still renders the chip for a fault kind', async () => {
+      serveOne(heldPrinter, {
+        open_incident: { kind: 'jam', status: 'escalated', slot_desc: null, created_at: null },
+      });
+      render(<PrintersPage />);
+
+      expect(await screen.findByText('AMS jam')).toBeInTheDocument();
+    });
+  });
+
+  /**
+   * The plate authority has owned the in-flight eject record since the
+   * standalone-eject rework and nothing rendered it — which is how two printers
+   * sat with a 40-minute claim and a clear-plate that 409'd with no way out on
+   * screen. Recover appears once the watchdog has given its verdict.
+   */
+  describe('in-flight eject', () => {
+    const occupancyWith = (ejectOverrides: Record<string, unknown>) => ({
+      state: 'FINISH',
+      awaiting_plate_clear: true,
+      occupancy: {
+        plate: { occupied: true, source_subtask_id: '123', policy: 'CooldownEject', since: null },
+        eject: {
+          purpose: 'production',
+          started: true,
+          age_s: 154,
+          hydrated: false,
+          runtime_exceeded: false,
+          ...ejectOverrides,
+        },
+        lease_age_s: null,
+      },
+    });
+
+    const serveStatus = (status: Record<string, unknown>) => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...mockPrinterStatus, ...status }),
+        ),
+      );
+    };
+
+    it('reports an owned sweep without offering the override', async () => {
+      serveStatus(occupancyWith({}));
+      render(<PrintersPage />);
+
+      expect(await screen.findByText(/eject in progress/i)).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /recover/i })).not.toBeInTheDocument();
+    });
+
+    it('offers Recover once the watchdog has fired', async () => {
+      serveStatus(occupancyWith({ runtime_exceeded: true, age_s: 2292 }));
+      render(<PrintersPage />);
+
+      expect(await screen.findByText(/eject stalled/i)).toBeInTheDocument();
+      const recover = screen.getByRole('button', { name: /recover/i });
+
+      fireEvent.click(recover);
+      // The EXISTING recover confirm — its effect list gains the eject bullet.
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByText(/drop the eject in progress/i)).toBeInTheDocument();
+    });
+  });
+
+  /**
+   * `is_active=false` keeps upstream's meaning — this instance holds no MQTT
+   * session — and is labelled Deactivated. It is no longer the maintenance verb.
+   */
+  describe('deactivated printer', () => {
+    const deactivated = { ...mockPrinters[0], is_active: false };
+
+    it('labels the header pill Deactivated instead of Offline', async () => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([deactivated])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...mockPrinterStatus, connected: false }),
+        ),
       );
       render(<PrintersPage />);
 
       await waitFor(() => {
-        expect(screen.getByText('X1 Carbon')).toBeInTheDocument();
+        expect(screen.getAllByText('Deactivated').length).toBeGreaterThan(0);
       });
-      // Active printer never shows the maintenance panel.
-      expect(screen.queryByText('In Maintenance')).not.toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: /exit maintenance/i })).not.toBeInTheDocument();
+      expect(screen.queryByText('Offline')).not.toBeInTheDocument();
+      // No connection diagnostic CTA — nothing is wrong with the network.
+      expect(screen.queryByRole('button', { name: /run.*diagnostic/i })).not.toBeInTheDocument();
+    });
+
+    it('PATCHes is_active=true from the Activate action', async () => {
+      const patchedBodies: unknown[] = [];
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([deactivated])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...mockPrinterStatus, connected: false }),
+        ),
+        http.patch('/api/v1/printers/:id', async ({ request }) => {
+          patchedBodies.push(await request.json());
+          return HttpResponse.json({ ...deactivated, is_active: true });
+        }),
+      );
+      render(<PrintersPage />);
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Activate' }));
+
+      await waitFor(() => expect(patchedBodies.length).toBeGreaterThan(0));
+      expect(patchedBodies[0]).toEqual(expect.objectContaining({ is_active: true }));
     });
   });
 

@@ -12,14 +12,13 @@
  * requires an identical leaf set.
  */
 import { describe, it, expect } from 'vitest';
-import type { PrinterStatus } from '../../api/client';
+import { OWN_SURFACE_INCIDENT_KINDS } from '../../api/client';
+import type { PrinterIncidentKind } from '../../api/client';
 import en from '../../i18n/locales/en';
-
-type IncidentKind = NonNullable<PrinterStatus['open_incident']>['kind'];
 
 /** Every kind the status payload can carry — value is unused; the KEYS are the
  *  assertion, and `Record` makes omitting one a compile error. */
-const INCIDENT_KINDS: Record<IncidentKind, true> = {
+const INCIDENT_KINDS: Record<PrinterIncidentKind, true> = {
   jam: true,
   runout: true,
   physical: true,
@@ -27,14 +26,26 @@ const INCIDENT_KINDS: Record<IncidentKind, true> = {
   power_loss: true,
   plate_vision: true,
   z_reference_lost: true,
+  // The operator's own maintenance hold: chip-suppressed, see below.
+  service_hold: true,
 };
 
 describe('printer incident chip labels', () => {
   const labels: Record<string, string> = en.printers.incident;
 
-  it('has English copy for every incident kind the API can send', () => {
-    for (const kind of Object.keys(INCIDENT_KINDS)) {
+  it('has English copy for every incident kind the chip renders', () => {
+    for (const kind of Object.keys(INCIDENT_KINDS) as PrinterIncidentKind[]) {
+      if (OWN_SURFACE_INCIDENT_KINDS.includes(kind)) continue;
       expect(labels[kind], `missing printers.incident.${kind}`).toBeTruthy();
+    }
+  });
+
+  /** A kind with its own surface must carry NO chip copy: copy that exists is
+   *  copy that will eventually be rendered, and two surfaces for one fact is
+   *  exactly what the maintenance banner was built to stop. */
+  it('has no chip copy for kinds that render their own surface', () => {
+    for (const kind of OWN_SURFACE_INCIDENT_KINDS) {
+      expect(labels[kind], `printers.incident.${kind} must not exist`).toBeUndefined();
     }
   });
 

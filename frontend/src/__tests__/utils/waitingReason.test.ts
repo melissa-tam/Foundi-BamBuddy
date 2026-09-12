@@ -21,6 +21,9 @@ describe('waitingReasonText', () => {
     expect(waitingReasonText('printer_offline_stalled', t)).toBe(
       'productionRuns.detail.waiting.printerOfflineStalled',
     );
+    expect(waitingReasonText('printer_service_hold', t)).toBe(
+      'productionRuns.detail.waiting.printerServiceHold',
+    );
     expect(waitingReasonText('plate_not_empty_printer_detected', t)).toBe(
       'productionRuns.detail.waiting.visionHold',
     );

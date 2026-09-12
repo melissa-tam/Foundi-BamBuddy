@@ -342,6 +342,57 @@ export interface LongLivedCameraToken {
 }
 
 // Printer types
+
+/**
+ * Every `printer_incident` kind the backend can report. The chip on the printer
+ * card looks its label up dynamically by this exact string, so a kind added here
+ * needs its locale leaf in the same change (pinned by
+ * `__tests__/i18n/incidentKinds.test.ts`) UNLESS it is listed in
+ * `OWN_SURFACE_INCIDENT_KINDS` below.
+ */
+export type PrinterIncidentKind =
+  | 'jam'
+  | 'runout'
+  | 'physical'
+  | 'power_loss'
+  | 'plate_vision'
+  | 'z_reference_lost'
+  | 'service_hold';
+
+/**
+ * Incident kinds that carry their OWN surface, so the generic incident chip must
+ * skip them: an operator's service hold is rendered by the maintenance banner,
+ * and a second chip saying the same thing is a duplicate surface for one fact.
+ */
+export const OWN_SURFACE_INCIDENT_KINDS: readonly PrinterIncidentKind[] = ['service_hold'];
+
+/**
+ * The operator's maintenance hold ("maintenance mode"): the printer keeps its
+ * MQTT session and every manual verb, and is out of every automatic lane
+ * (dispatch, auto-eject, cooldown, recovery drivers). Backed by a durable
+ * `printer_incident` row of kind `service_hold`; null / absent means no hold.
+ * Distinct from `is_active`, which is still "this instance holds a session".
+ */
+export interface ServiceHoldState {
+  /** ISO timestamp the operator took the hold. */
+  since: string;
+}
+
+/** `POST /printers/{id}/service-hold` — what entering the hold actually did. */
+export interface ServiceHoldEnterResult {
+  held: boolean;
+  already_held: boolean;
+  cooldown_ended: boolean;
+  eject_stopped: boolean;
+  job_stopped: boolean;
+  lease_revoked: boolean;
+}
+
+/** `DELETE /printers/{id}/service-hold`. */
+export interface ServiceHoldExitResult {
+  released: boolean;
+}
+
 export interface Printer {
   id: number;
   name: string;
@@ -368,6 +419,10 @@ export interface Printer {
   // operator clears it.
   quarantined: boolean;
   quarantine_reason: string | null;
+  // Operator maintenance hold. The fleet list is the primary origin for the
+  // printer card's banner (it is present even before a status frame arrives);
+  // absent on backends predating the hold → read as "no hold".
+  service_hold?: ServiceHoldState | null;
   created_at: string;
   updated_at: string;
 }
@@ -643,6 +698,9 @@ export interface PrinterStatus {
       age_s: number | null;
       /** Claim rebuilt from disk at startup (never arms the runtime watchdog). */
       hydrated: boolean;
+      /** The per-phase watchdog already fired its deadline on this sweep: no
+       *  runtime owner is coming, so the operator's Recover is the way out. */
+      runtime_exceeded: boolean;
     } | null;
     /** Seconds since a dispatch lease was taken on this printer; null when none. */
     lease_age_s: number | null;
@@ -672,11 +730,15 @@ export interface PrinterStatus {
   // change (pinned by `__tests__/i18n/incidentKinds.test.ts`). The three
   // pause-cause kinds joined the AMS three in the 2026-09-04 pause-recovery wave.
   open_incident?: {
-    kind: 'jam' | 'runout' | 'physical' | 'power_loss' | 'plate_vision' | 'z_reference_lost';
+    kind: PrinterIncidentKind;
     status: 'recovering' | 'escalated';
     slot_desc: string | null;
     created_at: string | null;
   } | null;
+  // Operator maintenance hold, mirrored onto the status frame (including the
+  // disconnected branch) so a card rendered from a stale fleet list still shows
+  // it. `Printer.service_hold` is the primary origin; this is the fallback.
+  service_hold?: ServiceHoldState | null;
   // AMS drying support
   supports_drying: boolean;
   // Active chamber heater (responds to M141). True only for H2C/H2D/H2DPro/H2S/X2D.
@@ -4285,6 +4347,20 @@ export const api = {
       `/printers/${printerId}/recover`,
       { method: 'POST' }
     ),
+  // Maintenance mode as a service hold: the printer keeps its MQTT session and
+  // every manual verb while the farm takes it out of dispatch, auto-eject,
+  // cooldown and the recovery drivers. Entering quiesces what is live (cooldown
+  // fans off, an in-flight eject sweep stopped, a running print stopped as an
+  // operator stop, the dispatch lease revoked) — the response says which of
+  // those actually happened. Permission: `printers:control`.
+  enterServiceHold: (printerId: number) =>
+    request<ServiceHoldEnterResult>(`/printers/${printerId}/service-hold`, {
+      method: 'POST',
+    }),
+  exitServiceHold: (printerId: number) =>
+    request<ServiceHoldExitResult>(`/printers/${printerId}/service-hold`, {
+      method: 'DELETE',
+    }),
 
   // Get current print user (for reprint tracking - Issue #206)
   getCurrentPrintUser: (printerId: number) =>

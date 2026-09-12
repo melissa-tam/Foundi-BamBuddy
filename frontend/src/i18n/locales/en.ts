@@ -189,6 +189,7 @@ export default {
         filamentRunoutRecoveryFailed: 'Filament ran out — insert a new spool into the marked AMS slot and resume',
         spoolPhysicalFault: 'Physical fault — hands needed, no auto-swap',
         printerOfflineStalled: 'Printer offline mid-print — outcome unknown until it reconnects',
+        printerServiceHold: 'Printer in maintenance mode',
         printPausedStalled: 'Paused on the printer — needs attention (no auto-recovery)',
         visionHold: 'Plate check tripped twice — clear the bed, then Mark plate cleared',
         powerLossHold: 'Held at the printer\'s power-loss prompt — resume at the printer',
@@ -728,22 +729,34 @@ export default {
     },
     // Maintenance
     maintenanceUpToDate: 'All maintenance up to date - Click to view',
-    // Maintenance Mode (#1476) — operator-flipped "out of service" state.
-    // Distinct from the scheduled-maintenance dashboard above; this one
-    // wraps the backend is_active flag and stops MQTT + queue dispatch.
+    // Maintenance mode = the service hold. The printer keeps its session and
+    // every manual verb; the farm takes it out of dispatch, auto-eject, cooldown
+    // and the recovery drivers. Distinct from the scheduled-maintenance
+    // dashboard above, and from `deactivated` below (which is the is_active
+    // flag: no session at all).
     maintenance: {
-      title: 'In Maintenance',
-      subtitle: 'This printer is paused — not connected, not eligible for the queue, not sending notifications.',
-      pillLabel: 'Maintenance',
-      exitButton: 'Exit maintenance',
+      badge: 'Maintenance mode',
+      since: 'Automation off since {{time}} — dispatch, auto-eject and cooldown paused',
+      exitButton: 'Exit maintenance mode',
+      exitHint: 'Dispatch resumes, and a plate still waiting on cooldown resumes its wait.',
       menuEnter: 'Enter maintenance mode',
       menuExit: 'Exit maintenance mode',
-      toastEntered: '{{name}} is now in maintenance mode',
-      toastExited: '{{name}} is back online',
-      confirmMidPrintTitle: 'Enter maintenance mode mid-print?',
-      confirmMidPrintMessage: '{{name}} is currently printing. Entering maintenance mode will disconnect MQTT and stop progress tracking and completion notifications for this job. Continue?',
-      editFieldLabel: 'Maintenance mode',
-      editFieldHelp: 'When on, this printer is paused from MQTT, queue dispatch and notifications — useful for repair, parallel Bambuddy installs, or temporary suspension.',
+      toastEntered: '{{name}} in maintenance mode',
+      toastExited: '{{name}} out of maintenance mode',
+      confirmTitle: 'Enter maintenance mode on {{name}}?',
+      confirmEffectPrint: '• Stop the running print — the run holds until Resume',
+      confirmEffectEject: '• Stop the eject sweep — the plate stays gated',
+      confirmEffectCooldown: '• Stop the cooldown fans',
+    },
+    // Deactivated = the is_active flag: this instance holds no MQTT session for
+    // the printer. A wiring state, not an out-of-service verb.
+    deactivated: {
+      pillLabel: 'Deactivated',
+      panelState: 'Deactivated — no connection to this printer.',
+      activate: 'Activate',
+      toastActivated: '{{name}} activated',
+      editFieldLabel: 'Deactivated',
+      editFieldHelp: 'No MQTT session; invisible to this instance (parallel installs, decommissioning).',
     },
     // Chamber light
     chamberLightOn: 'Turn on chamber light',
@@ -880,6 +893,7 @@ export default {
       recoverEffectPlate: '• Clear the plate hold',
       recoverEffectQuarantine: '• Clear the quarantine',
       recoverEffectResume: '• Resume the paused run',
+      recoverEffectEject: '• Drop the eject in progress',
       markPlateCleared: 'Mark plate cleared',
       actionsHelp: 'Recover & resume lifts the quarantine and resumes the paused run. Mark plate cleared only releases the plate gate.',
     },
@@ -917,9 +931,14 @@ export default {
       notCleared: 'Plate not Clear',
       inUse: 'Plate in Use',
       markClearedCancelsEject: 'Marking the plate cleared cancels the pending auto-eject.',
-      ejectInFlight: 'Eject in flight. The gate clears when the sweep completes.',
+      // The sweep completing is no longer a promise the gate can make: once the
+      // watchdog has fired, nothing else will clear this claim.
+      ejectInFlight: 'Eject in flight. Use Recover to override.',
       markOccupied: 'Mark plate as occupied',
       markOccupiedSuccess: 'Plate marked as occupied — dispatch blocked until cleared',
+      ejectInProgress: 'Eject in progress · {{age}}',
+      ejectStalled: 'Eject stalled · {{age}} — the farm lost track of the sweep',
+      menuRecover: 'Recover printer',
     },
     // Manual eject (W2) + new-spool prompt (W6)
     eject: {
