@@ -59,6 +59,7 @@ from backend.app.api.routes import (
     printers,
     production_runs,
     projects,
+    service_hold,
     settings as settings_routes,
     skus,
     slice_jobs,
@@ -7492,6 +7493,10 @@ app.include_router(users.router, prefix=app_settings.api_prefix)
 app.include_router(groups.router, prefix=app_settings.api_prefix)
 app.include_router(printers.router, prefix=app_settings.api_prefix)
 app.include_router(printer_eject.router, prefix=app_settings.api_prefix)
+# Maintenance mode (2026-09-12): enter/leave a printer's service hold. A /printers
+# satellite like printer_eject — the verb stops prints and sweeps, so it lives with the
+# motion routes rather than in the printer-record editor.
+app.include_router(service_hold.router, prefix=app_settings.api_prefix)
 # Printer-scoped HMS vocabulary read; its own module, registered after printers.router
 # like the other /printers satellites.
 app.include_router(hms.router, prefix=app_settings.api_prefix)

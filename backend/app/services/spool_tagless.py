@@ -77,7 +77,7 @@ from backend.app.core.websocket import ws_manager
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
-from backend.app.services import ams_presence, spool_respool
+from backend.app.services import ams_presence, printer_incidents, spool_respool
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.slot_identity import apply_spool_to_slot_via_mqtt
 from backend.app.services.spool_binding import (
@@ -3342,6 +3342,14 @@ async def reconcile_slot_config(db: AsyncSession, *, manager=printer_manager, no
     pushed = 0
     printer_ids = (await db.execute(select(Printer.id).where(Printer.is_active.is_(True)))).scalars().all()
     for printer_id in printer_ids:
+        if printer_incidents.automation_held(printer_id):
+            # MAINTENANCE MODE — beside the is_active filter above, and for the same
+            # reason: this lane is the durable WRITE retry (auto-config presets, K-profile
+            # re-applies, owed-identify drains), and a printer a human is working on takes
+            # no commanded writes. Observation continues elsewhere: the slot pipeline keeps
+            # binding what the trays report, so the ledger records the hold's slot changes.
+            logger.debug("[tagless] printer %s is in maintenance mode — reconcile pass skipped", printer_id)
+            continue
         state = manager.get_status(printer_id)
         if state is None or not getattr(state, "raw_data", None):
             continue  # disconnected / never connected — no live slots to reconcile

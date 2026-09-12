@@ -1343,3 +1343,58 @@ class TestBackupGroupHarmonise:
         assert await self._walk(db_session, printer.id, _configured_tray(color="000000FF"), now=_PAST_WINDOW) == 0
         assert env.apply.await_count == 1
         assert spool_tagless._autoconfig_epochs == {}
+
+
+class TestMaintenanceModeSkipsHeldPrinters:
+    """Maintenance mode (2026-09-12): AMS = observe, never act.
+
+    This lane is the durable WRITE retry — auto-config presets, K-profile re-applies,
+    owed-identify drains — and a printer a human has their hands in takes no commanded
+    writes. The skip sits beside the ``is_active`` filter for the same reason: both are
+    about whether this instance may talk to that machine at all.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_incidents(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
+
+    async def _hold(self, db, printer_id):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+        from backend.app.services import printer_incidents
+
+        assert await printer_incidents.open_declared(db, printer_id, kind=KIND_SERVICE_HOLD) is not None
+
+    async def test_a_held_printers_bare_slot_is_not_republished(self, db_session, printer_factory, env):
+        """The 2026-07-24 incident shape on a HELD printer: the same slot that must be
+        re-pushed on a free printer is left alone here."""
+        printer = await printer_factory()
+        await _seed_assignment(db_session, printer.id, 0, 2)
+        await self._hold(db_session, printer.id)
+        manager = _FakeManager({printer.id: _state([_bare_tray(2)])})
+
+        pushed = await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert pushed == 0
+        env.apply.assert_not_awaited()
+        # The printer is skipped before its live state is even read.
+        assert manager.status_calls == []
+
+    async def test_a_free_printer_beside_a_held_one_is_still_reconciled(self, db_session, printer_factory, env):
+        """The skip is PER PRINTER: one held machine must not stall the fleet's reconcile
+        (the failure mode the per-slot guard already exists for, one level up)."""
+        held = await printer_factory(name="009-H2S")
+        free = await printer_factory(name="010-H2S")
+        await _seed_assignment(db_session, held.id, 0, 2)
+        await _seed_assignment(db_session, free.id, 0, 2)
+        await self._hold(db_session, held.id)
+        manager = _FakeManager({held.id: _state([_bare_tray(2)]), free.id: _state([_bare_tray(2)])})
+
+        pushed = await spool_tagless.reconcile_slot_config(db_session, manager=manager, now=_T0)
+
+        assert pushed == 1
+        assert manager.status_calls == [free.id]
+        assert env.apply.await_args.kwargs["printer_id"] == free.id

@@ -132,6 +132,54 @@ class PrinterUpdate(BaseModel):
     plate_detection_roi: PlateDetectionROI | None = None
 
 
+class ServiceHoldState(BaseModel):
+    """Maintenance mode: a human has this printer, and every automatic lane stands down.
+
+    Present ⇔ the printer carries an OPEN ``service_hold`` incident; ``None`` means it
+    does not. Deliberately a nested object rather than a bare timestamp, so the field
+    reads as a STATE the UI branches on (the hold banner) instead of an optional number,
+    and so a later fact about the hold extends the object rather than the printer payload.
+
+    ``since`` is the incident's ``created_at`` as an ISO string — a JSON PRIMITIVE, not a
+    ``datetime``: the same payload rides ``printer_state_to_dict`` through the WebSocket
+    serializer's bare ``json.dumps``, which has no encoder behind it.
+
+    It is NOT ``is_active``. That flag means "this instance holds an MQTT session"
+    (Deactivated in the UI); a service hold keeps the session up on purpose — status
+    visible, manual verbs working — and takes the printer out of the automatic lanes.
+
+    ``since`` is nullable for one reason only: the OBJECT is the hold, so a row with no
+    readable timestamp must still project as held rather than vanish into ``None``.
+    """
+
+    since: str | None = None
+
+
+class ServiceHoldEnterResponse(BaseModel):
+    """``POST /printers/{id}/service-hold``: the hold's state plus what the quiesce did.
+
+    The four quiesce bools are what the operator's toast names, so each means *this call
+    changed that* — a second click on an already-quiet printer answers four Falses.
+    """
+
+    held: bool
+    already_held: bool
+    cooldown_ended: bool
+    eject_stopped: bool
+    job_stopped: bool
+    lease_revoked: bool
+
+
+class ServiceHoldExitResponse(BaseModel):
+    """``DELETE /printers/{id}/service-hold``: did THIS call release a hold.
+
+    False for a printer that was not held — the verb is idempotent, so "nothing to
+    release" is a 200 with ``released: false``, never a 404 or a 409.
+    """
+
+    released: bool
+
+
 class PrinterResponse(PrinterBase):
     id: int
     is_active: bool
@@ -146,6 +194,11 @@ class PrinterResponse(PrinterBase):
     plate_detection_roi: PlateDetectionROI | None = None
     quarantined: bool = False
     quarantine_reason: str | None = None
+    # Maintenance mode, projected from the printer's open ``service_hold`` incident.
+    # Filled by ``_serialize_printer`` (the ONE serializer behind both ``GET /printers/``
+    # and ``GET /printers/{id}``) — it is process state, not a column, so it cannot come
+    # from ``model_validate``'s ORM read.
+    service_hold: ServiceHoldState | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -389,6 +442,13 @@ class PendingEjectInfo(BaseModel):
     # Rebuilt from the durable stamp at startup rather than minted by a live dispatch:
     # no watchdog, no verifiable identity, and an operator eject supersedes it.
     hydrated: bool = False
+    # The runtime watchdog has already given its verdict on this sweep: it fired, and
+    # whether or not its stop was delivered, nothing is going to act on this eject now.
+    # Declared here for the same reason ``EjectWatchInfo`` declares ``hold_z``: the REST
+    # ``/status`` lane validates through this model while the WS lane dumps
+    # ``occupancy_payload``'s dict raw, so a field missing here flips the operator's
+    # "Eject stalled — Recover" row between the poll and the socket push (the C5 class).
+    runtime_exceeded: bool = False
 
 
 class PlateOccupancyInfo(BaseModel):
@@ -535,6 +595,11 @@ class PrinterStatus(BaseModel):
     # and it remains the phase input. This carries the WHY — which policy holds the
     # plate, since when, and whether an eject is in flight and has actually started.
     occupancy: PlateOccupancyInfo | None = None
+    # Maintenance mode (2026-09-12): a human has this printer and every automatic lane
+    # stands down. Reportable with or without a session — it is the incident store's
+    # own record, not a wire fact — so BOTH ``/status`` branches carry it, and so does
+    # ``printer_state_to_dict``'s WS frame from the same builder.
+    service_hold: ServiceHoldState | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;

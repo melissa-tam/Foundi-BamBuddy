@@ -5873,6 +5873,46 @@ class TestPhysicalHoldsOutliveTheJob:
         rows = await _incident_rows(db_session, printer.id)
         assert rows[0].resolve_source == "repair_observed"
 
+    async def test_a_repaired_path_does_not_resume_a_printer_in_maintenance_mode(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """The held twin of the pin above — and the sharpest case for the hold.
+
+        The evidence this lane resumes on IS the maintenance operator's own work: they
+        freed the filament path and loaded a slot by hand. Without the gate, repairing a
+        printer would restart its print under the hands that repaired it. Nothing is
+        published, the print stays where they left it, and the physical row stays open —
+        it closes the ordinary way, on its own repair rule, once they resume or the hold
+        lifts.
+        """
+        from datetime import timedelta
+
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        install_settings()
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_SETTLE_S", 0.0)
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_CONFIRM_S", 0.5)
+        monkeypatch.setattr(spool_recovery.printer_manager, "is_connected", lambda _pid: True)
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, client, row = await self._physical_hold(db_session, printer, monkeypatch)
+        # The operator takes the printer to work on it, THEN repairs the path.
+        assert await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD) is not None
+
+        state.hms_errors = []
+        spool_recovery._load_completed_at[printer.id] = row.created_at + timedelta(seconds=1)
+
+        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
+        for _name, task in spawned:
+            await task
+
+        assert client.calls == [], "no resume may be published under the hands that repaired the path"
+        assert state.state == "PAUSE"
+        rows = await _incident_rows(db_session, printer.id)
+        physical = next(r for r in rows if r.kind == "physical")
+        assert physical.resolved_at is None, "the hold suppresses the ACT; the fault record stands"
+
     async def test_will_own_ignores_a_pause_cause_row(self, db_session, printer_factory, install_settings, monkeypatch):
         """A plate-vision hold beside a jam must not silence the jam's raw alert."""
         from backend.app.models.printer_incident import STATUS_ESCALATED
@@ -5898,3 +5938,159 @@ class TestPhysicalHoldsOutliveTheJob:
         # Nothing AMS-side owns the printer, so the predicate falls through to the
         # aborted-close bar — which is empty — and answers True (it WILL own it).
         assert await spool_recovery.will_own(db_session, printer.id, state) is True
+
+
+class TestMaintenanceModeRecordsAndStandsDown:
+    """An AMS fault on a printer a human has taken (2026-09-12 maintenance mode).
+
+    The hold removes the ACT, never the RECORD: the row still opens — that is what makes
+    ``hold_blocks_dispatch`` refuse work after the hold lifts, until the fault resolves by
+    its own wire/repair rule — and ``will_own`` still answers True, so the duplicate raw
+    HMS page stays suppressed. What must not happen is a swap, an unload, a resume or a
+    driver at all, on a machine somebody has their hands in.
+
+    And the fault keeps its own NAME. ``service_hold`` is the reason a DRIVER-BOUND fault
+    takes instead of running the machine; a runout still escalates as
+    ``runout_needs_refill``, which is what stamps the exhausted roll spent — that stamp is
+    observation, and the ledger keeps it through a maintenance window.
+    """
+
+    async def _hold(self, db, printer_id):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        row = await printer_incidents.open_declared(db, printer_id, kind=KIND_SERVICE_HOLD)
+        assert row is not None
+        assert printer_incidents.automation_held(printer_id) is True
+
+    async def test_a_jam_opens_an_escalated_row_and_spawns_no_driver(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        from backend.app.models.printer_incident import KIND_JAM, STATUS_ESCALATED
+
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        await self._hold(db_session, printer.id)
+        state = _make_state()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        task = await on_ams_fault(printer.id, state)
+
+        assert task is None, "a held printer must get no recovery driver"
+        assert client.calls == [], "nothing may be commanded on a printer a human holds"
+        assert state.state == "PAUSE", "the print is left exactly where the operator found it"
+        rows = {row.kind: row for row in await printer_incidents.open_rows(db_session, printer.id)}
+        assert rows[KIND_JAM].status == STATUS_ESCALATED, "the fault is recorded, and recorded as a human's"
+        # A farm mechanical jam is DRIVER-BOUND work — the swap machine is exactly what
+        # the hold is refusing — so this is the fault that reads ``service_hold``.
+        assert [row.reason for row in await _escalation_rows(db_session, printer.id)] == ["service_hold"]
+        # The fault outlives the hold: releasing maintenance mode does not release the jam.
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is True
+
+    async def test_a_runout_keeps_its_own_reason_and_still_stamps_the_roll_spent(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """A runout on a held printer is NOT a ``service_hold`` escalation.
+
+        Its reason is what ``_escalate`` gates the durable spent stamp on
+        (``kind == runout and reason == runout_needs_refill``), and stamping an exhausted
+        roll is OBSERVATION — the ledger has to survive a maintenance window, or a roll
+        that ran out during one is silently still full in the inventory. What the hold
+        removes here is the driver that would have confirmed the PAUSE and the
+        auto-resume that would have followed the refill.
+        """
+        from backend.app.models.printer_incident import KIND_RUNOUT, STATUS_ESCALATED
+
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_recovery_failed")
+        stamped = _spy_hold_stamp(monkeypatch)
+        await self._hold(db_session, printer.id)
+        state = _make_state(hms=[_runout_same_slot_hms()])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        task = await on_ams_fault(printer.id, state)
+
+        assert task is None, "no driver — the hold refuses the act, not the record"
+        assert client.calls == []
+        rows = {row.kind: row for row in await printer_incidents.open_rows(db_session, printer.id)}
+        assert rows[KIND_RUNOUT].status == STATUS_ESCALATED
+        assert [row.reason for row in await _escalation_rows(db_session, printer.id)] == ["runout_needs_refill"]
+        # The roll is recorded exhausted, naming this printer and this job.
+        assert [(pid, job) for pid, job, _st in stamped] == [(printer.id, "task-1")]
+
+    async def test_a_refill_on_a_held_printer_does_not_resume(
+        self, db_session, printer_factory, monkeypatch, _fast_resume
+    ):
+        """The operator refills the demanded slot while the printer is in maintenance.
+
+        The unheld twin of this case (``test_refill_on_the_demanded_slot_resumes_once``)
+        resumes the print. Here nothing is published: a print restarting while somebody
+        has their hands in the machine is the surprise the hold exists to prevent. The
+        hold token stays on the unit and the runout incident stays open — the operator's
+        own Resume closes it on the wire, exactly as it does today.
+        """
+        printer = await printer_factory()
+        item = await _runout_held_item(db_session, printer.id)
+        resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+        await self._hold(db_session, printer.id)
+        state = _runout_paused_state(tray_id=2)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+
+        assert client.calls == [], "no resume may be published onto a held printer"
+        assert state.state == "PAUSE"
+        resumed.assert_not_awaited()
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
+
+    async def test_the_raw_hms_page_stays_suppressed(self, db_session, printer_factory, install_settings, monkeypatch):
+        """``will_own`` is unchanged by the hold. It answers "does an incident own these
+        codes", and one does — the row this lane just opened."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await self._hold(db_session, printer.id)
+        state = _make_state()
+
+        assert await spool_recovery.will_own(db_session, printer.id, state) is True
+
+    async def test_the_startup_reentry_hands_back_no_driver(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """A restart must not give a driver back to a printer somebody is working on."""
+        from backend.app.models.printer_incident import KIND_JAM, STATUS_ESCALATED, STATUS_RECOVERING
+
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        row = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_JAM,
+            code="0700_8010",
+            codes="jam:0700_8010",
+            slot_global_tray=0,
+            status=STATUS_RECOVERING,
+        )
+        assert row is not None
+        await self._hold(db_session, printer.id)
+        state = _make_state()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        task = await spool_recovery._reenter_recovering_incident(row.id, printer.id)
+
+        assert task is None
+        assert client.calls == []
+        db_session.expunge_all()
+        assert (await db_session.get(PrinterIncident, row.id)).status == STATUS_ESCALATED

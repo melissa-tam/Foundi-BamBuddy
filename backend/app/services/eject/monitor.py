@@ -1243,8 +1243,8 @@ class EjectCooldownMonitor:
         )
         logger.info("Eject monitor: printer %s armed %s", printer_id, type(policy).__name__)
 
-    def stand_down(self, printer_id: int, reason: str) -> None:
-        """Cancel + deregister the armed watch (no-op when nothing is armed).
+    def stand_down(self, printer_id: int, reason: str) -> asyncio.Task | None:
+        """Cancel + deregister the armed watch. Returns the cancelled task, or None.
 
         Public since 2026-09-12, because the service-hold quiesce needs exactly this
         act and must not grow a second one: the cancellation runs the watch task's own
@@ -1255,16 +1255,27 @@ class EjectCooldownMonitor:
         fans ran 6.3 h because the session was torn down first and ``prep.end()`` landed
         on ``skipped:no_client``.
 
+        **A caller that is about to DROP the session must AWAIT the returned task.**
+        ``cancel()`` only SCHEDULES the CancelledError; the ``finally`` that publishes
+        ``M106 P2 S0`` / ``M106 P3 S0`` runs on a later loop turn. The 2026-09-12 probe
+        caught exactly that gap on the deactivate path — ``[service-hold] printer 1
+        quiesced (deactivate): cooldown_ended=True`` at 07:07:08,545 and then
+        ``[cooldown-prep] … off=skipped:no_client`` at 07:07:08,546, because
+        ``update_printer`` had already deleted the client. The task is returned rather
+        than awaited here so this stays SYNC for its other caller: the policy driver
+        runs inside the authority's fan-out and may not await anything.
+
         The plate's STORED policy is deliberately untouched — this cancels a running
         watch, it does not decide anything about the plate — so
         :meth:`reconsider` can re-arm it when the hold lifts.
         """
         armed = self._armed.pop(printer_id, None)
         if armed is None:
-            return
+            return None
         if not armed.task.done():
             armed.task.cancel()
         logger.info("Eject monitor: printer %s watch cancelled (%s)", printer_id, reason)
+        return armed.task
 
     def _release_record(self, printer_id: int, task: asyncio.Task) -> None:
         """Drop the record iff it still belongs to ``task`` (never a successor's)."""

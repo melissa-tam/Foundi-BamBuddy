@@ -1338,6 +1338,7 @@ async def stop_queue_item(
     """
 
     from backend.app.models.smart_plug import SmartPlug
+    from backend.app.services.print_control import stop_as_operator
     from backend.app.services.printer_manager import printer_manager
     from backend.app.services.tasmota import tasmota_service
 
@@ -1362,25 +1363,13 @@ async def stop_queue_item(
     printer_id = item.printer_id
     auto_off_after = item.auto_off_after
 
-    # Try to send stop command to printer
-    stop_sent = False
-    try:
-        stop_sent = printer_manager.stop_print(printer_id)
-        if not stop_sent:
-            logger.warning("stop_print returned False for printer %s - printer may not be connected", printer_id)
-    except Exception as e:
-        logger.error("Error sending stop command for queue item %s: %s", item_id, e)
-
-    # Mark this printer as user-stopped BEFORE the first await so that if the
-    # MQTT on_print_complete callback fires during the db.commit() yield the flag
-    # is already set and the "failed" status will be correctly overridden to
-    # "cancelled" (preventing a spurious "print failed" notification).
-    try:
-        from backend.app.main import mark_printer_stopped_by_user
-
-        mark_printer_stopped_by_user(printer_id)
-    except Exception as _mark_err:
-        logger.warning("Failed to mark printer %s as user-stopped: %s", printer_id, _mark_err)
+    # The stop and the user-stopped mark are ONE act, owned by ``print_control``: it
+    # sends ``print.stop`` and sets the mark with nothing awaited in between, which is
+    # what this route's own comment demanded — if the MQTT on_print_complete callback
+    # fires during the db.commit() yield below, the flag is already set and the "failed"
+    # status is correctly overridden to "cancelled" (no spurious "print failed" page).
+    # It never raises, so the route keeps no guard of its own.
+    stop_sent = stop_as_operator(printer_id)
 
     # Update queue item status regardless - if printer is off, print is already stopped
     item.status = "cancelled"

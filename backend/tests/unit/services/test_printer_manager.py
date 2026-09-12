@@ -2110,21 +2110,133 @@ class TestOpenIncidentProjection:
     def test_an_open_incident_is_projected(self):
         from backend.app.services import printer_incidents
 
+        # The cache is keyed ``printer_id -> {incident_id -> payload}`` since a printer
+        # could hold several rows at once (2026-09-11), and every writer in the store
+        # produces the payload with its ``id`` in it. Seeding the older single-payload
+        # shape made this test read a STRING as a payload dict.
         printer_incidents._open_cache[7] = {
-            "kind": "runout",
-            "status": "escalated",
-            "slot_desc": "AMS A slot 3",
-            "created_at": "2026-08-09T12:00:00",
+            31: {
+                "id": 31,
+                "kind": "runout",
+                "status": "escalated",
+                "slot_desc": "AMS A slot 3",
+                "created_at": "2026-08-09T12:00:00",
+            }
         }
 
         payload = printer_state_to_dict(self._state(), printer_id=7)["open_incident"]
 
         assert payload == {
+            "id": 31,
             "kind": "runout",
             "status": "escalated",
             "slot_desc": "AMS A slot 3",
             "created_at": "2026-08-09T12:00:00",
         }
+
+
+class TestServiceHoldProjection:
+    """Maintenance mode on the status frame — its OWN field, from its own kind-scoped read.
+
+    The chip (``open_incident``) names the fault that stopped the work; ``service_hold``
+    names a hold a human declared. A printer can carry both at once, and the card renders
+    both, so neither may be derived from the other.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
+
+    def _state(self):
+        state = MagicMock()
+        state.connected = True
+        state.state = "IDLE"
+        state.temperatures = {}
+        state.hms_errors = []
+        state.raw_data = {}
+        state.stg_cur = -1
+        state.firmware_version = None
+        state.gcode_file = ""
+        state.subtask_name = ""
+        return state
+
+    def _seed(self, printer_id: int, rows: dict[int, dict]) -> None:
+        from backend.app.services import printer_incidents
+
+        printer_incidents._open_cache[printer_id] = rows
+
+    def test_an_unheld_printer_renders_null(self):
+        assert printer_state_to_dict(self._state(), printer_id=7)["service_hold"] is None
+
+    def test_no_printer_id_renders_null(self):
+        assert printer_state_to_dict(self._state())["service_hold"] is None
+
+    def test_a_held_printer_renders_since(self):
+        self._seed(
+            7,
+            {
+                9: {
+                    "id": 9,
+                    "kind": "service_hold",
+                    "status": "escalated",
+                    "slot_desc": None,
+                    "created_at": "2026-09-12T03:02:28",
+                }
+            },
+        )
+
+        assert printer_state_to_dict(self._state(), printer_id=7)["service_hold"] == {"since": "2026-09-12T03:02:28"}
+
+    def test_a_fault_alone_does_not_read_as_a_hold(self):
+        self._seed(
+            7,
+            {
+                4: {
+                    "id": 4,
+                    "kind": "runout",
+                    "status": "escalated",
+                    "slot_desc": "AMS A slot 3",
+                    "created_at": "2026-09-12T01:00:00",
+                }
+            },
+        )
+
+        frame = printer_state_to_dict(self._state(), printer_id=7)
+
+        assert frame["service_hold"] is None
+        assert frame["open_incident"]["kind"] == "runout"
+
+    def test_a_hold_and_a_fault_stand_side_by_side(self):
+        self._seed(
+            7,
+            {
+                4: {
+                    "id": 4,
+                    "kind": "runout",
+                    "status": "escalated",
+                    "slot_desc": "AMS A slot 3",
+                    "created_at": "2026-09-12T01:00:00",
+                },
+                9: {
+                    "id": 9,
+                    "kind": "service_hold",
+                    "status": "escalated",
+                    "slot_desc": None,
+                    "created_at": "2026-09-12T03:02:28",
+                },
+            },
+        )
+
+        frame = printer_state_to_dict(self._state(), printer_id=7)
+
+        # The chip names the FAULT (service_hold sorts last in KIND_PRECEDENCE on
+        # purpose), and the hold is still reported in full on its own field.
+        assert frame["open_incident"]["kind"] == "runout"
+        assert frame["service_hold"] == {"since": "2026-09-12T03:02:28"}
 
 
 class TestOccupancyProjection:

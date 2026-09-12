@@ -1282,6 +1282,33 @@ def _open_incident_payload(printer_id: int | None) -> dict | None:
     return printer_incidents.snapshot(printer_id)
 
 
+def service_hold_payload(printer_id: int | None) -> dict | None:
+    """Maintenance mode as ``{"since": iso}``, or None when the printer is not held.
+
+    ONE builder for all four construction sites (the WS serializer below, both REST
+    ``/status`` branches and the printer-list serializer), for the same reason
+    :func:`occupancy_payload` is one: a flag the printer never pushes must not be able
+    to read differently on the socket and on the poll.
+
+    A projection of the ``service_hold`` incident row, read from the incident store's
+    in-memory cache — never the DB, because this runs on every status broadcast. Only
+    JSON PRIMITIVES: the WS lane serializes this dict with a bare ``json.dumps``.
+    """
+    if not printer_id:
+        return None
+    from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+    from backend.app.services import printer_incidents
+
+    row = printer_incidents.snapshot(printer_id, kind=KIND_SERVICE_HOLD)
+    if row is None:
+        return None
+    # The ROW's presence is the hold; the timestamp is what it is. A row whose
+    # ``created_at`` somehow reads null must still project the hold — dropping the
+    # object over a missing number would hide maintenance mode from the card that gates
+    # every operator affordance on it.
+    return {"since": row.get("created_at")}
+
+
 def printer_state_to_dict(
     state: PrinterState,
     printer_id: int | None = None,
@@ -1610,6 +1637,11 @@ def printer_state_to_dict(
         # runs on every status broadcast. Lazy import for the same reason
         # _eject_watch_payload is lazy (the service imports this module).
         "open_incident": _open_incident_payload(printer_id),
+        # Maintenance mode (2026-09-12): {"since": iso} or null. Beside the incident
+        # chip and from the same store, but its OWN field and its own kind-scoped
+        # snapshot — the chip names the fault that stopped the work, while this names a
+        # hold a human declared, and the two stand side by side on one printer.
+        "service_hold": service_hold_payload(printer_id),
     }
     # Add cover URL if there's an active print and printer_id is provided
     # Include PAUSE state so skip objects modal can show cover

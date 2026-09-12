@@ -1039,3 +1039,88 @@ class TestOnPlateCleared:
 
     async def test_no_open_incident_is_not_an_error(self, db_session):
         assert await pause_recovery.on_plate_cleared(41) is False
+
+
+class TestMaintenanceModeStandsAside:
+    """Maintenance mode (2026-09-12): the prompt in front of the operator is theirs.
+
+    The sampler's two acts are the power-loss driver and the lost-Z arm, and a held
+    printer gets neither: nothing is resumed, nothing is stopped, and no hold is opened —
+    a human is at the screen, and the farm answering the prompt behind them is exactly the
+    surprise the hold exists to prevent.
+    """
+
+    async def _hold(self, db, printer_id):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        assert await printer_incidents.open_declared(db, printer_id, kind=KIND_SERVICE_HOLD) is not None
+
+    async def test_the_power_loss_prompt_is_left_to_the_operator(self, monkeypatch, db_session):
+        await _printer(db_session, 41)
+        await self._hold(db_session, 41)
+        state = _make_state()
+        client = FakeClient(state)
+        calls = _wire(monkeypatch, state, client)
+        paged = _spy(monkeypatch, "on_power_loss_hold")
+
+        for _ in range(5):  # five ~1 Hz pushes with the prompt standing
+            await _drive(41, state)
+
+        assert pause_recovery._in_flight.get(41) is None, "no driver may be spawned for a held printer"
+        assert client.calls == [], "nothing resumed"
+        assert calls == [], "nothing stopped"
+        paged.assert_not_awaited()
+        # Only the hold itself is on disk — no power-loss row was opened.
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        assert [row.kind for row in await _open_incidents(db_session, 41)] == [KIND_SERVICE_HOLD]
+
+    async def test_a_reconnect_during_the_hold_opens_no_lost_z_row(self, monkeypatch, db_session):
+        """The outage-burst arm is the other act, and it is held down by the same read."""
+        await _printer(db_session, 42)
+        await _geometry(db_session)
+        await self._hold(db_session, 42)
+        page = _spy(monkeypatch, "on_z_reference_lost")
+        anchor = time.time() - 300.0
+        state = _make_state(gcode_state="IDLE", hms=[], epoch=2, disconnected_at=anchor)
+        _wire(monkeypatch, state, None, fleet={pid: _make_state(disconnected_at=anchor + pid) for pid in range(1, 5)})
+        plate_occupancy.note_plate_detected(42, "part on the plate")
+
+        pause_recovery.note_status_push(42, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
+        pause_recovery.note_status_push(42, state)  # the reconnect edge
+        await _drain_z_arm(42)
+
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        assert [row.kind for row in await _open_incidents(db_session, 42)] == [KIND_SERVICE_HOLD]
+        page.assert_not_awaited()
+
+    async def test_releasing_the_hold_does_not_replay_the_edge(self, monkeypatch, db_session):
+        """The wire sample is still RECORDED while held, so an edge consumed during the
+        hold is not waiting to fire at the printer the moment it is released."""
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD, STATUS_RESOLVED
+
+        await _printer(db_session, 43)
+        await _geometry(db_session)
+        await self._hold(db_session, 43)
+        page = _spy(monkeypatch, "on_z_reference_lost")
+        anchor = time.time() - 300.0
+        after = _make_state(gcode_state="IDLE", hms=[], epoch=2, disconnected_at=anchor)
+        _wire(monkeypatch, after, None, fleet={pid: _make_state(disconnected_at=anchor + pid) for pid in range(1, 5)})
+        plate_occupancy.note_plate_detected(43, "part on the plate")
+
+        pause_recovery.note_status_push(43, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
+        pause_recovery.note_status_push(43, after)  # the reconnect edge, consumed by the hold
+        await _drain_z_arm(43)
+
+        row = await printer_incidents.get_open(db_session, 43, kinds={KIND_SERVICE_HOLD})
+        assert row is not None
+        await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source="operator")
+
+        pause_recovery.note_status_push(43, after)  # same epoch: no edge left to replay
+        await _drain_z_arm(43)
+
+        # The hold row (now closed) is the ONLY row this printer ever got: the released
+        # printer did not earn a lost-Z hold for an outage that happened during the hold.
+        assert [row.kind for row in await _open_incidents(db_session, 43)] == [KIND_SERVICE_HOLD]
+        page.assert_not_awaited()
