@@ -69,11 +69,18 @@ class IncidentRow(BaseModel):
 
 
 class IncidentSummary(BaseModel):
-    """The tally the audit had to hand-count: how many holds the farm ended alone."""
+    """The tally the audit had to hand-count: how many holds the farm ended alone.
+
+    ``total`` counts EQUIPMENT FAULTS. ``declared`` counts the planned holds an
+    operator opened by hand (maintenance mode), which are excluded from ``total``,
+    ``zero_human`` and ``by_outcome`` — see ``printer_incidents.summary`` — and appear
+    in ``by_kind`` like any other row. The two add up to the rows the page returned.
+    """
 
     since: datetime
     total: int
     zero_human: int
+    declared: int
     by_outcome: dict[str, int]
     by_kind: dict[str, dict[str, int]]
 

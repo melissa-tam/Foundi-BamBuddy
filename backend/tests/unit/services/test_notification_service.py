@@ -3549,3 +3549,153 @@ class TestPauseRecoveryNotifications:
         from backend.app.models.notification import NotificationProvider
 
         assert NotificationProvider.__table__.c.on_power_loss_recovery.default.arg is True
+
+
+class TestHeldPrinterSuppression:
+    """Maintenance mode: farm-reaction pages off, printer-originated alerts on.
+
+    The operator decision of 2026-09-12, at the ONE fan-out every event crosses. The
+    operator holding the printer IS the reaction — paging them about the plate they are
+    standing in front of is how a channel stops being read — while the machine's own
+    alarms (HMS, temperature, terminals, offline/online) still have every reason to speak.
+    """
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
+
+    @staticmethod
+    def _hold(printer_id: int) -> None:
+        """Put ``printer_id`` in maintenance mode, as the store's projection sees it.
+
+        ``automation_held`` is sync and DB-FREE by contract (it is asked from ~1 Hz poll
+        loops and from this fan-out), so the in-memory projection is its only input and
+        seeding it here exercises the real predicate.
+        """
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+        from backend.app.services import printer_incidents
+
+        printer_incidents._open_cache[printer_id] = {
+            7: {
+                "id": 7,
+                "kind": KIND_SERVICE_HOLD,
+                "status": "escalated",
+                "slot_desc": None,
+                "created_at": "2026-09-12T03:02:28",
+            }
+        }
+        assert printer_incidents.automation_held(printer_id) is True
+
+    @staticmethod
+    def _provider():
+        provider = MagicMock()
+        provider.id = 1
+        provider.name = "Test Provider"
+        provider.provider_type = "ntfy"
+        provider.enabled = True
+        provider.daily_digest_enabled = True  # a suppressed page is not worth summarising
+        provider.daily_digest_time = "23:59"
+        provider.config = '{"server": "https://ntfy.sh", "topic": "test"}'
+        return provider
+
+    async def _fan_out(self, service, *, event_type, printer_id):
+        with (
+            patch.object(service, "_send_to_provider", new_callable=AsyncMock) as send,
+            patch.object(service, "_queue_for_digest", new_callable=AsyncMock) as digest,
+            patch.object(service, "_update_provider_status", new_callable=AsyncMock),
+            patch.object(service, "_log_notification", new_callable=AsyncMock) as logged,
+        ):
+            send.return_value = (True, None)
+            await service._send_to_providers(
+                providers=[self._provider()],
+                title="t",
+                message="m",
+                db=AsyncMock(),
+                event_type=event_type,
+                printer_id=printer_id,
+            )
+        return send, digest, logged
+
+    def test_the_suppressed_set_is_the_farm_reaction_events(self):
+        """The membership IS the rule (the gate reads nothing else), so it is pinned."""
+        expected = {
+            "foreign_job_detected",
+            "plate_not_empty",
+            "cooldown_escalation",
+            "spool_recovery_failed",
+            "spool_out_of_rotation",
+            "print_paused_stalled",
+            "print_stalled",
+            "power_loss_hold",
+            "ams_wedged_idle",
+            "run_unit_stopped",
+        }
+
+        assert set(notification_service_module.HELD_PRINTER_SUPPRESSED_EVENTS) == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_type", sorted(notification_service_module.HELD_PRINTER_SUPPRESSED_EVENTS))
+    async def test_every_farm_reaction_event_is_suppressed_for_a_held_printer(self, service, event_type):
+        self._hold(5)
+
+        send, digest, logged = await self._fan_out(service, event_type=event_type, printer_id=5)
+
+        send.assert_not_called()
+        digest.assert_not_called()  # not sent, and not summarised tomorrow either
+        logged.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "print_complete",  # the printer finished something — it still finished it
+            "print_failed",
+            "print_stopped",
+            "printer_error",  # the HMS alert: the machine's own alarm
+            "printer_offline",
+            "ams_humidity_high",
+            "maintenance_due",
+            "z_reference_lost",  # a hold that OUTLIVES the maintenance window
+        ],
+    )
+    async def test_printer_originated_events_still_send_for_a_held_printer(self, service, event_type):
+        self._hold(5)
+
+        send, _digest, logged = await self._fan_out(service, event_type=event_type, printer_id=5)
+
+        send.assert_called_once()
+        logged.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unheld_printer_is_untouched(self, service):
+        send, digest, logged = await self._fan_out(service, event_type="plate_not_empty", printer_id=5)
+
+        send.assert_called_once()
+        digest.assert_called_once()
+        logged.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_held_printer_does_not_suppress_another_printers_page(self, service):
+        self._hold(5)
+
+        send, _digest, _logged = await self._fan_out(service, event_type="plate_not_empty", printer_id=6)
+
+        send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_fleet_wide_event_carries_no_printer_and_is_never_suppressed(self, service):
+        """No ``printer_id`` means the event is not ABOUT a printer (the queue-completed
+        page, the digest): there is nothing for a hold to be a hold of."""
+        self._hold(5)
+
+        send, _digest, _logged = await self._fan_out(service, event_type="plate_not_empty", printer_id=None)
+
+        send.assert_called_once()

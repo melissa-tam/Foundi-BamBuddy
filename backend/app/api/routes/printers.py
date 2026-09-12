@@ -41,8 +41,10 @@ from backend.app.schemas.printer import (
     PrinterStatus,
     PrinterUpdate,
     PrintOptionsResponse,
+    ServiceHoldState,
     SlotRecheckResponse,
 )
+from backend.app.services import service_hold
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     cleanup_downloaded_3mf,
@@ -54,9 +56,11 @@ from backend.app.services.bambu_ftp import (
     list_files_async,
 )
 from backend.app.services.bambu_mqtt import ams_mid_filament_change
+from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.hms_errors import current_runout_demand, hms_error_payload, runout_hold_active
 from backend.app.services.pause_recovery import on_plate_cleared
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
+from backend.app.services.print_control import stop_as_operator
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
     _eject_watch_payload,
@@ -65,6 +69,7 @@ from backend.app.services.printer_manager import (
     occupancy_payload,
     printer_manager,
     resolve_plate_id,
+    service_hold_payload,
     supports_airduct,
     supports_chamber_heater,
     supports_chamber_temp,
@@ -113,10 +118,19 @@ async def _caller_can_view_printer_secrets(user: User | None, db: AsyncSession) 
 
 
 def _serialize_printer(printer: Printer, *, include_secret: bool):
-    """Build the response shape that matches the caller's authority."""
-    if include_secret:
-        return PrinterResponseWithSecret.model_validate(printer)
-    return PrinterResponse.model_validate(printer)
+    """Build the response shape that matches the caller's authority.
+
+    ``service_hold`` is assigned after validation rather than passed in: it is the
+    incident store's process state, not a column, so ``model_validate``'s ORM read
+    cannot see it — and doing it HERE covers both ``GET /printers/`` and
+    ``GET /printers/{id}`` with one origin, which is the whole reason this helper exists.
+    """
+    model = PrinterResponseWithSecret if include_secret else PrinterResponse
+    response = model.model_validate(printer)
+    hold = service_hold_payload(printer.id)
+    if hold is not None:
+        response.service_hold = ServiceHoldState(**hold)
+    return response
 
 
 @router.get("/")
@@ -367,6 +381,10 @@ async def update_printer(
         raise HTTPException(404, "Printer not found")
 
     update_data = printer_data.model_dump(exclude_unset=True)
+    # Read the CURRENT flag before the fields are written: the two branches at the end of
+    # this route are about the TRANSITION, not the new value, and an idempotent
+    # ``is_active=False`` on an already-deactivated printer must quiesce nothing.
+    was_active = printer.is_active
 
     # Handle nested ROI object - flatten to individual columns
     if "plate_detection_roi" in update_data:
@@ -391,9 +409,24 @@ async def update_printer(
 
     # Reconnect if connection settings changed
     if any(k in update_data for k in ["ip_address", "access_code", "is_active"]):
+        if was_active and not printer.is_active:
+            # DEACTIVATION tears the MQTT session down, and every actuator the farm has
+            # armed on this printer speaks over it. Retire them WHILE the wire is still
+            # there — 2026-09-12: the session went first and 010-H2S's cooldown fans ran
+            # 6.3 h on a `prep.end()` that landed on `skipped:no_client`, while 001/009
+            # kept a phantom in-flight eject nothing could stop. Deactivation is not
+            # maintenance mode (no hold is opened here), but it needs the same stand-down.
+            await service_hold.quiesce(printer_id, cause="deactivate")
         printer_manager.disconnect_printer(printer_id)
         if printer.is_active:
             await printer_manager.connect_printer(printer)
+            if not was_active:
+                # RE-ACTIVATION changes what the plate-policy driver would answer
+                # (a watch cannot be armed on a printer with no session) without
+                # producing an occupancy transition to carry it, so the level-triggered
+                # re-run is what gives a still-gated plate its cooldown watch back
+                # instead of waiting for a restart.
+                eject_cooldown_monitor.reconsider(printer_id, "printer activated")
 
     return printer
 
@@ -495,6 +528,10 @@ async def get_printer_status(
             # and must not offer itself on an already-gated plate.
             awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
             occupancy=occupancy_payload(printer_id),
+            # Maintenance mode is the incident store's own record, so it reports with no
+            # session for the same reason the plate gate above does — and it MUST, since
+            # a deactivated printer can be held too (entering the hold is allowed there).
+            service_hold=service_hold_payload(printer_id),
             # Hardware capabilities are facts about the MODEL, not about the MQTT
             # session, so they are reportable with no session — same as the sticky
             # flags above. Load-bearing: the printer card's chamber-fan and airduct
@@ -827,6 +864,9 @@ async def get_printer_status(
         # Same builder as the WS payload and the disconnected branch above, so the
         # poll and the socket can never describe one printer's plate differently.
         occupancy=occupancy_payload(printer_id),
+        # Same builder as the WS frame and the disconnected branch — the card's hold
+        # banner must not appear on the socket push and vanish on the next poll.
+        service_hold=service_hold_payload(printer_id),
         quarantined=printer.quarantined,
         quarantine_reason=printer.quarantine_reason,
         model_mismatch=printer_manager.is_model_mismatch(printer_id),
@@ -2850,24 +2890,16 @@ async def stop_print(
     if not printer:
         raise HTTPException(404, "Printer not found")
 
-    client = printer_manager.get_client(printer_id)
-    if not client:
+    if printer_manager.get_client(printer_id) is None:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.stop_print()
-    if not success:
+    # The stop AND the user-stopped mark are one act (``print_control`` owns the pair, so
+    # the service-hold quiesce and the queue-page stop cannot drift from this one): the
+    # mark is what makes ``on_print_complete`` reclassify the firmware's
+    # "failed"/"aborted" as "cancelled", instead of the HMS heuristic in
+    # ``_dispatch_archive_update`` calling a user cancel a layer shift.
+    if not stop_as_operator(printer_id):
         raise HTTPException(502, "Failed to stop print — printer MQTT session not connected, command not delivered")
-
-    # Mark this printer as user-stopped so on_print_complete reclassifies
-    # the resulting "failed"/"aborted" MQTT status as "cancelled" — otherwise
-    # the HMS heuristic in _dispatch_archive_update mislabels user-cancels
-    # (e.g. the H2D's cancel-sequence module-0x0C HMS) as "Layer shift".
-    try:
-        from backend.app.main import mark_printer_stopped_by_user
-
-        mark_printer_stopped_by_user(printer_id)
-    except Exception as _mark_err:
-        logger.warning("Failed to mark printer %s as user-stopped: %s", printer_id, _mark_err)
 
     return {"success": True, "message": "Print stop command sent"}
 
@@ -2908,10 +2940,13 @@ async def clear_plate(
         # The gate IS that sweep's completion signal. Clearing it under the sweep would
         # release the printer into a dispatch landing on a plate the toolhead is still
         # crossing, so the operator is told to wait rather than silently overridden —
-        # ``recover_printer`` remains the explicit override.
+        # ``recover_printer`` remains the explicit override, and the copy NAMES it:
+        # "the gate clears when the sweep completes" is false once the runtime watchdog
+        # has fired (2026-09-12, 001/009-H2S — six 409s against a sweep nothing owned),
+        # and an operator who cannot see a way out clicks the same button six times.
         raise HTTPException(
             409,
-            {"code": "eject_in_flight", "message": "Eject in flight. The gate clears when the sweep completes."},
+            {"code": "eject_in_flight", "message": "Eject in flight. Use Recover to override."},
         )
     if refusal == "not_occupied":
         # Reachable only via the FINISH/FAILED limb above (no gate raised, but the

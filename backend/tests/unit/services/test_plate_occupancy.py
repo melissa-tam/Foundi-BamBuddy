@@ -382,6 +382,66 @@ class TestDeclareOccupied:
         assert po.plate_occupancy.is_plate_occupied(2) is True
 
 
+class TestRevokeLease:
+    """``revoke_lease`` is the transition ``declare_occupied`` used to inline.
+
+    A second caller (the service-hold quiesce) revokes WITHOUT declaring a plate, so
+    the rule became its own transition rather than a copy — and revoking is NOT
+    releasing: the lease object survives so ``commit_dispatch`` can identity-check it
+    and answer ``lease_revoked``, which is the refusal the scheduler unwinds on.
+    """
+
+    def _lease(self, printer_id: int = 4) -> po.DispatchLease:
+        lease = po.plate_occupancy.claim_for_dispatch(
+            printer_id, 1010, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
+        )
+        assert isinstance(lease, po.DispatchLease)
+        return lease
+
+    def test_revoke_then_commit_refuses_lease_revoked(self, clock):
+        lease = self._lease()
+
+        assert po.plate_occupancy.revoke_lease(4, "service hold") is True
+
+        assert lease.revoked is True
+        assert po.plate_occupancy.commit_dispatch(4, lease) == "lease_revoked"
+        # NOT released: the lease is still the one this printer holds, which is what
+        # makes the refusal ``lease_revoked`` rather than ``lease_unknown``.
+        assert po.plate_occupancy.snapshot(4).lease_unit_id == 1010
+
+    def test_revoke_is_idempotent_and_reports_whether_it_changed_anything(self, clock):
+        self._lease()
+
+        assert po.plate_occupancy.revoke_lease(4, "service hold") is True
+        assert po.plate_occupancy.revoke_lease(4, "service hold again") is False
+
+    def test_revoke_without_a_lease_is_false(self):
+        assert po.plate_occupancy.revoke_lease(4, "service hold") is False
+
+    def test_declare_occupied_still_revokes_through_it(self, clock):
+        """One implementation, both callers — the 2026-08-30 cure is unchanged."""
+        lease = self._lease()
+
+        assert po.plate_occupancy.declare_occupied(4, po.Evidence()) is None
+
+        assert lease.revoked is True
+        assert po.plate_occupancy.commit_dispatch(4, lease) == "lease_revoked"
+
+    def test_it_notifies_only_when_something_changed(self, clock):
+        """The fan-out describes transitions, not calls: a second revoke changed no
+        state, so it must not persist, broadcast or re-arm anything."""
+        self._lease()
+        rec = _Recorder()
+        rec.wire()
+
+        assert po.plate_occupancy.revoke_lease(4, "service hold") is True
+        first = list(rec.calls)
+        assert ("policy", "revoke_lease") in first
+
+        assert po.plate_occupancy.revoke_lease(4, "service hold") is False
+        assert rec.calls == first
+
+
 # ---------------------------------------------------------------------------
 # 4. The two claims
 # ---------------------------------------------------------------------------
@@ -744,20 +804,98 @@ class TestEjectLifecycle:
     def test_resolve_without_an_eject_refuses(self):
         assert po.plate_occupancy.resolve_eject(1, "completed") == "no_eject"
 
-    def test_drop_hydrated_eject_keeps_the_plate(self):
+    def test_drop_unowned_eject_keeps_the_plate(self):
         po.plate_occupancy.hydrate_plate(1, "subtask-A", po.EscalationOnly())
         po.plate_occupancy.hydrate_eject(1, _pending(hydrated=True))
 
-        assert po.plate_occupancy.drop_hydrated_eject(1, "reconciled: printer idle") is True
+        assert po.plate_occupancy.drop_unowned_eject(1, "reconciled: printer idle") is True
 
         view = po.plate_occupancy.snapshot(1)
         assert view.eject_purpose is None
         assert view.plate_occupied is True
 
-    def test_drop_hydrated_eject_refuses_to_touch_a_live_one(self):
+    def test_drop_unowned_eject_refuses_to_touch_a_live_one(self, caplog):
+        """A live sweep with no verdict still has a watchdog that owns its outcome."""
         _hold_live_eject(1)
-        assert po.plate_occupancy.drop_hydrated_eject(1, "reconciled") is False
+
+        with caplog.at_level("WARNING"):
+            assert po.plate_occupancy.drop_unowned_eject(1, "reconciled") is False
+
         assert po.plate_occupancy.eject_identity(1) is not None
+        assert "refusing to drop a LIVE" in caplog.text
+
+    def test_drop_unowned_eject_drops_a_stamped_live_one(self):
+        """The 2026-09-12 001/009-H2S shape: the watchdog fired, its stop went
+        undelivered and the task exited — nothing is coming to retire this record, so
+        the reconciler may dispose of it even though it was never hydrated."""
+        _hold_live_eject(1)
+        po.plate_occupancy.note_eject_started(1)
+        po.plate_occupancy.note_eject_runtime_exceeded(1, datetime.now(timezone.utc), "total")
+
+        assert po.plate_occupancy.drop_unowned_eject(1, "reconciled: printer idle") is True
+
+        assert po.plate_occupancy.eject_identity(1) is None
+        assert po.plate_occupancy.is_plate_occupied(1) is True  # the plate is untouched
+
+    def test_drop_unowned_eject_without_an_eject_is_false(self):
+        assert po.plate_occupancy.drop_unowned_eject(1, "reconciled") is False
+
+
+class TestUnownedEject:
+    """The predicate reads: the watchdog is not going to act on this record — it never
+    existed, or it has already given its verdict.
+
+    ONE predicate for both, because they mean the same operational thing — the eject is
+    registered and nothing is coming to retire it — and because the reconciler enrols on
+    it from three triggers (startup, the connected edge, the scheduler tick).
+    """
+
+    def test_no_eject_is_not_unowned(self):
+        assert po.plate_occupancy.unowned_eject(1) is False
+        _occupy(1)  # a plate alone is not an eject
+        assert po.plate_occupancy.unowned_eject(1) is False
+
+    def test_a_live_eject_with_no_verdict_is_OWNED(self):
+        """Its runtime watchdog is running and owns the outcome."""
+        _hold_live_eject(1)
+        assert po.plate_occupancy.unowned_eject(1) is False
+
+        po.plate_occupancy.note_eject_started(1)
+        assert po.plate_occupancy.unowned_eject(1) is False
+
+    def test_a_hydrated_eject_is_unowned(self):
+        """Rebuilt from a timestamp column: no estimate, so no watchdog ever armed."""
+        po.plate_occupancy.hydrate_plate(1, "subtask-A", po.EscalationOnly())
+        po.plate_occupancy.hydrate_eject(1, _pending(hydrated=True))
+
+        assert po.plate_occupancy.unowned_eject(1) is True
+
+    def test_a_stamped_verdict_makes_a_LIVE_eject_unowned(self):
+        """2026-09-12, 001/009-H2S: the deadline fired, both stops went undelivered and
+        the watchdog task exited — the record outlived its only owner."""
+        _hold_live_eject(1)
+        po.plate_occupancy.note_eject_runtime_exceeded(1, datetime.now(timezone.utc), "total")
+
+        assert po.plate_occupancy.unowned_eject(1) is True
+
+    def test_the_verdict_rides_the_view(self):
+        """The operator surfaces render the farm's own verdict, never an inference from
+        the eject's age — a long sweep and an abandoned one look identical by age."""
+        _hold_live_eject(1)
+        assert po.plate_occupancy.snapshot(1).eject_runtime_exceeded is False
+
+        po.plate_occupancy.note_eject_runtime_exceeded(1, datetime.now(timezone.utc), "total")
+
+        assert po.plate_occupancy.snapshot(1).eject_runtime_exceeded is True
+
+    def test_the_view_reports_false_with_no_eject(self):
+        assert po.plate_occupancy.snapshot(1).eject_runtime_exceeded is False
+
+    def test_current_view_is_the_evidence_free_snapshot(self):
+        """The monitor's ``reconsider`` reads it, so it must be the authority's own
+        projection rather than a second derivation."""
+        _occupy(1)
+        assert po.plate_occupancy.current_view(1) == po.plate_occupancy.snapshot(1)
 
     def test_set_policy_needs_an_occupied_plate(self):
         assert po.plate_occupancy.set_policy(1, po.FirstArticleEject(unit_id=1, run_id=1)) == "not_occupied"
@@ -874,7 +1012,7 @@ class TestNotify:
             ("eject claimed — not a release", "claim_eject", False),
             ("plate cleared — a release edge", "clear_plate", True),
             ("eject dropped — a release edge", "resolve_eject", True),
-            ("hydrated eject dropped — a release edge", "drop_hydrated", True),
+            ("unowned eject dropped — a release edge", "drop_unowned", True),
         ],
     )
     def test_kick_fires_only_on_the_two_release_edges(self, label, action, kicks):
@@ -895,11 +1033,11 @@ class TestNotify:
             _hold_live_eject(1)
             rec.wire()
             po.plate_occupancy.resolve_eject(1, "unverified")
-        elif action == "drop_hydrated":
+        elif action == "drop_unowned":
             po.plate_occupancy.hydrate_plate(1, "subtask-A", po.EscalationOnly())
             po.plate_occupancy.hydrate_eject(1, _pending(hydrated=True))
             rec.wire()
-            po.plate_occupancy.drop_hydrated_eject(1, "reconciled")
+            po.plate_occupancy.drop_unowned_eject(1, "reconciled")
 
         assert ("kick" in rec.names) is kicks, label
 

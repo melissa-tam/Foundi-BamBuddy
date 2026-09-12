@@ -5,6 +5,13 @@ its *record* (:class:`~backend.app.models.printer_incident.PrinterIncident`) —
 creation under the one-open-per-kind rule, the close and UPGRADE transitions, the
 queries the watchdogs ask, and the in-memory projection the WebSocket payload reads.
 
+Since 2026-09-12 it also holds the DECLARED kinds — a hold a human opened with a verb
+(maintenance mode), which no fault produced and no evidence closes. They ride the same
+row, the same per-kind exclusivity index and the same projection cache, and they are
+told apart by exactly two things: :func:`open_declared` (the code-less constructor)
+and :func:`automation_held` (the one predicate every automatic lane reads). The
+equipment-fault LEDGER deliberately excludes them (:func:`summary`).
+
 Why a separate module rather than more of ``spool_recovery``: three unrelated
 callers need incident FACTS without wanting the state machine — ``farm_stall``
 (hourly reminders + "is this pause owned"), ``printer_manager.printer_state_to_dict``
@@ -48,12 +55,14 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.app.models.printer_incident import (
     AMS_FAULT_KINDS,
+    DECLARED_KINDS,
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
     KIND_POWER_LOSS,
     KIND_PRECEDENCE,
     KIND_RUNOUT,
+    KIND_SERVICE_HOLD,
     KIND_Z_REFERENCE_LOST,
     RESOLUTION_WIRE,
     RESOLVE_AUTO_RESUME,
@@ -129,6 +138,12 @@ WAITING_REASON_PLATE_VISION = "plate_not_empty_printer_detected"
 # The printer rebooted with a part on the plate, so its Z datum is fiction and no eject
 # may run against it. Cleared by the human who removes the part.
 WAITING_REASON_Z_REFERENCE_LOST = "z_reference_lost"
+# An operator put this printer in maintenance mode, so every automatic lane stands
+# down. Nothing is wrong with the machine — the token exists for vocabulary hygiene
+# (``waiting_reason_for`` RAISES on an unregistered kind and ``RECOVERY_WAITING_REASONS``
+# is derived from the table below), and because a unit left pending on a held printer
+# should say why rather than reading as an unexplained wait.
+WAITING_REASON_SERVICE_HOLD = "printer_service_hold"
 
 # The tokens an INCIDENT owns. A hold that resolves clears only these — an unrelated
 # hold another owner stamped (low filament, a stagger wait) must survive a resume the
@@ -147,6 +162,7 @@ _WAITING_REASON_BY_KIND: dict[str, str] = {
     KIND_POWER_LOSS: WAITING_REASON_POWER_LOSS,
     KIND_PLATE_VISION: WAITING_REASON_PLATE_VISION,
     KIND_Z_REFERENCE_LOST: WAITING_REASON_Z_REFERENCE_LOST,
+    KIND_SERVICE_HOLD: WAITING_REASON_SERVICE_HOLD,
 }
 
 # The EXTERNAL overrides of the table above, by kind. ``external`` never changes
@@ -169,9 +185,9 @@ RECOVERY_WAITING_REASONS = (
 
 
 def resolution_class(kind: str, *, external: bool = False) -> str:
-    """What ENDS a hold of this kind on this hardware: ``wire`` / ``repair`` / ``operator``.
+    """What ENDS a hold of this kind on this hardware: ``wire`` / ``repair`` / ``operator`` / ``declared``.
 
-    The one reading of the model's ``RESOLVES_ON`` table, so the three literals are
+    The one reading of the model's ``RESOLVES_ON`` table, so the four literals are
     spelled once and every close path reads the same rule. It REPLACED the boolean
     ``resolves_on_operator``, which could only ever answer one of three questions:
     both of its callers were in fact asking "may the WIRE close this?", and with a
@@ -187,7 +203,9 @@ def resolution_class(kind: str, *, external: bool = False) -> str:
 
     An unregistered KIND answers ``wire`` — the pre-existing safe direction: a hold
     that closes too readily is visible, one that never closes blocks the printer
-    forever.
+    forever. A ``declared`` hold is the one class that reverses that preference, which
+    is precisely why it is registered rather than defaulted: it must NOT close on its
+    own, because the printer it holds may have a human's hands inside it.
     """
     resolution = RESOLVES_ON.get((kind, external))
     if resolution is not None:
@@ -358,6 +376,26 @@ def hold_blocks_dispatch(printer_id: int | None) -> bool:
     return bool(_open_cache.get(printer_id))
 
 
+def automation_held(printer_id: int | None) -> bool:
+    """Has a human DECLARED this printer out of every automatic lane? Pure, DB-free, sync.
+
+    THE one predicate the automation lanes read — the :func:`snapshot` /
+    :func:`hold_blocks_dispatch` idiom, for the same reason: it is asked from ~1 Hz
+    poll loops and from synchronous decision points (the plate-policy driver, the
+    notification fan-out, the hourly nag) that may not touch the DB.
+
+    It is deliberately NOT :func:`hold_blocks_dispatch`. That question is "may work go
+    onto this printer", which EVERY open hold answers no to; this one is "is this
+    printer's automation standing down because somebody said so" — a jam blocks
+    dispatch while the farm keeps trying to recover it, whereas a declared hold means
+    hands are in the machine and nothing automatic may act at all.
+
+    Membership in :data:`DECLARED_KINDS` is the whole rule, so a second declared kind
+    joins every lane by registering in the model rather than by editing them.
+    """
+    return bool(open_kinds(printer_id) & DECLARED_KINDS)
+
+
 def cached_kind(printer_id: int, incident_id: int) -> str | None:
     """The KIND the open-incident cache holds for ``incident_id``, or ``None``.
 
@@ -506,16 +544,93 @@ async def open_new(
     slot_global_tray: int | None,
     status: str = STATUS_RECOVERING,
 ) -> PrinterIncident | None:
-    """Create an open incident for this printer, or ``None`` when one already owns it.
+    """Create an open FAULT incident for this printer, or ``None`` when one owns it.
+
+    The fault-shaped constructor: ``code``/``codes`` are the triggering HMS
+    fingerprint and ``slot_global_tray`` the slot the firmware attributed. A kind with
+    no fault behind it uses :func:`open_declared` instead of passing empty strings
+    through here.
 
     Two guards, deliberately both: a pre-check (the ordinary case, so the common path
     logs a reason instead of raising) and the partial unique indexes (the race). A
     caller that gets ``None`` must treat the printer as already owned FOR THIS KIND.
+    """
+    return await _open_row(
+        db,
+        printer_id=printer_id,
+        job_id=job_id,
+        item_id=item_id,
+        kind=kind,
+        code=code,
+        codes=codes,
+        slot_global_tray=slot_global_tray,
+        status=status,
+    )
+
+
+async def open_declared(
+    db: AsyncSession,
+    printer_id: int,
+    *,
+    kind: str,
+    status: str = STATUS_ESCALATED,
+) -> PrinterIncident | None:
+    """Open a DECLARED hold — a human's statement, with no fault behind it.
+
+    The constructor for the code-less kinds (:data:`DECLARED_KINDS`), so a caller
+    that has nothing to say about a job, a code or a slot does not have to pass empty
+    strings through the fault-shaped :func:`open_new`: ``job_id=""``, ``code=""``,
+    ``codes=""``, ``item_id=None``, ``slot_global_tray=None`` are properties of the
+    KIND and belong here rather than at every call site.
+
+    ``status`` defaults to ``escalated`` because a declared hold is a human's from the
+    instant it opens — nothing is "recovering" it — and ``escalated_at`` is then when
+    the human took the printer, which is the age its banner and the ledger read.
+
+    Same idempotency and race contract as :func:`open_new` (it shares the body):
+    ``None`` means this printer already carries an open row of this kind, i.e. the
+    hold the caller was about to open is already standing. Raises ``ValueError`` for
+    any kind outside :data:`DECLARED_KINDS` — a fault opened with no fault
+    fingerprint would be a row nothing can classify.
+    """
+    if kind not in DECLARED_KINDS:
+        raise ValueError(f"{kind!r} is not a declared incident kind (expected one of {sorted(DECLARED_KINDS)})")
+    return await _open_row(
+        db,
+        printer_id=printer_id,
+        job_id="",
+        item_id=None,
+        kind=kind,
+        code="",
+        codes="",
+        slot_global_tray=None,
+        status=status,
+    )
+
+
+async def _open_row(
+    db: AsyncSession,
+    *,
+    printer_id: int,
+    job_id: str,
+    item_id: int | None,
+    kind: str,
+    code: str,
+    codes: str,
+    slot_global_tray: int | None,
+    status: str,
+) -> PrinterIncident | None:
+    """The ONE open transition behind :func:`open_new` and :func:`open_declared`.
+
+    The two public constructors differ only in what a caller is expected to KNOW, so
+    the exclusivity pre-check, the IntegrityError race report, the cache refresh and
+    the OPENED log line live here once.
 
     The pre-check is kind-SCOPED and mirrors the database exactly: an AMS kind is
     refused by any open AMS row (the three are readings of one AMS), and every other
     kind only by an open row of its own kind — so a lost-Z hold opens beside a jam,
-    which is the collision that let an eject run against a fabricated Z datum.
+    which is the collision that let an eject run against a fabricated Z datum, and a
+    service hold stands beside whatever fault the printer already carries.
     """
     scope = AMS_FAULT_KINDS if kind in AMS_FAULT_KINDS else {kind}
     if await get_open(db, printer_id, kinds=scope) is not None:
@@ -766,16 +881,32 @@ def outcome_of(incident: PrinterIncident) -> str:
 
 
 def summary(rows: list[PrinterIncident]) -> dict:
-    """The tally over ``rows``: total, zero-human count, and counts by outcome and by kind."""
+    """The tally over ``rows``: total, zero-human count, declared count, and the two breakdowns.
+
+    **A DECLARED row is counted in ``by_kind`` and nowhere else** (2026-09-12). This
+    is the EQUIPMENT-FAULT ledger — "what has the farm recovered from by itself, and
+    what did a human have to finish" — and a planned maintenance hold is neither: it
+    has no fault, it produced no page, and nobody "recovered" from it. Leaving it in
+    ``total`` would dilute the zero-human ratio by exactly the amount of maintenance
+    the shop does, and its ``by_outcome`` bucket would read ``held`` / ``human_resolved``
+    as though a machine had broken. It still appears under ``by_kind`` (the rows exist
+    and are worth seeing) and its own count comes back as ``declared``, so the two
+    figures stay reconcilable: ``total + declared == len(rows)``.
+    """
     by_outcome = dict.fromkeys(OUTCOMES, 0)
     by_kind: dict[str, dict[str, int]] = {}
+    declared = 0
     for row in rows:
         outcome = outcome_of(row)
-        by_outcome[outcome] += 1
         by_kind.setdefault(row.kind, dict.fromkeys(OUTCOMES, 0))[outcome] += 1
+        if row.kind in DECLARED_KINDS:
+            declared += 1
+            continue
+        by_outcome[outcome] += 1
     return {
-        "total": len(rows),
+        "total": len(rows) - declared,
         "zero_human": by_outcome[OUTCOME_AUTO_RECOVERED],
+        "declared": declared,
         "by_outcome": by_outcome,
         "by_kind": by_kind,
     }

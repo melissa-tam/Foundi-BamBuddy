@@ -656,7 +656,10 @@ class TestPrintersAPI:
         The gate IS that sweep's completion signal: clearing it under the toolhead
         would release the printer into a dispatch landing on a plate the sweep is
         still crossing. The operator is told to wait rather than silently overridden —
-        ``recover`` remains the explicit override."""
+        ``recover`` remains the explicit override, and since 2026-09-12 the copy NAMES
+        it: "the gate clears when the sweep completes" is false once the runtime
+        watchdog has fired, and an operator with no named way out clicks the same
+        button six times (001/009-H2S, 03:00-03:30)."""
         from backend.app.services.plate_occupancy import Evidence, PendingEject, plate_occupancy
         from backend.app.services.printer_manager import printer_manager
 
@@ -675,7 +678,7 @@ class TestPrintersAPI:
         assert response.status_code == 409, response.text
         assert response.json()["detail"] == {
             "code": "eject_in_flight",
-            "message": "Eject in flight. The gate clears when the sweep completes.",
+            "message": "Eject in flight. Use Recover to override.",
         }
         assert plate_occupancy.is_plate_occupied(printer.id) is True
 
@@ -1441,20 +1444,54 @@ class TestPrintControlAPI:
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_stop_print_success(self, async_client: AsyncClient, printer_factory):
-        """Verify successful stop print request."""
+        """Verify successful stop print request.
+
+        The stop and the user-stopped MARK are one act, owned by ``print_control`` since
+        2026-09-12 (three callers needed the pair — this route, the queue-page stop and
+        the service-hold quiesce), so the route's collaborator is that service and the
+        mark is part of what "stopped" means here.
+        """
+        import backend.app.main as main_module
+        from backend.app.services import print_control
+
         printer = await printer_factory(name="Printing Printer")
+        marked: list[int] = []
 
-        mock_client = MagicMock()
-        mock_client.stop_print.return_value = True
-
-        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
-            mock_pm.get_client.return_value = mock_client
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch.object(print_control.printer_manager, "stop_print", MagicMock(return_value=True)) as stop,
+            patch.object(main_module, "mark_printer_stopped_by_user", marked.append),
+        ):
+            mock_pm.get_client.return_value = MagicMock()  # connected
 
             response = await async_client.post(f"/api/v1/printers/{printer.id}/print/stop")
 
             assert response.status_code == 200
             assert response.json()["success"] is True
-            mock_client.stop_print.assert_called_once()
+            stop.assert_called_once_with(printer.id)
+            assert marked == [printer.id]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_stop_print_undelivered_is_502(self, async_client: AsyncClient, printer_factory):
+        """A connected printer whose publish did not land is still a failed stop: the
+        route keeps its own 502, and the service reports the delivery, not the route."""
+        import backend.app.main as main_module
+        from backend.app.services import print_control
+
+        printer = await printer_factory(name="Wedged Printer")
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch.object(print_control.printer_manager, "stop_print", MagicMock(return_value=False)),
+            patch.object(main_module, "mark_printer_stopped_by_user", MagicMock()),
+        ):
+            mock_pm.get_client.return_value = MagicMock()
+
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/print/stop")
+
+            assert response.status_code == 502
+            assert "not delivered" in response.json()["detail"]
 
     # ========================================================================
     # Pause print endpoint

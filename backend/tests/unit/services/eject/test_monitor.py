@@ -581,6 +581,118 @@ class TestPolicyDriverArming:
         assert EjectCooldownMonitor().request_release_now(7) is False
 
 
+class TestServiceHoldGate:
+    """A printer a human has DECLARED held wants no releasing watch at all.
+
+    ``_desired_policy`` is the ONE place a stored plate policy becomes a running
+    watch, so the automation hold is read there and nowhere else — one read covers the
+    cooldown watch and its fans, the FA watch, the foreign auto-eject and even
+    ``EscalationOnly``'s 90-minute foreign-deposit page. It is LEVEL-triggered, which
+    is what lets ``reconsider`` re-arm the STORED policy when the hold lifts: the hold
+    never touches the plate.
+
+    The 2026-09-12 shape it closes: 010-H2S's cooldown fans ran 22 821 s (6.3 h)
+    because the maintenance toggle tore the session down under an armed watch, which
+    then polled a dead socket — a disconnected tick being non-terminal by design.
+    """
+
+    @pytest.fixture()
+    def held(self, monkeypatch):
+        """The declared-hold predicate, steerable per printer id."""
+        holds: set[int] = set()
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid in holds)
+        return holds
+
+    def test_desired_policy_returns_none_for_a_held_printer(self, held):
+        mon = EjectCooldownMonitor()
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        view = plate_occupancy.snapshot(7)
+
+        assert mon._desired_policy(7, view) == CooldownEject(unit_id=42, run_id=9)
+
+        held.add(7)
+        assert mon._desired_policy(7, view) is None
+        # ...and only that printer: the predicate is per printer, not a global flag.
+        assert mon._desired_policy(8, view) == CooldownEject(unit_id=42, run_id=9)
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            CooldownEject(unit_id=42, run_id=9),
+            FirstArticleEject(unit_id=43, run_id=9),
+            ForeignAutoEject(profile_id=5, threshold_c=33.0),
+            EscalationOnly(),
+        ],
+    )
+    def test_a_held_printer_arms_nothing_for_any_policy(self, spawns, held, policy):
+        """Including the escalation-only hold: paging a human about the plate they are
+        standing in front of is exactly what maintenance mode is for."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        held.add(7)
+
+        _occupy(7, policy)
+
+        assert spawns == []
+        assert mon._armed == {}
+        # The PLATE is untouched — the policy is stored, just not running.
+        assert plate_occupancy.snapshot(7).plate_policy == policy
+
+    def test_reconsider_cancels_an_armed_watch_when_the_hold_is_entered(self, spawns, held):
+        """Entering a hold is not an occupancy transition, so nothing fans out — this is
+        the level-triggered re-read that makes it act anyway."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        armed = mon._armed[7].task
+
+        held.add(7)
+        mon.reconsider(7, "service hold entered")
+
+        assert armed.cancelled is True
+        assert mon._armed == {}
+        assert len(spawns) == 1  # nothing was armed in its place
+
+    def test_reconsider_re_arms_the_stored_policy_when_the_hold_is_released(self, spawns, held):
+        """The liveness half: a plate still gated under CooldownEject resumes its
+        cooldown and will auto-eject at threshold, with no restart and no second
+        decision table."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        held.add(7)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        assert mon._armed == {}
+
+        held.discard(7)
+        mon.reconsider(7, "service hold released")
+
+        assert [t.name for t in spawns] == ["eject-cooldown-watch-7"]
+        assert mon._armed[7].policy == CooldownEject(unit_id=42, run_id=9)
+
+    def test_reconsider_is_idempotent_on_an_unheld_printer(self, spawns, held):
+        """It re-runs the driver over the CURRENT view, and the driver respawns only on
+        a policy CHANGE — so a second call must not lose the watch's elapsed cooldown."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        _occupy(7, CooldownEject(unit_id=42, run_id=9))
+        first = mon._armed[7].task
+
+        mon.reconsider(7, "printer re-activated")
+
+        assert mon._armed[7].task is first
+        assert first.cancelled is False
+        assert len(spawns) == 1
+
+    def test_reconsider_on_a_clear_plate_arms_nothing(self, spawns, held):
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+
+        mon.reconsider(7, "service hold released")
+
+        assert spawns == []
+        assert mon._armed == {}
+
+
 class TestEjectTimerHygiene:
     """Level-triggered: whenever no eject is registered, both eject timers are dropped."""
 
@@ -1791,7 +1903,7 @@ class TestCooldownPrepWiring:
         task = asyncio.create_task(mon._watch(7, 42, release_now=asyncio.Event()))
         mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=42, run_id=None), task=task)
         await waiting.wait()
-        mon._cancel(7, "plate cleared by an operator")
+        mon.stand_down(7, "plate cleared by an operator")
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
@@ -1851,7 +1963,7 @@ class TestCooldownPrepWiring:
         prep = _PrepRecorder()
         task = await self._cancelled_watch(monkeypatch, mon, prep)
 
-        mon._cancel(7, "plate cleared")  # no successor
+        mon.stand_down(7, "plate cleared")  # no successor
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
@@ -1868,7 +1980,7 @@ class TestCooldownPrepWiring:
         prep = _PrepRecorder()
         task = await self._cancelled_watch(monkeypatch, mon, prep)
 
-        mon._cancel(7, "policy changed to CooldownEject")
+        mon.stand_down(7, "policy changed to CooldownEject")
         mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=43, run_id=None), task=_FakeTask("successor"))
         if successor_begins_first:
             await monitor_mod.cooldown_prep.begin(
@@ -1891,7 +2003,7 @@ class TestCooldownPrepWiring:
         prep = _PrepRecorder()
         task = await self._cancelled_watch(monkeypatch, mon, prep)
 
-        mon._cancel(7, "policy changed to EscalationOnly")
+        mon.stand_down(7, "policy changed to EscalationOnly")
         mon._armed[7] = _ArmedWatch(policy=EscalationOnly(), task=_FakeTask("successor"))
         with contextlib.suppress(asyncio.CancelledError):
             await task

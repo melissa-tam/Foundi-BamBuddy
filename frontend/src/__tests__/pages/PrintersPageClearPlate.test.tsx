@@ -96,9 +96,9 @@ describe('PrintersPage clear-plate affordance (global toggle off)', () => {
 
     await user.click(await screen.findByRole('button', { name: /mark plate as cleared/i }));
 
-    // The i18n'd refusal, never the backend English.
-    expect(
-      await screen.findByText('Eject in flight. The gate clears when the sweep completes.'),
-    ).toBeInTheDocument();
+    // The i18n'd refusal, never the backend English. The copy now names the
+    // way out: "the gate clears when the sweep completes" is false once the
+    // eject watchdog has fired, and Recover is the only override.
+    expect(await screen.findByText(/use recover to override/i)).toBeInTheDocument();
   });
 });

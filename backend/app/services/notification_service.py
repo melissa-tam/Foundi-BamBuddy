@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.notification import NotificationDigestQueue, NotificationLog, NotificationProvider
 from backend.app.models.notification_template import NotificationTemplate
-from backend.app.services import notify_dedup
+from backend.app.services import notify_dedup, printer_incidents
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,35 @@ _USER_AGENT = "Bambuddy/1.0 (+https://github.com/maziggy/bambuddy)"
 # 8 minutes). One hour is far above a scheduler tick and far below the timescale on
 # which an operator would want a genuine reminder.
 _QUEUE_WAITING_RENOTIFY_S = 3600.0
+
+# The FARM-REACTION events: a page whose subject is something the farm decided to do (or
+# refused to do) about a printer. Every one of them is suppressed while that printer is in
+# maintenance mode, because the operator holding the printer IS the reaction — they put it
+# in the hold, they are standing at it, and paging them about the plate they are looking at
+# is how a channel stops being read (operator decision, 2026-09-12).
+#
+# What is deliberately NOT here: everything PRINTER-originated. HMS and temperature alarms,
+# print complete / stopped / failed, offline / online, the user's own print emails — those
+# are the machine talking, not the farm reacting, and a printer in maintenance still has
+# every reason to say them. ``z_reference_lost`` is likewise absent: it pages about a hold
+# that outlives the maintenance window and refuses every later eject, so it must be seen.
+#
+# Membership is the WHOLE rule (the ONE gate is ``_send_to_providers``), so a new
+# farm-reaction event joins by being named here rather than by editing any emitter.
+HELD_PRINTER_SUPPRESSED_EVENTS: frozenset[str] = frozenset(
+    {
+        "foreign_job_detected",  # a print the farm did not start — nothing for it to do while held
+        "plate_not_empty",  # the plate the operator is standing in front of
+        "cooldown_escalation",  # the cooldown the hold just stood down
+        "spool_recovery_failed",  # the AMS fault the hold recorded and declined to act on
+        "spool_out_of_rotation",  # the farm taking a spool out of rotation
+        "print_paused_stalled",  # a pause nobody answered — the hold IS the answer
+        "print_stalled",  # a print the farm stopped tracking
+        "power_loss_hold",  # the power-loss prompt pause-recovery stands aside from while held
+        "ams_wedged_idle",  # the wedged-AMS refusal
+        "run_unit_stopped",  # the quiesce's own stop, among others
+    }
+)
 
 
 def _looks_like_cloudflare_challenge(response: httpx.Response) -> bool:
@@ -902,7 +931,24 @@ class NotificationService:
 
         All notifications are always sent immediately. If digest mode is enabled,
         the notification is ALSO queued for the daily digest summary.
+
+        THE one fan-out every event crosses, which is why the held-printer suppression
+        lives here: one read of ``printer_incidents.automation_held`` covers all ten
+        farm-reaction events (:data:`HELD_PRINTER_SUPPRESSED_EVENTS`) instead of ten
+        emitters each growing a gate that the eleventh would forget.
         """
+        if printer_id is not None and event_type in HELD_PRINTER_SUPPRESSED_EVENTS:
+            if printer_incidents.automation_held(printer_id):
+                # Not sent, and not queued for the digest either: a page an operator
+                # should never have received is not worth summarising tomorrow. INFO,
+                # because the absence of a page has to be explainable from the log.
+                logger.info(
+                    "notification %s for printer %s suppressed: printer in maintenance mode",
+                    event_type,
+                    printer_id,
+                )
+                return
+
         for provider in providers:
             try:
                 # Always send notification immediately

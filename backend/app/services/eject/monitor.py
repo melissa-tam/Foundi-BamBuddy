@@ -50,6 +50,7 @@ from sqlalchemy import select
 
 from backend.app.core.tasks import spawn_background_task
 from backend.app.schemas.settings import AppSettings
+from backend.app.services import printer_incidents
 from backend.app.services.eject import cooldown_prep, remote as eject_remote
 from backend.app.services.plate_occupancy import (
     CooldownEject,
@@ -902,19 +903,25 @@ async def _reconcile_one(
     max_wait_s: int,
     sleep: Callable[[float], Awaitable[None]],
 ) -> None:
-    """Reconcile ONE hydrated printer's pending eject against the live state (W1.2).
+    """Reconcile ONE printer's UNOWNED pending eject against the live state (W1.2).
 
     Polls until the printer reconnects (<= ``max_wait_s``), then applies the decision
     table: RUNNING/PAUSE+name-match -> the sweep is still in flight, so stamp its start
-    and leave it for the live terminal; RUNNING/PAUSE+mismatch -> drop the hydrated
-    eject, gate kept; FINISH+match -> replay the terminal as ``completed`` (production
-    gate clear / FA finalise); FAILED+match -> replay it as ``failed`` (quarantine, gate
-    kept); IDLE / unverifiable / never reconnects -> drop the hydrated eject, gate kept
-    for a human (never clear a gate on guesswork).
+    and leave it for the live terminal — UNLESS the watchdog's verdict is already
+    stamped, in which case the kill it could not deliver is re-driven now that there is
+    a session; RUNNING/PAUSE+mismatch -> drop the unowned eject, gate kept; FINISH+match
+    -> replay the terminal as ``completed`` (production gate clear / FA finalise);
+    FAILED+match -> replay it as ``failed`` (quarantine, gate kept); IDLE / unverifiable
+    / never reconnects -> drop the unowned eject, gate kept for a human (never clear a
+    gate on guesswork).
 
     Every verdict acts through the plate-occupancy authority, so the PLATE half of each
-    decision is the authority's rule rather than this table's: dropping a hydrated eject
-    deliberately leaves the plate exactly as the durable columns rebuilt it.
+    decision is the authority's rule rather than this table's: dropping an unowned eject
+    deliberately leaves the plate exactly as it stood.
+
+    The enrolment predicate is ``plate_occupancy.unowned_eject`` and the poll is the
+    only thing that makes this the STARTUP body — :func:`reconcile_pending_eject` is
+    the same table over a printer already known to be connected.
     """
     from backend.app.core.database import async_session
     from backend.app.services import farm_policy
@@ -927,7 +934,7 @@ async def _reconcile_one(
         if state is not None and getattr(state, "connected", False):
             break
         if waited >= max_wait_s:
-            plate_occupancy.drop_hydrated_eject(printer_id, "printer never reconnected after restart")
+            plate_occupancy.drop_unowned_eject(printer_id, "printer never reconnected after restart")
             logger.warning(
                 "Eject monitor: printer %s never reconnected within %ss — pending eject dropped, gate kept for a human",
                 printer_id,
@@ -946,6 +953,20 @@ async def _reconcile_one(
 
     if live in ("RUNNING", "PAUSE"):
         if name_matches:
+            identity = plate_occupancy.eject_identity(printer_id)
+            if identity is not None and identity.runtime_exceeded_at is not None:
+                # The watchdog already decided this sweep must stop and could not
+                # deliver the command — the printer was off the wire. It is back, and
+                # still sweeping: re-drive the ONE kill path now rather than leaving a
+                # sweep nobody is watching to run itself out (001/009-H2S 2026-09-12).
+                logger.warning(
+                    "Eject monitor: printer %s reconnected still running its eject after the deadline fired "
+                    "(verdict %s) — re-driving the stop",
+                    printer_id,
+                    identity.runtime_exceeded_at,
+                )
+                await eject_remote.redrive_eject_stop(printer_id, stage="reconnect")
+                return
             # The sweep survived the restart and is still executing. Stamp the START we
             # never observed so the eject's age reads honestly on every operator
             # surface; no watchdog arms off it (a hydrated record carries no estimate).
@@ -955,7 +976,7 @@ async def _reconcile_one(
                 printer_id,
             )
             return
-        plate_occupancy.drop_hydrated_eject(printer_id, f"printer is running a non-eject job ({subtask_name!r})")
+        plate_occupancy.drop_unowned_eject(printer_id, f"printer is running a non-eject job ({subtask_name!r})")
         logger.warning(
             "Eject monitor: printer %s is running a non-eject job (%r) post-restart — pending dropped, gate kept",
             printer_id,
@@ -999,21 +1020,13 @@ async def _reconcile_one(
 
     # IDLE / unknown state, or a terminal state whose name does not match: never
     # clear a gate on guesswork. Drop the pending and leave the gate for a human.
-    plate_occupancy.drop_hydrated_eject(
-        printer_id, f"unverifiable post-restart (state={live!r}, name={subtask_name!r})"
-    )
+    plate_occupancy.drop_unowned_eject(printer_id, f"unverifiable post-restart (state={live!r}, name={subtask_name!r})")
     logger.warning(
         "Eject monitor: printer %s eject unverifiable post-restart (state=%r, name=%r) — pending dropped, gate kept",
         printer_id,
         live,
         subtask_name,
     )
-
-
-def _hydrated_eject(printer_id: int) -> bool:
-    """True when this printer's eject came from the durable stamp, not a live dispatch."""
-    identity = plate_occupancy.eject_identity(printer_id)
-    return identity is not None and identity.hydrated
 
 
 async def _reconcile_one_guarded(
@@ -1031,6 +1044,34 @@ async def _reconcile_one_guarded(
         logger.exception("Eject monitor: pending-eject reconcile failed for printer %s", printer_id)
 
 
+async def reconcile_pending_eject(
+    printer_id: int,
+    *,
+    manager=printer_manager,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Reconcile ONE printer's unowned eject NOW — the two non-startup triggers.
+
+    The connected edge (``main.on_printer_status_change``, under the same
+    ``connection_epoch`` latch as ``reconcile_stale_active_prints``) and the scheduler
+    tick's dead-claim sweep (``farm_stall``) both know the printer is CONNECTED, so
+    this skips the reconnect poll entirely and runs the decision table against the
+    state that is already there: ``max_wait_s=0`` means "answer with what the manager
+    reports, or drop the record".
+
+    It is a NO-OP unless ``plate_occupancy.unowned_eject`` holds — the same enrolment
+    predicate the startup sweep uses — so a live sweep under a running watchdog is
+    never touched by a trigger that merely noticed the printer, and a trigger that
+    fires twice costs one predicate read.
+
+    Guarded like :func:`_reconcile_one_guarded`: both callers spawn it as a background
+    task beside work that must not be aborted by one printer's reconcile failing.
+    """
+    if not plate_occupancy.unowned_eject(printer_id):
+        return
+    await _reconcile_one_guarded(printer_id, manager=manager, poll_s=_RECONCILE_POLL_S, max_wait_s=0, sleep=sleep)
+
+
 async def reconcile_pending_ejects_on_startup(
     *,
     manager=printer_manager,
@@ -1038,11 +1079,15 @@ async def reconcile_pending_ejects_on_startup(
     max_wait_s: int = _RECONCILE_MAX_WAIT_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> int:
-    """Reconcile every hydrated pending eject after a restart (W1.2 background task).
+    """Reconcile every UNOWNED pending eject after a restart (W1.2 background task).
 
     Spawned from the lifespan AFTER ``plate_occupancy_store.hydrate()``. Returns the
     number of printers it STARTED reconciling. ``manager``/``sleep`` are injectable for
     testing.
+
+    Enrolment is ``plate_occupancy.unowned_eject`` — at startup that is every hydrated
+    record (nothing else can exist yet), and stating it as the authority's predicate is
+    what lets the two live triggers share this body instead of growing a second table.
 
     The printers are reconciled CONCURRENTLY, one background task each. Serially, a
     single disconnected printer held every other printer behind its 900 s reconnect cap
@@ -1052,7 +1097,7 @@ async def reconcile_pending_ejects_on_startup(
     printer's own transition through the authority), so concurrency costs nothing but
     the wake-ups.
     """
-    printer_ids = [pid for pid in plate_occupancy.printers_with_lease_or_eject() if _hydrated_eject(pid)]
+    printer_ids = [pid for pid in plate_occupancy.printers_with_lease_or_eject() if plate_occupancy.unowned_eject(pid)]
     if not printer_ids:
         return 0
     for printer_id in printer_ids:
@@ -1113,22 +1158,54 @@ class EjectCooldownMonitor:
         if not view.eject_present:
             eject_remote.cancel_eject_timers(printer_id)
 
-        desired = self._desired_policy(view)
+        desired = self._desired_policy(printer_id, view)
         armed = self._armed.get(printer_id)
         if desired is None:
             if armed is not None:
-                self._cancel(printer_id, f"{cause} — plate no longer watchable")
+                self.stand_down(printer_id, f"{cause} — plate no longer watchable")
             return
         if armed is not None and armed.policy == desired:
             return
         if armed is not None:
-            self._cancel(printer_id, f"{cause} — policy changed to {type(desired).__name__}")
+            self.stand_down(printer_id, f"{cause} — policy changed to {type(desired).__name__}")
         self._arm(printer_id, desired)
 
+    def reconsider(self, printer_id: int, cause: str) -> None:
+        """Re-run the driver over the authority's CURRENT view. Idempotent.
+
+        The level-triggered escape hatch: :meth:`on_occupancy_change` fires from the
+        authority's fan-out, so a fact that changes OUTSIDE the occupancy record —
+        a service hold entered or released, a printer re-activated — changes what
+        :meth:`_desired_policy` would answer while producing no transition to carry it.
+        This asks the question again against the same view a transition would have
+        handed over, so entering a hold cancels the plate's watch and releasing it
+        re-arms the STORED policy (which the hold never touched) with no restart and no
+        second decision table.
+        """
+        self.on_occupancy_change(printer_id, plate_occupancy.current_view(printer_id), cause)
+
     @staticmethod
-    def _desired_policy(view: OccupancyView) -> OccupancyPolicy | None:
-        """Which watch this view calls for, or None for "no watch at all"."""
+    def _desired_policy(printer_id: int, view: OccupancyView) -> OccupancyPolicy | None:
+        """Which watch this printer calls for, or None for "no watch at all".
+
+        THE gate between a STORED plate policy and a RUNNING watch — the only place
+        one becomes the other — which is why the automation hold is read here and
+        nowhere else. One read covers all four policies at once: the cooldown watch and
+        its fans, the first-article watch, the foreign auto-eject, and even
+        ``EscalationOnly``'s 90-minute foreign-deposit page, because a printer a human
+        has taken for maintenance should not page anyone about the plate they are
+        standing in front of.
+
+        It is LEVEL-triggered, not edge-triggered: the plate's stored policy is
+        untouched by the hold, so :meth:`reconsider` on release re-arms exactly what
+        was armed before — a cooldown that was already running resumes as a cooldown,
+        and the 2026-09-12 fans-for-6.3-hours shape (a watch polling a dead socket
+        after the printer left the wire) cannot recur, because the watch is cancelled
+        while the session is still up and its ``finally`` can still switch the fans off.
+        """
         if not view.plate_occupied or view.eject_present:
+            return None
+        if printer_incidents.automation_held(printer_id):
             return None
         return view.plate_policy
 
@@ -1166,14 +1243,39 @@ class EjectCooldownMonitor:
         )
         logger.info("Eject monitor: printer %s armed %s", printer_id, type(policy).__name__)
 
-    def _cancel(self, printer_id: int, reason: str) -> None:
-        """Cancel + deregister the armed watch (no-op when nothing is armed)."""
+    def stand_down(self, printer_id: int, reason: str) -> asyncio.Task | None:
+        """Cancel + deregister the armed watch. Returns the cancelled task, or None.
+
+        Public since 2026-09-12, because the service-hold quiesce needs exactly this
+        act and must not grow a second one: the cancellation runs the watch task's own
+        ``finally``, which retires the :mod:`cooldown_prep` — plate hold released, fans
+        commanded OFF — and it asks ``_cooldown_armed`` whether any successor still
+        wants them, so the fans-off decision stays a property of the PRINTER. Calling it
+        while the MQTT session is still up is the whole point: the 2026-09-12 010-H2S
+        fans ran 6.3 h because the session was torn down first and ``prep.end()`` landed
+        on ``skipped:no_client``.
+
+        **A caller that is about to DROP the session must AWAIT the returned task.**
+        ``cancel()`` only SCHEDULES the CancelledError; the ``finally`` that publishes
+        ``M106 P2 S0`` / ``M106 P3 S0`` runs on a later loop turn. The 2026-09-12 probe
+        caught exactly that gap on the deactivate path — ``[service-hold] printer 1
+        quiesced (deactivate): cooldown_ended=True`` at 07:07:08,545 and then
+        ``[cooldown-prep] … off=skipped:no_client`` at 07:07:08,546, because
+        ``update_printer`` had already deleted the client. The task is returned rather
+        than awaited here so this stays SYNC for its other caller: the policy driver
+        runs inside the authority's fan-out and may not await anything.
+
+        The plate's STORED policy is deliberately untouched — this cancels a running
+        watch, it does not decide anything about the plate — so
+        :meth:`reconsider` can re-arm it when the hold lifts.
+        """
         armed = self._armed.pop(printer_id, None)
         if armed is None:
-            return
+            return None
         if not armed.task.done():
             armed.task.cancel()
         logger.info("Eject monitor: printer %s watch cancelled (%s)", printer_id, reason)
+        return armed.task
 
     def _release_record(self, printer_id: int, task: asyncio.Task) -> None:
         """Drop the record iff it still belongs to ``task`` (never a successor's)."""
@@ -1212,7 +1314,7 @@ class EjectCooldownMonitor:
         watch's exit — ONE answer for both lanes, because it is a question about the
         PRINTER rather than about either fan. Order-independent by construction:
         whether a successor's ``begin`` ran before or after this exit, the record it
-        installed is already in ``_armed`` when ``_cancel`` popped ours — so the fans
+        installed is already in ``_armed`` when ``stand_down`` popped ours — so the fans
         end ON under a cooldown-class successor and OFF under an escalation-only hold
         or no watch at all.
         """

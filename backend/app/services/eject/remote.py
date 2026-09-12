@@ -182,7 +182,17 @@ _STOP_RETRY_DELAY_S = 5.0
 # re-driving a kill the watchdog already decided but could not deliver, because the
 # printer was off the wire when it fired (2026-09-04 outage). The stage exists so the
 # kill's copy can say what actually happened rather than borrowing a deadline's wording.
-EjectStopStage = Literal["total", "drop", "drop_late", "epilogue", "power_loss"]
+#
+# "service_hold" and "reconnect" are the other two deadline-less stages, both added
+# 2026-09-12 off the 001/009-H2S maintenance incident. "service_hold" is an operator
+# entering maintenance mode on a printer mid-sweep — the farm stops the sweep while it
+# still has a session, rather than letting the toggle orphan it. "reconnect" is the
+# other half of that shape: the printer came back with the sweep still running after
+# its deadline had already fired and the stop could not be delivered, so the kill is
+# re-driven on the session that just opened. Each gets its own wording for the same
+# reason power_loss does — a stage that borrows a deadline's sentence reports timing
+# evidence nobody measured.
+EjectStopStage = Literal["total", "drop", "drop_late", "epilogue", "power_loss", "service_hold", "reconnect"]
 
 # Where the phase poller is in the block. Typed beside the stop vocabulary because the
 # two are read together: the phase decides which deadline binds, and the deadline names
@@ -527,6 +537,25 @@ def _stop_reason(
             "eject interrupted by a power loss; sweep unverified",
             "power_loss_eject_interrupted",
         )
+    if stage == "service_hold":
+        # The operator took the printer for maintenance while the sweep was running.
+        # Nothing timed out — a human decided — so the copy says who stopped it and
+        # what it costs (the plate stays gated, because a stopped sweep is unverified).
+        return (
+            "eject stopped by the operator entering maintenance mode; sweep unverified",
+            "the eject sweep was stopped by the operator entering maintenance mode — the sweep is unverified, "
+            "so the plate stays gated. Check the build plate before clearing it.",
+        )
+    if stage == "reconnect":
+        # The deadline had already fired and its stop went undelivered; the printer is
+        # back and STILL running the sweep. No new timing evidence exists — the figures
+        # belong to the original kill — so this names the reconnect, not a budget.
+        return (
+            "printer reconnected with the sweep still running after its deadline had fired; stop re-driven",
+            "the printer reconnected with its eject sweep still running after the farm's deadline had already "
+            "fired, so the sweep was stopped. The plate has NOT been verified — inspect the build plate before "
+            "clearing it.",
+        )
     drop_budget = f"{drop_span_s:.0f}s" if drop_span_s is not None else "its"
     if stage == "drop":
         return (
@@ -570,6 +599,17 @@ def _stop_reason(
     )
 
 
+# What the page says when BOTH stop sends found no live MQTT session. One origin, no
+# stage variants: the stage decided why the farm wanted the sweep stopped, and this
+# sentence is about the one fact that outranks it — the command never reached the
+# machine, so nothing about the sweep is settled.
+_UNDELIVERED_STOP_DETAIL = (
+    "the farm tried to STOP this printer's eject sweep and could not reach the printer (no live connection), "
+    "so the sweep may still be running. The plate stays gated and the stop is re-driven when the printer "
+    "reconnects. Check the printer before clearing the plate."
+)
+
+
 async def _stamp_stop_and_page(
     printer_id: int,
     *,
@@ -582,11 +622,20 @@ async def _stamp_stop_and_page(
     """Stamp the runtime verdict, stop the job mid-flight, page the operator.
 
     THE one kill path. Both entries — the runtime watchdog's deadlines
-    (:func:`_stop_and_page`) and the pause-recovery lane's re-drive
-    (:func:`redrive_eject_stop`) — end here, so the ordering guarantees hold whatever
-    decided the kill. Callers supply the RENDERED copy (``diagnostic`` / ``source_detail``
-    from :func:`_stop_reason`) and a ``situation`` clause for the log; nothing here
+    (:func:`_stop_and_page`) and the re-drive (:func:`redrive_eject_stop`, three
+    callers) — end here, so the ordering guarantees hold whatever decided the kill.
+    Callers supply the RENDERED copy (``diagnostic`` / ``source_detail`` from
+    :func:`_stop_reason`) and a ``situation`` clause for the log; nothing here
     re-derives a judgement of its own.
+
+    The ONE thing only this function knows is whether the stop was actually
+    DELIVERED, and since 2026-09-12 the page says so. The caller's sentence describes
+    a sweep that was stopped; when both sends found no live MQTT session, that sentence
+    is false — the sweep is still running — so the page is replaced by
+    :data:`_UNDELIVERED_STOP_DETAIL`, which states what is true (the farm could not
+    reach the printer, the plate stays gated, the stop is re-driven on reconnect).
+    Telling an operator a sweep was "stopped at its deadline" while the toolhead is
+    still crossing the plate is the copy half of the 001/009-H2S incident.
 
     No escalation watch is armed here, unlike the pre-cut-over code: while an eject
     owns the printer the plate carries no watch by construction (an armed cooldown
@@ -634,7 +683,7 @@ async def _stamp_stop_and_page(
     from backend.app.services.eject.monitor import notify_plate_not_empty
 
     try:
-        await notify_plate_not_empty(printer_id, source_detail=source_detail)
+        await notify_plate_not_empty(printer_id, source_detail=source_detail if delivered else _UNDELIVERED_STOP_DETAIL)
     except Exception:  # noqa: BLE001 — a notify failure must never kill the watchdog
         logger.exception("eject.remote: mid-flight abort notification failed for printer %s", printer_id)
 
@@ -695,6 +744,14 @@ async def redrive_eject_stop(
 
     True iff a pending eject was found and the kill was re-driven; False when the
     printer holds no eject (nothing to stop, and nothing to say).
+
+    THREE callers, each naming its own ``stage``: the pause-recovery lane after an
+    outage (``power_loss``), the reconnect reconcile when a printer comes back still
+    running a sweep whose deadline had fired (``reconnect``), and the service-hold
+    quiesce when an operator takes the printer for maintenance mid-sweep
+    (``service_hold``). All three are the same act — stop a sweep the farm can no
+    longer account for — which is why they share this entry rather than composing
+    three kills.
 
     The 2026-09-04 outage is the shape this exists for: the runtime watchdog fired
     while the printer was off the wire, BOTH ``stop_print`` sends returned False, the

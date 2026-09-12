@@ -77,8 +77,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.core.database import Base
 
-# Incident kinds — the farm's reaction vocabulary. TWO closed origins, both listed
-# here so the store owns the whole vocabulary (2026-09-04 pause-recovery wave):
+# Incident kinds — the farm's reaction vocabulary. THREE closed origins, all listed
+# here so the store owns the whole vocabulary (2026-09-04 pause-recovery wave;
+# 2026-09-12 service hold):
 #
 # 1. The AMS fault taxonomy (``hms_errors.AmsFaultClass``) — NOT a second
 #    classification: the class -> kind mapping lives in ``spool_recovery._KIND_BY_CLASS``.
@@ -91,9 +92,17 @@ KIND_PHYSICAL = "physical"  # physical_fault — hands needed, never a swap
 KIND_POWER_LOSS = "power_loss"  # the firmware's power-loss prompt could not be answered (resume refused/failed)
 KIND_PLATE_VISION = "plate_vision"  # the pre-print plate check tripped (confirmed on the second consecutive trip)
 KIND_Z_REFERENCE_LOST = "z_reference_lost"  # rebooted with a part on the plate; the eject's Z frame is fiction
+#
+# 3. The DECLARED vocabulary — a hold no fault produced. A human declared it with a
+#    verb, and only that verb's counterpart ends it (see ``RESOLUTION_DECLARED``):
+KIND_SERVICE_HOLD = "service_hold"  # maintenance mode: hands are in the machine, every automatic lane stands down
 
 PAUSE_CAUSE_KINDS: frozenset[str] = frozenset({KIND_POWER_LOSS, KIND_PLATE_VISION, KIND_Z_REFERENCE_LOST})
 AMS_FAULT_KINDS: frozenset[str] = frozenset({KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL})
+# The kinds a HUMAN opens and a human closes, by name. The one predicate every
+# automation lane reads (``printer_incidents.automation_held``) is membership in this
+# set, so a second declared kind joins the fleet-wide quiesce by registering here.
+DECLARED_KINDS: frozenset[str] = frozenset({KIND_SERVICE_HOLD})
 
 # The RETURN-TO-NORMAL rule: what evidence ends a hold of each kind.
 #
@@ -108,6 +117,15 @@ AMS_FAULT_KINDS: frozenset[str] = frozenset({KIND_JAM, KIND_RUNOUT, KIND_PHYSICA
 # ``"operator"`` only a human act ends it (``clear_plate`` / ``operator_recover``),
 #               because the terminal that follows was CAUSED by the farm (a
 #               plate-vision stop) or the wire cannot see the plate (a lost Z frame).
+# ``"declared"`` no FAULT opened it, so no evidence closes it: it ends ONLY through
+#               the verb that opened it — never a plate act, a wire edge, a terminal
+#               or repair evidence. 2026-09-12 (001/009/010-H2S maintenance): an
+#               operator-declared hold that ``clear_plate`` or Recover could close
+#               would end the moment the operator marked the plate clear — which is
+#               the FIRST thing they do after lifting the part out — and the farm
+#               would dispatch onto a printer with hands in it. "Recover the plate"
+#               and "I am done working on this machine" are two statements, and only
+#               the second may release the automation.
 #
 # Keyed on ``(kind, external)`` because the SAME class of fault returns to normal
 # differently on the two hardwares, and only the data says which. Of the 8 physical
@@ -121,6 +139,7 @@ AMS_FAULT_KINDS: frozenset[str] = frozenset({KIND_JAM, KIND_RUNOUT, KIND_PHYSICA
 RESOLUTION_WIRE = "wire"
 RESOLUTION_REPAIR = "repair"
 RESOLUTION_OPERATOR = "operator"
+RESOLUTION_DECLARED = "declared"
 
 RESOLVES_ON: dict[tuple[str, bool], str] = {
     (KIND_JAM, False): RESOLUTION_WIRE,
@@ -134,6 +153,9 @@ RESOLVES_ON: dict[tuple[str, bool], str] = {
     (KIND_POWER_LOSS, False): RESOLUTION_WIRE,
     (KIND_PLATE_VISION, False): RESOLUTION_OPERATOR,
     (KIND_Z_REFERENCE_LOST, False): RESOLUTION_OPERATOR,
+    # A declared hold has no external variant either — there is no hardware for it to
+    # sit on. It is a statement about the MACHINE, not about a spool path.
+    (KIND_SERVICE_HOLD, False): RESOLUTION_DECLARED,
 }
 
 # The ONE order a single-slot reader uses when a printer carries more than one open
@@ -153,6 +175,10 @@ KIND_PRECEDENCE: tuple[str, ...] = (
     KIND_POWER_LOSS,
     KIND_PLATE_VISION,
     KIND_Z_REFERENCE_LOST,
+    # LAST, deliberately: the chip names the fault that stopped the WORK, and a
+    # declared hold stopped nothing — the operator did. Its own banner reads the row
+    # directly (``snapshot(kind=KIND_SERVICE_HOLD)``), so it never needs the chip.
+    KIND_SERVICE_HOLD,
 )
 
 # The partial predicate BOTH the model and ``core/database.run_migrations`` build
@@ -221,7 +247,11 @@ class PrinterIncident(Base):
         ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True, index=True
     )
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
-    # The representative short code (``MMMM_CCCC``) the notifications name.
+    # The representative short code (``MMMM_CCCC``) the notifications name. NOT NULL
+    # with a '' default, like ``job_id``: a CODE-LESS kind (a declared hold, a lost-Z
+    # frame) stores the empty string rather than a NULL, so ``row_external``'s
+    # classifier call and the already-handled lookups need no IS NULL branch on either
+    # dialect. ``printer_incidents.open_declared`` is the constructor for those kinds.
     code: Mapped[str] = mapped_column(String(16), nullable=False)
     # The sorted fingerprint of the whole triggering candidate set — the identity of
     # THIS fault, used to decide whether a later push is the same incident coming

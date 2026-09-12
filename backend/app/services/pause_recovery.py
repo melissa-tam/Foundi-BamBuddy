@@ -215,6 +215,22 @@ def note_status_push(printer_id: int, state) -> None:
         was_at_prompt = prev.at_prompt if prev is not None else False
         _seen[printer_id] = _WireSample(epoch=epoch, outage_s=outage_s, at_prompt=at_prompt)
 
+        if printer_incidents.automation_held(printer_id):
+            # MAINTENANCE MODE: the power-loss prompt and the plate-vision trip are the
+            # operator's to answer — they are standing at the screen. Nothing is opened,
+            # nothing is resumed and nothing is stopped.
+            #
+            # The wire sample above is still recorded, deliberately: the sampler's memory
+            # stays current, so an edge that happened DURING the hold is consumed by the
+            # hold rather than replayed at the printer the moment it is released.
+            if reconnected or (at_prompt and not was_at_prompt):
+                logger.info(
+                    "[pause-recovery] printer %s is in maintenance mode — standing aside (%s)",
+                    printer_id,
+                    "reconnected" if reconnected else "at the power-loss prompt",
+                )
+            return
+
         if reconnected:
             _maybe_arm_z_reference_hold(printer_id, anchor)
 
