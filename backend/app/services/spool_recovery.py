@@ -3527,8 +3527,9 @@ async def on_observed_running(printer_id: int) -> bool:
     Pause-recovery incidents (``pause_recovery.py`` — power loss, plate vision) never
     register in ``_active_tasks`` at all, so their screen-resume close is unchanged.
 
-    It closes only the printer's WIRE-resolved rows, and it may be several: a printer
-    can hold more than one fault, and each carries its own return-to-normal rule.
+    It closes only the printer's WIRE-resolved rows — tested by CLASS, never by a kind
+    list — and it may be several: a printer can hold more than one fault, and each
+    carries its own return-to-normal rule.
     A ``repair`` row is deliberately NOT closed here even though RUNNING is one of its
     two evidences — an EJECT sweep produces a PREPARE->RUNNING edge, and that sweep is
     filament-less, so this edge alone would close a stuck-filament hold seconds after
@@ -3564,7 +3565,13 @@ async def on_observed_running(printer_id: int) -> bool:
                         incident.id,
                     )
                     continue
-                if resolution == RESOLUTION_OPERATOR:
+                if resolution != RESOLUTION_WIRE:
+                    # ``operator`` and ``declared`` both: a RUNNING edge is not a human
+                    # clearing a plate, and it is not a human finishing maintenance
+                    # either — an operator can start a print from the screen WHILE the
+                    # printer is held, which is exactly what maintenance mode keeps
+                    # legal. Tested as the CLASS rather than as a kind list so a fifth
+                    # class cannot inherit the wire's evidence by default.
                     continue
                 item_id, kind, status = incident.item_id, incident.kind, incident.status
                 if await printer_incidents.close(
@@ -3731,7 +3738,10 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
 
     Two lanes, because "the wire went quiet" means opposite things for different
     kinds — ``printer_incidents.resolution_class`` over the row's kind and hardware
-    picks which, and an ``operator`` kind takes neither.
+    picks which, and each lane is selected by NAME. The ``operator`` and ``declared``
+    classes take NEITHER: a plate a human must clear and a printer a human has taken
+    for maintenance both read "connected, positive, no actionable fault", which is
+    this sweep's entire evidence for closing something.
 
     **The WIRE lane** (jam, runout, power loss, and a physical fault on the EXTERNAL
     holder, whose codes are firmware PROMPTS a human answers on the screen):
@@ -3818,7 +3828,7 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
                             continue
                         await _maybe_self_heal_after_repair(incident, state, evidence=evidence, live=live)
                         source, why = RESOLVE_REPAIR_OBSERVED, evidence
-                    else:
+                    elif resolution == RESOLUTION_WIRE:
                         over, reported = _hold_over(incident, state)
                         faults = live_candidates(state) if over else frozenset()
                         if not over or faults:
@@ -3826,6 +3836,16 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
                             continue
                         source, why = RESOLVE_WIRE_CLEAR, "no actionable fault"
                         live = reported
+                    else:
+                        # Any OTHER class — today ``declared`` — takes NEITHER lane, for
+                        # the same reason guard 0 excludes ``operator``: this sweep's
+                        # whole evidence is "connected, positive, no actionable fault",
+                        # which is the NORMAL reading of a printer a human has taken for
+                        # maintenance. Selecting the wire lane by NAME is what keeps a
+                        # fourth class from inheriting evidence that says nothing about
+                        # it (it was a bare ``else``).
+                        _hold_over_since.pop(incident.id, None)
+                        continue
 
                     first = _hold_over_since.get(incident.id)
                     if first is None:
@@ -3917,8 +3937,13 @@ async def rearm_incidents_on_startup() -> int:
     * no live state at all (the printer has not reported yet) → leave it OPEN and
       decide later. The wire sampler closes it on the first RUNNING transition.
 
-    That ladder is the WIRE class's. The other two take their own:
+    That ladder is the WIRE class's, and it is now selected by NAME rather than by
+    falling out of an ``else`` — a fourth resolution class must not inherit the wire's
+    evidence by default. The others take their own:
 
+    * ``declared`` → always left open. A restart is not a human saying they have
+      finished working on the machine, and a held printer reads IDLE, which is exactly
+      the wire evidence the ladder above would have closed it on.
     * ``operator`` → always left open. A restart is not a human clearing a plate.
     * ``repair`` → closed only on :func:`_repaired`, with no dwell (the restart IS
       the fresh derivation the dwell substitutes for elsewhere). After a restart the
@@ -3954,13 +3979,23 @@ async def rearm_incidents_on_startup() -> int:
                         if incident.status == STATUS_RECOVERING:
                             driverless.append((incident.id, incident.printer_id))
                         continue
-                else:
+                elif resolution == RESOLUTION_WIRE:
                     over, reported = _hold_over(incident, st)
                     if not over:
                         if incident.status == STATUS_RECOVERING:
                             driverless.append((incident.id, incident.printer_id))
                         continue
                     evidence = f"printer is {reported} not PAUSE"
+                else:
+                    # Any OTHER resolution class — today ``declared`` — is left open,
+                    # and the test is the CLASS, never a kind list. This limb used to
+                    # be a bare ``else`` carrying the wire ladder, which made "wire"
+                    # the default for every unregistered class: a declared hold (an
+                    # operator's maintenance mode) would have been closed by the very
+                    # first restart, because a held printer reads IDLE and IDLE is the
+                    # wire's own "the hold is over" evidence. A restart is not a human
+                    # saying they are finished.
+                    continue
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_REARM)
                 await _clear_hold_projection(db, incident.item_id)
                 closed += 1

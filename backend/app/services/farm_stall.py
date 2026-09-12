@@ -26,6 +26,11 @@ reconcile / operator resolves the true outcome.
   could retire such a row — no terminal echo ever arrives for a print that never
   began (2026-08-29, 001-H2S item 1010: 15 h, seven units queued behind it).
 
+  Its eject sibling rides the same call (``_reconcile_unowned_ejects``): a pending
+  eject whose runtime verdict fired and whose terminal never arrived is the same
+  "claim nobody will retire" shape, on a printer that never dropped its session — so
+  neither the startup reconcile nor the connected edge can ever see it.
+
 * ``check_ams_wedged_idle`` — the printer is CONNECTED, IDLE and taking no work
   because its AMS is latched mid filament-change (``ams_status_main == 1``), a state
   in which the firmware drops every load and unload. Nothing else can see it: no
@@ -148,6 +153,7 @@ def _reset_state() -> None:
     _dead_claim_since.clear()
     _ams_wedged_since.clear()
     _ams_wedged_paged.clear()
+    _eject_verdict_reconciled.clear()
 
 
 async def _grace_seconds(db: AsyncSession, key: str, default: int) -> float:
@@ -438,6 +444,72 @@ _DEAD_CLAIM_MIN_AGE_S = 600.0
 # subtask echo both flap around a dispatch; one poll is not evidence.
 _DEAD_CLAIM_DWELL_S = 120.0
 
+# printer_id -> the eject runtime VERDICT this watch has already re-triggered the
+# reconciler on. The trigger below is level-shaped (an unowned eject stays unowned
+# until something retires it), so without this the reconcile — and the stop and the
+# page it can drive — would re-fire every tick for as long as the record stands. Keyed
+# by the verdict STAMP, so a later eject that exceeds its own deadline is a new
+# occasion on the same printer. Process-lifetime like the dwell maps beside it: a
+# restart makes the STARTUP sweep the answer instead, which is the same act.
+_eject_verdict_reconciled: dict[int, object] = {}
+
+
+async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
+    """Re-drive the eject reconciler for a LOST TERMINAL ECHO on a connected printer.
+
+    The third trigger of the one reconciler (startup and the printer's connected edge
+    are the other two), and the only one for the shape neither of those can see: the
+    printer never dropped its session, so there is no connected edge to ride and no
+    restart to wait for — the eject's terminal echo simply never arrived (or arrived
+    while the watchdog was mid-kill) and the record sits registered, refusing every
+    later eject with ``eject_in_flight``.
+
+    Two conditions, both required. The printer must be CONNECTED (a disconnected one is
+    the connected-edge trigger's business, and reconciling against a dead session can
+    only guess), and the watchdog's verdict must be at least
+    :data:`_DEAD_CLAIM_DWELL_S` old — the same dwell, for the same reason it exists on
+    the sibling watch: the LIVE terminal handler is the first responder to a stopped
+    sweep and this must only ever see what it missed. A record with no verdict at all
+    (a hydrated one the startup sweep left in flight) is deliberately not touched here:
+    nothing has judged it, so there is nothing to conclude.
+
+    Spawned as a background task per printer, never awaited: the reconcile replays a
+    terminal through ``farm_policy`` and may re-drive a stop, and the tick must not
+    wait on either.
+    """
+    from datetime import datetime, timezone
+
+    from backend.app.core.tasks import spawn_background_task
+    from backend.app.services.eject.monitor import reconcile_pending_eject
+
+    wall = datetime.fromtimestamp(now, tz=timezone.utc)
+    for pid in list(plate_occupancy.printers_with_lease_or_eject()):
+        try:
+            pending = plate_occupancy.pending_eject_view(pid)
+            if pending is None:
+                _eject_verdict_reconciled.pop(pid, None)
+                continue
+            verdict = pending.runtime_exceeded_at
+            if verdict is None or not plate_occupancy.unowned_eject(pid):
+                continue
+            if not manager.is_connected(pid):
+                continue
+            if (wall - verdict).total_seconds() < _DEAD_CLAIM_DWELL_S:
+                continue
+            if _eject_verdict_reconciled.get(pid) == verdict:
+                continue
+            _eject_verdict_reconciled[pid] = verdict
+            logger.warning(
+                "farm_stall: printer %s still holds a %s eject whose runtime verdict fired at %s and whose "
+                "terminal never arrived — re-driving the eject reconcile",
+                pid,
+                pending.purpose,
+                verdict,
+            )
+            spawn_background_task(reconcile_pending_eject(pid), name=f"eject-pending-reconcile-{pid}")
+        except Exception:  # noqa: BLE001 — one printer must not abort the sweep
+            logger.exception("farm_stall: unowned-eject reconcile trigger failed for printer %s", pid)
+
 
 async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
     """Release a ``printing`` claim whose print demonstrably never started.
@@ -486,6 +558,15 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
     run-changed broadcast and the WARNING below are the operator surface.
 
     Injectable ``manager``/``now`` (epoch seconds — it drives both clocks) for tests.
+
+    The EJECT sibling of the same question rides this call
+    (:func:`_reconcile_unowned_ejects`): "a claim on a printer that nothing will ever
+    retire" is one shape with two records behind it — a queue row claiming ``printing``
+    and a pending eject whose terminal never came — and both are answered on the tick
+    with the same dwell. It runs FIRST and in its own guard, so a queue-side failure
+    cannot starve the eject side or the reverse, and it is deliberately not gated on
+    there being any ``printing`` row: a stranded eject blocks the printer with an empty
+    queue just as thoroughly.
     """
     now = time.time() if now is None else now
     from datetime import datetime, timezone
@@ -494,6 +575,11 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
     from backend.app.services import printer_incidents, spool_recovery
     from backend.app.services.print_scheduler import ACTIVE_PRINT_STATES
     from backend.app.services.queue_transitions import release_unstarted_claim
+
+    try:
+        await _reconcile_unowned_ejects(manager=manager, now=now)
+    except Exception:  # noqa: BLE001 — the eject sibling must not abort the queue watch
+        logger.exception("farm_stall: unowned-eject reconcile sweep failed")
 
     wall = datetime.fromtimestamp(now, tz=timezone.utc)
 
@@ -823,9 +909,17 @@ _PHYSICAL_REMINDER_DETAIL = (
 )
 
 # incident kind -> the reminder's detail copy. One line per kind, so the nag reads
-# like the alert it repeats. EVERY kind must appear: the lookup below falls back to the
-# jam sentence, so a missing row does not fail loudly — it nags an operator about a
-# spool jam on a printer holding for a lost Z reference.
+# like the alert it repeats. EVERY FAULT kind must appear: the lookup below falls back
+# to the jam sentence, so a missing row does not fail loudly — it nags an operator about
+# a spool jam on a printer holding for a lost Z reference.
+#
+# The DECLARED kinds (``printer_incident.DECLARED_KINDS``) are EXEMPT, here and in the
+# unpaused twin below, and the exemption is structural rather than an oversight:
+# :func:`_remind_open_incidents` never reaches the lookup for them, because a printer
+# carrying a declared hold is skipped whole (``printer_incidents.automation_held``).
+# Giving maintenance mode a reminder sentence would be writing copy for a branch that
+# cannot execute — and the hour a hold is released, the nag resumes off the FAULT rows
+# with their own copy. Add a row here only if a future declared kind is meant to nag.
 _INCIDENT_REMINDER_DETAIL: dict[str, str] = {
     KIND_JAM: _JAM_REMINDER_DETAIL,
     KIND_RUNOUT: _RUNOUT_REMINDER_DETAIL,
@@ -939,6 +1033,15 @@ async def _remind_open_incidents(
         pid = incident.printer_id
         key = (pid, f"incident:{incident.id}")
         try:
+            if printer_incidents.automation_held(pid):
+                # The operator is standing at this machine with it in maintenance mode.
+                # ONE read covers both halves: the declared row itself (nagging someone
+                # hourly about the hold they are holding is noise) and any fault
+                # recorded WHILE they work — a jam code raised by their own filament
+                # change is not an unattended hold. The rows stay open and nag again
+                # the hour after the hold is released, because the hold suppressed the
+                # reminder, not the fault.
+                continue
             if not manager.is_connected(pid):
                 continue
             st = manager.get_status(pid)

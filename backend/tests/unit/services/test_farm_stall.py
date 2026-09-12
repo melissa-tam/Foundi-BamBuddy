@@ -1198,10 +1198,95 @@ class TestRemindOpenIncidentsNonPause:
 
         The lookup falls back to the JAM sentence, so a missing row does not fail
         loudly — it nags an operator about a spool jam on a printer holding for a lost Z
-        reference. This is the pin that makes the omission impossible."""
-        from backend.app.models.printer_incident import AMS_FAULT_KINDS, PAUSE_CAUSE_KINDS
+        reference. This is the pin that makes the omission impossible.
 
-        assert set(farm_stall._INCIDENT_REMINDER_DETAIL_UNPAUSED) == AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS
+        The completeness rule is over the FAULT kinds. The DECLARED kinds are exempt by
+        construction and the exemption is asserted, not assumed: the reminder never
+        reaches the lookup for them, because a printer carrying a declared hold is
+        skipped whole (``automation_held``). Copy for a branch that cannot execute would
+        be worse than no copy — it would imply the nag exists.
+        """
+        from backend.app.models.printer_incident import AMS_FAULT_KINDS, DECLARED_KINDS, PAUSE_CAUSE_KINDS
+
+        faults = AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS
+        assert set(farm_stall._INCIDENT_REMINDER_DETAIL_UNPAUSED) == faults
+        assert set(farm_stall._INCIDENT_REMINDER_DETAIL) == faults
+        assert not (DECLARED_KINDS & set(farm_stall._INCIDENT_REMINDER_DETAIL))
+
+
+class TestHeldPrinterNagSkip:
+    """Maintenance mode silences the hourly nag for the WHOLE printer.
+
+    ONE read (``printer_incidents.automation_held``) covers both halves: the declared
+    row itself — nagging somebody hourly about the hold they are holding is noise — and
+    any FAULT recorded while they work, because a jam code raised by an operator's own
+    filament change is not an unattended hold. The rows stay OPEN, so the nag resumes
+    the hour after the hold is released.
+    """
+
+    async def _hold(self, db, printer_id):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+        from backend.app.services import printer_incidents
+
+        assert await printer_incidents.open_declared(db, printer_id, kind=KIND_SERVICE_HOLD) is not None
+
+    async def test_a_fault_on_a_held_printer_does_not_nag(self, db_session):
+        await _add_incident_held(db_session, 71, "physical", item=False)
+        await self._hold(db_session, 71)
+        mgr = _FakeManager({71: True}, {71: _FakeState("IDLE")})
+
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+
+            mock_n.assert_not_awaited()
+
+    async def test_the_hold_row_itself_never_nags(self, db_session):
+        await self._hold(db_session, 72)
+        mgr = _FakeManager({72: True}, {72: _FakeState("IDLE")})
+
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+
+            mock_n.assert_not_awaited()
+
+    async def test_an_unheld_printer_still_nags(self, db_session):
+        """The control: the skip is per printer, not a global mute."""
+        await _add_incident_held(db_session, 73, "physical", item=False)
+        await self._hold(db_session, 74)
+        await _add_incident_held(db_session, 74, "physical", item=False)
+        mgr = _FakeManager({73: True, 74: True}, {73: _FakeState("IDLE"), 74: _FakeState("IDLE")})
+
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+
+            assert [c.kwargs["printer_id"] for c in mock_n.await_args_list] == [73]
+
+    async def test_releasing_the_hold_lets_the_fault_nag_again(self, db_session):
+        """The hold suppressed the REMINDER, not the fault: the row is still open and
+        the nag resumes on the next window."""
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD, STATUS_RESOLVED
+        from backend.app.services import printer_incidents
+
+        await _add_incident_held(db_session, 75, "physical", item=False)
+        await self._hold(db_session, 75)
+        mgr = _FakeManager({75: True}, {75: _FakeState("IDLE")})
+
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_not_awaited()
+
+            hold = await printer_incidents.get_open(db_session, 75, kinds={KIND_SERVICE_HOLD})
+            assert hold is not None
+            await printer_incidents.close(db_session, hold.id, status=STATUS_RESOLVED, source="operator")
+
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W + 1)  # seeds the window
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W * 2 + 2)
+
+            mock_n.assert_awaited_once()
 
 
 class TestPauseCauseIncidentReminders:

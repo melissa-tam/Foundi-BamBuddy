@@ -1253,6 +1253,11 @@ def occupancy_payload(printer_id: int | None) -> dict | None:
             "started": view.eject_started,
             "age_s": view.eject_age_s,
             "hydrated": view.eject_hydrated,
+            # The runtime watchdog has fired on this sweep. The operator surface reads
+            # it to say "eject stalled — the farm lost track of the sweep" and to offer
+            # Recover: an age alone cannot tell a long sweep from an abandoned one, and
+            # this is the farm's own verdict rather than the reader's inference.
+            "runtime_exceeded": view.eject_runtime_exceeded,
         }
     return {
         "plate": {

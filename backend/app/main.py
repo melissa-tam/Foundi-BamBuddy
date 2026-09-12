@@ -1098,6 +1098,23 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             reconcile_stale_active_prints(printer_id),
             name=f"reconcile-stale-prints-{printer_id}",
         )
+        # The same edge, for the EJECT half of "what happened while we could not see
+        # this printer" (2026-09-12, 001/009-H2S). An eject whose watchdog gave its
+        # verdict — or whose record was rebuilt at startup — has nobody left to retire
+        # it: its terminal echo arrived while the session was down, so the pending sat
+        # registered and every later eject refused `eject_in_flight` for hours. Same
+        # epoch latch, same "once per connection" rule, and a no-op unless the
+        # authority says the eject is unowned, so a live sweep under a running
+        # watchdog is never touched.
+        from backend.app.services.plate_occupancy import plate_occupancy as _edge_occupancy
+
+        if _edge_occupancy.unowned_eject(printer_id):
+            from backend.app.services.eject.monitor import reconcile_pending_eject
+
+            spawn_background_task(
+                reconcile_pending_eject(printer_id),
+                name=f"eject-pending-reconcile-{printer_id}",
+            )
 
     # Device-vs-declared model reconciliation (Phase 2). Evaluated on any connected
     # status change; acted on only at a STATE TRANSITION so the one-shot
@@ -6664,11 +6681,27 @@ async def lifespan(app: FastAPI):
     # The order is load-bearing — hydrating an occupied plate notifies its policy, and
     # that notification is what re-arms the watch the restart lost, so a driver wired
     # afterwards would leave every rebuilt gate armless.
-    from backend.app.services import plate_occupancy_store
+    from backend.app.services import plate_occupancy_store, printer_incidents
     from backend.app.services.eject.monitor import wire_policy_driver
 
     plate_occupancy_store.wire_core()
     wire_policy_driver()
+    # Refill the incident projection BEFORE the plates hydrate. ``rehydrate`` is a pure
+    # read-and-rebuild (no transition, no notification), and the plate policy driver
+    # asks ``printer_incidents.automation_held`` at the moment it arms a watch — so a
+    # cache that is still empty here would arm a cooldown, its fans and its dispatch
+    # lane on a printer a human had declared held before the restart. The AMS sweep
+    # (``rearm_incidents_on_startup``) stays where it is and rebuilds this again after
+    # its own closes; running it twice costs one query.
+    try:
+        async with async_session() as _inc_db:
+            _open_holds = await printer_incidents.rehydrate(_inc_db)
+        if _open_holds:
+            logging.getLogger(__name__).info(
+                "Startup: %d open printer incident(s) rehydrated before plate hydration", _open_holds
+            )
+    except Exception as _ihe:  # noqa: BLE001 — a projection refill must never block startup
+        logging.getLogger(__name__).warning("Early incident rehydrate failed: %s", _ihe)
     await plate_occupancy_store.hydrate()
     await printer_manager.load_quarantine_from_db()
 

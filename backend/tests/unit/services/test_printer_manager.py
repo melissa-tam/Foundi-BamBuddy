@@ -2244,10 +2244,30 @@ class TestOccupancyProjection:
         assert eject["purpose"] == "production"
         assert eject["started"] is False  # no START echo yet
         assert eject["hydrated"] is False  # a claim is a LIVE dispatch by definition
+        assert eject["runtime_exceeded"] is False  # no watchdog verdict yet
         assert isinstance(eject["age_s"], float)
 
         plate_occupancy.note_eject_started(4242)
         assert occupancy_payload(4242)["eject"]["started"] is True
+
+    def test_payload_carries_the_runtime_watchdogs_verdict(self):
+        """The operator surface must render "the farm lost track of this sweep" as the
+        FARM's verdict, not as an inference from the eject's age — which cannot tell a
+        long sweep from an abandoned one (2026-09-12, 001/009-H2S)."""
+        from datetime import datetime, timezone
+
+        self._occupy(4242)
+        assert (
+            plate_occupancy.claim_for_eject(
+                4242,
+                PendingEject(purpose="production", run_id=3, queue_item_id=11),
+                Evidence(),
+            )
+            is None
+        )
+        plate_occupancy.note_eject_runtime_exceeded(4242, datetime.now(timezone.utc), "total")
+
+        assert occupancy_payload(4242)["eject"]["runtime_exceeded"] is True
 
     def test_payload_reports_a_lease_age_while_a_dispatch_is_in_flight(self):
         from backend.app.services.plate_occupancy import DispatchLease

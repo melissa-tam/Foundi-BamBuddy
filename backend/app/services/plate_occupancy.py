@@ -141,7 +141,8 @@ NotifyCause = Literal[
     "eject_completed",
     "eject_unverified",
     "eject_never_started",
-    "drop_hydrated_eject",
+    "drop_unowned_eject",
+    "revoke_lease",
     "set_policy",
 ]
 
@@ -473,6 +474,11 @@ class OccupancyView:
     eject_started: bool
     eject_age_s: float | None
     eject_hydrated: bool
+    # The runtime watchdog has already given its verdict on this sweep: it fired, and
+    # whatever the stop achieved the farm can no longer verify the sweep. Projected
+    # (never re-derived) so the operator surfaces and the reconciler read the same
+    # fact the authority holds — see :meth:`PlateOccupancy.unowned_eject`.
+    eject_runtime_exceeded: bool
     owner: OccupancyOwner
 
     @property
@@ -764,6 +770,38 @@ class PlateOccupancy:
         record.lease = None
         self._notify(printer_id, before, self._view(printer_id, None), "release_dispatch")
 
+    def revoke_lease(self, printer_id: int, reason: str) -> bool:
+        """Mark the in-flight dispatch lease REVOKED. True iff this call revoked one.
+
+        Revoking is not releasing. The lease OBJECT survives, because
+        :meth:`commit_dispatch` identity-checks the very object the scheduler is
+        holding across its FTPS upload and must be able to answer it ``lease_revoked``
+        — which is how the scheduler learns to unwind the row (via
+        ``_unwind_refused_commit`` → ``release_unstarted_claim``) instead of printing
+        onto a printer somebody has taken. Dropping the lease here would hand it
+        ``lease_unknown`` instead, which is a different story with a different cure.
+
+        THE one transition for that, extracted 2026-09-12 from
+        :meth:`declare_occupied`'s inline block so the service-hold quiesce takes the
+        same path an operator's plate declaration does. Idempotent and silent on an
+        already-revoked (or absent) lease: nothing changed, so nothing is notified —
+        the fan-out describes transitions, not calls.
+        """
+        record = self._records.get(printer_id)
+        if record is None or record.lease is None or record.lease.revoked:
+            return False
+
+        before = self._view(printer_id, None)
+        record.lease.revoked = True
+        logger.info(
+            "[occupancy] p%d: dispatch lease (unit %d) revoked — %s",
+            printer_id,
+            record.lease.unit_id,
+            reason,
+        )
+        self._notify(printer_id, before, self._view(printer_id, None), "revoke_lease")
+        return True
+
     # -- terminals and detections ------------------------------------------
 
     def note_terminal(self, printer_id: int, disposition: TerminalDisposition) -> None:
@@ -850,7 +888,11 @@ class PlateOccupancy:
         cure: the declaration landed between the scheduler's claim and its
         ``start_print`` and was erased by an unconditional gate clear on the dispatch
         path. Revoking makes :meth:`commit_dispatch` refuse ``lease_revoked``, so the
-        scheduler unwinds the row instead of printing onto the declared plate.
+        scheduler unwinds the row instead of printing onto the declared plate. It runs
+        through :meth:`revoke_lease` — the record mutations keep their original order
+        (plate, then lease), but the revoke is now its own transition with its own
+        notification, because a second caller (the service-hold quiesce) revokes
+        WITHOUT declaring a plate and neither may grow a second copy of the rule.
         """
         if ev.live_state in ACTIVE_PRINT_STATES:
             return "job_active"
@@ -863,14 +905,8 @@ class PlateOccupancy:
 
         before = self._view(printer_id, None)
         record.plate = PlateOccupied(source_subtask_id=None, policy=EscalationOnly(), since=_now())
-        if record.lease is not None and not record.lease.revoked:
-            record.lease.revoked = True
-            logger.info(
-                "[occupancy] p%d: dispatch lease (unit %d) revoked by an operator plate declaration",
-                printer_id,
-                record.lease.unit_id,
-            )
         self._notify(printer_id, before, self._view(printer_id, None), "declare_occupied")
+        self.revoke_lease(printer_id, "an operator declared the plate occupied")
         return None
 
     def clear_plate(self, printer_id: int) -> TransitionRefusal | None:
@@ -940,7 +976,7 @@ class PlateOccupancy:
 
         **A hydrated eject is SUPERSEDED, not protected.** It has ``started_at=None``
         by construction, no watchdog, no live identity, and ends in
-        :meth:`drop_hydrated_eject` anyway; refusing an operator in order to protect
+        :meth:`drop_unowned_eject` anyway; refusing an operator in order to protect
         a record the farm already admits it cannot verify is backwards. That refusal
         is the 2026-08-30 "8 consecutive eject 409s" class — printer 4, 01:46-01:49,
         after which the operator hand-jogged the toolhead. It is dropped here with a
@@ -1046,7 +1082,7 @@ class PlateOccupancy:
         A HYDRATED eject never expires here: its ``started_at`` is None by
         construction, so an expiry rule keyed on it would fire on every restart and
         discard a record the reconciler is still deciding about. Hydrated pendings
-        are the reconciler's business (:meth:`drop_hydrated_eject`).
+        are the reconciler's business (:meth:`drop_unowned_eject`).
         """
         record = self._records.get(printer_id)
         if record is None or record.eject is None:
@@ -1066,21 +1102,42 @@ class PlateOccupancy:
         self._notify(printer_id, before, self._view(printer_id, None), "eject_never_started")
         return True
 
-    def drop_hydrated_eject(self, printer_id: int, reason: str) -> bool:
-        """Dispose of a hydrated eject on the startup reconciler's verdict. True iff dropped.
+    def drop_unowned_eject(self, printer_id: int, reason: str) -> bool:
+        """Dispose of an UNOWNED eject on the reconciler's verdict. True iff dropped.
+
+        Unowned is exactly :meth:`unowned_eject` — a hydrated record, or one whose
+        runtime watchdog has already given its verdict. A LIVE eject with no verdict is
+        refused (and WARNed about): its watchdog is still running and still owns the
+        outcome, so dropping the record under it would leave a task armed to stop a
+        printer nothing is tracking any more.
 
         The plate is untouched: the reconciler decides only what became of the EJECT,
-        and a plate that survived a restart keeps whatever the durable columns said
-        until a human or a matched terminal moves it.
+        and a plate that survived a restart — or a sweep the farm had to stop — keeps
+        whatever it carried until a human or a matched terminal moves it.
         """
         record = self._records.get(printer_id)
-        if record is None or record.eject is None or not record.eject.hydrated:
+        if record is None or record.eject is None:
+            return False
+        if not self.unowned_eject(printer_id):
+            logger.warning(
+                "[occupancy] p%d: refusing to drop a LIVE %s eject with no watchdog verdict (%s)",
+                printer_id,
+                record.eject.purpose,
+                reason,
+            )
             return False
 
         before = self._view(printer_id, None)
-        logger.info("[occupancy] p%d: dropping hydrated %s eject (%s)", printer_id, record.eject.purpose, reason)
+        logger.info(
+            "[occupancy] p%d: dropping unowned %s eject (hydrated=%s, runtime_exceeded=%s) — %s",
+            printer_id,
+            record.eject.purpose,
+            record.eject.hydrated,
+            record.eject.runtime_exceeded_at is not None,
+            reason,
+        )
         record.eject = None
-        self._notify(printer_id, before, self._view(printer_id, None), "drop_hydrated_eject")
+        self._notify(printer_id, before, self._view(printer_id, None), "drop_unowned_eject")
         return True
 
     # -- policy -------------------------------------------------------------
@@ -1105,6 +1162,39 @@ class PlateOccupancy:
     def snapshot(self, printer_id: int, ev: Evidence | None = None) -> OccupancyView:
         """The printer's occupancy as a value. Without *ev*, ``lease_active`` is ``None``."""
         return self._view(printer_id, ev)
+
+    def current_view(self, printer_id: int) -> OccupancyView:
+        """The printer's CURRENT occupancy view — what the policy driver was last told.
+
+        :meth:`snapshot` with no evidence, named for its one purpose: re-running a
+        level-triggered consumer over the state as it stands (``eject_cooldown_monitor.
+        reconsider``), when the thing that changed was not an occupancy transition and
+        so produced no fan-out of its own. The view is the authority's own projection,
+        so the re-run cannot disagree with the arming that a real transition would do.
+        """
+        return self._view(printer_id, None)
+
+    def unowned_eject(self, printer_id: int) -> bool:
+        """Is this printer's eject one that NO watchdog is going to act on?
+
+        ``True`` when an eject is registered and either it never had a watchdog
+        (``hydrated`` — rebuilt at startup from a timestamp column, with no estimate
+        to arm on) or its watchdog has already given its verdict
+        (``runtime_exceeded_at``: the deadline fired, the stop was sent, the task
+        exited). Both mean the same operational thing — *the record is registered and
+        nothing is coming to retire it* — which is why ONE predicate answers for both
+        and why the reconciler enrols on it.
+
+        It is the 001/009-H2S shape of 2026-09-12: the whole-job deadline fired while
+        the printer was off the wire, both stops went undelivered, the task exited, and
+        the pending sat registered for hours refusing every later eject with
+        ``eject_in_flight`` — a state the startup reconciler would have cured, except
+        that nothing had restarted. Live records with no verdict are deliberately NOT
+        unowned: their watchdog is running and owns them.
+        """
+        record = self._records.get(printer_id)
+        eject = record.eject if record is not None else None
+        return eject is not None and (eject.hydrated or eject.runtime_exceeded_at is not None)
 
     def dispatchable(self, printer_id: int, ev: Evidence) -> TransitionRefusal | None:
         """May a unit be dispatched onto this printer? ``None`` means yes.
@@ -1305,6 +1395,7 @@ class PlateOccupancy:
                 else None
             ),
             eject_hydrated=eject is not None and eject.hydrated,
+            eject_runtime_exceeded=eject is not None and eject.runtime_exceeded_at is not None,
             owner=owner,
         )
 

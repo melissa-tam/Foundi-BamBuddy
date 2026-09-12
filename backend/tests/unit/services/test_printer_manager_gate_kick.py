@@ -114,7 +114,7 @@ def test_redundant_clear_does_not_kick():
 def test_a_dropped_eject_kicks_even_while_the_plate_stays_occupied():
     """The second release edge, which the old boolean flag could not express.
 
-    ``drop_hydrated_eject`` retires the startup reconciler's unverifiable claim and
+    ``drop_unowned_eject`` retires the startup reconciler's unverifiable claim and
     deliberately leaves the plate alone. The plate still blocks a unit dispatch, but
     the eject slot no longer does — and the kick is what lets the eject lane re-claim
     the printer promptly instead of waiting out a poll interval.
@@ -123,7 +123,7 @@ def test_a_dropped_eject_kicks_even_while_the_plate_stays_occupied():
     plate_occupancy.hydrate_eject(PRINTER, _pending())
 
     with patch("backend.app.services.dispatch_kick.dispatch_kick") as mock_dk:
-        assert plate_occupancy.drop_hydrated_eject(PRINTER, "reconciled") is True
+        assert plate_occupancy.drop_unowned_eject(PRINTER, "reconciled") is True
 
     mock_dk.kick.assert_called_once_with(KICK_REASON, PRINTER)
     assert plate_occupancy.is_plate_occupied(PRINTER) is True
