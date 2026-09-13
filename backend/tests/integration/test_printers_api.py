@@ -836,6 +836,7 @@ class TestPrintersAPI:
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
             patch.object(eject_cooldown_monitor, "active_watch", return_value=33.0),
             patch.object(eject_cooldown_monitor, "hold_z", return_value=2.0),
+            patch.object(eject_cooldown_monitor, "deferred", return_value=True),
         ):
             mock_pm.get_status = MagicMock(return_value=state)
             mock_pm.is_awaiting_plate_clear = MagicMock(return_value=True)
@@ -843,9 +844,11 @@ class TestPrintersAPI:
             mock_pm.model_mismatch_reason = MagicMock(return_value=None)
             response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
         assert response.status_code == 200
-        # ``hold_z`` must survive the REST lane's Pydantic serialisation exactly as the
-        # WS lane's raw dump carries it — the card's "plate raised" chip reads it.
-        assert response.json()["eject_watch"] == {"threshold_c": 33.0, "hold_z": 2.0}
+        # ``hold_z`` and ``deferred`` must survive the REST lane's Pydantic serialisation
+        # exactly as the WS lane's raw dump carries them — the card reads its "plate
+        # raised" chip from one and its "cooled · eject deferred" phase from the other, and
+        # a field missing from the model would flip that phase between the two lanes.
+        assert response.json()["eject_watch"] == {"threshold_c": 33.0, "hold_z": 2.0, "deferred": True}
 
         # Unarmed watch → null (mirrors _eject_watch_payload returning None).
         with (

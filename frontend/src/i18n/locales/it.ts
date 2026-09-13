@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: 'Tutta la manutenzione aggiornata - Clicca per vedere',
     maintenance: {
       badge: 'Modalità manutenzione',
-      since: 'Automazione disattivata dalle {{time}} — invio, auto-espulsione e raffreddamento in pausa',
+      since: 'Automazione disattivata dalle {{time}} — invio e auto-espulsione in pausa; il raffreddamento procede solo con le ventole',
       exitButton: 'Esci dalla modalità manutenzione',
-      exitHint: 'L\'invio riprende e una piastra ancora in attesa di raffreddamento riprende l\'attesa.',
+      exitHint: 'L\'invio riprende; una piastra bloccata viene espulsa quando il piano raggiunge la soglia.',
       menuEnter: 'Attiva la modalità manutenzione',
       menuExit: 'Esci dalla modalità manutenzione',
       toastEntered: '{{name}} in modalità manutenzione',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: 'Attivare la modalità manutenzione su {{name}}?',
       confirmEffectPrint: '• Ferma la stampa in corso — la serie attende fino a Riprendi',
       confirmEffectEject: '• Ferma la spazzata di espulsione — la piastra resta bloccata',
-      confirmEffectCooldown: '• Ferma le ventole di raffreddamento',
+      confirmEffectCooldown: '• Differisci l\'espulsione — le ventole di raffreddamento restano attive finché il piano non si è raffreddato, poi si fermano',
     },
     deactivated: {
       pillLabel: 'Disattivata',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: 'Raffreddamento fino a {{threshold}}°C · piatto sollevato',
       coolingHeldHint: 'Il piatto resta all\'altezza dell\'ugello con la testina parcheggiata allo scivolo. Non muovere la testina prima dell\'espulsione.',
       awaitingPlateClear: 'In attesa che il piatto venga liberato',
+      ejectDeferred: 'Raffreddamento terminato · espulsione differita',
+      ejectDeferredHint: 'Segnare prima il piatto come liberato se il pezzo è stato rimosso a mano. L\'espulsione parte al termine della modalità manutenzione.',
+      ejectDeferredHeld: 'Raffreddamento terminato · espulsione differita · piatto sollevato',
+      ejectDeferredHeldHint: 'Il piatto resta all\'altezza dell\'ugello con la testina parcheggiata allo scivolo. Non muovere la testina. Segnare prima il piatto come liberato se il pezzo è stato rimosso a mano; l\'espulsione parte al termine della modalità manutenzione.',
     },
     ejectPhase: {
       building: 'Espulsione: preparazione…',

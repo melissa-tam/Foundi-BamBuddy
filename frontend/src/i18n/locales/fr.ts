@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: 'Maintenance à jour - Cliquez pour voir',
     maintenance: {
       badge: 'Mode maintenance',
-      since: 'Automatisation coupée depuis {{time}} — envoi, éjection auto et refroidissement en pause',
+      since: 'Automatisation coupée depuis {{time}} — envoi et éjection auto en pause ; le refroidissement ne fonctionne qu\'avec les ventilateurs',
       exitButton: 'Quitter le mode maintenance',
-      exitHint: 'L\'envoi reprend, et un plateau encore en attente de refroidissement reprend son attente.',
+      exitHint: 'L\'envoi reprend ; un plateau bloqué est éjecté dès que le plateau chauffant atteint le seuil.',
       menuEnter: 'Activer le mode maintenance',
       menuExit: 'Quitter le mode maintenance',
       toastEntered: '{{name}} en mode maintenance',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: 'Activer le mode maintenance sur {{name}} ?',
       confirmEffectPrint: '• Arrêter l\'impression en cours — la série attend jusqu\'à Reprendre',
       confirmEffectEject: '• Arrêter le balayage d\'éjection — le plateau reste bloqué',
-      confirmEffectCooldown: '• Arrêter les ventilateurs de refroidissement',
+      confirmEffectCooldown: '• Différer l\'éjection — les ventilateurs de refroidissement tournent jusqu\'à ce que le plateau chauffant ait refroidi, puis s\'arrêtent',
     },
     deactivated: {
       pillLabel: 'Désactivée',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: 'Refroidissement jusqu\'à {{threshold}}°C · plateau relevé',
       coolingHeldHint: 'Le plateau est maintenu au niveau de la buse, la tête stationnée à la goulotte. Ne pas déplacer la tête avant l\'exécution de l\'éjection.',
       awaitingPlateClear: 'En attente du dégagement du plateau',
+      ejectDeferred: 'Refroidissement terminé · éjection différée',
+      ejectDeferredHint: 'Marquer d\'abord le plateau comme dégagé si la pièce a été retirée à la main. L\'éjection s\'exécute à la fin du mode maintenance.',
+      ejectDeferredHeld: 'Refroidissement terminé · éjection différée · plateau relevé',
+      ejectDeferredHeldHint: 'Le plateau est maintenu au niveau de la buse, la tête stationnée à la goulotte. Ne pas déplacer la tête. Marquer d\'abord le plateau comme dégagé si la pièce a été retirée à la main ; l\'éjection s\'exécute à la fin du mode maintenance.',
     },
     ejectPhase: {
       building: 'Éjection : préparation…',

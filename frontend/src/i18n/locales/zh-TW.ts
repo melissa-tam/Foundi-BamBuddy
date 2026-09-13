@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: '所有維護均已完成 - 點選檢視',
     maintenance: {
       badge: '維護模式',
-      since: '自 {{time}} 起自動化已關閉 — 派送、自動彈出和冷卻已暫停',
+      since: '自 {{time}} 起自動化已關閉 — 派送和自動彈出已暫停；冷卻僅由風扇繼續',
       exitButton: '結束維護模式',
-      exitHint: '派送恢復，仍在等待冷卻的列印板將繼續等待。',
+      exitHint: '派送恢復；被閘門鎖住的列印板將在熱床達到閾值後彈出。',
       menuEnter: '進入維護模式',
       menuExit: '結束維護模式',
       toastEntered: '{{name}} 已進入維護模式',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: '讓 {{name}} 進入維護模式？',
       confirmEffectPrint: '• 停止正在進行的列印 — 生產執行將保持到手動繼續',
       confirmEffectEject: '• 停止彈出清掃 — 列印板閘門保持關閉',
-      confirmEffectCooldown: '• 停止冷卻風扇',
+      confirmEffectCooldown: '• 延後彈出 — 冷卻風扇持續運轉至熱床冷卻後停止',
     },
     deactivated: {
       pillLabel: '已停用',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: '正在冷卻至 {{threshold}}°C · 列印板已抬升',
       coolingHeldHint: '列印板保持在噴嘴高度，工具頭停在滑槽處。取件執行前請勿移動工具頭。',
       awaitingPlateClear: '等待清理列印板',
+      ejectDeferred: '冷卻結束 · 取件延後',
+      ejectDeferredHint: '若已手動取下零件，請先將列印板標記為已清理。取件將在結束維護模式後執行。',
+      ejectDeferredHeld: '冷卻結束 · 取件延後 · 列印板已抬升',
+      ejectDeferredHeldHint: '列印板保持在噴嘴高度，工具頭停在滑槽處。請勿移動工具頭。若已手動取下零件，請先將列印板標記為已清理；取件將在結束維護模式後執行。',
     },
     ejectPhase: {
       building: '彈出：正在產生…',

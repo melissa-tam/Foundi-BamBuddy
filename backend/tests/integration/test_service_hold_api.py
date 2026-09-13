@@ -6,7 +6,8 @@ release, the permission, and the ``service_hold`` projection on all three read s
 (the printer list, a connected ``/status`` and a disconnected one).
 
 One neighbour is pinned here too, because it is what an operator actually reaches for on
-the 2026-09-12 shape: the deactivate PATCH quiesces BEFORE it tears the MQTT session down
+the 2026-09-12 shape: the deactivate PATCH runs the teardown quiesce BEFORE it tears the
+MQTT session down
 (the order is the whole fix). The clear-plate refusal's new copy ("Use Recover to
 override.") stays with the route that raises it, in ``test_printers_api.py``.
 """
@@ -60,7 +61,6 @@ class TestEnterAndExit:
             "held": True,
             "already_held": False,
             # Nothing to quiesce on an idle printer with no session in a test process.
-            "cooldown_ended": False,
             "eject_stopped": False,
             "job_stopped": False,
             "lease_revoked": False,
@@ -277,16 +277,21 @@ class TestDeactivateQuiescesFirst:
     async def test_the_patch_quiesces_on_the_deactivate_transition_before_disconnecting(
         self, async_client: AsyncClient, printer_factory, monkeypatch
     ):
-        """The ROUTE's half: deactivation quiesces, with the ``deactivate`` cause, first.
+        """The ROUTE's half: deactivation runs ONE verb, with the ``deactivate`` cause, first.
+
+        ``quiesce_for_teardown`` is the verb, not the bare ``quiesce``: a deactivation is
+        the one caller that must also RETIRE the plate watch, because it is about to drop
+        the session the watch's actuators speak over. Entering maintenance mode explicitly
+        does not.
 
         Call order alone is NOT the fix, and this pin deliberately does not claim to be
         one: the 2026-09-12 probe found the route already in this order while the fans
         stayed on, because ``stand_down``'s cancel is only scheduled. What the ordering
         has to ACHIEVE — both fans commanded off while the client still exists — is
         pinned as a consequence in
-        ``test_service_hold.py::TestQuiesceStandsTheCooldownDown``, over the real monitor
-        and the real cooldown prep. This one exists so that a route which stopped calling
-        the quiesce at all still fails something.
+        ``test_service_hold.py::TestEnteringKeepsTheCooldown``, over the real monitor and
+        the real cooldown prep. This one exists so that a route which stopped calling the
+        teardown at all still fails something.
         """
         printer = await printer_factory(is_active=True)
         order: list[str] = []
@@ -295,7 +300,7 @@ class TestDeactivateQuiescesFirst:
             order.append(f"quiesce:{cause}")
             return service_hold.QuiesceReport()
 
-        monkeypatch.setattr(service_hold, "quiesce", _fake_quiesce)
+        monkeypatch.setattr(service_hold, "quiesce_for_teardown", _fake_quiesce)
         monkeypatch.setattr(printer_manager, "disconnect_printer", lambda pid: order.append("disconnect"))
 
         response = await async_client.patch(f"/api/v1/printers/{printer.id}", json={"is_active": False})
@@ -311,7 +316,7 @@ class TestDeactivateQuiescesFirst:
             order.append("quiesce")
             return service_hold.QuiesceReport()
 
-        monkeypatch.setattr(service_hold, "quiesce", _fake_quiesce)
+        monkeypatch.setattr(service_hold, "quiesce_for_teardown", _fake_quiesce)
 
         response = await async_client.patch(f"/api/v1/printers/{printer.id}", json={"location": "bench 2"})
 
@@ -330,7 +335,7 @@ class TestDeactivateQuiescesFirst:
             order.append("quiesce")
             return service_hold.QuiesceReport()
 
-        monkeypatch.setattr(service_hold, "quiesce", _fake_quiesce)
+        monkeypatch.setattr(service_hold, "quiesce_for_teardown", _fake_quiesce)
 
         response = await async_client.patch(f"/api/v1/printers/{printer.id}", json={"is_active": False})
 
@@ -339,8 +344,9 @@ class TestDeactivateQuiescesFirst:
 
     async def test_re_activation_reconsiders_the_plate(self, async_client: AsyncClient, printer_factory, monkeypatch):
         """A plate gated while the printer had no session gets its watch back without a
-        restart: ``_desired_policy``'s answer changed, but no occupancy transition
-        happened to carry it."""
+        restart. It is the ONE remaining ``reconsider`` cause: a deactivation retired the
+        watch, and no occupancy transition happens to re-arm it (entering a hold no longer
+        retires one, so releasing a hold no longer needs this)."""
         from backend.app.services.eject.monitor import eject_cooldown_monitor
 
         printer = await printer_factory(is_active=False)

@@ -728,9 +728,9 @@ export default {
     maintenanceUpToDate: 'すべてのメンテナンスが最新です',
     maintenance: {
       badge: 'メンテナンスモード',
-      since: '{{time}} から自動処理を停止中 — ディスパッチ、自動排出、冷却を一時停止',
+      since: '{{time}} から自動処理を停止中 — ディスパッチと自動排出を一時停止、冷却はファンのみで継続',
       exitButton: 'メンテナンスモードを終了',
-      exitHint: 'ディスパッチが再開し、冷却待ちのプレートは待機を再開します。',
+      exitHint: 'ディスパッチが再開し、ゲート中のプレートはベッドがしきい値に達すると排出されます。',
       menuEnter: 'メンテナンスモードを開始',
       menuExit: 'メンテナンスモードを終了',
       toastEntered: '{{name}} をメンテナンスモードにしました',
@@ -738,7 +738,7 @@ export default {
       confirmTitle: '{{name}} をメンテナンスモードにしますか？',
       confirmEffectPrint: '• 実行中の印刷を停止 — 再開するまでランは保留されます',
       confirmEffectEject: '• 排出スイープを停止 — プレートはゲートされたままです',
-      confirmEffectCooldown: '• 冷却ファンを停止',
+      confirmEffectCooldown: '• 排出を延期 — 冷却ファンはベッドが冷えるまで稼働し、その後停止します',
     },
     deactivated: {
       pillLabel: '無効',
@@ -893,6 +893,10 @@ export default {
       coolingHeld: '{{threshold}}°C まで冷却中・プレート保持中',
       coolingHeldHint: 'プレートはノズル高さで保持され、ツールヘッドはシュート位置で待機しています。排出が実行されるまでツールヘッドを動かさないでください。',
       awaitingPlateClear: 'プレートのクリア待ち',
+      ejectDeferred: '冷却終了・排出を延期',
+      ejectDeferredHint: '部品を手で取り出した場合は、先にプレートをクリア済みにしてください。排出はメンテナンスモードの終了時に実行されます。',
+      ejectDeferredHeld: '冷却終了・排出を延期・プレート保持中',
+      ejectDeferredHeldHint: 'プレートはノズル高さで保持され、ツールヘッドはシュート位置で待機しています。ツールヘッドを動かさないでください。部品を手で取り出した場合は、先にプレートをクリア済みにしてください。排出はメンテナンスモードの終了時に実行されます。',
     },
     ejectPhase: {
       building: '排出: 作成中…',

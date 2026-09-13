@@ -112,7 +112,15 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
   });
   let phaseText: string | null = null;
   if (phase?.kind === 'printing') phaseText = t('printers.phase.printing');
-  else if (phase?.kind === 'cooling') {
+  else if (phase?.kind === 'ejectDeferred') {
+    // Same observability rule as cooling below: a live watch state is only
+    // claimed for a printer this instance can still see.
+    if (state.connected) {
+      phaseText = t(
+        phase.held ? 'printers.phase.ejectDeferredHeld' : 'printers.phase.ejectDeferred',
+      );
+    }
+  } else if (phase?.kind === 'cooling') {
     // Never claim "cooling" for a printer we cannot observe — mirror the
     // printer card, which shows no phase pill while disconnected.
     if (state.connected) {

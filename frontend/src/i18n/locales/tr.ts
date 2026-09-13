@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: 'Tüm bakım güncel - Görüntülemek için tıklayın',
     maintenance: {
       badge: 'Bakım modu',
-      since: '{{time}} saatinden beri otomasyon kapalı — gönderim, otomatik çıkarma ve soğutma duraklatıldı',
+      since: '{{time}} saatinden beri otomasyon kapalı — gönderim ve otomatik çıkarma duraklatıldı; soğutma yalnızca fanlarla sürer',
       exitButton: 'Bakım modundan çık',
-      exitHint: 'Gönderim sürer ve soğumayı bekleyen bir plaka beklemesine kaldığı yerden devam eder.',
+      exitHint: 'Gönderim sürer; kilitli bir plaka, tablası eşiğe indiğinde çıkarılır.',
       menuEnter: 'Bakım moduna al',
       menuExit: 'Bakım modundan çık',
       toastEntered: '{{name}} bakım modunda',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: '{{name}} bakım moduna alınsın mı?',
       confirmEffectPrint: '• Süren baskıyı durdur — seri, Sürdür denene kadar bekler',
       confirmEffectEject: '• Çıkarma süpürmesini durdur — plaka kilitli kalır',
-      confirmEffectCooldown: '• Soğutma fanlarını durdur',
+      confirmEffectCooldown: '• Çıkarmayı ertele — soğutma fanları tabla soğuyana kadar çalışır, sonra durur',
     },
     deactivated: {
       pillLabel: 'Devre dışı',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: '{{threshold}}°C\'ye soğutuluyor · plaka yukarıda',
       coolingHeldHint: 'Plaka nozul hizasında tutuluyor, kafa oluk konumunda bekliyor. Çıkarma çalışana kadar kafayı hareket ettirmeyin.',
       awaitingPlateClear: 'Plakanın temizlenmesi bekleniyor',
+      ejectDeferred: 'Soğutma bitti · çıkarma ertelendi',
+      ejectDeferredHint: 'Parça elle alındıysa önce plakayı temizlendi olarak işaretleyin. Çıkarma, bakım modu sona erdiğinde çalışır.',
+      ejectDeferredHeld: 'Soğutma bitti · çıkarma ertelendi · plaka yukarıda',
+      ejectDeferredHeldHint: 'Plaka nozul hizasında tutuluyor, kafa oluk konumunda bekliyor. Kafayı hareket ettirmeyin. Parça elle alındıysa önce plakayı temizlendi olarak işaretleyin; çıkarma, bakım modu sona erdiğinde çalışır.',
     },
     ejectPhase: {
       building: 'Çıkarma: hazırlanıyor…',

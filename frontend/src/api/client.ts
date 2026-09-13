@@ -382,7 +382,6 @@ export interface ServiceHoldState {
 export interface ServiceHoldEnterResult {
   held: boolean;
   already_held: boolean;
-  cooldown_ended: boolean;
   eject_stopped: boolean;
   job_stopped: boolean;
   lease_revoked: boolean;
@@ -720,7 +719,9 @@ export interface PrinterStatus {
   // `hold_z` is the height the plate is being HELD at for the duration of that
   // wait (nozzle plane, toolhead parked at the chute) — non-null means an
   // operator must not jog the toolhead until the eject runs; null = not held.
-  eject_watch?: { threshold_c: number; hold_z: number | null } | null;
+  // `deferred` is true once the cooldown watch has retired its fans and is
+  // withholding the eject under maintenance mode.
+  eject_watch?: { threshold_c: number; hold_z: number | null; deferred: boolean } | null;
   // Open printer-hold incident (WS2b): the fault this printer is currently held
   // by. Present for FOREIGN prints too — those have no queue unit, so this chip
   // is the only place their hold is visible. Null/absent when clear.

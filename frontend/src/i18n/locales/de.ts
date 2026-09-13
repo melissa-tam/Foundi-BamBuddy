@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: 'Alle Wartungen aktuell - Klicken zum Anzeigen',
     maintenance: {
       badge: 'Wartungsmodus',
-      since: 'Automatik aus seit {{time}} — Versand, Auto-Auswurf und Abkühlung pausiert',
+      since: 'Automatik aus seit {{time}} — Versand und Auto-Auswurf pausiert; eine Abkühlung läuft nur mit Lüftern',
       exitButton: 'Wartungsmodus beenden',
-      exitHint: 'Der Versand läuft wieder an, und eine Platte, die noch abkühlen muss, setzt ihre Wartezeit fort.',
+      exitHint: 'Der Versand läuft wieder an; eine gesperrte Platte wird ausgeworfen, sobald ihr Bett die Schwelle erreicht hat.',
       menuEnter: 'Wartungsmodus aktivieren',
       menuExit: 'Wartungsmodus beenden',
       toastEntered: '{{name}} im Wartungsmodus',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: 'Wartungsmodus für {{name}} aktivieren?',
       confirmEffectPrint: '• Laufenden Druck stoppen — der Auftrag wartet bis Fortsetzen',
       confirmEffectEject: '• Auswurf-Sweep stoppen — die Platte bleibt gesperrt',
-      confirmEffectCooldown: '• Abkühl-Lüfter stoppen',
+      confirmEffectCooldown: '• Auswurf verschieben — die Abkühl-Lüfter laufen, bis das Bett abgekühlt ist, dann stoppen sie',
     },
     deactivated: {
       pillLabel: 'Deaktiviert',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: 'Kühlt auf {{threshold}}°C ab · Platte angehoben',
       coolingHeldHint: 'Die Platte wird auf Düsenhöhe gehalten, der Druckkopf steht an der Rutsche. Den Druckkopf erst nach dem Auswurf bewegen.',
       awaitingPlateClear: 'Wartet auf Plattenfreigabe',
+      ejectDeferred: 'Abkühlung beendet · Auswurf verschoben',
+      ejectDeferredHint: 'Platte zuerst als freigegeben markieren, wenn das Teil von Hand entnommen wurde. Der Auswurf läuft, sobald der Wartungsmodus endet.',
+      ejectDeferredHeld: 'Abkühlung beendet · Auswurf verschoben · Platte angehoben',
+      ejectDeferredHeldHint: 'Die Platte wird auf Düsenhöhe gehalten, der Druckkopf steht an der Rutsche. Den Druckkopf nicht bewegen. Platte zuerst als freigegeben markieren, wenn das Teil von Hand entnommen wurde; der Auswurf läuft, sobald der Wartungsmodus endet.',
     },
     ejectPhase: {
       building: 'Auswurf: wird erstellt…',

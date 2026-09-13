@@ -633,7 +633,6 @@ describe('PrintersPage', () => {
           return HttpResponse.json({
             held: true,
             already_held: false,
-            cooldown_ended: false,
             eject_stopped: false,
             job_stopped: false,
             lease_revoked: false,
@@ -660,7 +659,6 @@ describe('PrintersPage', () => {
           return HttpResponse.json({
             held: true,
             already_held: false,
-            cooldown_ended: false,
             eject_stopped: false,
             job_stopped: true,
             lease_revoked: false,

@@ -712,9 +712,9 @@ export default {
     maintenanceUpToDate: '모든 유지보수 최신 상태 - 클릭하여 보기',
     maintenance: {
       badge: '유지보수 모드',
-      since: '{{time}}부터 자동화 중지 — 디스패치, 자동 배출, 냉각 일시정지',
+      since: '{{time}}부터 자동화 중지 — 디스패치와 자동 배출 일시정지, 냉각은 팬만 가동',
       exitButton: '유지보수 모드 종료',
-      exitHint: '디스패치가 재개되고, 냉각을 기다리던 플레이트는 대기를 이어갑니다.',
+      exitHint: '디스패치가 재개되고, 잠긴 플레이트는 베드가 기준 온도에 도달하면 배출됩니다.',
       menuEnter: '유지보수 모드 시작',
       menuExit: '유지보수 모드 종료',
       toastEntered: '{{name}} 유지보수 모드',
@@ -722,7 +722,7 @@ export default {
       confirmTitle: '{{name}}을(를) 유지보수 모드로 전환할까요?',
       confirmEffectPrint: '• 진행 중인 인쇄 중지 — 재개할 때까지 런이 보류됩니다',
       confirmEffectEject: '• 배출 스윕 중지 — 플레이트는 계속 잠깁니다',
-      confirmEffectCooldown: '• 냉각 팬 중지',
+      confirmEffectCooldown: '• 배출 연기 — 냉각 팬은 베드가 식을 때까지 돌고 그 후 정지합니다',
     },
     deactivated: {
       pillLabel: '비활성화됨',
@@ -868,6 +868,10 @@ export default {
       coolingHeld: '{{threshold}}°C까지 냉각 중 · 플레이트 상승',
       coolingHeldHint: '플레이트가 노즐 높이에서 유지되고 툴헤드는 슈트에 대기 중입니다. 배출이 실행될 때까지 툴헤드를 움직이지 마십시오.',
       awaitingPlateClear: '플레이트 비움 대기 중',
+      ejectDeferred: '냉각 종료 · 배출 연기',
+      ejectDeferredHint: '부품을 손으로 꺼낸 경우 먼저 플레이트를 비움으로 표시하십시오. 배출은 유지보수 모드가 끝나면 실행됩니다.',
+      ejectDeferredHeld: '냉각 종료 · 배출 연기 · 플레이트 상승',
+      ejectDeferredHeldHint: '플레이트가 노즐 높이에서 유지되고 툴헤드는 슈트에 대기 중입니다. 툴헤드를 움직이지 마십시오. 부품을 손으로 꺼낸 경우 먼저 플레이트를 비움으로 표시하십시오. 배출은 유지보수 모드가 끝나면 실행됩니다.',
     },
     ejectPhase: {
       building: '배출: 준비 중…',

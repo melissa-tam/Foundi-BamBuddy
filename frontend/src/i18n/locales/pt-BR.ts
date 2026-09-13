@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: 'Toda a manutenção está em dia - Clique para ver',
     maintenance: {
       badge: 'Modo manutenção',
-      since: 'Automação desligada desde {{time}} — envio, auto-ejeção e resfriamento pausados',
+      since: 'Automação desligada desde {{time}} — envio e auto-ejeção pausados; o resfriamento funciona só com ventiladores',
       exitButton: 'Sair do modo manutenção',
-      exitHint: 'O envio é retomado, e uma placa ainda aguardando resfriamento retoma a espera.',
+      exitHint: 'O envio é retomado; uma placa bloqueada é ejetada quando a mesa atinge o limite.',
       menuEnter: 'Entrar no modo manutenção',
       menuExit: 'Sair do modo manutenção',
       toastEntered: '{{name}} em modo manutenção',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: 'Entrar no modo manutenção em {{name}}?',
       confirmEffectPrint: '• Parar a impressão em andamento — a série aguarda até Retomar',
       confirmEffectEject: '• Parar a varredura de ejeção — a placa continua bloqueada',
-      confirmEffectCooldown: '• Parar os ventiladores de resfriamento',
+      confirmEffectCooldown: '• Adiar a ejeção — os ventiladores de resfriamento funcionam até a mesa esfriar e depois param',
     },
     deactivated: {
       pillLabel: 'Desativada',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: 'Resfriando até {{threshold}}°C · placa elevada',
       coolingHeldHint: 'A placa é mantida na altura do bico com o cabeçote estacionado na calha. Não mova o cabeçote até a ejeção ser executada.',
       awaitingPlateClear: 'Aguardando liberação da placa',
+      ejectDeferred: 'Resfriamento concluído · ejeção adiada',
+      ejectDeferredHint: 'Marque primeiro a placa como liberada se a peça foi retirada à mão. A ejeção é executada ao sair do modo manutenção.',
+      ejectDeferredHeld: 'Resfriamento concluído · ejeção adiada · placa elevada',
+      ejectDeferredHeldHint: 'A placa é mantida na altura do bico com o cabeçote estacionado na calha. Não mova o cabeçote. Marque primeiro a placa como liberada se a peça foi retirada à mão; a ejeção é executada ao sair do modo manutenção.',
     },
     ejectPhase: {
       building: 'Ejeção: preparando…',

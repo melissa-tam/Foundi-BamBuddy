@@ -2229,6 +2229,24 @@ function PrinterCard({
         awaiting_plate_clear: status.awaiting_plate_clear,
         eject_watch: status.eject_watch,
       });
+      if (phase?.kind === 'ejectDeferred') {
+        // Cooldown over, fans retired, sweep withheld by maintenance mode. The
+        // pill states where the plate is; what the operator can do about it
+        // (clear it by hand, or wait for the hold to end) rides the tooltip —
+        // and a plate still held at the nozzle plane carries the same do-not-jog
+        // constraint as the cooling pill, so it gets its own variant.
+        return phase.held
+          ? {
+              label: t('printers.phase.ejectDeferredHeld'),
+              className: 'bg-blue-500/20 text-blue-400',
+              title: t('printers.phase.ejectDeferredHeldHint'),
+            }
+          : {
+              label: t('printers.phase.ejectDeferred'),
+              className: 'bg-blue-500/20 text-blue-400',
+              title: t('printers.phase.ejectDeferredHint'),
+            };
+      }
       if (phase?.kind === 'cooling') {
         // A HELD plate (hold_z) keeps the toolhead parked at the chute for the
         // whole wait — that constraint is the operator's, so it rides a tooltip

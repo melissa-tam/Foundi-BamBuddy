@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: '所有维护均已完成 - 点击查看',
     maintenance: {
       badge: '维护模式',
-      since: '自 {{time}} 起自动化已关闭 — 派发、自动弹出和冷却已暂停',
+      since: '自 {{time}} 起自动化已关闭 — 派发和自动弹出已暂停；冷却仅由风扇继续',
       exitButton: '退出维护模式',
-      exitHint: '派发恢复，仍在等待冷却的打印板将继续等待。',
+      exitHint: '派发恢复；被闸门锁住的打印板将在热床达到阈值后弹出。',
       menuEnter: '进入维护模式',
       menuExit: '退出维护模式',
       toastEntered: '{{name}} 已进入维护模式',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: '让 {{name}} 进入维护模式？',
       confirmEffectPrint: '• 停止正在进行的打印 — 生产运行将保持到手动继续',
       confirmEffectEject: '• 停止弹出清扫 — 打印板闸门保持关闭',
-      confirmEffectCooldown: '• 停止冷却风扇',
+      confirmEffectCooldown: '• 延后弹出 — 冷却风扇继续运行至热床冷却后停止',
     },
     deactivated: {
       pillLabel: '已停用',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: '正在冷却至 {{threshold}}°C · 打印板已抬升',
       coolingHeldHint: '打印板保持在喷嘴高度，工具头停在滑槽处。取件执行前请勿移动工具头。',
       awaitingPlateClear: '等待清理打印板',
+      ejectDeferred: '冷却结束 · 取件延后',
+      ejectDeferredHint: '如已手动取下零件，请先将打印板标记为已清理。取件将在退出维护模式后执行。',
+      ejectDeferredHeld: '冷却结束 · 取件延后 · 打印板已抬升',
+      ejectDeferredHeldHint: '打印板保持在喷嘴高度，工具头停在滑槽处。请勿移动工具头。如已手动取下零件，请先将打印板标记为已清理；取件将在退出维护模式后执行。',
     },
     ejectPhase: {
       building: '弹出：正在生成…',
