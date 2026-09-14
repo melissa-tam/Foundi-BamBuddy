@@ -279,6 +279,8 @@ FanStepOutcome = Literal[
     "sent",
     "skipped:same",  # sustain == boost: the aux lane, which has no step by construction
     "skipped:not_published",  # this lane never started, so there is nothing to step
+    "skipped:retired",  # this prep has been retired — no actuator after retirement
+    "skipped:operator_off",  # a human switched this fan off; a step would re-assert it
     "skipped:active",
     "skipped:no_client",
     "skipped:publish",
@@ -307,6 +309,16 @@ class FanLane:
     threshold while this prep was live; ``off`` by :meth:`CooldownPrep.end`. Both
     later fields stay None when their moment never came, and the summary line renders
     that as ``none`` rather than inventing an outcome.
+
+    ``witnessed_on`` / ``operator_off`` are the OPERATOR's half of this lane's story,
+    decided from the wire witness in :meth:`CooldownPrep.note_sample`: the wire is the
+    only origin that also sees the touchscreen, so it is the only way to notice that a
+    human switched a fan the farm published back off (a touchscreen tap, or
+    ``POST /printers/{id}/fan-speed``). Zero is the ONE unambiguous witness value — the
+    wire reports a quantised 0-15 level, so "lowered but still running" is NOT detected
+    and is not claimed to be — and the detector only ever arms after the lane was
+    witnessed RUNNING, so a model that never reports the field (or the virtual printer,
+    which reports ``0`` unconditionally) decides nothing.
     """
 
     fan: CooldownFan
@@ -314,6 +326,10 @@ class FanLane:
     start: FanStartOutcome
     step: FanStepOutcome | None = None
     off: FanOffOutcome | None = None
+    # Has the wire ever reported this lane's fan actually turning after we published it?
+    witnessed_on: bool = False
+    # …and then reported it at exactly 0 without this lane having commanded that 0.
+    operator_off: bool = False
 
     @property
     def published(self) -> bool:
@@ -327,6 +343,7 @@ HoldOutcome = Literal[
     "sent",
     "skipped:foreign",  # queue_item_id is None — the foreign auto-eject watch never holds
     "skipped:disabled",  # farm_cooldown_hold_enabled is off — INFO, a deliberate operator state
+    "skipped:service_hold",  # maintenance mode: the hold MOVES the machine, hands may be in it
     "skipped:item_missing",
     "skipped:profile_missing",
     "skipped:geometry",  # GeometryUnavailable (no row, or not hardware-validated)
@@ -437,6 +454,14 @@ class CooldownPrep:
     all three are recovered by the next watch's ``begin`` (re-entrant by construction)
     or by the eject block's own ``M106 P2 S0`` / ``M106 P3 S0``, not by anything
     remembered here.
+
+    **RETIRED is a class invariant: no actuator is driven after :meth:`end`.** The prep's
+    lifetime is the COOLING EPISODE, which can now end BEFORE the watch does — a service
+    hold withholds the eject, so the watch retires the actuators at the cooldown's end and
+    goes on polling. Without the invariant the sampler would re-start the chamber fan at
+    its sustain speed on the first chamber-under-threshold sample AFTER that retirement
+    (the bed reaches the eject line before the chamber does on the measured trace), which
+    is the fans-run-for-hours shape again from the other direction.
     """
 
     printer_id: int
@@ -458,6 +483,9 @@ class CooldownPrep:
     chamber_at_arm_c: float | None = None
     bed_at_arm_c: float | None = None
     sampled: bool = False
+    # Has this cooling episode ended? Set by :meth:`end`, which is the ONE retirement
+    # path; every other entry point refuses on a retired prep (the invariant above).
+    retired: bool = False
     # When the chamber first read at or under the threshold (monotonic), or None for a
     # cooldown whose chamber never got there. THE measurement this wave exists to take.
     boost_ended_at: float | None = None
@@ -511,7 +539,20 @@ class CooldownPrep:
         the first sample and says so with ``after 0 s``; a chamber that never reads
         under it never steps, and the summary says ``never``; a model with no chamber
         reading at all is the same case as the second.
+
+        Also the ONE place the operator's own hand is noticed (:meth:`_note_fan_witnesses`),
+        read from the same poll and BEFORE the boost logic, because "a human switched this
+        fan off" changes what the step below is allowed to do. A RETIRED prep decides
+        nothing at all: the cooling episode is over, and a sample arriving afterwards
+        (this watch is still polling, because a service hold withheld its eject) must not
+        bring a fan back.
         """
+        if self.retired:
+            return
+        try:
+            self._note_fan_witnesses()
+        except Exception:  # noqa: BLE001 — a witness read never costs the step its decision
+            logger.exception("[cooldown-prep] printer %s: fan witness read failed", self.printer_id)
         try:
             chamber = _reading(temperatures, "chamber")
             if not self.sampled:
@@ -538,6 +579,41 @@ class CooldownPrep:
         except Exception:  # noqa: BLE001 — a sampler must never kill the watch that feeds it
             logger.exception("[cooldown-prep] printer %s: cooldown sample failed", self.printer_id)
 
+    def _note_fan_witnesses(self) -> None:
+        """Read both lanes' wire witnesses and decide whether a HUMAN turned one off.
+
+        Two facts per lane, in order, because the second is only meaningful after the
+        first: ``witnessed_on`` (the wire has reported this fan actually running since we
+        published it) and then ``operator_off`` (it now reports exactly 0, and this lane
+        did not command that 0). Only a lane the farm PUBLISHED is watched — a fan an
+        operator started themselves was never ours to decide about.
+
+        Decided here rather than at the step, and independently of ``boost_ended_at``, so
+        the fact is recorded when it happens rather than at whatever later moment the
+        chamber air happens to cross the line. Our OWN zero — a step to a sustain of 0 —
+        is excluded by construction; anything else at 0 after running is a hand on the
+        machine, and the farm stands aside for it (one INFO line, once per lane).
+        """
+        for lane in self.fans:
+            if not lane.published:
+                continue
+            observed = _observed_fan(self.printer_id, lane.fan)
+            if observed is None:
+                continue  # nothing reported: a witness that says nothing decides nothing
+            if observed > 0:
+                lane.witnessed_on = True
+                continue
+            if not lane.witnessed_on or lane.operator_off:
+                continue
+            if lane.step == "sent" and lane.request.sustain_percent == 0:
+                continue  # that zero is OURS — the boost-end step stopped this lane
+            lane.operator_off = True
+            logger.info(
+                "[cooldown-prep] printer %s: %s fan observed off — released to the operator, not re-commanded",
+                self.printer_id,
+                lane.fan.name,
+            )
+
     def _step_fan(self, lane: FanLane) -> FanStepOutcome:
         """Take one lane from its boost speed to its sustain speed, or say why not.
 
@@ -545,13 +621,22 @@ class CooldownPrep:
         already in cooling — the prelude is an ON-time precondition, not a per-command
         one. A sustain of 0 publishes ``S0`` and leaves the lane off from here, which
         :meth:`_switch_fan_off` then reports as ``skipped:already_off``.
+
+        Two refusals that are about OWNERSHIP rather than transport: a retired prep drives
+        no actuator at all (the class invariant), and a lane a human has switched off is
+        theirs — a step is a RE-ASSERTION of a speed, and re-asserting one over an
+        operator's off would be the farm arguing with the person at the machine.
         """
+        if self.retired:
+            return "skipped:retired"
         if lane.request.sustain_percent == lane.request.boost_percent:
             return "skipped:same"
         if not lane.published:
             # Never commanded this fan ON, so stepping it would be this module driving
             # a fan it does not own.
             return "skipped:not_published"
+        if lane.operator_off:
+            return "skipped:operator_off"
         if _live_state(self.printer_id) in ACTIVE_PRINT_STATES:
             logger.warning(
                 "[cooldown-prep] printer %s: a job is active — %s fan not stepped to %s%%",
@@ -589,7 +674,20 @@ class CooldownPrep:
         flow; on any other exit (an operator clearing the gate, a stall) the plate is
         parked at a safe height with the steppers released, which is the same state
         the stock end block leaves behind.
+
+        **Called twice on a deferred cooldown, and the two calls are different acts.** A
+        service hold retires the actuators when the COOLING ends (the watch goes on
+        polling), and the watch's exit ``finally`` calls this again later. The
+        MEASUREMENT is idempotent — one summary line per cooling episode, from the first
+        call — but the fans-off is not: :meth:`_retry_fan_off` re-attempts any lane whose
+        OFF did not actually land, because a ``skipped:active`` / ``skipped:no_client`` /
+        ``skipped:publish`` is not a retirement, and a deferral has no eject job whose
+        prologue would carry the durable ``M106 P2 S0``.
         """
+        if self.retired:
+            self._retry_fan_off(fan_off)
+            return
+        self.retired = True
         segments: list[str] = []
         for lane in self.fans:
             try:
@@ -620,8 +718,49 @@ class CooldownPrep:
             ", ".join(segments),
         )
 
+    def _retry_fan_off(self, fan_off: bool) -> None:
+        """Re-attempt the fans-off for a lane whose retirement never landed. Never raises.
+
+        Reached only from a SECOND :meth:`end` on an already-retired prep — the deferred
+        cooldown's shape, where the cooling ended under a service hold and the watch
+        exited later. A lane is re-attempted when it was published and its recorded ``off``
+        is neither ``sent`` nor ``skipped:already_off``: those two are the only outcomes
+        that mean the fan is actually stopped. ``skipped:not_wanted`` is included on
+        purpose — the first call may have handed the fans to a successor that has since
+        gone — and is filtered by ``fan_off`` here instead.
+
+        Deliberately NOT guarded by :attr:`retired`: this IS the retirement path, and the
+        invariant it enforces is "no actuator is driven after the episode", never "the OFF
+        is published at most once". No second summary line — the measurement was taken by
+        the first call, and a retry that lands says so in one line of its own.
+        """
+        if not fan_off:
+            return
+        for lane in self.fans:
+            if not lane.published or lane.off in ("sent", "skipped:already_off"):
+                continue
+            first_attempt = lane.off
+            try:
+                lane.off = self._switch_fan_off(lane, True)
+            except Exception:  # noqa: BLE001 — the other lane must still be re-attempted
+                logger.exception("[cooldown-prep] printer %s: %s fan off retry failed", self.printer_id, lane.fan.name)
+                lane.off = "skipped:publish"
+            if lane.off == "sent":
+                logger.info(
+                    "[cooldown-prep] printer %s: %s fan OFF landed on the retirement retry (first attempt %s)",
+                    self.printer_id,
+                    lane.fan.name,
+                    first_attempt,
+                )
+
     def _switch_fan_off(self, lane: FanLane, fan_off: bool) -> FanOffOutcome:
-        """Switch one fan off, or say why not. The only I/O :meth:`end` does."""
+        """Switch one fan off, or say why not. The only I/O :meth:`end` does.
+
+        Deliberately NOT suppressed by ``lane.operator_off``: the end-of-cooldown OFF
+        retires a fan the FARM published, and an operator who switched it back on gets it
+        switched off with the cooldown rather than left running on an idle printer. Only
+        the STEP (a re-assertion of a speed mid-cooldown) stands aside for a human.
+        """
         if not fan_off:
             return "skipped:not_wanted"
         if not lane.published:
@@ -651,6 +790,7 @@ async def begin(
     model: str | None,
     hold_enabled: bool,
     hold_part_top_mm: int,
+    held: bool = False,
     settle_s: float = 3.0,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> CooldownPrep:
@@ -668,10 +808,20 @@ async def begin(
     ``hold_part_top_mm`` are all resolved ONCE by the watch that arms this prep and
     never re-read here — this module opens no settings session and asks the manager for
     no model. ``settle_s``/``sleep`` are injected only so tests need not wait.
+
+    ``held`` is the printer's service hold, read once by the watch that arms this prep: it
+    refuses the plate HOLD and nothing else. Motion is an action — the hold drives the bed
+    and the toolhead (``G150.3``) and a human's hands may be inside the machine — while the
+    fans are air, and a held printer's plate has to cool like any other. The cost is stated
+    rather than hidden: a cooldown that arms under a hold is FAN-ONLY and therefore slower
+    (the aux stream is centred on the nozzle plane, ~73 mm above a vendor-parked part), and
+    it is NOT re-attempted when the hold lifts — the eject's first Z move handles either
+    plate position, and an unseeded estimator over-states the drop span, which is the safe
+    direction.
     """
     started_at = time.monotonic()
     hold, hold_z, max_z = await _hold_plate(
-        printer_id, queue_item_id, hold_enabled=hold_enabled, part_top_mm=hold_part_top_mm
+        printer_id, queue_item_id, hold_enabled=hold_enabled, part_top_mm=hold_part_top_mm, held=held
     )
     # The fan publishes are the LAST thing before the handle is returned — nothing is
     # awaited after them (the witness wait lives in ``CooldownPrep.observe_start``), so
@@ -754,7 +904,7 @@ def _start_fan(printer_id: int, fan: CooldownFan, request: FanRequest, model: st
 
 
 async def _hold_plate(
-    printer_id: int, queue_item_id: int | None, *, hold_enabled: bool, part_top_mm: int
+    printer_id: int, queue_item_id: int | None, *, hold_enabled: bool, part_top_mm: int, held: bool = False
 ) -> tuple[HoldOutcome, float | None, float | None]:
     """Send the plate hold, or return the reason it was skipped.
 
@@ -763,7 +913,7 @@ async def _hold_plate(
     did not happen would tell the runtime watchdog the bed is 120 mm closer to the
     nozzle than it is. ``max_z`` is returned whenever it was read, sent or not.
 
-    The gate order is cheapest-and-most-permanent first: the two refusals that need no
+    The gate order is cheapest-and-most-permanent first: the three refusals that need no
     state at all come before the session is even opened, a model with no registry
     numbers can never hold so it is not worth opening a 3MF for, and the admission pair
     (connected → ``ejectable``) is last because it is the only fact that can change
@@ -778,6 +928,14 @@ async def _hold_plate(
         # it has to be reachable from the Farm tab in the minute a hold misbehaves.
         logger.info("[cooldown-prep] printer %s: plate hold switched off — fans only", printer_id)
         return "skipped:disabled", None, None
+    if held:
+        # Maintenance mode. The plate is cooled by the fans alone: this is the one
+        # actuator here that MOVES the machine (the bed, and the toolhead's ``G150.3``),
+        # and the operator whose hands may be inside it is exactly who the hold exists
+        # for. INFO, not WARN — a declared state, like the switch above. Asked before any
+        # session is opened, because no amount of state could change the answer.
+        logger.info("[cooldown-prep] printer %s: printer in maintenance mode — fans only, plate not held", printer_id)
+        return "skipped:service_hold", None, None
 
     from backend.app.core.database import async_session
     from backend.app.models.eject_profile import EjectProfile

@@ -736,9 +736,9 @@ export default {
     // flag: no session at all).
     maintenance: {
       badge: 'Maintenance mode',
-      since: 'Automation off since {{time}} — dispatch, auto-eject and cooldown paused',
+      since: 'Automation off since {{time}} — dispatch and auto-eject paused; a cooldown runs fans-only',
       exitButton: 'Exit maintenance mode',
-      exitHint: 'Dispatch resumes, and a plate still waiting on cooldown resumes its wait.',
+      exitHint: 'Dispatch resumes; a gated plate ejects once its bed is at the threshold.',
       menuEnter: 'Enter maintenance mode',
       menuExit: 'Exit maintenance mode',
       toastEntered: '{{name}} in maintenance mode',
@@ -746,7 +746,7 @@ export default {
       confirmTitle: 'Enter maintenance mode on {{name}}?',
       confirmEffectPrint: '• Stop the running print — the run holds until Resume',
       confirmEffectEject: '• Stop the eject sweep — the plate stays gated',
-      confirmEffectCooldown: '• Stop the cooldown fans',
+      confirmEffectCooldown: '• Defer the eject — the cooldown fans run until the bed has cooled, then stop',
     },
     // Deactivated = the is_active flag: this instance holds no MQTT session for
     // the printer. A wiring state, not an out-of-service verb.
@@ -903,6 +903,10 @@ export default {
       coolingHeld: 'Cooling to {{threshold}}°C · plate raised',
       coolingHeldHint: 'Plate held at the nozzle plane with the toolhead parked at the chute. Do not jog the toolhead until the eject runs.',
       awaitingPlateClear: 'Awaiting plate clear',
+      ejectDeferred: 'Cooldown ended · eject deferred',
+      ejectDeferredHint: 'Mark the plate cleared first if the part was removed by hand. The eject runs when maintenance mode ends.',
+      ejectDeferredHeld: 'Cooldown ended · eject deferred · plate raised',
+      ejectDeferredHeldHint: 'Plate held at the nozzle plane with the toolhead parked at the chute. Do not jog the toolhead. Mark the plate cleared first if the part was removed by hand; the eject runs when maintenance mode ends.',
     },
     ejectPhase: {
       building: 'Ejecting: building…',

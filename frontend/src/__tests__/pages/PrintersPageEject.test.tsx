@@ -286,6 +286,39 @@ describe('door 2 — the expanded card\'s raised-gate banner', () => {
     expect(await screen.findByText('Cooling to 33°C')).toBeInTheDocument();
     expect(screen.queryByText(/plate raised/)).not.toBeInTheDocument();
   });
+
+  // A cooldown that finished under maintenance mode is NOT cooling any more: the
+  // fans are retired and the sweep waits on the hold. The pill says so instead of
+  // promising a release target the bed already met, and the operator's next step
+  // (clear it by hand, or wait for the hold to end) rides the tooltip.
+  it('shows a deferred-eject pill, with the operator next step on a tooltip', async () => {
+    mount(statusFinish({ eject_watch: { threshold_c: 33, deferred: true } }));
+    render(<PrintersPage />);
+
+    const pill = await screen.findByTitle(
+      'Mark the plate cleared first if the part was removed by hand. The eject runs when maintenance mode ends.',
+    );
+    expect(pill.textContent).toContain('eject deferred');
+    // No cooling claim survives the deferral — the cooldown episode is over.
+    expect(screen.queryByText(/Cooling to/)).not.toBeInTheDocument();
+    // Nothing is holding this plate, so the do-not-jog constraint is absent.
+    expect(pill.textContent).not.toContain('plate raised');
+  });
+
+  // A deferred eject on a plate the farm is still holding at the nozzle plane
+  // carries BOTH constraints: do not jog the toolhead, and the sweep is waiting
+  // on the hold. One pill, one tooltip — same shape as the cooling pair.
+  it('marks a deferred eject on a HELD plate, constraints on the tooltip', async () => {
+    mount(statusFinish({ eject_watch: { threshold_c: 33, hold_z: 2, deferred: true } }));
+    render(<PrintersPage />);
+
+    const pill = await screen.findByTitle(
+      'Plate held at the nozzle plane with the toolhead parked at the chute. Do not jog the toolhead. Mark the plate cleared first if the part was removed by hand; the eject runs when maintenance mode ends.',
+    );
+    expect(pill.textContent).toContain('eject deferred');
+    expect(pill.textContent).toContain('plate raised');
+    expect(screen.queryByText(/Cooling to/)).not.toBeInTheDocument();
+  });
 });
 
 describe('door 1 — the overflow menu item', () => {

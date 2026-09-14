@@ -1203,14 +1203,17 @@ def resolve_plate_id(state) -> int | None:
 
 
 def _eject_watch_payload(printer_id: int | None) -> dict | None:
-    """``{"threshold_c": t, "hold_z": z}`` for the printer's in-flight eject cooldown
-    watch, or None when no threshold-bearing watch is armed (Phase 4.3c).
+    """``{"threshold_c": t, "hold_z": z, "deferred": b}`` for the printer's in-flight eject
+    cooldown watch, or None when no threshold-bearing watch is armed (Phase 4.3c).
 
     ``hold_z`` is the height the cooldown prep parked the plate at, or None when the
-    plate is where the end block left it (an unheld model, a skipped hold) — it is
-    what the printer card renders its "plate raised" chip from. Both values are JSON
-    PRIMITIVES: this payload rides the WS serializer's bare ``json.dumps``, where a
-    non-primitive kills every status broadcast on the socket (2026-08-31)."""
+    plate is where the end block left it (an unheld model, a skipped hold, or a hold the
+    farm stopped claiming when a human took the printer) — it is what the printer card
+    renders its "plate raised" chip from. ``deferred`` is "cooled, fans retired, the eject
+    is waiting for maintenance mode to end" — the one cooldown state the hold flag cannot
+    express on its own. All three values are JSON PRIMITIVES: this payload rides the WS
+    serializer's bare ``json.dumps``, where a non-primitive kills every status broadcast on
+    the socket (2026-08-31)."""
     if not printer_id:
         return None
     from backend.app.services.eject.monitor import eject_cooldown_monitor
@@ -1218,7 +1221,11 @@ def _eject_watch_payload(printer_id: int | None) -> dict | None:
     threshold = eject_cooldown_monitor.active_watch(printer_id)
     if threshold is None:
         return None
-    return {"threshold_c": threshold, "hold_z": eject_cooldown_monitor.hold_z(printer_id)}
+    return {
+        "threshold_c": threshold,
+        "hold_z": eject_cooldown_monitor.hold_z(printer_id),
+        "deferred": eject_cooldown_monitor.deferred(printer_id),
+    }
 
 
 def occupancy_payload(printer_id: int | None) -> dict | None:

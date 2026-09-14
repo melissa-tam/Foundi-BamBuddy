@@ -519,6 +519,51 @@ class TestManualEjectExecution:
         assert verdict.queue_item_id == item.id
         dispatch.assert_awaited_once()
 
+    async def test_under_a_service_hold_the_click_bypasses_the_watch(self, db_session):
+        """A held printer's watch still runs — it cools the plate and WITHHOLDS the eject —
+        so signalling it would be asking a watch that is not allowed to release.
+
+        Worse than a no-op: the watch's reaction to a TERMINAL refusal is a page plus an
+        escalation-only policy, and ``notification_service`` drops a farm-reaction page for
+        a held printer. The operator who clicked "Eject now" would get a 200, no sweep and
+        no message. Dispatching directly makes the refusal the route's own 409.
+        """
+        printer, item = await _armed_printer(db_session, "WHELD")
+        dispatch = AsyncMock()
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        with (
+            c1,
+            c2,
+            patch.object(manual.printer_incidents, "automation_held", return_value=True),
+            patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True) as req,
+            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
+        ):
+            verdict = await manual.manual_eject(db_session, printer.id)
+        assert verdict.outcome == "dispatched"
+        assert verdict.queue_item_id == item.id
+        req.assert_not_called()  # the armed watch is not asked for a release it must refuse
+        dispatch.assert_awaited_once()
+
+    async def test_a_terminal_refusal_under_a_hold_propagates_to_the_route(self, db_session):
+        """The consequence the bypass exists for: the dispatcher's terminal refusal comes
+        out of this lane as an exception the route turns into a 409, instead of being
+        swallowed by the watch's own page-and-hold reaction."""
+        printer, _item = await _armed_printer(db_session, "WHELD2")
+        c1, c2 = _connected(_state("FINISH", bed=25.0))
+        boom = eject_remote.EjectDispatchError(
+            "Printer restarted with a part on the plate", code="z_unreferenced", terminal=True
+        )
+        with (
+            c1,
+            c2,
+            patch.object(manual.printer_incidents, "automation_held", return_value=True),
+            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            patch.object(manual.eject_remote, "dispatch_part_present_eject", AsyncMock(side_effect=boom)),
+            pytest.raises(eject_remote.EjectDispatchError),
+        ):
+            await manual.manual_eject(db_session, printer.id)
+
     async def test_no_watch_dispatches(self, db_session):
         printer = await _mk_printer(db_session, "DISP", gate="SUB-1")
         item = await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")

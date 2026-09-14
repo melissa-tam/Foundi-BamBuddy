@@ -36,6 +36,14 @@ converts the policy into a running task. The four ``start_*_watch`` entry points
 the ``_watching`` registry they deduped against are gone with it — a watch can no
 longer outlive, contradict, or double-arm against the plate it was arming for,
 because the plate is the only thing that decides it exists.
+
+**A service hold does not stop a cooldown (2026-09-13).** Maintenance mode suspends what
+the farm DOES to a printer, not what it observes: a held printer's plate keeps cooling
+(``cooldown_prep``'s fans, which are air rather than motion) and the watch WITHHOLDS the
+eject until the hold lifts. So the hold is not an arm-time gate — ``_desired_policy`` is a
+pure function of the plate — but a per-tick LEVEL inside the watch, minted once per watch
+in ``_watch`` and read by ``watch_bed_and_clear``/``watch_gate_escalation_only``. Nothing
+is re-armed on release: the running watch sees the level drop on its next tick.
 """
 
 from __future__ import annotations
@@ -93,10 +101,31 @@ class _ArmedWatch:
     threshold_c: float | None = field(default=None)
     # The Z the cooldown hold parked this printer's plate at, written ONCE by the
     # watch task and only when its hold was actually SENT (``cooldown_prep``). The
-    # one store behind all three consumers — ``hold_z()`` → the status payload → the
-    # printer card's "plate raised" chip, and the eject's estimator seed — so a plate
-    # nobody held cannot be reported as raised or costed as if it were.
+    # one store behind both consumers — ``hold_z()`` → the status payload → the printer
+    # card's "plate raised" chip, and ``eject_seed_z()`` → the eject estimator — so a
+    # plate nobody held cannot be reported as raised or costed as if it were. It is
+    # never cleared while the watch lives: the plate IS still up there (the part top
+    # sits ~48 mm under the nozzle plane) until a human lowers it, and the chip is
+    # exactly the "do not jog the toolhead" warning an operator opening the machine
+    # needs — dropping it the moment maintenance mode is entered would remove the
+    # warning at the one moment it matters.
     hold_z: float | None = field(default=None)
+    # Did a service hold stand at any point during this watch? Written once on the
+    # unheld→held edge and never cleared, because it records something that cannot be
+    # un-done: a human may have jogged the bed. The farm therefore keeps its position
+    # CLAIM (the chip above — the plate is raised, and saying so is the safe error) but
+    # stops offering it as a MEASUREMENT: ``eject_seed_z()`` answers None from here on,
+    # so the eject's runtime watchdog budgets its drop span from the safe
+    # over-statement instead of from a height nobody can still vouch for.
+    hold_seen: bool = False
+    # "This watch has finished cooling and is holding the eject back, because the
+    # printer is in maintenance mode." Written only by the owning watch task (like
+    # ``hold_z``), read through :meth:`EjectCooldownMonitor.deferred` and projected as
+    # ``eject_watch.deferred``. It lives on the WATCH rather than on the plate's policy
+    # because a policy field would flip policy equality and respawn the watch — losing
+    # the elapsed cooldown, the plateau anchor and the escalation state, and re-boosting
+    # the fans it has just retired.
+    deferred: bool = False
 
 
 # Fallbacks for direct watch_bed_and_clear callers (tests / manual arms) — derived
@@ -244,6 +273,8 @@ async def watch_bed_and_clear(
     on_stall: Callable[[str], Awaitable[None]] | None = None,
     release_now: asyncio.Event | None = None,
     on_sample: Callable[[Mapping[str, float | None]], None] | None = None,
+    held: Callable[[], bool] | None = None,
+    on_cooldown_over: Callable[[str], None] | None = None,
 ) -> str:
     """Poll the live bed temperature and enact the cooldown → eject policy.
 
@@ -290,6 +321,36 @@ async def watch_bed_and_clear(
     are all injectable for testing; ``manager`` supplies the BED reading only — whether
     the plate is still occupied is read from the plate-occupancy authority, the one
     place that knows.
+
+    **``held`` and ``on_cooldown_over``: a cooling-only watch (2026-09-13).** A service
+    hold suspends the farm's ACTIONS on a printer (motion, eject, page, quarantine), not
+    its OBSERVATION — cooling is air, not motion — so a hold no longer kills this watch.
+    ``held`` is read ONCE per tick as a LEVEL (None ⇒ never held, which is what every
+    direct caller and every test that does not pass it gets), and its answer decides only
+    whether a release is PERMITTED:
+
+    * threshold, near-threshold plateau and the max-hold cap all still DECIDE; while held
+      they withhold instead of dispatching — one INFO line, ``on_cooldown_over(cause)``
+      (the watch's own retirement of the cooldown actuators: the part is cool, so the fans
+      have finished their work) and a watch that keeps polling;
+    * a hot plateau while held is NOT a quarantine: the printer is healthy and a human is
+      standing in front of it, so it warns, retires the cooldown and withholds;
+    * the manual ``release_now`` is ALWAYS permitted — manual verbs stay live under a
+      hold, and an operator's own click is answered, never deferred;
+    * the escalation page is evaluated only when a release is permitted, so a hold longer
+      than ``escalate_s`` cannot burn the once-only page on a printer whose notifications
+      are suppressed anyway.
+
+    Nothing re-arms on release: the running watch simply reads ``held() == False`` on its
+    next tick and releases (the liveness pin).
+
+    **Two clocks, because there are two questions.** ``elapsed`` is wall time and always
+    accrues — it drives the plateau windows, which must keep measuring the cooling rate
+    under a hold so a bed that has reached equilibrium still retires its fans. ``held_s``
+    accrues on held ticks, and ``waited = elapsed - held_s`` is "how long the FARM has
+    waited for this bed": the max-hold cap and the escalation page compare that, so a
+    multi-hour hold can neither force-dispatch a re-heated bed the second it lifts nor
+    consume the page while nobody could be told.
     """
     if notify is None:
         # The escalation means "bed never reached the release threshold", NOT
@@ -298,12 +359,41 @@ async def watch_bed_and_clear(
         notify = functools.partial(_default_notify_cooldown_escalation, threshold_c=threshold_c, max_hold_s=max_hold_s)
 
     plateau_enabled = stall_window_s > 0 and on_stall is not None
-    elapsed = 0
+    elapsed = 0  # wall time: drives the plateau windows, accrues under a hold too
+    held_s = 0  # of which this much was spent held — see ``waited`` below
     escalated = False
     anchor: float | None = None  # first readable bed sample, held across strikes
     strikes = 0
     next_boundary = stall_window_s  # first plateau comparison point
     release_failures = 0
+    deferred = False  # the cooldown is over and the eject is waiting on a hold
+
+    def _withhold(cause: str) -> None:
+        """The eject this tick decided on is withheld: the printer is in maintenance mode.
+
+        The deferral edge, once per held episode — the SECOND edge of the cooling
+        episode's lifetime (the exit ``finally`` is the other). It is the honest answer
+        to "the part is cool but hands may be in the machine": the thermal half of the
+        wait is finished, so ``on_cooldown_over`` retires the actuators (fans off, no
+        second summary), and the release half waits for the hold to lift. Later calls in
+        the same episode are no-ops, so a bed that keeps meeting the threshold logs once
+        rather than every 20 s.
+        """
+        nonlocal deferred
+        if deferred:
+            return
+        deferred = True
+        logger.info(
+            "Eject monitor: printer %s %s while in maintenance mode — eject withheld, "
+            "cooldown actuators retired; watch continues",
+            printer_id,
+            cause,
+        )
+        if on_cooldown_over is not None:
+            try:
+                on_cooldown_over(cause)
+            except Exception:  # noqa: BLE001 — retiring the prep never costs the plate its watch
+                logger.exception("Eject monitor: cooldown retirement for printer %s failed", printer_id)
 
     async def _do_release(cause: str) -> str:
         """Dispatch the eject (``on_release``) with retry/stall handling.
@@ -355,6 +445,25 @@ async def watch_bed_and_clear(
         return "released"
 
     while True:
+        # The hold is a LEVEL, read ONCE per tick: every decision below asks the same
+        # question of the same answer, so a hold entered mid-tick cannot release through
+        # one branch and withhold through another.
+        is_held = held() if held is not None else False
+        release_permitted = not is_held
+        # How long the FARM has waited for this bed — wall time minus the time a human
+        # owned the machine. The cap and the escalation page are both about the farm's
+        # patience, never about the wall clock.
+        waited = elapsed - held_s
+        if deferred and not is_held:
+            # The hold lifted. Release on the VERY NEXT evaluation (nothing re-arms us),
+            # and re-measure the plateau from here: a human may have re-heated the bed,
+            # and the strikes/anchor/boundary from before the hold describe a different
+            # cooldown than the one this watch is now finishing.
+            deferred = False
+            anchor = None
+            strikes = 0
+            next_boundary = elapsed + stall_window_s
+
         # Phase boundary: the moment the plate-clear gate drops — the eject job's own
         # terminal, or an operator clearing the plate — the phase is over. Exit WITHOUT
         # dispatching so we never sweep an already-cleared plate (mirrors the foreign
@@ -369,7 +478,9 @@ async def watch_bed_and_clear(
         # W2: an operator "Eject now" during an armed watch sets release_now → sweep
         # immediately through the SAME _do_release path (no parallel dispatch race),
         # bypassing the cooldown threshold. The hot-bed allowance is enforced upstream
-        # in the manual-eject service before the event is ever set.
+        # in the manual-eject service before the event is ever set. Deliberately NOT
+        # gated by the hold: every manual verb stays live under maintenance mode, and a
+        # click that raised this event IS the human the hold defers to.
         if release_now is not None and release_now.is_set():
             release_now.clear()
             outcome = await _do_release("manual")
@@ -384,32 +495,46 @@ async def watch_bed_and_clear(
             bed_temp = None
         else:
             bed_temp = state.temperatures.get("bed")
-            if on_sample is not None:
+            if on_sample is not None and not deferred:
                 # THIS poll is the whole sampling story: the cooldown prep's chamber
                 # boost ends off the same reading that decides the release, so there is
                 # no second timer, no second cadence and no second connection check. A
                 # sampler that throws must never cost the plate its watch.
+                #
+                # Not while DEFERRED: the prep is retired, and a retired prep is a
+                # no-op by its own invariant — but calling it anyway would say this
+                # watch still feeds an actuator it has handed back.
                 try:
                     on_sample(state.temperatures)
                 except Exception:  # noqa: BLE001 — a sampler never kills the watch feeding it
                     logger.exception("Eject monitor: cooldown sampler for printer %s failed", printer_id)
-        if anchor is None and bed_temp is not None:
-            anchor = bed_temp
 
-        if bed_temp is not None and bed_temp <= threshold_c:
-            logger.info(
-                "Eject monitor: printer %s bed %.1f°C ≤ %.1f°C — dispatching part-present eject",
-                printer_id,
-                bed_temp,
-                threshold_c,
-            )
-            outcome = await _do_release("threshold")
-            if outcome != "retry":
-                return outcome
+        if deferred:
+            # The cooldown is over and its actuators are retired; the only thing left to
+            # decide is the release, and that waits for the hold. The gate check, the
+            # manual check and the state read above are the whole tick.
+            pass
+        elif bed_temp is not None and bed_temp <= threshold_c:
+            if anchor is None:
+                anchor = bed_temp
+            if release_permitted:
+                logger.info(
+                    "Eject monitor: printer %s bed %.1f°C ≤ %.1f°C — dispatching part-present eject",
+                    printer_id,
+                    bed_temp,
+                    threshold_c,
+                )
+                outcome = await _do_release("threshold")
+                if outcome != "retry":
+                    return outcome
+            else:
+                _withhold("threshold")
         else:
+            if anchor is None and bed_temp is not None:
+                anchor = bed_temp
             # Still above threshold (or unreadable). Escalate-once, then evaluate
             # the plateau watchdog and finally the max-hold cap.
-            if not escalated and elapsed >= escalate_s:
+            if release_permitted and not escalated and waited >= escalate_s:
                 escalated = True
                 logger.warning(
                     "Eject monitor: printer %s bed still above %.1f°C after %ss — escalating "
@@ -436,20 +561,26 @@ async def watch_bed_and_clear(
                             # ambient — RELEASE it, don't quarantine. Only a bed still
                             # genuinely hot (> threshold + margin) is a real stall.
                             if bed_temp <= threshold_c + plateau_eject_margin_c:
-                                logger.warning(
-                                    "Eject monitor: printer %s cooling plateaued at %.1f°C, within %.1f°C of the "
-                                    "%.1f°C threshold — releasing (near-threshold equilibrium), NO quarantine",
-                                    printer_id,
-                                    bed_temp,
-                                    plateau_eject_margin_c,
-                                    threshold_c,
-                                )
-                                outcome = await _do_release("plateau_near_threshold")
-                                if outcome != "retry":
-                                    return outcome
-                                # dispatch failed (< 3 so far) — keep polling; the next
-                                # boundary re-strikes and retries the release.
-                            else:
+                                if release_permitted:
+                                    logger.warning(
+                                        "Eject monitor: printer %s cooling plateaued at %.1f°C, within %.1f°C of the "
+                                        "%.1f°C threshold — releasing (near-threshold equilibrium), NO quarantine",
+                                        printer_id,
+                                        bed_temp,
+                                        plateau_eject_margin_c,
+                                        threshold_c,
+                                    )
+                                    outcome = await _do_release("plateau_near_threshold")
+                                    if outcome != "retry":
+                                        return outcome
+                                    # dispatch failed (< 3 so far) — keep polling; the
+                                    # next boundary re-strikes and retries the release.
+                                else:
+                                    # Equilibrated at ambient under a hold: the cooling
+                                    # is genuinely finished, so the fans stop — the
+                                    # sweep is the only half that waits.
+                                    _withhold("plateau_near_threshold")
+                            elif release_permitted:
                                 logger.warning(
                                     "Eject monitor: printer %s cooling plateaued (<%.2f°C over 2 windows) and bed "
                                     "%.1f°C is still >%.1f°C above the %.1f°C threshold — quarantining, NO eject",
@@ -467,22 +598,42 @@ async def watch_bed_and_clear(
                                 except Exception:  # noqa: BLE001
                                     logger.exception("Eject monitor: plateau on_stall raised (printer %s)", printer_id)
                                 return "stalled"
+                            else:
+                                # A bed stuck genuinely hot is a QUARANTINE when the farm
+                                # owns the printer — but under a hold the machine is a
+                                # human's, and taking it out of rotation for a bed
+                                # somebody may be working on would punish it for the
+                                # farm's own deferral. Warn, retire the cooldown, wait.
+                                logger.warning(
+                                    "Eject monitor: printer %s cooling plateaued (<%.2f°C over 2 windows) and bed "
+                                    "%.1f°C is still >%.1f°C above the %.1f°C threshold — no quarantine, printer in "
+                                    "maintenance mode",
+                                    printer_id,
+                                    stall_epsilon_c,
+                                    bed_temp,
+                                    plateau_eject_margin_c,
+                                    threshold_c,
+                                )
+                                _withhold("plateau_hot")
                     else:
                         strikes = 0
                         anchor = bed_temp  # re-anchor: this window DID cool
 
-            if max_hold_s > 0 and elapsed >= max_hold_s and bed_temp is not None:
-                logger.warning(
-                    "Eject monitor: printer %s still %.1f°C above %.1f°C at the %ss max-hold cap — "
-                    "dispatching eject anyway",
-                    printer_id,
-                    bed_temp,
-                    threshold_c,
-                    max_hold_s,
-                )
-                outcome = await _do_release("max_hold_cap")
-                if outcome != "retry":
-                    return outcome
+            if max_hold_s > 0 and waited >= max_hold_s and bed_temp is not None:
+                if release_permitted:
+                    logger.warning(
+                        "Eject monitor: printer %s still %.1f°C above %.1f°C at the %ss max-hold cap — "
+                        "dispatching eject anyway",
+                        printer_id,
+                        bed_temp,
+                        threshold_c,
+                        max_hold_s,
+                    )
+                    outcome = await _do_release("max_hold_cap")
+                    if outcome != "retry":
+                        return outcome
+                else:
+                    _withhold("max_hold_cap")
 
         if release_now is not None:
             # Event-aware wait so a manual release wakes the poll instantly instead of
@@ -494,6 +645,10 @@ async def watch_bed_and_clear(
         else:
             await sleep(check_interval_s)
         elapsed += check_interval_s
+        if is_held:
+            # Charged to the HUMAN's clock, not the farm's: this interval was one the
+            # farm was not allowed to act in.
+            held_s += check_interval_s
 
 
 async def watch_gate_escalation_only(
@@ -503,6 +658,7 @@ async def watch_gate_escalation_only(
     check_interval_s: int = _CHECK_INTERVAL_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     notify: Callable[[int], Awaitable[None]] | None = None,
+    held: Callable[[], bool] | None = None,
 ) -> str:
     """Escalation-only gate watch for a FOREIGN deposit — a terminal print Bambuddy
     did not dispatch that left material on the plate.
@@ -521,6 +677,13 @@ async def watch_gate_escalation_only(
     :func:`watch_bed_and_clear`, because this watch reads no bed — its only question
     is whether the plate is still occupied, and the plate-occupancy authority is the
     one place that knows.
+
+    ``held`` (a LEVEL, read once per tick; None ⇒ never held) gates the ONE act this
+    watch has. Paging a human about the plate they are standing in front of is exactly
+    what maintenance mode is for — and because ``escalated`` is once-only, firing it
+    during a hold would ALSO consume it: ``notification_service`` drops a farm-reaction
+    event for a held printer, so the page would be logged, suppressed, and never sent
+    again after the hold lifted. Holding the page keeps it for the moment it can be read.
     """
     if notify is None:
         # Foreign-deposit escalation — distinct from the cooldown_timeout source: a
@@ -538,7 +701,7 @@ async def watch_gate_escalation_only(
             )
             return "cleared"
 
-        if not escalated and elapsed >= escalate_s:
+        if not escalated and elapsed >= escalate_s and not (held() if held is not None else False):
             escalated = True
             logger.warning(
                 "Eject monitor: printer %s foreign deposit still gated after %ss — escalating "
@@ -1158,7 +1321,7 @@ class EjectCooldownMonitor:
         if not view.eject_present:
             eject_remote.cancel_eject_timers(printer_id)
 
-        desired = self._desired_policy(printer_id, view)
+        desired = self._desired_policy(view)
         armed = self._armed.get(printer_id)
         if desired is None:
             if armed is not None:
@@ -1174,38 +1337,37 @@ class EjectCooldownMonitor:
         """Re-run the driver over the authority's CURRENT view. Idempotent.
 
         The level-triggered escape hatch: :meth:`on_occupancy_change` fires from the
-        authority's fan-out, so a fact that changes OUTSIDE the occupancy record —
-        a service hold entered or released, a printer re-activated — changes what
-        :meth:`_desired_policy` would answer while producing no transition to carry it.
-        This asks the question again against the same view a transition would have
-        handed over, so entering a hold cancels the plate's watch and releasing it
-        re-arms the STORED policy (which the hold never touched) with no restart and no
-        second decision table.
+        authority's fan-out, so a fact that changes OUTSIDE the occupancy record changes
+        what :meth:`_desired_policy` would answer while producing no transition to carry
+        it. Since 2026-09-13 there is exactly ONE such fact left — a printer RE-ACTIVATED
+        after a deactivation stood its watch down (``PATCH /printers/{id}``) — because the
+        service hold no longer decides whether a watch exists, only what it may do. This
+        asks the question again against the same view a transition would have handed over,
+        so a still-gated plate gets its watch back with no restart and no second decision
+        table.
         """
         self.on_occupancy_change(printer_id, plate_occupancy.current_view(printer_id), cause)
 
     @staticmethod
-    def _desired_policy(printer_id: int, view: OccupancyView) -> OccupancyPolicy | None:
-        """Which watch this printer calls for, or None for "no watch at all".
+    def _desired_policy(view: OccupancyView) -> OccupancyPolicy | None:
+        """Which watch this plate calls for, or None for "no watch at all".
 
-        THE gate between a STORED plate policy and a RUNNING watch — the only place
-        one becomes the other — which is why the automation hold is read here and
-        nowhere else. One read covers all four policies at once: the cooldown watch and
-        its fans, the first-article watch, the foreign auto-eject, and even
-        ``EscalationOnly``'s 90-minute foreign-deposit page, because a printer a human
-        has taken for maintenance should not page anyone about the plate they are
-        standing in front of.
+        THE gate between a STORED plate policy and a RUNNING watch — the only place one
+        becomes the other — and a PURE function of the plate: a plate nothing stands on,
+        or one an eject already owns, carries no watch, and every other plate carries the
+        watch its policy names. It takes no printer id, because after 2026-09-13 there is
+        no per-PRINTER fact left in the answer.
 
-        It is LEVEL-triggered, not edge-triggered: the plate's stored policy is
-        untouched by the hold, so :meth:`reconsider` on release re-arms exactly what
-        was armed before — a cooldown that was already running resumes as a cooldown,
-        and the 2026-09-12 fans-for-6.3-hours shape (a watch polling a dead socket
-        after the printer left the wire) cannot recur, because the watch is cancelled
-        while the session is still up and its ``finally`` can still switch the fans off.
+        **The service hold is deliberately NOT read here (2026-09-13).** A hold changes
+        what a watch DOES, never whether it exists: the cooldown is air, not motion, so a
+        held printer keeps cooling its plate (fans only) and withholds the EJECT — the
+        decision that moves the machine — which is a per-tick level inside the watch
+        (``watch_bed_and_clear(held=…)``), not an arm-time gate. Reading the hold here
+        cost the operator both halves of the wrong answer: entering mid-cooldown killed
+        the watch and switched the fans off over a hot bed, and a print that FINISHED
+        during a hold got no fans at all for the length of the hold.
         """
         if not view.plate_occupied or view.eject_present:
-            return None
-        if printer_incidents.automation_held(printer_id):
             return None
         return view.plate_policy
 
@@ -1246,8 +1408,8 @@ class EjectCooldownMonitor:
     def stand_down(self, printer_id: int, reason: str) -> asyncio.Task | None:
         """Cancel + deregister the armed watch. Returns the cancelled task, or None.
 
-        Public since 2026-09-12, because the service-hold quiesce needs exactly this
-        act and must not grow a second one: the cancellation runs the watch task's own
+        Public since 2026-09-12, because a SESSION TEARDOWN needs exactly this act and
+        must not grow a second one: the cancellation runs the watch task's own
         ``finally``, which retires the :mod:`cooldown_prep` — plate hold released, fans
         commanded OFF — and it asks ``_cooldown_armed`` whether any successor still
         wants them, so the fans-off decision stays a property of the PRINTER. Calling it
@@ -1255,19 +1417,23 @@ class EjectCooldownMonitor:
         fans ran 6.3 h because the session was torn down first and ``prep.end()`` landed
         on ``skipped:no_client``.
 
+        Since 2026-09-13 its only non-driver caller is
+        ``service_hold.quiesce_for_teardown`` — entering maintenance mode no longer
+        retires the watch (a held printer keeps cooling, fans only, and withholds the
+        eject), so retiring one is now exactly what "the session is about to drop" means.
+
         **A caller that is about to DROP the session must AWAIT the returned task.**
         ``cancel()`` only SCHEDULES the CancelledError; the ``finally`` that publishes
         ``M106 P2 S0`` / ``M106 P3 S0`` runs on a later loop turn. The 2026-09-12 probe
-        caught exactly that gap on the deactivate path — ``[service-hold] printer 1
-        quiesced (deactivate): cooldown_ended=True`` at 07:07:08,545 and then
-        ``[cooldown-prep] … off=skipped:no_client`` at 07:07:08,546, because
-        ``update_printer`` had already deleted the client. The task is returned rather
-        than awaited here so this stays SYNC for its other caller: the policy driver
-        runs inside the authority's fan-out and may not await anything.
+        caught exactly that gap on the deactivate path — the quiesce logged its report at
+        07:07:08,545 and then ``[cooldown-prep] … off=skipped:no_client`` at
+        07:07:08,546, because ``update_printer`` had already deleted the client. The task
+        is returned rather than awaited here so this stays SYNC for its other caller: the
+        policy driver runs inside the authority's fan-out and may not await anything.
 
         The plate's STORED policy is deliberately untouched — this cancels a running
-        watch, it does not decide anything about the plate — so
-        :meth:`reconsider` can re-arm it when the hold lifts.
+        watch, it does not decide anything about the plate — so :meth:`reconsider` can
+        re-arm it when the printer comes back.
         """
         armed = self._armed.pop(printer_id, None)
         if armed is None:
@@ -1301,11 +1467,46 @@ class EjectCooldownMonitor:
 
         None covers every "the plate is where the end block left it" case at once: no
         watch, an escalation-only hold, a hold the prep skipped, and a cooldown watch
-        that has not finished arming. This is the only reader of ``_armed.hold_z``
-        outside the watch task that writes it — nothing else may reach into
-        ``_armed``."""
+        that has not finished arming.
+
+        **The CLAIM, not the measurement.** This is what the printer card's "plate raised"
+        chip renders, and it survives a service hold on purpose: the plate really is still
+        up there until a human lowers it, and the chip is the "do not jog the toolhead"
+        warning an operator opening the machine needs most at exactly that moment. The
+        estimator's question is the different one — see :meth:`eject_seed_z`."""
         armed = self._armed.get(printer_id)
         return armed.hold_z if armed is not None else None
+
+    def eject_seed_z(self, printer_id: int) -> float | None:
+        """The plate height the EJECT may budget its first Z move from, or None.
+
+        Same store as :meth:`hold_z`, one question further: not "where does the farm say
+        the plate is" but "can the farm still VOUCH for that height". None when no watch is
+        armed, when no hold was sent — and when a service hold has stood during this watch
+        (``hold_seen``), because a human may have jogged the bed and a seed is a promise to
+        the eject's runtime watchdog about the distance its first move has to cover. An
+        absent seed makes the watchdog over-state that distance, which costs a few seconds
+        of deadline; a wrong one makes it under-state it, which stops a sweep mid-flight
+        and gates the plate for a human. The asymmetry is the whole rule.
+
+        Read at RELEASE time, never bound at arm: the hold can be entered at any point in
+        a cooldown that may run for an hour."""
+        armed = self._armed.get(printer_id)
+        if armed is None or armed.hold_seen:
+            return None
+        return armed.hold_z
+
+    def deferred(self, printer_id: int) -> bool:
+        """Has this printer's watch finished cooling and is it holding the eject back?
+
+        True only while a running watch has met its release condition under a service
+        hold: the fans are retired and the sweep is waiting for the hold to lift. It is
+        what separates "cooling under a hold" from "cooled, fans off, waiting on the
+        hold" on the printer card — two states the hold flag and the watch's existence
+        cannot tell apart between them. Same access rule as :meth:`hold_z`: written by
+        the owning watch task, read here, and nowhere else."""
+        armed = self._armed.get(printer_id)
+        return armed.deferred if armed is not None else False
 
     def _cooldown_armed(self, printer_id: int, *, other_than: asyncio.Task | None) -> bool:
         """Is a RELEASING watch other than ``other_than``'s armed for this printer?
@@ -1334,6 +1535,43 @@ class EjectCooldownMonitor:
 
     # -- watch bodies -------------------------------------------------------
 
+    def _held_level(self, printer_id: int) -> Callable[[], bool]:
+        """Mint ONE stateful "is this printer held?" callable for the calling watch.
+
+        The eject lane's whole reading of ``printer_incidents.automation_held`` — one
+        callable per watch, handed to :func:`cooldown_prep.begin` at arm and to
+        :func:`watch_bed_and_clear` as its per-tick level. It is STATEFUL because the two
+        EDGES of the hold are facts only the watch that owns the plate can act on, and it
+        sees every read the watch makes:
+
+        * unheld → held sets ``hold_seen``, and deliberately LEAVES ``hold_z``. The plate
+          is still raised, and the card's chip is the "do not jog the toolhead" warning an
+          operator opening the machine needs; what the farm gives up is the right to offer
+          that height as a MEASUREMENT, so ``eject_seed_z()`` stops answering it and the
+          eject over-states its drop span instead — the safe direction.
+        * held → unheld clears ``deferred``. The eject is permitted again, and the card's
+          "cooled · eject deferred" phase must go with the hold that caused it.
+
+        Both writes are guarded by ``armed.task is current_task()``: a watch that has
+        already been superseded may not reach into its successor's record.
+        """
+        last_held = False
+
+        def held_now() -> bool:
+            nonlocal last_held
+            now_held = printer_incidents.automation_held(printer_id)
+            if now_held != last_held:
+                last_held = now_held
+                armed = self._armed.get(printer_id)
+                if armed is not None and armed.task is asyncio.current_task():
+                    if now_held:
+                        armed.hold_seen = True
+                    else:
+                        armed.deferred = False
+            return now_held
+
+        return held_now
+
     async def _watch(
         self,
         printer_id: int,
@@ -1346,6 +1584,9 @@ class EjectCooldownMonitor:
         release_now: asyncio.Event,
     ) -> None:
         try:
+            # ONE hold level for this whole watch — arm, every tick, and the fallback
+            # escalation watch below. Minted first so no path can grow a second read.
+            held_now = self._held_level(printer_id)
             if threshold_override is not None:
                 # Foreign auto-eject: the release threshold is the chosen profile's
                 # cooldown target, passed directly (there is no queue item to resolve).
@@ -1365,7 +1606,7 @@ class EjectCooldownMonitor:
                     purpose,
                     queue_item_id,
                 )
-                await watch_gate_escalation_only(printer_id)
+                await watch_gate_escalation_only(printer_id, held=held_now)
                 return
             armed = self._armed.get(printer_id)
             if armed is not None and armed.task is asyncio.current_task():
@@ -1396,37 +1637,62 @@ class EjectCooldownMonitor:
                 model=printer_manager.get_model(printer_id),
                 hold_enabled=settings.hold_enabled,
                 hold_part_top_mm=settings.hold_part_top_mm,
+                # The plate hold MOVES the machine, so it is the one actuator a service
+                # hold refuses: hands may be in the printer. The fans are air, and run.
+                held=held_now(),
             )
             armed = self._armed.get(printer_id)
             if armed is not None and armed.task is asyncio.current_task():
                 armed.hold_z = prep.hold_z if prep.hold == "sent" else None
-            # Where the eject will find the plate. Read back off the record rather
-            # than from ``prep`` so the seed and what the UI renders are the same
-            # value from the same store — and so a watch whose record was already
-            # taken over seeds nothing.
-            plate_z = armed.hold_z if (armed is not None and armed.task is asyncio.current_task()) else None
+
+            def _seeded_release(dispatch, **bound):
+                """Wrap a dispatcher so its plate seed is read at RELEASE time.
+
+                Never bound at arm: a service hold entered at any point in a cooldown
+                withdraws the farm's right to offer the parked height as a MEASUREMENT
+                (``eject_seed_z`` — the plate stays claimed as raised for the card, but a
+                human may have jogged the bed), and a cooldown can run for an hour. Read
+                back off the record rather than off ``prep``, so the seed and the chip the
+                UI renders come from one store, and so a watch whose record was already
+                taken over seeds nothing.
+                """
+
+                async def _release() -> None:
+                    await dispatch(plate_z=self.eject_seed_z(printer_id), **bound)
+
+                return _release
+
             if purpose == "fa":
-                on_release = functools.partial(
-                    _dispatch_fa_eject,
-                    printer_id=printer_id,
-                    queue_item_id=queue_item_id,
-                    run_id=run_id,
-                    plate_z=plate_z,
+                on_release = _seeded_release(
+                    _dispatch_fa_eject, printer_id=printer_id, queue_item_id=queue_item_id, run_id=run_id
                 )
             elif purpose == "foreign":
                 # No hold ever happens on a foreign plate (no unit, no donor, no
-                # measured part height), so its eject stays unseeded by construction.
+                # measured part height), so its eject takes no seed at all — there is
+                # nothing to read at release time either.
                 on_release = functools.partial(
                     eject_remote.dispatch_identified_foreign_eject, printer_id=printer_id, profile_id=profile_id
                 )
             else:
-                on_release = functools.partial(
-                    _dispatch_production_eject,
-                    printer_id=printer_id,
-                    queue_item_id=queue_item_id,
-                    plate_z=plate_z,
+                on_release = _seeded_release(
+                    _dispatch_production_eject, printer_id=printer_id, queue_item_id=queue_item_id
                 )
             on_stall = functools.partial(_act_on_cooldown_stall, printer_id=printer_id, queue_item_id=queue_item_id)
+
+            def _cooldown_over(cause: str) -> None:
+                """The deferral edge: the bed is done, the eject is not allowed yet.
+
+                ONE of the cooling episode's two ends (the exit ``finally`` is the other),
+                and the only one that happens with the watch still running: it records the
+                deferral on our own record — for the card's "cooled, eject deferred" phase
+                — and retires the prep, so the fans stop when the cooling stops instead of
+                running for the length of the hold.
+                """
+                record = self._armed.get(printer_id)
+                if record is not None and record.task is asyncio.current_task():
+                    record.deferred = True
+                prep.end(fan_off=True)
+
             try:
                 # The fan witness waits INSIDE the guarded span: a cancel during its
                 # settle must still retire the prep below, or a fan commanded ON in
@@ -1445,6 +1711,8 @@ class EjectCooldownMonitor:
                     on_stall=on_stall,
                     release_now=release_now,
                     on_sample=prep.note_sample,
+                    held=held_now,
+                    on_cooldown_over=_cooldown_over,
                 )
             finally:
                 # Retire the prep however the poll ended — release, stall, gate clear,
@@ -1453,6 +1721,11 @@ class EjectCooldownMonitor:
                 # holds OUR record on a normal exit and the SUCCESSOR's (or nothing)
                 # on a cancel — which is exactly the question the fans-off asks, for
                 # both lanes at once (it is a question about the printer).
+                #
+                # On a watch that DEFERRED (a service hold withheld its eject) the prep
+                # is already retired: this call emits no second summary and only
+                # re-attempts a fan whose OFF did not land — the deferral has no eject
+                # job to carry the durable ``M106 P2 S0``, so this is that retry.
                 prep.end(fan_off=not self._cooldown_armed(printer_id, other_than=asyncio.current_task()))
         except asyncio.CancelledError:
             raise  # the driver cancelled us because the policy changed — not a failure
@@ -1463,7 +1736,12 @@ class EjectCooldownMonitor:
 
     async def _escalation_only(self, printer_id: int) -> None:
         try:
-            await watch_gate_escalation_only(printer_id)
+            # The hold as a per-tick LEVEL, same shape as the cooldown watch's — a plain
+            # partial here, because this watch owns no ``hold_z`` and no ``deferred`` and
+            # so has no edges of its own to detect.
+            await watch_gate_escalation_only(
+                printer_id, held=functools.partial(printer_incidents.automation_held, printer_id)
+            )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — a watch failure must not crash the callback loop

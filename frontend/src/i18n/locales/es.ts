@@ -729,9 +729,9 @@ export default {
     maintenanceUpToDate: 'Todo el mantenimiento al día - Haga clic para ver',
     maintenance: {
       badge: 'Modo mantenimiento',
-      since: 'Automatización desactivada desde {{time}} — envío, auto-expulsión y enfriamiento en pausa',
+      since: 'Automatización desactivada desde {{time}} — envío y auto-expulsión en pausa; el enfriamiento funciona solo con ventiladores',
       exitButton: 'Salir del modo mantenimiento',
-      exitHint: 'El envío se reanuda, y una placa que aún espera el enfriamiento reanuda su espera.',
+      exitHint: 'El envío se reanuda; una placa bloqueada se expulsa cuando su cama alcanza el umbral.',
       menuEnter: 'Entrar en modo mantenimiento',
       menuExit: 'Salir del modo mantenimiento',
       toastEntered: '{{name}} en modo mantenimiento',
@@ -739,7 +739,7 @@ export default {
       confirmTitle: '¿Entrar en modo mantenimiento en {{name}}?',
       confirmEffectPrint: '• Detener la impresión en curso — la serie espera hasta Reanudar',
       confirmEffectEject: '• Detener el barrido de expulsión — la placa sigue bloqueada',
-      confirmEffectCooldown: '• Detener los ventiladores de enfriamiento',
+      confirmEffectCooldown: '• Diferir la expulsión — los ventiladores de enfriamiento siguen hasta que la cama se enfríe y luego se detienen',
     },
     deactivated: {
       pillLabel: 'Desactivada',
@@ -894,6 +894,10 @@ export default {
       coolingHeld: 'Enfriando hasta {{threshold}}°C · placa elevada',
       coolingHeldHint: 'La placa se mantiene a la altura de la boquilla con el cabezal aparcado en la rampa. No mueva el cabezal hasta que se ejecute la expulsión.',
       awaitingPlateClear: 'Esperando despeje de la cama',
+      ejectDeferred: 'Enfriamiento terminado · expulsión diferida',
+      ejectDeferredHint: 'Marque primero la placa como despejada si la pieza se retiró a mano. La expulsión se ejecuta al salir del modo mantenimiento.',
+      ejectDeferredHeld: 'Enfriamiento terminado · expulsión diferida · placa elevada',
+      ejectDeferredHeldHint: 'La placa se mantiene a la altura de la boquilla con el cabezal aparcado en la rampa. No mueva el cabezal. Marque primero la placa como despejada si la pieza se retiró a mano; la expulsión se ejecuta al salir del modo mantenimiento.',
     },
     ejectPhase: {
       building: 'Expulsión: preparando…',

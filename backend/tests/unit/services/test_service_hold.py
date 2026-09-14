@@ -8,8 +8,11 @@ things are faked and both on purpose: the eject kill path (pinned end-to-end in
 
 The shapes this suite exists to hold, all from that morning:
 
-* the fans come OFF while the session is still up (010-H2S ran them 6.3 h because the
-  MQTT teardown went first and ``prep.end()`` landed on ``skipped:no_client``);
+* the fans come OFF while the session is still up when the SESSION is what is going
+  (010-H2S ran them 6.3 h because the MQTT teardown went first and ``prep.end()`` landed
+  on ``skipped:no_client``) — and, since 2026-09-13, they deliberately do NOT come off when
+  a human merely takes the printer: entering a hold leaves the cooldown running (fans
+  only) and withholds the eject, so the two verbs are pinned apart here;
 * an in-flight sweep is stopped through the ONE kill path, not a re-composed one;
 * the dispatch lease is revoked, so a unit already past its decision point unwinds
   instead of printing onto a printer somebody has taken (002-H2S got a new unit within
@@ -20,6 +23,7 @@ The shapes this suite exists to hold, all from that morning:
 """
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -232,12 +236,7 @@ class TestEnterOpensTheHold:
         verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
 
         assert (verdict.held, verdict.already_held) == (True, False)
-        assert (verdict.cooldown_ended, verdict.eject_stopped, verdict.job_stopped, verdict.lease_revoked) == (
-            False,
-            False,
-            False,
-            False,
-        )
+        assert (verdict.eject_stopped, verdict.job_stopped, verdict.lease_revoked) == (False, False, False)
         assert printer_incidents.automation_held(printer.id) is True
 
     async def test_re_entering_reports_already_held_and_quiesces_again(self, db_session, printer_factory):
@@ -270,14 +269,20 @@ class TestEnterOpensTheHold:
 # --- the quiesce ------------------------------------------------------------
 
 
-class TestQuiesceStandsTheCooldownDown:
+class TestEnteringKeepsTheCooldown:
     """The REAL monitor and the REAL ``cooldown_prep`` over a spy client.
 
-    Both cases assert the same CONSEQUENCE — ``M106 P2 S0`` / ``M106 P3 S0`` published —
-    and neither waits for the watch task itself, because "the fans are off by the time
-    the quiesce returns" is the whole contract. A pin that awaited the task first would
-    have passed on the 2026-09-12 probe defect, where the publishes happened one loop
-    turn too late and landed on a deleted client.
+    Two verbs, two opposite consequences, pinned side by side because conflating them is
+    what produced both of the operator's complaints:
+
+    * :func:`service_hold.quiesce` (what ENTERING runs) leaves the watch armed and both
+      fans running — a hold stops what the farm DOES to the machine, and moving air over
+      a hot plate is not that. The eject is withheld inside the watch instead;
+    * :func:`service_hold.quiesce_for_teardown` (what DEACTIVATION runs) retires the
+      watch, and asserts the consequence — ``M106 P2 S0`` / ``M106 P3 S0`` published — at
+      the instant the call RETURNS, because that is the instant the session goes. A pin
+      that awaited the task first would have passed on the 2026-09-12 probe defect, where
+      the publishes happened one loop turn too late and landed on a deleted client.
     """
 
     async def _arm_cooldown(self, printer, monkeypatch):
@@ -306,60 +311,88 @@ class TestQuiesceStandsTheCooldownDown:
         assert client.fans == [(2, 100), (3, 100)]  # both lanes armed at boost
         return client, manager, eject_cooldown_monitor._armed[printer.id].task
 
-    async def test_entering_ends_the_cooldown_and_switches_both_fans_off(
-        self, db_session, printer_factory, monkeypatch
+    async def test_entering_leaves_the_watch_armed_and_both_fans_running(
+        self, db_session, printer_factory, monkeypatch, caplog
     ):
-        """The 010-H2S shape, from the other end: the watch is cancelled while the MQTT
-        session is still up, so the watch task's own ``finally`` retires the prep and
-        BOTH cooldown fans are commanded off (``M106 P2 S0`` / ``M106 P3 S0``)."""
+        """The operator requirement, 2026-09-13: under maintenance mode the cooldown runs
+        as in production — and the eject does not. Cancelling the watch here commanded both
+        fans off over a bed that was still hot, because the watch's ``finally`` cannot tell
+        "the session is going" from "a human is at the machine"."""
         printer = await printer_factory(model="H2S")
         client, _manager, task = await self._arm_cooldown(printer, monkeypatch)
 
-        verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
+        with caplog.at_level(logging.INFO, logger=service_hold.__name__):
+            verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
 
-        # No test-side wait: ``quiesce`` awaits the cancelled watch itself, so the task
-        # is finished and its publishes have landed by the time ``enter`` returns.
-        assert task.done()
-        assert printer.id not in eject_cooldown_monitor._armed
-        assert verdict.cooldown_ended is True
-        assert client.fans[-2:] == [(2, 0), (3, 0)]
-        # The plate's STORED policy is untouched — that is what lets the release re-arm it.
+        assert verdict.held is True
+        assert task.done() is False  # the watch is still polling the bed
+        assert eject_cooldown_monitor._armed[printer.id].task is task
+        assert client.fans == [(2, 100), (3, 100)]  # nothing was switched off
+        assert "cooldown watch continues under the hold (fans only, eject withheld)" in caplog.text
+        # The plate's STORED policy is untouched, as it always was.
         assert plate_occupancy.current_view(printer.id).plate_policy == CooldownEject(unit_id=1857, run_id=None)
 
-    async def test_the_deactivate_quiesce_publishes_the_fans_off_before_the_session_drops(
+    async def test_the_teardown_verb_publishes_the_fans_off_before_the_session_drops(
         self, db_session, printer_factory, monkeypatch
     ):
         """THE 2026-09-12 probe defect, pinned as a consequence rather than as call order.
 
-        ``update_printer`` calls ``quiesce(cause="deactivate")`` and then
+        ``update_printer`` calls ``quiesce_for_teardown(cause="deactivate")`` and then
         ``disconnect_printer``, which DELETES the client. The order was always right; what
         was wrong is that ``cancel()`` only schedules the CancelledError, so the watch's
         ``finally`` ran a loop turn later and published into a client that was already
-        gone — the live probe caught ``cooldown_ended=True`` at 07:07:08,545 and
+        gone — the live probe caught the quiesce's own report at 07:07:08,545 and
         ``off=skipped:no_client`` at 07:07:08,546. So this asserts what was published at
-        the instant the quiesce RETURNED, which is the instant the session goes.
+        the instant the call RETURNED, which is the instant the session goes.
+
+        Losing the session is the one thing that genuinely ends a cooldown — which is why
+        this verb exists separately from the hold's quiesce, rather than the hold
+        borrowing it.
         """
         printer = await printer_factory(model="H2S")
         client, manager, task = await self._arm_cooldown(printer, monkeypatch)
 
-        report = await service_hold.quiesce(printer.id, cause="deactivate")
+        await service_hold.quiesce_for_teardown(printer.id, cause="deactivate")
         published_while_connected = list(client.fans)
         manager.drop()  # exactly what update_printer does next: disconnect_printer
 
-        assert task.done(), "the quiesce must not return while the watch is still retiring"
-        assert report.cooldown_ended is True
+        assert task.done(), "the teardown must not return while the watch is still retiring"
+        assert printer.id not in eject_cooldown_monitor._armed
         assert published_while_connected[-2:] == [(2, 0), (3, 0)], (
             "both fans must be commanded OFF while the MQTT session is still up"
         )
         assert client.fans == published_while_connected, "nothing may be published after the client is dropped"
 
-    async def test_no_armed_watch_reports_no_cooldown_ended(self, db_session, printer_factory, monkeypatch):
+    async def test_the_teardown_verb_still_runs_the_whole_quiesce(self, db_session, printer_factory, monkeypatch):
+        """It is the quiesce PLUS the watch, never a second sequence of its own."""
+        printer = await printer_factory()
+        _fake_spawns(monkeypatch)
+        lease = plate_occupancy.claim_for_dispatch(
+            printer.id,
+            unit_id=1856,
+            pre_state="IDLE",
+            pre_subtask=None,
+            min_hold_s=0.0,
+            max_hold_s=0.0,
+            ev=Evidence(live_state="IDLE"),
+        )
+
+        report = await service_hold.quiesce_for_teardown(printer.id, cause="deactivate")
+
+        assert report.lease_revoked is True
+        assert plate_occupancy.commit_dispatch(printer.id, lease) == "lease_revoked"
+
+    async def test_no_armed_watch_says_nothing_about_a_cooldown(self, db_session, printer_factory, monkeypatch, caplog):
+        """The line is a statement about THIS printer's plate, so a printer whose plate
+        nothing is watching must not produce it."""
         printer = await printer_factory()
         _fake_spawns(monkeypatch)
 
-        verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
+        with caplog.at_level(logging.INFO, logger=service_hold.__name__):
+            verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
 
-        assert verdict.cooldown_ended is False
+        assert verdict.held is True
+        assert "cooldown watch continues" not in caplog.text
 
 
 class TestQuiesceStopsTheSweep:
@@ -485,7 +518,7 @@ class TestQuiesceNeverRaises:
 
         report = await service_hold.quiesce(printer.id, cause="service hold")
 
-        assert report.cooldown_ended is False  # the step that threw
+        assert report.eject_stopped is False  # the step that threw reported nothing
         assert report.lease_revoked is True  # the step after it still ran
         assert plate_occupancy.commit_dispatch(printer.id, lease) == "lease_revoked"
 
@@ -494,7 +527,7 @@ class TestQuiesceNeverRaises:
 
 
 class TestExit:
-    async def test_exit_closes_the_row_rearms_the_plate_and_kicks_dispatch(
+    async def test_exit_closes_the_row_leaves_the_watch_alone_and_kicks_dispatch(
         self, db_session, printer_factory, monkeypatch
     ):
         printer = await printer_factory()
@@ -502,21 +535,22 @@ class TestExit:
         plate_occupancy.configure(policy_driver=eject_cooldown_monitor.on_occupancy_change)
         await service_hold.enter(db_session, printer.id, actor="raymond")
 
-        # A plate that deposits DURING the hold arms no watch (B's ``_desired_policy``
-        # gate) — the stored policy is kept, the running watch is not.
+        # A plate that deposits DURING the hold arms its watch: the hold decides what that
+        # watch may DO (fans only, eject withheld), never whether it exists.
         _occupy(printer.id, CooldownEject(unit_id=1857, run_id=None))
-        assert spawned == []
-        assert printer.id not in eject_cooldown_monitor._armed
+        assert spawned == [f"eject-cooldown-watch-{printer.id}"]
+        armed = eject_cooldown_monitor._armed[printer.id]
 
         released = await service_hold.exit(db_session, printer.id, actor="raymond")
 
         assert released is True
         assert await printer_incidents.get_open(db_session, printer.id, kinds={KIND_SERVICE_HOLD}) is None
         assert printer_incidents.automation_held(printer.id) is False
-        # ``reconsider`` re-ran the driver on the current view: the stored cooldown is
-        # armed again, with no restart and no second decision table.
+        # Nothing is re-armed: the armed watch is untouched, and it reads the hold as a
+        # per-tick level — so the eject dispatches on its very next poll. A respawn here
+        # would restart the cooldown from zero and re-boost the fans.
         assert spawned == [f"eject-cooldown-watch-{printer.id}"]
-        assert eject_cooldown_monitor._armed[printer.id].policy == CooldownEject(unit_id=1857, run_id=None)
+        assert eject_cooldown_monitor._armed[printer.id] is armed
         assert dispatch_kick._reasons[-1][1:] == ("service_hold_released", printer.id)
 
     async def test_exit_on_an_unheld_printer_releases_nothing(self, db_session, printer_factory):

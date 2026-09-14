@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -103,6 +104,9 @@ class _PrepRecorder:
         # line). Both are the watch's to resolve, never the prep's to look up.
         self.models: list[str | None] = []
         self.thresholds: list[float | None] = []
+        # The printer's service hold as the watch read it at arm — the one input that
+        # decides whether the plate HOLD (motion) is attempted at all.
+        self.helds: list[bool | None] = []
         # Every temperature map the bed poll handed the prep — the boost-end lane.
         self.samples: list[dict] = []
         self.ended: list[bool] = []
@@ -128,6 +132,7 @@ class _PrepRecorder:
         async def fake_begin(printer_id, *, queue_item_id, fans, release_threshold_c, model, **kwargs):
             recorder.begun.append((printer_id, queue_item_id, fans))
             recorder.holds.append((kwargs.get("hold_enabled"), kwargs.get("hold_part_top_mm")))
+            recorder.helds.append(kwargs.get("held"))
             recorder.models.append(model)
             recorder.thresholds.append(release_threshold_c)
             recorder.order.append("begin")
@@ -343,6 +348,39 @@ class _StallRecorder:
 
     async def __call__(self, reason):
         self.reasons.append(reason)
+
+
+class _CooldownOverRecorder:
+    """Injectable on_cooldown_over: records the CAUSE of each deferral edge.
+
+    In production this closure retires the cooldown prep (fans off) and stamps
+    ``deferred`` on the watch's own record; here it is one list, because the question
+    these tests ask is *how many times, and for which reason* — the retirement itself is
+    pinned in ``test_cooldown_prep.py`` and its wiring in ``TestCooldownPrepWiring``."""
+
+    def __init__(self):
+        self.causes: list[str] = []
+
+    def __call__(self, cause: str) -> None:
+        self.causes.append(cause)
+
+
+class _HeldScript:
+    """A service hold scripted per POLL: answer N is the level at tick N.
+
+    The watch reads ``held()`` exactly once per tick, at the top, so the call count IS
+    the tick index — which is what lets a test pin "the eject dispatched on the very next
+    tick after the hold lifted" rather than merely "it dispatched eventually". The last
+    answer repeats for every later tick."""
+
+    def __init__(self, answers):
+        self._answers = list(answers)
+        self.calls = 0
+
+    def __call__(self) -> bool:
+        answer = self._answers[min(self.calls, len(self._answers) - 1)]
+        self.calls += 1
+        return answer
 
 
 # --------------------------------------------------------------------------- #
@@ -581,19 +619,21 @@ class TestPolicyDriverArming:
         assert EjectCooldownMonitor().request_release_now(7) is False
 
 
-class TestServiceHoldGate:
-    """A printer a human has DECLARED held wants no releasing watch at all.
+class TestServiceHoldCoolingOnly:
+    """A held printer keeps COOLING its plate and withholds only the EJECT.
 
-    ``_desired_policy`` is the ONE place a stored plate policy becomes a running
-    watch, so the automation hold is read there and nowhere else — one read covers the
-    cooldown watch and its fans, the FA watch, the foreign auto-eject and even
-    ``EscalationOnly``'s 90-minute foreign-deposit page. It is LEVEL-triggered, which
-    is what lets ``reconsider`` re-arm the STORED policy when the hold lifts: the hold
-    never touches the plate.
+    The hold suspends what the farm DOES to a machine — motion, sweep, page, quarantine —
+    not what it observes, and moving air is not motion. So the hold is no longer an
+    arm-time gate (``_desired_policy`` is a pure function of the plate) but a per-tick
+    LEVEL inside the watch: the fans finish their curve, the release boundary withholds,
+    and the watch keeps polling until the hold lifts.
 
-    The 2026-09-12 shape it closes: 010-H2S's cooldown fans ran 22 821 s (6.3 h)
-    because the maintenance toggle tore the session down under an armed watch, which
-    then polled a dead socket — a disconnected tick being non-terminal by design.
+    The two shapes this replaces, both operator-reported: entering a hold mid-cooldown
+    cancelled the watch, whose ``finally`` then commanded both fans off over a hot bed;
+    and a print that FINISHED during a hold armed no watch at all, so its plate cooled by
+    convection alone for the length of the hold. The 2026-09-12 010-H2S fans-for-6.3-h
+    incident is still closed, from the other end: a teardown retires the watch while the
+    session is up (``service_hold.quiesce_for_teardown``).
     """
 
     @pytest.fixture()
@@ -603,17 +643,17 @@ class TestServiceHoldGate:
         monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid in holds)
         return holds
 
-    def test_desired_policy_returns_none_for_a_held_printer(self, held):
+    def test_desired_policy_ignores_the_hold(self, held):
+        """It answers about the PLATE. A held printer's plate is still occupied, still
+        carries a policy, and still needs the watch that policy names."""
         mon = EjectCooldownMonitor()
         _occupy(7, CooldownEject(unit_id=42, run_id=9))
         view = plate_occupancy.snapshot(7)
 
-        assert mon._desired_policy(7, view) == CooldownEject(unit_id=42, run_id=9)
+        assert mon._desired_policy(view) == CooldownEject(unit_id=42, run_id=9)
 
         held.add(7)
-        assert mon._desired_policy(7, view) is None
-        # ...and only that printer: the predicate is per printer, not a global flag.
-        assert mon._desired_policy(8, view) == CooldownEject(unit_id=42, run_id=9)
+        assert mon._desired_policy(view) == CooldownEject(unit_id=42, run_id=9)
 
     @pytest.mark.parametrize(
         "policy",
@@ -624,23 +664,23 @@ class TestServiceHoldGate:
             EscalationOnly(),
         ],
     )
-    def test_a_held_printer_arms_nothing_for_any_policy(self, spawns, held, policy):
-        """Including the escalation-only hold: paging a human about the plate they are
-        standing in front of is exactly what maintenance mode is for."""
+    def test_a_held_printer_still_arms_its_watch(self, spawns, held, policy):
+        """Every policy, including the escalation-only hold — whose 90-minute page is
+        withheld INSIDE the watch (``watch_gate_escalation_only(held=…)``) rather than by
+        never existing, so the page is kept for the moment a human can read it instead of
+        being consumed while notifications are suppressed."""
         mon = EjectCooldownMonitor()
         _wire(mon)
         held.add(7)
 
         _occupy(7, policy)
 
-        assert spawns == []
-        assert mon._armed == {}
-        # The PLATE is untouched — the policy is stored, just not running.
-        assert plate_occupancy.snapshot(7).plate_policy == policy
+        assert len(spawns) == 1
+        assert mon._armed[7].policy == policy
 
-    def test_reconsider_cancels_an_armed_watch_when_the_hold_is_entered(self, spawns, held):
-        """Entering a hold is not an occupancy transition, so nothing fans out — this is
-        the level-triggered re-read that makes it act anyway."""
+    def test_entering_a_hold_never_cancels_a_running_watch(self, spawns, held):
+        """The cooldown that is already running is the one the operator can hear. It
+        keeps its elapsed time, its plateau anchor, its escalation state and its fans."""
         mon = EjectCooldownMonitor()
         _wire(mon)
         _occupy(7, CooldownEject(unit_id=42, run_id=9))
@@ -649,25 +689,25 @@ class TestServiceHoldGate:
         held.add(7)
         mon.reconsider(7, "service hold entered")
 
-        assert armed.cancelled is True
-        assert mon._armed == {}
-        assert len(spawns) == 1  # nothing was armed in its place
+        assert armed.cancelled is False
+        assert mon._armed[7].task is armed
+        assert len(spawns) == 1
 
-    def test_reconsider_re_arms_the_stored_policy_when_the_hold_is_released(self, spawns, held):
-        """The liveness half: a plate still gated under CooldownEject resumes its
-        cooldown and will auto-eject at threshold, with no restart and no second
-        decision table."""
+    def test_releasing_a_hold_does_not_respawn_the_watch(self, spawns, held):
+        """Nothing is re-armed on release: the SAME task reads the level drop on its next
+        tick and releases. A respawn here would restart the cooldown from zero."""
         mon = EjectCooldownMonitor()
         _wire(mon)
         held.add(7)
         _occupy(7, CooldownEject(unit_id=42, run_id=9))
-        assert mon._armed == {}
+        armed = mon._armed[7].task
 
         held.discard(7)
         mon.reconsider(7, "service hold released")
 
-        assert [t.name for t in spawns] == ["eject-cooldown-watch-7"]
-        assert mon._armed[7].policy == CooldownEject(unit_id=42, run_id=9)
+        assert mon._armed[7].task is armed
+        assert armed.cancelled is False
+        assert len(spawns) == 1
 
     def test_reconsider_is_idempotent_on_an_unheld_printer(self, spawns, held):
         """It re-runs the driver over the CURRENT view, and the driver respawns only on
@@ -687,10 +727,282 @@ class TestServiceHoldGate:
         mon = EjectCooldownMonitor()
         _wire(mon)
 
-        mon.reconsider(7, "service hold released")
+        mon.reconsider(7, "printer re-activated")
 
         assert spawns == []
         assert mon._armed == {}
+
+
+class TestWatchBedAndClearUnderAHold:
+    """``watch_bed_and_clear(held=…, on_cooldown_over=…)``: the release is withheld, the
+    cooldown is retired at its own end, and the watch keeps polling.
+
+    Two clocks are pinned here because they answer two different questions: ``elapsed``
+    (wall time — the plateau windows must keep measuring the cooling rate under a hold, so
+    a bed at equilibrium still retires its fans) and ``waited`` (elapsed minus held time —
+    "how long the FARM has waited", which is what the cap and the escalation page are
+    about). A hold is not the farm waiting.
+    """
+
+    async def test_a_cooled_bed_under_a_hold_withholds_the_eject_and_keeps_watching(self):
+        _gate_up(7)
+        mgr = _FakeManager([_status(27)])
+        rel, stall, over = _ReleaseRecorder(), _StallRecorder(), _CooldownOverRecorder()
+        clear = _ClearAfter(7, after_polls=3)
+
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=10_000,
+            check_interval_s=20,
+            sleep=clear,
+            on_release=rel,
+            on_stall=stall,
+            held=lambda: True,
+            on_cooldown_over=over,
+        )
+
+        assert outcome == "cleared"  # it was still polling when the operator cleared the plate
+        assert rel.calls == 0  # nothing swept a plate a human may be standing over
+        assert over.causes == ["threshold"]  # the cooling ended, once, at the deferral edge
+        assert clear.calls == 3  # and the watch went on polling afterwards
+        assert stall.reasons == []
+
+    async def test_the_eject_dispatches_on_the_very_next_tick_after_the_hold_lifts(self):
+        """THE liveness pin. Nothing re-arms this watch, so if the level drop did not
+        release on the next poll, a plate would sit cooled and gated until a restart."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(27)])
+        rel, over = _ReleaseRecorder(), _CooldownOverRecorder()
+        script = _HeldScript([True, True, False])
+
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=10_000,
+            check_interval_s=20,
+            sleep=_noop_sleep,
+            on_release=rel,
+            on_stall=_StallRecorder(),
+            held=script,
+            on_cooldown_over=over,
+        )
+
+        assert outcome == "released"
+        assert rel.calls == 1
+        assert script.calls == 3  # the FIRST unheld tick is the one that dispatched
+        assert over.causes == ["threshold"]
+
+    async def test_the_escalation_page_is_not_consumed_by_the_hold(self, caplog):
+        """``escalated`` is once-only and ``notification_service`` drops a farm-reaction
+        page for a held printer — so firing it during a hold would spend it on a message
+        nobody receives. It is measured against WAITED time, and fires after the hold."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(60)])
+        clear = _ClearAfter(7, after_polls=7)
+        polls: list[int] = []
+
+        async def notify(printer_id, *, bed_c=None):
+            polls.append(clear.calls)
+
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=40,
+            check_interval_s=20,
+            sleep=clear,
+            notify=notify,
+            on_release=_ReleaseRecorder(),
+            on_stall=_StallRecorder(),
+            held=_HeldScript([True, True, True, True, False]),
+            on_cooldown_over=_CooldownOverRecorder(),
+        )
+
+        assert outcome == "cleared"
+        # Four held ticks charged nothing to the farm's clock: the page waits for two
+        # unheld intervals after them (poll 7), where the wall clock would have paged at
+        # poll 3 and burned the once-only flag inside the hold.
+        assert polls == [6]
+
+    async def test_a_hot_plateau_under_a_hold_withholds_instead_of_quarantining(self, caplog):
+        """A printer a human is working on is not a printer to take out of rotation. The
+        plateau is still MEASURED (that is what proves the bed has stopped cooling), but
+        its verdict is a deferral, and it is evaluated once — not every window."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(60)])
+        rel, stall, over = _ReleaseRecorder(), _StallRecorder(), _CooldownOverRecorder()
+        clear = _ClearAfter(7, after_polls=6)
+
+        with caplog.at_level(logging.WARNING, logger=monitor_mod.__name__):
+            outcome = await watch_bed_and_clear(
+                7,
+                28.0,
+                manager=mgr,
+                escalate_s=10_000,
+                check_interval_s=20,
+                sleep=clear,
+                stall_window_s=20,
+                stall_epsilon_c=1.0,
+                plateau_eject_margin_c=3.0,
+                on_release=rel,
+                on_stall=stall,
+                held=lambda: True,
+                on_cooldown_over=over,
+            )
+
+        assert outcome == "cleared"  # never "stalled"
+        assert stall.reasons == []  # no quarantine, no run pause
+        assert rel.calls == 0
+        assert over.causes == ["plateau_hot"]
+        plateau_warnings = [r for r in caplog.records if "cooling plateaued" in r.getMessage()]
+        assert len(plateau_warnings) == 1  # once, then the deferred tick decides nothing
+        assert "maintenance mode" in plateau_warnings[0].getMessage()
+
+    async def test_a_near_threshold_plateau_under_a_hold_is_withheld(self):
+        """Equilibrated at ambient: the cooling is genuinely finished, so the fans stop —
+        but the sweep still waits for the human."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(30)])
+        rel, over = _ReleaseRecorder(), _CooldownOverRecorder()
+
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=10_000,
+            check_interval_s=20,
+            sleep=_ClearAfter(7, after_polls=5),
+            stall_window_s=20,
+            stall_epsilon_c=1.0,
+            plateau_eject_margin_c=3.0,
+            on_release=rel,
+            on_stall=_StallRecorder(),
+            held=lambda: True,
+            on_cooldown_over=over,
+        )
+
+        assert outcome == "cleared"
+        assert rel.calls == 0
+        assert over.causes == ["plateau_near_threshold"]
+
+    async def test_the_cap_measures_waited_time_not_wall_time(self):
+        """A three-hour hold must not force-dispatch a possibly re-heated bed the instant
+        it lifts: the cap is the farm's patience, and the hold is not the farm waiting."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(60)])
+        rel, over = _ReleaseRecorder(), _CooldownOverRecorder()
+        script = _HeldScript([True, True, True, True, True, False])
+
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=10_000,
+            check_interval_s=20,
+            max_hold_s=40,
+            sleep=_noop_sleep,
+            on_release=rel,
+            on_stall=_StallRecorder(),
+            held=script,
+            on_cooldown_over=over,
+        )
+
+        assert outcome == "released"
+        assert rel.calls == 1
+        # Five held ticks, then two full intervals of farm waiting before the cap fires.
+        assert script.calls == 8
+        assert over.causes == []  # the cap never came due while the hold stood
+
+    async def test_a_manual_release_is_answered_under_a_hold(self):
+        """Every manual verb stays live in maintenance mode, and the click that set this
+        event IS the human the deferral defers to."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(60)])
+        rel, over = _ReleaseRecorder(), _CooldownOverRecorder()
+        event = asyncio.Event()
+        event.set()
+
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=10_000,
+            check_interval_s=20,
+            sleep=_noop_sleep,
+            on_release=rel,
+            on_stall=_StallRecorder(),
+            release_now=event,
+            held=lambda: True,
+            on_cooldown_over=over,
+        )
+
+        assert outcome == "released"
+        assert rel.calls == 1
+        assert over.causes == []
+
+    async def test_the_cooldown_is_retired_once_per_held_EPISODE(self):
+        """The deferral is latched per episode: a bed that keeps meeting the threshold
+        logs and retires once, not every 20 s. A SECOND episode (the hold lifted, the bed
+        was re-heated, the hold was entered again) is a second deferral — while the prep
+        itself retires only once in its lifetime, which its own ``retired`` invariant
+        owns (``test_cooldown_prep.py``)."""
+        _gate_up(7)
+        mgr = _FakeManager([_status(27), _status(27), _status(60), _status(27)])
+        rel, over = _ReleaseRecorder(), _CooldownOverRecorder()
+
+        outcome = await watch_bed_and_clear(
+            7,
+            28.0,
+            manager=mgr,
+            escalate_s=10_000,
+            check_interval_s=20,
+            sleep=_ClearAfter(7, after_polls=4),
+            on_release=rel,
+            on_stall=_StallRecorder(),
+            held=_HeldScript([True, True, False, True]),
+            on_cooldown_over=over,
+        )
+
+        assert outcome == "cleared"
+        assert rel.calls == 0  # the unheld tick read a re-heated bed, so nothing released
+        assert over.causes == ["threshold", "threshold"]  # one per episode
+
+
+class TestWatchGateEscalationOnlyUnderAHold:
+    async def test_the_foreign_deposit_page_is_withheld_while_held(self):
+        """The plate a human is standing in front of is not worth a page — and the page
+        is once-only, so firing it into the hold's notification suppression would lose it
+        for good."""
+        _gate_up(7)
+        notify = _NotifyRecorder()
+        clear = _ClearAfter(7, after_polls=4)
+
+        outcome = await watch_gate_escalation_only(
+            7, escalate_s=20, check_interval_s=20, sleep=clear, notify=notify, held=lambda: True
+        )
+
+        assert outcome == "cleared"
+        assert notify.calls == []
+        assert clear.calls == 4  # it kept holding the gate throughout
+
+    async def test_the_page_fires_once_the_hold_lifts(self):
+        _gate_up(7)
+        notify = _NotifyRecorder()
+
+        outcome = await watch_gate_escalation_only(
+            7,
+            escalate_s=20,
+            check_interval_s=20,
+            sleep=_ClearAfter(7, after_polls=4),
+            notify=notify,
+            held=_HeldScript([True, True, False]),
+        )
+
+        assert outcome == "cleared"
+        assert notify.calls == [7]
 
 
 class TestEjectTimerHygiene:
@@ -1558,7 +1870,7 @@ class TestArmedWatchResolution:
         assert settings.hold_part_top_mm == int(fields["farm_cooldown_hold_part_top_mm"].default)
 
     def test_printer_state_payload_helper(self):
-        # printer_manager exposes the armed watch as {"threshold_c", "hold_z"} / None.
+        # printer_manager exposes the armed watch as {"threshold_c", "hold_z", "deferred"}.
         from backend.app.services.eject.monitor import eject_cooldown_monitor
         from backend.app.services.printer_manager import _eject_watch_payload
 
@@ -1568,9 +1880,9 @@ class TestArmedWatchResolution:
         eject_cooldown_monitor._armed[901] = armed
         try:
             # An unheld plate still reports its threshold — hold_z is simply absent.
-            assert _eject_watch_payload(901) == {"threshold_c": 33.0, "hold_z": None}
+            assert _eject_watch_payload(901) == {"threshold_c": 33.0, "hold_z": None, "deferred": False}
             armed.hold_z = 2.0
-            assert _eject_watch_payload(901) == {"threshold_c": 33.0, "hold_z": 2.0}
+            assert _eject_watch_payload(901) == {"threshold_c": 33.0, "hold_z": 2.0, "deferred": False}
             armed.threshold_c = None  # escalation-only hold / still resolving
             assert _eject_watch_payload(901) is None
         finally:
@@ -1588,7 +1900,7 @@ class TestArmedWatchResolution:
             policy=CooldownEject(unit_id=1, run_id=None), task=_FakeTask("x"), threshold_c=33.0, hold_z=2.0
         )
         try:
-            assert json.dumps(_eject_watch_payload(902)) == '{"threshold_c": 33.0, "hold_z": 2.0}'
+            assert json.dumps(_eject_watch_payload(902)) == '{"threshold_c": 33.0, "hold_z": 2.0, "deferred": false}'
         finally:
             eject_cooldown_monitor._armed.pop(902, None)
 
@@ -1805,6 +2117,183 @@ class TestCooldownPrepWiring:
 
         assert prep.begun == [(7, 42, FANS_ON)]
         assert prep.holds == [(False, -20)]
+
+    async def test_the_watch_tells_the_prep_the_printer_is_held(self, monkeypatch):
+        """The hold reaches the prep as a plain bool, read once at arm. It refuses the
+        plate HOLD there — the one actuator that MOVES the machine a human may have their
+        hands in — and leaves the fans alone, because air is not motion."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid == 7)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.helds == [True]
+        # …and the fans were still requested in full: the hold gates one actuator.
+        assert prep.begun == [(7, 42, FANS_ON)]
+
+    async def test_an_unheld_printer_arms_the_prep_unheld(self, monkeypatch):
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: False)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.helds == [False]
+
+    async def test_a_hold_keeps_the_plate_raised_chip_and_withdraws_the_eject_seed(self, monkeypatch):
+        """One store, two questions, and a hold answers them differently.
+
+        The CLAIM survives: the plate really is still at ~Z2 with the part top ~48 mm under
+        the nozzle plane until a human lowers it, and the card's "plate raised" chip is the
+        "do not jog the toolhead" warning an operator opening the machine needs most at
+        exactly that moment — dropping it on the held edge would remove the warning when it
+        matters. The MEASUREMENT does not survive: a human may have jogged the bed, and the
+        seed is a promise to the eject's runtime watchdog about the distance its first move
+        has to cover. An absent seed over-states that distance (a few seconds of deadline);
+        a wrong one under-states it and stops a sweep mid-flight.
+        """
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder(hold="sent", hold_z=2.0)
+        holds: set[int] = set()
+        seen: dict[str, object] = {}
+
+        async def fake_watch(pid, threshold, **kwargs):
+            seen["chip_at_arm"] = mon.hold_z(pid)
+            seen["seed_at_arm"] = mon.eject_seed_z(pid)
+            holds.add(pid)  # an operator enters maintenance mode mid-cooldown
+            kwargs["held"]()  # …and the watch's next tick reads the level
+            seen["chip_after_edge"] = mon.hold_z(pid)
+            seen["seed_after_edge"] = mon.eject_seed_z(pid)
+            seen["hold_seen"] = mon._armed[pid].hold_seen
+            await kwargs["on_release"]()
+            return "released"
+
+        async def fake_dispatch(*, printer_id, queue_item_id, plate_z=None):
+            seen["plate_z"] = plate_z
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid in holds)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        monkeypatch.setattr(monitor_mod, "_dispatch_production_eject", fake_dispatch)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert (seen["chip_at_arm"], seen["seed_at_arm"]) == (2.0, 2.0)  # before a hold, one answer
+        assert seen["hold_seen"] is True
+        assert seen["chip_after_edge"] == 2.0  # the chip is KEPT: the plate is still up there
+        assert seen["seed_after_edge"] is None  # the measurement is withdrawn
+        assert seen["plate_z"] is None  # and that is what the eject is seeded with
+
+    async def test_the_withdrawn_seed_is_never_restored_when_the_hold_lifts(self, monkeypatch):
+        """``hold_seen`` records something that cannot be un-done. Leaving maintenance mode
+        does not tell the farm the bed was left alone, so the seed stays withdrawn for the
+        life of this watch while the chip goes on reporting the plate raised."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder(hold="sent", hold_z=2.0)
+        holds: set[int] = set()
+        seen: dict[str, object] = {}
+
+        async def fake_watch(pid, threshold, **kwargs):
+            holds.add(pid)
+            kwargs["held"]()
+            holds.discard(pid)
+            kwargs["held"]()  # the hold lifts
+            seen["chip"] = mon.hold_z(pid)
+            seen["seed"] = mon.eject_seed_z(pid)
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid in holds)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert seen["chip"] == 2.0
+        assert seen["seed"] is None
+
+    async def test_an_unheld_watch_seeds_the_eject_from_its_own_hold(self, monkeypatch):
+        """The ordinary production path is untouched: no hold ever stood, so the height the
+        prep actually SENT is both the chip and the estimator seed."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder(hold="sent", hold_z=2.0)
+        seen: dict[str, object] = {}
+
+        async def fake_watch(pid, threshold, **kwargs):
+            await kwargs["on_release"]()
+            return "released"
+
+        async def fake_dispatch(*, printer_id, queue_item_id, plate_z=None):
+            seen["plate_z"] = plate_z
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: False)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        monkeypatch.setattr(monitor_mod, "_dispatch_production_eject", fake_dispatch)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert seen["plate_z"] == 2.0
+
+    async def test_the_held_edge_never_writes_to_a_successors_record(self, monkeypatch):
+        """The same guard every other write in this watch uses: a watch whose record has
+        already been taken over by a successor may not reach into it."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder(hold="sent", hold_z=2.0)
+        holds: set[int] = set()
+        seen: dict[str, object] = {}
+
+        async def fake_watch(pid, threshold, **kwargs):
+            successor = _ArmedWatch(policy=CooldownEject(unit_id=99, run_id=None), task=_FakeTask("successor"))
+            successor.hold_z = 7.5
+            mon._armed[pid] = successor
+            holds.add(pid)
+            kwargs["held"]()
+            seen["successor_hold_seen"] = successor.hold_seen
+            seen["successor_hold_z"] = successor.hold_z
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid in holds)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert seen["successor_hold_seen"] is False  # its own watch owns that decision
+        assert seen["successor_hold_z"] == 7.5
+
+    async def test_the_deferral_is_projected_and_cleared_when_the_hold_lifts(self, monkeypatch):
+        """``deferred`` is the card's "cooled · eject deferred" phase, and it belongs to
+        the WATCH rather than to the plate's policy: a policy field would flip policy
+        equality and respawn the watch, losing its elapsed cooldown and re-boosting the
+        fans it has just retired. The retirement rides the same edge."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        holds: set[int] = set()
+        seen: dict[str, object] = {}
+
+        async def fake_watch(pid, threshold, **kwargs):
+            holds.add(pid)
+            kwargs["held"]()
+            kwargs["on_cooldown_over"]("threshold")  # the bed reached the line while held
+            seen["deferred"] = mon.deferred(pid)
+            seen["retired_after"] = list(prep.ended)
+            holds.discard(pid)
+            kwargs["held"]()  # the hold lifts: the eject is permitted again
+            seen["after_resume"] = mon.deferred(pid)
+            return "released"
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid in holds)
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert seen["deferred"] is True
+        assert seen["retired_after"] == [True]  # the fans went off at the cooldown's end
+        assert seen["after_resume"] is False
+        # The exit ``finally`` retires it again — the prep's own idempotence decides what
+        # that second call does (one summary, a re-attempt of any OFF that did not land).
+        assert prep.ended == [True, True]
+        assert mon.deferred(7) is False  # no record survives the watch
 
     async def test_the_watch_resolves_the_model_and_the_threshold_for_the_prep(self, monkeypatch):
         """The prep gates its chamber lane on the MODEL and steps its boost down at the
@@ -2056,7 +2545,7 @@ class TestCooldownPrepWiring:
         monkeypatch.setattr(monitor_mod, "eject_cooldown_monitor", mon)
         await mon._watch(7, 42, release_now=asyncio.Event())
 
-        assert seen["payload"] == {"threshold_c": 33.0, "hold_z": 2.0}
+        assert seen["payload"] == {"threshold_c": 33.0, "hold_z": 2.0, "deferred": False}
 
 
 class TestCooldownArmedArbiter:

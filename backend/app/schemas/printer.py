@@ -158,13 +158,16 @@ class ServiceHoldState(BaseModel):
 class ServiceHoldEnterResponse(BaseModel):
     """``POST /printers/{id}/service-hold``: the hold's state plus what the quiesce did.
 
-    The four quiesce bools are what the operator's toast names, so each means *this call
-    changed that* — a second click on an already-quiet printer answers four Falses.
+    The three quiesce bools are the API's and the log's record of what this call actually
+    changed — a second click on an already-quiet printer answers three Falses. (The
+    operator's toast is static copy: it names the hold's effects, not this payload.)
+
+    There is no cooldown bool: entering a hold no longer ends a cooldown — the fans finish
+    their curve and the eject is withheld — so the only value it could carry is False.
     """
 
     held: bool
     already_held: bool
-    cooldown_ended: bool
     eject_stopped: bool
     job_stopped: bool
     lease_revoked: bool
@@ -410,10 +413,15 @@ class EjectWatchInfo(BaseModel):
     was skipped or the model has no clearance numbers). Declared here because the
     REST ``/status`` lane serialises through this model with ``extra="ignore"``
     while the WS lane dumps the same dict raw: a field missing here would flip the
-    card's "plate raised" chip between the two lanes (the C5 class)."""
+    card's "plate raised" chip between the two lanes (the C5 class).
+
+    ``deferred`` (2026-09-13) is "this plate has finished cooling and its eject is waiting
+    on maintenance mode": the fans are already retired, so the hold flag and the watch's
+    existence cannot tell that state from a cooldown still in progress."""
 
     threshold_c: float
     hold_z: float | None = None
+    deferred: bool = False
 
 
 class PlateInfo(BaseModel):

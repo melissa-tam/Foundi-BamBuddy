@@ -280,6 +280,7 @@ class _Env:
         fans: CooldownFanSettings | None = None,
         model: str | None = _UNSET,  # type: ignore[assignment]
         release_threshold_c: float | None = None,
+        held: bool = False,
         settle_s: float = 3.0,
     ):
         """``begin`` followed by the arm-time witness, the way ``_watch`` drives them."""
@@ -291,6 +292,7 @@ class _Env:
             model=self.model if model is _UNSET else model,
             hold_enabled=self.hold_enabled,
             hold_part_top_mm=self.hold_part_top_mm,
+            held=held,
             settle_s=settle_s,
             sleep=self.sleep,
         )
@@ -1168,6 +1170,290 @@ class TestHoldZIsOnlyEverSetOnSent:
         prep = await env.begin()
         assert prep.hold != "sent"
         assert prep.hold_z is None
+
+
+# --------------------------------------------------------------------------- #
+# Maintenance mode: the fans run, the plate is not moved
+# --------------------------------------------------------------------------- #
+class TestServiceHold:
+    """A held printer's plate cools on the FANS alone.
+
+    The hold's line is motion, not air: raising the plate drives the bed and the
+    toolhead's ``G150.3`` on a machine whose operator may have their hands inside it,
+    while switching a fan on changes nothing they can be hurt by. The cost is accepted
+    rather than hidden — an unheld plate is held at the nozzle plane where the aux stream
+    actually is, ~73 mm above a vendor-parked part, so a cooldown that arms under a hold
+    is slower — and it is NOT re-attempted when the hold lifts.
+    """
+
+    async def test_the_hold_is_refused_and_no_session_is_opened(self, env, caplog):
+        """Asked before any state is read: no queue item, no profile, no geometry row and
+        no donor 3MF can change the answer, so none of them is fetched."""
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin(held=True)
+
+        assert prep.hold == "skipped:service_hold"
+        assert prep.hold_z is None
+        assert env.sessions == 0  # not one DB session opened for a decision already made
+        assert env.client.hold_gcode == []  # and nothing was published at the machine
+        assert "maintenance mode — fans only, plate not held" in caplog.text
+
+    async def test_both_fans_still_run_under_a_hold(self, env):
+        """THE operator requirement: under maintenance mode the cooldown runs as in
+        production — aux fan on, chamber boosting — with no eject."""
+        prep = await env.begin(held=True)
+
+        assert env.client.fans == [(2, 100), (3, 100)]
+        assert [lane.start for lane in prep.fans] == ["sent", "sent"]
+
+    async def test_the_chamber_lane_still_steps_down_under_a_hold(self, env):
+        """The boost's end is a fact about the chamber AIR, not about who owns the
+        printer: the exhaust's unique work finishes at the eject line either way."""
+        prep = await env.begin(held=True)
+        env.client.fans.clear()
+
+        prep.note_sample({"bed": 40.0, "chamber": 33.0})
+
+        assert prep.lane("chamber").step == "sent"
+        assert env.client.fans == [(3, 50)]
+
+    async def test_the_hold_is_asked_after_the_operators_own_switch(self, env, caplog):
+        """Both are static refusals; the operator's switch is reported first so a farm
+        that has the hold switched off altogether reads the same way held or not."""
+        env.hold_enabled = False
+        prep = await env.begin(held=True)
+        assert prep.hold == "skipped:disabled"
+
+    async def test_a_foreign_plate_is_still_reported_as_foreign(self, env):
+        """The foreign refusal comes first — it is the deepest fact (no unit, no donor,
+        no measured part height), and a held foreign plate is not a different case."""
+        prep = await env.begin(queue_item_id=None, held=True)
+        assert prep.hold == "skipped:foreign"
+
+
+# --------------------------------------------------------------------------- #
+# RETIRED: no actuator after the cooling episode ends
+# --------------------------------------------------------------------------- #
+class TestRetiredInvariant:
+    """The prep's lifetime is the COOLING EPISODE, and the episode can now end before the
+    watch does: a service hold withholds the eject, so the watch retires the actuators at
+    the cooldown's end and keeps polling. Everything that drives a fan therefore refuses
+    on a retired prep — otherwise the sampler restarts the chamber fan at its sustain
+    speed on the first chamber-under-threshold sample AFTER the retirement, which on the
+    measured trace is exactly what happens (the bed reaches the eject line first).
+    """
+
+    async def test_a_sample_after_end_steps_nothing(self, env, caplog):
+        """The H1 shape, in order: the bed crosses the line, the fans are retired, and
+        the chamber only then reaches the threshold."""
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin()
+            prep.end(fan_off=True)
+            assert env.client.fans == [(2, 100), (3, 100), (2, 0), (3, 0)]
+            env.client.fans.clear()
+
+            prep.note_sample({"bed": 30.0, "chamber": 32.0})
+
+        assert env.client.fans == []  # no fan was brought back
+        assert prep.boost_ended_at is None  # and no measurement was taken after the end
+        assert prep.lane("chamber").step is None
+        assert _boost_lines(caplog) == []
+
+    async def test_a_step_on_a_retired_prep_says_so(self, env):
+        """The invariant is per-METHOD, not only per-caller: the sampler's early return is
+        what production relies on, and this is the outcome any later caller would get."""
+        prep = await env.begin()
+        prep.end(fan_off=True)
+
+        assert prep.retired is True
+        assert prep._step_fan(prep.lane("chamber")) == "skipped:retired"
+
+    async def test_end_twice_logs_one_summary(self, env, caplog):
+        """The MEASUREMENT is idempotent: one ``cooldown ended after N s`` line per
+        cooling episode, from the first call. ``_summary`` asserts exactly one."""
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin()
+            prep.end(fan_off=True)
+            prep.end(fan_off=True)
+
+        assert "off=sent" in _summary(caplog)
+
+    async def test_a_lane_whose_first_off_was_skipped_active_is_retired_on_the_second_end(self, env, caplog):
+        """The H2 shape. A deferral has no eject job whose prologue carries the durable
+        ``M106 P2 S0``, so a first OFF that landed on ``skipped:active`` (a foreign job was
+        running) would leave both fans on for the length of the hold. The exit ``finally``
+        IS the retry, and it logs when one lands."""
+        prep = await env.begin()
+        env.manager.state = "RUNNING"  # a job owns the machine at the deferral edge
+        prep.end(fan_off=True)
+        assert [lane.off for lane in prep.fans] == ["skipped:active", "skipped:active"]
+        env.client.fans.clear()
+        env.manager.state = "FINISH"  # …and it has ended by the time the watch exits
+
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep.end(fan_off=True)
+
+        assert env.client.fans == [(2, 0), (3, 0)]
+        assert [lane.off for lane in prep.fans] == ["sent", "sent"]
+        assert caplog.text.count("landed on the retirement retry") == 2
+        assert "first attempt skipped:active" in caplog.text
+
+    async def test_a_landed_off_is_never_re_published(self, env):
+        """``sent`` and ``skipped:already_off`` are the two outcomes that mean the fan is
+        actually stopped; nothing re-commands those."""
+        prep = await env.begin(fans=_fans(chamber_sustain=0))
+        prep.note_sample({"bed": 40.0, "chamber": 32.0})  # steps the chamber lane to 0
+        prep.end(fan_off=True)
+        assert [lane.off for lane in prep.fans] == ["sent", "skipped:already_off"]
+        env.client.fans.clear()
+
+        prep.end(fan_off=True)
+
+        assert env.client.fans == []
+
+    async def test_the_retry_is_skipped_when_the_fans_were_handed_over(self, env):
+        """``fan_off=False`` means a successor cooldown-class watch still wants them —
+        the same question on the second call as on the first."""
+        prep = await env.begin()
+        prep.end(fan_off=False)
+        env.client.fans.clear()
+
+        prep.end(fan_off=False)
+
+        assert env.client.fans == []
+        assert [lane.off for lane in prep.fans] == ["skipped:not_wanted", "skipped:not_wanted"]
+
+
+# --------------------------------------------------------------------------- #
+# The operator's own hand on a fan
+# --------------------------------------------------------------------------- #
+class TestOperatorFanOff:
+    """A fan an operator switches off by hand (touchscreen, or ``POST /fan-speed``) is
+    THEIRS, and the farm does not re-assert it.
+
+    The wire is the only origin that also sees the touchscreen, so the detector lives on
+    the poll that was already running. Zero is the one unambiguous witness value — the
+    wire reports a quantised 0-15 LEVEL, so a fan that was merely turned DOWN is not
+    detected, and that limit is stated rather than papered over. It fails OPEN: a lane
+    never witnessed running never arms the detector at all.
+    """
+
+    async def test_a_witnessed_lane_switched_off_by_hand_is_released_to_the_operator(self, env, caplog):
+        prep = await env.begin()
+        env.manager.chamber_fan = 15  # the wire says the exhaust is running
+        prep.note_sample({"bed": 50.0, "chamber": 38.0})
+        assert prep.lane("chamber").witnessed_on is True
+        env.client.fans.clear()
+        env.manager.chamber_fan = 0  # …and now it is not, and we did not do that
+
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep.note_sample({"bed": 40.0, "chamber": 33.0})  # the boost would step here
+
+        assert prep.lane("chamber").operator_off is True
+        assert prep.lane("chamber").step == "skipped:operator_off"
+        assert env.client.fans == []  # the step is a RE-ASSERTION, and it stood aside
+        assert "chamber fan observed off — released to the operator, not re-commanded" in caplog.text
+
+    async def test_it_is_said_once_per_lane(self, env, caplog):
+        prep = await env.begin()
+        env.manager.chamber_fan = 15
+        prep.note_sample({"bed": 50.0, "chamber": 38.0})
+        env.manager.chamber_fan = 0
+
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            for _ in range(3):
+                prep.note_sample({"bed": 45.0, "chamber": 36.0})
+
+        assert caplog.text.count("released to the operator") == 1
+
+    async def test_the_end_of_cooldown_off_is_not_suppressed(self, env, caplog):
+        """The OFF retires a fan the FARM published: an operator who switched it back on
+        gets it switched off with the cooldown, rather than left running on an idle
+        printer — which is a state nothing else in the farm clears."""
+        prep = await env.begin()
+        env.manager.fan = 15
+        prep.note_sample({"bed": 50.0, "chamber": 38.0})
+        env.manager.fan = 0
+        prep.note_sample({"bed": 45.0, "chamber": 36.0})
+        assert prep.lane("aux").operator_off is True
+        env.client.fans.clear()
+
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep.end(fan_off=True)
+
+        assert env.client.fans == [(2, 0), (3, 0)]
+        assert prep.lane("aux").off == "sent"
+
+    async def test_our_own_sustain_zero_is_not_read_as_the_operator(self, env):
+        """``sustain_percent == 0`` is a step TARGET: that zero on the wire is ours, and
+        misreading it would make every zero-sustain cooldown claim a human intervened."""
+        prep = await env.begin(fans=_fans(chamber_sustain=0))
+        env.manager.chamber_fan = 15
+        prep.note_sample({"bed": 50.0, "chamber": 38.0})
+        prep.note_sample({"bed": 40.0, "chamber": 33.0})  # our step publishes S0
+        assert prep.lane("chamber").step == "sent"
+        env.manager.chamber_fan = 0  # …and the wire duly reports it
+
+        prep.note_sample({"bed": 36.0, "chamber": 31.0})
+
+        assert prep.lane("chamber").operator_off is False
+
+    async def test_a_lane_the_wire_never_reported_running_still_steps(self, env):
+        """The virtual printer's shape (and a model that does not report the field):
+        ``big_fan2_speed`` reads 0 from the start, which is no evidence of anything —
+        arming the detector on it would suppress every step on that machine."""
+        env.manager.chamber_fan = 0
+        prep = await env.begin()
+        prep.note_sample({"bed": 50.0, "chamber": 38.0})
+        env.client.fans.clear()
+
+        prep.note_sample({"bed": 40.0, "chamber": 33.0})
+
+        assert prep.lane("chamber").witnessed_on is False
+        assert prep.lane("chamber").operator_off is False
+        assert prep.lane("chamber").step == "sent"
+        assert env.client.fans == [(3, 50)]
+
+    async def test_a_none_witness_decides_nothing(self, env):
+        """An unreadable witness is not a zero. A printer that drops off the wire
+        mid-cooldown must not be read as an operator switching its fans off."""
+        prep = await env.begin()
+        env.manager.chamber_fan = 15
+        prep.note_sample({"bed": 50.0, "chamber": 38.0})
+        env.manager.chamber_fan = None
+
+        prep.note_sample({"bed": 45.0, "chamber": 36.0})
+
+        assert prep.lane("chamber").witnessed_on is True
+        assert prep.lane("chamber").operator_off is False
+
+    async def test_an_unpublished_lane_is_never_watched(self, env):
+        """A fan the farm never commanded ON was never ours to decide about — an operator
+        running the aux fan themselves is not something to detect or to stop."""
+        prep = await env.begin(fans=_fans(chamber_enabled=False))
+        env.manager.chamber_fan = 15
+        prep.note_sample({"bed": 50.0, "chamber": 38.0})
+        env.manager.chamber_fan = 0
+
+        prep.note_sample({"bed": 45.0, "chamber": 36.0})
+
+        assert prep.lane("chamber").witnessed_on is False
+        assert prep.lane("chamber").operator_off is False
+
+    async def test_a_witness_read_that_throws_never_costs_the_step_its_decision(self, env, caplog):
+        """The detector is a diagnostic riding the sampler; the step below it is the
+        actuator. A manager that throws must not take the second with the first."""
+        prep = await env.begin()
+
+        def boom(printer_id):
+            raise RuntimeError("manager down")
+
+        env.manager.get_status = boom
+        with caplog.at_level(logging.ERROR, logger=cooldown_prep.__name__):
+            prep.note_sample({"bed": 40.0, "chamber": 33.0})
+
+        assert "fan witness read failed" in caplog.text
+        assert prep.lane("aux").step == "skipped:same"  # decided before any wire read
 
 
 async def test_begin_runs_the_hold_before_the_fans(env):

@@ -55,6 +55,7 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.schemas.printer import EjectOrigin, EjectOutcome, EjectRefusalReason
+from backend.app.services import printer_incidents
 from backend.app.services.eject import remote as eject_remote
 from backend.app.services.eject.donor import (
     AUTO_DONOR_CHAIN,
@@ -437,6 +438,15 @@ async def _eject_farm_unit(
     :class:`~backend.app.services.plate_occupancy.CooldownEject` policy is the armed
     watch's identity, so signalling that watch's single release path is what keeps two
     dispatches off one printer.
+
+    **Except under a service hold, where this lane dispatches DIRECTLY.** A held printer's
+    watch still runs (it cools the plate and withholds the eject), and its reaction to a
+    TERMINAL refusal — ``z_unreferenced``, say — is ``_hold_for_human``, a page plus an
+    escalation-only policy. But ``notification_service`` drops a farm-reaction page for a
+    held printer, so the operator who just clicked "Eject now" would get a 200, no sweep
+    and no message. Dispatching here instead surfaces the refusal as the route's own 409.
+    (The direct dispatch registers the eject, so ``_desired_policy`` sees ``eject_present``
+    and stands the watch down; its ``finally`` retires the prep.)
     """
     threshold = await _resolve_eject_threshold(item.id)
     if threshold is None:
@@ -447,7 +457,12 @@ async def _eject_farm_unit(
         return hot
 
     policy = plate_occupancy.snapshot(printer_id).plate_policy
-    if isinstance(policy, CooldownEject) and policy.unit_id == item.id:
+    # The ONE hold read in this service (the eject lane's other is the watch's own level).
+    if (
+        isinstance(policy, CooldownEject)
+        and policy.unit_id == item.id
+        and not printer_incidents.automation_held(printer_id)
+    ):
         if eject_cooldown_monitor.request_release_now(printer_id):
             logger.info(
                 "manual_eject: signalled immediate release on printer %s (watch armed, item %s)", printer_id, item.id

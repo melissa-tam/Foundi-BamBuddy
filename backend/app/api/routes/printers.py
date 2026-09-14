@@ -414,9 +414,11 @@ async def update_printer(
             # armed on this printer speaks over it. Retire them WHILE the wire is still
             # there — 2026-09-12: the session went first and 010-H2S's cooldown fans ran
             # 6.3 h on a `prep.end()` that landed on `skipped:no_client`, while 001/009
-            # kept a phantom in-flight eject nothing could stop. Deactivation is not
-            # maintenance mode (no hold is opened here), but it needs the same stand-down.
-            await service_hold.quiesce(printer_id, cause="deactivate")
+            # kept a phantom in-flight eject nothing could stop. ONE verb owns that order
+            # (watch retired and awaited, then the quiesce); deactivation is not
+            # maintenance mode — no hold is opened here — but losing the session is the
+            # one thing that genuinely ends a cooldown, which entering a hold does not.
+            await service_hold.quiesce_for_teardown(printer_id, cause="deactivate")
         printer_manager.disconnect_printer(printer_id)
         if printer.is_active:
             await printer_manager.connect_printer(printer)
