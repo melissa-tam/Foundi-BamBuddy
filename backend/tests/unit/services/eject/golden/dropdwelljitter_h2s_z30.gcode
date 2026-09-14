@@ -7,7 +7,10 @@ M73 P5 ; phase beacon: drop phase begins - eject runtime watchdog
 M140 S0
 M106 P2 S0
 M106 P3 S0
-; --- first Z move: one flow from wherever the plate is (vendor park or the cooldown hold) ---
+; --- first Z move: to the sweep height, from wherever the plate is (vendor park or cooldown hold) ---
+G1 Z40 F900
+; --- home X/Y (never Z): at the sweep height, clear of the part, before the drop ---
+G28 X Y
 G1 Z290 F900
 ; --- bed-drop jitter: 3 x 10mm at the drop floor ---
 G1 Z280 F900
@@ -18,8 +21,7 @@ G1 Z280 F900
 G1 Z290 F900
 ; --- bed-drop dwell: hold 5s at the floor to peel the part ---
 M400 S5
-; --- home X/Y (never Z) at the block's clearest point ---
-G28 X Y
+; --- return to the sweep height ---
 G1 Z40 F900
 M73 P50 ; phase beacon: sweep begins - eject runtime watchdog
 ; --- sweep: push part off the front edge ---

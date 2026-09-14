@@ -9,9 +9,10 @@ from backend.app.services.eject.generator import (
     SWEEP_PHASE_MARKER,
     EjectGenerationError,
     generate_eject_gcode,
+    lift_z,
     part_height_error,
 )
-from backend.app.services.eject.validator import validate_eject_gcode
+from backend.app.services.eject.validator import _EPS, validate_eject_gcode
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import (
     H2C_GEOMETRY,
@@ -501,13 +502,17 @@ class TestZReferenceModalRules:
 
 
 class TestHomeOrderGuard:
-    """WHERE the X/Y home runs, checked independently of the generator.
+    """WHERE the X/Y home runs and at what height, checked independently of the generator.
 
-    The block may start from the vendor's parked bed OR from the cooldown hold's ~2 mm,
-    so a home emitted before the first Z move would sweep X/Y past a part standing above
-    the nozzle plane — safe only if Y homes rearward, which is vendor-suggested and
-    unproven here. Homing after the first Z move is safe whatever the starting Z, which
-    is why it is a validator rule and not merely a generator habit."""
+    Y DOES home rearward (operator eyewitness 2026-09-13) and the hotend crosses the rear
+    of the plate while homing, so direction buys nothing — homing safety is Z-clearance
+    plus frame integrity. Hence three rules: exactly one Z-bearing move precedes the home
+    (zero leaves the starting Z unknown, two means the plate already went to the drop
+    floor and the home would run in a frame a silent stall may have corrupted), the
+    tracked Z at the home is at least the lift height, and the home happens exactly once
+    before the sweep. Every existing hand-written block below homes after ``G1 Z40`` at
+    ``max_z=30``/``clearance=10`` — lift 40, EQUALITY, which is why rule 2 needs
+    ``- _EPS``."""
 
     @staticmethod
     def _block(profile, body: str) -> str:
@@ -569,6 +574,111 @@ class TestHomeOrderGuard:
         )
         errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).errors
         assert any("home after the sweep marker" in e for e in errors), errors
+
+    def test_a_home_after_two_z_moves_is_rejected(self):
+        # The shape shipped between 2026-09-10 and this change: the home at the DROP
+        # FLOOR. Refused now — the drop is the block's only move toward a possible
+        # obstruction, so a home after it runs in a frame a silent step loss may have
+        # corrupted, and G28 X/Y are sensorless-stall moves.
+        profile = _profile(bed_drop_clearance_mm=50.0)  # drop floor Z290 on H2S
+        gcode = self._block(
+            profile,
+            f"G1 Z40 F900\nG1 Z290 F900\nG28 X Y\nG1 Z40 F900\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).errors
+        assert any("home after more than one Z move" in e for e in errors), errors
+
+    def test_a_home_at_the_cooldown_hold_height_is_rejected(self):
+        # One Z move precedes the home, so rule 1 is satisfied — but it took the plate
+        # to the hold's ~2 mm, where the 30 mm part stands ABOVE the nozzle plane.
+        profile = _profile()
+        gcode = self._block(
+            profile,
+            f"G1 Z2 F900\nG28 X Y\nG1 Z40 F900\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).errors
+        assert any("does not clear the part" in e and "Z40" in e for e in errors), errors
+
+    def test_a_home_at_the_z_offset_floor_is_rejected(self):
+        # The hole rule 1 alone leaves open: ``G1 Z0.4`` is a LEGAL move (it is the
+        # z_offset floor itself) and satisfies "exactly one Z move first", yet homes with
+        # a 30 mm part 39.6 mm into the nozzle's plane.
+        profile = _profile()
+        gcode = self._block(
+            profile,
+            f"G1 Z0.4 F900\nG28 X Y\nG1 Z40 F900\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY).errors
+        assert any("X/Y home at Z0.4 does not clear the part" in e for e in errors), errors
+
+    def test_a_home_first_block_is_a_validation_error_not_a_crash(self):
+        # There is no tracked Z at an unpreceded home, so rule 2 must not compare against
+        # None: a TypeError here would leave eject_profiles.py / dispatch.py returning a
+        # 500 where the operator should read a refusal.
+        profile = _profile()
+        gcode = self._block(
+            profile,
+            f"G28 X Y\nG1 Z40 F900\n{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        result = validate_eject_gcode(gcode, profile, 30.0, H2S_GEOMETRY)
+        assert result.ok is False
+        assert any("home precedes the block's first Z move" in e for e in result.errors), result.errors
+        assert not any("does not clear the part" in e for e in result.errors), result.errors
+
+    def test_a_dual_second_home_after_an_extra_z_move_is_rejected(self):
+        # Dual models home twice, so the rule is per HOME: the X torque form is fine, the
+        # Y one runs after the drop and is refused.
+        profile = _profile(bed_drop_clearance_mm=50.0)  # drop floor Z275 on H2C
+        body = "G1 Z40 F900\nG28 X T300\nG1 Z275 F900\nG28 Y T300\nG1 Z40 F900\n"
+        gcode = self._block(profile, f"{body}{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n")
+        errors = validate_eject_gcode(gcode, profile, 30.0, H2C_GEOMETRY).errors
+        assert any("home after more than one Z move" in e for e in errors), errors
+
+    def test_the_generated_block_homes_at_exactly_the_lift_height(self):
+        # The positive control's other half: the generator does not merely clear the
+        # part, it homes at the block's own transit height. Equality is why rule 2
+        # compares against ``lift - _EPS``.
+        for geometry in (H2S_GEOMETRY, H2C_GEOMETRY):
+            for bed_drop in (None, 50.0):
+                profile = _profile(bed_drop_clearance_mm=bed_drop)
+                lines = [ln.strip() for ln in generate_eject_gcode(profile, 30.0, geometry).splitlines()]
+                home_idx = next(i for i, ln in enumerate(lines) if ln.startswith("G28 "))
+                z_before = [ln for ln in lines[:home_idx] if ln.startswith(("G0 ", "G1 ")) and " Z" in ln]
+                assert z_before == [f"G1 Z{lift_z(30.0, profile):g} F900"], (geometry.model_key, bed_drop, z_before)
+
+    def test_the_lift_comparison_is_epsilon_tolerant_not_exact(self):
+        # A %g-rounded lift can land a hair under the float; the guard must refuse a real
+        # shortfall and admit rounding noise.
+        profile = _profile()
+        lift = lift_z(30.0, profile)
+        under = self._block(
+            profile,
+            f"G1 Z{lift - 2 * _EPS:.10f} F900\nG28 X Y\nG1 Z40 F900\n"
+            f"{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        errors = validate_eject_gcode(under, profile, 30.0, H2S_GEOMETRY).errors
+        assert any("does not clear the part" in e for e in errors), errors
+        noise = self._block(
+            profile,
+            f"G1 Z{lift - _EPS / 2:.10f} F900\nG28 X Y\nG1 Z40 F900\n"
+            f"{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z40 F900\n",
+        )
+        assert validate_eject_gcode(noise, profile, 30.0, H2S_GEOMETRY).ok
+
+    def test_the_clearance_rule_is_lift_z_not_a_re_derivation(self):
+        # The validator side of test_generator.py's TestSharedCoordinateOrigins: the
+        # home-clearance threshold IS lift_z()'s number, so it moves with the profile's
+        # clearance and with the part height rather than being re-derived here.
+        for clearance, max_z in ((25.0, 30.0), (10.0, 38.0)):
+            profile = _profile(clearance_mm=clearance)
+            lift = lift_z(max_z, profile)
+            gcode = self._block(
+                profile,
+                f"G1 Z40 F900\nG28 X Y\nG1 Z{lift:g} F900\n"
+                f"{SWEEP_PHASE_MARKER}\nG1 X170 Y160 F9000\nG1 Z{lift:g} F900\n",
+            )
+            errors = validate_eject_gcode(gcode, profile, max_z, H2S_GEOMETRY).errors
+            assert any(f"at or above the lift height Z{lift:g}" in e for e in errors), (clearance, max_z, errors)
 
 
 class TestPartHeightRefusalIsOneSentence:

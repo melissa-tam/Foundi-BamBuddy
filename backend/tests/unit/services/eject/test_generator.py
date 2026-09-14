@@ -22,7 +22,10 @@ from backend.app.services.eject.generator import (
     Z_REFERENCE_OVERTRAVEL_MM,
     EjectGenerationError,
     HoldPlacement,
+    bottom_target_warning,
     cooldown_hold_lines,
+    degenerate_drop_error,
+    drop_z,
     estimate_runtime_s,
     estimate_runtime_segments,
     generate_eject_gcode,
@@ -472,14 +475,16 @@ class TestTravelEnvelopeClamp:
 
 class TestBedDropReleaseAssist:
     """Farm eject v2: the optional bed-drop release assist drives the bed all the
-    way DOWN (bigger Z) then back to the lift height, between the heater-off and the
-    sweep. NULL clearance = off (the v1 goldens stay byte-identical)."""
+    way DOWN (bigger Z) from the lift height and back to it, AFTER the X/Y home and
+    before the sweep. NULL clearance = off (the v1 goldens' motion is unchanged)."""
 
-    def test_drop_is_the_first_z_move_and_the_return_follows_the_home(self):
+    def test_the_lift_is_the_first_z_move_and_the_drop_follows_the_home(self):
         # H2S z_travel 340, clearance 50 -> drop to 290; max_z 30 + clearance 10 ->
-        # return to lift 40. Since the block became ONE Z flow the drop IS the first Z
-        # move: nothing lifts to 40 first (the old order's 63 mm up / 280 mm down), the
-        # home runs at the drop floor, and only then does the bed return to the lift.
+        # lift 40. The block's FIRST Z move is the lift, unconditionally: it is what
+        # buys the home its clearance over the part (10 mm — the vendor's own G150.3
+        # precondition) before the toolhead is allowed to move at all. The home then
+        # runs in the frame the print left, and only AFTER it does the bed drop — the
+        # one move that can stall against debris and corrupt that frame.
         profile = _profile(bed_drop_clearance_mm=50.0)
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
@@ -490,13 +495,19 @@ class TestBedDropReleaseAssist:
         # only one that says anything about this block.
         chamber_idx = lines.index("M106 P3 S0")
         home_idx = lines.index("G28 X Y")
+        sweep_beacon_idx = lines.index(PHASE_BEACON_SWEEP + " ; phase beacon: sweep begins - eject runtime watchdog")
         sweep_idx = lines.index("; --- sweep: push part off the front edge ---")
         assert heater_idx < aux_idx < home_idx < sweep_idx
         assert chamber_idx == aux_idx + 1
-        first_move = next(ln for ln in lines[chamber_idx + 1 :] if ln and not ln.startswith(";"))
-        assert first_move == "G1 Z290 F900"
-        assert lines[home_idx + 1] == "G1 Z40 F900"
-        # Nothing moves Z before the drop.
+        # The first Z move is the lift, and the home is the very next command after it.
+        block = [ln for ln in lines[chamber_idx + 1 :] if ln and not ln.startswith(";")]
+        assert block[0] == "G1 Z40 F900"
+        assert block[1] == "G28 X Y"
+        # The drop follows the home; the return to the lift height is the last thing
+        # before the sweep beacon.
+        assert block[2] == "G1 Z290 F900"
+        assert lines[sweep_beacon_idx - 1] == "G1 Z40 F900"
+        # Nothing moves Z before the first Z move.
         assert not any(ln.startswith("G1 Z") for ln in lines[:chamber_idx])
 
     def test_drop_zero_clearance_goes_to_full_travel(self):
@@ -522,21 +533,22 @@ class TestBedDropReleaseAssist:
             generate_eject_gcode(_profile(bed_drop_clearance_mm=305.0), 30.0, H2S_GEOMETRY)
 
     def test_drop_block_self_validates_on_both_geometries(self):
-        for geometry, drop_z in ((H2S_GEOMETRY, "G1 Z290 F900"), (H2C_GEOMETRY, "G1 Z275 F900")):
+        for geometry, drop_line in ((H2S_GEOMETRY, "G1 Z290 F900"), (H2C_GEOMETRY, "G1 Z275 F900")):
             profile = _profile(bed_drop_clearance_mm=50.0)
             gcode = generate_eject_gcode(profile, 30.0, geometry)
-            assert drop_z in gcode
+            assert drop_line in gcode
             result = validate_eject_gcode(gcode, profile, 30.0, geometry)
             assert result.ok, result.errors
 
 
 class TestBedDropDwellAndJitter:
-    """The two drop-FLOOR behaviours. Emission order is drop → jitter → dwell →
+    """The two drop-FLOOR behaviours. Emission order is home → drop → jitter → dwell →
     return; jitter strokes rise AWAY from the machine bottom first so no move
     passes the drop target, and the dwell is `M400 S<n>` (the only dwell form the
-    runtime estimator counts, and the abort watchdog consumes that estimate)."""
+    runtime estimator counts, and the abort watchdog consumes that estimate) — the LAST
+    thing that happens at the floor, which is what the field's help text promises."""
 
-    def test_emission_order_is_drop_jitter_dwell_return(self):
+    def test_emission_order_is_home_drop_jitter_dwell_return(self):
         # H2S z_travel 340 - clearance 50 -> drop 290; lift 40; 3 x 10 mm strokes
         # oscillate 290 -> 280 -> 290, then a 5 s hold, then the return.
         profile = _profile(
@@ -554,19 +566,21 @@ class TestBedDropDwellAndJitter:
         assert chamber_idx == aux_idx + 1
         block = [ln for ln in lines[chamber_idx + 1 :] if ln and not ln.startswith(";")]
         assert block[:10] == [
-            "G1 Z290 F900",  # drop to the floor — the block's FIRST Z move
+            "G1 Z40 F900",  # the block's FIRST Z move: to the sweep height
+            "G28 X Y",  # home, clear of the part, BEFORE the drop
+            "G1 Z290 F900",  # drop to the floor
             "G1 Z280 F900",  # jitter 1: up (away from the machine bottom) ...
             "G1 Z290 F900",  # ... and back to the floor
             "G1 Z280 F900",  # jitter 2
             "G1 Z290 F900",
             "G1 Z280 F900",  # jitter 3
             "G1 Z290 F900",
-            "M400 S5",  # dwell at the floor, AFTER the strokes
-            "G28 X Y",  # home at the floor — the block's clearest point
-            "G1 Z40 F900",  # return to the lift height, LAST
+            "M400 S5",  # dwell at the floor — the LAST thing that happens there
         ]
+        # ... and the return out of the floor is the next line after the dwell.
+        assert block[10] == "G1 Z40 F900"
 
-    def test_dwell_alone_sits_between_drop_and_home(self):
+    def test_dwell_alone_is_the_last_thing_at_the_floor(self):
         profile = _profile(bed_drop_clearance_mm=50.0, bed_drop_dwell_s=7)
         gcode = generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
         lines = [ln.strip() for ln in gcode.splitlines()]
@@ -576,7 +590,7 @@ class TestBedDropDwellAndJitter:
         chamber_idx = lines.index("M106 P3 S0")
         assert chamber_idx == aux_idx + 1
         block = [ln for ln in lines[chamber_idx + 1 :] if ln and not ln.startswith(";")]
-        assert block[:4] == ["G1 Z290 F900", "M400 S7", "G28 X Y", "G1 Z40 F900"]
+        assert block[:5] == ["G1 Z40 F900", "G28 X Y", "G1 Z290 F900", "M400 S7", "G1 Z40 F900"]
 
     def test_dwell_is_m400_never_g4(self):
         # G4 is invisible to estimate_runtime_s, which the abort watchdog consumes.
@@ -690,9 +704,11 @@ M18
 """
 
 
-# The SAME single-pass shape under the one-Z-flow order (2026-09-10): the drop is the
-# block's first Z move, the home runs at the floor, the return follows it. Kept beside
-# its predecessor so the two orders' estimates can be read against each other.
+# The SAME single-pass shape under the current order (2026-09-14): the block's first Z
+# move is the LIFT, the home follows it at that height, and the drop is a round trip
+# below it. Kept beside its predecessor so the two orders' estimates can be read against
+# each other — this shape does the MOST Z travel of the three (lift, then the full drop
+# and back), so it is the one that must still fit inside the incident calibration.
 _ONE_FLOW_SHAPE_BLOCK = """\
 ; ===== FARM EJECT BLOCK profile=singlepass =====
 M17
@@ -700,8 +716,9 @@ G90
 M73 P5
 M140 S0
 M106 P2 S0
-G1 Z340 F900
+G1 Z60.1 F900
 G28 X Y
+G1 Z340 F900
 G1 Z60.1 F900
 M73 P50
 ; --- sweep ---
@@ -836,12 +853,15 @@ class TestEstimateRuntime:
         assert eject_abort_deadline_s(seconds) >= 83.0
 
     def test_the_one_flow_shape_keeps_the_same_guarantees(self):
-        # The same profile under the ONE-Z-FLOW order: no lift before the drop, the home
-        # at the floor, the return after it. The machine does strictly LESS motion (the
-        # 63 mm lift is gone) while the estimate covers strictly more of it, so both ends
-        # of the incident calibration must still hold.
+        # The same profile under the CURRENT order: lift, home, then the drop as a round
+        # trip below the lift height. This is the block shape with the MOST Z motion, and
+        # UNSEEDED it is scored more conservatively still — with no known start Z the
+        # first move is bounded at max(60.1, 340 - 60.1) = 279.9 mm, so the estimate books
+        # 839.7 mm against the ~622.7 mm a bed parked at the vendor's ~123 actually
+        # travels. Measured 2026-09-14: 106.0 s unseeded (was 91.3 s when the drop was the
+        # first move). Both ends of the incident calibration must still hold at that.
         seconds = estimate_runtime_s(_ONE_FLOW_SHAPE_BLOCK, z_travel_mm=340.0)
-        assert 67.0 <= seconds <= 105.0, f"estimated {seconds:.1f}s"
+        assert 67.0 <= seconds <= 115.0, f"estimated {seconds:.1f}s"
         assert eject_abort_deadline_s(seconds) < 179.0
         assert eject_abort_deadline_s(seconds) >= 83.0
         # Seeded from the cooldown hold, the same block estimates slightly TIGHTER: the
@@ -873,6 +893,84 @@ class TestSharedCoordinateOrigins:
         assert f"G1 Z{lift_z(30.0, profile):g} F900" in lines
         park_idx = lines.index(PHASE_BEACON_PARK + " ; phase beacon: sweep done - eject runtime watchdog")
         assert lines[park_idx + 1] == f"G1 Z{park_z(30.0, profile):g} F900"
+
+    def test_the_drop_target_is_one_function_the_validator_shares(self):
+        # The drop was derived TWICE — once in the generator, once in the validator's
+        # Z-ceiling guard — which is exactly the shape this class exists to forbid. The
+        # emitted floor line must be drop_z()'s own number, and the validator must admit
+        # the block it bounds with the same function.
+        profile = _profile(bed_drop_clearance_mm=50.0)
+        for geometry in (H2S_GEOMETRY, H2C_GEOMETRY):
+            drop = drop_z(profile, geometry)
+            assert drop == pytest.approx(geometry.z_travel_mm - 50.0)
+            lines = [ln.strip() for ln in generate_eject_gcode(profile, 30.0, geometry).splitlines()]
+            assert f"G1 Z{drop:g} F900" in lines
+            assert validate_eject_gcode(generate_eject_gcode(profile, 30.0, geometry), profile, 30.0, geometry).ok
+        # Assist off, and a model with no registered travel, both derive to None — the
+        # ONE place either condition turns into "there is no drop".
+        assert drop_z(_profile(), H2S_GEOMETRY) is None
+        assert drop_z(profile, replace(H2S_GEOMETRY, z_travel_mm=None)) is None
+
+    def test_the_degenerate_refusal_is_one_sentence(self):
+        # Generator raises it, validator appends it — same profile, same words.
+        profile = _profile(bed_drop_clearance_mm=305.0)  # drop 35 <= lift 40
+        sentence = degenerate_drop_error(30.0, profile, H2S_GEOMETRY)
+        assert sentence is not None and "degenerate drop" in sentence
+        with pytest.raises(EjectGenerationError) as raised:
+            generate_eject_gcode(profile, 30.0, H2S_GEOMETRY)
+        assert str(raised.value) == sentence
+        # A block generated under a LEGAL drop, re-validated against the degenerate
+        # profile, carries that identical sentence out of the validator.
+        legal = generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
+        assert sentence in validate_eject_gcode(legal, profile, 30.0, H2S_GEOMETRY).errors
+        # And a healthy pair says nothing at all.
+        assert degenerate_drop_error(30.0, _profile(bed_drop_clearance_mm=50.0), H2S_GEOMETRY) is None
+
+
+class TestBottomTargetWarning:
+    """``bed_drop_clearance_mm = 0`` aims the drop at the declared machine bottom.
+
+    Warned about, never refused: the fleet's live profile runs 0 today and an error
+    would 409 it out of production. Both surfaces — the generator's build INFO line and
+    the validator's ``warnings`` — read ONE predicate, so the preview and the built-file
+    record can never disagree about whether the drop has any margin left."""
+
+    _EXPECTED = (
+        "drop target Z340 is the declared machine bottom (z_travel_mm) — a short-fall on an "
+        "obstruction is indistinguishable from a normal cycle; set bed_drop_clearance_mm > 0"
+    )
+
+    def test_zero_clearance_warns_through_the_validator(self):
+        profile = _profile(bed_drop_clearance_mm=0.0)
+        result = validate_eject_gcode(generate_eject_gcode(profile, 30.0, H2S_GEOMETRY), profile, 30.0, H2S_GEOMETRY)
+        # A WARNING, not an error: the block still ships.
+        assert result.ok, result.errors
+        assert self._EXPECTED in result.warnings
+        assert not any("machine bottom" in e for e in result.errors)
+
+    def test_a_positive_margin_does_not_warn(self):
+        profile = _profile(bed_drop_clearance_mm=10.0)
+        result = validate_eject_gcode(generate_eject_gcode(profile, 30.0, H2S_GEOMETRY), profile, 30.0, H2S_GEOMETRY)
+        assert result.ok, result.errors
+        assert not any("machine bottom" in w for w in result.warnings)
+        assert bottom_target_warning(profile, H2S_GEOMETRY) is None
+
+    def test_the_assist_being_off_cannot_warn(self):
+        assert bottom_target_warning(_profile(), H2S_GEOMETRY) is None
+
+    def test_the_build_info_line_carries_the_warning(self, caplog):
+        with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=0.0), 30.0, H2S_GEOMETRY)
+        built = [r.getMessage() for r in caplog.records if "built block" in r.getMessage()]
+        assert len(built) == 1
+        assert f"warn={self._EXPECTED}" in built[0]
+
+    def test_the_build_info_line_says_none_with_a_margin(self, caplog):
+        with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
+            generate_eject_gcode(_profile(bed_drop_clearance_mm=10.0), 30.0, H2S_GEOMETRY)
+        built = [r.getMessage() for r in caplog.records if "built block" in r.getMessage()]
+        assert len(built) == 1
+        assert built[0].endswith("warn=none")
 
 
 class TestCooldownHoldLines:
@@ -1002,15 +1100,18 @@ class TestBuildSummaryLog:
     before this line the 2026-07-31 incident could only be reconstructed by
     re-deriving the block through the preview endpoint."""
 
-    def test_summary_names_the_first_z_move(self, caplog):
-        # The block's first Z move is where it starts from AND the move that stalls, so
-        # a post-incident reader must find it in the log without re-deriving the profile.
+    def test_summary_names_the_first_z_move_and_the_stalling_move(self, caplog):
+        # The block's first Z move is now ALWAYS the lift, so ``lift_z=`` names it and a
+        # separate ``first_z=`` would be the same number twice. The move that STALLS is
+        # the drop, and a post-incident reader must find that one in the log without
+        # re-deriving the profile — assist off, it says so rather than going silent.
         with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
             generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
             generate_eject_gcode(_profile(), 30.0, H2S_GEOMETRY)
         messages = [r.getMessage() for r in caplog.records]
-        assert any("first_z=290" in m and "drop_z=290" in m for m in messages)
-        assert any("first_z=40" in m and "drop_z=off" in m for m in messages)
+        assert "first_z=" not in "".join(messages)
+        assert any("lift_z=40" in m and "drop_z=290" in m for m in messages)
+        assert any("lift_z=40" in m and "drop_z=off" in m for m in messages)
 
     def test_summary_names_the_drop_target(self, caplog):
         with caplog.at_level(logging.INFO, logger="backend.app.services.eject.generator"):
@@ -1169,15 +1270,19 @@ class TestEstimateRuntimeSegments:
             assert seg.total_s == pytest.approx(merged.total_s), path.name
             assert seg.tail_s > 0.0, f"{path.name} scored an empty tail"
 
-    def test_drop_span_holds_the_first_z_move_the_home_and_the_return(self):
-        # The span the drop-lane deadline is armed on. One Z flow: the drop (unknown
-        # origin, so bounded at 290 mm), the home's allowance, the 250 mm return to 40.
+    def test_drop_span_holds_the_lift_the_home_the_drop_and_the_return(self):
+        # The span the drop-lane deadline is armed on, in emission order: the lift to 40
+        # (unknown origin, so bounded at max(40, 340-40) = 300 mm), the home's allowance,
+        # the 250 mm drop to 290 and the 250 mm return. The home sits INSIDE the span
+        # either way, so moving it did not move the phase boundary.
         block = generate_eject_gcode(_profile(bed_drop_clearance_mm=50.0), 30.0, H2S_GEOMETRY)
         drop = estimate_runtime_segments(block, z_travel_mm=340.0)
-        assert drop.drop_span_s == pytest.approx((290.0 + 250.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
-        # Seeded from the cooldown hold the drop leg is 2 mm shorter, and measured.
+        assert drop.drop_span_s == pytest.approx((300.0 + 250.0 + 250.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
+        # Seeded from the cooldown hold the lift leg is MEASURED from 2 mm (38 mm) rather
+        # than bounded, so the same block scores a tighter span.
         seeded = estimate_runtime_segments(block, start_z=2.0, z_travel_mm=340.0)
-        assert seeded.drop_span_s == pytest.approx((288.0 + 250.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
+        assert seeded.drop_span_s == pytest.approx((38.0 + 250.0 + 250.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
+        assert seeded.drop_span_s < drop.drop_span_s
         # A drop-LESS block's span is no longer empty — it holds that block's own lift
         # and its home. Dispatch still leaves the lane disarmed for such profiles (see
         # BuiltEject.drop_span_s); the estimator states the truth either way.

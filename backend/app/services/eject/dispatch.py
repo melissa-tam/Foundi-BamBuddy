@@ -119,8 +119,10 @@ async def build_part_present_eject_file(
 
     The plate's G-code is REPLACED ENTIRELY (via ``repack_3mf_with_gcode``, MD5
     recomputed) by the generated eject block: ``M17`` → ``M140 S0`` / ``M106 P2 S0`` /
-    ``M106 P3 S0`` → ONE Z move to the bed-drop floor (or, assist-off, to the lift
-    height) → home X/Y only → the sweep, the park, then the completion epilogue. The home is
+    ``M106 P3 S0`` → ONE Z move to the lift height → home X/Y only → the bed-drop round
+    trip when the release assist is on → the sweep, the park, then the completion
+    epilogue (the canonical order statement is :func:`~backend.app.services.eject.
+    generator.generate_eject_gcode`'s own diagram). The home is
     single-nozzle ``G28 X Y`` or the dual-nozzle (H2C/H2D/X2D) torque-parameterized
     ``G28 X T300`` / ``G28 Y T300`` pair (a bare ``G28 X Y`` stall-loops that firmware),
     and NEVER a bare ``G28`` / ``G28 Z`` — the part sits on the plate, so the block
