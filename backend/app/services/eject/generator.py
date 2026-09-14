@@ -5,18 +5,37 @@ height and printer model. The block runs *after* the printer's stock shutdown (b
 dropped ~Z123, motors M18-disabled) OR after the server-side cooldown HOLD
 (:func:`cooldown_hold_lines`) has parked the plate near the nozzle plane with the
 toolhead off the bed, so it re-engages the motors, commands the bed heater off, and
-then makes ONE Z move from wherever the plate happens to be — the bed-drop floor when
-the release assist is on, the lift height otherwise — before homing X/Y and sweeping
-the part off the front (door side).
+then makes ONE Z move from wherever the plate happens to be — always to the LIFT
+height, the height the sweep itself runs from — before homing X/Y and sweeping the
+part off the front (door side). The bed-drop release assist, when on, is a round trip
+DOWN from that height and back to it, and it runs AFTER the home.
 
-The X/Y home sits AFTER that first Z move rather than before it, at the block's
-CLEAREST point. That ordering is what makes the block indifferent to its starting Z:
-homing first would run ``G28 X Y`` beside a plate held at ~2 mm with the part standing
-48 mm above the nozzle plane, which is safe only if Y homes rearward — vendor-suggested
-and never proven here. Homing at the drop floor (or, assist-off, at the lift height the
-block's own park traverse already accepts) is safe by construction, with no dependence
-on homing direction or on where a screen jog left the toolhead. It also deletes the old
-order's waste: a 63 mm lift immediately undone by a 280 mm drop (operator-ratified).
+The X/Y home therefore sits AFTER the block's first Z move and BEFORE the drop. Two
+independent reasons, both load-bearing:
+
+* CLEARANCE. At the lift height the part top sits exactly ``clearance_mm`` under the
+  nozzle plane — the vendor's own precondition for crossing a loaded plate (the stock
+  end block runs its ``G150.3`` at ``max_layer_z + 10``, and the fleet's
+  ``clearance_mm`` IS that 10; see :func:`cooldown_hold_lines` and
+  ``h2s-gcode-dialect.md``), and the same gap this block's own sweep-entry transit and
+  park traverse already accept on every production eject. Homing FIRST, before any Z
+  move, would run the home beside a plate the cooldown hold left at ~2 mm with the part
+  standing ~48 mm ABOVE the nozzle plane: a NEGATIVE clearance, a guaranteed strike.
+  Homing direction does not rescue that case — operator eyewitness 2026-09-13
+  established that Y homes rearward AND that the hotend crosses the rear of the plate
+  while homing, so a rearward home is not self-clearing. Homing safety is Z-clearance
+  and nothing else.
+* FRAME INTEGRITY. The bed-drop is the ONLY move in the block that drives toward a
+  possible obstruction (debris under the plate). A stall there loses steps in the
+  dangerous direction — the plate ends HIGHER than the firmware believes — and every
+  absolute Z after it is read in that corrupted frame. That is the 012-H2S 2026-07-31
+  gouged-plate incident, recorded verbatim beside
+  :data:`~backend.app.services.eject.remote.EJECT_ABORT_MARGIN_FRAC`. ``G28 X`` /
+  ``G28 Y`` are sensorless-stall moves, so a home run in that corrupted frame can read
+  contact with the part as its endstop and corrupt X/Y on top of Z, after which the
+  sweep runs in a frame the envelope guard never validated. Homing BEFORE the drop
+  keeps the home in the frame the print left — the only frame this block ever has
+  evidence for.
 
 The block ENDS with the bed parked proportional to part height — the toolhead
 sits at ``max(max_z_height + clearance_mm, PARK_Z_MM)`` above the plate (bed
@@ -69,17 +88,19 @@ rests on and, in particular, which parts are proven and which are hypotheses the
 witnesses.
 
 An optional ``bed_drop_clearance_mm`` (NULL = off) adds a mechanical release
-assist after the bed heater is commanded off: the bed drives all the way DOWN
-to the machine bottom minus that clearance (bigger Z = bed farther from the
+assist after the home: the bed drives all the way DOWN from the lift height to
+the machine bottom minus that clearance (bigger Z = bed farther from the
 nozzle), then returns to the lift height before the sweep runs — jolting a
 stuck part loose without changing the sweep itself. The machine bottom is the
-target model's ``z_travel_mm`` (from the geometry registry, never hardcoded);
-a profile that enables the assist against a model with no ``z_travel_mm`` fails
-closed. Two further tunings act AT that drop floor, emitted drop → jitter →
-dwell → home → return: ``bed_drop_jitter_cycles``/``bed_drop_jitter_mm`` oscillate the
+target model's ``z_travel_mm`` (:func:`drop_z`, from the geometry registry, never
+hardcoded); a profile that enables the assist against a model with no ``z_travel_mm``
+fails closed. Two further tunings act AT that drop floor, emitted home → drop →
+jitter → dwell → return: ``bed_drop_jitter_cycles``/``bed_drop_jitter_mm`` oscillate the
 bed up-then-back (up FIRST, so no move passes the drop target) and
-``bed_drop_dwell_s`` holds there for whole seconds as ``M400 S<n>``. Both are
-NULL = off and both fail closed without the drop itself.
+``bed_drop_dwell_s`` holds there for whole seconds as ``M400 S<n>`` — the LAST thing
+that happens at the floor. Both are NULL = off and both fail closed without the drop
+itself. A ``bed_drop_clearance_mm`` of exactly 0 aims the drop at the declared machine
+bottom and is WARNED about, never refused (:func:`bottom_target_warning`).
 """
 
 from __future__ import annotations
@@ -205,10 +226,11 @@ SWEEP_PHASE_MARKER = "; --- sweep: push part off the front edge ---"
 # "is the reported percent still below the sweep beacon?". The completion epilogue's
 # stock ``M73 P100 R0`` closes the series and is emitted verbatim with it.
 PHASE_BEACON_REFERENCED_PCT = 2  # Z re-reference done (emitted ONLY by that prologue)
-# Drop phase begins. The NAME is historical — the block no longer lifts before the drop
-# — and it is kept because the watchdog's phase vocabulary is P-NUMBER keyed
-# (await_p5/await_p50/await_p75); renaming the constant would not rename that. Emitted
-# BEFORE the block's first Z move, so the drop-span deadline it opens covers that move.
+# Drop phase begins. The NAME is accurate again — the block lifts, homes, then drops —
+# but it is P-NUMBER keyed either way (the watchdog speaks await_p5/await_p50/await_p75),
+# so the constant's name was never what the wire carried. Emitted BEFORE the block's
+# first Z move, so the drop-span deadline it opens covers that move, the home and the
+# whole drop round trip.
 PHASE_BEACON_LIFTED_PCT = 5
 PHASE_BEACON_SWEEP_PCT = 50  # bed-drop done, sweep begins
 PHASE_BEACON_PARK_PCT = 75  # sweep done, park begins
@@ -473,6 +495,76 @@ def park_z(max_z_height: float, profile: EjectProfile) -> float:
     return max(lift_z(max_z_height, profile), PARK_Z_MM)
 
 
+def drop_z(profile: EjectProfile, geometry: ModelGeometry) -> float | None:
+    """The bed-drop release assist's FLOOR target (mm), or ``None`` when it is off.
+
+    The machine bottom (``geometry.z_travel_mm``) minus the profile's
+    ``bed_drop_clearance_mm``. Bigger Z = bed farther from the nozzle, so the clearance
+    is how far the drop stops SHORT of the declared bottom.
+
+    ONE origin, shared with the validator, for the same reason :func:`lift_z` is: the
+    validator opens its Z ceiling to exactly this number, and two copies of a coordinate
+    rule is how a guard ends up bounding a number the generator never emitted.
+
+    ``None`` covers both "assist off" (NULL clearance) and "no registered
+    ``z_travel_mm``" — the second is a fail-closed REFUSAL at both call sites, never a
+    silent skip, so this function stays a pure derivation and each caller raises or
+    appends in its own idiom. Read defensively (``getattr``) so a transient profile
+    built without the column still generates.
+    """
+    bed_drop = getattr(profile, "bed_drop_clearance_mm", None)
+    if bed_drop is None or geometry.z_travel_mm is None:
+        return None
+    return geometry.z_travel_mm - bed_drop
+
+
+def degenerate_drop_error(max_z_height: float, profile: EjectProfile, geometry: ModelGeometry) -> str | None:
+    """The degenerate-drop refusal for this profile/model pair, or ``None``.
+
+    The ONE origin of that sentence, alongside :func:`part_height_error`: a drop target
+    that is not BELOW the lift height is not a drop at all — it would raise the bed
+    toward the part instead of away from it, and the validator's Z ceiling would open to
+    a number above the block's own sweep height. Generator raises it, validator appends
+    it, so both refuse the same profile in the same words.
+    """
+    drop = drop_z(profile, geometry)
+    if drop is None:
+        return None
+    lift = lift_z(max_z_height, profile)
+    if drop > lift:
+        return None
+    bed_drop = profile.bed_drop_clearance_mm
+    return (
+        f"bed-drop target Z{drop:g} (z_travel {geometry.z_travel_mm:g} - clearance "
+        f"{bed_drop:g}) is not below the lift height Z{lift:g} — degenerate drop"
+    )
+
+
+def bottom_target_warning(profile: EjectProfile, geometry: ModelGeometry) -> str | None:
+    """A WARNING when the drop aims at the declared machine bottom itself, else ``None``.
+
+    ``bed_drop_clearance_mm = 0`` puts the drop target exactly on ``z_travel_mm``, which
+    means the move is COMMANDED to reach the mechanical stop. Every mm of clearance is a
+    mm of debris under the plate that cannot corrupt the block's Z frame (see the module
+    docstring's FRAME INTEGRITY note); at zero there is no margin left, and a drop that
+    falls short against an obstruction looks exactly like a normal cycle — the bed stops
+    early either way, and there is no Z telemetry to tell the two apart.
+
+    Deliberately a warning and NOT an error: the fleet's live profile runs 0 today, and
+    an error would 409 it out of production. The fix is a profile value taken through the
+    hardware ladder, not a refusal. Both surfaces (the generator's build INFO line and
+    :func:`~backend.app.services.eject.validator.validate_eject_gcode`'s ``warnings``)
+    read this ONE predicate.
+    """
+    drop = drop_z(profile, geometry)
+    if drop is None or drop != geometry.z_travel_mm:
+        return None
+    return (
+        f"drop target Z{drop:g} is the declared machine bottom (z_travel_mm) — a short-fall on an "
+        "obstruction is indistinguishable from a normal cycle; set bed_drop_clearance_mm > 0"
+    )
+
+
 def hold_placement(max_z_height: float, clear_above_mm: float, part_top_mm: float) -> HoldPlacement:
     """Where to hold a part of ``max_z_height``: the operator's target under two clamps.
 
@@ -576,11 +668,12 @@ def cooldown_hold_lines(
         :func:`hold_placement` — and its one refusal is :func:`part_height_error`, the same
         sentence the generator raises.
 
-        On an assist-OFF eject profile a target below ``-clearance_mm`` holds the plate
-        LOWER than that block's own ``lift_z``, so the eject's first Z move then travels
-        toward the nozzle instead of away from it — the reverse of the assist-ON flow, and
-        safe: the toolhead is at the chute for the whole hold, and the target keeps the part
-        top at least ``clearance_mm`` under the lift height the block moves to.
+        A target below ``-clearance_mm`` holds the plate LOWER than the eject block's own
+        ``lift_z``, so that block's first Z move then travels toward the nozzle instead of
+        away from it. Safe either way: the toolhead is at the chute for the whole hold, and
+        the target keeps the part top at least ``clearance_mm`` under the lift height the
+        block moves to — which is the height its X/Y home runs at, so the direction of that
+        first move never changes what the home clears.
 
         Raises:
             EjectGenerationError: the part is taller than the profile's guard.
@@ -642,7 +735,7 @@ class EjectRuntimeSegments:
     # (the Z re-reference drive, when present, is its own ``reference_s`` segment ahead
     # of it). Non-zero only for a hand-edited or legacy block that moves in its prologue.
     pre_s: float
-    drop_span_s: float  # P5 → P50: the first Z move, the floor behaviours, the home, the return
+    drop_span_s: float  # P5 → P50: the first Z move, the home, the drop, the floor behaviours, the return
     sweep_span_s: float  # commanded time between the P50 and P75 beacons (the sweep lanes)
     tail_s: float  # the P75 beacon onward (park + completion epilogue)
     total_s: float  # every span above + EJECT_RUNTIME_OVERHEAD_S
@@ -721,10 +814,10 @@ def estimate_runtime_segments(
       about where the plate was cannot outrank the machine's own declaration.
     * **An absolute Z move from an UNKNOWN Z counts the LONGEST travel it could be** —
       ``max(target, z_travel_mm - target)`` (:func:`_unknown_z_travel_mm`). The block's
-      FIRST Z move is now its bed drop (assist-off: its lift), i.e. the very move that
-      stalls, so the old "unknown Z contributes 0 mm" rule would understate the drop
-      span by 217-338 mm — 14-23 s at F900 — and the ``stage=drop`` deadline would kill
-      healthy ejects. Over-stating an unknown move is the safe direction and the same
+      FIRST Z move is its lift, and the bed drop that follows it inside the same span is
+      the move that stalls, so the old "unknown Z contributes 0 mm" rule would understate
+      the drop span by hundreds of mm — 14-23 s at F900 — and the ``stage=drop`` deadline
+      would kill healthy ejects. Over-stating an unknown move is the safe direction and the same
       doctrine ``G380`` is counted under. ``start_z`` removes the guess entirely when
       the caller KNOWS where the plate is (the cooldown hold parked it there), making
       that first move exact; without it the walk is a bound, not a measurement.
@@ -911,9 +1004,14 @@ def generate_eject_gcode(
         M106 P2 S0                            ; aux fan off (the cooldown prep runs it)
         M106 P3 S0                            ; chamber fan off (ditto; the stock end
                                               ;   block's own line — duct mode untouched)
-        G1 Z{drop_z | lift_z} F900            ; the block's FIRST and only Z approach
-        <jitter strokes / M400 S{dwell}>      ; assist only, at the drop floor
-        <G28 X Y | DUAL_NOZZLE_HOME>          ; home X/Y (NEVER Z) at the clearest point
+        G1 Z{lift_z} F900                     ; the block's FIRST Z move: the sweep height
+        <G28 X Y | DUAL_NOZZLE_HOME>          ; home X/Y (NEVER Z) at the sweep height,
+                                              ;   clear of the part by clearance_mm, and
+                                              ;   BEFORE the drop — in the frame the
+                                              ;   print left
+        G1 Z{drop_z} F900                     ; assist only: the drop, a round trip DOWN
+        <jitter strokes>                      ; assist only, at the drop floor
+        M400 S{dwell}                         ; assist only: the LAST thing at the floor
         G1 Z{lift_z} F900                     ; assist only: return to the sweep height
         M73 P50                               ; PHASE BEACON: sweep begins
         <descending sweep lanes>
@@ -922,12 +1020,15 @@ def generate_eject_gcode(
         <COMPLETION_EPILOGUE>                 ; stock finish tail — the job ends FINISH
         ; ===== FARM EJECT BLOCK END =====
 
-    There is exactly ONE Z flow: the first move goes wherever the block needs the bed
-    (the drop floor with the release assist on, the lift height without it) from
-    wherever the plate happens to be — the vendor's parked ~Z123 after a stock
-    shutdown, or the cooldown hold's ~Z2 (:func:`cooldown_hold_lines`). The X/Y home
-    follows that move rather than preceding it, so it runs at the block's clearest
-    point and needs no assumption about homing direction or toolhead position.
+    There is exactly ONE Z flow: the first move goes straight to the LIFT height — the
+    height the sweep runs from — from wherever the plate happens to be (the vendor's
+    parked ~Z123 after a stock shutdown, or the cooldown hold's ~Z2,
+    :func:`cooldown_hold_lines`). The X/Y home follows that move immediately, so it
+    never runs beside a held plate whose part stands above the nozzle plane, and it
+    PRECEDES the bed-drop, so it never runs in a frame a silent drop stall may have
+    corrupted. The drop, when the assist is on, is a round trip down from the lift
+    height and back to it. This docstring's diagram is the canonical statement of that
+    order; the validator's home-order guard is the canonical statement of the rule.
 
     The block's END STATE parks the bed at :func:`park_z` (the lift height, floored at
     :data:`PARK_Z_MM`), Z before XY, so a part that survived the sweep sits clear of
@@ -1021,8 +1122,12 @@ def generate_eject_gcode(
 
     # --- prologue: re-engage after stock shutdown -------------------------
     # NEVER G28 (all axes) or G28 Z: Z-homing probes the bed centre where the part
-    # still sits. The X/Y home is NOT emitted here — it runs after the first Z move,
-    # at the block's clearest point (see that section). All this prologue does is
+    # still sits. The X/Y home is NOT emitted here either — it runs after the first Z
+    # move has taken the plate to the sweep height, because a home emitted here would
+    # run beside a plate the cooldown hold left at ~2 mm with the part standing ~48 mm
+    # ABOVE the nozzle plane (negative clearance, guaranteed strike), and the home
+    # direction does not help: Y homes rearward, but the hotend crosses the rear of the
+    # plate while homing (operator eyewitness 2026-09-13). All this prologue does is
     # re-engage the motors, optionally re-reference Z, and set the absolute dialect
     # every coordinate below is read in.
     lines.append("; --- prologue: re-engage motors ---")
@@ -1064,10 +1169,11 @@ def generate_eject_gcode(
     lines.append("M106 P3 S0")
 
     # --- bed-drop release assist (optional) -------------------------------
-    # Drive the bed all the way DOWN to the machine bottom minus the profile's
-    # clearance (bigger Z = bed farther from the nozzle), then return to the lift
-    # height — a mechanical jolt to release a part the sweep alone can't shift.
-    # NULL clearance = assist off.
+    # Drive the bed all the way DOWN from the lift height to the machine bottom minus
+    # the profile's clearance (bigger Z = bed farther from the nozzle), then return to
+    # the lift height — a mechanical jolt to release a part the sweep alone can't
+    # shift. NULL clearance = assist off. Preconditions are checked HERE, before a
+    # single line is emitted, so a refusal costs no motion.
     bed_drop = profile.bed_drop_clearance_mm
     # Drop-FLOOR behaviours (both optional, NULL = off). Read defensively: a
     # transient profile built without these attributes still generates (mirrors the
@@ -1075,7 +1181,7 @@ def generate_eject_gcode(
     dwell_s: int | None = getattr(profile, "bed_drop_dwell_s", None)
     jitter_cycles: int | None = getattr(profile, "bed_drop_jitter_cycles", None)
     jitter_mm: float | None = getattr(profile, "bed_drop_jitter_mm", None)
-    drop_z: float | None = None
+    drop_target: float | None = None
     # The lift height: where the sweep runs from, where the assist returns to, and the
     # validator's expected Z ceiling for a non-drop block.
     lift = lift_z(max_z_height, profile)
@@ -1100,66 +1206,83 @@ def generate_eject_gcode(
                 f"bed-drop release assist is enabled but model {geometry.model_key!r} has no "
                 "z_travel_mm — set it via PUT /model-geometry before ejecting with this profile"
             )
-        drop_z = geometry.z_travel_mm - bed_drop
-        if drop_z <= lift:
-            raise EjectGenerationError(
-                f"bed-drop target Z{drop_z:g} (z_travel {geometry.z_travel_mm:g} - clearance "
-                f"{bed_drop:g}) is not below the lift height Z{lift:g} — degenerate drop"
-            )
+        # The ONE derivation, shared with the validator (:func:`drop_z`). Not None here:
+        # the missing-z_travel_mm case is refused two lines above.
+        drop_target = drop_z(profile, geometry)
+        degenerate = degenerate_drop_error(max_z_height, profile, geometry)
+        if degenerate is not None:
+            raise EjectGenerationError(degenerate)
         if (jitter_cycles is None) != (jitter_mm is None):
             raise EjectGenerationError(
                 "bed-drop jitter needs bed_drop_jitter_cycles and bed_drop_jitter_mm both set or both null"
             )
-        if jitter_mm is not None and jitter_mm >= drop_z - lift:
+        if jitter_mm is not None and drop_target is not None and jitter_mm >= drop_target - lift:
             raise EjectGenerationError(
-                f"bed-drop jitter {jitter_mm:g} mm reaches Z{drop_z - jitter_mm:g} from the drop target "
-                f"Z{drop_z:g} — oscillation would cross the lift height Z{lift:g}"
+                f"bed-drop jitter {jitter_mm:g} mm reaches Z{drop_target - jitter_mm:g} from the drop target "
+                f"Z{drop_target:g} — oscillation would cross the lift height Z{lift:g}"
             )
 
-    # --- first Z move: ONE flow from wherever the plate is ----------------
+    # --- first Z move: to the SWEEP HEIGHT, from wherever the plate is -----
     # "Wherever" is either the vendor's parked ~Z123 after a stock shutdown or the
     # cooldown hold's ~Z2 (``cooldown_hold_lines``) — the block never assumes which.
-    # With the release assist on it goes straight to the drop floor; without it, to the
-    # lift height. The old order lifted to the lift height FIRST and only then dropped,
-    # which on the fleet's own profile was 63 mm up immediately undone by 280 mm down.
-    first_z = drop_z if drop_z is not None else lift
-    lines.append("; --- first Z move: one flow from wherever the plate is (vendor park or the cooldown hold) ---")
-    lines.append(f"G1 Z{_fmt(first_z)} F900")
-    if drop_z is not None:
-        if jitter_cycles is not None and jitter_mm is not None:
-            # Every stroke rises AWAY from the machine bottom first and returns to the
-            # drop target, so no move passes drop_z — the block's Z ceiling is
-            # unchanged and the validator needs no new case.
-            lines.append(f"; --- bed-drop jitter: {jitter_cycles} x {_fmt(jitter_mm)}mm at the drop floor ---")
-            for _ in range(jitter_cycles):
-                lines.append(f"G1 Z{_fmt(drop_z - jitter_mm)} F900")
-                lines.append(f"G1 Z{_fmt(drop_z)} F900")
-        if dwell_s is not None:
-            # `M400 S<n>` (whole seconds) is the verified dwell dialect AND the only
-            # form estimate_runtime_s counts; G4 is invisible to it, and the in-flight
-            # abort watchdog consumes that estimate as its deadline.
-            lines.append(f"; --- bed-drop dwell: hold {dwell_s}s at the floor to peel the part ---")
-            lines.append(f"M400 S{dwell_s}")
+    # It is UNCONDITIONAL and it always targets the lift height, assist or no assist:
+    # this is the move that buys the home its clearance, and it is the last thing that
+    # happens before the toolhead is allowed to move at all.
+    lines.append(
+        "; --- first Z move: to the sweep height, from wherever the plate is (vendor park or cooldown hold) ---"
+    )
+    lines.append(f"G1 Z{_fmt(lift)} F900")
 
-    # --- home X/Y (never Z) at the block's clearest point ------------------
-    # The home runs HERE, after the first Z move, and never before it. With the assist
-    # on the toolhead sweeps X/Y with the bed at the drop floor — ~290 mm below the
-    # nozzle over a 50 mm part, the clearest the machine ever is. With the assist off it
-    # homes at the lift height, which is the same clearance the block's own park
-    # traverse already accepts. Homing FIRST would be safe only from a bed parked low:
-    # after a cooldown hold the plate sits at ~2 mm with the part standing 48 mm above
-    # the nozzle plane, and a forward X/Y home would then be safe only if Y homes
-    # rearward — vendor-suggested, never proven here. Homing after the Z move needs no
-    # such assumption, and none about where a screen jog left the toolhead either.
-    lines.append("; --- home X/Y (never Z) at the block's clearest point ---")
+    # --- home X/Y (never Z): at the sweep height, BEFORE the drop ----------
+    # Placement rests on two independent facts, either of which alone decides it:
+    #
+    #   CLEARANCE — at the lift height the part top is exactly ``clearance_mm`` under
+    #   the nozzle plane, the vendor's own precondition for crossing a loaded plate
+    #   (the stock end block runs ``G150.3`` at ``max_layer_z + 10``; the fleet's
+    #   clearance IS that 10) and the same gap this block's own sweep-entry transit and
+    #   park traverse accept on every production eject. Homing BEFORE the first Z move
+    #   would instead home beside a held plate with the part ~48 mm ABOVE the plane —
+    #   negative clearance. Y homing rearward does not rescue that: the hotend crosses
+    #   the REAR of the plate while homing (operator eyewitness 2026-09-13), so a
+    #   rearward home is not self-clearing and Z-clearance is the whole question.
+    #
+    #   FRAME INTEGRITY — the drop below is the only move in the block that drives
+    #   toward a possible obstruction (debris under the plate). A stall there loses
+    #   steps with the plate ending HIGHER than the firmware believes, and every
+    #   absolute Z after it runs in that corrupted frame (012-H2S 2026-07-31,
+    #   gouged plate; see ``remote.EJECT_ABORT_MARGIN_FRAC``). ``G28 X``/``G28 Y`` are
+    #   sensorless-stall homes, so a home run in that frame can read contact with the
+    #   part as its endstop and corrupt X/Y too. Homing here keeps the home in the
+    #   frame the print left — the only frame the block has evidence for.
+    lines.append("; --- home X/Y (never Z): at the sweep height, clear of the part, before the drop ---")
     if is_dual_nozzle_model(geometry.model_key):
         # Dual-nozzle firmware stall-loops on unparameterized homing (see
         # DUAL_NOZZLE_HOME) — home X then Y with the stock parameterized forms.
         lines.extend(DUAL_NOZZLE_HOME)
     else:
         lines.append("G28 X Y")
-    if drop_z is not None:
-        # Return from the drop floor to the lift height the sweep runs from.
+
+    if drop_target is not None:
+        # The bed-drop release assist: ONE block, so every floor behaviour and the
+        # return out of the floor sit in one place. Round trip — down from the lift
+        # height, jitter, dwell, back up to the lift height.
+        lines.append(f"G1 Z{_fmt(drop_target)} F900")
+        if jitter_cycles is not None and jitter_mm is not None:
+            # Every stroke rises AWAY from the machine bottom first and returns to the
+            # drop target, so no move passes it — the block's Z ceiling is unchanged
+            # and the validator needs no new case.
+            lines.append(f"; --- bed-drop jitter: {jitter_cycles} x {_fmt(jitter_mm)}mm at the drop floor ---")
+            for _ in range(jitter_cycles):
+                lines.append(f"G1 Z{_fmt(drop_target - jitter_mm)} F900")
+                lines.append(f"G1 Z{_fmt(drop_target)} F900")
+        if dwell_s is not None:
+            # `M400 S<n>` (whole seconds) is the verified dwell dialect AND the only
+            # form estimate_runtime_s counts; G4 is invisible to it, and the in-flight
+            # abort watchdog consumes that estimate as its deadline. It is the LAST
+            # thing that happens at the floor — nothing runs between it and the return.
+            lines.append(f"; --- bed-drop dwell: hold {dwell_s}s at the floor to peel the part ---")
+            lines.append(f"M400 S{dwell_s}")
+        lines.append("; --- return to the sweep height ---")
         lines.append(f"G1 Z{_fmt(lift)} F900")
 
     # --- sweep: push the part off the FRONT (door side) -------------------
@@ -1221,22 +1344,24 @@ def generate_eject_gcode(
     # so before this line the 2026-07-31 gouged-plate incident could only be
     # reconstructed by re-deriving the geometry through the preview endpoint. Every
     # figure a post-incident reader needs about what the machine was told to do —
-    # the bed-drop target above all — is here, per built file.
+    # the bed-drop target above all — is here, per built file. ``warn=`` carries the
+    # zero-margin drop warning (:func:`bottom_target_warning`) so the built-file record
+    # says the same thing the preview's ``warnings`` list does.
     logger.info(
-        "eject.generator: built block profile=%r model=%s max_z=%smm z_ref=%s lift_z=%s first_z=%s drop_z=%s "
-        "dwell=%s jitter=%s sweep_z=%s lanes=%d span=[%s, %s]",
+        "eject.generator: built block profile=%r model=%s max_z=%smm z_ref=%s lift_z=%s drop_z=%s "
+        "dwell=%s jitter=%s sweep_z=%s lanes=%d span=[%s, %s] warn=%s",
         profile.name,
         geometry.model_key,
         _fmt(max_z_height),
         "on" if geometry.z_reference_validated else "off",
         _fmt(lift),
-        _fmt(first_z),
-        _fmt(drop_z) if drop_z is not None else "off",
+        _fmt(drop_target) if drop_target is not None else "off",
         dwell_s if dwell_s is not None else "off",
         f"{jitter_cycles}x{_fmt(jitter_mm)}mm" if jitter_cycles is not None and jitter_mm is not None else "off",
         [_fmt(z) for z in z_levels],
         len(x_lanes),
         _fmt(lane_lo),
         _fmt(lane_hi),
+        bottom_target_warning(profile, geometry) or "none",
     )
     return "\n".join(lines) + "\n"

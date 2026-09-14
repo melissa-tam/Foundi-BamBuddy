@@ -287,11 +287,14 @@ class TestBuiltEjectDropSpan:
             built = await build_part_present_eject_file(src, 1, _profile(bed_drop_clearance_mm=50.0), H2S_GEOMETRY)
             dropless = await build_part_present_eject_file(src, 1, _profile(), H2S_GEOMETRY)
 
-            # With the assist on: the block's own P5→P50 span, which since the block
-            # became one Z flow is the drop, the home and the return. The donor's part is
-            # 18 mm, so the lift is 28 and the drop floor 340-50=290; the drop leg is
-            # bounded at 290 mm (unknown origin) and the return is 262 mm, both at F900.
-            assert built.drop_span_s == pytest.approx((290.0 + 262.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01)
+            # With the assist on: the block's own P5→P50 span — the lift, the home, the
+            # drop and the return. The donor's part is 18 mm, so the lift is 28 and the
+            # drop floor 340-50=290. The LIFT is the move with the unknown origin, so it
+            # is bounded at max(28, 340-28) = 312 mm; the drop and the return are 262 mm
+            # each, all at F900.
+            assert built.drop_span_s == pytest.approx(
+                (312.0 + 262.0 + 262.0) / 900.0 * 60.0 + HOMING_ALLOWANCE_S, abs=0.01
+            )
             assert built.drop_span_s == pytest.approx(
                 estimate_runtime_segments(
                     _read_plate_gcode(built.path), z_travel_mm=H2S_GEOMETRY.z_travel_mm
@@ -322,9 +325,12 @@ class TestBuiltEjectDropSpan:
             assert seeded.start_z == 2.0
             assert unseeded.start_z is None
             assert _read_plate_gcode(seeded.path) == _read_plate_gcode(unseeded.path)
-            # 290 - 2 measured against 290 bounded: the seed is 2 mm of F900 travel.
+            # The first Z move is the lift to 28. Seeded it is MEASURED from the held
+            # 2 mm (26 mm of travel); unseeded it is BOUNDED at max(28, 340-28) = 312 mm,
+            # because a bed left at the vendor's park could be anywhere above it. The
+            # seed is worth the 286 mm difference at F900.
             assert unseeded.expected_runtime_s - seeded.expected_runtime_s == pytest.approx(
-                2.0 / 900.0 * 60.0, abs=0.01
+                (312.0 - 26.0) / 900.0 * 60.0, abs=0.01
             )
             assert seeded.expected_runtime_s == estimate_runtime_s(
                 _read_plate_gcode(seeded.path), start_z=2.0, z_travel_mm=H2S_GEOMETRY.z_travel_mm

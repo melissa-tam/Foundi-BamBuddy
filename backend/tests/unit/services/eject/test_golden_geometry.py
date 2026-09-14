@@ -13,8 +13,8 @@ otherwise.
 * **H2C goldens** (``*_h2c_*``) lock the dual-nozzle recipe: the block homes with the
   parameterized stock forms (``G28 X T300`` → ``G28 Y T300``) instead of the bare
   ``G28 X Y`` that stall-loops on that firmware (007-H2C incident).
-* Both dialects home AFTER the block's first Z move (2026-09-10, one Z flow), which
-  ``test_every_golden_is_one_z_flow`` asserts on the committed bytes.
+* Both dialects home AFTER the block's first Z move — the lift — and BEFORE the
+  bed-drop, which ``test_every_golden_is_one_z_flow`` asserts on the committed bytes.
 
 ``capture_golden.py`` regenerates every fixture below (it imports this ``MATRIX``
 and ``_profile``), so the two never drift.
@@ -123,13 +123,13 @@ MATRIX = [
     # H2C dual-nozzle golden: mirrors its H2S namesake's parameters; the prologue
     # locks the ladder-validated parameterized homing recipe.
     ("default_h2c_z30", H2C_GEOMETRY, {}, 30.0),
-    # Bed-drop release assist (farm eject v2): default 50 mm clearance. H2S drops to
-    # z_travel 340 - 50 = 290 then returns to lift 40; H2C drops to 325 - 50 = 275.
-    # These 2 goldens ARE the deliberate, ladder-gated recipe addition.
+    # Bed-drop release assist (farm eject v2): default 50 mm clearance. H2S lifts to 40,
+    # homes, drops to z_travel 340 - 50 = 290 and returns to 40; H2C drops to 325 - 50 =
+    # 275. These 2 goldens ARE the deliberate, ladder-gated recipe addition.
     ("drop_h2s_z30", H2S_GEOMETRY, {"name": "drop", "bed_drop_clearance_mm": 50.0}, 30.0),
     ("drop_h2c_z30", H2C_GEOMETRY, {"name": "drop", "bed_drop_clearance_mm": 50.0}, 30.0),
     # Bed-drop floor behaviours: 3 x 10 mm jitter strokes then a 5 s hold, emitted
-    # drop → jitter → dwell → return. H2S jitters 290↔280 and H2C 275↔265 — up
+    # home → drop → jitter → dwell → return. H2S jitters 290↔280 and H2C 275↔265 — up
     # FIRST, so neither passes its drop target. Ladder-gated like the drop pair.
     (
         "dropdwelljitter_h2s_z30",
@@ -157,7 +157,8 @@ MATRIX = [
     ),
     # Z RE-REFERENCE (2026-09-04), one golden per homing dialect. These lock the recipe
     # a model receives ONCE its own ladder flips ``z_reference_validated`` — dormant
-    # until then, which is exactly why the nine goldens above must remain byte-identical.
+    # until then, which is exactly why flipping the gate must leave the MOTION of the
+    # nine goldens above untouched (their prologue is the only thing that may differ).
     # H2S drives G380 S2 Z390 (340 travel + 50 overtravel) then declares G92 Z340; H2C
     # drives Z375 and declares Z325, composed with the torque home pair.
     ("zref_h2s_z30", H2S_GEOMETRY_Z_REFERENCED, {"name": "zref"}, 30.0),
@@ -180,10 +181,17 @@ def test_every_golden_is_one_z_flow(name, geometry, overrides, max_z):
     """The block's structure, asserted on the committed bytes rather than on the code.
 
     ONE Z flow: the drop-phase beacon opens before the first Z move (so the deadline it
-    arms covers that move), the first Z move goes straight where the block needs the bed
-    from wherever the plate is, and the X/Y home runs after it — at the clearest point —
-    exactly once, before the sweep. Byte-equality above pins WHAT changed; this pins WHY
-    the order is what it is, in terms a reader can check against the recipe."""
+    arms covers that move), the first Z move goes straight to the LIFT height from
+    wherever the plate is, and the X/Y home runs immediately after it — exactly once,
+    before the sweep, and before the bed-drop where one exists.
+
+    EXACTLY ONE Z-bearing move precedes the home, and it is the lift. That is the whole
+    safety argument in one assertion: one move means the home runs at a height the block
+    derived (part top + clearance_mm, the vendor's own G150.3 gap) rather than wherever
+    a second move left the bed, and it means the home has not yet passed through the
+    drop — the only move that can stall against debris and leave every later absolute Z
+    reading in a corrupted frame (012-H2S 2026-07-31). Byte-equality above pins WHAT
+    changed; this pins WHY the order is what it is."""
     profile = _profile(**overrides)
     lines = [ln.strip() for ln in (GOLDEN_DIR / f"{name}.gcode").read_text().splitlines()]
 
@@ -207,17 +215,24 @@ def test_every_golden_is_one_z_flow(name, geometry, overrides, max_z):
     assert len(homes) == (2 if is_dual_nozzle_model(geometry.model_key) else 1)
     assert all(first_z_idx < home < sweep_idx for home in homes)
 
+    # EXACTLY ONE Z-bearing move precedes the home, and it is the lift. That single
+    # assertion carries the whole safety argument: one move means the home runs at a
+    # height the block DERIVED (part top + clearance_mm — the vendor's own G150.3 gap),
+    # not wherever a second move left the bed, and it means the home has not yet passed
+    # through the drop, the one move that can stall against debris and leave every later
+    # absolute Z reading in a corrupted frame (012-H2S 2026-07-31).
+    z_moves_before_home = [i for i, ln in enumerate(lines[: min(homes)]) if ln.startswith(("G1 Z", "G0 Z"))]
+    assert z_moves_before_home == [first_z_idx]
+
     lift = lift_z(max_z, profile)
     bed_drop = profile.bed_drop_clearance_mm
-    if bed_drop is None:
-        assert lines[first_z_idx] == f"G1 Z{lift:g} F900"
-    else:
+    assert lines[first_z_idx] == f"G1 Z{lift:g} F900"
+    if bed_drop is not None:
         drop = geometry.z_travel_mm - bed_drop
-        # The drop IS the first move: no lift precedes it (the old order's 63 mm up
-        # immediately undone by 280 mm down), and the return follows the home.
-        assert lines[first_z_idx] == f"G1 Z{drop:g} F900"
-        assert f"G1 Z{lift:g} F900" not in lines[:first_z_idx]
-        assert lines[max(homes) + 1] == f"G1 Z{lift:g} F900"
+        # The drop FOLLOWS the home (it never precedes it), and the round trip ends back
+        # at the lift height the sweep runs from.
+        assert lines[max(homes) + 1] == f"G1 Z{drop:g} F900"
+        assert lines[sweep_idx - 2] == f"G1 Z{lift:g} F900"
         if profile.bed_drop_jitter_cycles is None:
             # Without jitter strokes the floor is visited exactly once.
             assert sum(1 for ln in lines if ln == f"G1 Z{drop:g} F900") == 1
