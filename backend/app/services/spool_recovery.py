@@ -11,13 +11,21 @@ HMS (feed fault, or a runout the firmware backup failed to rescue) — during AN
 print, however it was started — it reproduces the operator's proven manual recovery
 sequence:
 
-    (printer already PAUSEd) → [reset a wedged filament-change] → (SWAP COMMIT: take
-    the jammed spool out of rotation) → unload → confirm the AMS finished the unload
-    cycle (see :func:`_confirm_unloaded`) → select the next eligible loaded spool →
-    load it → confirm ``tray_now == target`` (the first load may not take — resend) →
-    resume → confirm RUNNING and hold stable (a lingering fault may need one extra
-    pause/resume cycle) → SUCCESS. If nothing works: escalate — notify and leave
-    the printer PAUSED for a human, never resume blind.
+    (printer already PAUSEd) → [reset a wedged filament-change] → select the next
+    eligible loaded spool → (SWAP COMMIT: take the jammed spool out of rotation) →
+    unload → confirm the AMS finished the unload cycle (see :func:`_confirm_unloaded`)
+    → load the replacement → confirm ``tray_now == target`` (the first load may not
+    take — resend) → resume → confirm RUNNING and hold stable (a lingering fault may
+    need one extra pause/resume cycle) → SUCCESS. If nothing works: give up — restore
+    what the swap moved, notify, and leave the printer PAUSED for a human, never
+    resume blind.
+
+    SELECTION PRECEDES THE COMMIT (004-H2S 2026-09-17, incident 192). The swap used to
+    stamp and unload before it knew a replacement existed, so an honest "no eligible
+    spool" verdict left a printer with an empty extruder that no copy described; the
+    operator's Resume then printed 4 h of air. With nothing to load there is now no
+    unload, and a driver that DID empty the extruder reloads the jammed spool before it
+    pages (:func:`_give_up`) — the machine is symmetric.
 
     Out-of-rotation stamping/notification is bound to the SWAP-COMMIT boundary (the
     step just before the first unload), NOT to entry: a no-swap firmware self-heal
@@ -126,7 +134,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -330,8 +338,9 @@ _RUNOUT_RESUME_SETTLE_S = 15.0
 # Bound on how long we wait for RUNNING after the resume before standing aside.
 _RUNOUT_RESUME_CONFIRM_S = 30.0
 
-# tray_now sentinel: no filament fed (unloaded). 255 on H2-series.
-_NO_FILAMENT = 255
+# tray_now sentinel: no filament fed (unloaded). The value lives with the tray
+# vocabulary (``tray_fields``, one origin per magic value); this is the module's name for it.
+_NO_FILAMENT = tray_fields.TRAY_NOW_NOTHING_FED
 
 # The client's AMS write-refusal reason (a ``bambu_mqtt._AMS_REFUSAL_LOG_TEXT`` key)
 # that recovery must NOT try to wait out: a drying cycle holds the lockout for hours,
@@ -453,7 +462,16 @@ class _RecoveryEvidence:
     a lie that sent the operator looking for spools instead of at the feed path.
     """
 
-    confirmed_unloads: int = 0  # unload cycles the AMS confirmed complete
+    # Unload commands the driver PUBLISHED this incident, confirmed or not (the ``ok``
+    # and ``fail`` verdicts of :func:`_unload_and_confirm`; ``skipped`` and ``drying``
+    # publish nothing). It answers exactly one question — did the FARM empty this
+    # extruder? — which is the give-up's restore precondition.
+    unloads_sent: int = 0
+    # Unload cycles the AMS confirmed complete. Since the swap waits for a replacement
+    # to be in hand (004-H2S 2026-09-17), every one of them PRECEDED a load attempt —
+    # the reorder's one semantic narrowing, and the reason ``feed_path_blocked`` still
+    # means what it says: the AMS unloaded cleanly and the path still would not feed.
+    confirmed_unloads: int = 0
     loads_attempted: int = 0  # candidates we sent an ams_change_filament for
     loads_confirmed: int = 0  # loads the printer confirmed on tray_now
 
@@ -1286,6 +1304,125 @@ def slot_was_feeding(
     return decode_global_tray(feeder) == (ams_id, tray_id)
 
 
+# --- where the filament is, and what to tell the operator about it -----------
+
+FeederKind = Literal["jammed", "empty", "other", "external", "unknown"]
+
+# What the DRIVER did about an extruder IT emptied, stated by the driver and never
+# inferred from the wire (:func:`_restore_jammed_feeder`). Five jam-kind reasons reach
+# :func:`_escalate` straight from the entry gate with nothing unloaded, and after a feed
+# fault ``tray_now`` frequently already reads 255 — so a wire-inferred "was unloaded"
+# would attribute an act to the farm that never happened, and a bare boolean would claim
+# a failed reload on the give-ups where none is attempted.
+RestoreVerdict = Literal["ok", "fail", "skipped_wedged", "skipped_drying"]
+
+
+@dataclass(frozen=True)
+class FeederPosition:
+    """Where the filament sits right now, read RELATIVE to this incident's jammed tray.
+
+    ONE owner for that question. Nine one-line ``tray_now`` comparisons in this module
+    each ask a different one ("is the AMS unloaded", "did the load take", "did the
+    operator resume on the jammed feeder"); this is the only one that classifies the
+    feeder for the operator page and for the give-up's restore decision, and neither
+    projection may re-derive it from ``tray_now`` itself (pinned by test).
+
+    ``kind``:
+
+    * ``jammed``  — the jammed tray is still the feeder (nothing was unloaded, or a
+      restore put it back);
+    * ``empty``   — the 255 sentinel: NOTHING is feeding. After a feed fault that is
+      never "the path is clear" (invariant 8);
+    * ``other``   — a different regular tray feeds (a replacement that loaded, or an
+      AMS-HT id that has no letter+slot name);
+    * ``external``— the external spool holder (254): no AMS slot is involved;
+    * ``unknown`` — no live state, no jammed tray to be relative to, or a ``tray_now``
+      that names neither a tray nor a sentinel.
+
+    ``global_tray`` is the slot the operator must be TOLD about — the jammed tray for
+    ``jammed``/``empty`` (the one still loaded, or the one that was unloaded), the tray
+    now at the feeder for ``other``, and None where there is nothing to name (which is
+    why no clause can ever render "tray None").
+    """
+
+    kind: FeederKind
+    global_tray: int | None
+
+
+def _feeder_position(state, jammed_global_tray: int | None, printer_id: int | None) -> FeederPosition:
+    """Classify the feeder against ``jammed_global_tray``. Never raises.
+
+    Witness order is :func:`slot_was_feeding`'s, for its reason: on dual-nozzle
+    hardware ``tray_now`` is SINGLE-valued and describes only the active hotend, so a
+    jammed slot feeding the other nozzle would read ``empty`` here and a restore would
+    load on top of filament that never left. The per-extruder map answers first, and
+    only a machine that carries none falls through to ``tray_now``.
+    """
+    if state is None or jammed_global_tray is None:
+        return FeederPosition("unknown", None)
+    feeders = _dual_nozzle_feeders(state, printer_id)
+    if jammed_global_tray in feeders:
+        return FeederPosition("jammed", jammed_global_tray)
+    if feeders:
+        # A hotend IS fed, just not from the jammed slot — mapping order decides which
+        # one the page names, exactly as the mapping witnesses order themselves.
+        return FeederPosition("other", feeders[0])
+    raw = getattr(state, "tray_now", None)
+    feeder = tray_fields.valid_feeder(raw)
+    if feeder is not None:
+        return FeederPosition("jammed" if feeder == jammed_global_tray else "other", feeder)
+    if raw == _NO_FILAMENT:
+        return FeederPosition("empty", jammed_global_tray)
+    if raw == tray_fields.TRAY_NOW_EXTERNAL_SPOOL:
+        return FeederPosition("external", None)
+    return FeederPosition("unknown", None)
+
+
+def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None) -> str | None:
+    """The sentence a jam escalation appends to its static reason copy, or None.
+
+    The reason copy says WHY the farm gave up; this says what state the printer is in
+    while it waits, which is the half incident 192 (004-H2S 2026-09-17) was missing:
+    the page never said the extruder was empty, so a Resume was the natural next click
+    and the print ran four hours on air.
+
+    ``restore`` is the driver's own statement about an extruder IT emptied, so a
+    give-up that unloaded nothing renders nothing about unloading. Runout / physical /
+    external kinds get no clause at all (their copy already carries the slot
+    instruction, and the swap machine never moved their filament).
+    """
+    slot = runout_slot_desc(position.global_tray) or f"tray {position.global_tray}"
+    if position.kind == "jammed":
+        if restore == "ok":
+            return (
+                f"The jammed spool was unloaded and reloaded ({slot}). Clear the extruder, then resume on the printer."
+            )
+        return f"The jammed spool is still loaded ({slot}). Clear the extruder, then resume on the printer."
+    if position.kind == "empty":
+        if restore == "fail":
+            return (
+                f"No filament is loaded: {slot} was unloaded and the reload failed. "
+                "Check the filament path, load a spool, then resume on the printer."
+            )
+        if restore == "skipped_wedged":
+            return (
+                f"No filament is loaded: {slot} was unloaded; the AMS is mid filament-change, "
+                "so no reload was attempted."
+            )
+        if restore == "skipped_drying":
+            return (
+                f"No filament is loaded: {slot} was unloaded; the AMS is drying, so no reload was attempted. "
+                "Load a spool after the cycle, then resume on the printer."
+            )
+        # The farm did not empty it and cannot say why it reads empty — 255 is
+        # "nothing is feeding", not "the path is clear" (invariant 8). The reason
+        # copy stands on its own.
+        return None
+    if position.kind == "other":
+        return f"{slot} is loaded."
+    return None
+
+
 async def _route_fault(
     db: AsyncSession,
     *,
@@ -1692,11 +1829,11 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             if reset == "fail":
                 # The feeder is genuinely wedged — hands are needed and the jammed
                 # spool is legitimately out of rotation. Commit the stamp (once) at
-                # this boundary, THEN escalate.
+                # this boundary, THEN give up.
                 if not oor_stamped and incident.jammed_global_tray is not None:
                     await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
                     oor_stamped = True
-                await _escalate(incident, "stuck_reset_failed")
+                await _give_up(incident, client, "stuck_reset_failed", evidence=evidence)
                 return
             if reset == "recovered":
                 # Same-feeder self-heal: the firmware reset cleared the jam with no
@@ -1712,34 +1849,17 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                     await _clear_oor_if_resumed_on_jammed_feeder(db, incident)
                 await _succeed(incident, incident.jammed_global_tray, swapped=False)
                 return
-            # reset in ("skipped", "ok") → the swap is COMMITTED: take the jammed spool
-            # out of rotation ONCE, right before the first unload. Boundary semantics:
-            # the stamp means "recovery is abandoning this spool", so every escalation
-            # that can follow this point (ams_drying, unload_failed, load exhaustion)
-            # correctly KEEPS the stamp; only a clean swap-and-resume or an
-            # external-takeover abort resolves it (the latter's _clear reverses it when
-            # the operator resumed on the jammed feeder).
-            if not oor_stamped and incident.jammed_global_tray is not None:
-                await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
-                oor_stamped = True
-            unload = await _unload_and_confirm(incident, client)
-            if unload not in ("ok", "skipped"):
-                _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
-            if unload == "abort":
-                await _abort(incident)
-                return
-            if unload == "handover":
-                _hand_over(incident)
-                return
-            if unload == "drying":
-                await _escalate(incident, "ams_drying")
-                return
-            if unload == "fail":
-                await _escalate(incident, "unload_failed")
-                return
-            if unload == "ok":
-                evidence.confirmed_unloads += 1
-
+            # reset in ("skipped", "ok") → LOOK BEFORE YOU LEAP. Selection runs here,
+            # ahead of the stamp and the unload, because everything below it COMMITS
+            # the swap: 004-H2S 2026-09-17 (incident 192) stamped a spool out of
+            # rotation and unloaded it, and only then asked what to load — the honest
+            # answer was "nothing", and the printer was handed to a human with an empty
+            # extruder that no copy described. Selection touches no feeder (it reads
+            # tray telemetry and may force a bare-tray config write), so running it
+            # first costs the swap nothing and buys round 1 the right to abandon
+            # cleanly: with no candidate to load there is no unload, and invariants 7
+            # (the stamp is the swap-commit boundary) and 8 (an unload is unconditional
+            # BEFORE A LOAD) both hold literally.
             target, only_low = await _select_replacement(incident, tried)
             if target is None:
                 # A takeover during the (possibly bounded) selection / forced
@@ -1764,9 +1884,41 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                     )
                 else:
                     reason = evidence.exhaustion_reason()
-                await _escalate(incident, reason)
+                await _give_up(incident, client, reason, evidence=evidence)
                 return
             tried.add(target)
+
+            # A replacement is in hand → the swap COMMITS: take the jammed spool out of
+            # rotation ONCE, right before the first unload. Boundary semantics: the
+            # stamp means "recovery is abandoning this spool", so every give-up that can
+            # follow this point (ams_drying, unload_failed, load exhaustion) correctly
+            # KEEPS the stamp; only a clean swap-and-resume or an external-takeover
+            # abort resolves it (the latter's _clear reverses it when the operator
+            # resumed on the jammed feeder — never on a feeder the driver restored).
+            if not oor_stamped and incident.jammed_global_tray is not None:
+                await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
+                oor_stamped = True
+            unload = await _unload_and_confirm(incident, client)
+            if unload in ("ok", "fail"):
+                # The command went out — confirmed or not, the FARM moved this feeder,
+                # which is what the give-up's restore is allowed to undo.
+                evidence.unloads_sent += 1
+            if unload not in ("ok", "skipped"):
+                _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
+            if unload == "abort":
+                await _abort(incident)
+                return
+            if unload == "handover":
+                _hand_over(incident)
+                return
+            if unload == "drying":
+                await _give_up(incident, client, "ams_drying", evidence=evidence)
+                return
+            if unload == "fail":
+                await _give_up(incident, client, "unload_failed", evidence=evidence)
+                return
+            if unload == "ok":
+                evidence.confirmed_unloads += 1
 
             evidence.loads_attempted += 1
             load = await _load_and_confirm(incident, client, target)
@@ -1779,7 +1931,7 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                 _hand_over(incident)
                 return
             if load == "drying":
-                await _escalate(incident, "ams_drying")
+                await _give_up(incident, client, "ams_drying", evidence=evidence)
                 return
             if load == "fail":
                 continue  # load never confirmed — try the next candidate
@@ -1865,7 +2017,7 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
 
         # (4) Every candidate exhausted.
         _log_candidate_outcome(incident, gtid=None, verdict="candidates_exhausted")
-        await _escalate(incident, evidence.exhaustion_reason())
+        await _give_up(incident, client, evidence.exhaustion_reason(), evidence=evidence)
     except Exception:  # noqa: BLE001 — the driver must never crash the event loop
         logger.exception("spool_recovery: recovery driver crashed for printer %s", pid)
     finally:
@@ -3025,7 +3177,11 @@ async def _mark_out_of_rotation(incident: RecoveryIncident, global_tray: int, *,
     from backend.app.services.notification_service import notification_service
 
     ams_id, tray_id = decode_global_tray(global_tray)
-    slot_desc = f"AMS{ams_id} slot {tray_id}" if ams_id is not None else f"tray {global_tray}"
+    # ONE origin for the human slot name (:func:`runout_slot_desc`), so the
+    # out-of-rotation page, the incident chip, the escalation and the firmware all say
+    # "AMS A slot 2". The three renderings this module carried were 0-indexed and
+    # disagreed with every other surface (004-H2S 2026-09-17, incident 192).
+    slot_desc = runout_slot_desc(global_tray) or f"tray {global_tray}"
     spool_desc = f"tray {global_tray}"
     try:
         async with async_session() as db:
@@ -3096,7 +3252,7 @@ async def _describe_slot(db: AsyncSession, printer_id: int, global_tray: int | N
     sa = res.scalar_one_or_none()
     if sa is not None and sa.spool is not None:
         return _spool_label(sa.spool)
-    return f"AMS{ams_id} slot {tray_id}"
+    return runout_slot_desc(global_tray) or f"tray {global_tray}"
 
 
 async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = True) -> None:
@@ -3167,15 +3323,14 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
             else:
                 # No-swap self-heal: nothing was swapped and nothing is out of
                 # rotation, so send the truthful self-heal alert (the swap-framed
-                # succeeded copy would be false). slot_desc mirrors _mark_out_of_
-                # rotation's "AMS{ams_id} slot {tray_id}" format; a null jammed tray
-                # falls back to a safe generic.
+                # succeeded copy would be false). slot_desc renders through the one
+                # origin :func:`runout_slot_desc`, like every other slot name; a null
+                # jammed tray falls back to a safe generic.
                 jammed = incident.jammed_global_tray
                 if jammed is None:
                     slot_desc = "the same slot"
                 else:
-                    ams_id, tray_id = decode_global_tray(jammed)
-                    slot_desc = f"AMS{ams_id} slot {tray_id}" if ams_id is not None else f"tray {jammed}"
+                    slot_desc = runout_slot_desc(jammed) or f"tray {jammed}"
                 spool_desc = await _describe_slot(db, incident.printer_id, jammed)
                 printer = await db.get(Printer, incident.printer_id)
                 printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
@@ -3214,7 +3369,106 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
         logger.exception("spool_recovery: succeed handler failed for printer %s", incident.printer_id)
 
 
-async def _escalate(incident: RecoveryIncident, reason: str) -> None:
+async def _restore_jammed_feeder(
+    incident: RecoveryIncident, client
+) -> RestoreVerdict | Literal["abort", "handover"] | None:
+    """Put the jammed spool back when the swap emptied the extruder and failed.
+
+    The invariant the driver owns: it never hands a printer to a human with NOTHING
+    loaded when the AMS would load something. After the selection reorder the only way
+    the extruder is empty at a give-up is the residual — the swap committed, a
+    replacement load FAILED, and no further candidate exists — and at that boundary a
+    reload is state RESTORATION, not re-selection: invariant 7 holds (the stamp neither
+    moves nor clears; it did jam, and the flag only bars auto-selection) and invariant 8
+    holds (this incident's confirmed unload precedes the reload).
+
+    ``None`` = not needed (the feeder is not empty, so nothing was left dangling). The
+    three refusals and the two outcomes are :data:`RestoreVerdict`; ``abort`` /
+    ``handover`` propagate exactly as they do from every other step.
+
+    Called ONLY by :func:`_give_up`, and only once that has established the driver
+    published an unload of its own (``_RecoveryEvidence.unloads_sent``) — this function
+    reads the WIRE, and the wire cannot tell an extruder the farm emptied from one the
+    firmware retracted. What it adds is the other half: a driver that unloaded but whose
+    jammed tray reads loaded again has nothing left to restore.
+
+    Two preconditions beyond "the extruder is empty":
+
+    * ``not ams_mid_filament_change(state)`` — the fork's ONE wedge predicate (value 1
+      only). ``== AMS_STATUS_IDLE`` would fail OPEN at the assist state 3 that every
+      RUNNING H2S reads, and an assist-state AMS does accept loads.
+    * a known jammed tray — there is no slot to load back otherwise.
+
+    It reuses :func:`_load_and_confirm` whole, so the drying pre-flight, the
+    ``note_commanded_load`` marking (the backup-swap detector must not spend the
+    departed spool) and the takeover handling are the swap's own, not a second copy.
+    The load is NOT counted in :class:`_RecoveryEvidence` — it is not a candidate, and
+    the escalation reason must read exactly as it did before the restore existed.
+    """
+    jammed = incident.jammed_global_tray
+    state = _get_state(incident.printer_id)
+    if _feeder_position(state, jammed, incident.printer_id).kind != "empty" or jammed is None:
+        return None
+    if ams_mid_filament_change(state):
+        # The firmware drops every load in this state; the lever is its own CONTINUE,
+        # which the wedged reasons' copy already names.
+        _log_candidate_outcome(incident, gtid=jammed, verdict="restore_skipped_wedged")
+        return "skipped_wedged"
+    load = await _load_and_confirm(incident, client, jammed)
+    if load in ("abort", "handover"):
+        return load
+    verdict: RestoreVerdict = "skipped_drying" if load == "drying" else ("ok" if load == "ok" else "fail")
+    _log_candidate_outcome(incident, gtid=jammed, verdict=f"restore_{verdict}")
+    return verdict
+
+
+async def _give_up(incident: RecoveryIncident, client, reason: str, *, evidence: _RecoveryEvidence) -> None:
+    """THE give-up boundary: restore what the swap moved, then escalate.
+
+    Every ``_escalate`` reachable inside :func:`_run_recovery`'s candidate loop and
+    after it routes through here, so the restore decision is made ONCE from live state
+    instead of six inline conditions drifting apart. The escalations that never enter
+    the loop (the entry gate, the startup re-entry, the runout branch) call
+    :func:`_escalate` directly with ``restore=None``: they unloaded nothing, so they
+    have nothing to restore and nothing to claim about a reload.
+
+    :func:`_abort` and :func:`_hand_over` deliberately leave the extruder as it is —
+    another actor owns the printer, and a takeover is never a give-up.
+    """
+    # The restore exists to undo the DRIVER's OWN unload — nothing else. A give-up that
+    # published none (round 1 on an AMS the firmware wedged itself, or a no-candidate
+    # verdict while ``tray_now`` already read 255 because the firmware retracted after
+    # the fault — see :func:`_resolve_jammed_tray`) leaves the printer exactly as the
+    # firmware left it, and the reason copy stands on its own: moving filament there
+    # would be the farm acting on a state it never created, on a load with no explicit
+    # unload behind it — the one a wedged AMS drops (invariant 8). The wire position
+    # alone cannot tell those apart, because 255 is what BOTH look like.
+    verdict = await _restore_jammed_feeder(incident, client) if evidence.unloads_sent else None
+    if verdict == "abort":
+        # A takeover DURING the restore must not un-stamp the spool: the operator
+        # resumed on a feeder the FARM had just reloaded, so the click is not the
+        # "I declare this spool usable" statement _clear_oor_if_resumed_on_jammed_feeder
+        # reads it as.
+        await _abort(incident, restored=True)
+        return
+    if verdict == "handover":
+        _hand_over(incident)
+        return
+    logger.info(
+        "[spool_recovery] give-up printer=%s reason=%s restore=%s unloads_sent=%s unloads_confirmed=%s "
+        "loads_attempted=%s loads_confirmed=%s",
+        incident.printer_id,
+        reason,
+        verdict,
+        evidence.unloads_sent,
+        evidence.confirmed_unloads,
+        evidence.loads_attempted,
+        evidence.loads_confirmed,
+    )
+    await _escalate(incident, reason, restore=verdict)
+
+
+async def _escalate(incident: RecoveryIncident, reason: str, *, restore: RestoreVerdict | None = None) -> None:
     """Give up: hold the incident ESCALATED, project the token, notify, leave PAUSED.
 
     NEVER resumes — a human must intervene. The incident stays OPEN (an escalation is
@@ -3226,6 +3480,11 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
     A HELD AMS runout additionally carries the DURABLE spent stamp for the exhausted
     roll (``spool_respool.mark_spent_on_runout_hold``, guarded) — see the call below for
     why an escalation, and not a wire edge, is what a hold spanning a deploy can rely on.
+
+    ``restore`` is :func:`_give_up`'s statement about an extruder the DRIVER emptied,
+    and it is what lets the composed detail say where the filament is (:func:`
+    _feeder_clause`). It is passed explicitly and never inferred: the default ``None``
+    is the truthful answer for every caller that unloaded nothing.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -3235,6 +3494,16 @@ async def _escalate(incident: RecoveryIncident, reason: str) -> None:
     await _log_tray_snapshot(incident)
 
     detail = _ESCALATE_DETAIL.get(reason, reason)
+    # Where the filament actually IS, read once off the live wire and appended to the
+    # static reason copy — feed faults only, because that is the machine that moves
+    # filament. Runout / physical / external copy already carries its slot instruction.
+    if incident.is_feed_fault:
+        clause = _feeder_clause(
+            _feeder_position(_get_state(incident.printer_id), incident.jammed_global_tray, incident.printer_id),
+            restore,
+        )
+        if clause is not None:
+            detail = f"{detail} {clause}"
     # The hold's projection onto the farm unit, one token per kind. A foreign print
     # has no unit — the incident row carries the whole state there.
     token = waiting_reason_for(incident.kind, external=incident.external)
@@ -3411,7 +3680,7 @@ async def _record_escalation_and_maybe_quarantine(
         logger.exception("spool_recovery: repeat-jam quarantine bookkeeping failed for printer %s", incident.printer_id)
 
 
-async def _abort(incident: RecoveryIncident, *, token: str = "external_interference") -> None:
+async def _abort(incident: RecoveryIncident, *, token: str = "external_interference", restored: bool = False) -> None:
     """Silent abort — somebody else owns this printer now. Stop acting and drop our
     stale ``recovering`` flag (the print is being handled elsewhere).
 
@@ -3423,7 +3692,13 @@ async def _abort(incident: RecoveryIncident, *, token: str = "external_interfere
     the jammed global tray), they declared that spool usable — clear its
     out-of-rotation flag the same way a physical re-insert would, so a self-cleared
     jam does not leave the spool excluded from all future dispatch. Any other live
-    state keeps the flag (a physical reseat stays the canonical clear)."""
+    state keeps the flag (a physical reseat stays the canonical clear).
+
+    ``restored`` is the one thing that reading cannot survive: the driver ITSELF put
+    the jammed spool back on the feeder (:func:`_restore_jammed_feeder`), so "they
+    resumed on the jammed feeder" says nothing about what the operator thinks of the
+    spool — the farm chose that feeder, not them. The stamp stays; remove+re-insert or
+    the Inventory control clears it."""
     from backend.app.core.database import async_session
 
     # Close FIRST (before any await that could fail): an external actor owns this
@@ -3440,7 +3715,8 @@ async def _abort(incident: RecoveryIncident, *, token: str = "external_interfere
             if item is not None and item.waiting_reason == WAITING_REASON_RECOVERING:
                 item.waiting_reason = None
                 await db.commit()
-            await _clear_oor_if_resumed_on_jammed_feeder(db, incident)
+            if not restored:
+                await _clear_oor_if_resumed_on_jammed_feeder(db, incident)
     except Exception:  # noqa: BLE001 — cleanup is best-effort
         logger.exception("spool_recovery: abort cleanup failed for printer %s", incident.printer_id)
 
