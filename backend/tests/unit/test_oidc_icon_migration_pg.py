@@ -35,8 +35,13 @@ async def _capture_sql(is_sqlite_value: bool) -> list[str]:
     that would have been executed during ``run_migrations``.
 
     Sub-migration callables that don't emit ALTER TABLE icon_data (the auto-
-    link constraint update and the AMS-id widening) are no-op'd to keep the
-    test focused on the icon migration.
+    link constraint update, the AMS-id widening and the AUTOINCREMENT table
+    rebuild) are no-op'd to keep the test focused on the icon migration.
+    ``_rebuild_table_with_autoincrement`` is in that list because it cannot run
+    against a fake conn at all: it reads the live ``sqlite_master`` DDL and the
+    ``foreign_keys`` pragma and branches on both, and a ``MagicMock`` answers
+    every read with a truthy mock — so it would refuse on a foreign-keys pragma
+    that was never really on. Same reason as the other two, same treatment.
 
     ``run_migrations`` uses ``async with conn.begin_nested()`` for the few
     DML backfills, so the fake conn returns a real async context manager.
@@ -58,6 +63,7 @@ async def _capture_sql(is_sqlite_value: bool) -> list[str]:
         patch("backend.app.core.database._safe_execute", side_effect=fake_safe_execute),
         patch("backend.app.core.database._migrate_update_auto_link_constraint", AsyncMock()),
         patch("backend.app.core.database._migrate_widen_spoolman_slot_ams_id_range", AsyncMock()),
+        patch("backend.app.core.database._rebuild_table_with_autoincrement", AsyncMock()),
     ):
         await db_module.run_migrations(fake_conn)
 
