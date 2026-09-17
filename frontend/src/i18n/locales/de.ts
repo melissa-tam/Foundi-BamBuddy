@@ -883,10 +883,13 @@ export default {
       recoverMessageWithReason: '"{{name}}" wiederherstellen? Grund: {{reason}}. Dies ist eine ausdrückliche Übersteuerung, die:',
       recoverEffectPlate: '• die Plattensperre aufhebt',
       recoverEffectQuarantine: '• die Quarantäne aufhebt',
-      recoverEffectResume: '• den pausierten Lauf fortsetzt',
+      recoverEffectLease: '• die Dispatch-Reservierung freigibt',
       recoverEffectEject: '• Laufenden Auswurf verwerfen',
+      recoverEffectFault: '• die offene Gerätestörung schließt',
+      recoverEffectResume: '• den pausierten Lauf fortsetzt',
+      recoverClosedFault: 'Gerätestörung geschlossen',
       markPlateCleared: 'Platte als freigegeben markieren',
-      actionsHelp: 'Wiederherstellen & fortsetzen hebt die Quarantäne auf und setzt den pausierten Lauf fort. Platte als freigegeben markieren gibt nur die Plattensperre frei.',
+      actionsHelp: 'Wiederherstellen & fortsetzen löst alles, was diesen Drucker hält — Platte, Reservierung, Auswurf, Quarantäne, Gerätestörung — und setzt den pausierten Lauf fort. Platte als freigegeben markieren gibt nur die Plattensperre frei.',
     },
     phase: {
       printing: 'Druckt',
@@ -932,6 +935,7 @@ export default {
       ejectInProgress: 'Auswurf läuft · {{age}}',
       ejectStalled: 'Auswurf hängt · {{age}} — die Farm hat den Sweep aus den Augen verloren',
       menuRecover: 'Drucker wiederherstellen',
+      clearedClosedFault: 'Gerätestörung geschlossen',
     },
     // Manueller Auswurf (W2) + Neue-Spule-Hinweis (W6)
     eject: {
@@ -1241,7 +1245,7 @@ export default {
     incidentAction: {
       jam: 'AMS-Filamentweg freimachen, dann Druck fortsetzen',
       runout: 'Angeforderten Slot nachfüllen; der Druck läuft von selbst weiter',
-      physical: 'Filamentweg am Drucker freimachen, dann Druck fortsetzen',
+      physical: 'Filamentweg blockiert. Wird gelöst, wenn ein Slot lädt oder der unterbrochene Druck durch den Weg fertig wird, oder per Wiederherstellen.',
       power_loss: 'Am Drucker fortsetzen',
       plate_vision: 'Bett freiräumen, dann „Platte als freigegeben markieren“',
       z_reference_lost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen, dann „Platte als freigegeben markieren“',

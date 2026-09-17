@@ -30,7 +30,7 @@ from backend.app.models.printer_incident import KIND_PLATE_VISION, PrinterIncide
 from backend.app.models.recovery_escalation import RecoveryEscalation
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import printer_incidents, spool_recovery
+from backend.app.services import incident_resolution, printer_incidents, spool_recovery
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
 from backend.app.services.printer_incidents import (
     WAITING_REASON_FAILED,
@@ -178,6 +178,28 @@ def _make_state(
     st.hms_errors = hms if hms is not None else [_feed_fault_hms()]
     st.raw_data = {"ams": [{"id": 0, "tray": trays if trays is not None else [_ams_tray(0), _ams_tray(1)]}]}
     return st
+
+
+def _stamp_load_edge(printer_id, when):
+    """Put a completed-load edge in the motion ledger at ``when``.
+
+    The ledger's ONE writer is the per-push sampler; a unit test that needs the
+    evidence to already exist reaches for the store directly rather than simulating a
+    tray transition it is not testing.
+    """
+    incident_resolution.ledger._load_completed_at[printer_id] = when  # noqa: SLF001
+
+
+def _terminal(*, status="completed", eject=False, job_id="task-1"):
+    """The terminal ``main.on_print_complete`` hands the closer.
+
+    ``status`` is the FIRMWARE's own word (captured before the operator-UI rewrite),
+    ``eject`` is that callback's sweep flag and ``job_id`` the wire ``subtask_id`` —
+    the three facts the repair class's completed-arm is qualified on.
+    """
+    from backend.app.services.incident_resolution import TerminalEvent
+
+    return TerminalEvent(status=status, eject=eject, job_id=job_id)
 
 
 class FakeClient:
@@ -893,7 +915,7 @@ async def test_escalation_hold_does_not_outlive_its_job(db_session, printer_fact
     # Job 1 reaches its terminal — the hold closes with it (in production this is
     # main.on_print_complete's per-print reset; the printer's RUNNING edge closes it
     # too).
-    assert await spool_recovery.on_job_terminal(printer.id) is True
+    assert await spool_recovery.on_job_terminal(printer.id, _terminal()) is True
 
     # Job 2 on the same printer is a fresh incident — recovers normally.
     await _farm_item(db_session, printer.id, subtask="task-2")
@@ -2961,7 +2983,7 @@ def test_resolve_runout_tray_prefers_the_demand_over_mapping_and_tray_now():
     state = SimpleNamespace(tray_now=255, hms_errors=[_runout_demand_hms(0, 2), _runout_same_slot_hms()])
 
     assert _resolve_runout(item, state) == (2, "single")
-    assert spool_recovery.runout_slot_desc(2) == "AMS A slot 3"
+    assert printer_incidents.runout_slot_desc(2) == "AMS A slot 3"
 
 
 def test_resolve_jam_tray_ignores_any_demand():
@@ -4212,10 +4234,10 @@ async def test_a_terminal_closes_the_hold(db_session, printer_factory, monkeypat
     state = _make_state(gcode_state="FINISH", hms=[])
     _wire(monkeypatch, state, FakeClient(state))
 
-    assert await spool_recovery.on_job_terminal(printer.id) is True
+    assert await spool_recovery.on_job_terminal(printer.id, _terminal()) is True
 
     assert await _incident_row(db_session, printer.id) is None
-    assert await spool_recovery.on_job_terminal(printer.id) is False  # nothing left to close
+    assert await spool_recovery.on_job_terminal(printer.id, _terminal()) is False  # nothing left to close
 
 
 # --- refill auto-resume: two spawn sources, one body ------------------------
@@ -4424,7 +4446,7 @@ class TestEntryThrottle:
         task = await on_ams_fault(printer.id, state)
         if task is not None:
             await task  # settle the driver before the next session touches the row
-        await spool_recovery.on_job_terminal(printer.id)  # the hold ends
+        await spool_recovery.on_job_terminal(printer.id, _terminal(job_id="foreign-job"))  # the hold ends
 
         # A DIFFERENT fault on the next push must be evaluated immediately.
         state2 = _make_state(subtask="foreign-job", hms=[_physical_wire_hms()])
@@ -5252,7 +5274,7 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
         state = _make_state()
         _wire(monkeypatch, state, FakeClient(state))
 
-        assert await spool_recovery.on_job_terminal(printer.id) is True
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal()) is True
 
         incident = replace(_incident(printer.id, step_timeout_s=0.05, item_id=item.id), incident_id=row.id)
         with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
@@ -5279,7 +5301,7 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
         state = _make_state()
         _wire(monkeypatch, state, FakeClient(state))
 
-        assert await spool_recovery.on_job_terminal(printer.id) is True
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal()) is True
 
         incident = replace(_incident(printer.id, step_timeout_s=0.05, item_id=item.id), incident_id=row.id)
         with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
@@ -5758,7 +5780,10 @@ class TestPhysicalHoldsOutliveTheJob:
         await _farm_item(db_session, printer.id)
         await self._physical_hold(db_session, printer, monkeypatch)
 
-        assert await spool_recovery.on_job_terminal(printer.id) is False
+        # The operator's STOP, in the firmware's own word. Shape 38's pin: a stop /
+        # failed / aborted terminal is very often somebody ending the very print the
+        # fault broke, and it launders nothing.
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal(status="failed")) is False
 
         row = await _incident_row(db_session, printer.id)
         assert row is not None and row.resolved_at is None
@@ -5789,7 +5814,7 @@ class TestPhysicalHoldsOutliveTheJob:
         await self._physical_hold(db_session, printer, monkeypatch)
         idle = _make_state(gcode_state="IDLE", hms=[], tray_now=1)
         _wire(monkeypatch, idle, FakeClient(idle))
-        spool_recovery._load_completed_at.clear()
+        incident_resolution.ledger.reset()
 
         assert await spool_recovery.rearm_incidents_on_startup() == 0
         assert (await _incident_row(db_session, printer.id)).resolved_at is None
@@ -5804,14 +5829,176 @@ class TestPhysicalHoldsOutliveTheJob:
         await _farm_item(db_session, printer.id)
         await self._physical_hold(db_session, printer, monkeypatch)
 
-        assert await pause_recovery.on_plate_cleared(printer.id) is False
+        assert await pause_recovery.on_plate_cleared(printer.id) == []
         assert (await _incident_row(db_session, printer.id)).resolved_at is None
 
-        assert await pause_recovery.on_plate_cleared(printer.id, recover=True) is True
+        assert [kind for _id, kind in await pause_recovery.on_plate_cleared(printer.id, recover=True)] == ["physical"]
         rows = await _incident_rows(db_session, printer.id)
         assert rows[0].resolved_at is not None
         assert rows[0].resolve_source == "operator"
         assert printer_incidents.hold_blocks_dispatch(printer.id) is False
+
+    # --- the completed-after-resume evidence, end to end (2026-09-17, 011-H2S) ------
+    #
+    # The table's own cases live in ``test_incident_resolution.py`` and hand the ledger
+    # its contents. These drive the REAL chain instead — the per-push sampler stamps the
+    # ledger, ``main.on_print_complete``'s own TerminalEvent reaches the closer, and the
+    # row moves in the database — because that is the join the 011-H2S incident actually
+    # broke: every part worked, and nothing connected the print completing to the hold.
+
+    async def _running_push(self, printer, state, monkeypatch):
+        """Resume the printer the way production does: a PAUSE sample, then RUNNING.
+
+        Two pushes, because the sampler is EDGE-triggered and the seed is what makes the
+        second one an edge. The ledger's ``running_seen_at`` is stamped by the real
+        :func:`spool_recovery.note_demand_watch` — nothing here writes it.
+        """
+        spawned = _capture_spawns(monkeypatch)
+        spool_recovery.note_demand_watch(printer.id, state)  # seed: still PAUSEd on the fault
+        state.state, state.hms_errors = "RUNNING", []  # the operator repaired it and resumed
+        spool_recovery.note_demand_watch(printer.id, state)
+        for coro in spawned:
+            await coro  # the RUNNING-edge closer runs for real; a repair row stands
+        return spawned
+
+    async def test_the_interrupted_job_completing_closes_the_hold(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """THE 011-H2S chain. The operator cleared the path at the printer and resumed;
+        the print then ran to ``completed``, which means filament fed through the
+        repaired path to the end of that job. 23 of the 40 physical rows in this farm's
+        history ended exactly this way and not one of them was ever counted."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, row = await self._physical_hold(db_session, printer, monkeypatch)
+
+        await self._running_push(printer, state, monkeypatch)
+        assert incident_resolution.ledger.running_seen_at(printer.id) is not None
+
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal(job_id=row.job_id)) is True
+
+        rows = await _incident_rows(db_session, printer.id)
+        assert rows[0].resolved_at is not None
+        assert rows[0].resolve_source == "repair_completed"
+        # The point of the whole wave: dispatch is unblocked without a human.
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is False
+
+    async def test_an_aborted_terminal_after_the_same_resume_keeps_it(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """Shape 38's pin, through the same chain: the print ran, and then somebody
+        stopped it. A stop is not "filament fed to the end of this job"."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, row = await self._physical_hold(db_session, printer, monkeypatch)
+        await self._running_push(printer, state, monkeypatch)
+
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal(status="aborted")) is False
+
+        held = await _incident_row(db_session, printer.id)
+        assert held is not None and held.status == "escalated"
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is True
+
+    async def test_another_jobs_completion_launders_nothing(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """The row blocks the DISPATCHER, not the touchscreen. A print somebody started
+        from the screen, completing on another slot, must not clear a blocked shared
+        path — so the terminal is bound to the job the fault interrupted."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, row = await self._physical_hold(db_session, printer, monkeypatch)
+        await self._running_push(printer, state, monkeypatch)
+
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal(job_id="a-screen-job")) is False
+
+        held = await _incident_row(db_session, printer.id)
+        assert held is not None and held.resolved_at is None
+
+    async def test_a_completed_eject_sweep_launders_nothing(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """A sweep is filament-LESS and completes on every production cycle, so without
+        the eject flag the farm's own eject would clear every physical hold it met."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, row = await self._physical_hold(db_session, printer, monkeypatch)
+        await self._running_push(printer, state, monkeypatch)
+
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal(eject=True)) is False
+
+        held = await _incident_row(db_session, printer.id)
+        assert held is not None and held.resolved_at is None
+
+    async def test_a_completion_with_no_running_sighting_keeps_it(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """The pull-back-at-unload shape: the fault is raised while the job is ENDING,
+        so the job completes with nothing ever having run through the path afterwards.
+        No push is sampled here at all, which is what that looks like on the wire."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, row = await self._physical_hold(db_session, printer, monkeypatch)
+        # The wire goes QUIET at the terminal — the firmware wipes its standing HMS list
+        # there — WITHOUT any push ever having read RUNNING. Clearing it is what isolates
+        # the running-sighting qualifier: leave the fault standing and ``path_quiet``
+        # refuses first, and this case would pass without testing anything (caught by
+        # mutation, 2026-09-17).
+        state.hms_errors = []
+        assert incident_resolution.ledger.running_seen_at(printer.id) is None
+
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal(job_id=row.job_id)) is False
+
+        held = await _incident_row(db_session, printer.id)
+        assert held is not None and held.status == "escalated"
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is True
+
+    async def test_a_running_eject_never_enters_the_ledger(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """The eject exclusion is asked at STAMP time, not only at the terminal.
+
+        A sweep drives the printer RUNNING like any other job. If that reading entered
+        the ledger, a later completion would find a "print ran through the path"
+        sighting that was never a print — so the sampler asks the plate authority before
+        it writes, and the evidence simply never exists.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+
+        from backend.app.services.plate_occupancy import EscalationOnly, PendingEject, plate_occupancy
+
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, row = await self._physical_hold(db_session, printer, monkeypatch)
+
+        plate_occupancy.hydrate_plate(printer.id, row.job_id, EscalationOnly())
+        plate_occupancy.hydrate_eject(
+            printer.id,
+            PendingEject(
+                purpose="manual",
+                run_id=None,
+                queue_item_id=None,
+                dispatched_at=_dt.now(_tz.utc),
+                started_at=None,
+                hydrated=True,
+            ),
+        )
+
+        await self._running_push(printer, state, monkeypatch)
+
+        assert incident_resolution.ledger.running_seen_at(printer.id) is None, (
+            "an eject sweep's RUNNING must never be recorded as a print through the path"
+        )
+        # ...and the completion that follows it therefore closes nothing.
+        assert await spool_recovery.on_job_terminal(printer.id, _terminal(job_id=row.job_id)) is False
+        held = await _incident_row(db_session, printer.id)
+        assert held is not None and held.resolved_at is None
 
     async def test_a_later_push_upgrades_a_jam_and_the_driver_hands_over(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
@@ -5910,7 +6097,7 @@ class TestPhysicalHoldsOutliveTheJob:
         # The path is freed and a slot loads cleanly: the fault leaves the wire and the
         # sampler stamps a completed load AFTER the row opened.
         state.hms_errors = []
-        spool_recovery._load_completed_at[printer.id] = row.created_at + timedelta(seconds=1)
+        _stamp_load_edge(printer.id, row.created_at + timedelta(seconds=1))
 
         assert await spool_recovery.sweep_open_incidents(now=0.0) == 0  # dwell seeded; the resume goes out now
         for _name, task in spawned:
@@ -5955,7 +6142,7 @@ class TestPhysicalHoldsOutliveTheJob:
         assert await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD) is not None
 
         state.hms_errors = []
-        spool_recovery._load_completed_at[printer.id] = row.created_at + timedelta(seconds=1)
+        _stamp_load_edge(printer.id, row.created_at + timedelta(seconds=1))
 
         assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
         for _name, task in spawned:
@@ -6789,20 +6976,12 @@ def test_every_give_up_inside_the_loop_goes_through_one_boundary():
 
 
 def test_no_second_slot_rendering_in_the_module():
-    """One origin for the human slot name. An f-string spelling a slot anywhere but
-    `runout_slot_desc` is the defect this wave closed — three renderings, one right."""
+    """One origin for the human slot name. The owner is `printer_incidents.runout_slot_desc`
+    (the incident-resolution wave moved it there, 2026-09-17), so NO f-string in this module
+    may spell a slot — three 0-indexed renderings here were the defect this wave closed."""
     module = _module_ast()
-    owner = next(
-        n
-        for n in ast.walk(module)
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "runout_slot_desc"
-    )
-    allowed = {id(n) for n in ast.walk(owner) if isinstance(n, ast.JoinedStr)}
-
     offenders = [
-        ast.unparse(n)
-        for n in ast.walk(module)
-        if isinstance(n, ast.JoinedStr) and id(n) not in allowed and "slot {" in ast.unparse(n)
+        ast.unparse(n) for n in ast.walk(module) if isinstance(n, ast.JoinedStr) and "slot {" in ast.unparse(n)
     ]
 
     assert offenders == [], f"slot names must render through runout_slot_desc: {offenders}"

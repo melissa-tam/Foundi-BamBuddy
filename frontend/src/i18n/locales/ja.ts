@@ -882,10 +882,13 @@ export default {
       recoverMessageWithReason: '"{{name}}" を復旧しますか？理由: {{reason}}。これは次を実行する明示的なオーバーライドです:',
       recoverEffectPlate: '• プレート保留を解除',
       recoverEffectQuarantine: '• 隔離を解除',
-      recoverEffectResume: '• 一時停止中のランを再開',
+      recoverEffectLease: '• ディスパッチ予約を解放',
       recoverEffectEject: '• 実行中の排出を破棄',
+      recoverEffectFault: '• 未解決の機器故障をクローズ',
+      recoverEffectResume: '• 一時停止中のランを再開',
+      recoverClosedFault: '機器故障をクローズしました',
       markPlateCleared: 'プレートをクリア済みにする',
-      actionsHelp: '復旧して再開は隔離を解除し一時停止中のランを再開します。プレートをクリア済みにするはプレートのロックのみ解除します。',
+      actionsHelp: '復旧して再開はこのプリンターを保持しているもの（プレート、予約、排出、隔離、機器故障）を解除し、一時停止中のランを再開します。プレートをクリア済みにするはプレートのロックのみ解除します。',
     },
     phase: {
       printing: '印刷中',
@@ -931,6 +934,7 @@ export default {
       ejectInProgress: '排出実行中 · {{age}}',
       ejectStalled: '排出が停滞 · {{age}} — ファームがスイープを追跡できなくなりました',
       menuRecover: 'プリンターを復旧',
+      clearedClosedFault: '機器故障をクローズしました',
     },
     // 手動排出（W2）＋ 新しいスプールの通知（W6）
     eject: {
@@ -1240,7 +1244,7 @@ export default {
     incidentAction: {
       jam: 'AMSのフィラメント経路を解消してから印刷を再開してください',
       runout: '要求されたスロットに補充してください。印刷は自動で再開します',
-      physical: 'プリンター側でフィラメント経路を解消してから印刷を再開してください',
+      physical: 'フィラメント経路がブロックされています。スロットのロード、中断した印刷がその経路で完了、または復旧で解除されます。',
       power_loss: 'プリンター側で再開してください',
       plate_vision: 'ベッドを片付けてから「プレートをクリア済みにする」',
       z_reference_lost: '部品がプレートに載ったまま再起動 — 手で取り除いてから「プレートをクリア済みにする」',

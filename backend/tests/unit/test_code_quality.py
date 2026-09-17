@@ -211,6 +211,156 @@ class TestImportShadowing:
             pytest.fail(error_msg)
 
 
+# --- The equipment-fault resolution family (2026-09-17) -----------------------------
+
+# WHO may read the resolution-class vocabulary. The four class literals and the
+# ``RESOLVES_ON`` table they key are the rule's own words: the model DEFINES them, the
+# store reads them into one pure function, the rule table turns them into verdicts, and
+# the incidents read surface reports the class as data. Anybody else spelling one is a
+# SIXTH closer being born — which is the shape this wave existed to end (011-H2S
+# 2026-09-17: six closers each carrying their own ``if resolution == …`` chain, so a new
+# evidence had to be added in six places and was therefore added in none).
+_RESOLUTION_VOCABULARY_OWNERS = {
+    ("models", "printer_incident.py"),
+    ("services", "printer_incidents.py"),
+    ("services", "incident_resolution.py"),
+    ("api", "routes", "incidents.py"),
+}
+
+_RESOLUTION_LITERALS = {
+    "RESOLUTION_WIRE",
+    "RESOLUTION_REPAIR",
+    "RESOLUTION_OPERATOR",
+    "RESOLUTION_DECLARED",
+    "RESOLVES_ON",
+}
+
+# WHO may end an equipment-fault row. The family's own closers plus the TWO lanes the
+# rule table's module docstring DECLARES as out-of-table, each because it owns state the
+# table cannot see:
+#   * ``farm_policy``  — the plate-vision first-trip re-check (the windowed trip count,
+#                        the vouching test, the gate it raises when it cannot vouch);
+#   * ``service_hold`` — ``exit``, the declared hold's own and only counterpart verb.
+# A close appearing anywhere else fails this test BY CONSTRUCTION. That is the point:
+# the allowlist is a declaration, so a new closer has to be argued for in a diff rather
+# than added in silence.
+_INCIDENT_CLOSERS = {
+    ("services", "printer_incidents.py"),  # defines it
+    ("services", "spool_recovery.py"),
+    ("services", "pause_recovery.py"),
+    ("services", "farm_policy.py"),
+    ("services", "service_hold.py"),
+}
+
+
+def _relative_parts(py_file: Path) -> tuple[str, ...]:
+    return py_file.relative_to(BACKEND_DIR).parts
+
+
+def _scan_resolution_vocabulary(py_file: Path) -> list[tuple[str, int]]:
+    """Every USE (never a mention in prose) of a class literal or ``resolution_class``.
+
+    AST, not grep: the four literals are named in docstrings and comments all over this
+    codebase — that is documentation, and pinning it would make the rule unwritable.
+    Only ``Name`` / ``Attribute`` / ``Call`` nodes count.
+    """
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _RESOLUTION_LITERALS:
+            hits.append((node.id, node.lineno))
+        elif isinstance(node, ast.Attribute) and node.attr in _RESOLUTION_LITERALS:
+            hits.append((node.attr, node.lineno))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "resolution_class":
+                hits.append(("resolution_class()", node.lineno))
+    return hits
+
+
+def _scan_incident_closes(py_file: Path) -> list[tuple[str, int]]:
+    """Every call that ENDS an incident row: ``printer_incidents.close`` and the bulk
+    ``close_open_for_printer``, however the module was imported."""
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            owner = func.value
+            qualified = isinstance(owner, ast.Name) and owner.id == "printer_incidents"
+            if func.attr == "close_open_for_printer" or (qualified and func.attr == "close"):
+                hits.append((f"printer_incidents.{func.attr}()", node.lineno))
+        elif isinstance(func, ast.Name) and func.id == "close_open_for_printer":
+            hits.append(("close_open_for_printer()", node.lineno))
+    return hits
+
+
+class TestIncidentResolutionOwnership:
+    """The resolution rule has ONE owner, and rows are ended in declared places only.
+
+    Both scans are SOURCE pins rather than behaviour pins, deliberately: the failure
+    they catch is a correct-looking new branch in the wrong module, which every
+    behaviour test in the suite would happily pass.
+    """
+
+    def test_the_class_vocabulary_stays_inside_the_family(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts in _RESOLUTION_VOCABULARY_OWNERS:
+                continue
+            for symbol, line in _scan_resolution_vocabulary(py_file):
+                strays.append(f"  - {'/'.join(parts)}:{line} uses {symbol}")
+
+        if strays:
+            pytest.fail(
+                "The resolution-class vocabulary escaped its owners:\n"
+                + "\n".join(strays)
+                + "\n\nAsk incident_resolution.resolve(row, occasion, ctx) instead — the class "
+                "literals belong to the rule table, and a closer that reads them is a second "
+                "copy of the rule."
+            )
+
+    def test_only_declared_lanes_close_an_incident(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts in _INCIDENT_CLOSERS:
+                continue
+            for symbol, line in _scan_incident_closes(py_file):
+                strays.append(f"  - {'/'.join(parts)}:{line} calls {symbol}")
+
+        if strays:
+            pytest.fail(
+                "A new equipment-fault closer appeared outside the declared lanes:\n"
+                + "\n".join(strays)
+                + "\n\nThe family's closers live in spool_recovery / pause_recovery and select "
+                "their lane through incident_resolution's table; farm_policy (plate-vision "
+                "first-trip re-check) and service_hold.exit are the two DECLARED exceptions, "
+                "named in incident_resolution's module docstring. A third needs the same "
+                "declaration."
+            )
+
+    def test_the_allowlisted_lanes_are_still_there(self):
+        """The liveness half. An allowlist whose entries have all moved away silently
+        stops policing anything, and both scans would then pass on an empty set."""
+        found_vocabulary = {
+            parts
+            for parts in (_relative_parts(f) for f in get_python_files(BACKEND_DIR))
+            if parts in _RESOLUTION_VOCABULARY_OWNERS
+        }
+        assert found_vocabulary == _RESOLUTION_VOCABULARY_OWNERS
+
+        # ``printer_incidents`` DEFINES the verb rather than calling it through the
+        # module name, so it is allowlisted but never a hit — every other entry must be.
+        callers = _INCIDENT_CLOSERS - {("services", "printer_incidents.py")}
+        closers_with_a_close = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_incident_closes(f)}
+        assert closers_with_a_close == callers
+
+
 class TestModuleImports:
     """Tests for module import health."""
 

@@ -883,10 +883,13 @@ export default {
       recoverMessageWithReason: 'Ripristinare "{{name}}"? Motivo: {{reason}}. È una forzatura esplicita che:',
       recoverEffectPlate: '• Rimuove il blocco del piano',
       recoverEffectQuarantine: '• Rimuove la quarantena',
-      recoverEffectResume: '• Riprende la serie in pausa',
+      recoverEffectLease: '• Rilascia la prenotazione di dispatch',
       recoverEffectEject: '• Annulla l\'espulsione in corso',
+      recoverEffectFault: '• Chiude il guasto apparecchiatura aperto',
+      recoverEffectResume: '• Riprende la serie in pausa',
+      recoverClosedFault: 'Guasto apparecchiatura chiuso',
       markPlateCleared: 'Segna il piatto come liberato',
-      actionsHelp: 'Recupera e riprendi rimuove la quarantena e riprende la serie in pausa. Segna il piatto come liberato rilascia solo il blocco del piatto.',
+      actionsHelp: 'Recupera e riprendi rilascia tutto ciò che blocca questa stampante — piatto, prenotazione, espulsione, quarantena, guasto apparecchiatura — e riprende la serie in pausa. Segna il piatto come liberato rilascia solo il blocco del piatto.',
     },
     phase: {
       printing: 'In stampa',
@@ -932,6 +935,7 @@ export default {
       ejectInProgress: 'Espulsione in corso · {{age}}',
       ejectStalled: 'Espulsione bloccata · {{age}} — la farm ha perso traccia della spazzata',
       menuRecover: 'Ripristina stampante',
+      clearedClosedFault: 'Guasto apparecchiatura chiuso',
     },
     // Espulsione manuale (W2) + avviso nuova bobina (W6)
     eject: {
@@ -1241,7 +1245,7 @@ export default {
     incidentAction: {
       jam: 'Libera il percorso del filamento dell\'AMS, poi riprendi la stampa',
       runout: 'Ricarica lo slot richiesto; la stampa riprende da sola',
-      physical: 'Libera il percorso del filamento sulla stampante, poi riprendi la stampa',
+      physical: 'Percorso del filamento bloccato. Si risolve al caricamento di uno slot, quando la stampa interrotta termina attraverso il percorso, o con Ripristina.',
       power_loss: 'Riprendi sulla stampante',
       plate_vision: 'Libera il piano, poi «Segna il piatto come liberato»',
       z_reference_lost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano, poi «Segna il piatto come liberato»',

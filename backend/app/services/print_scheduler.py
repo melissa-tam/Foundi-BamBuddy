@@ -2842,7 +2842,7 @@ class PrintScheduler:
             if not backup_on:
                 return
 
-            from backend.app.services.spool_recovery import runout_slot_desc
+            from backend.app.services.printer_incidents import runout_slot_desc
             from backend.app.services.spool_respool import decode_global_tray, encode_global_tray
 
             status = printer_manager.get_status(printer_id)

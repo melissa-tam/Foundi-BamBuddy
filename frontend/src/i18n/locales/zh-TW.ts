@@ -883,10 +883,13 @@ export default {
       recoverMessageWithReason: '復原 "{{name}}"？原因：{{reason}}。這是一次明確的覆寫操作，將會：',
       recoverEffectPlate: '• 解除板料保持',
       recoverEffectQuarantine: '• 解除隔離',
-      recoverEffectResume: '• 繼續已暫停的執行',
+      recoverEffectLease: '• 釋放派發佔用',
       recoverEffectEject: '• 放棄進行中的彈出',
+      recoverEffectFault: '• 關閉未結的設備故障',
+      recoverEffectResume: '• 繼續已暫停的執行',
+      recoverClosedFault: '設備故障已關閉',
       markPlateCleared: '將列印板標記為已清理',
-      actionsHelp: '恢復並繼續會解除隔離並繼續已暫停的執行。將列印板標記為已清理僅解除列印板鎖定。',
+      actionsHelp: '復原並繼續會解除此印表機的所有保持（列印板、派發佔用、彈出、隔離、設備故障）並繼續已暫停的執行。將列印板標記為已清理僅解除列印板鎖定。',
     },
     phase: {
       printing: '列印中',
@@ -932,6 +935,7 @@ export default {
       ejectInProgress: '彈出進行中 · {{age}}',
       ejectStalled: '彈出停滯 · {{age}} — 農場已失去對清掃的追蹤',
       menuRecover: '復原印表機',
+      clearedClosedFault: '設備故障已關閉',
     },
     // 手動彈出（W2）+ 新料卷提示（W6）
     eject: {
@@ -1241,7 +1245,7 @@ export default {
     incidentAction: {
       jam: '清理 AMS 送料通道，然後繼續列印',
       runout: '為所要求的槽位補充耗材；列印會自動繼續',
-      physical: '在印表機上清理耗材通道，然後繼續列印',
+      physical: '耗材通道受阻。載入槽位、被中斷的列印經該通道完成，或執行復原後解除。',
       power_loss: '請在印表機上繼續',
       plate_vision: '清理熱床後點選「將列印板標記為已清理」',
       z_reference_lost: '重新啟動時列印板上仍有零件 — 手動取下後點選「將列印板標記為已清理」',

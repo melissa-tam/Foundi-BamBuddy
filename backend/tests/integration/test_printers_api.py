@@ -336,6 +336,43 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_recover_reports_incidents_closed(self, async_client: AsyncClient, printer_factory, db_session):
+        """Recover names the equipment fault it ended.
+
+        011-H2S 2026-09-17: the operator pressed Recover against an escalated physical
+        row and got ``{plate_cleared: false, quarantine_cleared: false, runs_resumed:
+        []}`` — a response indistinguishable from "this verb did nothing", on the one
+        verb that was going to work. The hold's own kind is the answer.
+        """
+        from backend.app.models.printer_incident import KIND_PHYSICAL, STATUS_ESCALATED
+        from backend.app.services import printer_incidents
+
+        printer = await printer_factory(name="Recover Closes Fault Printer")
+        incident = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="job-1",
+            item_id=None,
+            kind=KIND_PHYSICAL,
+            code="0700_0011",
+            codes="physical_fault:0700_0011",
+            slot_global_tray=2,
+            status=STATUS_ESCALATED,
+        )
+        assert incident is not None
+
+        response = await async_client.post(f"/api/v1/printers/{printer.id}/recover")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["incidents_closed"] == ["physical"]
+        # ...and it is the ROW that moved, not just the sentence.
+        db_session.expunge_all()
+        assert (await printer_incidents.get_open(db_session, printer.id)) is None
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_recover_unknown_printer_404(self, async_client: AsyncClient):
         """POST /{id}/recover on an unknown printer returns 404."""
         response = await async_client.post("/api/v1/printers/9999/recover")
@@ -550,6 +587,86 @@ class TestPrintersAPI:
         assert occupancy["eject"]["age_s"] is not None
         assert "owner" not in occupancy
 
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("connected", [False, True])
+    async def test_printers_status_open_incident(
+        self, async_client: AsyncClient, printer_factory, db_session, connected
+    ):
+        """BOTH ``/status`` branches carry ``open_incident``, ``operator_exits`` included.
+
+        011-H2S 2026-09-17: the payload was built in the WS serializer only, so the poll
+        never carried it and ``PrinterStatus`` did not even declare the field — which is
+        why the card could not learn from the RULE that Recover would end that hold and
+        gated the verb on an occupancy claim the printer did not have.
+
+        The incident store's record is not a wire fact, so it reports with or without a
+        session — exactly like maintenance mode — and both branches read the one builder
+        so the chip cannot appear on the socket and vanish on the next poll.
+        """
+        from backend.app.models.printer_incident import KIND_PHYSICAL, STATUS_ESCALATED
+        from backend.app.services import printer_incidents
+        from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name=f"Open Incident Printer {connected}")
+        incident = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="job-1",
+            item_id=None,
+            kind=KIND_PHYSICAL,
+            code="0700_0011",
+            codes="physical_fault:0700_0011",
+            slot_global_tray=2,
+            status=STATUS_ESCALATED,
+        )
+        assert incident is not None
+
+        state = None
+        if connected:
+            state = PrinterState()
+            state.connected = True
+            state.state = "IDLE"
+        try:
+            with patch.object(printer_manager, "get_status", return_value=state):
+                response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["connected"] is connected
+            open_incident = body["open_incident"]
+            assert open_incident is not None, "the equipment-fault chip must survive both branches"
+            assert open_incident["kind"] == "physical"
+            assert open_incident["status"] == "escalated"
+            assert open_incident["slot_desc"] == "AMS A slot 3"
+            # THE field: an AMS physical fault is repair-resolved, and Recover is its
+            # third return-to-normal — so the card may offer the verb with no gate and
+            # no quarantine anywhere in sight.
+            assert open_incident["operator_exits"] is True
+        finally:
+            # This case deliberately leaves the row OPEN, and the store's projection
+            # cache is process state whose keys (printer ids) restart at 1 per test.
+            # Drop it rather than leaving a hold for the next case to inherit.
+            printer_incidents._reset_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_printers_status_open_incident_is_null_when_nothing_is_held(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
+        """No open row ⇒ no chip. A cache miss can never invent a hold."""
+        from backend.app.services import printer_incidents
+        from backend.app.services.printer_manager import printer_manager
+
+        printer_incidents._reset_state()
+        printer = await printer_factory(name="Unheld Printer")
+        with patch.object(printer_manager, "get_status", return_value=None):
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["open_incident"] is None
+
     # ========================================================================
     # Clear-plate: the operator's plate acknowledgment
     # ========================================================================
@@ -607,6 +724,10 @@ class TestPrintersAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/clear-plate")
 
         assert response.status_code == 200, response.text
+        # test_clear_plate_reports_incidents_closed: the routine verb names what it
+        # ended too, so an operator can tell a clear that answered a hold from one that
+        # only released a gate.
+        assert response.json()["incidents_closed"] == ["z_reference_lost"]
         assert plate_occupancy.is_plate_occupied(printer.id) is False
         assert printer_incidents.snapshot(printer.id) is None
         db_session.expunge_all()

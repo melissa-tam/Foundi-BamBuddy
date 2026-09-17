@@ -1278,10 +1278,20 @@ def occupancy_payload(printer_id: int | None) -> dict | None:
     }
 
 
-def _open_incident_payload(printer_id: int | None) -> dict | None:
-    """The printer's OPEN AMS incident as ``{kind, status, slot_desc, created_at}``,
-    or None. A projection of the durable row, cached in memory (WS2b) — a cache miss
-    renders no chip and can never invent a hold."""
+def open_incident_payload(printer_id: int | None) -> dict | None:
+    """The printer's highest-precedence OPEN incident as a wire dict, or None.
+
+    ``{id, kind, status, slot_desc, created_at, operator_exits}`` — a projection of the
+    durable row, read from the incident store's in-memory cache (WS2b). A cache miss
+    renders no chip and can never invent a hold.
+
+    PUBLIC, and ONE builder for all three construction sites (the WS serializer below
+    and BOTH REST ``/status`` branches), for the same reason
+    :func:`service_hold_payload` is one: a fact the printer never pushes must not be
+    able to read differently on the socket and on the poll. It was WS-only until
+    2026-09-17, which is why ``GET /printers/{id}/status`` could not tell the card that
+    a hold offers the Recover verb (011-H2S).
+    """
     if not printer_id:
         return None
     from backend.app.services import printer_incidents
@@ -1637,13 +1647,14 @@ def printer_state_to_dict(
         # whether an eject is in flight and has actually started. STORED fields only —
         # see occupancy_payload for why there is no owner here.
         "occupancy": occupancy_payload(printer_id),
-        # Open AMS incident (WS2b): {kind, status, slot_desc, created_at} or null.
+        # Open incident (WS2b): {id, kind, status, slot_desc, created_at,
+        # operator_exits} or null. Same builder as BOTH /status branches.
         # A FOREIGN print's hold has no queue row and therefore no waiting_reason
         # chip anywhere in the UI — this is the only place it can be seen. Read from
         # the incident store's in-memory projection, never the DB: this serializer
         # runs on every status broadcast. Lazy import for the same reason
         # _eject_watch_payload is lazy (the service imports this module).
-        "open_incident": _open_incident_payload(printer_id),
+        "open_incident": open_incident_payload(printer_id),
         # Maintenance mode (2026-09-12): {"since": iso} or null. Beside the incident
         # chip and from the same store, but its OWN field and its own kind-scoped
         # snapshot — the chip names the fault that stopped the work, while this names a

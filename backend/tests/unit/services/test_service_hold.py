@@ -595,9 +595,9 @@ class TestOnlyItsOwnVerbEndsTheHold:
         printer = await printer_factory()
         await service_hold.enter(db_session, printer.id, actor="raymond")
 
-        closed_any = await pause_recovery.on_plate_cleared(printer.id, recover=False)
+        closed = await pause_recovery.on_plate_cleared(printer.id, recover=False)
 
-        assert closed_any is False
+        assert closed == []
         assert printer_incidents.automation_held(printer.id) is True
         assert await printer_incidents.get_open(db_session, printer.id, kinds={KIND_SERVICE_HOLD}) is not None
 
@@ -608,5 +608,8 @@ class TestOnlyItsOwnVerbEndsTheHold:
         result = await farm_policy.recover_printer(db_session, printer.id)
 
         assert result["quarantine_cleared"] is False
+        # ...and the verb REPORTS that it closed nothing, rather than leaving the
+        # operator to infer it from a chip that stayed lit.
+        assert result["incidents_closed"] == []
         assert printer_incidents.automation_held(printer.id) is True
         assert await printer_incidents.get_open(db_session, printer.id, kinds={KIND_SERVICE_HOLD}) is not None

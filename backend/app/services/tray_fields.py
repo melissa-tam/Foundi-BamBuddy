@@ -78,6 +78,38 @@ TRAY_PRESENT_STATES = (TRAY_STATE_SEATED, TRAY_STATE_FED)
 # need the stride, and two spellings of it would silently address different slots.
 TRAYS_PER_AMS_UNIT = 4
 
+# The two ``tray_now`` values that are NOT trays. The firmware reports the feeder
+# currently engaged as a global tray id, and reserves the top of the byte for two
+# statements about the ABSENCE of an AMS feeder: 254 = the external spool holder is
+# feeding (no AMS slot involved at all), 255 = nothing is feeding. Both read as
+# perfectly ordinary integers, which is exactly why they are named here rather than
+# spelled at each call: a consumer that treats 255 as a slot sends an operator to a
+# tray that does not exist, and a load "completing onto feeder 255" is the absence of
+# a load being read as its evidence.
+TRAY_NOW_EXTERNAL_SPOOL = 254
+TRAY_NOW_NOTHING_FED = 255
+
+
+def valid_feeder(value: object) -> int | None:
+    """A ``tray_now``-style value that names a REAL AMS feeder (0..253), else ``None``.
+
+    The ONE reading of "is this a slot?" for every consumer of a feeder id. It lives
+    here, with the tray vocabulary, for the reason invariant 1 states: a magic tray
+    value gets one origin, beside the parsers that read the field — and the two
+    consumers are otherwise on opposite sides of the graph (``spool_recovery``'s
+    jammed-feeder resolution and the motion ledger in ``incident_resolution``), so a
+    home in either would have made one import the other. This module is a leaf both
+    already depend on.
+
+    ``None`` for anything unparseable and for the two sentinels: neither is something
+    the swap machine can unload, nor a slot an operator can be sent to, nor a feeder a
+    filament change can complete ONTO.
+    """
+    tray = parse_int_field(value)
+    if tray is None:
+        return None
+    return tray if 0 <= tray < TRAY_NOW_EXTERNAL_SPOOL else None
+
 
 def parse_int_field(raw: object) -> int | None:
     """Parse a numeric tray field to ``int``, or ``None`` when it asserts nothing.

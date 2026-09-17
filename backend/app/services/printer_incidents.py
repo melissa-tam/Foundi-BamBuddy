@@ -64,6 +64,8 @@ from backend.app.models.printer_incident import (
     KIND_RUNOUT,
     KIND_SERVICE_HOLD,
     KIND_Z_REFERENCE_LOST,
+    RESOLUTION_OPERATOR,
+    RESOLUTION_REPAIR,
     RESOLUTION_WIRE,
     RESOLVE_AUTO_RESUME,
     RESOLVE_DRIVER_SELF_HEAL,
@@ -213,6 +215,53 @@ def resolution_class(kind: str, *, external: bool = False) -> str:
     return RESOLVES_ON.get((kind, False), RESOLUTION_WIRE)
 
 
+def closed_by_recover(kind: str, *, external: bool = False) -> bool:
+    """Does the operator's **Recover** verb end a hold of this kind on this hardware?
+
+    Pure over the same ``RESOLVES_ON`` table :func:`resolution_class` reads, stated
+    ONCE here so the rule table and the WIRE agree by construction. Two classes say
+    yes, for two different reasons, and both are the same statement from the operator's
+    side — "I went to the machine and dealt with it":
+
+    * ``operator`` — the evidence IS a human act (a part off the plate, a Z datum
+      re-established), so both plate verbs end it;
+    * ``repair`` — Recover means "an operator inspected this machine", which is the
+      third return-to-normal the class admits beside its two motion evidences. (A
+      ROUTINE clear-plate does not; this answers the weaker question "can Recover end
+      it", which is what the card needs to decide whether to offer the verb.)
+
+    ``wire`` says no — a runout hold is not answered by somebody clearing a plate —
+    and ``declared`` says no by definition: a hold a human declared ends only through
+    the verb that declared it.
+
+    It exists because the printer card had to derive the affordance from the CLASS to
+    know whether Recover applies, and the class vocabulary must not reach the wire:
+    ``_payload`` projects this boolean as ``operator_exits`` instead (011-H2S
+    2026-09-17 — a physical hold on an idle printer offered no Recover at all, because
+    the card gated it on an occupancy claim the printer did not have).
+    """
+    return resolution_class(kind, external=external) in (RESOLUTION_OPERATOR, RESOLUTION_REPAIR)
+
+
+def runout_slot_desc(global_tray: int | None) -> str | None:
+    """Human slot name for a regular AMS global tray ("AMS A slot 1").
+
+    Letter = ``A + g//4``, slot = ``g%4 + 1``. ``None`` for AMS-HT / external /
+    unresolved trays — they have no clean letter+slot mapping, and rendering a wrong
+    place is worse than rendering none.
+
+    It lives HERE, with the store that owns the kinds, because it is the vocabulary of
+    an incident's location and every consumer of it is an incident reader: the chip
+    (:func:`slot_desc`), ``spool_recovery``'s escalation + guidance refresh, and
+    ``farm_stall``'s hourly reminder. It used to live in ``spool_recovery`` and be
+    call-time-imported from here, which made the edge bidirectional for one pure
+    three-liner — one origin for the wording, one direction for the import.
+    """
+    if global_tray is None or not (0 <= global_tray <= 127):
+        return None
+    return f"AMS {chr(ord('A') + global_tray // 4)} slot {global_tray % 4 + 1}"
+
+
 def row_external(incident: PrinterIncident) -> bool:
     """Is this row's fault on the EXTERNAL spool holder?
 
@@ -280,11 +329,8 @@ def slot_desc(incident: PrinterIncident) -> str | None:
     to identify. That is precisely the misreading the 003-H2S incident acted on.
     """
     if incident.slot_global_tray is not None:
-        # Function-level import: spool_recovery imports THIS module at module level,
-        # and its ``runout_slot_desc`` is the one origin for the wording (the
-        # escalation, the reminder and this chip must never disagree).
-        from backend.app.services.spool_recovery import runout_slot_desc
-
+        # :func:`runout_slot_desc` above is the one origin for the wording — the
+        # escalation, the reminder and this chip must never disagree.
         return runout_slot_desc(incident.slot_global_tray)
     return "external" if row_external(incident) else None
 
@@ -294,6 +340,15 @@ def _payload(incident: PrinterIncident) -> dict:
 
     ``id`` rides along so a reader can ask about ONE row rather than about whatever
     is open now (see :func:`cached_kind`); the UI ignores it.
+
+    ``operator_exits`` is :func:`closed_by_recover` — "would Recover end this hold" —
+    and it is deliberately the BOOLEAN rather than the class: the card needs the
+    affordance, not the vocabulary, and a UI that branched on ``"repair"`` would own a
+    copy of the rule table. It is what lets the printer card offer Recover on a hold
+    that raised no plate gate and no quarantine (011-H2S 2026-09-17, and the
+    ``z_reference_lost`` hold before it).
+
+    Only JSON PRIMITIVES: the WS lane serializes this dict with a bare ``json.dumps``.
     """
     return {
         "id": incident.id,
@@ -301,6 +356,7 @@ def _payload(incident: PrinterIncident) -> dict:
         "status": incident.status,
         "slot_desc": slot_desc(incident),
         "created_at": incident.created_at.isoformat() if incident.created_at else None,
+        "operator_exits": closed_by_recover(incident.kind, external=row_external(incident)),
     }
 
 
