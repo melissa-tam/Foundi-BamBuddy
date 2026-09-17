@@ -56,6 +56,8 @@ class LibraryFile(Base):
     """File stored in the library."""
 
     __tablename__ = "library_files"
+    # A deleted id is never reused — see core.database._rebuild_table_with_autoincrement (005-H2S 2026-09-17).
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     folder_id: Mapped[int | None] = mapped_column(ForeignKey("library_folders.id", ondelete="CASCADE"), nullable=True)

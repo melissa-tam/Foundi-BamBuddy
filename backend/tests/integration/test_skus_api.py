@@ -125,6 +125,11 @@ class TestSkuFiles:
         assert len(detail["files"]) == 1
 
     async def test_add_file_link_no_gcode_on_plate_422(self, async_client, db_session, tmp_path):
+        """A catalog link must pin an ACTUALLY-SLICED plate.
+
+        The route asks the shared ``list_gcode_plate_ids`` reader now (it hand-scanned
+        the namelist before, solely to dodge a first-gcode fallback that no longer
+        exists) — the 422 and its wording are unchanged."""
         r = await async_client.post("/api/v1/skus", json={"code": "SKU008.01", "name": "NoPlate"})
         sid = r.json()["id"]
         lib = await _add_library_file(db_session, tmp_path, name="p1.gcode.3mf")  # only plate 1
@@ -133,6 +138,21 @@ class TestSkuFiles:
             json={"library_file_id": lib.id, "plate_index": 3, "units_per_plate": 1},
         )
         assert resp.status_code == 422
+        assert resp.json()["detail"] == "Plate 3 has no G-code in the 3MF"
+
+    async def test_add_file_link_unreadable_3mf_422(self, async_client, db_session, tmp_path):
+        """A file that is not a ZIP at all keeps its OWN message — "no G-code on that
+        plate" and "this is not a 3MF" are different things to tell an operator."""
+        r = await async_client.post("/api/v1/skus", json={"code": "SKU008.02", "name": "NotA3mf"})
+        sid = r.json()["id"]
+        lib = await _add_library_file(db_session, tmp_path, name="corrupt.gcode.3mf")
+        (tmp_path / "corrupt.gcode.3mf").write_bytes(b"not a zip at all")
+        resp = await async_client.post(
+            f"/api/v1/skus/{sid}/files",
+            json={"library_file_id": lib.id, "plate_index": 1, "units_per_plate": 1},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "Library file is not a readable 3MF"
 
     async def test_add_file_link_missing_file_404(self, async_client, db_session, tmp_path):
         r = await async_client.post("/api/v1/skus", json={"code": "SKU009.01", "name": "X"})

@@ -10,6 +10,8 @@ class Project(Base):
     """Project to group related prints (e.g., 'Voron Build' with multiple parts)."""
 
     __tablename__ = "projects"
+    # A deleted id is never reused — see core.database._rebuild_table_with_autoincrement (005-H2S 2026-09-17).
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255))

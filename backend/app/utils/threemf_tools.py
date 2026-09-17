@@ -748,7 +748,9 @@ def inject_gcode_into_3mf(
         end_gcode: G-code to append, or None.
 
     Returns:
-        Path to temp file with injected G-code, or None if injection failed.
+        Path to temp file with injected G-code, or None if injection failed —
+        including when the container carries no ``plate_{plate_id}.gcode`` member
+        (the injection has no target; another plate is never substituted).
         Caller is responsible for cleaning up the temp file.
     """
     if not start_gcode and not end_gcode:
@@ -782,15 +784,23 @@ def inject_gcode_into_3mf(
 
 
 def _find_target_gcode_name(namelist: list[str], plate_id: int) -> str | None:
-    """Pick the gcode member for `plate_id` (falling back to the first gcode)."""
-    all_gcode = [f for f in namelist if f.endswith(".gcode")]
-    if not all_gcode:
-        return None
+    """The EXACT ``…/plate_{plate_id}.gcode`` member, or None when it is absent.
+
+    A plate reader answers the plate it was ASKED for, or nothing. There used to be a
+    "fall back to the first gcode member" arm here, and on 2026-09-17 it built an eject
+    for 005-H2S out of a single-plate donor while the dispatcher commanded
+    ``project_file`` plate 3: the firmware looked for ``Metadata/plate_3.gcode``, the
+    container held only ``plate_1.gcode``, and the job went PREPARE → FAILED with
+    "the content of print file is unreadable" (HMS ``0500_0003`` / ``0500_4003``).
+    Every caller already treats None as "this plate is not in this file" (a 422, a
+    ``{}`` header, a refused repack), so the honest answer is the only one that can be
+    acted on. :func:`list_gcode_plate_ids` is how a caller asks WHICH plates exist.
+    """
     plate_pattern = f"plate_{plate_id}.gcode"
-    for f in all_gcode:
+    for f in namelist:
         if f.endswith(plate_pattern):
             return f
-    return all_gcode[0]
+    return None
 
 
 def list_gcode_plate_ids(source_path: Path) -> list[int]:
@@ -815,6 +825,36 @@ def list_gcode_plate_ids(source_path: Path) -> list[int]:
         if m:
             ids.add(int(m.group(1)))
     return sorted(ids)
+
+
+def resolve_plate_id(source_path: Path, filename: str | None) -> int | None:
+    """Pick the ejectable/printable plate id for a container, or None if unresolvable.
+
+    The "which plate does this container actually have" rule, stated ONCE beside
+    :func:`list_gcode_plate_ids` (it lived in ``services.eject.donor`` until
+    2026-09-17, where the farm-unit lane could not reach it without importing the
+    eject package). Prefers a ``plate_(\\d+)`` hint in ``filename`` WHEN that plate
+    actually carries G-code; otherwise the single G-code-bearing plate. Returns None
+    when the file has no G-code plate, or the hint is absent and the choice is
+    ambiguous (several G-code plates) — a blind sweep is never guessed.
+
+    This answers for a caller that has NO recorded plate. A caller that HAS one (a
+    farm queue row's ``plate_id``) validates it against
+    :func:`list_gcode_plate_ids` instead and fails closed when it is absent; it must
+    never fall back to this, because "some other plate of this file" is exactly the
+    wrong answer.
+    """
+    plates = list_gcode_plate_ids(source_path)
+    if not plates:
+        return None
+    m = re.search(r"plate_(\d+)", str(filename or ""))
+    if m:
+        hinted = int(m.group(1))
+        if hinted in plates:
+            return hinted
+    if len(plates) == 1:
+        return plates[0]
+    return None
 
 
 _SLICE_INFO_NAME = "Metadata/slice_info.config"
@@ -1073,8 +1113,10 @@ def read_plate_gcode_header(source_path: Path, plate_id: int, max_bytes: int = 6
 
     Only the leading `max_bytes` of the (potentially hundreds-of-MB) gcode member
     are decompressed — the header block sits at the very top of the file — so this
-    is cheap even on large sliced files. Returns an empty dict if the plate/header
-    can't be read.
+    is cheap even on large sliced files. Returns an empty dict if the header can't be
+    read OR the container carries no ``plate_{plate_id}.gcode`` member: an absent
+    plate is answered ``{}``, never another plate's header
+    (:func:`_find_target_gcode_name`).
     """
     try:
         with zipfile.ZipFile(source_path, "r") as zf:

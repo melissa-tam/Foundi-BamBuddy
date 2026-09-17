@@ -56,6 +56,15 @@ def _clean_occupancy():
     plate_occupancy.reset_for_tests()
 
 
+def _started_80s_ago() -> datetime:
+    """A ``PendingEject.started_at`` for a sweep the printer DID start.
+
+    The stamp is written by the PRINT START echo, so it is the one fact separating "the
+    sweep ran and failed" (a machine fault: quarantine) from "the printer refused the
+    file at setup" (a build fault: page, no quarantine). A nominal eject runs 80-83 s."""
+    return datetime.now(timezone.utc) - timedelta(seconds=80)
+
+
 async def _mk_profile(db, name="ep"):
     prof = EjectProfile(name=name)
     db.add(prof)
@@ -1554,9 +1563,13 @@ class TestOnTerminalEjectHandling:
         ]
 
     async def test_production_failed_keeps_plate_and_quarantines(self, db_session):
+        """A sweep that RAN and then failed is a machine fault: quarantine, as before.
+
+        ``started_at`` is what separates this from the rejected-file branch below — the
+        printer echoed PRINT START, so something moved and the failure is the machine's."""
         printer = await self._mk_printer(db_session, "PEfail")
         batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
-        self._arm(printer.id, PendingEject("production", batch.id, 222))
+        self._arm(printer.id, PendingEject("production", batch.id, 222, started_at=_started_80s_ago()))
 
         with (
             patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
@@ -1590,7 +1603,7 @@ class TestOnTerminalEjectHandling:
             )
         )
         await db_session.commit()
-        self._arm(printer.id, PendingEject("production", batch.id, 223))
+        self._arm(printer.id, PendingEject("production", batch.id, 223, started_at=_started_80s_ago()))
 
         with (
             patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
@@ -1625,10 +1638,12 @@ class TestOnTerminalEjectHandling:
         assert plate_occupancy.is_plate_occupied(printer.id) is False  # plate released
 
     async def test_manual_failed_keeps_plate_no_quarantine(self, db_session):
-        # A manual eject that ends non-completed keeps the plate occupied (fail-closed)
-        # and — unlike production/FA — NEVER quarantines (it owns no run to protect).
+        # A manual eject that STARTED and then ended non-completed keeps the plate
+        # occupied (fail-closed) and — unlike production/FA — NEVER quarantines (it owns
+        # no run to protect). A manual eject the printer never started takes the
+        # rejected-file branch instead (the never-started tests at the end of this class).
         printer = await self._mk_printer(db_session, "MANfail")
-        self._arm(printer.id, PendingEject("manual", None, None))
+        self._arm(printer.id, PendingEject("manual", None, None, started_at=_started_80s_ago()))
 
         with (
             patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client(None)),
@@ -1693,7 +1708,7 @@ class TestOnTerminalEjectHandling:
         fa.status = "completed"
         batch.first_article_state = "awaiting_approval"
         await db_session.commit()
-        self._arm(printer.id, PendingEject("fa", batch.id, fa.id))
+        self._arm(printer.id, PendingEject("fa", batch.id, fa.id, started_at=_started_80s_ago()))
 
         with (
             patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
@@ -1777,6 +1792,225 @@ class TestOnTerminalEjectHandling:
         assert final_printer_id == printer.id
         assert final_view.eject_present is False  # → every stamp on this printer NULLed
         assert final_view.plate_occupied is False
+
+    # -- the printer rejected the eject file (005-H2S 2026-09-17) ------------- #
+    #
+    # A pending eject with NO ``started_at`` that ends anything but "completed" means the
+    # printer refused the job at setup: it never echoed PRINT START, so nothing moved and
+    # nothing swept. That is a FILE fault, not a machine fault — the plate stays gated and
+    # a human is paged with the printer's own codes, but the printer is NOT quarantined
+    # and no run is paused. The incident: an eject built from a re-bound library id packed
+    # the sweep into plate 1 while the dispatcher commanded plate 3, and the printer
+    # answered HMS 0500_4003 "unable to parse the file".
+
+    _REJECTION_HMS = [{"code": "0x4003", "attr": 0x05000400, "module": 0x500, "severity": 3, "full_code": "05004003"}]
+
+    @staticmethod
+    def _page_recorder():
+        """Patch the ONE plate-not-empty page and capture its ``source_detail``."""
+        return patch(
+            "backend.app.services.eject.monitor.notify_plate_not_empty",
+            new_callable=AsyncMock,
+        )
+
+    async def test_never_started_failed_production_eject_pages_and_does_not_quarantine(self, db_session, caplog):
+        printer = await self._mk_printer(db_session, "REJprod")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        self._arm(printer.id, PendingEject("production", batch.id, 555))
+
+        with (
+            caplog.at_level(logging.WARNING, logger="backend.app.services.farm_policy"),
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+            patch.object(farm_policy.printer_manager, "set_quarantined") as set_q,
+            patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock),
+            patch.object(farm_policy.notification_service, "on_run_paused", new_callable=AsyncMock) as paused,
+            self._page_recorder() as page,
+        ):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                None,
+                "failed",
+                completed_subtask_id="SUB-E",
+                hms_errors=self._REJECTION_HMS,
+            )
+
+        assert plate_occupancy.pending_eject_view(printer.id) is None  # job ended → retired
+        view = plate_occupancy.snapshot(printer.id)
+        assert view.plate_occupied is True  # the part is still on the plate
+        assert isinstance(view.plate_policy, EscalationOnly)  # only a human clears it
+        set_q.assert_not_called()  # NOT a machine fault
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
+        paused.assert_not_awaited()  # the run keeps its other printers
+        await db_session.refresh(batch)
+        assert batch.status != "paused"
+        # ONE page, and it names what the printer said and what the operator must do.
+        page.assert_awaited_once()
+        detail = page.await_args.kwargs["source_detail"]
+        assert "rejected the eject file before starting it" in detail
+        assert "0500_4003" in detail  # the code, rendered by the one HMS formatter
+        assert "Mark plate cleared" in detail
+        assert any("rejected the eject file" in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+
+    async def test_never_started_failed_manual_eject_takes_the_same_branch(self, db_session):
+        """Purpose-independent: the branch sits AHEAD of the purpose fork, because a
+        refused file means the same thing whoever asked for the sweep."""
+        printer = await self._mk_printer(db_session, "REJman")
+        self._arm(printer.id, PendingEject("manual", None, None))
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client(None)),
+            patch.object(farm_policy.printer_manager, "set_quarantined") as set_q,
+            self._page_recorder() as page,
+        ):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                None,
+                "failed",
+                completed_subtask_id=None,
+                completed_subtask_name=f"eject_manual_p{printer.id}",
+                hms_errors=self._REJECTION_HMS,
+            )
+
+        view = plate_occupancy.snapshot(printer.id)
+        assert view.plate_occupied is True
+        assert isinstance(view.plate_policy, EscalationOnly)
+        set_q.assert_not_called()
+        page.assert_awaited_once()
+        assert "0500_4003" in page.await_args.kwargs["source_detail"]
+
+    async def test_never_started_failed_fa_eject_neither_approves_nor_quarantines(self, db_session):
+        printer = await self._mk_printer(db_session, "REJfa")
+        batch, _ = await _mk_run(db_session, quantity=3, printer_ids=[printer.id], require_fa=True)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "completed"
+        batch.first_article_state = "awaiting_approval"
+        await db_session.commit()
+        self._arm(printer.id, PendingEject("fa", batch.id, fa.id))
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+            patch.object(farm_policy.printer_manager, "set_quarantined") as set_q,
+            patch.object(
+                farm_policy.notification_service, "on_first_article_approved", new_callable=AsyncMock
+            ) as approved_note,
+            self._page_recorder() as page,
+        ):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                None,
+                "failed",
+                completed_subtask_id="SUB-E",
+                hms_errors=self._REJECTION_HMS,
+            )
+
+        view = plate_occupancy.snapshot(printer.id)
+        assert view.plate_occupied is True
+        assert isinstance(view.plate_policy, EscalationOnly)
+        set_q.assert_not_called()
+        approved_note.assert_not_awaited()
+        await db_session.refresh(batch)
+        assert batch.first_article_state == "awaiting_approval"  # re-approvable after the fix
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
+        page.assert_awaited_once()
+
+    async def test_a_terminal_carrying_no_codes_still_pages(self, db_session):
+        """The page must survive a silent refusal: no HMS list is itself information."""
+        printer = await self._mk_printer(db_session, "REJnohms")
+        self._arm(printer.id, PendingEject("production", None, 556))
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+            self._page_recorder() as page,
+        ):
+            await farm_policy.on_terminal(db_session, printer.id, None, "failed", completed_subtask_id="SUB-E")
+
+        page.assert_awaited_once()
+        assert "no HMS code reported" in page.await_args.kwargs["source_detail"]
+        assert plate_occupancy.is_plate_occupied(printer.id) is True
+
+    async def test_a_page_failure_never_undoes_the_resolve(self, db_session):
+        """The resolve comes FIRST and the page is wrapped: both call sites swallow this
+        function's exceptions, so a raise would leave the pending registered and the 180 s
+        start deadline would page the WRONG sentence ("the firmware ignores a project_file
+        sent while it is busy")."""
+        printer = await self._mk_printer(db_session, "REJboom")
+        self._arm(printer.id, PendingEject("production", None, 557))
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+            patch(
+                "backend.app.services.eject.monitor.notify_plate_not_empty",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("smtp down"),
+            ),
+        ):
+            await farm_policy.on_terminal(db_session, printer.id, None, "failed", completed_subtask_id="SUB-E")
+
+        assert plate_occupancy.pending_eject_view(printer.id) is None  # retired all the same
+        assert plate_occupancy.is_plate_occupied(printer.id) is True  # and still gated
+
+    async def test_a_hydrated_pending_keeps_todays_quarantine(self, db_session):
+        """DIVERGENCE from the capsule's literal predicate (``started_at is None and
+        final_status != 'completed'``), recorded here because the code cannot honestly
+        satisfy it: a HYDRATED pending carries ``started_at=None`` BY CONSTRUCTION — the
+        durable mirror is one timestamp column, not the built artifact — so the stamp
+        alone would read "the printer rejected the file" for every sweep interrupted by a
+        restart, dropping the quarantine AND telling the operator something false.
+
+        The predicate is therefore ``started_at is None and not hydrated``, which is the
+        pairing ``plate_occupancy.expire_eject_start`` already uses for the same reason
+        ("never started" vs "start unknown"). Decision D5 is unchanged — a hydrated
+        terminal was never a never-started one."""
+        printer = await self._mk_printer(db_session, "REJhyd")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        plate_occupancy.hydrate_plate(printer.id, "SUB-E", EscalationOnly())
+        plate_occupancy.hydrate_eject(printer.id, PendingEject("production", batch.id, 559, hydrated=True))
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=None),
+            patch.object(farm_policy.printer_manager, "set_quarantined"),
+            patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock),
+            self._page_recorder() as page,
+        ):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                None,
+                "failed",
+                completed_subtask_id=None,
+                completed_subtask_name="eject_production_item559",
+                hms_errors=self._REJECTION_HMS,
+            )
+
+        assert plate_occupancy.is_plate_occupied(printer.id) is True  # gate kept either way
+        await db_session.refresh(printer)
+        assert printer.quarantined is True  # today's unverified-sweep reaction, unchanged
+        page.assert_not_awaited()  # and NOT the rejected-file sentence
+
+    async def test_a_never_started_COMPLETED_terminal_is_untouched(self, db_session):
+        """Liveness pair: the branch is keyed on the FAILURE too.
+
+        A completed sweep whose start echo was missed (an MQTT drop over a short eject)
+        must still clear the plate — the old behaviour, unchanged."""
+        printer = await self._mk_printer(db_session, "REJok")
+        batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        self._arm(printer.id, PendingEject("production", batch.id, 558))
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
+            self._page_recorder() as page,
+        ):
+            await farm_policy.on_terminal(db_session, printer.id, None, "completed", completed_subtask_id="SUB-E")
+
+        assert plate_occupancy.is_plate_occupied(printer.id) is False  # plate released
+        page.assert_not_awaited()
 
 
 class TestEjectRuntimeExceededMark:

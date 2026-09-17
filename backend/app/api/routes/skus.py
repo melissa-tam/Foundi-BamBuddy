@@ -39,6 +39,7 @@ from backend.app.services.sku_catalog import (
     parse_sku_suggestion,
     resolve_file_capabilities,
 )
+from backend.app.utils.threemf_tools import list_gcode_plate_ids
 
 router = APIRouter(prefix="/skus", tags=["skus"])
 
@@ -259,22 +260,23 @@ async def add_sku_file(
     if lib is None:
         raise HTTPException(status_code=404, detail="Library file not found")
 
-    # 422 if the requested plate has no sliced G-code in the 3MF. STRICT match
-    # on `plate_{index}.gcode` — do NOT use _find_target_gcode_name here, whose
-    # any-gcode fallback is dispatch-time leniency; a catalog link must pin an
-    # actually-sliced plate (a multi-plate project may have only one sliced).
+    # 422 if the requested plate has no sliced G-code in the 3MF: a catalog link must
+    # pin an actually-sliced plate (a multi-plate project may have only one sliced).
+    # ``list_gcode_plate_ids`` is the shared "which plates does this container carry"
+    # reader — this route used to scan the namelist by hand purely to avoid the
+    # first-gcode fallback that used to live in the plate reader; that fallback is gone.
+    import zipfile
+
     source_path = _resolve_source_disk_path(lib)
     if not source_path or not Path(source_path).exists():
         raise HTTPException(status_code=422, detail="Library file not found on disk")
-    import zipfile
-
-    plate_member_suffix = f"plate_{data.plate_index}.gcode"
     try:
-        with zipfile.ZipFile(source_path, "r") as zf:
-            has_gcode = any(name.endswith(plate_member_suffix) for name in zf.namelist())
-    except (OSError, zipfile.BadZipFile) as exc:
+        readable = zipfile.is_zipfile(source_path)
+    except OSError as exc:
         raise HTTPException(status_code=422, detail="Library file is not a readable 3MF") from exc
-    if not has_gcode:
+    if not readable:
+        raise HTTPException(status_code=422, detail="Library file is not a readable 3MF")
+    if data.plate_index not in list_gcode_plate_ids(Path(source_path)):
         raise HTTPException(status_code=422, detail=f"Plate {data.plate_index} has no G-code in the 3MF")
 
     link = SkuFile(

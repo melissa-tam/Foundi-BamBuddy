@@ -11,6 +11,8 @@ class Spool(Base):
     """Spool inventory item for tracking filament spools and their properties."""
 
     __tablename__ = "spool"
+    # A deleted id is never reused — see core.database._rebuild_table_with_autoincrement (005-H2S 2026-09-17).
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     material: Mapped[str] = mapped_column(String(50))  # PLA, PETG, ABS, etc.

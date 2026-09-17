@@ -583,6 +583,157 @@ class TestPrePrintFailureCompletion:
         assert any(e.get("code") == "0x4038" for e in errs)
 
 
+class TestJobBoundaryCompletionReset:
+    """The per-job flags reset on the JOB BOUNDARY, not on RUNNING (005-H2S 2026-09-17).
+
+    ``_completion_triggered`` used to be cleared only under a RUNNING push, so a job that
+    died in PREPARE inherited the PREVIOUS print's flag and the #1111 pre-print-failure
+    arm could never fire after a completed print. Live consequence: printer 005-H2S
+    rejected an eject file at setup (HMS 0500_4003 "unable to parse the file"), the job
+    went FINISH → PREPARE → FAILED, and NO terminal ever reached the farm — the start
+    deadline expired 180 s later with the wrong diagnosis and the plate escalated as a
+    foreign deposit.
+
+    Every push here is a real ``_process_message`` so the flags are only ever moved by
+    the code under test; the sequences are the ones the printer actually produces.
+    """
+
+    @pytest.fixture
+    def mqtt_client(self):
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        return BambuMQTTClient(
+            ip_address="192.168.1.100",
+            serial_number="TEST123",
+            access_code="12345678",
+        )
+
+    @staticmethod
+    def _recorder(client):
+        """Capture every terminal the client fires, in order."""
+        calls: list[dict] = []
+        client.on_print_start = lambda data: None
+        client.on_print_complete = lambda data: calls.append(data)
+        return calls
+
+    @staticmethod
+    def _push(client, state, *, file=None, subtask=None, hms=None):
+        payload: dict = {"gcode_state": state}
+        if file is not None:
+            payload["gcode_file"] = file
+        if subtask is not None:
+            payload["subtask_name"] = subtask
+        if hms is not None:
+            payload["hms"] = hms
+        client._process_message({"print": payload})
+
+    def _run_a_print_to_finish(self, client):
+        """The predecessor every eject follows: RUNNING then FINISH."""
+        self._push(client, "RUNNING", file="/data/Metadata/plate_1.gcode", subtask="Unit-2200")
+        self._push(client, "FINISH", file="/data/Metadata/plate_1.gcode", subtask="Unit-2200")
+
+    def test_finish_then_prepare_then_failed_fires_the_failure_once(self, mqtt_client):
+        """THE incident shape: the eject the printer refused at setup is a TERMINAL."""
+        calls = self._recorder(mqtt_client)
+        self._run_a_print_to_finish(mqtt_client)
+
+        self._push(mqtt_client, "PREPARE", file="/data/Metadata/eject.gcode", subtask="eject_production_item2200")
+        self._push(
+            mqtt_client,
+            "FAILED",
+            file="/data/Metadata/eject.gcode",
+            subtask="eject_production_item2200",
+            hms=[{"attr": 0x05000400, "code": 0x00010003}],
+        )
+
+        assert [c["status"] for c in calls] == ["completed", "failed"]
+        failed = calls[-1]
+        assert failed["subtask_name"] == "eject_production_item2200"
+        # The codes ride the payload — farm_policy pages with them.
+        assert failed["hms_errors"], "the rejection's HMS list must reach the terminal callback"
+
+    def test_a_second_failed_push_does_not_fire_again(self, mqtt_client):
+        """The flag is per JOB: the firmware republishes FAILED, the farm reacts once."""
+        calls = self._recorder(mqtt_client)
+        self._run_a_print_to_finish(mqtt_client)
+        self._push(mqtt_client, "PREPARE", file="/data/Metadata/eject.gcode")
+        self._push(mqtt_client, "FAILED", file="/data/Metadata/eject.gcode")
+        assert [c["status"] for c in calls] == ["completed", "failed"]
+
+        self._push(mqtt_client, "FAILED", file="/data/Metadata/eject.gcode")
+
+        assert [c["status"] for c in calls] == ["completed", "failed"]  # unchanged
+
+    def test_two_rejected_dispatches_fire_two_terminals(self, mqtt_client):
+        """The operator's retry is a NEW job, and it gets its own terminal.
+
+        On 2026-09-17 the operator re-pressed "Eject plate" eight times; every one of
+        them was silent. FAILED → PREPARE is a boundary like any other."""
+        calls = self._recorder(mqtt_client)
+        self._run_a_print_to_finish(mqtt_client)
+
+        for _ in range(2):
+            self._push(mqtt_client, "PREPARE", file="/data/Metadata/eject.gcode")
+            self._push(mqtt_client, "FAILED", file="/data/Metadata/eject.gcode")
+
+        assert [c["status"] for c in calls] == ["completed", "failed", "failed"]
+
+    def test_a_healthy_next_print_still_fires_exactly_one_terminal(self, mqtt_client):
+        """Liveness pair: FINISH → PREPARE → RUNNING → FINISH is unchanged.
+
+        The reset must not fabricate a terminal or double one — the ordinary job that
+        does reach RUNNING still ends with exactly one completion."""
+        calls = self._recorder(mqtt_client)
+        self._run_a_print_to_finish(mqtt_client)
+
+        self._push(mqtt_client, "PREPARE", file="/data/Metadata/plate_2.gcode", subtask="Unit-2201")
+        self._push(mqtt_client, "RUNNING", file="/data/Metadata/plate_2.gcode", subtask="Unit-2201")
+        self._push(mqtt_client, "FINISH", file="/data/Metadata/plate_2.gcode", subtask="Unit-2201")
+
+        assert [c["status"] for c in calls] == ["completed", "completed"]
+        assert calls[-1]["subtask_name"] == "Unit-2201"
+
+    def test_first_connect_failed_still_never_fires(self, mqtt_client):
+        """The #1111 guard survives the reset: no PREPARE was seen, so no boundary.
+
+        A stale FAILED on the first push after Bambuddy starts must not be mistaken for
+        a fresh failure — the reset only fires on entry INTO setup."""
+        calls = self._recorder(mqtt_client)
+        assert mqtt_client._previous_gcode_state is None
+
+        self._push(mqtt_client, "FAILED", file="/data/Metadata/plate_1.gcode", subtask="Stale")
+
+        assert calls == []
+
+    def test_a_boundary_after_an_unfired_terminal_still_fires(self, mqtt_client):
+        """Composition with the diagnostic branch, which sets the flag on a terminal it
+        did NOT fire (so the next print starts clean). That write must not outlive the
+        job either: the PREPARE after it is a boundary and clears it."""
+        calls = self._recorder(mqtt_client)
+        self._push(mqtt_client, "FAILED", file="/data/Metadata/plate_1.gcode")  # prev=None → unfired
+        assert calls == []
+        assert mqtt_client._completion_triggered is True  # the diagnostic branch's mark
+
+        self._push(mqtt_client, "PREPARE", file="/data/Metadata/eject.gcode")
+        self._push(mqtt_client, "FAILED", file="/data/Metadata/eject.gcode")
+
+        assert [c["status"] for c in calls] == ["failed"]
+
+    def test_pause_is_not_a_boundary(self, mqtt_client):
+        """A PAUSEd job is the SAME job: its flags must survive.
+
+        PREPARE is never re-entered from PAUSE in the field, but the exclusion is the
+        reason the set names four states rather than two — it says what an ACTIVE job
+        is, and a paused print is one."""
+        self._push(mqtt_client, "RUNNING", file="/data/Metadata/plate_1.gcode")
+        self._push(mqtt_client, "PAUSE", file="/data/Metadata/plate_1.gcode")
+        assert mqtt_client._was_running is True
+
+        self._push(mqtt_client, "PREPARE", file="/data/Metadata/plate_1.gcode")
+
+        assert mqtt_client._was_running is True  # still the same job
+
+
 class TestAMSDataMerging:
     """Tests for AMS data merging, particularly handling empty slots."""
 

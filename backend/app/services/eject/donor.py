@@ -39,7 +39,6 @@ the first is answered by an operator looking at the plate before confirming.
 from __future__ import annotations
 
 import logging
-import re
 import time
 import zipfile
 from abc import ABC, abstractmethod
@@ -53,8 +52,14 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.farm_correlation import resolve_item_donor
 from backend.app.utils.printer_models import canon_model
-from backend.app.utils.threemf_tools import list_gcode_plate_ids, read_plate_gcode_header, read_plate_json
+from backend.app.utils.threemf_tools import (
+    list_gcode_plate_ids,
+    read_plate_gcode_header,
+    read_plate_json,
+    resolve_plate_id,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -190,26 +195,6 @@ def _take_donor(printer_id: int, plate_source: str | None) -> Path | None:
 # --------------------------------------------------------------------------- #
 # Shared plate / height helpers
 # --------------------------------------------------------------------------- #
-def resolve_plate_id(donor_path: Path, filename: str | None) -> int | None:
-    """Pick the ejectable plate id for a donor, or None if unresolvable.
-
-    Prefers a ``plate_(\\d+)`` hint in the filename WHEN that plate actually carries
-    G-code; otherwise falls back to the single G-code-bearing plate. Returns None when
-    the file has no G-code plate or the hint is absent and the choice is ambiguous
-    (multiple G-code plates) — a blind sweep is never guessed."""
-    plates = list_gcode_plate_ids(donor_path)
-    if not plates:
-        return None
-    m = re.search(r"plate_(\d+)", str(filename or ""))
-    if m:
-        hinted = int(m.group(1))
-        if hinted in plates:
-            return hinted
-    if len(plates) == 1:
-        return plates[0]
-    return None
-
-
 def read_max_z(donor_path: Path, plate_id: int) -> float | None:
     """The plate's parsed ``max_z_height``, or None when the header does not carry one."""
     header = read_plate_gcode_header(donor_path, plate_id)
@@ -316,66 +301,35 @@ async def _fetch_donor(printer: Printer, filename: str | None) -> Path | None:
 async def source_from_item(db: AsyncSession, printer: Printer, item: PrintQueueItem) -> DonorSource | None:
     """The ON-DISK donor for one farm queue unit, or None.
 
-    The one item→donor body, shared by :class:`LastFarmItemFile` and every caller that
-    already knows which unit a plate belongs to. Deliberately DISK-ONLY (never an FTPS
-    re-fetch — the strict tier already asked the wire; this is the local fallback), in
-    priority order:
+    The eject lane's view of ONE answer that lives elsewhere:
+    ``farm_correlation.resolve_item_donor`` is THE item→donor resolver (which file
+    this unit printed, and which plate of it — archive-first, plate validated against
+    the container), and this adds only the two things an eject build needs on top of
+    it: the plate's parsed height and the :class:`DonorSource` shape the chain speaks.
 
-    * (a) ``item.archive_id`` → :class:`PrintArchive` whose ``file_path`` is non-empty
-      and exists on disk (``base_dir / file_path``);
-    * (b) else ``item.library_file_id`` → :class:`LibraryFile` resolved with the
-      established absolute-or-``base_dir`` pattern;
-    * (c) neither on disk → ``None``.
-
-    Plate id prefers the item's own ``plate_id`` when the donor actually carries it,
-    else the filename-hint / single-G-code-plate resolution (never a blind guess); the
-    height is parsed from that plate's G-code header. Any unresolved step returns None.
+    Deliberately DISK-ONLY (never an FTPS re-fetch — the strict tier already asked the
+    wire; this is the local fallback). Returns None when the shared resolver has no
+    donor for the unit, or when the resolved plate's G-code header carries no
+    ``max_z_height``: an eject cannot be built without a part height, and a height
+    read off a plate this unit did not print is worse than none.
     """
-    from backend.app.core.config import settings as app_settings
-
-    donor_path: Path | None = None
-    display_name: str | None = None  # names the donor for the plate-id filename hint
-    print_name: str | None = None  # the operator-facing name for the confirm dialog
-    if item.archive_id is not None:
-        archive = await db.get(PrintArchive, item.archive_id)
-        if archive is not None and archive.file_path:
-            disk = app_settings.base_dir / archive.file_path
-            if disk.is_file():
-                donor_path = disk
-                display_name = archive.filename
-                print_name = archive.print_name or archive.filename
-    if donor_path is None and item.library_file_id is not None:
-        library_file = await db.get(LibraryFile, item.library_file_id)
-        if library_file is not None:
-            lib_path = Path(library_file.file_path)
-            resolved = lib_path if lib_path.is_absolute() else app_settings.base_dir / library_file.file_path
-            if resolved.is_file():
-                donor_path = resolved
-                display_name = library_file.filename
-                print_name = library_file.filename
-    if donor_path is None:
-        logger.info("[donor] p%s item %s has no on-disk donor (archive/library both absent)", printer.id, item.id)
+    donor = await resolve_item_donor(db, item)
+    if donor is None:
+        logger.info("[donor] p%s item %s has no resolvable donor (see the [DONOR] line above)", printer.id, item.id)
         return None
 
-    plates = list_gcode_plate_ids(donor_path)
-    if not plates:
-        logger.info("[donor] p%s item %s donor %s carries no G-code plate", printer.id, item.id, donor_path.name)
-        return None
-    if item.plate_id is not None and item.plate_id in plates:
-        plate_id = item.plate_id
-    else:
-        resolved_plate = resolve_plate_id(donor_path, display_name)
-        if resolved_plate is None:
-            logger.info("[donor] p%s item %s donor plate ambiguous (plates=%s)", printer.id, item.id, plates)
-            return None
-        plate_id = resolved_plate
-
-    max_z = read_max_z(donor_path, plate_id)
+    max_z = read_max_z(donor.local_path, donor.plate_id)
     if max_z is None:
-        logger.info("[donor] p%s item %s donor plate %s has no max_z header", printer.id, item.id, plate_id)
+        logger.info("[donor] p%s item %s donor plate %s has no max_z header", printer.id, item.id, donor.plate_id)
         return None
 
-    return DonorSource(path=donor_path, plate_id=plate_id, max_z=max_z, print_name=print_name, tmp_path=None)
+    return DonorSource(
+        path=donor.local_path,
+        plate_id=donor.plate_id,
+        max_z=max_z,
+        print_name=donor.print_name,
+        tmp_path=None,
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -770,6 +770,10 @@ class TestEjectJobCallbacks:
         farm_hook.assert_awaited_once()
         assert farm_hook.await_args.args[3] == "completed"
         assert farm_hook.await_args.kwargs["completed_subtask_id"] == "SUB-E"
+        # …and with the terminal's HMS list, which the policy pages with when a printer
+        # rejects an eject file at setup. None here because this sweep ended clean; the
+        # pin is that the key is FORWARDED at all (a dropped kwarg raises KeyError).
+        assert farm_hook.await_args.kwargs["hms_errors"] is None
         # No "Print Complete/Stopped" notification for the sweep.
         mock_notif.on_print_complete.assert_not_awaited()
         # SD-card cleanup of the uploaded eject file still happened.

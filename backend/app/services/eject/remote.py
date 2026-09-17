@@ -69,6 +69,8 @@ from backend.app.services.usb_storage import upload_in_flight
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from backend.app.services.farm_correlation import DispatchDonor
+
 logger = logging.getLogger(__name__)
 
 # Re-exported so the eject lane's own callers keep one import site for the vocabulary
@@ -1394,21 +1396,32 @@ def _live_evidence(printer_id: int) -> Evidence:
     )
 
 
-async def _resolve_source_path(db: AsyncSession, item: PrintQueueItem) -> Path:
-    """The on-disk source ``.gcode.3mf`` for ``item`` (the file it printed), or a 409.
+async def _resolve_source_donor(db: AsyncSession, item: PrintQueueItem) -> DispatchDonor:
+    """The donor ``item`` printed from — file AND validated plate — or a 409.
 
     Thin adapter over ``farm_correlation.resolve_item_donor``, which is THE
-    "which file did this unit print" resolver — the same question the print-start
-    archive capture asks, answered once. This lane's only difference is that a
-    missing donor is a dispatch precondition failure rather than a fall-back-to-
-    guessing, so it raises instead of returning None.
+    "which file did this unit print, and which plate of it" resolver — the same
+    question the print-start archive capture and the cooldown hold ask, answered once.
+    This lane's only difference is that a missing donor is a dispatch precondition
+    failure rather than a fall-back-to-guessing, so it raises instead of returning
+    None.
+
+    The whole donor is returned rather than just its path because the PLATE is the half
+    that was getting lost: this lane used to take the file from here and then re-read
+    ``item.plate_id or 1`` for the firmware, so a donor that did not carry the unit's
+    plate still produced a dispatch (2026-09-17, 005-H2S). The resolver now validates
+    the plate against the container, so "there is a donor" and "it carries this unit's
+    plate" are one answer.
     """
     from backend.app.services.farm_correlation import resolve_item_donor
 
     donor = await resolve_item_donor(db, item)
     if donor is None:
-        raise EjectDispatchError("Eject source file not found on disk for the finished unit", status_code=409)
-    return donor.local_path
+        raise EjectDispatchError(
+            "Eject source file not found on disk for the finished unit, or it does not carry that unit's plate",
+            status_code=409,
+        )
+    return donor
 
 
 async def dispatch_part_present_eject(
@@ -1470,11 +1483,12 @@ async def dispatch_part_present_eject(
     if profile is None:
         raise EjectDispatchError("Eject profile not found", status_code=409)
 
-    source_path = await _resolve_source_path(db, item)
-    plate_id = item.plate_id or 1
+    donor = await _resolve_source_donor(db, item)
     eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="building")
     try:
-        built = await build_part_present_eject_file(source_path, plate_id, profile, geometry, plate_z=plate_z)
+        built = await build_part_present_eject_file(
+            donor.local_path, donor.plate_id, profile, geometry, plate_z=plate_z
+        )
     except Exception as exc:  # noqa: BLE001 — generation/validation/repack → actionable 409
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=queue_item_id, phase="failed")
         raise EjectDispatchError(f"Failed to build part-present eject file: {exc}", status_code=409) from exc
@@ -1499,7 +1513,7 @@ async def dispatch_part_present_eject(
             printer=printer,
             eject_path=built.path,
             job_stem=f"eject_{purpose}_item{queue_item_id}",
-            plate_id=plate_id,
+            plate_id=built.plate_id,
             pending=pending,
             ev=ev,
         )
@@ -1589,7 +1603,7 @@ async def dispatch_foreign_eject(
             printer=printer,
             eject_path=built.path,
             job_stem=f"eject_manual_p{printer_id}",
-            plate_id=plate_id,
+            plate_id=built.plate_id,
             pending=pending,
             ev=ev,
         )
@@ -1619,6 +1633,11 @@ async def _upload_start_claim_eject(
     The ``start_print`` file, the MQTT ``project_file`` param (plate path, keyed by
     ``plate_id``) and the eventual SD cleanup all key off the SAME ``remote_filename``
     (the bare ``job_stem``).
+
+    ``plate_id`` is ALWAYS the caller's ``BuiltEject.plate_id`` — the member the build
+    packed the sweep into. "Which plate was packed" and "which plate is commanded" are
+    one value by construction; a second read of the queue row is what let them diverge
+    into an unparseable ``project_file`` on 2026-09-17 (005-H2S).
 
     ``ev`` is the PRE-DISPATCH wire snapshot, carried down from the dispatcher rather
     than re-read here on purpose: by the time this claims, the printer may already

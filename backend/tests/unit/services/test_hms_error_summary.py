@@ -1,16 +1,21 @@
-"""Tests for main._format_hms_error_summary — the helper that turns MQTT hms_errors
-into a human-readable PrintQueueItem.error_message on pre-print failures (#1111)."""
+"""Tests for hms_errors.format_hms_error_summary — the helper that turns an MQTT
+hms_errors payload into human-readable fault text.
+
+It moved out of ``main`` on 2026-09-17: ``farm_policy`` names the codes in the "the
+printer rejected the eject file" page and a service may never import the monolith.
+Two consumers now, one implementation — ``main.on_print_complete``'s
+``PrintQueueItem.error_message`` on a pre-print failure (#1111) and that page."""
 
 
 def _format(hms_errors):
-    from backend.app.main import _format_hms_error_summary
+    from backend.app.services.hms_errors import format_hms_error_summary
 
-    return _format_hms_error_summary(hms_errors)
+    return format_hms_error_summary(hms_errors)
 
 
 def test_returns_none_for_empty_list():
     assert _format([]) is None
-    assert _format(None or []) is None
+    assert _format(None) is None  # the terminal payload's key can be absent
 
 
 def test_formats_known_nozzle_mismatch_code():
