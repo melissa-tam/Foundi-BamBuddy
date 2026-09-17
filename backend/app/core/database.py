@@ -468,11 +468,30 @@ async def _column_exists(conn, table_name: str, column_name: str) -> bool:
 # and was rejected by the printer as unreadable.
 #
 # The members are the operator-deletable tables whose ids are held by rows that OUTLIVE
-# the delete. Parent-first order, so a reader walks the graph the way the FKs point.
+# the delete — the whole class, not only the farm half that produced the incident. The
+# non-farm five were found by auditing every delete path against the FK-off reality, where
+# an ``ondelete=`` clause does nothing and only ORM cascade or explicit cleanup code runs:
+#   users        — user_deletion clears its own referents, but a reused id still inherits
+#                  the departed user's user_groups memberships, i.e. their permissions.
+#   groups       — oidc_providers.default_group_id is never cleared, and SSO auto-create
+#                  re-reads it, so new users would land in a stranger group.
+#   projects     — library_files, library_folders and pending_uploads keep their project_id,
+#                  so orphans re-materialise inside an unrelated new project.
+#   smart_plugs  — smart_plug_energy_snapshots are never deleted; a new plug would inherit
+#                  the old plug's kWh and cost history.
+#   spool        — spool_usage_history is never deleted and slot_recheck_intent
+#                  .minted_spool_id is never nulled, so a new roll inherits a gram ledger
+#                  and the re-check undo's "mint_gone" refusal silently stops firing.
+# Parent-first order, so a reader walks the graph the way the FKs point.
 # Adding a new deletable table means classifying it in
 # ``backend/tests/unit/test_id_reuse_census.py`` — that census fails until you do.
 _AUTOINCREMENT_TABLES: tuple[str, ...] = (
+    "users",
+    "groups",
+    "projects",
     "printers",
+    "smart_plugs",
+    "spool",
     "library_files",
     "print_archives",
     "eject_profiles",
@@ -5391,7 +5410,7 @@ async def run_migrations(conn):
         if _table is None:
             # The model is not registered in this process, so no database it created can
             # hold the table either. Loud is wrong here: the census test is the pin that
-            # the eight names are real.
+            # the forbidden names are real.
             continue
         await _rebuild_table_with_autoincrement(conn, _table)
 

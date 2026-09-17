@@ -9,7 +9,7 @@ eject packed the sweep into plate 1 while the dispatcher commanded plate 3, and 
 rejected the container as unreadable.
 
 ``create_all`` gives a FRESH install the flag from the model, which would mask the
-migration entirely — so the fixture strips ``sqlite_autoincrement`` off the eight tables
+migration entirely — so the fixture strips ``sqlite_autoincrement`` off every forbidden table
 before ``create_all`` to build the genuine pre-migration shape, seeds every one of them
 (including ``print_queue``'s self-referencing retry lineage), adds a hand-written index and
 a trigger the model does not declare, and only then runs ``run_migrations``.
@@ -41,7 +41,12 @@ _PROBE_LOG = "ai_probe_log"
 
 # Seeded ids, deliberately non-contiguous so "the max row" is unambiguous per table.
 _SEED_MAX_ID = {
+    "users": 21,
+    "groups": 23,
+    "projects": 24,
     "printers": 2,
+    "smart_plugs": 25,
+    "spool": 26,
     "library_files": 9,
     "print_archives": 7,
     "eject_profiles": 2,
@@ -114,7 +119,12 @@ def _pre_migration_shape():
 # PYTHON-side default (``position``, ``status``, the whole calibration block …), which only
 # the Core insert applies — a raw ``INSERT`` omitting them fails the NOT NULL check.
 _MINIMAL_ROW: dict[str, dict] = {
+    "users": {"username": "probe-user"},
+    "groups": {"name": "probe-group"},
+    "projects": {"name": "probe-project"},
     "printers": {"name": "probe", "serial_number": "SN-probe", "ip_address": "10.0.0.9", "access_code": "ccc"},
+    "smart_plugs": {"name": "probe-plug"},
+    "spool": {"material": "PETG"},
     "library_files": {"filename": "p.3mf", "file_path": "/lib/p.3mf", "file_type": "3mf", "file_size": 1},
     "print_archives": {"filename": "p.3mf", "file_path": "/arch/p.3mf", "file_size": 1},
     "eject_profiles": {"name": "probe-profile"},
@@ -132,17 +142,25 @@ async def _insert(conn, table_name: str, **values):
 
 
 async def _seed(conn):
-    """Seed every one of the eight tables with FK-consistent rows, at explicit ids.
+    """Seed every forbidden table with FK-consistent rows, at explicit ids.
 
     FK-consistent on purpose: ``PRAGMA foreign_key_check`` must come back empty afterwards,
     which it cannot do if the fixture itself plants dangling references.
     """
+    # The five non-farm parents close the same class: each is operator-deletable and each
+    # leaves at least one reference standing after the delete (memberships, a default-group
+    # pointer, project_id on three tables, energy snapshots, a gram ledger).
+    await _insert(conn, "users", id=21, username="operator")
+    await _insert(conn, "groups", id=23, name="Operators")
+    await _insert(conn, "projects", id=24, name="half-shell", parent_id=None)
     await _insert(
         conn, "printers", id=1, name="unit-001", serial_number="SN001", ip_address="10.0.0.1", access_code="aaa"
     )
     await _insert(
         conn, "printers", id=2, name="unit-002", serial_number="SN002", ip_address="10.0.0.2", access_code="bbb"
     )
+    await _insert(conn, "smart_plugs", id=25, name="plug-001", printer_id=1)
+    await _insert(conn, "spool", id=26, material="PETG", location_id=None)
     await _insert(
         conn,
         "library_files",
@@ -285,7 +303,7 @@ class TestPreMigrationShape:
 
 
 class TestRebuild:
-    async def test_all_eight_tables_carry_autoincrement(self, migrated):
+    async def test_every_forbidden_table_carries_autoincrement(self, migrated):
         """(a) The whole point: every operator-deletable table stops recycling ids."""
         async with migrated.connect() as conn:
             for table in _AUTOINCREMENT_TABLES:
@@ -366,7 +384,7 @@ class TestRebuild:
         )
 
     async def test_every_table_refuses_to_reissue_its_deleted_max_id(self, migrated):
-        """(c) The property is claimed for all eight, so it is checked on all eight."""
+        """(c) The property is claimed for every forbidden table, so it is checked on each."""
         # Child-first, so each delete leaves the remaining seeds FK-consistent for as long
         # as it can; the later parents' deletes deliberately leave the usual dangling
         # references behind, because that is what this fork does and what must stay safe.

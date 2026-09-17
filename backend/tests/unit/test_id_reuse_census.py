@@ -31,13 +31,16 @@ _NO_INBOUND = "no inbound FK — "
 # no reference outlives the row. (``ondelete=`` is inert with FK enforcement off; what does
 # the work is the ORM relationship cascade or explicit cleanup code.)
 _CLEARED = "referenced, cleared on delete — "
-# Referenced AND left dangling: the same hazard class as the forbidden eight, deliberately
-# out of this wave's scope. Named so the next wave has its worklist instead of a rediscovery.
-_DEFERRED = "DEFERRED, same class as the eight — "
 
-# ── the eight (D6) ─────────────────────────────────────────────────────────────────────
+# ── the forbidden set (D6, closed 2026-09-17) ──────────────────────────────────────────
 # One origin: the tuple the migration itself walks. A table that stops being rebuilt stops
 # being claimed safe here in the same edit.
+#
+# There is deliberately no "deferred" third bucket. The first cut of this census had one —
+# five tables that were referenced AND left dangling but sat outside the wave's original
+# scope — and a bucket for "unsafe, but not today" is how a closed class reopens. The
+# operator ruling was to close it here, so every one of them is in the forbidden set and
+# the only remaining answers are "cannot mis-bind" and "must never reuse an id".
 ID_REUSE_FORBIDDEN = frozenset(_AUTOINCREMENT_TABLES)
 
 # ── everything else, one line of reasoning each ────────────────────────────────────────
@@ -100,18 +103,6 @@ ID_REUSE_REASONED: dict[str, str] = {
     "notification_providers": _CLEARED + "ORM cascade takes notification_logs and the digest queue",
     "oidc_providers": _CLEARED + "ORM cascade deletes user_oidc_links with the provider",
     "printer_maintenance": _CLEARED + "ORM cascade deletes maintenance_history with the item",
-    # --- same hazard, next wave ---------------------------------------------------------
-    # Named by the plan's own "out of scope" list, plus three the delete-path audit for this
-    # census turned up. Each leaves at least one reference standing after the row is gone.
-    "users": _DEFERRED
-    + "plan-scoped out; user_deletion IS written for the FK-off reality, so this is the safest of the five",
-    "groups": _DEFERRED
-    + "plan-scoped out; oidc_providers.default_group_id is never cleared, and SSO auto-create re-reads it",
-    "projects": _DEFERRED
-    + "library_files, library_folders and pending_uploads keep their project_id after the project goes",
-    "smart_plugs": _DEFERRED
-    + "smart_plug_energy_snapshots are never deleted — a new plug would inherit the old plug's kWh",
-    "spool": _DEFERRED + "spool_usage_history is never deleted and slot_recheck_intent.minted_spool_id is never nulled",
 }
 
 
@@ -204,7 +195,7 @@ class TestCensus:
         }
         assert not wrong, (
             f"these tables are filed as unreferenced but now have inbound foreign keys: {wrong} — "
-            "re-decide them (cleared on delete, deferred, or forbidden)"
+            "re-decide them (cleared on delete, or forbidden)"
         )
 
     def test_every_referenced_table_is_reasoned_beyond_no_inbound(self):
@@ -214,12 +205,16 @@ class TestCensus:
         for name in sorted(referenced & set(ID_REUSE_REASONED)):
             assert not ID_REUSE_REASONED[name].startswith(_NO_INBOUND), name
 
-    def test_the_forbidden_eight_are_exactly_the_migration_list(self):
+    def test_the_forbidden_set_is_exactly_the_migration_list(self):
         """One origin. The census cannot drift from what ``run_migrations`` actually rebuilds."""
         assert frozenset(_AUTOINCREMENT_TABLES) == ID_REUSE_FORBIDDEN
-        assert len(_AUTOINCREMENT_TABLES) == len(set(_AUTOINCREMENT_TABLES)) == 8
+        assert len(_AUTOINCREMENT_TABLES) == len(set(_AUTOINCREMENT_TABLES)) == 13
 
-    def test_the_deferred_wave_is_named_not_forgotten(self):
-        """Out of scope is a decision with a worklist, not a silence."""
-        deferred = {name for name, reason in ID_REUSE_REASONED.items() if reason.startswith(_DEFERRED)}
-        assert deferred == {"users", "groups", "projects", "smart_plugs", "spool"}
+    def test_the_whole_dangling_reference_class_is_forbidden(self):
+        """The five non-farm tables the delete-path audit found are IN, not scheduled.
+
+        Each leaves at least one reference standing after the row is gone — the exact shape
+        that re-bound ``library_file_id`` 109. They are named here so a later edit that
+        quietly drops one from ``_AUTOINCREMENT_TABLES`` fails with the reason attached.
+        """
+        assert {"users", "groups", "projects", "smart_plugs", "spool"} <= ID_REUSE_FORBIDDEN
