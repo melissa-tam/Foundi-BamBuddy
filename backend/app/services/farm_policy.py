@@ -1180,9 +1180,10 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
        paused runs — ``transition_run`` 409s otherwise, so filter first).
 
     Returns ``{"plate_cleared": bool, "quarantine_cleared": bool,
-    "runs_resumed": [ids]}`` — the booleans report whether that state was actually
-    changed (was set/quarantined before). 404 if the printer is unknown. Each
-    per-run resume is wrapped so one failure can't abort the whole recovery.
+    "runs_resumed": [ids], "incidents_closed": [kinds]}`` — the booleans report whether
+    that state was actually changed (was set/quarantined before), and the last names
+    the equipment-fault rows step 1 ended. 404 if the printer is unknown. Each per-run
+    resume is wrapped so one failure can't abort the whole recovery.
     """
     # Function-level import avoids a circular import (production_run imports
     # farm_policy helpers), matching the fork's style.
@@ -1199,9 +1200,12 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
     # too — recover is the stronger form of the same statement the clear-plate route
     # makes, and a confirmed plate-check or lost-Z hold left standing after it would
     # keep the chip lit and the eject lane refusing on a printer a human just cleared.
-    # Scoped by the incident model's own RESOLVES_ON table inside the lane: a
-    # wire-resolved hold (a runout, say) is NOT answered by somebody clearing a plate.
-    await pause_recovery.on_plate_cleared(printer_id, recover=True)
+    # WHICH rows it answers is the rule table's, asked inside the lane: a hold the wire
+    # owns (a runout, say) is NOT answered by somebody clearing a plate.
+    # ...and it reports WHAT it closed. A Recover whose only effect was ending an
+    # equipment fault used to be indistinguishable from one that did nothing at all
+    # (011-H2S 2026-09-17).
+    incidents_closed = [kind for _id, kind in await pause_recovery.on_plate_cleared(printer_id, recover=True)]
 
     # 2. Quarantine — idempotent; report whether it was actually set.
     quarantine_cleared = bool(printer.quarantined)
@@ -1242,16 +1246,19 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
             logger.exception("farm_policy: failed to resume run %s while recovering printer %s", batch_id, printer_id)
 
     logger.info(
-        "farm_policy: recovered printer %s (plate_cleared=%s, quarantine_cleared=%s, runs_resumed=%s)",
+        "farm_policy: recovered printer %s (plate_cleared=%s, quarantine_cleared=%s, runs_resumed=%s, "
+        "incidents_closed=%s)",
         printer_id,
         plate_cleared,
         quarantine_cleared,
         runs_resumed,
+        incidents_closed,
     )
     return {
         "plate_cleared": plate_cleared,
         "quarantine_cleared": quarantine_cleared,
         "runs_resumed": runs_resumed,
+        "incidents_closed": incidents_closed,
     }
 
 

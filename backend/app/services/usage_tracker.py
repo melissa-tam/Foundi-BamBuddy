@@ -1437,7 +1437,7 @@ async def _warn_zero_gram_tagless_charge(
     from backend.app.models.printer import Printer
     from backend.app.services import notify_dedup
     from backend.app.services.notification_service import notification_service
-    from backend.app.services.spool_recovery import runout_slot_desc
+    from backend.app.services.printer_incidents import runout_slot_desc
     from backend.app.services.spool_respool import encode_global_tray
     from backend.app.services.spool_tagless import is_tagless_spool
 

@@ -4175,18 +4175,6 @@ async def on_print_complete(printer_id: int, data: dict):
     except Exception as _rse:  # noqa: BLE001 — edge-state reset must never crash the completion callback
         logger.warning("[RESPOOL] backup-swap edge reset failed on print complete for printer %s: %s", printer_id, _rse)
 
-    # Close any AMS incident this print was holding (WS2b). A fault cannot outlive the
-    # job it interrupted — whatever the outcome, the hold is over and the next print
-    # must not inherit a printer that reads "already owned". Unconditional and
-    # symmetric to the reset above; the farm unit's own waiting_reason hygiene stays
-    # farm_policy.on_terminal's job (W4b), so the two never fight over one row.
-    try:
-        from backend.app.services.spool_recovery import on_job_terminal
-
-        await on_job_terminal(printer_id)
-    except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
-        logger.warning("[SPOOL-RECOVERY] incident close failed on print complete for printer %s: %s", printer_id, _ite)
-
     # Retire any physical cycle a DE-BOUNCE preserved on this printer (2026-08-20). The
     # preservation exists so a runout's spent stamp — which lands ~3 min after the bay
     # clears — can still drive REPLACE_SPENT on the next push; a job boundary is the CAUSE
@@ -4297,6 +4285,33 @@ async def on_print_complete(printer_id: int, data: dict):
             printer_id,
             _raw_status,
         )
+
+    # Close the incidents this terminal answers (WS2b, extended 2026-09-17). A JOB hold
+    # cannot outlive the job; an EQUIPMENT fault can — and since 011-H2S a ``repair``
+    # hold IS answered by the job the fault interrupted reaching ``completed``, because
+    # that means filament fed through the repaired path to the end of that print.
+    #
+    # Deliberately placed HERE rather than up with the per-print resets: the verdict
+    # needs ``_is_eject_job`` (an eject sweep is filament-less, so its completion proves
+    # nothing) and the firmware's own ``subtask_id``. ``_raw_status`` is the value
+    # captured at its own site ABOVE, taken BEFORE the operator-UI rewrite rebound
+    # ``data["status"]`` from "failed" to "cancelled" — so what the rule table reads is
+    # the printer's own word, not the farm's reading of it. (``subtask_id`` is untouched
+    # by that rewrite.) Nothing between the old call position and this one touches
+    # incident state.
+    #
+    # The farm unit's own waiting_reason hygiene stays farm_policy.on_terminal's job
+    # (W4b), so the two never fight over one row.
+    try:
+        from backend.app.services.incident_resolution import TerminalEvent
+        from backend.app.services.spool_recovery import on_job_terminal
+
+        await on_job_terminal(
+            printer_id,
+            TerminalEvent(status=_raw_status, eject=_is_eject_job, job_id=data.get("subtask_id")),
+        )
+    except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
+        logger.warning("[SPOOL-RECOVERY] incident close failed on print complete for printer %s: %s", printer_id, _ite)
 
     # Terminal-status correlation (Phase 1, P1-A). Resolve WHICH queue item this
     # finish belongs to ONCE, up front, and thread the verdict to BOTH the plate-

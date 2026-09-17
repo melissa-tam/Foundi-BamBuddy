@@ -883,10 +883,13 @@ export default {
       recoverMessageWithReason: 'Recuperar "{{name}}"? Motivo: {{reason}}. Esta é uma substituição explícita que irá:',
       recoverEffectPlate: '• Remover a retenção da placa',
       recoverEffectQuarantine: '• Remover a quarentena',
-      recoverEffectResume: '• Retomar a série pausada',
+      recoverEffectLease: '• Libera a reserva de despacho',
       recoverEffectEject: '• Descartar a ejeção em andamento',
+      recoverEffectFault: '• Fecha a falha de equipamento aberta',
+      recoverEffectResume: '• Retomar a série pausada',
+      recoverClosedFault: 'Falha de equipamento fechada',
       markPlateCleared: 'Marcar placa como liberada',
-      actionsHelp: 'Recuperar e retomar remove a quarentena e retoma a série pausada. Marcar placa como liberada apenas solta a trava da placa.',
+      actionsHelp: 'Recuperar e retomar libera tudo que retém esta impressora — placa, reserva, ejeção, quarentena, falha de equipamento — e retoma a série pausada. Marcar placa como liberada apenas solta a trava da placa.',
     },
     phase: {
       printing: 'Imprimindo',
@@ -932,6 +935,7 @@ export default {
       ejectInProgress: 'Ejeção em andamento · {{age}}',
       ejectStalled: 'Ejeção travada · {{age}} — a farm perdeu o rastro da varredura',
       menuRecover: 'Recuperar impressora',
+      clearedClosedFault: 'Falha de equipamento fechada',
     },
     // Ejeção manual (W2) + aviso de nova bobina (W6)
     eject: {
@@ -1241,7 +1245,7 @@ export default {
     incidentAction: {
       jam: 'Desobstrua o caminho do filamento do AMS e retome a impressão',
       runout: 'Reabasteça o slot solicitado; a impressão retoma sozinha',
-      physical: 'Desobstrua o caminho do filamento na impressora e retome a impressão',
+      physical: 'Caminho do filamento bloqueado. Sai quando um slot carrega, quando a impressão interrompida conclui por esse caminho, ou com Recuperar.',
       power_loss: 'Retome na impressora',
       plate_vision: 'Libere a mesa e depois «Marcar placa como liberada»',
       z_reference_lost: 'Reiniciada com uma peça na placa — remova-a à mão e depois «Marcar placa como liberada»',

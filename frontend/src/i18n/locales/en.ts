@@ -892,10 +892,13 @@ export default {
       recoverMessageWithReason: 'Recover "{{name}}"? Reason: {{reason}}. This is an explicit override that will:',
       recoverEffectPlate: '• Clear the plate hold',
       recoverEffectQuarantine: '• Clear the quarantine',
-      recoverEffectResume: '• Resume the paused run',
+      recoverEffectLease: '• Release the dispatch lease',
       recoverEffectEject: '• Drop the eject in progress',
+      recoverEffectFault: '• Close the open equipment fault',
+      recoverEffectResume: '• Resume the paused run',
+      recoverClosedFault: 'Equipment fault closed',
       markPlateCleared: 'Mark plate cleared',
-      actionsHelp: 'Recover & resume lifts the quarantine and resumes the paused run. Mark plate cleared only releases the plate gate.',
+      actionsHelp: 'Recover & resume releases everything holding this printer — plate, lease, eject, quarantine, equipment fault — and resumes the paused run. Mark plate cleared only releases the plate gate.',
     },
     phase: {
       printing: 'Printing',
@@ -943,6 +946,7 @@ export default {
       ejectInProgress: 'Eject in progress · {{age}}',
       ejectStalled: 'Eject stalled · {{age}} — the farm lost track of the sweep',
       menuRecover: 'Recover printer',
+      clearedClosedFault: 'Equipment fault closed',
     },
     // Manual eject (W2) + new-spool prompt (W6)
     eject: {
@@ -1256,7 +1260,7 @@ export default {
     incidentAction: {
       jam: 'Clear the AMS feed path, then resume the print',
       runout: 'Refill the demanded slot; the print resumes on its own',
-      physical: 'Clear the filament path at the printer, then resume the print',
+      physical: 'Filament path blocked. Clears when a slot loads or the interrupted print completes through the path, or on Recover.',
       power_loss: 'Resume at the printer',
       plate_vision: 'Clear the bed, then Mark plate cleared',
       z_reference_lost: 'Restarted with a part on the plate — remove it by hand, then Mark plate cleared',

@@ -155,6 +155,36 @@ class ServiceHoldState(BaseModel):
     since: str | None = None
 
 
+class OpenIncidentState(BaseModel):
+    """The printer's highest-precedence OPEN equipment-fault row, as the card reads it.
+
+    Present ⇔ the printer carries an open incident; ``None`` means it does not. Built
+    by ``printer_manager.open_incident_payload`` for BOTH ``/status`` branches and the
+    WS frame, so the chip cannot appear on the socket push and vanish on the next poll.
+
+    ``operator_exits`` is the load-bearing field and the reason this schema exists: it
+    answers "would **Recover** end this hold" (``printer_incidents.closed_by_recover``),
+    so the card can offer the verb from the RULE instead of guessing from a plate gate
+    or a quarantine it happens to see. 011-H2S 2026-09-17 had neither, so the only verb
+    that could have closed its hold was never rendered — and the same unreachable shape
+    already existed for a ``z_reference_lost`` hold. The class vocabulary deliberately
+    stays off the wire: a UI branching on ``"repair"`` would own a copy of the rule.
+
+    Only JSON PRIMITIVES (``created_at`` is an ISO string, not a ``datetime``): the same
+    dict rides ``printer_state_to_dict`` through the WebSocket serializer's bare
+    ``json.dumps``, which has no encoder behind it.
+    """
+
+    # Always a persisted row: the projection cache is filled from committed rows, so
+    # the id and the two status words are facts, not optionals.
+    id: int
+    kind: str
+    status: str
+    slot_desc: str | None = None
+    created_at: str | None = None
+    operator_exits: bool = False
+
+
 class ServiceHoldEnterResponse(BaseModel):
     """``POST /printers/{id}/service-hold``: the hold's state plus what the quiesce did.
 
@@ -608,6 +638,11 @@ class PrinterStatus(BaseModel):
     # own record, not a wire fact — so BOTH ``/status`` branches carry it, and so does
     # ``printer_state_to_dict``'s WS frame from the same builder.
     service_hold: ServiceHoldState | None = None
+    # The open equipment-fault row (2026-09-17). Reportable with or without a session
+    # for the same reason maintenance mode is — it is the incident store's own record,
+    # not a wire fact — so BOTH ``/status`` branches carry it, and so does
+    # ``printer_state_to_dict``'s WS frame, from the one builder.
+    open_incident: OpenIncidentState | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;
@@ -629,6 +664,39 @@ class PrinterStatus(BaseModel):
     # Set for every active print regardless of plate count; the frontend decides
     # whether to render it based on current_archive_id's is_multi_plate flag.
     current_plate_id: int | None = None
+
+
+class RecoverResult(BaseModel):
+    """What ``POST /printers/{id}/recover`` actually changed.
+
+    Every field reports whether that state was really mutated, so a repeat call (the
+    verb is idempotent) is visibly a no-op rather than a second success.
+
+    ``incidents_closed`` carries the KINDS of the equipment-fault rows the verb ended.
+    It exists because Recover's effect on a hold was invisible until 2026-09-17: the
+    operator pressed it against 011-H2S's escalated physical row, got
+    ``{plate_cleared: false, quarantine_cleared: false, runs_resumed: []}`` back, and
+    had no way to tell "it closed the fault" from "it did nothing at all".
+    """
+
+    plate_cleared: bool = False
+    quarantine_cleared: bool = False
+    runs_resumed: list[int] = []
+    incidents_closed: list[str] = []
+
+
+class ClearPlateResult(BaseModel):
+    """What ``POST /printers/{id}/clear-plate`` did, in the same vocabulary.
+
+    The routine plate ack answers the ``operator`` class only — a confirmed plate-check
+    trip, a Z datum lost to a reboot — never a filament-path hold; ``incidents_closed``
+    is how the operator sees WHICH, instead of inferring it from a chip that did or did
+    not go dark.
+    """
+
+    success: bool = True
+    message: str = ""
+    incidents_closed: list[str] = []
 
 
 class DiagnosticCheck(BaseModel):

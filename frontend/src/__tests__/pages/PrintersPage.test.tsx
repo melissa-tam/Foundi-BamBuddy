@@ -82,7 +82,7 @@ describe('PrintersPage', () => {
         return HttpResponse.json(mockPrinterStatus);
       }),
       http.post('/api/v1/printers/:id/clear-plate', () => {
-        return HttpResponse.json({ success: true, message: 'Plate cleared' });
+        return HttpResponse.json({ success: true, message: 'Plate cleared', incidents_closed: [] });
       }),
       http.get('/api/v1/settings/', () => {
         return HttpResponse.json({
@@ -434,7 +434,7 @@ describe('PrintersPage', () => {
         }),
         http.post('/api/v1/printers/:id/clear-plate', () => {
           awaitingPlateClear = false;
-          return HttpResponse.json({ success: true, message: 'Plate cleared' });
+          return HttpResponse.json({ success: true, message: 'Plate cleared', incidents_closed: [] });
         })
       );
 
@@ -465,7 +465,7 @@ describe('PrintersPage', () => {
         }),
         http.post('/api/v1/printers/:id/clear-plate', () => {
           awaitingPlateClear = false;
-          return HttpResponse.json({ success: true, message: 'Plate cleared' });
+          return HttpResponse.json({ success: true, message: 'Plate cleared', incidents_closed: [] });
         })
       );
 
@@ -682,7 +682,7 @@ describe('PrintersPage', () => {
 
     it('does not render the generic incident chip for the hold kind', async () => {
       serveOne(heldPrinter, {
-        open_incident: { kind: 'service_hold', status: 'escalated', slot_desc: null, created_at: null },
+        open_incident: { id: 41, kind: 'service_hold', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false },
       });
       render(<PrintersPage />);
       await screen.findByRole('button', { name: /exit maintenance mode/i });
@@ -694,7 +694,7 @@ describe('PrintersPage', () => {
 
     it('still renders the chip for a fault kind', async () => {
       serveOne(heldPrinter, {
-        open_incident: { kind: 'jam', status: 'escalated', slot_desc: null, created_at: null },
+        open_incident: { id: 42, kind: 'jam', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false },
       });
       render(<PrintersPage />);
 
@@ -754,6 +754,108 @@ describe('PrintersPage', () => {
       // The EXISTING recover confirm — its effect list gains the eject bullet.
       const dialog = await screen.findByRole('dialog');
       expect(within(dialog).getByText(/drop the eject in progress/i)).toBeInTheDocument();
+    });
+  });
+
+  /**
+   * The operator's exit from an equipment fault. Printer 011-H2S sat escalated
+   * with a clean wire, no quarantine, no plate gate and no eject — every card
+   * predicate said "nothing to recover" while the backend's Recover verb was the
+   * only thing that could close the row. The card now derives the affordance and
+   * the dialog's effect list from the SAME verdict (`utils/printerRecovery`), so
+   * what the operator is offered and what they are told cannot drift apart.
+   */
+  describe('equipment fault Recover', () => {
+    const faultStatus = (operatorExits: boolean) => ({
+      state: 'IDLE',
+      awaiting_plate_clear: false,
+      occupancy: {
+        plate: { occupied: false, source_subtask_id: null, policy: null, since: null },
+        eject: null,
+        lease_age_s: null,
+      },
+      open_incident: {
+        id: 188,
+        kind: 'physical',
+        status: 'escalated',
+        slot_desc: 'AMS A slot 3',
+        created_at: '2026-09-17T09:43:00Z',
+        operator_exits: operatorExits,
+      },
+    });
+
+    const serveFault = (operatorExits: boolean) => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...mockPrinterStatus, ...faultStatus(operatorExits) }),
+        ),
+      );
+    };
+
+    it('offers Recover in the card menu on the fault alone', async () => {
+      serveFault(true);
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+
+      expect(await screen.findByRole('button', { name: 'Recover printer' })).toBeInTheDocument();
+    });
+
+    it('lists the fault effect and NOT the plate hold this printer does not have', async () => {
+      serveFault(true);
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await user.click(await screen.findByRole('button', { name: 'Recover printer' }));
+
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByText(/close the open equipment fault/i)).toBeInTheDocument();
+      expect(within(dialog).queryByText(/clear the plate hold/i)).not.toBeInTheDocument();
+      // The run resume is the VERB's consequence, not this printer's state:
+      // it is listed whatever the effect list says.
+      expect(within(dialog).getByText(/resume the paused run/i)).toBeInTheDocument();
+    });
+
+    it('does not offer Recover for a fault that is not the operator\'s to close', async () => {
+      // A runout ends on the wire reading filament again — Recover is not its exit.
+      serveFault(false);
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await screen.findByRole('button', { name: /maintenance mode/i });
+
+      expect(screen.queryByRole('button', { name: 'Recover printer' })).not.toBeInTheDocument();
+    });
+
+    it('names the closed fault in the Recover toast', async () => {
+      serveFault(true);
+      server.use(
+        http.post('/api/v1/printers/:id/recover', () =>
+          HttpResponse.json({
+            plate_cleared: false,
+            quarantine_cleared: false,
+            runs_resumed: [],
+            incidents_closed: ['physical'],
+          }),
+        ),
+      );
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await user.click(await screen.findByRole('button', { name: 'Recover printer' }));
+      const dialog = await screen.findByRole('dialog');
+      await user.click(within(dialog).getByRole('button', { name: 'Recover & resume' }));
+
+      expect(await screen.findByText(/equipment fault closed/i)).toBeInTheDocument();
     });
   });
 

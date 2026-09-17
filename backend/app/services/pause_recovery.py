@@ -63,14 +63,11 @@ from backend.app.models.printer_incident import (
     KIND_PLATE_VISION,
     KIND_POWER_LOSS,
     KIND_Z_REFERENCE_LOST,
-    RESOLUTION_OPERATOR,
-    RESOLUTION_REPAIR,
-    RESOLVE_OPERATOR,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
     STATUS_RESOLVED,
 )
-from backend.app.services import printer_incidents
+from backend.app.services import incident_resolution, printer_incidents
 from backend.app.services.hms_errors import (
     POWER_LOSS_PROMPT_CODES,
     POWER_LOSS_RESUME_FAILED_CODES,
@@ -78,6 +75,7 @@ from backend.app.services.hms_errors import (
     power_loss_prompt_standing,
     power_loss_resume_failed,
 )
+from backend.app.services.incident_resolution import ClearedEvent, Context, ledger
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 
@@ -758,48 +756,55 @@ async def _stop_for_vision(printer_id: int) -> bool:
 # --- entry point 3: the operator's clear --------------------------------------------
 
 
-async def on_plate_cleared(printer_id: int, *, recover: bool = False) -> bool:
-    """Close the holds whose resolution IS the operator's act. True when any closed.
+async def on_plate_cleared(printer_id: int, *, recover: bool = False) -> list[tuple[int, str]]:
+    """Close the holds whose resolution IS the operator's act. Returns ``[(id, kind)]``.
 
     Called from the clear-plate route (routine, ``recover=False``) and from
-    ``farm_policy.recover_printer`` (``recover=True``). Scoped by the incident model's
-    own ``RESOLVES_ON`` table through ``printer_incidents.resolution_class``, per row
-    — a printer can hold several — and never by a kind list spelled here:
+    ``farm_policy.recover_printer`` (``recover=True``). WHICH rows each verb answers
+    is :mod:`incident_resolution`'s table, per row — a printer can hold several, and
+    the two verbs are different statements:
 
-    * ``operator`` rows (a confirmed plate-check trip, a lost Z frame) close on BOTH
-      verbs: the evidence a human produces is the part coming off the plate;
+    * ``operator`` rows (a confirmed plate-check trip, a lost Z frame) close on BOTH:
+      the evidence a human produces is the part coming off the plate;
     * ``repair`` rows (an AMS physical fault) close on RECOVER only. Recover means
       "an operator inspected the machine" (it discards every stored belief about the
-      plate too), which is exactly the third return-to-normal the repair class
-      admits. A routine clear-plate says nothing about the filament path;
-    * ``wire`` rows are never closed here — a runout hold is not answered by somebody
-      clearing a plate.
+      plate too), which is exactly the third return-to-normal the repair class admits.
+      A routine clear-plate says nothing about the filament path;
+    * ``wire`` and ``declared`` rows are never closed here.
+
+    It returns WHAT IT CLOSED rather than a bare boolean because both verbs report it
+    to the operator (``incidents_closed``): a Recover that silently ended an equipment
+    fault is indistinguishable, at the UI, from one that did nothing — which is how
+    011-H2S 2026-09-17 produced a day of "Mark plate cleared" clicks against a hold
+    neither verb was ever going to touch.
     """
     try:
         from backend.app.core.database import async_session
 
+        ctx = Context(
+            state=printer_manager.get_status(printer_id),
+            ledger=ledger,
+            driver_live=False,
+            cleared=ClearedEvent(recover=recover),
+        )
         closed: list[tuple[int, str]] = []
         async with async_session() as db:
             for incident in await printer_incidents.open_rows(db, printer_id):
-                resolution = printer_incidents.resolution_class(
-                    incident.kind, external=printer_incidents.row_external(incident)
-                )
-                if resolution == RESOLUTION_OPERATOR or (recover and resolution == RESOLUTION_REPAIR):
-                    row = await printer_incidents.close(
-                        db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_OPERATOR
+                verdict = incident_resolution.resolve(incident, "plate_cleared", ctx)
+                if not verdict.close:
+                    logger.info(
+                        "[pause-recovery] printer %s plate cleared (%s), but its open %s incident %s is left "
+                        "standing: %s",
+                        printer_id,
+                        "recover" if recover else "clear-plate",
+                        incident.kind,
+                        incident.id,
+                        verdict.evidence,
                     )
-                    if row is not None:
-                        closed.append((row.id, row.kind))
                     continue
-                logger.info(
-                    "[pause-recovery] printer %s plate cleared (%s), but its open %s incident %s resolves on %s "
-                    "— left standing",
-                    printer_id,
-                    "recover" if recover else "clear-plate",
-                    incident.kind,
-                    incident.id,
-                    resolution,
-                )
+                row = await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source)
+                if row is not None:
+                    closed.append((row.id, row.kind))
         for incident_id, kind in closed:
             logger.info(
                 "[pause-recovery] printer %s %s hold %s closed — the operator %s",
@@ -808,10 +813,10 @@ async def on_plate_cleared(printer_id: int, *, recover: bool = False) -> bool:
                 incident_id,
                 "recovered the printer" if recover else "cleared the plate",
             )
-        return bool(closed)
+        return closed
     except Exception:  # noqa: BLE001 — an operator verb must never fail on its hold cleanup
         logger.exception("[pause-recovery] plate-cleared hold close failed for printer %s", printer_id)
-        return False
+        return []
 
 
 # --- the fleet summary --------------------------------------------------------------

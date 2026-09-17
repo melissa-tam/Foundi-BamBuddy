@@ -113,7 +113,8 @@ DECLARED_KINDS: frozenset[str] = frozenset({KIND_SERVICE_HOLD})
 # ``"repair"``  the wire going quiet proves NOTHING, because the firmware wipes its
 #               HMS list at every terminal; the hold ends on POSITIVE evidence that
 #               filament moved through the path again (a completed load, or a print
-#               running on it) — ``spool_recovery._repaired``.
+#               running on it, or the job it interrupted completing) — the
+#               ``repair`` cells of ``incident_resolution._TABLE``.
 # ``"operator"`` only a human act ends it (``clear_plate`` / ``operator_recover``),
 #               because the terminal that follows was CAUSED by the farm (a
 #               plate-vision stop) or the wire cannot see the plate (a lost Z frame).
@@ -212,6 +213,17 @@ RESOLVE_WIRE_CLEAR = "wire_clear"
 # ``repair`` kind's HMS list goes quiet at every terminal whether or not anything was
 # fixed, so "no code standing" is not evidence there and positive motion is.
 RESOLVE_REPAIR_OBSERVED = "repair_observed"
+# The path was repaired and the JOB THE FAULT INTERRUPTED then ran to ``completed``.
+# Its own token beside ``repair_observed`` because it is a different, stronger
+# statement: not "filament moved once" but "filament fed through this path to the end
+# of the very print the fault broke". 23 of the 40 physical rows in this farm's
+# history ended as a hand repair plus a resume, and every one of those completions was
+# invisible to the farm until 2026-09-17 (011-H2S) — the completion landed inside the
+# sweep's 120 s dwell and the terminal closer had no repair vocabulary. Its own token
+# so the audit ledger can COUNT the new evidence against the other two. ``outcome_of``
+# needs no entry: a physical row is escalated at entry, so ``escalated_at`` puts every
+# close of one in ``human_resolved`` whatever produced it.
+RESOLVE_REPAIR_COMPLETED = "repair_completed"
 # The recovery DRIVER produced the outcome itself (``spool_recovery._succeed``): the
 # jammed feeder was swapped for a replacement and the print resumed, or the firmware
 # CONTINUE self-healed the wedged change on the SAME feeder. Their own tokens rather

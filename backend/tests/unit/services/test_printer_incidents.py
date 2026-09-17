@@ -1214,16 +1214,18 @@ class TestNoCloserEndsADeclaredHold:
 
         printer, _ = await self._held(db_session, printer_factory)
 
-        assert await pause_recovery.on_plate_cleared(printer.id, recover=recover) is False
+        assert await pause_recovery.on_plate_cleared(printer.id, recover=recover) == []
 
         await self._still_open(db_session, printer.id)
 
     async def test_spool_recovery_on_job_terminal(self, db_session, printer_factory):
         from backend.app.services import spool_recovery
+        from backend.app.services.incident_resolution import TerminalEvent
 
         printer, _ = await self._held(db_session, printer_factory)
 
-        assert await spool_recovery.on_job_terminal(printer.id) is False
+        terminal = TerminalEvent(status="completed", eject=False, job_id="task-1")
+        assert await spool_recovery.on_job_terminal(printer.id, terminal) is False
 
         await self._still_open(db_session, printer.id)
 

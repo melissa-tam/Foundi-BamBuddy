@@ -883,10 +883,13 @@ export default {
       recoverMessageWithReason: 'Récupérer "{{name}}" ? Motif : {{reason}}. Il s\'agit d\'un forçage explicite qui :',
       recoverEffectPlate: '• Lève le blocage du plateau',
       recoverEffectQuarantine: '• Lève la quarantaine',
-      recoverEffectResume: '• Reprend la série en pause',
+      recoverEffectLease: '• Libère la réservation de répartition',
       recoverEffectEject: '• Abandonner l\'éjection en cours',
+      recoverEffectFault: '• Clôt la panne d\'équipement ouverte',
+      recoverEffectResume: '• Reprend la série en pause',
+      recoverClosedFault: 'Panne d\'équipement clôturée',
       markPlateCleared: 'Marquer le plateau comme dégagé',
-      actionsHelp: 'Récupérer et reprendre lève la quarantaine et reprend la série en pause. Marquer le plateau comme dégagé libère uniquement le verrou du plateau.',
+      actionsHelp: 'Récupérer et reprendre libère tout ce qui retient cette imprimante — plateau, réservation, éjection, quarantaine, panne d\'équipement — et reprend la série en pause. Marquer le plateau comme dégagé libère uniquement le verrou du plateau.',
     },
     phase: {
       printing: 'Impression',
@@ -932,6 +935,7 @@ export default {
       ejectInProgress: 'Éjection en cours · {{age}}',
       ejectStalled: 'Éjection bloquée · {{age}} — la ferme a perdu la trace du balayage',
       menuRecover: 'Récupérer l\'imprimante',
+      clearedClosedFault: 'Panne d\'équipement clôturée',
     },
     // Éjection manuelle (W2) + invite nouvelle bobine (W6)
     eject: {
@@ -1241,7 +1245,7 @@ export default {
     incidentAction: {
       jam: 'Dégagez le chemin du filament de l\'AMS, puis reprenez l\'impression',
       runout: 'Rechargez l\'emplacement demandé ; l\'impression reprend d\'elle-même',
-      physical: 'Dégagez le chemin du filament sur l\'imprimante, puis reprenez l\'impression',
+      physical: 'Chemin du filament bloqué. Se libère au chargement d\'un emplacement, quand l\'impression interrompue se termine par ce chemin, ou via Récupérer.',
       power_loss: 'Reprenez sur l\'imprimante',
       plate_vision: 'Dégagez le plateau, puis « Marquer le plateau comme dégagé »',
       z_reference_lost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main, puis « Marquer le plateau comme dégagé »',

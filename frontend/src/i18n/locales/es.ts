@@ -883,10 +883,13 @@ export default {
       recoverMessageWithReason: '¿Recuperar "{{name}}"? Motivo: {{reason}}. Es una anulación explícita que:',
       recoverEffectPlate: '• Quita la retención de la placa',
       recoverEffectQuarantine: '• Quita la cuarentena',
-      recoverEffectResume: '• Reanuda la serie en pausa',
+      recoverEffectLease: '• Libera la reserva de despacho',
       recoverEffectEject: '• Descartar la expulsión en curso',
+      recoverEffectFault: '• Cierra la avería de equipo abierta',
+      recoverEffectResume: '• Reanuda la serie en pausa',
+      recoverClosedFault: 'Avería de equipo cerrada',
       markPlateCleared: 'Marcar cama como despejada',
-      actionsHelp: 'Recuperar y reanudar levanta la cuarentena y reanuda la serie pausada. Marcar cama como despejada solo libera el bloqueo de la cama.',
+      actionsHelp: 'Recuperar y reanudar libera todo lo que retiene esta impresora — placa, reserva, expulsión, cuarentena, avería de equipo — y reanuda la serie pausada. Marcar cama como despejada solo libera el bloqueo de la cama.',
     },
     phase: {
       printing: 'Imprimiendo',
@@ -932,6 +935,7 @@ export default {
       ejectInProgress: 'Expulsión en curso · {{age}}',
       ejectStalled: 'Expulsión atascada · {{age}} — la granja perdió el rastro del barrido',
       menuRecover: 'Recuperar impresora',
+      clearedClosedFault: 'Avería de equipo cerrada',
     },
     // Expulsión manual (W2) + aviso de nueva bobina (W6)
     eject: {
@@ -1241,7 +1245,7 @@ export default {
     incidentAction: {
       jam: 'Despeje la vía de filamento del AMS y reanude la impresión',
       runout: 'Recargue la ranura solicitada; la impresión se reanuda sola',
-      physical: 'Despeje la vía del filamento en la impresora y reanude la impresión',
+      physical: 'Vía de filamento bloqueada. Se resuelve al cargar una ranura, al completarse por esa vía la impresión interrumpida, o con Recuperar.',
       power_loss: 'Reanude en la impresora',
       plate_vision: 'Despeje la cama y luego «Marcar cama como despejada»',
       z_reference_lost: 'Reiniciada con una pieza en la cama — retírela a mano y luego «Marcar cama como despejada»',

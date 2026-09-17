@@ -1997,7 +1997,7 @@ async def _scan_spent_contradictions(db: AsyncSession, manager) -> int:
     """The sweep :func:`detect_spent_contradictions` throttles and guards. See it."""
     from backend.app.services import notify_dedup
     from backend.app.services.notification_service import notification_service
-    from backend.app.services.spool_recovery import runout_slot_desc
+    from backend.app.services.printer_incidents import runout_slot_desc
 
     result = await db.execute(
         select(SpoolAssignment)
