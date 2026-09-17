@@ -173,26 +173,30 @@ class TestInjectGcodeInto3mf:
         finally:
             source.unlink(missing_ok=True)
 
-    def test_fallback_to_first_gcode(self):
-        """Falls back to first gcode file when plate-specific not found."""
+    def test_absent_plate_is_refused_not_substituted(self):
+        """A plate the container does not carry is answered None — never another plate's
+        member, because on 2026-09-17 that substitution packed an eject sweep into
+        ``plate_1.gcode`` for a job whose ``project_file`` commanded
+        ``Metadata/plate_3.gcode``, and the printer could not parse the result
+        (005-H2S, HMS ``0500_0003`` / ``0500_4003``).
+        """
         source = _make_temp_path()
-
         with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("Metadata/plate_1.gcode", "ORIGINAL\n")
+        before = source.read_bytes()
+        temp_dir = Path(tempfile.gettempdir())
+        temps_before = set(temp_dir.glob("*.3mf"))
 
         try:
-            # Request plate 5 which doesn't exist — should fall back to plate_1
-            result = inject_gcode_into_3mf(source, 5, "; INJECTED", None)
-            assert result is not None
+            assert inject_gcode_into_3mf(source, 5, "; INJECTED", None) is None
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert gcode.startswith("; INJECTED\n")
+            # Nothing was written: no new temp container, and the donor is untouched.
+            assert set(temp_dir.glob("*.3mf")) - temps_before == set()
+            assert source.read_bytes() == before
+            with zipfile.ZipFile(source, "r") as zf:
+                assert zf.read("Metadata/plate_1.gcode") == b"ORIGINAL\n"
         finally:
             source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
 
     def test_original_file_unchanged(self):
         """The source 3MF is never modified."""
