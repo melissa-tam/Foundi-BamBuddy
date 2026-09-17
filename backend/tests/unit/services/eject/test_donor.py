@@ -626,3 +626,103 @@ class TestReadPlateBbox:
         corrupt = tmp_path / "corrupt.gcode.3mf"
         corrupt.write_bytes(b"this is not a zip archive")
         assert read_plate_bbox(corrupt, 1) is None
+
+
+class TestSourceFromItem:
+    """The item→donor body is no longer this module's: it is ONE call to
+    ``farm_correlation.resolve_item_donor`` plus the plate height an eject build needs.
+
+    The fork carried two item→donor resolvers until 2026-09-17 — this one (archive-first,
+    plate validated against the container) and a library-first one in
+    ``farm_correlation`` with no plate check. The farm-unit eject lane used the second,
+    built a sweep from a library row whose SQLite id had been re-used by an unrelated
+    upload, and commanded a plate that file does not carry (005-H2S). One resolver, so
+    the lanes cannot answer differently again.
+    """
+
+    async def test_the_dispatch_archive_outranks_the_library_row(self, db_session):
+        """Archive-first, and the archive's ``print_name`` is what the dialog shows."""
+        archive_copy = _make_3mf(plates=(1, 2, 3, 4))
+        stranger = _make_3mf(plates=(1,))
+        try:
+            printer = await _mk_printer(db_session, "SFI1")
+            lf = await _mk_library(db_session, filename="M12_Drill.gcode.3mf", file_path=str(stranger))
+            arch = await _mk_archive(
+                db_session,
+                printer_id=printer.id,
+                subtask="SUB-2200",
+                file_path=str(archive_copy),
+                filename="48ac27.gcode.3mf",
+                print_name="Half Shell",
+            )
+            item = await _mk_item(
+                db_session, printer_id=printer.id, library_file_id=lf.id, archive_id=arch.id, plate_id=3
+            )
+            await db_session.commit()
+
+            result = await donor_mod.source_from_item(db_session, printer, item)
+
+            assert result is not None
+            assert result.path == archive_copy, "the dispatch-time copy, never the re-bound library row"
+            assert result.plate_id == 3
+            assert result.max_z == 18.0
+            assert result.print_name == "Half Shell"
+        finally:
+            archive_copy.unlink(missing_ok=True)
+            stranger.unlink(missing_ok=True)
+
+    async def test_a_donor_without_the_units_plate_declines(self, db_session):
+        """Set-but-absent is a refusal, not a reason to sweep some other plate."""
+        single = _make_3mf(plates=(1,))
+        try:
+            printer = await _mk_printer(db_session, "SFI2")
+            arch = await _mk_archive(
+                db_session, printer_id=printer.id, subtask="SUB-X", file_path=str(single), filename="one.gcode.3mf"
+            )
+            item = await _mk_item(db_session, printer_id=printer.id, archive_id=arch.id, plate_id=3)
+            await db_session.commit()
+
+            assert await donor_mod.source_from_item(db_session, printer, item) is None
+        finally:
+            single.unlink(missing_ok=True)
+
+    async def test_the_library_row_still_answers_for_a_unit_with_no_archive(self, db_session):
+        """LIVENESS: archive-first is a precedence, not a requirement."""
+        source = _make_3mf(plates=(1,))
+        try:
+            printer = await _mk_printer(db_session, "SFI3")
+            lf = await _mk_library(db_session, filename="Last.gcode.3mf", file_path=str(source))
+            item = await _mk_item(db_session, printer_id=printer.id, library_file_id=lf.id, plate_id=1)
+            await db_session.commit()
+
+            result = await donor_mod.source_from_item(db_session, printer, item)
+
+            assert result is not None
+            assert result.path == source
+            assert result.print_name == "Last.gcode.3mf"
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_a_plateless_donor_declines(self, db_session):
+        """A container with no G-code plate at all cannot answer, and says so."""
+        bare = _make_bare_3mf()
+        try:
+            printer = await _mk_printer(db_session, "SFI4")
+            lf = await _mk_library(db_session, filename="Bare.gcode.3mf", file_path=str(bare))
+            item = await _mk_item(db_session, printer_id=printer.id, library_file_id=lf.id, plate_id=None)
+            await db_session.commit()
+
+            assert await donor_mod.source_from_item(db_session, printer, item) is None
+        finally:
+            bare.unlink(missing_ok=True)
+
+    async def test_the_module_keeps_no_second_plate_resolver(self):
+        """``resolve_plate_id`` moved to ``utils.threemf_tools`` beside
+        ``list_gcode_plate_ids`` — it is a pure container question, and leaving a copy
+        here is what let the two lanes drift apart in the first place."""
+        import inspect
+
+        from backend.app.utils import threemf_tools
+
+        assert "def resolve_plate_id" not in inspect.getsource(donor_mod), "not defined here any more"
+        assert donor_mod.resolve_plate_id is threemf_tools.resolve_plate_id, "the one origin is imported, not copied"

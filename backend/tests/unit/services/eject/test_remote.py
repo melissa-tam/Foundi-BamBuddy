@@ -2085,3 +2085,89 @@ class TestRuntimeWatchdogReferencePhase:
         assert _records(caplog, "bed-drop phase cleared")
         assert _records(caplog, "sweep phase cleared")
         assert "stage=epilogue" in _kill_line(caplog)
+
+
+class TestTheCommandedPlateIsTheBuiltPlate:
+    """What the build PACKED and what the firmware is TOLD are one value.
+
+    The 2026-09-17 incident (005-H2S) lived in the gap between them: the dispatcher
+    re-read ``item.plate_id or 1`` for ``start_print`` while the builder had resolved a
+    G-code member with a first-member fallback, so a donor that did not carry plate 3
+    was uploaded with the sweep in ``plate_1.gcode`` and a ``project_file`` naming
+    ``Metadata/plate_3.gcode``. The printer answered "the content of print file is
+    unreadable" (HMS ``0500_0003`` / ``0500_4003``) and never started.
+    """
+
+    @staticmethod
+    def _multi_plate_3mf(plates: list[int]) -> Path:
+        fd, name = tempfile.mkstemp(suffix=".gcode.3mf")
+        os.close(fd)
+        path = Path(name)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for plate in plates:
+                zf.writestr(f"Metadata/plate_{plate}.gcode", _PLATE_GCODE)
+                zf.writestr(f"Metadata/plate_{plate}.gcode.md5", "STALE")
+            zf.writestr("3D/3dmodel.model", "<model/>")
+        return path
+
+    async def test_the_units_plate_is_packed_and_commanded(self, db_session):
+        """A unit that printed plate 3 of a 4-plate donor: the uploaded container holds
+        the sweep in ``plate_3.gcode`` and ``start_print`` commands plate 3."""
+        source = self._multi_plate_3mf([1, 2, 3, 4])
+        uploaded: dict[str, bytes] = {}
+
+        async def _capture(_ip, _code, eject_path, _remote, **_kwargs):
+            with zipfile.ZipFile(eject_path, "r") as zf:
+                uploaded.update({name: zf.read(name) for name in zf.namelist() if name.endswith(".gcode")})
+            return True
+
+        try:
+            printer, item = await _seed(db_session, source)
+            item.plate_id = 3
+            await db_session.commit()
+            _gate(printer.id)
+            start = MagicMock(return_value=True)
+            with (
+                patch.object(printer_manager, "is_connected", return_value=True),
+                patch(
+                    "backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))
+                ),
+                patch("backend.app.services.bambu_ftp.upload_file_async", AsyncMock(side_effect=_capture)),
+                patch.object(printer_manager, "start_print", start),
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=7
+                )
+            assert start.call_args.kwargs["plate_id"] == 3, "the firmware is told the plate that was packed"
+            packed = uploaded["Metadata/plate_3.gcode"].decode("utf-8")
+            assert "FARM EJECT BLOCK" in packed
+            assert "FARM EJECT BLOCK" not in uploaded["Metadata/plate_1.gcode"].decode("utf-8")
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_a_donor_without_the_units_plate_is_a_409(self, db_session):
+        """The donor resolver refuses a file that cannot supply the unit's plate, and
+        this lane turns that into the precondition failure the operator sees — never a
+        sweep built on some other plate."""
+        source = self._multi_plate_3mf([1])
+        try:
+            printer, item = await _seed(db_session, source)
+            item.plate_id = 3  # the re-bound-library shape: the file is a stranger
+            await db_session.commit()
+            _gate(printer.id)
+            c1, c2, c3 = _ftp_patches()
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=7
+                )
+            assert exc.value.status_code == 409
+            start.assert_not_called()
+            assert plate_occupancy.pending_eject_view(printer.id) is None, "nothing claimed"
+        finally:
+            source.unlink(missing_ok=True)

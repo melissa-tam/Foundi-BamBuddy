@@ -28,6 +28,7 @@ from backend.app.services.eject.generator import (
     generate_eject_gcode,
 )
 from backend.app.services.eject.validator import validate_eject_gcode
+from backend.app.utils.threemf_tools import list_gcode_plate_ids
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,15 +79,43 @@ class BuiltEject:
     one BOUNDS it. "Seeded" and "unseeded" are therefore two populations of one
     instrument, and a runtime series that mixes them without saying which is which
     cannot be read.
+
+    ``plate_id`` is the member the build actually PACKED the sweep into, and it is the
+    plate the dispatcher then commands in ``project_file`` — ONE value for both halves.
+    They used to be two reads of ``item.plate_id`` with a plate-reader fallback between
+    them, and on 2026-09-17 they disagreed: the sweep was packed into ``plate_1.gcode``
+    while ``start_print`` told the firmware ``Metadata/plate_3.gcode``, which is a file
+    the printer cannot parse (005-H2S, HMS ``0500_0003`` / ``0500_4003``).
     """
 
     path: Path
+    plate_id: int
     expected_runtime_s: float
     drop_span_s: float | None
     sweep_span_s: float
     tail_s: float
     reference_s: float | None = None
     start_z: float | None = None
+
+
+_NO_MAX_Z = "Could not parse max_z_height from the 3MF gcode header"
+
+
+def _absent_plate_reason(source_path: Path, plate_id: int) -> str | None:
+    """The "donor X has no plate N" sentence when the container genuinely lacks it, else None.
+
+    The build fails on an absent plate in two places — the header read (no height) and
+    the repack (no member to replace) — and both used to report a symptom ("could not
+    parse max_z_height", "failed to repack") for what is really ONE fact: this donor is
+    not the file that printed this plate. Naming the fact is what the operator needs,
+    because the fix is never in the eject profile; it is the wrong donor (2026-09-17,
+    005-H2S). Returns None when the plate IS present, so a genuinely headerless plate
+    keeps its own diagnosis instead of being mislabelled.
+    """
+    plates = list_gcode_plate_ids(source_path)
+    if plate_id in plates:
+        return None
+    return f"donor {source_path.name} has no plate {plate_id} (G-code plates: {plates or 'none'})"
 
 
 async def resolve_cooldown_override(db: AsyncSession, batch_id: int | None) -> float | None:
@@ -157,14 +186,18 @@ async def build_part_present_eject_file(
     than fatal (the estimate is then the longest the move could take).
 
     Returns a :class:`BuiltEject` — the temp ``.gcode.3mf`` path (caller cleans it
-    up) plus the runtime the block is expected to take. The estimate is taken from
-    the EJECT BLOCK text, which is exactly what replaces the plate G-code, i.e.
-    exactly what the printer executes; anything else in the archive is inert. Raises
-    :class:`EjectGenerationError` on any failure.
+    up), the plate the sweep was PACKED into (the dispatcher commands that same value,
+    never a second read of the queue row) plus the runtime the block is expected to
+    take. The estimate is taken from the EJECT BLOCK text, which is exactly what
+    replaces the plate G-code, i.e. exactly what the printer executes; anything else in
+    the archive is inert. Raises :class:`EjectGenerationError` on any failure —
+    including a donor that does not carry ``plate_id`` at all, which is named as such
+    ("donor <name> has no plate N") and surfaces to the operator through the eject
+    route's existing 409: the remedy is a different donor, never a different profile.
     """
     max_z = max_z_override if max_z_override is not None else read_max_z(Path(source_path), plate_id)
     if max_z is None:
-        raise EjectGenerationError("Could not parse max_z_height from the 3MF gcode header")
+        raise EjectGenerationError(_absent_plate_reason(Path(source_path), plate_id) or _NO_MAX_Z)
 
     block = generate_eject_gcode(profile, max_z, geometry)
     validation = validate_eject_gcode(block, profile, max_z, geometry)
@@ -180,6 +213,9 @@ async def build_part_present_eject_file(
     try:
         path = await get_or_build_eject_file(Path(source_path), plate_id, block)
     except EjectBuildError as exc:
+        reason = _absent_plate_reason(Path(source_path), plate_id)
+        if reason is not None:
+            raise EjectGenerationError(reason) from exc
         raise EjectGenerationError(f"Failed to repack the part-present eject 3mf: {exc}") from exc
     logger.info(
         "eject.dispatch: built part-present eject from %s plate %s (max_z %.2fmm, profile %r, z_ref=%s, "
@@ -200,6 +236,7 @@ async def build_part_present_eject_file(
     )
     return BuiltEject(
         path=path,
+        plate_id=plate_id,
         expected_runtime_s=segments.total_s,
         drop_span_s=drop_span_s,
         sweep_span_s=segments.sweep_span_s,

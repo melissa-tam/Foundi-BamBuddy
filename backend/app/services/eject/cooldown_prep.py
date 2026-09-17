@@ -918,6 +918,14 @@ async def _hold_plate(
     numbers can never hold so it is not worth opening a 3MF for, and the admission pair
     (connected → ``ejectable``) is last because it is the only fact that can change
     between now and the publish, so it is asked as late as it can be.
+
+    **A donor that cannot supply this unit's plate ends the lane fan-only** — the plate
+    is not raised at all — rather than holding at some other plate's height. It shows up
+    as ``skipped:donor`` (the shared resolver refused the donor outright) or
+    ``skipped:max_z`` (the plate is in the container but its header carries no height).
+    Until 2026-09-17 the chain here read ``source.plate_id or item.plate_id or 1`` and
+    the plate reader fell back to the first G-code member, so a stranger donor produced
+    a height and the bed rose to it (005-H2S).
     """
     if queue_item_id is None:
         return "skipped:foreign", None, None
@@ -997,14 +1005,17 @@ async def _hold_plate(
             source = await farm_correlation.resolve_item_donor(db, item)
             if source is None:
                 logger.warning(
-                    "[cooldown-prep] printer %s: no donor file for unit %s — plate not held",
+                    "[cooldown-prep] printer %s: no donor file for unit %s (or it does not carry that unit's "
+                    "plate) — plate not held",
                     printer_id,
                     queue_item_id,
                 )
                 return "skipped:donor", None, None
-            # Same precedence the eject dispatcher uses: the FARM's dispatched plate
-            # first, anything parsed out of the file never.
-            plate_id = source.plate_id or item.plate_id or 1
+            # The ONE resolver's plate — already validated against the donor's own
+            # G-code members. There is no second read of the queue row here: the hold
+            # raises the plate to a HEIGHT read off this plate's header, so a plate the
+            # donor does not carry must end the lane, never be replaced by plate 1.
+            plate_id = source.plate_id
 
             max_z = donor.read_max_z(source.local_path, plate_id)
             if max_z is None:
