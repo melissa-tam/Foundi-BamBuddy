@@ -51,6 +51,7 @@ from backend.app.schemas.settings import AppSettings
 from backend.app.services import farm_correlation, pause_recovery, printer_incidents
 from backend.app.services.dispatch_target import DispatchTarget, target_of
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
+from backend.app.services.hms_errors import format_hms_error_summary
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
@@ -108,6 +109,24 @@ _VISION_CONFIRMED_DETAIL = (
     "and requeued the plate. Clear the bed, then Mark plate cleared. Repeated hits on one printer mean the "
     "eject profile is not releasing parts: re-run that profile's hardware ladder."
 )
+
+
+def _hms_summary(hms_errors: list[dict] | None) -> str | None:
+    """The printer's own account of a failure, as text a human can act on.
+
+    ``hms_errors.format_hms_error_summary`` is THE renderer (it also writes
+    ``PrintQueueItem.error_message``); this only adds the last-resort fall-back for a
+    payload the catalogs cannot describe at all — the raw ``full_code``s, which are
+    still greppable against the printer screen and the vendored tables. None means the
+    terminal carried no codes whatsoever, which is itself worth saying in the page.
+    """
+    described = format_hms_error_summary(hms_errors)
+    if described:
+        return described
+    if not hms_errors:
+        return None
+    raw = [str(e.get("full_code") or "").strip() for e in hms_errors]
+    return ", ".join(code for code in raw if code) or None
 
 
 # --------------------------------------------------------------------------- #
@@ -274,6 +293,7 @@ async def on_terminal(
     archive_data: dict | None = None,
     completed_subtask_id: str | None = None,
     completed_subtask_name: str | None = None,
+    hms_errors: list[dict] | None = None,
 ) -> None:
     """React to a terminal print status. Non-farm prints are a no-op.
 
@@ -287,6 +307,12 @@ async def on_terminal(
     must not finalise / clear someone else's plate (Phase 1). After a restart the id
     check turns lenient (the client's ``last_dispatch_subtask_id`` is gone), so the
     name check re-establishes positive identity for a HYDRATED pending (W1/R2).
+
+    ``hms_errors`` is the terminal payload's live HMS list (the same one
+    ``main.on_print_complete`` writes ``error_message`` from). It is the printer's own
+    account of WHY a job ended, and the rejected-eject branch below pages with it —
+    "unable to parse the file" is the difference between a sweep that failed and a file
+    the printer never read.
     """
     try:
         # 1. Server-dispatched eject job terminal (production OR first-article). The
@@ -366,6 +392,53 @@ async def on_terminal(
                         f"{pending.expected_runtime_s:.0f}s" if pending.expected_runtime_s is not None else "n/a",
                     )
                     plate_occupancy.resolve_eject(printer_id, "unverified")
+                    return
+                if pending.started_at is None and not pending.hydrated and final_status != "completed":
+                    # The printer REFUSED the file at setup — it never started the job, so
+                    # nothing moved and nothing swept. ``started_at`` is stamped by the
+                    # PRINT START echo, so "no start + a non-completed terminal" is exactly
+                    # that shape: PREPARE → FAILED, the 005-H2S 2026-09-17 incident (HMS
+                    # 0500_4003 "unable to parse the file" — the eject was built from the
+                    # wrong donor and the commanded plate member was absent).
+                    #
+                    # A HYDRATED pending is excluded because there ``started_at`` is None BY
+                    # CONSTRUCTION (the durable mirror is one timestamp column, not the built
+                    # artifact) — it means "the farm restarted mid-sweep and cannot say", not
+                    # "never started". Same pairing as ``expire_eject_start``, for the same
+                    # reason: a rule keyed on the stamp alone fires on every restart.
+                    #
+                    # It is a FILE fault, not a machine fault: quarantining the printer or
+                    # pausing the run would park healthy hardware over a bad build, and the
+                    # next eject of a repaired file has nothing to recover from. So: keep
+                    # the gate (the part is still on the plate), page a human with the
+                    # printer's own codes, and leave the printer dispatchable. Deliberately
+                    # ahead of the purpose fork — production, manual and FA all mean the
+                    # same thing here, and none of their reactions is owed.
+                    codes = _hms_summary(hms_errors) or "no HMS code reported"
+                    logger.warning(
+                        "farm_policy: %s eject on printer %s ended %r before the printer ever started it — "
+                        "the printer rejected the eject file (%s); plate stays gated, no quarantine",
+                        pending.purpose,
+                        printer_id,
+                        final_status,
+                        codes,
+                    )
+                    plate_occupancy.resolve_eject(printer_id, "unverified")
+                    try:
+                        from backend.app.services.eject.monitor import notify_plate_not_empty
+
+                        await notify_plate_not_empty(
+                            printer_id,
+                            source_detail=(
+                                f"the printer rejected the eject file before starting it ({codes}) — nothing was "
+                                "swept; remove the part by hand and Mark plate cleared, or eject again once the "
+                                "cause is fixed"
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — a page must never abort the resolve above
+                        logger.warning(
+                            "farm_policy: rejected-eject page failed for printer %s", printer_id, exc_info=True
+                        )
                     return
                 if pending.purpose == "fa":
                     if final_status == "completed":

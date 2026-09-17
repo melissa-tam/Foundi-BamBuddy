@@ -4254,6 +4254,26 @@ class BambuMQTTClient:
             and self._previous_gcode_file is not None
         )
 
+        # Per-job completion flags reset on the JOB BOUNDARY, not on RUNNING. Entry into
+        # PREPARE/SLICING from a state that is not part of an active job IS the boundary:
+        # the previous job is over and the next one's setup has begun. Resetting only on a
+        # RUNNING push (below) means a job that never reaches RUNNING inherits its
+        # predecessor's flags — 005-H2S 2026-09-17: a job that dies in PREPARE inherited the
+        # previous print's completion flag, so the pre-print-failure arm of
+        # ``should_trigger_completion`` could never fire after a completed print (log:
+        # "State is FAILED but completion NOT triggered: prev=PREPARE, was_running=False,
+        # already_triggered=True"). The printer had rejected an eject file at setup and no
+        # terminal ever reached the farm. PAUSE is deliberately in the "active" set beside
+        # RUNNING — a paused job is still the same job.
+        if self.state.state in ("PREPARE", "SLICING") and self._previous_gcode_state not in (
+            "PREPARE",
+            "SLICING",
+            "RUNNING",
+            "PAUSE",
+        ):
+            self._completion_triggered = False
+            self._was_running = False
+
         # Track RUNNING state for more robust completion detection
         running_first_observed = False
         if self.state.state == "RUNNING" and current_file:
