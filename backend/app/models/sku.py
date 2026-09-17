@@ -24,6 +24,8 @@ class Sku(Base):
     """A catalog product/part code with its default farm eject behaviour."""
 
     __tablename__ = "skus"
+    # A deleted id is never reused — see core.database._rebuild_table_with_autoincrement (005-H2S 2026-09-17).
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     # Canonical product code, e.g. "SKU007.01". Unique across the catalog.
@@ -61,7 +63,12 @@ class SkuFile(Base):
     """
 
     __tablename__ = "sku_files"
-    __table_args__ = (UniqueConstraint("sku_id", "library_file_id", "plate_index", name="uq_sku_file_plate"),)
+    # A deleted id is never reused — see core.database._rebuild_table_with_autoincrement (005-H2S 2026-09-17).
+    # The dict is the LAST element of the tuple form: SQLAlchemy reads dialect kwargs there.
+    __table_args__ = (
+        UniqueConstraint("sku_id", "library_file_id", "plate_index", name="uq_sku_file_plate"),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     sku_id: Mapped[int] = mapped_column(ForeignKey("skus.id", ondelete="CASCADE"), nullable=False, index=True)

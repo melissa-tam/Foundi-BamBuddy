@@ -456,6 +456,182 @@ async def _column_exists(conn, table_name: str, column_name: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+# A DELETED ID IS NEVER REUSED (005-H2S, 2026-09-17).
+#
+# SQLite recycles the rowid of a deleted MAX row unless the table is declared
+# AUTOINCREMENT, and this fork deliberately never turns FK enforcement on (see the
+# notes beside ``PRAGMA foreign_keys`` in this file, ``api/routes/printers.py`` and
+# ``services/user_deletion.py``) — so a reference to a purged row does not fail, it
+# silently RE-BINDS to whatever row next takes that id. On 2026-09-16 ``library_files``
+# id 109 was purged and re-issued twice; a completed unit's ``print_queue.library_file_id``
+# then pointed at a stranger single-plate file, and its eject built the wrong container
+# and was rejected by the printer as unreadable.
+#
+# The members are the operator-deletable tables whose ids are held by rows that OUTLIVE
+# the delete. Parent-first order, so a reader walks the graph the way the FKs point.
+# Adding a new deletable table means classifying it in
+# ``backend/tests/unit/test_id_reuse_census.py`` — that census fails until you do.
+_AUTOINCREMENT_TABLES: tuple[str, ...] = (
+    "printers",
+    "library_files",
+    "print_archives",
+    "eject_profiles",
+    "skus",
+    "sku_files",
+    "print_batches",
+    "print_queue",
+)
+
+
+async def _rebuild_table_with_autoincrement(conn, table) -> None:
+    """Rebuild one SQLite table so its INTEGER PRIMARY KEY carries ``AUTOINCREMENT``.
+
+    A FRESH install gets the flag straight from the model
+    (``__table_args__ = {"sqlite_autoincrement": True}``) via ``create_all``; this is the
+    one-time retrofit for an install whose table already exists. SQLite cannot add
+    AUTOINCREMENT with ``ALTER TABLE`` — create-copy-drop-rename is the only route.
+    PostgreSQL has nothing to fix (a sequence never goes backwards), so the whole helper
+    is a no-op off SQLite.
+
+    **Failure semantics.** ``run_migrations`` runs inside ONE ``engine.begin()``
+    transaction (:func:`init_db`), and everything from the CREATE onwards runs inside
+    ``conn.begin_nested()`` and RAISES on failure. A failure while rebuilding table *n*
+    therefore rolls back tables 1..*n-1* as well: startup aborts with the original schema
+    intact and there is no half-applied state for the next boot to reason about.
+
+    **What it refuses rather than risks.** ``PRAGMA foreign_keys = 1`` — the DROP would
+    cascade-delete children — raises; the pragma is never turned off here, because an
+    install that enabled it made a decision this helper must not silently reverse. A live
+    column the model does not have, or a model column that is NOT NULL with no default and
+    absent live, means the copy would lose or invent data: the table is left exactly as it
+    is and the skip is an ERROR log, not an exception (one un-retrofitted table must not
+    take the whole install's startup down). A model column that is NOT NULL with only a
+    PYTHON-side default and absent live is deliberately NOT in that skip set: a raw
+    ``INSERT ... SELECT`` cannot apply a Python default, so it fails the NOT NULL check and
+    takes the fatal path below — which is the right answer, because the schema and the
+    model disagreeing that way is a missing ADD COLUMN migration, not a table to tiptoe past.
+
+    Indexes and triggers are captured from ``sqlite_master`` BEFORE the drop and replayed
+    verbatim after the rename, because ``DROP TABLE`` takes them with it and several are
+    hand-written in this file and unknown to the model —
+    ``ix_print_queue_dispatch_subtask_id`` and the three ``print_archives`` FTS triggers
+    among them. A replay that does not restore every captured object raises.
+
+    Only the leading ``CREATE TABLE <name> (`` token is renamed, never a ``REFERENCES``
+    clause: ``print_queue.retry_of_id`` points at ``print_queue`` itself, and the new table
+    takes that name a statement later. ``sqlite_sequence`` is deliberately not written —
+    the explicit-rowid INSERT seeds it to MAX(id), which is exactly the floor the next
+    insert must clear.
+    """
+    import re
+
+    from sqlalchemy import text
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+    from sqlalchemy.schema import CreateTable
+
+    if not is_sqlite():
+        return
+
+    name = table.name
+    existing_sql = (
+        await conn.execute(text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :t"), {"t": name})
+    ).scalar()
+    if existing_sql is None:
+        return  # Not in this database (fresh-install ordering, or a partial model registration in tests).
+    if "AUTOINCREMENT" in existing_sql.upper():
+        return  # Already carries it — created fresh by create_all, or rebuilt by an earlier boot.
+
+    if (await conn.execute(text("PRAGMA foreign_keys"))).scalar():
+        raise RuntimeError(
+            f"refusing the AUTOINCREMENT rebuild of {name}: PRAGMA foreign_keys is ON, so the DROP would "
+            "cascade-delete child rows. This fork runs with FK enforcement off by design; an install that "
+            "turned it on must decide for itself, and this migration will not turn it off."
+        )
+
+    live_columns = [row[1] for row in await conn.execute(text(f"PRAGMA table_info({name})"))]
+    model_columns = [column.name for column in table.columns]
+
+    unknown_live = [column for column in live_columns if column not in model_columns]
+    if unknown_live:
+        logger.error(
+            "[MIGRATION] AUTOINCREMENT rebuild SKIPPED for %s: live column(s) %s are not in the model, so the "
+            "copy would silently drop them. Table left intact — its deleted ids can still be reused.",
+            name,
+            ", ".join(unknown_live),
+        )
+        return
+    unfillable = [
+        column.name
+        for column in table.columns
+        if column.name not in live_columns
+        and not column.nullable
+        and column.server_default is None
+        and column.default is None
+    ]
+    if unfillable:
+        logger.error(
+            "[MIGRATION] AUTOINCREMENT rebuild SKIPPED for %s: model column(s) %s are NOT NULL with no default "
+            "and absent from the live table, so the copy has nothing to put in them. Table left intact — its "
+            "deleted ids can still be reused.",
+            name,
+            ", ".join(unfillable),
+        )
+        return
+
+    captured = (
+        await conn.execute(
+            text(
+                "SELECT type, name, sql FROM sqlite_master WHERE tbl_name = :t AND type IN ('index', 'trigger') "
+                "AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
+            ),
+            {"t": name},
+        )
+    ).fetchall()
+    row_count = (await conn.execute(text(f'SELECT COUNT(*) FROM "{name}"'))).scalar()
+
+    staging = f"{name}__ai"
+    ddl = str(CreateTable(table).compile(dialect=sqlite_dialect.dialect()))
+    leading_name = re.compile(
+        rf"^(\s*CREATE\s+TABLE\s+)(?:{re.escape(chr(34) + name + chr(34))}|{re.escape(name)})(\s*\()",
+        re.IGNORECASE,
+    )
+    staging_ddl, renamed = leading_name.subn(rf'\g<1>"{staging}"\g<2>', ddl, count=1)
+    if renamed != 1:
+        raise RuntimeError(f"AUTOINCREMENT rebuild of {name}: could not rename the CREATE TABLE token in {ddl!r}")
+
+    columns_sql = ", ".join(f'"{column}"' for column in model_columns if column in live_columns)
+
+    async with conn.begin_nested():
+        await conn.execute(text(staging_ddl))
+        await conn.execute(text(f'INSERT INTO "{staging}" ({columns_sql}) SELECT {columns_sql} FROM "{name}"'))
+        await conn.execute(text(f'DROP TABLE "{name}"'))
+        await conn.execute(text(f'ALTER TABLE "{staging}" RENAME TO "{name}"'))
+        for _type, _object_name, object_sql in captured:
+            await conn.execute(text(object_sql))
+        restored = (
+            await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = :t AND type IN ('index', 'trigger') "
+                    "AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
+                ),
+                {"t": name},
+            )
+        ).scalar()
+        if restored != len(captured):
+            raise RuntimeError(
+                f"AUTOINCREMENT rebuild of {name}: replayed {restored} of {len(captured)} captured "
+                f"index/trigger objects ({', '.join(row[1] for row in captured)})"
+            )
+
+    logger.info(
+        "[MIGRATION] AUTOINCREMENT rebuild: %s now never reissues a deleted id (%s row(s) copied, "
+        "%s index/trigger object(s) replayed)",
+        name,
+        row_count,
+        len(captured),
+    )
+
+
 async def _migrate_normalize_printer_ids(conn) -> None:
     from sqlalchemy import text
 
@@ -5206,6 +5382,18 @@ async def run_migrations(conn):
             "farm_cooldown_aux_fan_enabled=false and the '0' row deleted (the speed setting no longer "
             "encodes off; an absent row now means the schema default)"
         )
+
+    # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds
+    # from and the live table agree. A deleted id is never reused (005-H2S 2026-09-17) —
+    # rationale, refusals and failure semantics live on the helper.
+    for _autoincrement_table in _AUTOINCREMENT_TABLES:
+        _table = Base.metadata.tables.get(_autoincrement_table)
+        if _table is None:
+            # The model is not registered in this process, so no database it created can
+            # hold the table either. Loud is wrong here: the census test is the pin that
+            # the eight names are real.
+            continue
+        await _rebuild_table_with_autoincrement(conn, _table)
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (
