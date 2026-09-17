@@ -92,6 +92,35 @@ def _library_donor(tmp_path: Path) -> Path:
     )
 
 
+def _container(dest: Path, plates: list[int]) -> Path:
+    """A synthetic ``.gcode.3mf`` carrying a G-code member for exactly ``plates``.
+
+    Unlike :func:`_multi_plate_3mf` (whose slice_info declares plates but which always
+    writes the ladder's single plate-3 member), the MEMBER SET here is the point: the
+    2026-09-17 incident is a container that does not carry the plate the unit printed,
+    and the only thing that can express it is which ``Metadata/plate_N.gcode`` members
+    exist. Synthetic, never a production file.
+    """
+    blocks = [
+        line
+        for index in plates
+        for line in (
+            "  <plate>",
+            f'    <metadata key="index" value="{index}"/>',
+            '    <metadata key="prediction" value="19860"/>',
+            '    <metadata key="weight" value="100.0"/>',
+            "  </plate>",
+        )
+    ]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(dest, "w") as zf:
+        zf.writestr("Metadata/slice_info.config", "\n".join(["<config>", *blocks, "</config>"]))
+        for index in plates:
+            zf.writestr(f"Metadata/plate_{index}.gcode", "; HEADER_BLOCK_START\n; max_z_height: 18.00\n")
+            zf.writestr(f"Metadata/plate_{index}.gcode.md5", "STALE")
+    return dest
+
+
 def _printer_stub() -> SimpleNamespace:
     return SimpleNamespace(id=3, ip_address="10.0.0.3", access_code="12345678", model="H2S")
 
@@ -640,10 +669,48 @@ async def _seed_library_file(db, path: Path, base_dir: Path, *, filename: str = 
 
 
 @pytest.mark.asyncio
-async def test_donor_prefers_the_library_row_and_carries_the_items_plate(
+async def test_donor_prefers_the_dispatch_archive_and_carries_the_items_plate(
     db_session, printer_factory, tmp_path, monkeypatch
 ):
-    """The dispatched source, present for the whole run's lifetime."""
+    """The bytes the unit was DISPATCHED WITH outrank the library row it came from.
+
+    Both rows resolve to real files here, so the test measures the PRECEDENCE and
+    nothing else. The archive wins because of a deletion asymmetry: an archive cannot
+    be deleted out from under a live queue row, while a library row can be trashed,
+    purged, and have its SQLite rowid handed to the next upload — which is how unit
+    2200's ``library_file_id`` came to name a stranger file (2026-09-17, 005-H2S).
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.farm_correlation import resolve_dispatch_donor
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    printer = await printer_factory()
+    library_path = _library_donor(tmp_path)
+    archive_path = _multi_plate_3mf(tmp_path / "archive" / "1" / "dispatch_copy.3mf", {DISPATCHED_PLATE: PLATE_3_GRAMS})
+    library_row = await _seed_library_file(db_session, library_path, tmp_path)
+    archive = await _seed_archive(db_session, printer.id, file_path=str(archive_path.relative_to(tmp_path)))
+    item = await _seed_farm_item(db_session, printer.id, "FARM-815")
+    item.library_file_id = library_row.id
+    item.archive_id = archive.id
+    await db_session.commit()
+
+    donor = await resolve_dispatch_donor(db_session, printer.id, "FARM-815")
+
+    assert donor is not None
+    assert donor.local_path == archive_path, "the dispatch-time copy, not the library row"
+    assert donor.plate_id == DISPATCHED_PLATE, "the plate the FARM dispatched, not one parsed from the file"
+    assert donor.item_id == item.id
+    assert donor.print_name == "plate_3", "the archive's operator-facing name rides along"
+
+
+@pytest.mark.asyncio
+async def test_donor_uses_the_library_row_when_the_unit_has_no_archive(
+    db_session, printer_factory, tmp_path, monkeypatch
+):
+    """LIVENESS for the second tier: archive-first is a precedence, not a requirement.
+
+    A unit dispatched before its archive row exists (or one whose archive was never
+    written) still resolves its donor from the library row it was built from."""
     from backend.app.core.config import settings as app_settings
     from backend.app.services.farm_correlation import resolve_dispatch_donor
 
@@ -660,7 +727,7 @@ async def test_donor_prefers_the_library_row_and_carries_the_items_plate(
     assert donor is not None
     assert donor.local_path == donor_path
     assert donor.filename == SPLICED_NAME
-    assert donor.plate_id == DISPATCHED_PLATE, "the plate the FARM dispatched, not one parsed from the file"
+    assert donor.plate_id == DISPATCHED_PLATE
     assert donor.item_id == item.id
 
 
@@ -668,7 +735,10 @@ async def test_donor_prefers_the_library_row_and_carries_the_items_plate(
 async def test_donor_falls_back_to_the_archive_copy_when_the_library_bytes_are_gone(
     db_session, printer_factory, tmp_path, monkeypatch
 ):
-    """What remains after a transient Direct-Print library row was reaped."""
+    """What remains after a transient Direct-Print library row was reaped.
+
+    Since the resolver became archive-first the archive answers here whether or not a
+    library row survives; this pins the case where it is the ONLY thing left."""
     from backend.app.core.config import settings as app_settings
     from backend.app.services.farm_correlation import resolve_dispatch_donor
 
@@ -753,6 +823,122 @@ async def test_a_foreign_print_gets_no_donor_even_while_a_farm_unit_is_printing(
     assert await resolve_dispatch_donor(db_session, printer.id, None) is None
     # Liveness: the farm's own dispatch still resolves.
     assert await resolve_dispatch_donor(db_session, printer.id, "FARM-815") is not None
+
+
+# ---------------------------------------------------------------------------
+# The 005-H2S shape (2026-09-17): a re-bound library id, and the plate check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_rebound_library_id_cannot_displace_the_dispatch_archive(
+    db_session, printer_factory, tmp_path, monkeypatch
+):
+    """THE 005-H2S shape, end to end.
+
+    Unit 2200 printed plate 3 of a 4-plate file. Hours later the operator trashed and
+    purged that library row; SQLite handed its rowid (109) to the next upload — a
+    SINGLE-PLATE file — and ``print_queue.library_file_id`` silently came to name a
+    stranger. A library-first resolver handed that stranger to the eject builder, which
+    packed the sweep into ``plate_1.gcode`` while the dispatcher commanded plate 3:
+    HMS ``0500_0003`` / ``0500_4003``, "the content of print file is unreadable".
+
+    Archive-first makes the re-bound id unreachable: the dispatch-time copy is the
+    file, and plate 3 is its own plate.
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.farm_correlation import resolve_item_donor
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    printer = await printer_factory()
+    stranger = _container(tmp_path / "library" / "1d0916e0.3mf", [1])  # the re-uploaded M12 file
+    four_plate = _container(tmp_path / "archive" / "1" / "48ac27.3mf", [1, 2, 3, 4])  # archive 1918
+    stranger_row = await _seed_library_file(db_session, stranger, tmp_path, filename="M12_Drill.gcode.3mf")
+    archive = await _seed_archive(db_session, printer.id, file_path=str(four_plate.relative_to(tmp_path)))
+    item = await _seed_farm_item(db_session, printer.id, "FARM-2200")
+    item.library_file_id = stranger_row.id
+    item.archive_id = archive.id
+    await db_session.commit()
+
+    donor = await resolve_item_donor(db_session, item)
+
+    assert donor is not None
+    assert donor.local_path == four_plate, "the dispatch archive, never the re-bound library row"
+    assert donor.plate_id == DISPATCHED_PLATE
+
+
+@pytest.mark.asyncio
+async def test_a_donor_without_the_units_plate_is_refused_not_substituted(
+    db_session, printer_factory, tmp_path, monkeypatch, caplog
+):
+    """FAIL CLOSED: an archive that lacks plate 3 is no donor — never plate 1 instead.
+
+    This is the half that makes the fix a class closure rather than a re-ordering: if
+    the preferred row ALSO fails to carry the unit's plate (a truncated archive, a
+    re-sliced file), the honest answer is "no donor", because every consumer downstream
+    — the eject repack, the commanded ``project_file``, the cooldown hold's height —
+    reads the answer as "the plate this unit printed".
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.farm_correlation import resolve_item_donor
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    printer = await printer_factory()
+    single = _container(tmp_path / "archive" / "1" / "truncated.3mf", [1])
+    archive = await _seed_archive(db_session, printer.id, file_path=str(single.relative_to(tmp_path)))
+    item = await _seed_farm_item(db_session, printer.id, "FARM-2201")
+    item.archive_id = archive.id
+    await db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.farm_correlation"):
+        donor = await resolve_item_donor(db_session, item)
+
+    assert donor is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("has no plate 3" in m for m in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_a_unit_without_a_plate_takes_the_containers_own_answer(
+    db_session, printer_factory, tmp_path, monkeypatch
+):
+    """A non-plate-scoped unit: the container decides, and only when it can.
+
+    ``plate_id`` is NULL on a unit that was never plate-scoped. A single G-code plate
+    is then an unambiguous answer, and so is a ``plate_N`` hint in the donor's own name
+    when the container carries that plate; several plates and no hint are not, and a
+    blind sweep is never guessed.
+    """
+    from backend.app.core.config import settings as app_settings
+    from backend.app.services.farm_correlation import resolve_item_donor
+
+    monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+    printer = await printer_factory()
+    single = _container(tmp_path / "archive" / "1" / "one_plate.3mf", [1])
+    many = _container(tmp_path / "archive" / "2" / "four_plate.3mf", [1, 2, 3, 4])
+
+    single_archive = await _seed_archive(db_session, printer.id, file_path=str(single.relative_to(tmp_path)))
+    plateless = await _seed_farm_item(db_session, printer.id, "FARM-2202", plate_id=None)
+    plateless.archive_id = single_archive.id
+    many_archive = await _seed_archive(db_session, printer.id, file_path=str(many.relative_to(tmp_path)))
+    many_archive.filename = "four_plate.gcode.3mf"  # no plate hint in the name
+    ambiguous = await _seed_farm_item(db_session, printer.id, "FARM-2203", plate_id=None)
+    ambiguous.archive_id = many_archive.id
+    hinted_archive = await _seed_archive(db_session, printer.id, file_path=str(many.relative_to(tmp_path)))
+    hinted_archive.filename = "four_plate_plate_2.gcode.3mf"
+    hinted = await _seed_farm_item(db_session, printer.id, "FARM-2204", plate_id=None)
+    hinted.archive_id = hinted_archive.id
+    await db_session.commit()
+
+    resolved = await resolve_item_donor(db_session, plateless)
+    assert resolved is not None
+    assert resolved.plate_id == 1, "the container's only G-code plate"
+
+    assert await resolve_item_donor(db_session, ambiguous) is None, "four plates, no record, no hint: refuse"
+
+    by_hint = await resolve_item_donor(db_session, hinted)
+    assert by_hint is not None
+    assert by_hint.plate_id == 2, "the donor's own name names the plate, and the container carries it"
 
 
 # ---------------------------------------------------------------------------

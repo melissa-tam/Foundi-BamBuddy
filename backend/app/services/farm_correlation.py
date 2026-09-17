@@ -95,6 +95,7 @@ from backend.app.services.plate_occupancy import (
     plate_occupancy,
 )
 from backend.app.utils.filename import print_identity_key
+from backend.app.utils.threemf_tools import list_gcode_plate_ids, resolve_plate_id
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -225,13 +226,21 @@ class DispatchDonor:
     class). ``plate_id`` is the plate the FARM dispatched, which is authoritative
     over anything parsed out of the file or echoed by the printer: a hand-spliced
     ladder plate can declare a different index internally and still be the file that
-    ran.
+    ran. It is a plain ``int`` because the resolver VALIDATED it against the
+    container's own G-code members before building this object — a donor whose plate
+    cannot be named is no donor at all, so no consumer has to decide what to do with
+    an unknown plate (2026-09-17, 005-H2S).
+
+    ``print_name`` is the operator-facing name of the print (the archive's
+    ``print_name``, else the file's own name), for the surfaces that show a human
+    WHICH job a donor belongs to — the manual-eject confirm dialog above all.
     """
 
     local_path: Path
     filename: str
-    plate_id: int | None
+    plate_id: int
     item_id: int
+    print_name: str | None = None
 
 
 def _payload_names(payload: dict) -> set[str]:
@@ -428,59 +437,108 @@ async def resolve_active_plate_id(db: AsyncSession, printer_id: int, subtask_id:
 
 
 async def resolve_item_donor(db: AsyncSession, item: PrintQueueItem) -> DispatchDonor | None:
-    """The on-disk source ``.gcode.3mf`` ``item`` printed from, or None.
+    """The on-disk source ``.gcode.3mf`` ``item`` printed from, and its plate, or None.
 
     THE one origin for "which file did this unit actually print, and which plate of
-    it". Two rows can answer, in this order:
+    it" — the eject builder, the cooldown hold, the print-start archive capture and
+    the usage tracker all ask it here. Two rows can answer, **archive first**:
 
-    * ``library_file_id`` — the dispatched source, present for the whole run's
-      lifetime and the file the scheduler uploaded (``print_scheduler`` resolves the
-      same pair at dispatch; G-code injection happens on a system temp AFTER this
-      file is read, so the durable copy is always the un-injected original);
-    * ``archive_id`` — the per-dispatch archive copy, which is what remains when a
-      transient Direct-Print library row was reaped after dispatch
-      (``cleanup_library_after_dispatch`` nulls ``library_file_id`` and rebinds the
-      item to the archive).
+    * ``archive_id`` — the bytes this unit was DISPATCHED WITH. On the library path
+      the scheduler writes a byte copy at dispatch (``print_scheduler.py`` ~3765-3787);
+      on the archive path it is the operator-selected archive (~3717-3728); on a retry
+      it is the ancestor's archive (``queue_builder.CARRIED_COLUMNS``).
+    * ``library_file_id`` — the library row the dispatch was built from, resolved with
+      the absolute-or-``base_dir`` pattern. Second, not first, because of a DELETION
+      ASYMMETRY: an archive cannot be deleted out from under a live queue row (the
+      archive delete detaches its queue items — ``archive.py
+      delete_related_queue_items`` — and the route refuses a printing row with a 409
+      via ``count_related_queue_items``), while a library row can be trashed and
+      purged at any moment AND its SQLite rowid re-used by the next upload. On
+      2026-09-17 that re-use pointed unit 2200's ``library_file_id`` at a stranger
+      single-plate file and the eject was built from it (005-H2S, HMS ``0500_4003``).
 
     Both are checked with ``is_file()`` rather than ``exists()``: an archive row
     created without a 3MF carries ``file_path == ""``, and ``base_dir / ""`` is the
     base directory itself — which ``exists()`` happily confirms, handing the caller a
     DIRECTORY as a donor.
 
-    Returns None when neither row resolves to bytes on disk; the caller decides
-    whether that is a 409, a fall-back-to-guessing, or a wait (the missing-library
-    file WAIT of 2026-08-15).
+    The plate is then VALIDATED against the container's own G-code members
+    (``list_gcode_plate_ids``), because a donor that cannot supply the plate this unit
+    printed is the wrong file, not a file to sweep some other plate of:
+
+    * ``item.plate_id`` set and present → that plate;
+    * ``item.plate_id`` set and ABSENT → None + WARN. Fail closed. Never another plate;
+    * ``item.plate_id`` None (a non-plate-scoped unit) → the container's own answer
+      (``threemf_tools.resolve_plate_id``: filename hint, else the single G-code
+      plate), and None when that is ambiguous.
+
+    Returns None when neither row resolves to bytes on disk or the plate cannot be
+    named; the caller decides whether that is a 409, a fall-back-to-guessing, or a
+    wait (the missing-library file WAIT of 2026-08-15).
     """
     from backend.app.core.config import settings as app_settings
     from backend.app.models.archive import PrintArchive
     from backend.app.models.library import LibraryFile
 
-    if item.library_file_id:
-        library_file = await db.get(LibraryFile, item.library_file_id)
-        if library_file is not None and library_file.file_path:
-            lib_path = Path(library_file.file_path)
-            path = lib_path if lib_path.is_absolute() else app_settings.base_dir / library_file.file_path
-            if path.is_file():
-                return DispatchDonor(
-                    local_path=path,
-                    filename=library_file.filename or path.name,
-                    plate_id=item.plate_id,
-                    item_id=item.id,
-                )
+    path: Path | None = None
+    filename: str | None = None
+    print_name: str | None = None
 
     if item.archive_id:
         archive = await db.get(PrintArchive, item.archive_id)
         if archive is not None and archive.file_path:
-            path = app_settings.base_dir / archive.file_path
-            if path.is_file():
-                return DispatchDonor(
-                    local_path=path,
-                    filename=archive.filename or path.name,
-                    plate_id=item.plate_id,
-                    item_id=item.id,
-                )
+            disk = app_settings.base_dir / archive.file_path
+            if disk.is_file():
+                path = disk
+                filename = archive.filename or disk.name
+                print_name = archive.print_name or archive.filename or disk.name
 
-    return None
+    if path is None and item.library_file_id:
+        library_file = await db.get(LibraryFile, item.library_file_id)
+        if library_file is not None and library_file.file_path:
+            lib_path = Path(library_file.file_path)
+            disk = lib_path if lib_path.is_absolute() else app_settings.base_dir / library_file.file_path
+            if disk.is_file():
+                path = disk
+                filename = library_file.filename or disk.name
+                print_name = library_file.filename or disk.name
+
+    if path is None or filename is None:
+        return None
+
+    plates = list_gcode_plate_ids(path)
+    if item.plate_id is not None:
+        if item.plate_id not in plates:
+            logger.warning(
+                "[DONOR] queue item %s: donor %s has no plate %s (G-code plates: %s) — refusing it rather than "
+                "offering another plate",
+                item.id,
+                filename,
+                item.plate_id,
+                plates or "none",
+            )
+            return None
+        plate_id = item.plate_id
+    else:
+        resolved = resolve_plate_id(path, filename)
+        if resolved is None:
+            logger.info(
+                "[DONOR] queue item %s: donor %s carries no unambiguous plate (G-code plates: %s) and the unit "
+                "records none",
+                item.id,
+                filename,
+                plates or "none",
+            )
+            return None
+        plate_id = resolved
+
+    return DispatchDonor(
+        local_path=path,
+        filename=filename,
+        plate_id=plate_id,
+        item_id=item.id,
+        print_name=print_name,
+    )
 
 
 async def resolve_dispatch_donor(db: AsyncSession, printer_id: int, subtask_id: str | None) -> DispatchDonor | None:

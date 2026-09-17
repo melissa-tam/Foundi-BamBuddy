@@ -203,9 +203,11 @@ async def locate_3mf_for_print(
     """
     if known_donor is not None:
         if known_donor.local_path.is_file():
-            # The item's own plate outranks the gcode_file echo; fall back to the
-            # echo only for a unit that carries no plate (single-plate / non-farm).
-            expected = known_donor.plate_id if known_donor.plate_id is not None else parse_plate_id(filename)
+            # The donor's plate is the FARM's own record, validated against the
+            # container by the one resolver — it outranks anything derived from the
+            # ``gcode_file`` echo, and it is never absent (a donor whose plate cannot
+            # be named is no donor at all), so there is no echo fallback here.
+            expected = known_donor.plate_id
             logger.info(
                 "[CALLBACK] printer %s: queue item %s dispatched this print — using its known donor %s "
                 "(plate %s), skipping the name-derived lookup and the #1204 plate cross-check",

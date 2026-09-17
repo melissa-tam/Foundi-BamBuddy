@@ -15,6 +15,7 @@ from pathlib import Path
 
 from backend.app.utils.threemf_tools import (
     _SLICE_INFO_NAME,
+    _find_target_gcode_name,
     extract_bed_type_from_3mf,
     extract_embedded_presets_from_3mf,
     extract_filament_usage_from_3mf,
@@ -30,6 +31,7 @@ from backend.app.utils.threemf_tools import (
     read_plate_json,
     repack_3mf_eject,
     repack_3mf_with_gcode,
+    resolve_plate_id,
     zero_slice_usage_bytes,
 )
 
@@ -79,6 +81,106 @@ class TestListGcodePlateIds:
 
     def test_unreadable_returns_empty(self):
         assert list_gcode_plate_ids(Path("does-not-exist.3mf")) == []
+
+
+class TestFindTargetGcodeName:
+    """The plate reader answers the plate it was ASKED for, or nothing.
+
+    It had a "fall back to the first gcode member" arm until 2026-09-17, when that arm
+    packed an eject sweep into ``plate_1.gcode`` for a job whose ``project_file``
+    commanded ``Metadata/plate_3.gcode`` — a container the firmware cannot parse
+    (005-H2S). Every caller already treats None as "not in this file"."""
+
+    _NAMES = ["Metadata/plate_1.gcode", "Metadata/plate_2.gcode", "Metadata/plate_1.gcode.md5", "3D/3dmodel.model"]
+
+    def test_exact_member_for_each_plate(self):
+        assert _find_target_gcode_name(self._NAMES, 1) == "Metadata/plate_1.gcode"
+        assert _find_target_gcode_name(self._NAMES, 2) == "Metadata/plate_2.gcode"
+
+    def test_absent_plate_is_none_never_another_plate(self):
+        assert _find_target_gcode_name(self._NAMES, 3) is None
+
+    def test_no_gcode_member_at_all_is_none(self):
+        assert _find_target_gcode_name(["3D/3dmodel.model"], 1) is None
+
+    def test_a_longer_plate_number_is_not_a_suffix_match(self):
+        """``plate_11.gcode`` must not answer a request for plate 1."""
+        assert _find_target_gcode_name(["Metadata/plate_11.gcode"], 1) is None
+        assert _find_target_gcode_name(["Metadata/plate_11.gcode"], 11) == "Metadata/plate_11.gcode"
+
+
+class TestResolvePlateId:
+    """The "which plate does this container have" rule for a caller that records none.
+
+    It lived in ``services.eject.donor`` until 2026-09-17; it moved here beside
+    ``list_gcode_plate_ids`` so the farm-unit lane could reach it without importing the
+    eject package. A caller that HAS a recorded plate validates that instead — this is
+    only ever asked when there is nothing to validate."""
+
+    def test_single_gcode_plate_is_unambiguous(self):
+        path = _write_3mf(["Metadata/plate_2.gcode", "3D/3dmodel.model"])
+        try:
+            assert resolve_plate_id(path, None) == 2
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_filename_hint_wins_when_the_container_carries_that_plate(self):
+        path = _write_3mf(["Metadata/plate_1.gcode", "Metadata/plate_3.gcode"])
+        try:
+            assert resolve_plate_id(path, "Half_Shell_plate_3.gcode.3mf") == 3
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_a_hint_the_container_does_not_carry_is_ignored(self):
+        """The hint is a HINT — the members decide. Two plates and no usable hint is
+        ambiguous, and a blind sweep is never guessed."""
+        path = _write_3mf(["Metadata/plate_1.gcode", "Metadata/plate_3.gcode"])
+        try:
+            assert resolve_plate_id(path, "Half_Shell_plate_9.gcode.3mf") is None
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_hint_rescues_an_otherwise_ambiguous_container(self):
+        path = _write_3mf(["Metadata/plate_1.gcode", "Metadata/plate_2.gcode"])
+        try:
+            assert resolve_plate_id(path, None) is None
+            assert resolve_plate_id(path, "job_plate_2.3mf") == 2
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_no_gcode_plate_and_unreadable_file_are_none(self, tmp_path):
+        path = _write_3mf(["3D/3dmodel.model"])
+        try:
+            assert resolve_plate_id(path, "job_plate_1.3mf") is None
+        finally:
+            path.unlink(missing_ok=True)
+        assert resolve_plate_id(tmp_path / "missing.3mf", None) is None
+
+
+class TestReadPlateGcodeHeaderPlateScope:
+    """The header reader is plate-scoped: an absent plate answers ``{}``.
+
+    Its consumers turn ``{}`` into a refusal — the eject build has no part height, the
+    SKU catalog reports no ``max_z_height``, the profile route 422s — which is the
+    whole point: a height read off a plate this job did not print is worse than none.
+    """
+
+    _HEADER = "; HEADER_BLOCK_START\n; max_z_height: 18.00\n; HEADER_BLOCK_END\n"
+
+    def _donor(self, tmp_path):
+        path = tmp_path / "one_plate.gcode.3mf"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Metadata/plate_1.gcode", self._HEADER)
+        return path
+
+    def test_present_plate_parses(self, tmp_path):
+        assert read_plate_gcode_header(self._donor(tmp_path), 1).get("max_z_height") == "18.00"
+
+    def test_absent_plate_is_empty_never_another_plates_header(self, tmp_path):
+        assert read_plate_gcode_header(self._donor(tmp_path), 3) == {}
+
+    def test_absent_plate_machine_end_is_none(self, tmp_path):
+        assert read_plate_gcode_machine_end(self._donor(tmp_path), 3) is None
 
 
 class TestParseGcodeLayerFilamentUsage:
@@ -1171,12 +1273,36 @@ class TestRepack3mfEjectZeroing:
 
     def test_no_gcode_member_returns_none(self, tmp_path):
         # A donor with NO gcode member at all → None (the caller translates to its
-        # own error). A specific-plate miss falls back to the first gcode, so None
-        # requires the absence of every gcode member.
+        # own error).
         path = tmp_path / "no_gcode.3mf"
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("3D/3dmodel.model", self._MODEL)
         assert repack_3mf_eject(path, 1, self._NEW_GCODE) is None
+
+    def test_a_plate_the_donor_does_not_carry_returns_none(self, tmp_path):
+        """THE 2026-09-17 regression: a single-plate donor asked for plate 3.
+
+        This used to build — the plate reader fell back to the FIRST gcode member, so
+        the sweep was packed into ``plate_1.gcode`` while the dispatcher went on
+        commanding ``Metadata/plate_3.gcode``. The firmware cannot parse a file whose
+        commanded member is absent (005-H2S: HMS ``0500_0003`` / ``0500_4003``), and a
+        15 KB "eject" was uploaded where every healthy one is 6-17 MB. A build that
+        cannot pack the plate it was asked for now produces nothing at all.
+        """
+        src = self._write_3mf(tmp_path)  # carries plate 1 only
+        assert repack_3mf_eject(src, 3, self._NEW_GCODE) is None
+        # Liveness: the plate it DOES carry still builds.
+        out = repack_3mf_eject(src, 1, self._NEW_GCODE)
+        try:
+            assert out is not None
+        finally:
+            if out is not None:
+                out.unlink(missing_ok=True)
+
+    def test_repack_with_gcode_also_refuses_an_absent_plate(self, tmp_path):
+        """The general-purpose swap (the ladder tool's entry) answers the same way."""
+        src = self._write_3mf(tmp_path)
+        assert repack_3mf_with_gcode(src, 3, self._NEW_GCODE) is None
 
     def test_no_slice_info_still_builds(self, tmp_path):
         src = self._write_3mf(tmp_path, with_slice_info=False)

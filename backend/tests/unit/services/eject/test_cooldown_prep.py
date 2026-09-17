@@ -67,6 +67,10 @@ MODEL_WITHOUT_AIRDUCT = "P1S"
 
 _UNSET = object()
 
+# The REAL height reader, captured before any test stubs it, so the donor-plate tests
+# below can drive the actual ``plate_N.gcode`` member lookup instead of a fake.
+_REAL_READ_MAX_Z = cooldown_prep.donor.read_max_z
+
 
 def _fans(
     *,
@@ -344,17 +348,19 @@ class TestPlateHold:
         assert prep.hold == "sent"
         assert prep.hold_z == 4.0
 
-    async def test_plate_id_precedence_is_the_dispatchers(self, env):
-        """The FARM's dispatched plate first, the unit's own next, 1 last — the same
-        precedence ``remote.dispatch_part_present_eject`` uses."""
+    async def test_the_plate_is_the_resolvers_answer_and_nothing_else(self, env):
+        """ONE plate, read once — the queue row is never re-consulted here.
+
+        This used to be ``source.plate_id or item.plate_id or 1``: three sources for one
+        fact, so a donor that did not carry the unit's plate still produced a height and
+        the bed rose to it. The shared resolver now validates the plate against the
+        donor's own G-code members before it answers at all, which makes any second
+        reading of ``item.plate_id`` either redundant or wrong (2026-09-17, 005-H2S).
+        """
         env.donor.plate_id = 2
         env.item.plate_id = 3
         await env.begin()
-        env.donor.plate_id = None
-        await env.begin()
-        env.item.plate_id = None
-        await env.begin()
-        assert env.plate_ids == [2, 3, 1]
+        assert env.plate_ids == [2], "the donor's validated plate, never the row's"
 
     async def test_foreign_watch_never_holds_and_never_opens_a_session(self, env):
         """No unit ⇒ no donor, no profile, no measured height: nothing to hold safely."""
@@ -407,10 +413,21 @@ class TestPlateHold:
         assert (prep.hold, prep.hold_z) == ("skipped:bedslinger", None)
         assert env.client.hold_gcode == []
 
-    async def test_unresolvable_donor(self, env):
+    async def test_unresolvable_donor(self, env, caplog):
+        """No donor ⇒ no height ⇒ fan-only, and this is now also the 005-H2S shape.
+
+        Since 2026-09-17 the shared resolver refuses a donor that does not carry the
+        unit's plate (a re-bound library id, a truncated archive), so "the file this
+        unit printed is not on disk" and "the file on disk is not the one this unit
+        printed" arrive here as the same answer — and both end the lane before the bed
+        moves, rather than holding at a stranger plate's height."""
         env.donor = None
-        prep = await env.begin()
+        with caplog.at_level(logging.WARNING, logger=cooldown_prep.__name__):
+            prep = await env.begin()
         assert (prep.hold, prep.max_z) == ("skipped:donor", None)
+        assert env.client.hold_gcode == []
+        assert env.client.fans == [(2, 100), (3, 100)], "fan-only is a WORKING cooldown prep"
+        assert "no donor file for unit" in caplog.text
 
     async def test_plate_without_a_max_z_height(self, env):
         env.max_z = None
@@ -427,6 +444,71 @@ class TestPlateHold:
         assert prep.max_z == 60.0  # measured, then refused — the two are distinguishable
         assert "exceeds profile max_part_height_mm" in caplog.text
         assert env.client.hold_gcode == []
+
+
+class TestTheHeightComesFromTheUnitsOwnPlate:
+    """The last line of defence: the height is read from the plate the unit PRINTED.
+
+    These drive the REAL ``donor.read_max_z`` against real synthetic containers, because
+    the thing under test is exactly what a stub would paper over — which ZIP member the
+    reader opens. Until 2026-09-17 it fell back to the FIRST G-code member, so a donor
+    that did not carry plate 3 still answered a height, and the bed rose to a stranger
+    part's dimensions. It now answers ``{}`` for an absent plate, which lands here as
+    ``skipped:max_z``: fan-only, plate not raised.
+
+    In production such a donor no longer reaches this point at all — the shared resolver
+    refuses it and the lane ends at ``skipped:donor`` (see ``test_unresolvable_donor``).
+    This pins the behaviour of the layer BELOW that refusal.
+    """
+
+    @staticmethod
+    def _container(dest: Path, plates: dict[int, str | None]) -> Path:
+        """A ``.gcode.3mf`` with one G-code member per plate, each carrying (or not) a
+        ``max_z_height`` header."""
+        import zipfile
+
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+            for plate, height in plates.items():
+                header = "; HEADER_BLOCK_START\n"
+                if height is not None:
+                    header += f"; max_z_height: {height}\n"
+                header += "; HEADER_BLOCK_END\n"
+                zf.writestr(f"Metadata/plate_{plate}.gcode", header)
+                zf.writestr(f"Metadata/plate_{plate}.gcode.md5", "STALE")
+        return dest
+
+    async def test_a_donor_without_that_plate_holds_nothing(self, env, monkeypatch, tmp_path, caplog):
+        """The 005-H2S donor shape: a single-plate file, a unit that printed plate 3."""
+        monkeypatch.setattr(cooldown_prep.donor, "read_max_z", _REAL_READ_MAX_Z)
+        single = self._container(tmp_path / "M12_Drill.gcode.3mf", {1: "12.00"})
+        env.donor = SimpleNamespace(
+            local_path=single, filename="M12_Drill.gcode.3mf", plate_id=3, item_id=ITEM_ID, print_name=None
+        )
+
+        with caplog.at_level(logging.WARNING, logger=cooldown_prep.__name__):
+            prep = await env.begin()
+
+        assert (prep.hold, prep.hold_z, prep.max_z) == ("skipped:max_z", None, None)
+        assert env.client.hold_gcode == [], "the bed is never commanded on a donor we cannot measure"
+        assert env.client.fans == [(2, 100), (3, 100)], "the fans still run — the cooldown is not cancelled"
+        assert "carries no max_z_height" in caplog.text
+
+    async def test_the_units_own_plate_still_holds(self, env, monkeypatch, tmp_path, caplog):
+        """LIVENESS PAIR: the 4-plate donor the unit really printed holds normally, at
+        the height of ITS plate — not plate 1's."""
+        monkeypatch.setattr(cooldown_prep.donor, "read_max_z", _REAL_READ_MAX_Z)
+        four = self._container(tmp_path / "48ac27.gcode.3mf", {1: "12.00", 2: "20.00", 3: f"{MAX_Z:.2f}", 4: "31.00"})
+        env.donor = SimpleNamespace(
+            local_path=four, filename="48ac27.gcode.3mf", plate_id=3, item_id=ITEM_ID, print_name="Half Shell"
+        )
+
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin()
+
+        assert prep.hold == "sent"
+        assert prep.max_z == MAX_Z, "plate 3's height, not the first member's 12.00"
+        assert env.client.hold_gcode, "the bed was commanded"
+        assert "plate hold sent" in caplog.text
 
 
 class TestTheOperatorsHoldSettings:
