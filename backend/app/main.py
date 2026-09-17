@@ -936,39 +936,6 @@ def _hms_should_notify_severity(severity: int) -> bool:
     return severity <= 3
 
 
-def _format_hms_error_summary(hms_errors: list[dict]) -> str | None:
-    """Build a human-readable failure reason from MQTT hms_errors for PrintQueueItem.error_message.
-
-    Each entry has keys: code ('0x4038'), attr (32-bit int), module, severity.
-    The short code used for the hms_errors.py lookup table is 'MMMM_EEEE' — module
-    from attr bits 16-31, error from the numeric part of code. Falls back to the raw
-    short code when no description is on file. Returns None for an empty list so
-    callers can leave error_message unset.
-    """
-    if not hms_errors:
-        return None
-    from backend.app.services.hms_errors import lookup_description_any
-
-    parts: list[str] = []
-    for err in hms_errors:
-        try:
-            code_str = str(err.get("code", "")).replace("0x", "")
-            error_num = int(code_str, 16) if code_str else 0
-            attr_int = int(err.get("attr", 0))
-            module_num = (attr_int >> 16) & 0xFFFF
-            # Mask to the low 16 bits so a full 32-bit hms[] code (e.g. 0x00030004)
-            # still renders as the canonical MMMM_CCCC shape, matching hms_short_code.
-            short_code = f"{module_num:04X}_{error_num & 0xFFFF:04X}"
-        except (TypeError, ValueError):
-            continue
-        # Prefer the lossless full_code (via attr+code) against the vendored
-        # catalog, then fall back to the legacy 2-group table. Display shape
-        # stays "[MMMM_CCCC] text".
-        description = lookup_description_any(attr_int, err.get("code", 0))
-        parts.append(f"[{short_code}] {description}" if description else f"[{short_code}]")
-    return "; ".join(parts) if parts else None
-
-
 async def _bump_library_file_usage_if_completed(db, item, queue_status: str) -> None:
     """Increment LibraryFile.print_count and stamp last_printed_at when a queued
     print completes successfully. Gated to status=='completed': failed, cancelled
@@ -4857,7 +4824,9 @@ async def on_print_complete(printer_id: int, data: dict):
                 ):
                     item.stop_source = _stop_source
                 if queue_status == "failed" and not item.error_message:
-                    item.error_message = _format_hms_error_summary(data.get("hms_errors") or [])
+                    from backend.app.services.hms_errors import format_hms_error_summary
+
+                    item.error_message = format_hms_error_summary(data.get("hms_errors") or [])
 
                 # Bump usage counters on the source library file so admins can
                 # sort by "last printed" and (eventually) auto-purge stale
@@ -5160,6 +5129,7 @@ async def on_print_complete(printer_id: int, data: dict):
                             archive_data=no_archive_data,
                             completed_subtask_id=data.get("subtask_id"),
                             completed_subtask_name=data.get("subtask_name"),
+                            hms_errors=data.get("hms_errors"),
                         )
                     except Exception as farm_err:
                         logger.warning("[NOTIFY-BG] farm policy hook (no-archive) failed: %s", farm_err)
@@ -5701,6 +5671,7 @@ async def on_print_complete(printer_id: int, data: dict):
                         archive_data=archive_data,
                         completed_subtask_id=data.get("subtask_id"),
                         completed_subtask_name=data.get("subtask_name"),
+                        hms_errors=data.get("hms_errors"),
                     )
                 except Exception as farm_err:
                     logger.warning("[NOTIFY-BG] farm policy hook failed: %s", farm_err)

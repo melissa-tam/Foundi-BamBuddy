@@ -936,6 +936,43 @@ def lookup_description_any(attr: int | str, code: int | str) -> str | None:
     return lookup_full_code(full_code) or get_error_description(hms_short_code(attr, code))
 
 
+def format_hms_error_summary(hms_errors: list[dict] | None) -> str | None:
+    """Render an MQTT ``hms_errors`` payload list as human-readable fault text.
+
+    THE one "turn the terminal payload's HMS list into a sentence" implementation.
+    Each entry has keys ``code`` ('0x4038'), ``attr`` (32-bit int), ``module``,
+    ``severity``; the short code used for the lookup is ``MMMM_EEEE`` — module from
+    ``attr`` bits 16-31, error from the numeric part of ``code``. Display shape is
+    ``[MMMM_CCCC] text``, falling back to the bare short code when nothing on file
+    describes it, and malformed entries are skipped. Returns None for an empty list
+    (or one whose every entry is malformed) so callers can leave a field unset.
+
+    It lives here rather than in ``main`` since 2026-09-17: ``farm_policy`` names the
+    codes in the "the printer rejected the eject file" page, and a service may never
+    import the monolith. ``main.on_print_complete``'s ``error_message`` is the other
+    caller — one implementation, two consumers.
+    """
+    if not hms_errors:
+        return None
+    parts: list[str] = []
+    for err in hms_errors:
+        try:
+            code_str = str(err.get("code", "")).replace("0x", "")
+            error_num = int(code_str, 16) if code_str else 0
+            attr_int = int(err.get("attr", 0))
+            # Mask to the low 16 bits so a full 32-bit hms[] code (e.g. 0x00030004)
+            # still renders as the canonical MMMM_CCCC shape, matching hms_short_code.
+            module_num = (attr_int >> 16) & 0xFFFF
+            short_code = f"{module_num:04X}_{error_num & 0xFFFF:04X}"
+        except (TypeError, ValueError):
+            continue
+        # Prefer the lossless full_code (via attr+code) against the vendored
+        # catalog, then fall back to the legacy 2-group table.
+        description = lookup_description_any(attr_int, err.get("code", 0))
+        parts.append(f"[{short_code}] {description}" if description else f"[{short_code}]")
+    return "; ".join(parts) if parts else None
+
+
 # Firmware runout ``code`` words (low 32 bits) that carry a per-slot attribution
 # in their ``attr`` — the ``0700_2X00`` family that names the exhausted slot on the
 # printer screen ("AMS A Slot 3 filament has run out …"). Probe-verified against the

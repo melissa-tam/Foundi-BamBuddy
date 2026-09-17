@@ -606,6 +606,32 @@ class TestPolicyDriverArming:
         if releasable:
             assert armed.release_now.is_set()  # request_release_now signalled it
 
+    def test_the_arm_reads_farm_source_off_the_same_view_as_the_policy(self, spawns):
+        """The escalation hold's page copy is decided where the plate is READ.
+
+        ``PlateOccupied.source_subtask_id`` is the fact ("the farm deposited this"), and
+        the driver already holds the view carrying it at arm time. Passing it here is
+        what keeps the watch from taking a second, later opinion off the authority —
+        the alternative (a field on the EscalationOnly policy) was considered and
+        rejected: it would persist a fact the plate record already owns."""
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        seen: list[tuple[int, bool]] = []
+
+        async def _never_run():  # pragma: no cover — the spawns fixture closes it
+            return None
+
+        def _fake_escalation(printer_id, *, farm_source=False):
+            seen.append((printer_id, farm_source))
+            return _never_run()
+
+        mon._escalation_only = _fake_escalation
+
+        _occupy(7, EscalationOnly(), source="SUB-1")  # the farm's own unit finished here
+        _occupy(8, EscalationOnly(), source=None)  # a print the farm did not dispatch
+
+        assert seen == [(7, True), (8, False)]
+
     def test_release_now_is_unset_until_requested(self, spawns):
         mon = EjectCooldownMonitor()
         _wire(mon)
@@ -1657,6 +1683,50 @@ class TestWatchGateEscalationOnly:
         assert outcome == "cleared"
         assert notify.calls == [6]  # attempted once; exception swallowed
 
+    @staticmethod
+    def _capture_default_page(monkeypatch) -> list[str]:
+        """Capture the ``source_detail`` of the watch's OWN default page.
+
+        These two tests are about the default, so they must not inject ``notify`` —
+        they replace the module-level page the default partial binds instead."""
+        details: list[str] = []
+
+        async def _fake_page(printer_id, *, source_detail=""):
+            details.append(source_detail)
+
+        monkeypatch.setattr(monitor_mod, "notify_plate_not_empty", _fake_page)
+        return details
+
+    async def test_the_default_page_names_the_farm_when_the_farm_deposited_the_plate(self, monkeypatch):
+        """005-H2S 2026-09-17: a farm unit's eject was rejected at setup, the plate
+        escalated — and the operator was paged "A print the farm did not dispatch left a
+        part on the plate", about the farm's own unit. The sentence follows the plate."""
+        details = self._capture_default_page(monkeypatch)
+        _gate_up(3)
+        sleep = _ClearAfter(3, after_polls=3)
+
+        outcome = await watch_gate_escalation_only(3, escalate_s=40, check_interval_s=20, sleep=sleep, farm_source=True)
+
+        assert outcome == "cleared"
+        assert len(details) == 1
+        assert details[0] == (
+            "A farm unit's eject did not run — the part is still on the plate. "
+            "Remove it by hand, then Mark plate cleared."
+        )
+
+    async def test_the_default_page_keeps_the_foreign_sentence_for_a_foreign_deposit(self, monkeypatch):
+        """Liveness pair: the foreign copy is unchanged, and it is still the default."""
+        details = self._capture_default_page(monkeypatch)
+        _gate_up(3)
+        sleep = _ClearAfter(3, after_polls=3)
+
+        outcome = await watch_gate_escalation_only(3, escalate_s=40, check_interval_s=20, sleep=sleep)
+
+        assert outcome == "cleared"
+        assert details == [
+            "A print the farm did not dispatch left a part on the plate. Clear the bed to resume dispatch."
+        ]
+
 
 class TestNotifyPlateNotEmpty:
     """``notify_plate_not_empty`` is PUBLIC since the cut-over: three lanes outside
@@ -1751,12 +1821,14 @@ class TestArmedWatchResolution:
         2026-07-18/07-21 forbids — so the watch falls back to the escalation hold."""
         mon = EjectCooldownMonitor()
         held: list[int] = []
+        kwargs_seen: dict[str, object] = {}
 
         async def fake_resolve(qid, *, for_first_article=False):
             return None  # not an eject job
 
         async def fake_escalation(pid, **kwargs):
             held.append(pid)
+            kwargs_seen.update(kwargs)
             return "cleared"
 
         monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", fake_resolve)
@@ -1766,6 +1838,10 @@ class TestArmedWatchResolution:
         await mon._watch(7, 42, release_now=asyncio.Event())
 
         assert held == [7]
+        # The plate belongs to a farm UNIT (a production policy carries one), so the
+        # fallback hold pages the farm sentence — same rule as the driver's own arm,
+        # derived here from the purpose the watch was armed with.
+        assert kwargs_seen["farm_source"] is True
         assert mon.active_watch(7) is None
 
     async def test_fa_watch_resolves_fa_threshold_and_releases_into_fa_dispatch(self, monkeypatch, stub_prep):
