@@ -2236,7 +2236,7 @@ async def _page_reused_core_swap(obs: TrayObservation, deps: PipelineDeps, depar
     try:
         from backend.app.models.printer import Printer
         from backend.app.services.notification_service import notification_service
-        from backend.app.services.spool_recovery import runout_slot_desc
+        from backend.app.services.printer_incidents import runout_slot_desc
 
         printer = await deps.db.get(Printer, printer_id)
         label = f"{departed.material or 'filament'}, delivered {delivered:.0f} g"

@@ -2121,6 +2121,9 @@ class TestOpenIncidentProjection:
                 "status": "escalated",
                 "slot_desc": "AMS A slot 3",
                 "created_at": "2026-08-09T12:00:00",
+                # 2026-09-17: would the operator's Recover end this row? A runout is
+                # wire-resolved, so no — and the card must not offer the verb for it.
+                "operator_exits": False,
             }
         }
 
@@ -2132,6 +2135,7 @@ class TestOpenIncidentProjection:
             "status": "escalated",
             "slot_desc": "AMS A slot 3",
             "created_at": "2026-08-09T12:00:00",
+            "operator_exits": False,
         }
 
 

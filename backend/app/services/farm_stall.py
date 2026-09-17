@@ -69,9 +69,9 @@ from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.printer_incidents import (
     RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
+    runout_slot_desc,
 )
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.spool_recovery import runout_slot_desc
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -965,7 +965,7 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
 def _live_runout_slot(state) -> str | None:
     """Human name of the slot the firmware is CURRENTLY demanding filament in, from
     the live printer state — or ``None`` when it names none. Formatting comes from
-    ``spool_recovery.runout_slot_desc`` (one origin for the wording)."""
+    ``printer_incidents.runout_slot_desc`` (one origin for the wording)."""
     demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
     if demand is None:
         return None

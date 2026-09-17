@@ -5,6 +5,12 @@ import { formatPrintName } from '../utils/printName';
 import { computePopoverPosition } from '../utils/popoverPosition';
 import { mapModelCode } from '../utils/printerModels';
 import {
+  inFlightEject,
+  recoverApplies,
+  recoverEffects,
+  type RecoverEffect,
+} from '../utils/printerRecovery';
+import {
   BED_TEMP_DEFAULTS,
   CHAMBER_TEMP_DEFAULTS,
   FAN_SPEED_DEFAULTS,
@@ -20,6 +26,19 @@ import {
 // original bug at #1447).
 const DRYING_POPOVER_WIDTH = 240;
 const DRYING_POPOVER_ESTIMATED_HEIGHT = 320;
+
+// One line per Recover effect in the confirm dialog: the operator confirms an
+// explicit override, so the dialog states exactly what THIS printer loses — no
+// fixed list that promises effects the printer does not have. The verb's own
+// unconditional consequence (resuming the paused runs) is appended after these
+// by the dialog; it belongs to no printer state, so it is not an effect here.
+const RECOVER_EFFECT_COPY: Record<RecoverEffect, string> = {
+  plate: 'printers.quarantine.recoverEffectPlate',
+  lease: 'printers.quarantine.recoverEffectLease',
+  eject: 'printers.quarantine.recoverEffectEject',
+  quarantine: 'printers.quarantine.recoverEffectQuarantine',
+  equipment_fault: 'printers.quarantine.recoverEffectFault',
+};
 
 // Printer states in which a job owns the plate, so no eject may be offered.
 // Wider than RUNNING/PAUSE: PREPARE and SLICING precede the first layer but the
@@ -2181,13 +2200,14 @@ function PrinterCard({
   const serviceHoldSince = serviceHold?.since ? parseUTCDate(serviceHold.since) : null;
   // The plate authority's in-flight eject claim, and whether its watchdog has
   // already given its verdict (no runtime owner is coming — Recover is the exit).
-  const inFlightEject = status?.occupancy?.eject ?? null;
-  // Anything the authority is holding on this printer: a raised plate gate, a
-  // dispatch lease, or an eject claim. Recover is the one override for all three.
-  const hasOccupancyClaim =
-    status?.occupancy?.plate.occupied === true ||
-    status?.occupancy?.lease_age_s != null ||
-    inFlightEject !== null;
+  const ejectClaim = inFlightEject(status);
+  // Everything Recover would clear here — the plate gate, a dispatch lease, an
+  // eject claim, the quarantine, an equipment fault whose exit IS this verb.
+  // `utils/printerRecovery` is the one origin: the menu, both banners and the
+  // confirm dialog below read this list, so the affordance and the dialog's
+  // effect lines are the same fact.
+  const recoverEffectList = recoverEffects(printer, status);
+  const canRecover = recoverApplies(recoverEffectList);
 
   const activePrintName = status?.current_print && isPrintingOrPaused
     ? formatPrintName(status.subtask_name || status.current_print || null, status.gcode_file, t, activePlateLabel)
@@ -2416,8 +2436,13 @@ function PrinterCard({
 
   const clearPlateMutation = useMutation({
     mutationFn: () => api.clearPlate(printer.id),
-    onSuccess: () => {
-      showToast(t('queue.clearPlateSuccess'));
+    onSuccess: (result) => {
+      // One message per event: the gate release, plus the fault it closed when
+      // the verb met an equipment fault whose rule this clear satisfies.
+      const closedFault = result.incidents_closed.length > 0
+        ? ` ${t('printers.plateStatus.clearedClosedFault')}`
+        : '';
+      showToast(t('queue.clearPlateSuccess') + closedFault);
       queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
         old ? { ...old, awaiting_plate_clear: false } : old
       );
@@ -2461,8 +2486,13 @@ function PrinterCard({
   const recoverMutation = useMutation({
     mutationFn: () => api.recoverPrinter(printer.id),
     onSuccess: (result) => {
+      // One message per event — the runs it resumed and the fault it closed are
+      // both what the operator just did.
+      const closedFault = result.incidents_closed.length > 0
+        ? ` ${t('printers.quarantine.recoverClosedFault')}`
+        : '';
       showToast(
-        t('printers.quarantine.recoverSuccess', { count: result.runs_resumed.length })
+        t('printers.quarantine.recoverSuccess', { count: result.runs_resumed.length }) + closedFault
       );
       setShowRecoverConfirm(false);
       queryClient.setQueryData(['printerStatus', printer.id], (old: PrinterStatus | undefined) =>
@@ -2716,7 +2746,7 @@ function PrinterCard({
   // this list, and an empty list is why an idle printer enters on one click.
   const serviceHoldEffects: string[] = [];
   if (isActivePrintState) serviceHoldEffects.push(t('printers.maintenance.confirmEffectPrint'));
-  if (inFlightEject) serviceHoldEffects.push(t('printers.maintenance.confirmEffectEject'));
+  if (ejectClaim) serviceHoldEffects.push(t('printers.maintenance.confirmEffectEject'));
   if (status?.eject_watch) serviceHoldEffects.push(t('printers.maintenance.confirmEffectCooldown'));
 
   const handleEnterServiceHold = () => {
@@ -3531,11 +3561,12 @@ function PrinterCard({
               ? t('printers.maintenance.menuExit')
               : t('printers.maintenance.menuEnter')}
           </button>
-          {/* Operator override for the plate authority, offered whenever it holds
-              anything on this printer — a raised gate, a dispatch lease or an
-              eject claim. The quarantine banner carries the same verb, but a
-              stuck claim on an unquarantined printer had no surface at all. */}
-          {hasOccupancyClaim && (
+          {/* Operator override, offered whenever it would clear something on this
+              printer — a raised gate, a dispatch lease, an eject claim, the
+              quarantine, or an equipment fault whose exit IS this verb. The
+              banners carry the same verb under their own state, but a stuck claim
+              or a lone escalated fault had no surface at all. */}
+          {canRecover && (
             <button
               className={`w-full px-4 py-2 text-left text-sm flex items-center gap-2 ${
                 hasPermission('printers:recover')
@@ -3750,20 +3781,24 @@ function PrinterCard({
             </div>
             {/* Phase 4.3h: Recover & resume is the primary path (lifts the
                 quarantine AND resumes the paused run); Mark plate cleared is
-                the narrower secondary — it only releases the plate gate. */}
+                the narrower secondary — it only releases the plate gate.
+                Offered on the same derived verdict as the menu, so this banner
+                never decides for itself what the verb reaches. */}
             <div className="mt-2 flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); setShowRecoverConfirm(true); }}
-                disabled={!hasPermission('printers:recover') || recoverMutation.isPending}
-                title={!hasPermission('printers:recover') ? t('printers.permission.noControl') : t('printers.quarantine.recover')}
-                className="inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
-              >
-                {recoverMutation.isPending ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : null}
-                {t('printers.quarantine.recover')}
-              </button>
+              {canRecover && (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setShowRecoverConfirm(true); }}
+                  disabled={!hasPermission('printers:recover') || recoverMutation.isPending}
+                  title={!hasPermission('printers:recover') ? t('printers.permission.noControl') : t('printers.quarantine.recover')}
+                  className="inline-flex items-center gap-1 rounded-md border border-red-400/40 bg-red-500/20 px-2 py-1 text-xs font-medium text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-bambu-dark"
+                >
+                  {recoverMutation.isPending ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : null}
+                  {t('printers.quarantine.recover')}
+                </button>
+              )}
               {needsPlateClear && (
                 <button
                   type="button"
@@ -4840,31 +4875,31 @@ function PrinterCard({
                 verdict (`runtime_exceeded`) no runtime owner is coming: the row
                 says so and offers the override. Age is mm:ss — a sweep is a
                 two-minute job. */}
-            {viewMode === 'expanded' && inFlightEject && (
+            {viewMode === 'expanded' && ejectClaim && (
               <div
                 className={`mt-2 rounded-lg border p-2.5 ${
-                  inFlightEject.runtime_exceeded
+                  ejectClaim.runtime_exceeded
                     ? 'border-red-500/40 bg-red-500/10'
                     : 'border-blue-500/40 bg-blue-500/10'
                 }`}
               >
                 <div className="flex items-start gap-2">
-                  {inFlightEject.runtime_exceeded ? (
+                  {ejectClaim.runtime_exceeded ? (
                     <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-400" />
                   ) : (
                     <Wind className="w-4 h-4 flex-shrink-0 mt-0.5 text-blue-400" />
                   )}
                   <p
                     className={`min-w-0 flex-1 text-xs ${
-                      inFlightEject.runtime_exceeded ? 'text-red-200/90' : 'text-blue-200/90'
+                      ejectClaim.runtime_exceeded ? 'text-red-200/90' : 'text-blue-200/90'
                     }`}
                   >
-                    {inFlightEject.runtime_exceeded
-                      ? t('printers.plateStatus.ejectStalled', { age: formatEjectAge(inFlightEject.age_s) })
-                      : t('printers.plateStatus.ejectInProgress', { age: formatEjectAge(inFlightEject.age_s) })}
+                    {ejectClaim.runtime_exceeded
+                      ? t('printers.plateStatus.ejectStalled', { age: formatEjectAge(ejectClaim.age_s) })
+                      : t('printers.plateStatus.ejectInProgress', { age: formatEjectAge(ejectClaim.age_s) })}
                   </p>
                 </div>
-                {inFlightEject.runtime_exceeded && (
+                {ejectClaim.runtime_exceeded && (
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <button
                       type="button"
@@ -6981,23 +7016,25 @@ function PrinterCard({
         </Modal>
       )}
 
-      {/* Recover & resume confirmation (farm one-click recovery). Lists the three
-          effects so the operator confirms an explicit override of the plate gate. */}
+      {/* Recover & resume confirmation (farm one-click recovery). The state-derived
+          lines are one per effect this printer actually has — a fixed list promised
+          a plate hold a printer held only by an escalated fault never had. The run
+          resume is NOT state-derived: `farm_policy.recover_printer` always attempts
+          it, so it is a consequence of the VERB and stays inline as a decision input
+          (never folded into RecoverEffect, which nothing could derive it from). */}
       {showRecoverConfirm && (
         <ConfirmModal
           title={t('printers.quarantine.recoverTitle')}
           message={
-            (printer.quarantine_reason
-              ? t('printers.quarantine.recoverMessageWithReason', { name: printer.name, reason: printer.quarantine_reason })
-              : t('printers.quarantine.recoverMessage', { name: printer.name }))
-            + '\n\n'
-            + t('printers.quarantine.recoverEffectPlate')
-            + '\n' + t('printers.quarantine.recoverEffectQuarantine')
-            + '\n' + t('printers.quarantine.recoverEffectResume')
-            // Recover is also the only way out of a stuck eject claim, and
-            // dropping one is a consequence the operator must see BEFORE
-            // confirming — so it joins the effect list whenever one is owned.
-            + (inFlightEject ? '\n' + t('printers.quarantine.recoverEffectEject') : '')
+            [
+              printer.quarantine_reason
+                ? t('printers.quarantine.recoverMessageWithReason', { name: printer.name, reason: printer.quarantine_reason })
+                : t('printers.quarantine.recoverMessage', { name: printer.name }),
+              [
+                ...recoverEffectList.map((effect) => t(RECOVER_EFFECT_COPY[effect])),
+                t('printers.quarantine.recoverEffectResume'),
+              ].join('\n'),
+            ].join('\n\n')
           }
           confirmText={t('printers.quarantine.recover')}
           variant="warning"

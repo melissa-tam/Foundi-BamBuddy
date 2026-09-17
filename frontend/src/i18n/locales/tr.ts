@@ -883,10 +883,13 @@ export default {
       recoverMessageWithReason: '"{{name}}" kurtarılsın mı? Neden: {{reason}}. Bu, şunları yapan açık bir geçersiz kılmadır:',
       recoverEffectPlate: '• Tabla tutmasını kaldırır',
       recoverEffectQuarantine: '• Karantinayı kaldırır',
-      recoverEffectResume: '• Duraklatılan çalışmayı sürdürür',
+      recoverEffectLease: '• Gönderim rezervasyonunu serbest bırakır',
       recoverEffectEject: '• Süren çıkarmayı iptal et',
+      recoverEffectFault: '• Açık ekipman arızasını kapatır',
+      recoverEffectResume: '• Duraklatılan çalışmayı sürdürür',
+      recoverClosedFault: 'Ekipman arızası kapatıldı',
       markPlateCleared: 'Plakayı temizlendi olarak işaretle',
-      actionsHelp: 'Kurtar ve sürdür karantinayı kaldırır ve duraklatılan çalışmayı sürdürür. Plakayı temizlendi olarak işaretle yalnızca plaka kilidini açar.',
+      actionsHelp: 'Kurtar ve sürdür bu yazıcıyı tutan her şeyi — plaka, rezervasyon, çıkarma, karantina, ekipman arızası — serbest bırakır ve duraklatılan çalışmayı sürdürür. Plakayı temizlendi olarak işaretle yalnızca plaka kilidini açar.',
     },
     phase: {
       printing: 'Yazdırılıyor',
@@ -932,6 +935,7 @@ export default {
       ejectInProgress: 'Çıkarma sürüyor · {{age}}',
       ejectStalled: 'Çıkarma takıldı · {{age}} — çiftlik süpürmenin izini kaybetti',
       menuRecover: 'Yazıcıyı kurtar',
+      clearedClosedFault: 'Ekipman arızası kapatıldı',
     },
     // Manuel çıkarma (W2) + yeni makara istemi (W6)
     eject: {
@@ -1241,7 +1245,7 @@ export default {
     incidentAction: {
       jam: 'AMS filaman yolunu temizleyin, sonra yazdırmayı sürdürün',
       runout: 'İstenen yuvayı doldurun; yazdırma kendiliğinden sürer',
-      physical: 'Yazıcıdaki filaman yolunu temizleyin, sonra yazdırmayı sürdürün',
+      physical: 'Filaman yolu tıkalı. Bir yuva yüklendiğinde, kesilen baskı bu yoldan tamamlandığında ya da Kurtar ile temizlenir.',
       power_loss: 'Yazıcıdan sürdürün',
       plate_vision: 'Yatağı temizleyin, sonra “Plakayı temizlendi olarak işaretle”',
       z_reference_lost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın, sonra “Plakayı temizlendi olarak işaretle”',

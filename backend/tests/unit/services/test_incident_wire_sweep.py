@@ -34,7 +34,7 @@ from backend.app.models.printer_incident import (
     STATUS_ESCALATED,
     STATUS_RECOVERING,
 )
-from backend.app.services import printer_incidents, spool_recovery
+from backend.app.services import incident_resolution, printer_incidents, spool_recovery
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
 
 pytestmark = pytest.mark.asyncio
@@ -120,10 +120,11 @@ async def _row(db, printer_id):
 
 
 class TestHoldOverPredicate:
-    """``_hold_over`` is the ONE reading of "the printer says the hold is over",
-    consumed by the startup rearm and by the sweep. The agreement is pinned rather
-    than assumed: two copies of this rule drifting is how a restart and a running
-    process come to disagree about whether a printer is held."""
+    """``incident_resolution._hold_over`` is the ONE reading of "the printer says the
+    hold is over", consumed by the wire lane's ``sweep_tick`` and ``startup`` cells.
+    The agreement is pinned rather than assumed: two copies of this rule drifting is
+    how a restart and a running process come to disagree about whether a printer is
+    held."""
 
     @pytest.mark.parametrize(
         ("live", "expected"),
@@ -147,9 +148,18 @@ class TestHoldOverPredicate:
         _wire(monkeypatch, state)
 
         # The predicate...
-        verdict, reported = spool_recovery._hold_over(incident, state)
+        verdict, reported = incident_resolution._hold_over(state)
         assert verdict is expected
         assert reported == (live or "")
+        # ...the table cell that consumes it...
+        assert (
+            incident_resolution.resolve(
+                incident,
+                "startup",
+                incident_resolution.Context(state=state, ledger=incident_resolution.ledger, driver_live=False),
+            ).close
+            is expected
+        )
 
         # ...and the rearm that consumes it, on the identical evidence.
         assert (await spool_recovery.rearm_incidents_on_startup() == 1) is expected
@@ -351,7 +361,7 @@ class TestRepairClassSweep:
         from datetime import timedelta
 
         offset = timedelta(seconds=30 if after else -30)
-        spool_recovery._load_completed_at[printer_id] = incident.created_at + offset
+        incident_resolution.ledger._load_completed_at[printer_id] = incident.created_at + offset  # noqa: SLF001
 
     async def test_an_idle_clean_printer_does_NOT_close_a_physical_hold(self, db_session, printer_factory, monkeypatch):
         """THE 003-H2S PIN. Exactly the constellation the wire lane closes on — and
@@ -506,7 +516,7 @@ class TestRepairClassSweep:
 
 
 class TestLoadCompletedEdge:
-    """``_load_completed_at`` is the repair evidence, and it is an EDGE.
+    """``MotionLedger.load_completed_at`` is the repair evidence, and it is an EDGE.
 
     A LEVEL cannot serve: 003-H2S read ``tray_now == 1`` continuously through the
     whole fault. What the sampler stamps is the transition — the AMS finished a
@@ -522,27 +532,27 @@ class TestLoadCompletedEdge:
     async def test_the_first_sample_only_seeds(self, db_session, printer_factory):
         printer = await printer_factory()
         self._sample(printer.id, tray_now=1)
-        assert printer.id not in spool_recovery._load_completed_at
+        assert incident_resolution.ledger.load_completed_at(printer.id) is None
 
     async def test_a_transition_onto_a_real_feeder_stamps(self, db_session, printer_factory):
         printer = await printer_factory()
         self._sample(printer.id, tray_now=255)
         self._sample(printer.id, tray_now=1)
-        assert printer.id in spool_recovery._load_completed_at
+        assert incident_resolution.ledger.load_completed_at(printer.id) is not None
 
     async def test_a_standing_level_never_stamps(self, db_session, printer_factory):
         printer = await printer_factory()
         self._sample(printer.id, tray_now=1)
         self._sample(printer.id, tray_now=1)
         self._sample(printer.id, tray_now=1)
-        assert printer.id not in spool_recovery._load_completed_at
+        assert incident_resolution.ledger.load_completed_at(printer.id) is None
 
     async def test_an_unload_never_stamps(self, db_session, printer_factory):
         """255 is "nothing is feeding" — the opposite of the evidence."""
         printer = await printer_factory()
         self._sample(printer.id, tray_now=1)
         self._sample(printer.id, tray_now=255)
-        assert printer.id not in spool_recovery._load_completed_at
+        assert incident_resolution.ledger.load_completed_at(printer.id) is None
 
     async def test_a_reconnect_cannot_fabricate_the_edge(self, db_session, printer_factory):
         """The same rule the negative edges obey: a new MQTT session re-seeds every
@@ -550,4 +560,4 @@ class TestLoadCompletedEdge:
         printer = await printer_factory()
         self._sample(printer.id, tray_now=255, epoch=1)
         self._sample(printer.id, tray_now=1, epoch=2)
-        assert printer.id not in spool_recovery._load_completed_at
+        assert incident_resolution.ledger.load_completed_at(printer.id) is None

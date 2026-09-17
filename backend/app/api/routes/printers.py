@@ -27,6 +27,7 @@ from backend.app.schemas.printer import (
     AmsLabelBody,
     AMSTray,
     AMSUnit,
+    ClearPlateResult,
     ConfigureAmsSlotBody,
     DiagnosticRequest,
     FilaSwitchResponse,
@@ -41,6 +42,7 @@ from backend.app.schemas.printer import (
     PrinterStatus,
     PrinterUpdate,
     PrintOptionsResponse,
+    RecoverResult,
     ServiceHoldState,
     SlotRecheckResponse,
 )
@@ -62,11 +64,13 @@ from backend.app.services.pause_recovery import on_plate_cleared
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
 from backend.app.services.print_control import stop_as_operator
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
+from backend.app.services.printer_incidents import runout_slot_desc
 from backend.app.services.printer_manager import (
     _eject_watch_payload,
     get_derived_status_name,
     has_chamber_fan,
     occupancy_payload,
+    open_incident_payload,
     printer_manager,
     resolve_plate_id,
     service_hold_payload,
@@ -77,7 +81,6 @@ from backend.app.services.printer_manager import (
     supports_drying_while_printing,
 )
 from backend.app.services.slot_identity import resolve_slot_identity
-from backend.app.services.spool_recovery import runout_slot_desc
 from backend.app.services.tray_fields import tray_presence_map
 from backend.app.utils.http import build_content_disposition
 
@@ -534,6 +537,11 @@ async def get_printer_status(
             # session for the same reason the plate gate above does — and it MUST, since
             # a deactivated printer can be held too (entering the hold is allowed there).
             service_hold=service_hold_payload(printer_id),
+            # The open equipment-fault row, from the same builder as the WS frame and
+            # the connected branch below: the card's Recover affordance reads
+            # ``open_incident.operator_exits``, and a hold that reported on the socket
+            # but not on the poll would make that verb flicker.
+            open_incident=open_incident_payload(printer_id),
             # Hardware capabilities are facts about the MODEL, not about the MQTT
             # session, so they are reportable with no session — same as the sticky
             # flags above. Load-bearing: the printer card's chamber-fan and airduct
@@ -869,6 +877,8 @@ async def get_printer_status(
         # Same builder as the WS frame and the disconnected branch — the card's hold
         # banner must not appear on the socket push and vanish on the next poll.
         service_hold=service_hold_payload(printer_id),
+        # Same builder as the WS frame and the disconnected branch above.
+        open_incident=open_incident_payload(printer_id),
         quarantined=printer.quarantined,
         quarantine_reason=printer.quarantine_reason,
         model_mismatch=printer_manager.is_model_mismatch(printer_id),
@@ -2906,7 +2916,7 @@ async def stop_print(
     return {"success": True, "message": "Print stop command sent"}
 
 
-@router.post("/{printer_id}/clear-plate")
+@router.post("/{printer_id}/clear-plate", response_model=ClearPlateResult)
 async def clear_plate(
     printer_id: int,
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CLEAR_PLATE),
@@ -2957,10 +2967,16 @@ async def clear_plate(
 
     # The operator's clear IS the resolution of the two holds a human owns — a
     # confirmed plate-check trip and a Z reference lost to a reboot (2026-09-04
-    # pause-recovery wave). Wire-resolved holds are left to their own lanes.
-    await on_plate_cleared(printer_id)
+    # pause-recovery wave). Wire-resolved holds are left to their own lanes, and a
+    # filament-path hold needs Recover, not this. What it DID close is reported rather
+    # than swallowed: an operator whose click ended nothing must be able to see that.
+    closed = await on_plate_cleared(printer_id)
 
-    return {"success": True, "message": "Plate cleared, next print will start shortly"}
+    return ClearPlateResult(
+        success=True,
+        message="Plate cleared, next print will start shortly",
+        incidents_closed=[kind for _id, kind in closed],
+    )
 
 
 @router.post("/{printer_id}/mark-plate-occupied")
@@ -3044,7 +3060,7 @@ async def clear_quarantine(
     return {"id": printer.id, "quarantined": printer.quarantined}
 
 
-@router.post("/{printer_id}/recover")
+@router.post("/{printer_id}/recover", response_model=RecoverResult)
 async def recover_printer(
     printer_id: int,
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_RECOVER),
@@ -3053,10 +3069,11 @@ async def recover_printer(
     """One-click farm recovery for a wedged printer.
 
     Collapses the three-step manual recovery into one explicit operator override:
-    clears the plate-clear gate, clears any farm quarantine, and resumes every
-    paused run with a queue item on this printer. Idempotent — a repeat call is a
-    no-op. Returns a summary of what was actually changed. 404 if the printer is
-    unknown.
+    clears the plate-clear gate, clears any farm quarantine, resumes every paused run
+    with a queue item on this printer, and closes every hold whose return-to-normal IS
+    an operator inspecting the machine. Idempotent — a repeat call is a no-op. Returns
+    a summary of what was actually changed, ``incidents_closed`` included. 404 if the
+    printer is unknown.
     """
     from backend.app.services.farm_policy import recover_printer as _recover_printer
 

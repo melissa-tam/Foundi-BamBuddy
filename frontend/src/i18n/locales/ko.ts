@@ -857,10 +857,13 @@ export default {
       recoverMessageWithReason: '"{{name}}"을(를) 복구하시겠습니까? 사유: {{reason}}. 다음을 수행하는 명시적 재정의입니다:',
       recoverEffectPlate: '• 플레이트 보류 해제',
       recoverEffectQuarantine: '• 격리 해제',
-      recoverEffectResume: '• 일시정지된 런 재개',
+      recoverEffectLease: '• 디스패치 예약 해제',
       recoverEffectEject: '• 진행 중인 배출 취소',
+      recoverEffectFault: '• 열린 장비 결함 종료',
+      recoverEffectResume: '• 일시정지된 런 재개',
+      recoverClosedFault: '장비 결함 종료됨',
       markPlateCleared: '플레이트 비움으로 표시',
-      actionsHelp: '복구 및 재개는 격리를 해제하고 일시정지된 런을 재개합니다. 플레이트 비움으로 표시는 플레이트 잠금만 해제합니다.',
+      actionsHelp: '복구 및 재개는 이 프린터를 붙잡고 있는 것(플레이트, 예약, 배출, 격리, 장비 결함)을 해제하고 일시정지된 런을 재개합니다. 플레이트 비움으로 표시는 플레이트 잠금만 해제합니다.',
     },
     phase: {
       printing: '인쇄 중',
@@ -906,6 +909,7 @@ export default {
       ejectInProgress: '배출 진행 중 · {{age}}',
       ejectStalled: '배출 정체 · {{age}} — 팜이 스윕을 추적하지 못했습니다',
       menuRecover: '프린터 복구',
+      clearedClosedFault: '장비 결함 종료됨',
     },
     // 수동 배출(W2) + 새 스풀 알림(W6)
     eject: {
@@ -1199,7 +1203,7 @@ export default {
     incidentAction: {
       jam: 'AMS 필라멘트 경로를 정리한 뒤 출력을 재개하세요',
       runout: '요청된 슬롯을 보충하세요. 출력은 자동으로 재개됩니다',
-      physical: '프린터에서 필라멘트 경로를 정리한 뒤 출력을 재개하세요',
+      physical: '필라멘트 경로가 막혔습니다. 슬롯 로드, 중단된 출력이 해당 경로로 완료, 또는 복구로 해제됩니다.',
       power_loss: '프린터에서 재개하세요',
       plate_vision: '베드를 비운 뒤 ‘플레이트 비움으로 표시’',
       z_reference_lost: '플레이트에 출력물이 있는 상태로 재시작됨 — 손으로 제거한 뒤 ‘플레이트 비움으로 표시’',

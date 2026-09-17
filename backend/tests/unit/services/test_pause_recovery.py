@@ -1014,7 +1014,8 @@ class TestOnPlateCleared:
             status=STATUS_ESCALATED,
         )
 
-        assert await pause_recovery.on_plate_cleared(39) is True
+        # It reports WHAT it closed — both verbs carry the list to the operator.
+        assert [kind for _id, kind in await pause_recovery.on_plate_cleared(39)] == [KIND_Z_REFERENCE_LOST]
 
         assert await printer_incidents.get_open(db_session, 39) is None
 
@@ -1033,12 +1034,12 @@ class TestOnPlateCleared:
             status=STATUS_ESCALATED,
         )
 
-        assert await pause_recovery.on_plate_cleared(40) is False
+        assert await pause_recovery.on_plate_cleared(40) == []
 
         assert (await printer_incidents.get_open(db_session, 40)) is not None
 
     async def test_no_open_incident_is_not_an_error(self, db_session):
-        assert await pause_recovery.on_plate_cleared(41) is False
+        assert await pause_recovery.on_plate_cleared(41) == []
 
 
 class TestMaintenanceModeStandsAside:

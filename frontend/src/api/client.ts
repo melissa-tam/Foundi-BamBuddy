@@ -378,6 +378,60 @@ export interface ServiceHoldState {
   since: string;
 }
 
+/**
+ * The OPEN `printer_incident` row this printer is held by — the projection the
+ * backend builds once (`printer_incidents._payload`) and serves on BOTH the REST
+ * status and the WS frame.
+ */
+export interface OpenIncidentState {
+  /** Row id, so a reader can ask about THIS row rather than "whatever is open". */
+  id: number;
+  kind: PrinterIncidentKind;
+  /** An OPEN row is only ever recovering (a driver is acting) or escalated. */
+  status: 'recovering' | 'escalated';
+  slot_desc: string | null;
+  created_at: string | null;
+  /**
+   * The operator's Recover verb ends THIS row. Decided by the backend rule
+   * (`printer_incidents.closed_by_recover`) — never re-derived from `kind` here,
+   * which is why the resolution-class vocabulary stays off the wire.
+   */
+  operator_exits: boolean;
+}
+
+/** An in-flight eject claim held by the plate-occupancy authority. */
+export interface PlateEjectClaim {
+  purpose: string;
+  /** The printer echoed PRINT START for the sweep. */
+  started: boolean;
+  /** Seconds since the claim was taken; null when unknown. */
+  age_s: number | null;
+  /** Claim rebuilt from disk at startup (never arms the runtime watchdog). */
+  hydrated: boolean;
+  /** The per-phase watchdog already fired its deadline on this sweep: no
+   *  runtime owner is coming, so the operator's Recover is the way out. */
+  runtime_exceeded: boolean;
+}
+
+/**
+ * What `POST /printers/{id}/recover` did. `incidents_closed` names the equipment
+ * faults the verb ended — the operator sees the fault they cleared, not just the
+ * plate/quarantine effects.
+ */
+export interface RecoverResult {
+  plate_cleared: boolean;
+  quarantine_cleared: boolean;
+  runs_resumed: number[];
+  incidents_closed: PrinterIncidentKind[];
+}
+
+/** What `POST /printers/{id}/clear-plate` did (same incident reporting). */
+export interface ClearPlateResult {
+  success: boolean;
+  message: string;
+  incidents_closed: PrinterIncidentKind[];
+}
+
 /** `POST /printers/{id}/service-hold` — what entering the hold actually did. */
 export interface ServiceHoldEnterResult {
   held: boolean;
@@ -689,18 +743,7 @@ export interface PrinterStatus {
       since: string | null;
     };
     /** In-flight eject claim on this printer; null when none is owned. */
-    eject: {
-      purpose: string;
-      /** The printer echoed PRINT START for the sweep. */
-      started: boolean;
-      /** Seconds since the claim was taken; null when unknown. */
-      age_s: number | null;
-      /** Claim rebuilt from disk at startup (never arms the runtime watchdog). */
-      hydrated: boolean;
-      /** The per-phase watchdog already fired its deadline on this sweep: no
-       *  runtime owner is coming, so the operator's Recover is the way out. */
-      runtime_exceeded: boolean;
-    } | null;
+    eject: PlateEjectClaim | null;
     /** Seconds since a dispatch lease was taken on this printer; null when none. */
     lease_age_s: number | null;
   };
@@ -730,12 +773,7 @@ export interface PrinterStatus {
   // by that exact string, so a kind added here needs its locale key in the same
   // change (pinned by `__tests__/i18n/incidentKinds.test.ts`). The three
   // pause-cause kinds joined the AMS three in the 2026-09-04 pause-recovery wave.
-  open_incident?: {
-    kind: PrinterIncidentKind;
-    status: 'recovering' | 'escalated';
-    slot_desc: string | null;
-    created_at: string | null;
-  } | null;
+  open_incident?: OpenIncidentState | null;
   // Operator maintenance hold, mirrored onto the status frame (including the
   // disconnected branch) so a card rendered from a stale fleet list still shows
   // it. `Printer.service_hold` is the primary origin; this is the fallback.
@@ -4294,7 +4332,7 @@ export const api = {
       method: 'POST',
     }),
   clearPlate: (printerId: number) =>
-    request<{ success: boolean; message: string }>(`/printers/${printerId}/clear-plate`, {
+    request<ClearPlateResult>(`/printers/${printerId}/clear-plate`, {
       method: 'POST',
     }),
   // Operator statement that the plate is OCCUPIED: raises the plate-clear gate
@@ -4344,10 +4382,7 @@ export const api = {
   // (composes the three canonical mutators server-side). Replaces the separate
   // clear-quarantine affordance on the printer card.
   recoverPrinter: (printerId: number) =>
-    request<{ plate_cleared: boolean; quarantine_cleared: boolean; runs_resumed: number[] }>(
-      `/printers/${printerId}/recover`,
-      { method: 'POST' }
-    ),
+    request<RecoverResult>(`/printers/${printerId}/recover`, { method: 'POST' }),
   // Maintenance mode as a service hold: the printer keeps its MQTT session and
   // every manual verb while the farm takes it out of dispatch, auto-eject,
   // cooldown and the recovery drivers. Entering quiesces what is live (cooldown
