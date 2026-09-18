@@ -2,11 +2,30 @@
 """Comprehensive end-to-end test for Bambuddy application."""
 
 import os
+import tempfile
 import time
 
-from playwright.sync_api import expect, sync_playwright
+import pytest
+
+# playwright is an optional dev extra, and these scripts also need a server on
+# BASE_URL. The ship gate collects this directory (`pytest backend/tests tests`),
+# so without these guards the module is a collection ERROR on every box that has
+# not installed playwright. Skip at import instead; the file stays runnable both
+# as a pytest module and as a standalone script once playwright IS installed.
+#
+# Both are required and they are not the same package: `playwright` supplies
+# sync_api, while the `page` fixture every test below takes is supplied by the
+# pytest-playwright PLUGIN. With only the library installed these would collect
+# and then error on a missing fixture rather than skipping.
+pytest.importorskip("playwright.sync_api")
+pytest.importorskip("pytest_playwright")
+
+from playwright.sync_api import expect, sync_playwright  # noqa: E402
 
 BASE_URL = os.environ.get("BAMBUDDY_URL", "http://localhost:8000")
+
+# Screenshot target. /tmp was hardcoded and does not exist on Windows.
+SCREENSHOT_DIR = tempfile.gettempdir()
 
 
 def test_navigation_and_sidebar(page):
@@ -18,7 +37,7 @@ def test_navigation_and_sidebar(page):
     page.wait_for_load_state("networkidle")
 
     # Take initial screenshot
-    page.screenshot(path="/tmp/bambuddy_home.png", full_page=True)
+    page.screenshot(path=os.path.join(SCREENSHOT_DIR, "bambuddy_home.png"), full_page=True)
     print("✓ Home page loaded")
 
     # Check sidebar is visible
@@ -72,7 +91,7 @@ def test_printers_page(page):
         print(f"✓ Found {len(ams_elements)} AMS unit(s) displayed")
 
     # Take screenshot
-    page.screenshot(path="/tmp/bambuddy_printers.png", full_page=True)
+    page.screenshot(path=os.path.join(SCREENSHOT_DIR, "bambuddy_printers.png"), full_page=True)
     print("✓ Printers page screenshot saved")
 
     return True
@@ -101,7 +120,7 @@ def test_archives_page(page):
         print("✓ Upload button found")
 
     # Take screenshot
-    page.screenshot(path="/tmp/bambuddy_archives.png", full_page=True)
+    page.screenshot(path=os.path.join(SCREENSHOT_DIR, "bambuddy_archives.png"), full_page=True)
     print("✓ Archives page screenshot saved")
 
     return True
@@ -122,7 +141,7 @@ def test_queue_page(page):
         print("✓ Queue page content detected")
 
     # Take screenshot
-    page.screenshot(path="/tmp/bambuddy_queue.png", full_page=True)
+    page.screenshot(path=os.path.join(SCREENSHOT_DIR, "bambuddy_queue.png"), full_page=True)
     print("✓ Queue page screenshot saved")
 
     return True
@@ -146,7 +165,7 @@ def test_statistics_page(page):
         print(f"✓ Statistics found: {', '.join(found_stats)}")
 
     # Take screenshot
-    page.screenshot(path="/tmp/bambuddy_statistics.png", full_page=True)
+    page.screenshot(path=os.path.join(SCREENSHOT_DIR, "bambuddy_statistics.png"), full_page=True)
     print("✓ Statistics page screenshot saved")
 
     return True
@@ -174,7 +193,7 @@ def test_settings_page(page):
             print(f"✓ Settings section found: {section}")
 
     # Take screenshot
-    page.screenshot(path="/tmp/bambuddy_settings.png", full_page=True)
+    page.screenshot(path=os.path.join(SCREENSHOT_DIR, "bambuddy_settings.png"), full_page=True)
     print("✓ Settings page screenshot saved")
 
     return True
@@ -196,7 +215,7 @@ def test_keyboard_shortcuts(page):
     modal = page.locator('text="Keyboard Shortcuts"').first
     if modal.is_visible():
         print("✓ Keyboard shortcuts modal opened with '?'")
-        page.screenshot(path="/tmp/bambuddy_shortcuts_modal.png")
+        page.screenshot(path=os.path.join(SCREENSHOT_DIR, "bambuddy_shortcuts_modal.png"))
 
         # Close with Escape
         page.keyboard.press("Escape")
@@ -271,7 +290,7 @@ def test_responsive_design(page):
         page.wait_for_load_state("networkidle")
         time.sleep(0.5)
 
-        page.screenshot(path=f"/tmp/bambuddy_{name.lower()}.png", full_page=True)
+        page.screenshot(path=os.path.join(SCREENSHOT_DIR, f"bambuddy_{name.lower()}.png"), full_page=True)
         print(f"✓ {name} viewport ({width}x{height}) screenshot saved")
 
     # Reset to desktop
@@ -366,7 +385,8 @@ def run_comprehensive_test():
             except Exception as e:
                 print(f"\n❌ {test_name} FAILED: {e}")
                 results[test_name] = False
-                page.screenshot(path=f"/tmp/bambuddy_error_{test_name.lower().replace(' ', '_')}.png")
+                shot = f"bambuddy_error_{test_name.lower().replace(' ', '_')}.png"
+                page.screenshot(path=os.path.join(SCREENSHOT_DIR, shot))
 
         browser.close()
 
@@ -383,7 +403,7 @@ def run_comprehensive_test():
         print(f"  {status} - {test_name}")
 
     print(f"\nTotal: {passed}/{total} tests passed")
-    print("Screenshots saved to /tmp/bambuddy_*.png")
+    print(f"Screenshots saved to {SCREENSHOT_DIR}/bambuddy_*.png")
 
     return all(results.values())
 

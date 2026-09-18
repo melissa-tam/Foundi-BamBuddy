@@ -307,6 +307,27 @@ async def _noop_sleep(_seconds):
     return None
 
 
+class _AbortAfter:
+    """A ``sleep`` stand-in that stops the watch after N polls — the harness's own bound.
+
+    :class:`_ClearAfter` ends a watch the way production does, through the plate gate.
+    This one ends it from OUTSIDE, for the configuration in which production has no
+    ending of its own; the poll count it records is the evidence for how far the watch
+    got before the harness, and not the watch, called time."""
+
+    class Stop(Exception):
+        """Raised out of the sleep to unwind an otherwise unbounded poll."""
+
+    def __init__(self, polls: int) -> None:
+        self.limit = polls
+        self.calls = 0
+
+    async def __call__(self, _seconds):
+        self.calls += 1
+        if self.calls >= self.limit:
+            raise self.Stop
+
+
 class _NotifyRecorder:
     """Injectable notify callable: records printer_ids (and the live bed the cooldown
     watch passes) and optionally raises. Accepts the foreign-gate watch's bare
@@ -1619,6 +1640,95 @@ class TestWatchBedAndClear:
         )
         assert outcome == "cleared"
         assert sleep.gate_seen == [True, True, True]  # held the gate across the disconnect
+
+
+class TestBothCooldownWatchdogsDisabled:
+    """Both cooldown watchdogs off is a REACHABLE configuration, and nothing bounds it.
+
+    ``farm_cooldown_stall_window_minutes`` and ``farm_cooldown_max_hold_minutes`` both
+    accept 0 (``schemas/settings.py``, ``ge=0``) and ``_resolve_stall_settings`` passes a
+    stored 0 straight through as ``minutes * 60`` — no floor, no clamp. At 0 the plateau
+    watch is never enabled and the max-hold cap can never fire, so a bed that never
+    reaches the threshold leaves the watch polling with nothing to end it but the plate
+    gate: one escalation page, then silence, while a part sits on the plate.
+
+    These tests PIN that as current behaviour — they do not endorse it. The poll is
+    bounded by :class:`_AbortAfter`, i.e. by the harness, precisely because production
+    supplies no bound of its own.
+    """
+
+    _THRESHOLD_C = 28.0
+    _HOT_BED = 80.0
+    _POLL_S = 20
+    _POLLS = 40
+
+    async def test_a_bed_that_never_cools_polls_until_the_harness_stops_it(self):
+        _gate_up(11)
+        mgr = _FakeManager([_status(self._HOT_BED)])
+        release, stall, notify = _ReleaseRecorder(), _StallRecorder(), _NotifyRecorder()
+        sleeper = _AbortAfter(self._POLLS)
+
+        with pytest.raises(_AbortAfter.Stop):
+            await watch_bed_and_clear(
+                11,
+                self._THRESHOLD_C,
+                manager=mgr,
+                escalate_s=60,
+                check_interval_s=self._POLL_S,
+                sleep=sleeper,
+                notify=notify,
+                stall_window_s=0,
+                max_hold_s=0,
+                on_release=release,
+                on_stall=stall,
+            )
+
+        # 800 s of simulated cooling on a bed 52 °C above the line, and the watch has
+        # reached no decision of any kind.
+        assert sleeper.calls == self._POLLS
+        assert release.calls == 0
+        assert stall.reasons == []
+        assert notify.calls == [11], "the once-only escalation page is the whole alarm"
+        assert plate_occupancy.is_plate_occupied(11) is True
+
+    @pytest.mark.parametrize(
+        ("stall_window_s", "max_hold_s", "outcome", "releases", "stalls"),
+        [
+            (0, 120, "released", 1, 0),
+            (60, 0, "stalled", 0, 1),
+        ],
+        ids=["the_max_hold_cap_alone_ends_it", "the_plateau_watch_alone_ends_it"],
+    )
+    async def test_either_watchdog_on_its_own_ends_the_same_wait(
+        self, stall_window_s, max_hold_s, outcome, releases, stalls
+    ):
+        """The liveness half: the unbounded poll above is a CONFIGURATION hole, not a
+        broken harness — the identical arrangement terminates as soon as either
+        watchdog is given a non-zero window."""
+        _gate_up(11)
+        mgr = _FakeManager([_status(self._HOT_BED)])
+        release, stall, notify = _ReleaseRecorder(), _StallRecorder(), _NotifyRecorder()
+        sleeper = _AbortAfter(self._POLLS)
+
+        result = await watch_bed_and_clear(
+            11,
+            self._THRESHOLD_C,
+            manager=mgr,
+            escalate_s=60,
+            check_interval_s=self._POLL_S,
+            sleep=sleeper,
+            notify=notify,
+            stall_window_s=stall_window_s,
+            stall_epsilon_c=1.0,
+            max_hold_s=max_hold_s,
+            on_release=release,
+            on_stall=stall,
+        )
+
+        assert result == outcome
+        assert sleeper.calls < self._POLLS, "the watch ended itself, before the harness's bound"
+        assert release.calls == releases
+        assert len(stall.reasons) == stalls
 
 
 class TestWatchGateEscalationOnly:

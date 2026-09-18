@@ -5,6 +5,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
+from backend.app.core.paths import resolve_data_dir
+
 # Application version - single source of truth
 APP_VERSION = "0.2.4.8"
 GITHUB_REPO = "maziggy/bambuddy"
@@ -49,15 +51,18 @@ def _resolve_build_version(version_file: Path, app_version: str) -> str:
 # APP_VERSION in dev). Never fed into the update-check version comparison.
 BUILD_VERSION = _resolve_build_version(_app_dir / "VERSION", APP_VERSION)
 
-# Data directory - for persistent data (database, archives)
-# Use DATA_DIR env var if set (Docker), otherwise use project root (local dev)
-_data_dir_env = os.environ.get("DATA_DIR")
-_data_dir = Path(_data_dir_env) if _data_dir_env else _app_dir
+# Data directory - for persistent data (database, archives).
+# ``core.paths.resolve_data_dir()`` is THE reader of DATA_DIR; this module no
+# longer reads the env var itself. ``legacy_fallback`` keeps the DATA_DIR-unset
+# dev location of base_dir/archive_dir/database_url at the project root, exactly
+# as before (see paths.resolve_data_dir's docstring).
+_data_dir = resolve_data_dir(legacy_fallback=_app_dir)
 
 # Plate calibration directory - special handling to maintain backwards compatibility
 # Docker: DATA_DIR/plate_calibration (e.g., /data/plate_calibration)
-# Local dev: project_root/data/plate_calibration (original location)
-_plate_cal_dir = Path(_data_dir_env) / "plate_calibration" if _data_dir_env else _app_dir / "data" / "plate_calibration"
+# Local dev: project_root/data/plate_calibration (original location — which is
+# what the plain resolver's fallback already returns, so no special-casing).
+_plate_cal_dir = resolve_data_dir() / "plate_calibration"
 
 # Log directory - use LOG_DIR env var if set, otherwise use app_dir/logs
 _log_dir_env = os.environ.get("LOG_DIR")
@@ -68,7 +73,7 @@ _log_dir = Path(_log_dir_env) if _log_dir_env else _app_dir / "logs"
 # DATA_DIR is INSTALL_ROOT-adjacent (…\Bambuddy\data), so config lives in a
 # sibling …\Bambuddy\config created with an admin/SYSTEM-only ACL — separate
 # from the users-modify data dir. Local dev falls back to app_dir/config.
-_config_dir = Path(_data_dir_env).parent / "config" if _data_dir_env else _app_dir / "config"
+_config_dir = resolve_data_dir().parent / "config"
 
 
 def _migrate_database() -> Path:

@@ -2774,138 +2774,6 @@ class TestCertificateService:
         assert key_path.exists()
 
 
-class TestBindServer:
-    """Tests for BindServer (port 3002 bind/detect protocol)."""
-
-    @pytest.fixture
-    def bind_server(self):
-        """Create a BindServer instance."""
-        from backend.app.services.virtual_printer.bind_server import BindServer
-
-        return BindServer(
-            serial="09400A391800001",
-            model="O1D",
-            name="Bambuddy",
-        )
-
-    def test_build_frame(self, bind_server):
-        """Verify frame building produces correct format."""
-        payload = {"login": {"command": "detect"}}
-        frame = bind_server._build_frame(payload)
-
-        # Header: 0xA5A5
-        assert frame[:2] == b"\xa5\xa5"
-        # Trailer: 0xA7A7
-        assert frame[-2:] == b"\xa7\xa7"
-        # Length field is total message size (LE uint16)
-        import struct
-
-        total_len = struct.unpack_from("<H", frame, 2)[0]
-        assert total_len == len(frame)
-        # JSON payload is between header and trailer
-        import json
-
-        json_bytes = frame[4:-2]
-        parsed = json.loads(json_bytes)
-        assert parsed == payload
-
-    def test_parse_frame_valid(self, bind_server):
-        """Verify valid frame parsing extracts JSON correctly."""
-        import json
-        import struct
-
-        payload = {"login": {"command": "detect", "sequence_id": "20000"}}
-        json_bytes = json.dumps(payload, separators=(",", ":")).encode()
-        total_len = 4 + len(json_bytes) + 2
-        frame = b"\xa5\xa5" + struct.pack("<H", total_len) + json_bytes + b"\xa7\xa7"
-
-        result = bind_server._parse_frame(frame)
-
-        assert result is not None
-        assert result["login"]["command"] == "detect"
-        assert result["login"]["sequence_id"] == "20000"
-
-    def test_parse_frame_invalid_header(self, bind_server):
-        """Verify invalid header returns None."""
-        result = bind_server._parse_frame(b"\xbb\xbb\x06\x00{}\xa7\xa7")
-        assert result is None
-
-    def test_parse_frame_invalid_trailer(self, bind_server):
-        """Verify invalid trailer returns None."""
-        result = bind_server._parse_frame(b"\xa5\xa5\x06\x00{}\xbb\xbb")
-        assert result is None
-
-    def test_parse_frame_too_short(self, bind_server):
-        """Verify short data returns None."""
-        result = bind_server._parse_frame(b"\xa5\xa5\x00")
-        assert result is None
-
-    def test_parse_frame_invalid_json(self, bind_server):
-        """Verify invalid JSON returns None."""
-        import struct
-
-        bad_json = b"not json"
-        total_len = 4 + len(bad_json) + 2
-        frame = b"\xa5\xa5" + struct.pack("<H", total_len) + bad_json + b"\xa7\xa7"
-        result = bind_server._parse_frame(frame)
-        assert result is None
-
-    def test_build_frame_roundtrip(self, bind_server):
-        """Verify build_frame output can be parsed back."""
-        payload = {
-            "login": {
-                "bind": "free",
-                "command": "detect",
-                "connect": "lan",
-                "dev_cap": 1,
-                "id": "09400A391800001",
-                "model": "O1D",
-                "name": "Bambuddy",
-                "sequence_id": 3021,
-                "version": "01.00.00.00",
-            }
-        }
-        frame = bind_server._build_frame(payload)
-        parsed = bind_server._parse_frame(frame)
-
-        assert parsed is not None
-        assert parsed["login"]["id"] == "09400A391800001"
-        assert parsed["login"]["model"] == "O1D"
-        assert parsed["login"]["name"] == "Bambuddy"
-        assert parsed["login"]["bind"] == "free"
-
-    def test_bind_server_stores_config(self, bind_server):
-        """Verify bind server stores serial, model, name."""
-        assert bind_server.serial == "09400A391800001"
-        assert bind_server.model == "O1D"
-        assert bind_server.name == "Bambuddy"
-        assert bind_server.version == "01.00.00.00"
-
-    def test_bind_server_custom_version(self):
-        """Verify custom firmware version is stored."""
-        from backend.app.services.virtual_printer.bind_server import BindServer
-
-        server = BindServer(
-            serial="TEST123",
-            model="C13",
-            name="Test",
-            version="02.03.04.05",
-        )
-        assert server.version == "02.03.04.05"
-
-    def test_bind_ports_constant(self):
-        """Verify BIND_PORTS includes both 3000 and 3002 for slicer compatibility."""
-        from backend.app.services.virtual_printer.bind_server import BIND_PORTS
-
-        assert 3000 in BIND_PORTS
-        assert 3002 in BIND_PORTS
-
-    def test_bind_server_initializes_empty_servers_list(self, bind_server):
-        """Verify bind server starts with empty servers list."""
-        assert bind_server._servers == []
-        assert bind_server._running is False
-
-
 class TestSlicerProxyManager:
     """Tests for SlicerProxyManager (proxy mode)."""
 
@@ -3379,6 +3247,29 @@ class TestBindServer:
         assert result["login"]["command"] == "detect"
         assert result["login"]["sequence_id"] == "20000"
 
+    def test_parse_frame_accepts_independently_built_wire_bytes(self, bind_server):
+        """Parse a frame assembled from raw bytes, NOT via ``_build_frame``.
+
+        Deliberately does not round-trip: every other parse case here feeds
+        _parse_frame something _build_frame produced, so a framing bug present
+        in both halves (wrong length base, wrong magic) would cancel out and go
+        unseen. This pins the wire format itself -- 0xA5A5 + uint16_le(total
+        size) + compact JSON + 0xA7A7 -- against a literal construction.
+        """
+        import json
+        import struct
+
+        payload = {"login": {"command": "detect", "sequence_id": "20000"}}
+        json_bytes = json.dumps(payload, separators=(",", ":")).encode()
+        total_len = 4 + len(json_bytes) + 2
+        frame = b"\xa5\xa5" + struct.pack("<H", total_len) + json_bytes + b"\xa7\xa7"
+
+        result = bind_server._parse_frame(frame)
+
+        assert result is not None
+        assert result["login"]["command"] == "detect"
+        assert result["login"]["sequence_id"] == "20000"
+
     def test_parse_frame_invalid_header(self, bind_server):
         """Verify invalid header returns None."""
         frame = b"\xb5\xb5\x10\x00" + b'{"login":{}}' + b"\xa7\xa7"
@@ -3409,6 +3300,40 @@ class TestBindServer:
         frame = bind_server._build_frame(original)
         parsed = bind_server._parse_frame(frame)
         assert parsed == original
+
+    def test_build_frame_roundtrip_preserves_every_login_field(self, bind_server):
+        """Round-trip the FULL detect reply and check each field individually.
+
+        The dict-equality case above uses three keys. A real detect reply is the
+        nine-key payload below, mixing str and int values; this pins that none of
+        them is dropped, retyped or reordered into a different value by the
+        compact-separator JSON encoding.
+        """
+        payload = {
+            "login": {
+                "bind": "free",
+                "command": "detect",
+                "connect": "lan",
+                "dev_cap": 1,
+                "id": "09400A391800001",
+                "model": "O1D",
+                "name": "Bambuddy",
+                "sequence_id": 3021,
+                "version": "01.00.00.00",
+            }
+        }
+        frame = bind_server._build_frame(payload)
+        parsed = bind_server._parse_frame(frame)
+
+        assert parsed is not None
+        assert parsed["login"]["id"] == "09400A391800001"
+        assert parsed["login"]["model"] == "O1D"
+        assert parsed["login"]["name"] == "Bambuddy"
+        assert parsed["login"]["bind"] == "free"
+        assert parsed["login"]["connect"] == "lan"
+        assert parsed["login"]["dev_cap"] == 1
+        assert parsed["login"]["sequence_id"] == 3021
+        assert parsed["login"]["version"] == "01.00.00.00"
 
     def test_bind_server_stores_config(self, bind_server):
         """Verify config is stored correctly."""

@@ -1,4 +1,4 @@
-"""The pin-cutover repair migration (2026-08-12; 003-H2S external-spool incident).
+"""The pin-cutover repair migration.
 
 ``ams_mapping`` changed meaning in this release: it used to hold a derivation the
 dialog computed at queue time and the scheduler replayed verbatim hours later; it now
@@ -9,57 +9,26 @@ clears them on PENDING rows and lets those items decide against live state.
 
 ONE-TIME is the whole point, and it is what this file mostly exists to pin: after the
 cutover a pending mapping IS an operator pin, and a migration that re-ran would delete
-a human's slot choice on every restart. Same durable-marker shape as the WS-F posture
+a human's slot choice on every restart. Same durable-marker shape as the posture
 migration (a settings row written in the same nested transaction as the clear).
-
-SQLite-safe and self-contained, mirroring the sibling migration regression tests.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _MARKER = "migration_clear_pending_ams_mapping_20260812"
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import EVERY model module so `create_all` builds the whole schema (see the
-    sibling migration tests: `run_migrations` ALTERs across the schema and
-    `_safe_execute` re-raises "no such table")."""
-    import importlib
-    import pkgutil
-
-    import backend.app.models as models_pkg
-
-    for module in pkgutil.iter_modules(models_pkg.__path__):
-        importlib.import_module(f"{models_pkg.__name__}.{module.name}")
-
-
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
@@ -81,7 +50,7 @@ async def _mapping(conn, item_id: int) -> str | None:
 
 @pytest.mark.asyncio
 async def test_clears_cached_mappings_on_pending_items(engine):
-    """The eight landmines: pending rows carrying a pre-cutover derivation."""
+    """Pending rows carrying a pre-cutover derivation."""
     async with engine.begin() as conn:
         landmine = await _add_item(conn, status="pending", mapping="[254]", position=1)
         other = await _add_item(conn, status="pending", mapping="[0, -1]", position=2)
@@ -158,9 +127,8 @@ async def test_is_idempotent_on_a_second_pass(engine):
 
 @pytest.mark.asyncio
 async def test_logs_the_affected_item_ids(engine, caplog):
-    """Post-deploy the log is how the operator sees WHICH queued units were repaired
-    (S9's witness: the migration line names them, then each dispatches with a freshly
-    computed mapping)."""
+    """Post-deploy the log is how the operator sees WHICH queued units were repaired:
+    the line names them, and each then dispatches with a freshly computed mapping."""
     import logging
 
     async with engine.begin() as conn:

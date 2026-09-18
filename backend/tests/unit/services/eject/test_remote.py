@@ -81,8 +81,8 @@ def _make_source_3mf() -> Path:
     return path
 
 
-async def _seed(db, source: Path):
-    printer = Printer(name="RM", serial_number="RM1", ip_address="1.2.3.4", access_code="x", model="H2S")
+async def _seed(db, source: Path, *, model: str = "H2S"):
+    printer = Printer(name="RM", serial_number="RM1", ip_address="1.2.3.4", access_code="x", model=model)
     db.add(printer)
     await db.flush()
     lib = LibraryFile(
@@ -382,6 +382,95 @@ class TestDispatchRefusesBeforeItBuilds:
                 )
             assert exc.value.code == "not_occupied"
             build.assert_not_awaited()
+        finally:
+            source.unlink(missing_ok=True)
+
+
+class TestGeometryFailsClosedOnBothAutoLanes:
+    """Red line 2: a model only ejects unattended once its envelope has been through the
+    hardware ladder. Both dispatchers resolve geometry with ``require_validated=True``, and
+    this is the UNATTENDED copy of that rule — the eject the farm dispatches with nobody
+    watching. The eject conftest seeds ``H2C`` unvalidated and no ``P1S`` row at all, which
+    is exactly the two causes :class:`GeometryUnavailable` distinguishes.
+
+    The refusal must land BEFORE the build: an unvalidated envelope must never be turned
+    into G-code at all, not merely withheld after it exists.
+    """
+
+    _CASES = [("H2C", "not hardware-validated"), ("P1S", "no eject geometry")]
+    _IDS = ["a_row_that_never_passed_the_ladder", "a_model_with_no_row_at_all"]
+
+    @pytest.mark.parametrize(("model", "fragment"), _CASES, ids=_IDS)
+    async def test_the_unit_dispatcher_refuses_without_building(self, db_session, model, fragment):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source, model=model)
+            _gate(printer.id)
+            build = AsyncMock()
+            c1, c2, c3 = _ftp_patches()
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(remote, "build_part_present_eject_file", build),
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            assert exc.value.status_code == 409
+            assert fragment in str(exc.value)
+            build.assert_not_awaited()
+            start.assert_not_called()
+            assert plate_occupancy.pending_eject_view(printer.id) is None
+        finally:
+            source.unlink(missing_ok=True)
+
+    @pytest.mark.parametrize(("model", "fragment"), _CASES, ids=_IDS)
+    async def test_the_foreign_dispatcher_refuses_without_building(self, db_session, model, fragment):
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source, model=model)
+            _gate(printer.id)
+            build = AsyncMock()
+            c1, c2, c3 = _ftp_patches()
+            with (
+                c1,
+                c2,
+                c3,
+                patch.object(remote, "build_part_present_eject_file", build),
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_foreign_eject(
+                    db_session,
+                    printer_id=printer.id,
+                    profile_id=item.eject_profile_id,
+                    source_path=source,
+                    plate_id=1,
+                )
+            assert exc.value.status_code == 409
+            assert fragment in str(exc.value)
+            build.assert_not_awaited()
+            start.assert_not_called()
+            assert plate_occupancy.pending_eject_view(printer.id) is None
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_a_validated_row_is_what_lets_the_same_call_through(self, db_session):
+        """The negative cases above must fail on the geometry gate and nothing else: the
+        identical arrangement on the validated H2S row reaches the build and claims."""
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            _gate(printer.id)
+            c1, c2, c3 = _ftp_patches()
+            with c1, c2, c3, patch.object(printer_manager, "start_print", MagicMock(return_value=True)):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            assert plate_occupancy.pending_eject_view(printer.id) is not None
         finally:
             source.unlink(missing_ok=True)
 

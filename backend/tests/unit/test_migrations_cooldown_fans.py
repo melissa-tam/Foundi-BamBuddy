@@ -1,4 +1,4 @@
-"""Regression tests for the cooldown-fan startup migrations (2026-09-11).
+"""Regression tests for the cooldown-fan startup migrations.
 
 Two migrations ship with the cooldown-fan wave, and both change what an operator
 sees, so both are pinned here:
@@ -22,63 +22,26 @@ sees, so both are pinned here:
    read, in either position. ``create_all`` builds the table WITHOUT the column now
    that the model has lost it, so the pre-migration shape is built explicitly here —
    otherwise the test would pass without the migration existing at all.
-
-SQLite-safe and self-contained, mirroring the sibling migration regression tests.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _SPEED_KEY = "farm_cooldown_aux_fan_percent"
 _SWITCH_KEY = "farm_cooldown_aux_fan_enabled"
 _DEAD_COLUMN = "cooling_fan_assist"
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import EVERY model module so `create_all` builds the whole schema.
-
-    Not a hand-picked subset, and not the package `__init__` either (it does not
-    re-export every module — `virtual_printer` is one it misses). `run_migrations`
-    ALTERs tables across the schema and `_safe_execute` deliberately RE-RAISES
-    "no such table" (that is schema corruption, not idempotency), so a partial
-    `create_all` leaves this file passing or failing according to which other test
-    module happened to import a model first.
-    """
-    import importlib
-    import pkgutil
-
-    import backend.app.models as models_pkg
-
-    for module in pkgutil.iter_modules(models_pkg.__path__):
-        importlib.import_module(f"{models_pkg.__name__}.{module.name}")
-
-
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
@@ -94,11 +57,6 @@ async def _setting(conn, key: str) -> str | None:
 async def _eject_profile_columns(conn) -> set[str]:
     rows = (await conn.execute(text("PRAGMA table_info(eject_profiles)"))).fetchall()
     return {row[1] for row in rows}
-
-
-# ============================================================================
-# 1. The "0 = off" fold
-# ============================================================================
 
 
 @pytest.mark.asyncio
@@ -161,11 +119,6 @@ async def test_an_existing_switch_row_is_never_overwritten(engine):
     async with engine.connect() as conn:
         assert await _setting(conn, _SWITCH_KEY) == "true"
         assert await _setting(conn, _SPEED_KEY) is None
-
-
-# ============================================================================
-# 2. The dead eject-profile column
-# ============================================================================
 
 
 @pytest.mark.asyncio

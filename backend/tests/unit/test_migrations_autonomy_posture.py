@@ -1,4 +1,4 @@
-"""Regression tests for the WS-F autonomy migrations (2026-08-10).
+"""Regression tests for the autonomy startup migrations.
 
 Two startup migrations, both of which change operator-visible posture and so must
 be pinned:
@@ -17,17 +17,17 @@ be pinned:
    the lane permanently off. Its reader maps a MISSING key to True, which is what
    makes the deletion restore the shipped default — asserted here directly, because
    the reader itself lives in a module this change may not touch.
-
-SQLite-safe and self-contained, mirroring the sibling migration regression tests.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _POSTURE_MARKER = "migration_success_notifications_off_20260810"
 _SUCCESS_COLUMNS = ("on_spool_recovery_succeeded", "on_spool_recovery_self_healed")
@@ -35,46 +35,9 @@ _SUCCESS_COLUMNS = ("on_spool_recovery_succeeded", "on_spool_recovery_self_heale
 _FAILURE_COLUMN = "on_spool_recovery_failed"
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import EVERY model module so `create_all` builds the whole schema.
-
-    Not a hand-picked subset, and not the package `__init__` either (it does not
-    re-export every module — `virtual_printer` is one it misses). `run_migrations`
-    ALTERs tables across the schema and `_safe_execute` deliberately RE-RAISES
-    "no such table" (that is schema corruption, not idempotency), so a partial
-    `create_all` leaves this file passing or failing according to which other test
-    module happened to import a model first.
-    """
-    import importlib
-    import pkgutil
-
-    import backend.app.models as models_pkg
-
-    for module in pkgutil.iter_modules(models_pkg.__path__):
-        importlib.import_module(f"{models_pkg.__name__}.{module.name}")
-
-
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 

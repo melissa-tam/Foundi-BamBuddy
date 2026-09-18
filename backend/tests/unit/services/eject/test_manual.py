@@ -428,6 +428,26 @@ class TestManualEjectItemResolution:
         resolution = await manual._resolve_manual_eject_item(db_session, printer.id, None)
         assert resolution.lane == "none"
 
+    async def test_a_vision_trip_demotes_a_farm_owned_plate_out_of_the_matched_lane(self, db_session):
+        """A plate-vision trip rewrites the plate SOURCELESS, so the unit that made the
+        part can no longer be matched to it and what was a sweepable plate becomes a job
+        for a human. Pinned as CURRENT behaviour, not endorsed — the trip's own caller
+        (``farm_policy``) fires it on a plate the farm may already own."""
+        printer = await _mk_printer(db_session, "RESVIS", gate="SUB-1")
+        item = await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")
+        await db_session.commit()
+        _gate_up(printer.id, gate="SUB-1")
+        matched = await manual._resolve_manual_eject_item(db_session, printer.id, "SUB-1")
+        assert (matched.lane, matched.item.id) == ("eject", item.id)
+
+        plate_occupancy.note_plate_detected(printer.id, "plate_vision_confirmed:0500_808C")
+
+        resolution = await manual._resolve_manual_eject_item(
+            db_session, printer.id, plate_occupancy.plate_source(printer.id)
+        )
+        assert resolution.lane == "none"
+        assert resolution.item is None
+
 
 class TestManualEjectThermal:
     async def test_bed_hot_carries_temps(self, db_session):

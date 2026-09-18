@@ -6,12 +6,40 @@ Supports failure injection, custom AVBL command, and filesystem inspection.
 
 import logging
 import os
+import socket
 import threading
 import time
 
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import TLS_FTPHandler
 from pyftpdlib.servers import FTPServer
+
+_PASSIVE_PORT_BASE = 60000
+_PASSIVE_PORT_SPAN = 101  # serial default: 60000-60100 inclusive
+_PASSIVE_PORTS_PER_WORKER = 20
+
+
+def _passive_port_range() -> range:
+    """Return a passive-port range no sibling xdist worker shares.
+
+    Every worker used to be handed the same 101 ports, so two workers running
+    an FTP test at the same moment could pick the same passive port and one of
+    them would fail to bind. Under xdist each worker takes a disjoint block
+    derived from PYTEST_XDIST_WORKER ("gw0", "gw1", ...). With the variable
+    absent the run is serial, so the full original range is kept.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    index = worker[2:] if worker.startswith("gw") else ""
+    if not index.isdigit():
+        return range(_PASSIVE_PORT_BASE, _PASSIVE_PORT_BASE + _PASSIVE_PORT_SPAN)
+
+    start = _PASSIVE_PORT_BASE + int(index) * _PASSIVE_PORTS_PER_WORKER
+    end = start + _PASSIVE_PORTS_PER_WORKER
+    if end > 65536:
+        # More workers than this scheme can carve up; fall back rather than
+        # hand out ports past the top of the port space.
+        return range(_PASSIVE_PORT_BASE, _PASSIVE_PORT_BASE + _PASSIVE_PORT_SPAN)
+    return range(start, end)
 
 
 class ImplicitTLS_FTPHandler(TLS_FTPHandler):
@@ -168,9 +196,15 @@ class MockBambuFTPServer:
         handler.authorizer = authorizer
         handler.certfile = self.cert_path
         handler.keyfile = self.key_path
-        handler.passive_ports = range(60000, 60101)
+        handler.passive_ports = _passive_port_range()
         handler.tls_control_required = False
         handler.tls_data_required = False
+        # pyftpdlib delays a failed login's 530 by auth_failed_timeout (3 s) to
+        # slow down password guessing. Nothing is guessing here, and the delay
+        # raced the client's own socket timeout: it was the whole 3.0 s of
+        # test_connect_wrong_access_code, and it is why a shorter client timeout
+        # would turn a deterministic 530 into a timeout.
+        handler.auth_failed_timeout = 0
         # Reset ssl_context so it picks up our cert/key
         handler.ssl_context = None
 
@@ -185,8 +219,33 @@ class MockBambuFTPServer:
 
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        # Brief wait for server to be ready
-        time.sleep(0.1)
+        self._await_listening()
+
+    def _await_listening(self, timeout: float = 5.0) -> None:
+        """Block until the control port accepts a TCP connection.
+
+        Replaces a flat 0.1 s pad, which was simultaneously too long on an idle
+        box and no guarantee at all on a loaded one. Only the TCP handshake is
+        performed -- this is an implicit-TLS server, so the probe closes before
+        the TLS handshake; pyftpdlib handles that as an ordinary early
+        disconnect and its logging is already pinned to CRITICAL.
+        """
+        deadline = time.monotonic() + timeout
+        last_error: OSError | None = None
+        while time.monotonic() < deadline:
+            if self._thread is not None and not self._thread.is_alive():
+                raise RuntimeError(f"mock FTPS server thread died before {self.host}:{self.port} accepted a connection")
+            try:
+                with socket.create_connection((self.host, self.port), timeout=0.5):
+                    return
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.01)
+
+        raise RuntimeError(
+            f"mock FTPS server did not accept a connection on {self.host}:{self.port} "
+            f"within {timeout}s (last error: {last_error!r})"
+        )
 
     def stop(self):
         """Stop the FTP server and wait for thread to exit."""

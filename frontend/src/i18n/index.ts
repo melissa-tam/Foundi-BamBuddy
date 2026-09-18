@@ -1,68 +1,85 @@
 import i18n from 'i18next';
+import type { Resource } from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 
-// Import translations directly for bundling
+// `en` is the fallback locale and the ONLY bundle this module carries — the
+// baseline the instance cannot answer a `t()` without. The other ten locales
+// live in `./resources`, which production loads through `./boot`. See the
+// statement on `initI18n` below for why the split exists and why it is safe.
 import en from './locales/en';
-import de from './locales/de';
-import es from './locales/es';
-import fr from './locales/fr';
-import ja from './locales/ja';
-import it from './locales/it';
-import ko from './locales/ko';
-import ptBR from './locales/pt-BR';
-import zhCN from './locales/zh-CN';
-import zhTW from './locales/zh-TW';
-import tr from './locales/tr';
 
-const resources = {
-  en: { translation: en },
-  de: { translation: de },
-  es: { translation: es },
-  fr: { translation: fr },
-  ja: { translation: ja },
-  it: { translation: it },
-  ko: { translation: ko },
-  'pt-BR': { translation: ptBR },
-  'zh-CN': { translation: zhCN },
-  'zh-TW': { translation: zhTW },
-  tr: { translation: tr },
-};
+/** The fallback-only resource set every environment starts from. */
+const baseResources: Resource = { en: { translation: en } };
 
 const SUPPORTED_LNGS = ['en', 'de', 'es', 'fr', 'ja', 'it', 'ko', 'pt-BR', 'tr', 'zh-CN', 'zh-TW'];
 const APPLIANCE_CONSUMED_KEY = 'bambuddy_appliance_locale_consumed';
 
-// Plural suffixes: `compatibilityJSON` is deliberately left unset, so i18next 25
-// runs JSON v4 and resolves `<key>_one` / `<key>_other` (via Intl.PluralRules)
-// and nothing else — a `<key>_plural` never resolves and silently renders the
-// singular at every count. `scripts/check-i18n-parity.mjs` check 3 refuses that
-// shape on disk; `src/__tests__/i18n/plurals.test.ts` proves this instance still
-// selects the right form at runtime.
-i18n
-  .use(LanguageDetector)
-  .use(initReactI18next)
-  .init({
-    resources,
-    fallbackLng: 'en',
-    supportedLngs: SUPPORTED_LNGS,
+/**
+ * Initialise THE app i18next instance. Called exactly once per environment:
+ *
+ *   - production / dev — `src/i18n/boot.ts` passes the full eleven-locale set
+ *     from `./resources`, and `src/main.tsx` imports that module BEFORE
+ *     `./App.tsx`, so init still runs before a single component module is
+ *     evaluated and long before the first render. Identical to when this call
+ *     sat at this module's top level.
+ *   - tests — the `import.meta.env.MODE` branch at the foot of this file boots
+ *     `baseResources` alone, so importing this module always yields a READY
+ *     instance. Nine test files plus `src/__tests__/setup.ts` depend on that.
+ *
+ * The resource set is the only thing that varies. Options, plugins,
+ * `supportedLngs`, the appliance hook and `availableLanguages` are identical in
+ * both, and `./resources` remains the ONE list of which locales exist.
+ *
+ * Why the locale set is a parameter rather than an `import.meta.env` branch
+ * over a `resources` literal here: a static `import` is evaluated whether or
+ * not its binding reaches the literal — Vite's SSR transform hoists every
+ * import to the head of the module and vite-node does not tree-shake — so a
+ * branch alone would still pay all 4.0 MB of locale modules in each of the 229
+ * test files. The saving comes from the ten heavy modules not being in THIS
+ * module's import graph at all.
+ *
+ * Why they are not added after init instead: i18next's `setResolvedLanguage`
+ * picks the first language that already holds translations AT INIT TIME, so a
+ * de/ja user would resolve to `en` if their bundle arrived even a tick later.
+ * Production must therefore hand the whole set to `init`, exactly as before.
+ *
+ * Plural suffixes: `compatibilityJSON` is deliberately left unset, so i18next
+ * 25 runs JSON v4 and resolves `<key>_one` / `<key>_other` (via
+ * Intl.PluralRules) and nothing else — a `<key>_plural` never resolves and
+ * silently renders the singular at every count. `scripts/check-i18n-parity.mjs`
+ * check 3 refuses that shape on disk; `src/__tests__/i18n/plurals.test.ts`
+ * proves this instance still selects the right form at runtime.
+ */
+export function initI18n(resources: Resource): void {
+  i18n
+    .use(LanguageDetector)
+    .use(initReactI18next)
+    .init({
+      resources,
+      fallbackLng: 'en',
+      supportedLngs: SUPPORTED_LNGS,
 
-    detection: {
-      // Order of detection methods
-      order: ['localStorage', 'navigator', 'htmlTag'],
-      // Key to use in localStorage
-      lookupLocalStorage: 'bambutrack_language',
-      // Cache user language
-      caches: ['localStorage'],
-    },
+      detection: {
+        // Order of detection methods
+        order: ['localStorage', 'navigator', 'htmlTag'],
+        // Key to use in localStorage
+        lookupLocalStorage: 'bambutrack_language',
+        // Cache user language
+        caches: ['localStorage'],
+      },
 
-    interpolation: {
-      escapeValue: false, // React already escapes
-    },
+      interpolation: {
+        escapeValue: false, // React already escapes
+      },
 
-    react: {
-      useSuspense: false,
-    },
-  });
+      react: {
+        useSuspense: false,
+      },
+    });
+
+  applyApplianceLocale();
+}
 
 /**
  * Bambuddy Appliance hook: on the first SPA load after the firstboot wizard
@@ -96,7 +113,16 @@ function applyApplianceLocale() {
     });
 }
 
-applyApplianceLocale();
+// The suite never loads `./boot`, so this module self-boots on the `en`
+// baseline: importing it yields a ready instance in every environment. `MODE`
+// is `'test'` under Vitest (it creates its Vite server with that mode; the same
+// signal already gates the logging in `src/hooks/useWebSocket.ts`) and
+// `'production'` in a `vite build`, where Vite inlines the literal and the
+// bundler drops this branch. A test needing more than `en` registers it
+// explicitly — see `src/__tests__/i18n/plurals.test.ts`.
+if (import.meta.env.MODE === 'test') {
+  initI18n(baseResources);
+}
 
 export default i18n;
 

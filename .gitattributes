@@ -6,3 +6,10 @@
 # A CRLF checkout under core.autocrlf=true fails every golden on a fresh tree or after a
 # merge materialises a new one (2026-09-04: the two zref_* goldens landed CRLF in the ship gate).
 backend/tests/unit/services/eject/golden/*.gcode text eol=lf
+
+# Shell scripts must stay LF. Under core.autocrlf=true (this dev box) a .sh
+# with no attribute is checked out CRLF, which makes '#!/bin/sh' parse as
+# '/bin/sh\r' -- Git Bash reports a bad interpreter and every line ends in a
+# stray CR. Same class as the golden .gcode rule above. Affects the Docker
+# entrypoint and the install scripts too, which run on Linux.
+*.sh text eol=lf

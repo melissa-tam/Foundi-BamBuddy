@@ -1,16 +1,13 @@
-"""Regression test for the cancellation-cascade recovery migration (#1667).
+"""The cancellation-cascade recovery migration (#1667).
 
-Pre-fix: the scheduler's `_check_previous_success` lookback included
-`skipped` and excluded `cancelled`, so a single user-cancelled print
-poisoned every downstream item with `require_previous_success=True`
-indefinitely (reporter saw 18 items blocked over 3 days from one
-cancellation).
+The scheduler's `_check_previous_success` lookback included `skipped` and
+excluded `cancelled`, so a single user-cancelled print poisoned every
+downstream item carrying `require_previous_success=True`, indefinitely.
 
-This migration reverses the bug surgically: ONLY skipped items whose
-immediate real predecessor (by `completed_at` desc, excluding skipped
-items themselves) was `cancelled` get reset to `pending`. Items whose
-true predecessor was `failed` or `aborted` stay skipped — those were
-legitimate failure-gated skips.
+The migration reverses that surgically: ONLY skipped items whose immediate
+real predecessor (by `completed_at` desc, excluding skipped items themselves)
+was `cancelled` get reset to `pending`. Items whose true predecessor was
+`failed` or `aborted` stay skipped — those are legitimate failure-gated skips.
 """
 
 from __future__ import annotations
@@ -19,68 +16,17 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """run_migrations touches multiple tables; the full schema must exist."""
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
@@ -121,7 +67,6 @@ async def _get_status(engine, item_id: int) -> tuple[str, str | None]:
 
 @pytest.mark.asyncio
 async def test_skipped_after_cancelled_resets_to_pending(engine):
-    """Bug A + B: cancelled → skipped → migration resets the skipped item."""
     await _insert_queue_item(engine, id=10, printer_id=1, status="cancelled", minutes_offset=1)
     await _insert_queue_item(
         engine,
@@ -205,9 +150,8 @@ async def test_skipped_with_other_error_message_untouched(engine):
 
 @pytest.mark.asyncio
 async def test_reporter_exact_cascade_resets_all_three(engine):
-    """The reporter's exact pattern: failed → cancelled → skipped → skipped.
-    Predecessors (by completed_at desc, skipped excluded) are cancelled for
-    both stuck items, so both reset."""
+    """failed → cancelled → skipped → skipped: the predecessor (by completed_at
+    desc, skipped excluded) is cancelled for both stuck items, so both reset."""
     await _insert_queue_item(engine, id=50, printer_id=1, status="failed", minutes_offset=1)
     await _insert_queue_item(engine, id=51, printer_id=1, status="cancelled", minutes_offset=2)
     await _insert_queue_item(

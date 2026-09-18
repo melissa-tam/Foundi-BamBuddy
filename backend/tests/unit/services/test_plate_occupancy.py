@@ -63,6 +63,29 @@ def clock(monkeypatch):
     return c
 
 
+class _WallClock:
+    """A steerable stand-in for ``_now`` — the wall clock every stored ``since`` is
+    stamped from. Separate from :class:`_Clock` because the module measures HOLDS in
+    monotonic seconds and TIMESTAMPS in wall time, and the shared ``_fixtures/clock.py``
+    is a monotonic float stand-in by contract (it returns no ``datetime``)."""
+
+    def __init__(self, start: datetime | None = None) -> None:
+        self.t = start or datetime(2026, 9, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += timedelta(seconds=seconds)
+
+
+@pytest.fixture()
+def wall_clock(monkeypatch):
+    c = _WallClock()
+    monkeypatch.setattr(po, "_now", c)
+    return c
+
+
 def _deposit_evidence(*, deposited: bool) -> po.DepositEvidence:
     """The two unambiguous ends of the deposit table, for tests about something else."""
     if deposited:
@@ -314,7 +337,113 @@ class TestNoteTerminal:
 
 
 # ---------------------------------------------------------------------------
-# 3. declare_occupied
+# 3. note_plate_detected
+# ---------------------------------------------------------------------------
+
+
+class TestNotePlateDetected:
+    """The printer's own vision trip (``farm_policy`` calls it on both the unvouched and
+    the confirmed branch). The record it writes is always sourceless and always
+    escalation-only: there is no job identity behind a vision trip to sweep against."""
+
+    _DETAIL = "plate_vision_confirmed:0500_808C"
+
+    @staticmethod
+    def _prior(prior: str | None) -> None:
+        """Put the plate into the state the trip is about to land on."""
+        if prior == "vision":
+            po.plate_occupancy.note_plate_detected(1, "plate_vision_unvouched:0500_806E")
+        elif prior == "declared":
+            _occupy(1)
+        elif prior == "cooldown":
+            po.plate_occupancy.note_terminal(1, _disposition(source="SUB-7", policy=po.CooldownEject(4, 2)))
+        elif prior == "foreign_auto":
+            po.plate_occupancy.hydrate_plate(1, None, po.ForeignAutoEject(profile_id=3, threshold_c=33.0))
+
+    def test_it_raises_a_human_clear_gate_and_arms_the_policy(self):
+        rec = _Recorder()
+        rec.wire()
+
+        po.plate_occupancy.note_plate_detected(1, self._DETAIL)
+
+        view = po.plate_occupancy.snapshot(1)
+        assert view.plate_occupied is True
+        assert view.plate_source_subtask_id is None
+        assert view.plate_policy == po.EscalationOnly()
+        # A clear→occupied edge is not a release edge, so the scheduler is not kicked.
+        assert rec.calls == [("persist", ""), ("broadcast", ""), ("policy", "plate_detected")]
+
+    @pytest.mark.parametrize(
+        ("prior", "rewrites"),
+        [
+            (None, True),
+            ("vision", False),
+            ("declared", False),
+            ("cooldown", True),
+            ("foreign_auto", True),
+        ],
+        ids=[
+            "clear_plate",
+            "an_earlier_vision_trip",
+            "an_operator_declaration",
+            "a_farm_unit_cooling_on_the_plate",
+            "a_foreign_plate_armed_to_auto_eject",
+        ],
+    )
+    def test_the_guard_suppresses_only_a_record_it_would_write_identically(self, prior, rewrites, wall_clock):
+        """Re-stamping ``since`` would lie about when the plate became occupied and churn
+        the fan-out, so a trip that would change nothing does nothing. Every OTHER prior
+        record is overwritten — including the two that carry a sweep plan."""
+        self._prior(prior)
+        since_before = po.plate_occupancy.snapshot(1).plate_since
+        wall_clock.advance(300)
+        rec = _Recorder()
+        rec.wire()
+
+        po.plate_occupancy.note_plate_detected(1, self._DETAIL)
+
+        view = po.plate_occupancy.snapshot(1)
+        assert view.plate_occupied is True
+        assert view.plate_source_subtask_id is None
+        assert view.plate_policy == po.EscalationOnly()
+        if rewrites:
+            assert view.plate_since == wall_clock.t
+            assert rec.calls == [("persist", ""), ("broadcast", ""), ("policy", "plate_detected")]
+        else:
+            assert view.plate_since == since_before
+            assert rec.calls == []
+
+    def test_a_trip_demotes_a_farm_owned_plate_to_human_clear(self):
+        """The gate keeps the part but LOSES the sweep identity. ``plate_source`` goes
+        None, so the matched-eject ladder in ``eject/manual.py`` — which pairs the plate
+        with the unit whose ``dispatch_subtask_id`` equals it — can no longer match, and
+        the plate needs a human. Pinned as CURRENT behaviour, not endorsed."""
+        po.plate_occupancy.note_terminal(1, _disposition(source="SUB-7", policy=po.CooldownEject(4, 2)))
+        assert po.plate_occupancy.plate_source(1) == "SUB-7"
+
+        po.plate_occupancy.note_plate_detected(1, self._DETAIL)
+
+        assert po.plate_occupancy.is_plate_occupied(1) is True
+        assert po.plate_occupancy.plate_source(1) is None
+        assert po.plate_occupancy.snapshot(1).plate_policy == po.EscalationOnly()
+
+    def test_a_mid_job_trip_is_legal_and_settles_nobody_elses_claim(self, clock):
+        """The H2-series pre-print check fires MID-JOB, so the trip is legal from every
+        owner — it records the plate without consuming the lease the dispatch holds."""
+        lease = po.plate_occupancy.claim_for_dispatch(
+            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
+        )
+        assert isinstance(lease, po.DispatchLease)
+
+        po.plate_occupancy.note_plate_detected(1, "plate_vision_unvouched:0500_806E")
+
+        view = po.plate_occupancy.snapshot(1, po.Evidence(live_state=RUNNING))
+        assert view.plate_occupied is True
+        assert view.lease_unit_id == 9
+
+
+# ---------------------------------------------------------------------------
+# 4. declare_occupied
 # ---------------------------------------------------------------------------
 
 
@@ -443,7 +572,7 @@ class TestRevokeLease:
 
 
 # ---------------------------------------------------------------------------
-# 4. The two claims
+# 5. The two claims
 # ---------------------------------------------------------------------------
 
 
@@ -572,7 +701,7 @@ class TestClaimForEject:
 
 
 # ---------------------------------------------------------------------------
-# 5. clear_plate / operator_recover
+# 6. clear_plate / operator_recover
 # ---------------------------------------------------------------------------
 
 
@@ -619,7 +748,7 @@ class TestClearAndRecover:
 
 
 # ---------------------------------------------------------------------------
-# 6. Lease settlement (read-time, never a transition)
+# 7. Lease settlement (read-time, never a transition)
 # ---------------------------------------------------------------------------
 
 
@@ -726,7 +855,7 @@ class TestLeaseSettlement:
 
 
 # ---------------------------------------------------------------------------
-# 7. Eject lifecycle
+# 8. Eject lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -906,7 +1035,7 @@ class TestUnownedEject:
 
 
 # ---------------------------------------------------------------------------
-# 8. The watchdog verdict, stamped before the stop
+# 9. The watchdog verdict, stamped before the stop
 # ---------------------------------------------------------------------------
 
 
@@ -945,7 +1074,7 @@ class TestRuntimeExceeded:
 
 
 # ---------------------------------------------------------------------------
-# 9. The fan-out
+# 10. The fan-out
 # ---------------------------------------------------------------------------
 
 
@@ -1138,7 +1267,7 @@ class TestNotify:
 
 
 # ---------------------------------------------------------------------------
-# 10. The two gates, as tables
+# 11. The two gates, as tables
 # ---------------------------------------------------------------------------
 
 
