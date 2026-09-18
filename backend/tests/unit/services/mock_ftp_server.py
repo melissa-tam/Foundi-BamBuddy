@@ -199,6 +199,12 @@ class MockBambuFTPServer:
         handler.passive_ports = _passive_port_range()
         handler.tls_control_required = False
         handler.tls_data_required = False
+        # pyftpdlib delays a failed login's 530 by auth_failed_timeout (3 s) to
+        # slow down password guessing. Nothing is guessing here, and the delay
+        # raced the client's own socket timeout: it was the whole 3.0 s of
+        # test_connect_wrong_access_code, and it is why a shorter client timeout
+        # would turn a deterministic 530 into a timeout.
+        handler.auth_failed_timeout = 0
         # Reset ssl_context so it picks up our cert/key
         handler.ssl_context = None
 

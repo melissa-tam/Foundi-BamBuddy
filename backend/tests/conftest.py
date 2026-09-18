@@ -51,6 +51,16 @@ def _cleanup_test_root_dir():
 
 atexit.register(_cleanup_test_root_dir)
 
+# No test opens a socket off this machine. Installed here, before the app is
+# imported, for the same reason the data root is: it is process-wide state that
+# has to be in place before anything can use it. The rule, why it is
+# fail-open, and what it deliberately allows (127.0.0.1 — the real pyftpdlib
+# FTPS server, the virtual-printer MQTT/FTP servers, asyncio's Windows
+# self-pipe) live in the module.
+from backend.tests._fixtures.netguard import install_outbound_connect_guard  # noqa: E402
+
+install_outbound_connect_guard()
+
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 # Ensure settings use our env vars - import and override before database import
