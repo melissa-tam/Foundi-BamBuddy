@@ -55,25 +55,33 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from backend.app.core.database import Base
 
-# A per-engine temp FILE, deliberately NOT ":memory:".
+# TWO urls, because the StaticPool hazard is scoped to SHARED ownership.
 #
-# Under ":memory:" SQLAlchemy selects StaticPool, which means the pool's single
-# connection IS the database. That makes the whole module's data hostage to that
-# one connection: a test which cancels a task while it holds a session lets the
-# cancelled task's cleanup close the connection, and the pool's next checkout
-# opens a FRESH, EMPTY database -- so every later test in the module dies on
-# "no such table". test_spool_recovery.test_dedup_blocks_while_incident_active
-# does exactly that (it cancels a live recovery task on purpose), and it poisoned
-# the 247 tests that follow it.
+# Under ":memory:" SQLAlchemy selects StaticPool, so the pool's single connection
+# IS the database. For the MODULE-scoped engine below that is fatal: a test which
+# cancels a task while it holds a session lets the cancelled task's cleanup close
+# that connection, the pool's next checkout opens a FRESH, EMPTY database, and
+# every later test in the module dies on "no such table".
+# test_spool_recovery.test_dedup_blocks_while_incident_active cancels a live
+# recovery task on purpose and poisoned the 247 tests after it that way. The
+# shared engine therefore takes a FILE url, which selects AsyncAdaptedQueuePool
+# where connections are disposable and the data outlives them.
 #
-# A file URL selects AsyncAdaptedQueuePool, where connections are disposable and
-# the data outlives them. The file lives under the per-worker DATA_DIR the
-# composition root established, so it is worker-local and swept with it.
+# A throwaway engine that ONE test creates, owns and discards cannot hit that --
+# there is no later test to poison. Charging those callers the file price to
+# protect the shared fixture is not free: `:memory:` + a 69-table create_all
+# measures 0.045 s against 0.63-0.98 s file-backed, and every run_migrations call
+# pays it again, which cost the 32-file migration family 39% (176.6 s -> 245.6 s).
+#
+# The files land wherever `tempfile` points (TMPDIR), NOT under DATA_DIR.
 _TEST_DB_SEQ = itertools.count()
 
+#: For a throwaway engine owned by a single test. Fast, and unsafe to SHARE.
+MEMORY_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
-def _test_database_url() -> str:
-    """A fresh SQLite file URL, unique per engine within this worker."""
+
+def _shared_database_url() -> str:
+    """A fresh SQLite FILE url, for an engine outliving the test that built it."""
     directory = Path(tempfile.mkdtemp(prefix="bbtestdb_"))
     return f"sqlite+aiosqlite:///{(directory / f'test_{next(_TEST_DB_SEQ)}.db').as_posix()}"
 
@@ -106,7 +114,14 @@ def import_all_models() -> None:
 
 
 async def create_memory_engine(*, echo: bool = False) -> AsyncEngine:
-    """Build an in-memory engine with the FULL schema already created.
+    """Build a genuinely IN-MEMORY engine with the FULL schema already created.
+
+    For an engine ONE test creates, owns and discards -- the shape every
+    migration test wants. Do NOT share the result across tests: `:memory:`
+    selects StaticPool, so the single connection IS the database and anything
+    that closes it (a cancelled task holding a session) takes the data with it.
+    An engine that has to outlive its creating test wants `_shared_database_url`
+    instead; `module_database` below is the one such caller.
 
     The shared replacement for the 23 hand-rolled ``engine()`` fixtures across
     the migration tests. Callers that need a pre-migration schema run their own
@@ -117,7 +132,7 @@ async def create_memory_engine(*, echo: bool = False) -> AsyncEngine:
             await conn.execute(text(f"ALTER TABLE eject_profiles DROP COLUMN {_NEW_COLUMN}"))
     """
     import_all_models()
-    engine = create_async_engine(_test_database_url(), echo=echo)
+    engine = create_async_engine(MEMORY_DATABASE_URL, echo=echo)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     return engine
@@ -204,7 +219,12 @@ async def dispose_live_engine_after_module() -> AsyncGenerator[None, None]:
 @pytest.fixture(scope="module")
 async def module_database() -> AsyncGenerator[ModuleDatabase, None]:
     """The module's in-memory engine: built once, torn down once."""
-    engine = await create_memory_engine()
+    import_all_models()
+    # FILE-backed on purpose: this engine is shared by every test in the module,
+    # which is exactly the ownership the StaticPool hazard above bites.
+    engine = create_async_engine(_shared_database_url())
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     database = ModuleDatabase(engine=engine, tables=tuple(reversed(Base.metadata.sorted_tables)))
     yield database
     await engine.dispose()
