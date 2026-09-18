@@ -310,6 +310,69 @@ class TestRetryPolicy:
         await db_session.commit()
         assert await farm_policy._genuine_failure_count(db_session, retry) == 1
 
+    @pytest.mark.parametrize(
+        ("retry_max", "minted"),
+        [(0, 0), (1, 1)],
+        ids=["a_cap_of_zero_denies_even_the_first_failure", "the_default_cap_grants_it"],
+    )
+    async def test_the_cap_bounds_a_plates_very_first_genuine_failure(self, db_session, retry_max, minted):
+        """``farm_retry_max_per_unit`` is settable to 0 (schema ``ge=0``) and is baked onto
+        the run at creation. At 0 the comparison is ``0 < 0`` — so a run created under it
+        prints each plate once and never retries, which is the whole point of the knob."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=retry_max)
+        item = await _mk_failed_item(db_session, batch, prof, printer_id=3, retry_count=0, pos=40)
+        assert await farm_policy._genuine_failure_count(db_session, item) == 0
+
+        await farm_policy._on_item_failed(db_session, batch, item)
+
+        assert len([i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]) == minted
+
+    @pytest.mark.parametrize(
+        ("depth", "minted"),
+        [(1, 1), (2, 0)],
+        ids=["one_failed_ancestor_still_has_room", "two_failed_ancestors_have_spent_it"],
+    )
+    async def test_a_cap_above_one_counts_the_whole_failed_lineage(self, db_session, depth, minted):
+        """The cap is not a boolean. Only the counts 0 and 1 were pinned, so a run allowed
+        TWO retries had nothing saying the second one is the last."""
+        batch, prof = await _mk_run(db_session, quantity=4, printer_ids=[3], require_fa=False, retry_max=2)
+        item = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=50)
+        for step in range(depth):
+            item = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=51 + step, retry_of_id=item.id)
+        assert await farm_policy._genuine_failure_count(db_session, item) == depth
+
+        await farm_policy._on_item_failed(db_session, batch, item)
+
+        assert len([i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]) == minted
+
+    async def test_a_self_referencing_chain_terminates_at_the_walk_guard(self, db_session):
+        """A corrupted row pointing at itself must END the walk, not hang the tick. The
+        guard's own bound IS the answer, which is also what makes the corruption legible:
+        no honest lineage can be a thousand failures deep."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=1)
+        item = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=60)
+        item.retry_of_id = item.id
+        await db_session.commit()
+
+        assert await farm_policy._genuine_failure_count(db_session, item) == farm_policy._LINEAGE_WALK_MAX
+
+    async def test_deleting_a_failed_ancestor_hands_the_retry_budget_back(self, db_session):
+        """The cap is DERIVED from the surviving chain, and ``retry_of_id`` is
+        ``ON DELETE SET NULL`` — so purging an exhausted plate's original truncates the walk
+        at the missing parent and the spent retry becomes available again. Pinned as CURRENT
+        behaviour: a plate can be re-retried by deleting its own history."""
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=1)
+        retry = await _mk_exhausted_chain(db_session, batch, prof, printer_id=3, pos=70)
+        assert await farm_policy._genuine_failure_count(db_session, retry) == 1
+
+        original = await db_session.get(PrintQueueItem, retry.retry_of_id)
+        await db_session.delete(original)
+        await db_session.commit()
+
+        assert await farm_policy._genuine_failure_count(db_session, retry) == 0
+        await farm_policy._on_item_failed(db_session, batch, retry)
+        assert len([i for i in await _items(db_session, batch.id) if i.retry_of_id == retry.id]) == 1
+
 
 class TestQuarantine:
     async def _mk_printer(self, db, pid_name="Q"):

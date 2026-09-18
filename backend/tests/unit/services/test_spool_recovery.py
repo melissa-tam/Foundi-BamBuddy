@@ -6336,6 +6336,65 @@ class TestMaintenanceModeRecordsAndStandsDown:
         db_session.expunge_all()
         assert (await db_session.get(PrinterIncident, row.id)).status == STATUS_ESCALATED
 
+    async def test_the_page_is_suppressed_while_the_row_is_still_written(
+        self, db_session, printer_factory, notification_provider_factory, install_settings, monkeypatch
+    ):
+        """The record and the page are INDEPENDENT channels, and the hold silences only one.
+
+        The sibling tests spy ``on_spool_recovery_failed`` itself, which stops short of the
+        gate that actually suppresses the page — ``notification_service``'s ONE fan-out. This
+        one lets the real emitter run against a real provider row and watches the
+        single-provider sender instead, so a change that moved the hold check upstream into
+        the fault handler — making the fault vanish from BOTH channels at once — fails here.
+        """
+        from backend.app.models.printer_incident import KIND_JAM, STATUS_ESCALATED
+
+        install_settings()
+        await notification_provider_factory()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        await self._hold(db_session, printer.id)
+        from backend.app.services.notification_service import notification_service
+
+        # A real return shape, so a regression fails on the assertion below rather than
+        # on the caller unpacking a bare mock.
+        sent = AsyncMock(return_value=(True, None))
+        monkeypatch.setattr(notification_service, "_send_to_provider", sent)
+        digest = _spy(monkeypatch, "_queue_for_digest")
+        state = _make_state()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        assert await on_ams_fault(printer.id, state) is None
+
+        # The page: silenced in both channels — a page an operator should never have
+        # received is not worth summarising tomorrow either.
+        sent.assert_not_awaited()
+        digest.assert_not_awaited()
+        # The record: written anyway, and written as a human's.
+        rows = {row.kind: row for row in await printer_incidents.open_rows(db_session, printer.id)}
+        assert rows[KIND_JAM].status == STATUS_ESCALATED
+
+    async def test_the_same_page_reaches_a_provider_when_nothing_is_held(
+        self, db_session, printer_factory, notification_provider_factory, monkeypatch
+    ):
+        """The liveness half of the test above: its silence is a live gate refusing, not a
+        provider row that was never going to be asked in the first place."""
+        from backend.app.services.notification_service import notification_service
+
+        provider = await notification_provider_factory()
+        printer = await printer_factory()
+        sent = AsyncMock(return_value=(True, None))
+        monkeypatch.setattr(notification_service, "_send_to_provider", sent)
+
+        await notification_service.on_spool_recovery_failed(
+            printer.id, printer.name, "job-1", "ran out", db_session, kind="runout"
+        )
+
+        sent.assert_awaited_once()
+        assert sent.await_args.args[0].id == provider.id
+
 
 # ===========================================================================
 # 004-H2S 2026-09-17, incident 192: the swap committed before it knew it could swap.
