@@ -1,87 +1,30 @@
 """Regression test for the eject_profiles bed-drop dwell/jitter column migration.
 
-Adds ``bed_drop_dwell_s``, ``bed_drop_jitter_cycles`` and ``bed_drop_jitter_mm``
-(all nullable — NULL = that drop-floor behaviour is off) to an existing
-``eject_profiles`` table. ``create_all`` would create them from the current model
-and mask the migration, so the fixture drops them first to simulate a
-pre-migration schema; the test then proves ``run_migrations`` re-adds all three,
-that a row inserted without them defaults to NULL, that set values round-trip,
-and that a second pass is a no-op. Idempotent and SQLite-safe (mirrors the
-bed-drop clearance migration regression test in this suite).
+``bed_drop_dwell_s``, ``bed_drop_jitter_cycles`` and ``bed_drop_jitter_mm`` are
+all nullable: NULL = that drop-floor behaviour is off.
+
+``create_all`` builds the columns from the current model and would mask the
+migration entirely, so the fixture DROPs them (SQLite 3.35+) to reconstruct the
+pre-migration schema ``run_migrations`` actually has to repair.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _NEW_COLUMNS = ("bed_drop_dwell_s", "bed_drop_jitter_cycles", "bed_drop_jitter_mm")
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        eject_profile,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        library,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        printer_model_geometry,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
-
-
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    eng = await create_memory_engine()
     async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Simulate a pre-migration schema: drop the columns the current model
-        # created so run_migrations actually has to re-add them (SQLite 3.35+).
         for column in _NEW_COLUMNS:
             await conn.execute(text(f"ALTER TABLE eject_profiles DROP COLUMN {column}"))
     yield eng

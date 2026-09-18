@@ -9,45 +9,17 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    import backend.app.models  # noqa: F401
-    from backend.app.models import (  # noqa: F401
-        external_link,
-        location,
-        print_log,
-        print_queue,
-        project_bom,
-        slot_preset,
-        spoolman_k_profile,
-        spoolman_slot_assignment,
-        virtual_printer,
-    )
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def engine_with_case_variant_spools():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    engine = await create_memory_engine()
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
         await conn.execute(text("DELETE FROM locations"))
         await conn.execute(
             text(
@@ -97,12 +69,8 @@ async def test_backfill_is_idempotent_with_existing_locations(engine_with_case_v
 async def engine_with_null_storage_location():
     """A spool with NULL storage_location must NOT produce a phantom location row
     or get linked to anything — it stays NULL on both fields."""
-    from backend.app.core.database import Base
-
-    _register_all_models()
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    engine = await create_memory_engine()
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
         await conn.execute(text("DELETE FROM locations"))
         await conn.execute(
             text(
@@ -143,23 +111,18 @@ async def test_backfill_skips_null_and_whitespace_storage_location(
 
 @pytest.fixture
 async def engine_with_legacy_null_name_key_location():
-    """Simulate a legacy install where a `locations` row was manually inserted
-    BEFORE the name_key column existed. The migration must backfill the
-    legacy row's name_key BEFORE the dedup INSERT, so the spool-link UPDATE
-    can join on the new key (#1505 review IMPORTANT 11)."""
-    from backend.app.core.database import Base
+    """A `locations` row inserted BEFORE the name_key column existed.
 
-    _register_all_models()
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    The migration must backfill the legacy row's name_key BEFORE the dedup
+    INSERT, so the spool-link UPDATE can join on the new key.
+    """
+    engine = await create_memory_engine()
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Drop the model-shaped locations table (which has NOT NULL on
-        # name_key) and recreate it in its pre-migration shape: no name_key
-        # column at all, mirroring a real upgrade from a Bambuddy version
-        # that predates this feature. The migration's idempotent ALTER TABLE
-        # is what adds the column without a NOT NULL constraint, so the
-        # legacy row can legally have NULL until the new backfill UPDATE
-        # runs.
+        # The model-shaped table has NOT NULL on name_key, which would mask the
+        # backfill; the pre-migration shape has no name_key column at all. The
+        # migration's idempotent ALTER TABLE adds it without a NOT NULL
+        # constraint, so the legacy row can legally hold NULL until the
+        # backfill UPDATE runs.
         await conn.execute(text("DROP TABLE locations"))
         await conn.execute(
             text(
@@ -204,6 +167,4 @@ async def test_backfill_links_spool_to_legacy_null_name_key_location(
     # got backfilled by the FIRST step of the migration.
     assert len(loc_rows) == 1
     assert loc_rows[0].name_key == "drybox 1"
-    # The spool got linked to that legacy row — under the old ordering it
-    # would have been left with `location_id IS NULL`.
     assert spool_rows[0].location_id == loc_rows[0].id

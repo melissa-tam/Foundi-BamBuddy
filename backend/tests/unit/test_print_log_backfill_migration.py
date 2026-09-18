@@ -1,25 +1,18 @@
 """Regression test for the PrintLogEntry → PrintArchive backfill migration (#1390).
 
-Reporter IndividualGhost1905 upgraded to 0.2.4.1 (which shipped the per-event
-aggregation rewrite from #1378) and saw Quick Stats partially break on old
-data:
-
-  - Total Filament Cost = 0 (PrintLogEntry.cost was NULL on pre-upgrade rows)
-  - Time Accuracy empty for pre-upgrade runs (the new query JOINs on
-    archive_id, which the column-add migration left NULL)
-
-#1378's migration added the columns but didn't backfill anything. This test
-pins the backfill that the same `run_migrations` pass now performs:
+The migration that added `print_log_entries.archive_id` / `cost` /
+`energy_kwh` / `energy_cost` left every pre-existing row NULL, so Quick Stats
+read 0 filament cost and an empty time accuracy for everything printed before
+the upgrade. The same `run_migrations` pass now backfills them:
 
   Step 1: link old log entries to their archive via print_name + printer_id.
-  Step 2: copy archive.cost / energy_kwh / energy_cost onto the latest
-          matching log entry per archive (so the sum across archives
-          reproduces the pre-fix total exactly — pre-#1378, archive.cost
-          held the LATEST run's value because reprints overwrote it).
+  Step 2: copy archive.cost / energy_kwh / energy_cost onto the LATEST
+          matching log entry per archive.
 
-Earlier reprints stay with cost = NULL — matching #1378's "first/latest run
-writes, the rest stay NULL" convention for new prints, so reruns don't
-double-count.
+Only the latest run is credited because `archive.cost` held that run's value —
+a reprint overwrote it — so the sum across archives reproduces the pre-upgrade
+total exactly. Earlier reprints stay NULL, which is also the live write path's
+convention for new prints, so reruns never double-count.
 """
 
 from __future__ import annotations
@@ -28,77 +21,26 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch in run_migrations regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import every model so Base.metadata knows the full schema."""
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def engine_with_legacy_data():
     """Fresh schema + a legacy-shape dataset: two archives, four PrintLogEntry
-    rows. The cube.3mf archive carries cost+energy (the user's reprinted file);
+    rows. The cube.3mf archive carries cost+energy (the reprinted file);
     gear.3mf has neither set. Three matching log entries simulate cube's
     reprint history (status: failed → completed → completed). All log entries
     start with archive_id and cost = NULL, exactly like the column-add
-    migration leaves on a pre-#1378 install."""
+    migration leaves on an upgrading install."""
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    from backend.app.core.database import Base
     from backend.app.models.archive import PrintArchive
 
-    _register_all_models()
-
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine = await create_memory_engine()
 
     SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
     async with SessionLocal() as session:
@@ -131,8 +73,7 @@ async def engine_with_legacy_data():
 
     async with engine.begin() as conn:
         # Three log entries for cube.3mf (two early reprints + a latest run),
-        # one for gear.3mf. All with archive_id and cost NULL — exactly the
-        # state the column-add migration leaves on pre-#1378 installs.
+        # one for gear.3mf.
         base = datetime.now(timezone.utc) - timedelta(days=10)
         for i, (delta_days, status, print_name) in enumerate(
             [
@@ -154,9 +95,8 @@ async def engine_with_legacy_data():
                 {"id": i, "pn": print_name, "status": status, "ts": ts},
             )
 
-        # Force NULL on the columns we want the migration to touch — the
-        # CREATE TABLE from Base.metadata.create_all already left them NULL,
-        # but we set explicitly so the fixture's intent is loud.
+        # Redundant against create_all, which already leaves these NULL — stated
+        # explicitly so the pre-migration state the fixture claims is unmissable.
         await conn.execute(
             text("UPDATE print_log_entries SET archive_id = NULL, cost = NULL, energy_kwh = NULL, energy_cost = NULL")
         )
@@ -183,10 +123,8 @@ async def test_backfill_links_log_entries_to_their_archive(engine_with_legacy_da
 
 
 async def test_backfill_copies_cost_and_energy_to_latest_run_only(engine_with_legacy_data):
-    """Pre-#1378 archive.cost = LAST run's value because reprints overwrote it.
-    The backfill attributes that cost to the latest matching log entry; earlier
-    runs stay NULL so summing across runs reproduces sum-of-archive-costs
-    exactly — what the user saw before the upgrade."""
+    """Archive cost/energy lands on the latest matching run only; earlier runs stay
+    NULL, so summing across runs reproduces the sum of archive costs exactly."""
     async with engine_with_legacy_data.begin() as conn:
         await run_migrations(conn)
 
@@ -224,12 +162,13 @@ async def test_backfill_is_idempotent(engine_with_legacy_data):
 
 
 async def test_backfill_skips_archives_with_any_costed_run(engine_with_legacy_data):
-    """If ANY log entry for an archive already has cost set — e.g. the post-#1378
-    live write path filled it for a new run — the backfill leaves the entire
-    archive alone. This is the migration's idempotency anchor: 'cost is
-    accounted for somewhere on this archive's history' is the signal we use
-    to decide whether to inject the archive-level value. Backfilling another
-    row would double-count once the live writes start adding up."""
+    """If ANY log entry for an archive already has cost set — the live write path
+    filled it for a new run — the backfill leaves the entire archive alone.
+
+    "Cost is accounted for somewhere in this archive's history" is the migration's
+    idempotency anchor; injecting the archive-level value onto another row would
+    double-count as soon as the live writes add up.
+    """
     async with engine_with_legacy_data.begin() as conn:
         # Pretend run #1 was written post-fix with its own cost.
         await conn.execute(text("UPDATE print_log_entries SET cost = 1.11 WHERE id = 1"))

@@ -1,4 +1,4 @@
-"""The pool cutover migration (2026-09-04; the printer-subset POOL wave).
+"""The pool cutover migration.
 
 ``printer_id`` changed meaning on a PENDING row. A run targeting a SUBSET of the fleet
 used to round-robin its plates into hard ``printer_id`` values at creation time — a
@@ -7,13 +7,10 @@ It now holds an operator PIN and nothing else: a subset is a POOL
 (``target_printer_ids``), ``printer_id`` stays NULL while the unit waits, and the
 scheduler places each unit against live fleet state at dispatch.
 
-Every pre-release value is therefore mis-typed data, the same class as the 2026-08-12
-``ams_mapping`` cutover — with one difference this file exists to pin: that migration
-CLEARED to NULL, this one WRITES a reconstruction, so the reconstruction is decided per
-BATCH from the only evidence that survived (the batch's own units) and the tests below
-are mostly about that decision being right in each shape.
-
-SQLite-safe and self-contained, mirroring the sibling migration regression tests.
+Every pre-release value is therefore mis-typed data, the same class as the ``ams_mapping``
+cutover — with one difference this file exists to pin: that migration CLEARED to NULL,
+this one WRITES a reconstruction, decided per BATCH from the only evidence that survived
+(the batch's own units).
 """
 
 from __future__ import annotations
@@ -22,47 +19,18 @@ import logging
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _MARKER = "migration_pool_pinned_farm_units_20260904"
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import EVERY model module so `create_all` builds the whole schema (see the
-    sibling migration tests: `run_migrations` ALTERs across the schema and
-    `_safe_execute` re-raises "no such table")."""
-    import importlib
-    import pkgutil
-
-    import backend.app.models as models_pkg
-
-    for module in pkgutil.iter_modules(models_pkg.__path__):
-        importlib.import_module(f"{models_pkg.__name__}.{module.name}")
-
-
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
@@ -174,8 +142,7 @@ async def test_model_batch_top_up_rows_become_the_model_pool_not_a_printers_pool
 @pytest.mark.asyncio
 async def test_single_plate_run_becomes_a_one_member_pool(engine):
     """Honest limit 1: a x1 run cannot witness the rest of its subset, so its
-    recoverable set is the ONE printer it was pinned to. Identical behaviour to
-    today — no worse, and stated rather than guessed at."""
+    recoverable set is the ONE printer it was pinned to."""
     async with engine.begin() as conn:
         batch = await _add_batch(conn, sku_file_id=13)
         only = await _add_item(conn, batch_id=batch, printer_id=7, position=1)

@@ -1,79 +1,27 @@
-"""Regression test for the VP access-code sync migration.
+"""The VP access-code sync migration.
 
-Non-proxy VPs with a target printer must use the target's access code
-because the live-mirror bridge forwards the slicer's MQTT/RTSPS auth
-bytes through to the real printer. Earlier UIs let the codes diverge,
-producing a VP whose listener accepted the bind but whose bridge then
-failed at the second hop. The migration in ``run_migrations`` rewrites
-mismatched rows on the next boot after upgrade.
+A non-proxy VP with a target printer must use the target's access code,
+because the live-mirror bridge forwards the slicer's MQTT/RTSPS auth bytes
+through to the real printer. Diverged codes give a VP whose listener accepts
+the bind but whose bridge then fails at the second hop, so the migration
+rewrites mismatched rows.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """run_migrations touches multiple tables; the full schema must exist."""
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
