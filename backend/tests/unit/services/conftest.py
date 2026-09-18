@@ -125,6 +125,32 @@ def clear_ftp_mode_cache():
     BambuFTPClient._mode_cache.clear()
 
 
+# How long an upload against the test double may wait for the 226 that never
+# comes. See the fixture below.
+TRANSFER_COMPLETION_TIMEOUT_S = 2.0
+
+
+@pytest.fixture(autouse=True)
+def short_transfer_completion_timeout():
+    """Don't sit out the production 226 floor against a server that never sends it.
+
+    ``BambuFTPClient.upload_file`` / ``upload_bytes`` wait
+    ``max(self.timeout, TRANSFER_COMPLETION_TIMEOUT)`` for the server's 226
+    "Transfer complete" — a 60 s FLOOR, because an H2D routinely takes 30+ s.
+    pyftpdlib never sends 226 here at all (the client closes the TLS data
+    channel without ``unwrap()``, so the mock never completes the STOR — the
+    same reason this file's upload tests are in the Windows known-failing set),
+    so every upload test paid the full floor: 5 × 60 s in ``call`` plus 2 × 30 s
+    where ``upload_file_async``'s ``asyncio.wait_for`` tripped first — 361 s of
+    this file's 375 s.
+
+    Shortened HERE, on the class attribute, and never in production: the floor
+    exists for real printers and stays 60 s for them.
+    """
+    with patch.object(BambuFTPClient, "TRANSFER_COMPLETION_TIMEOUT", TRANSFER_COMPLETION_TIMEOUT_S):
+        yield
+
+
 @pytest.fixture()
 def patch_ftp_port(ftp_server):
     """Patch FTP_PORT at class level for async wrapper tests.

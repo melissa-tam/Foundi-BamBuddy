@@ -164,6 +164,14 @@ class BambuFTPClient:
     FTP_PORT = 990
     # Default timeout in seconds (increased for A1 printers)
     DEFAULT_TIMEOUT = 30
+    # Seconds to wait for the server's 226 "Transfer complete" after the data
+    # channel closes. A FLOOR, not a cap: H2D printers routinely take 30+ s to
+    # send it, so a caller's shorter socket timeout must not shorten this wait.
+    # Named rather than inlined in the two ``max(self.timeout, 60)`` calls so
+    # the harness has a seam: the pyftpdlib test double never sends 226 at all,
+    # so every upload test used to sit out the full production floor. Nothing in
+    # production overrides it.
+    TRANSFER_COMPLETION_TIMEOUT = 60
     # Models that may need SSL mode fallback (try prot_p first, fall back to prot_c)
     # These models have varying FTP SSL behavior depending on firmware version
     A1_MODELS = ("A1", "A1 Mini")
@@ -521,7 +529,7 @@ class BambuFTPClient:
                 old_timeout = self._ftp.sock.gettimeout()
                 # Use a generous timeout — H2D printers can take 30+ seconds
                 # to send the 226 after the data channel closes.
-                self._ftp.sock.settimeout(max(self.timeout, 60))
+                self._ftp.sock.settimeout(max(self.timeout, self.TRANSFER_COMPLETION_TIMEOUT))
                 try:
                     resp = self._ftp.voidresp()
                     logger.info("FTP STOR confirmed for %s: %s", remote_path, resp.strip())
@@ -652,7 +660,7 @@ class BambuFTPClient:
             # exceptions (timeout, socket-level) are tolerated as in upload_file.
             try:
                 old_timeout = self._ftp.sock.gettimeout()
-                self._ftp.sock.settimeout(max(self.timeout, 60))
+                self._ftp.sock.settimeout(max(self.timeout, self.TRANSFER_COMPLETION_TIMEOUT))
                 try:
                     self._ftp.voidresp()
                 finally:

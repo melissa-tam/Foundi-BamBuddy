@@ -47,6 +47,29 @@ def _claim_eject(printer_id: int, *, purpose="production", run_id=1, queue_item_
     return pending
 
 
+@pytest.fixture(autouse=True)
+def sd_card_delete():
+    """THE SD-card cleanup transport for this file. Every ``on_print_complete``
+    walks the post-print SD-card delete (``main.py`` ~:4740), which tries each
+    candidate remote path up to 3 times with a hardcoded 2 s backoff on anything
+    that is not a ``DeleteResult``. These are callback-WIRING tests — none of
+    them is about FTP — so four of them used to patch the transport inline and
+    three did not; two of the four patched it with a bare ``AsyncMock`` whose
+    ``MagicMock`` return value is neither ``DELETED`` nor ``NOT_FOUND``, so the
+    ladder classified it FAILED and slept the full 2+2 s per candidate anyway.
+    That was 8.1 s in every one of twelve tests.
+
+    Autouse so a new test in this file cannot reintroduce the cost by omission.
+    ``DELETED`` is the ordinary production outcome and what the explicit patches
+    already chose; a test that needs the handle takes this fixture by name.
+    """
+    from backend.app.services.bambu_ftp import DeleteResult
+
+    with patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock) as mock:
+        mock.return_value = DeleteResult.DELETED
+        yield mock
+
+
 class TestPrintStartLogic:
     """Test print start callback logic without database integration."""
 
@@ -715,15 +738,13 @@ class TestEjectJobCallbacks:
         assert identity is not None and identity.started_at is not None
 
     @pytest.mark.asyncio
-    async def test_eject_completed_no_rewrite_notification_suppressed_farm_finalises(self, test_engine):
+    async def test_eject_completed_no_rewrite_notification_suppressed_farm_finalises(self, test_engine, sd_card_delete):
         """A clean eject FINISH reaches farm_policy as 'completed' (NOT rewritten to
         'cancelled'), emits NO print notification, yet the farm hook + SD-card
         cleanup still run."""
         from contextlib import ExitStack
 
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-        from backend.app.services.bambu_ftp import DeleteResult
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-DONE")
@@ -741,10 +762,6 @@ class TestEjectJobCallbacks:
             mock_ws.send_print_complete = AsyncMock()
             mock_ws.broadcast = AsyncMock()
             stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-            mock_del = stack.enter_context(
-                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
-            )
-            mock_del.return_value = DeleteResult.DELETED
             farm_hook = stack.enter_context(
                 patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
             )
@@ -777,7 +794,7 @@ class TestEjectJobCallbacks:
         # No "Print Complete/Stopped" notification for the sweep.
         mock_notif.on_print_complete.assert_not_awaited()
         # SD-card cleanup of the uploaded eject file still happened.
-        mock_del.assert_awaited()
+        sd_card_delete.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_dry_run_terminal_untouched_not_treated_as_eject(self, test_engine):
@@ -787,8 +804,6 @@ class TestEjectJobCallbacks:
         from contextlib import ExitStack
 
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-        from backend.app.services.bambu_ftp import DeleteResult
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         # A REAL dry-run unit, correlated by its dispatch id. The dry-run flag is the
@@ -816,10 +831,6 @@ class TestEjectJobCallbacks:
             mock_ws.send_print_complete = AsyncMock()
             mock_ws.broadcast = AsyncMock()
             stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-            mock_del = stack.enter_context(
-                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
-            )
-            mock_del.return_value = DeleteResult.DELETED
             farm_hook = stack.enter_context(
                 patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
             )
@@ -861,8 +872,6 @@ class TestEjectJobCallbacks:
 
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-        from backend.app.services.bambu_ftp import DeleteResult
-
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-NAME")
         # No claimed eject on purpose — only the echoed NAME identifies this as an eject.
@@ -882,7 +891,6 @@ class TestEjectJobCallbacks:
             mock_ws.send_print_complete = AsyncMock()
             mock_ws.broadcast = AsyncMock()
             stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-            stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
             farm_hook = stack.enter_context(
                 patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
             )
@@ -938,7 +946,6 @@ class TestEjectJobCallbacks:
             mock_ws.send_print_complete = AsyncMock()
             mock_ws.broadcast = AsyncMock()
             stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-            stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
             stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
             sweep = stack.enter_context(
                 patch("backend.app.services.ams_presence.on_printer_terminal", new_callable=AsyncMock)
@@ -988,7 +995,6 @@ class TestEjectJobCallbacks:
             mock_ws.send_print_complete = AsyncMock()
             mock_ws.broadcast = AsyncMock()
             stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-            stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
             stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
             sweep = stack.enter_context(
                 patch("backend.app.services.ams_presence.on_printer_terminal", new_callable=AsyncMock)
@@ -1025,7 +1031,6 @@ class TestEjectJobCallbacks:
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
         from backend.app.services import farm_correlation
-        from backend.app.services.bambu_ftp import DeleteResult
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-NOCORR")
@@ -1045,10 +1050,6 @@ class TestEjectJobCallbacks:
             mock_ws.send_print_complete = AsyncMock()
             mock_ws.broadcast = AsyncMock()
             stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-            mock_del = stack.enter_context(
-                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
-            )
-            mock_del.return_value = DeleteResult.DELETED
             farm_hook = stack.enter_context(
                 patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
             )
@@ -1090,7 +1091,6 @@ class TestEjectJobCallbacks:
         from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
         from backend.app.services import farm_correlation
-        from backend.app.services.bambu_ftp import DeleteResult
 
         maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
         pid = await self._seed_printer(maker, "EJ-NAME-NOCORR")
@@ -1111,10 +1111,6 @@ class TestEjectJobCallbacks:
             mock_ws.send_print_complete = AsyncMock()
             mock_ws.broadcast = AsyncMock()
             stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-            mock_del = stack.enter_context(
-                patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock)
-            )
-            mock_del.return_value = DeleteResult.DELETED
             farm_hook = stack.enter_context(
                 patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock)
             )
@@ -1190,7 +1186,6 @@ class TestOccupancyLiveness:
         mock_ws.send_print_complete = AsyncMock()
         mock_ws.broadcast = AsyncMock()
         stack.enter_context(patch("backend.app.main.mqtt_relay")).on_print_complete = AsyncMock()
-        stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", new_callable=AsyncMock))
         stack.enter_context(patch("backend.app.services.farm_policy._maybe_idle_deep_park", new_callable=AsyncMock))
         return mock_notif
 
