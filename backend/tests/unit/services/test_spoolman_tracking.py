@@ -18,6 +18,25 @@ from backend.app.services.spoolman_tracking import (
 )
 
 
+def _ams_printer_manager(slot_count=1):
+    """Printer manager reporting one AMS unit with PLA seated in `slot_count` slots."""
+    printer_manager = MagicMock()
+    printer_manager.get_status.return_value = SimpleNamespace(
+        raw_data={"ams": [{"id": 0, "tray": [{"id": i, "tray_type": "PLA"} for i in range(slot_count)]}]}
+    )
+    return printer_manager
+
+
+@pytest.fixture
+def app_settings_with_existing_file():
+    """`app_settings` whose base_dir / <relative path> resolves to a file that exists."""
+    mock_settings = MagicMock()
+    mock_path = MagicMock()
+    mock_path.exists.return_value = True
+    mock_settings.base_dir.__truediv__.return_value = mock_path
+    return mock_settings
+
+
 class TestResolveSpoolTag:
     """Tests for _resolve_spool_tag()."""
 
@@ -212,7 +231,7 @@ class TestStorePrintData:
     """Tests for store_print_data()."""
 
     @pytest.mark.asyncio
-    async def test_prefers_explicit_ams_mapping_over_queue_mapping(self):
+    async def test_prefers_explicit_ams_mapping_over_queue_mapping(self, app_settings_with_existing_file):
         db = AsyncMock()
         # store_print_data now queries the queue item unconditionally (to pick up
         # plate_id for multi-plate 3MFs, #1697), then deletes any stale spoolman
@@ -225,18 +244,10 @@ class TestStorePrintData:
         db.add = MagicMock()
         db.commit = AsyncMock()
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA"}, {"id": 1, "tray_type": "PLA"}]}]}
-        )
-
-        mock_settings = MagicMock()
-        mock_path = MagicMock()
-        mock_path.exists.return_value = True
-        mock_settings.base_dir.__truediv__.return_value = mock_path
+        printer_manager = _ams_printer_manager(slot_count=2)
 
         with (
-            patch("backend.app.services.spoolman_tracking.app_settings", mock_settings),
+            patch("backend.app.services.spoolman_tracking.app_settings", app_settings_with_existing_file),
             patch("backend.app.api.routes.settings.get_setting", AsyncMock(side_effect=["true", "true"])),
             patch(
                 "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
@@ -260,35 +271,24 @@ class TestStorePrintData:
         assert db.execute.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_stores_tracking_when_disable_weight_sync_is_false(self):
-        """#1119: per-print tracking must run regardless of disable_weight_sync.
+    async def test_tracking_runs_whenever_spoolman_is_enabled(self, app_settings_with_existing_file):
+        """Per-print tracking is the ONLY weight writer for Spoolman (#1119).
 
-        Previously store_print_data short-circuited when the deprecated
-        `spoolman_disable_weight_sync` flag was off, leaving non-BL spools
-        with no weight-update path at all. Per-print tracking is now the
-        only weight writer for Spoolman, so it must run whenever Spoolman
-        is enabled.
+        So it runs on the `spoolman_enabled` setting alone: gating it on the
+        deprecated `spoolman_disable_weight_sync` flag as well would leave
+        non-Bambu spools with no weight-update path at all.
         """
         db = AsyncMock()
         db.execute = AsyncMock(return_value=MagicMock())
         db.add = MagicMock()
         db.commit = AsyncMock()
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA"}]}]}
-        )
+        printer_manager = _ams_printer_manager()
 
-        mock_settings = MagicMock()
-        mock_path = MagicMock()
-        mock_path.exists.return_value = True
-        mock_settings.base_dir.__truediv__.return_value = mock_path
-
-        # Only spoolman_enabled is consulted now (disable_weight_sync is no
-        # longer read). The single side_effect entry proves no extra
-        # get_setting calls slip back in.
+        # A single side_effect entry: spoolman_enabled is the only setting read,
+        # so any extra get_setting call would exhaust the mock and fail here.
         with (
-            patch("backend.app.services.spoolman_tracking.app_settings", mock_settings),
+            patch("backend.app.services.spoolman_tracking.app_settings", app_settings_with_existing_file),
             patch("backend.app.api.routes.settings.get_setting", AsyncMock(side_effect=["true"])),
             patch(
                 "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
@@ -308,6 +308,40 @@ class TestStorePrintData:
 
         # Tracking row was inserted — the fix is working.
         db.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_passes_queue_plate_id_to_3mf_extract(self, app_settings_with_existing_file):
+        """A multi-plate 3MF queued for one plate is charged that plate's filament only (#1697)."""
+        db = AsyncMock()
+        queue_item = SimpleNamespace(ams_mapping=None, plate_id=2)
+        queue_result = MagicMock()
+        queue_result.scalar_one_or_none.return_value = queue_item
+        delete_result = MagicMock()
+        db.execute = AsyncMock(side_effect=[queue_result, delete_result])
+        db.add = MagicMock()
+        db.commit = AsyncMock()
+
+        extract_mock = MagicMock(return_value=[{"slot_id": 1, "used_g": 190.0, "type": "PETG", "color": "#888888"}])
+
+        with (
+            patch("backend.app.services.spoolman_tracking.app_settings", app_settings_with_existing_file),
+            patch("backend.app.api.routes.settings.get_setting", AsyncMock(side_effect=["true", "true"])),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", extract_mock),
+            patch("backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf", return_value=None),
+            patch("backend.app.utils.threemf_tools.extract_filament_properties_from_3mf", return_value={}),
+        ):
+            await store_print_data(
+                printer_id=1,
+                archive_id=15,
+                file_path="archives/test.3mf",
+                db=db,
+                printer_manager=_ams_printer_manager(),
+                ams_mapping=[1, -1, -1, -1],
+            )
+
+        # plate_id rides as the second positional arg to the extractor
+        assert extract_mock.call_count == 1
+        assert extract_mock.call_args.args[1] == 2
 
 
 class TestApplySpoolColorsToArchive:
