@@ -110,9 +110,7 @@ class ParsedTree:
             except (SyntaxError, UnicodeDecodeError, OSError):
                 unparsed.append(path)
                 continue
-            self._modules[path] = ParsedModule(
-                path=path, source=source, tree=tree, root=root, repo_root=repo_root
-            )
+            self._modules[path] = ParsedModule(path=path, source=source, tree=tree, root=root, repo_root=repo_root)
         self.unparsed = tuple(unparsed)
 
     def modules(

@@ -11,13 +11,12 @@ One module owns four things that used to be scattered across the tree:
    which meant the in-memory schema depended on whatever a test happened to
    import first.
 
-2. **The in-memory engine.** Module-scoped, created once per test module rather
-   than once per test. ``create_async_engine("sqlite+aiosqlite:///:memory:")``
-   selects ``StaticPool`` (SQLAlchemy 2.0.51), so the module's single connection
-   IS the database and every session in the module sees the same data. This is
-   only sound because ``asyncio_default_fixture_loop_scope`` and
-   ``asyncio_default_test_loop_scope`` are both ``module`` in ``pyproject.toml``:
-   one loop per module keeps that connection valid for the module's lifetime.
+2. **The engine.** Module-scoped, created once per test module rather than once
+   per test, over a per-engine temp FILE. It is deliberately not ``:memory:``:
+   that URL selects ``StaticPool``, where the pool's one connection IS the
+   database, so a single test cancelling a task that holds a session destroys
+   the module's data and every later test dies on ``no such table``. A file URL
+   selects ``AsyncAdaptedQueuePool``, whose connections are disposable.
 
 3. **Per-test isolation.** ``DELETE FROM`` every table in reverse
    ``sorted_tables`` order at test setup, plus ``sqlite_sequence`` so
@@ -43,9 +42,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import itertools
 import pkgutil
+import tempfile
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 from sqlalchemy import Table, text
@@ -53,9 +55,28 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from backend.app.core.database import Base
 
-# In-memory SQLite. Under SQLAlchemy 2.0.51 this URL selects StaticPool, i.e.
-# ONE connection shared by every session built on the engine.
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+# A per-engine temp FILE, deliberately NOT ":memory:".
+#
+# Under ":memory:" SQLAlchemy selects StaticPool, which means the pool's single
+# connection IS the database. That makes the whole module's data hostage to that
+# one connection: a test which cancels a task while it holds a session lets the
+# cancelled task's cleanup close the connection, and the pool's next checkout
+# opens a FRESH, EMPTY database -- so every later test in the module dies on
+# "no such table". test_spool_recovery.test_dedup_blocks_while_incident_active
+# does exactly that (it cancels a live recovery task on purpose), and it poisoned
+# the 247 tests that follow it.
+#
+# A file URL selects AsyncAdaptedQueuePool, where connections are disposable and
+# the data outlives them. The file lives under the per-worker DATA_DIR the
+# composition root established, so it is worker-local and swept with it.
+_TEST_DB_SEQ = itertools.count()
+
+
+def _test_database_url() -> str:
+    """A fresh SQLite file URL, unique per engine within this worker."""
+    directory = Path(tempfile.mkdtemp(prefix="bbtestdb_"))
+    return f"sqlite+aiosqlite:///{(directory / f'test_{next(_TEST_DB_SEQ)}.db').as_posix()}"
+
 
 _models_imported = False
 
@@ -89,7 +110,7 @@ async def create_memory_engine(*, echo: bool = False) -> AsyncEngine:
             await conn.execute(text(f"ALTER TABLE eject_profiles DROP COLUMN {_NEW_COLUMN}"))
     """
     import_all_models()
-    engine = create_async_engine(TEST_DATABASE_URL, echo=echo)
+    engine = create_async_engine(_test_database_url(), echo=echo)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     return engine

@@ -167,7 +167,6 @@ SETTINGS_DIR_ASSIGNMENT_ALLOWLIST = frozenset(
     {
         # :103-104 stashes and :140 restores base_dir by hand; it survives a
         # passing test but not a failure before the restore.
-        "backend/tests/integration/test_library_slice_api.py",
     }
 )
 
@@ -206,9 +205,7 @@ def _touches_metadata_create_all(module: ParsedModule) -> bool:
 
 
 def _defines_clock_class(module: ParsedModule) -> bool:
-    return any(
-        isinstance(node, ast.ClassDef) and node.name.endswith("Clock") for node in ast.walk(module.tree)
-    )
+    return any(isinstance(node, ast.ClassDef) and node.name.endswith("Clock") for node in ast.walk(module.tree))
 
 
 def _settings_aliases(module: ParsedModule) -> set[str]:

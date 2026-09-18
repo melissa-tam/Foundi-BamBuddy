@@ -52,7 +52,6 @@ def _cleanup_test_root_dir():
 atexit.register(_cleanup_test_root_dir)
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E402
 
 # Ensure settings use our env vars - import and override before database import
 from backend.app.core.config import settings  # noqa: E402
@@ -210,13 +209,16 @@ def reset_spoolman_location_sync_cache():
 
 
 @pytest.fixture
-async def async_client(test_engine, db_session) -> AsyncGenerator[AsyncClient, None]:
+async def async_client(test_engine, db_session, own_session_factory) -> AsyncGenerator[AsyncClient, None]:
     """Create an async test client."""
     from backend.app.core.database import async_session, get_db
     from backend.app.main import app
 
-    # Create a new session maker for the test engine
-    test_async_session = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    # `own_session_factory` IS a sessionmaker over `test_engine` (see
+    # _fixtures/db.py). Building a second one here would make conftest a rival
+    # owner of "how a test session is made", which test_fixture_ownership pins
+    # against -- and the two would drift the moment one gained an option.
+    test_async_session = own_session_factory
 
     async def override_get_db():
         async with test_async_session() as session:
