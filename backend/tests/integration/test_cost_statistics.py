@@ -7,21 +7,6 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 
-
-@pytest.fixture(autouse=True)
-def cleanup_test_archive_files():
-    yield
-    import glob
-    import os
-
-    # Remove any test archive files created in archives/test/
-    for f in glob.glob("archives/test/test_print*.3mf"):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
-
-
 """Integration tests for cost tracking in archives and statistics.
 
 Tests the full flow of cost tracking from usage to statistics:

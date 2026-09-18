@@ -69,15 +69,35 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [tool.pytest.ini_options]
+# THE pytest config. backend/tests/pytest.ini is deleted: with two config files
+# pytest resolved a different rootdir per invocation (`pytest backend/tests` ->
+# rootdir backend/tests + pytest.ini; `pytest backend/tests tests` -> repo root
+# + pyproject.toml), so the ship gate and a local run silently used different
+# warning filters and different asyncio loop scopes.
 testpaths = ["backend/tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
+# One event loop per MODULE, for fixtures and tests alike. Both keys are
+# required: pytest-asyncio 1.4.0 defaults each to "function", which rebuilt a
+# loop (and therefore the whole DB engine) around every single test. Module
+# scope is what lets backend/tests/_fixtures/db.py own a module-scoped engine
+# whose single StaticPool connection stays valid across the module's tests.
+asyncio_default_fixture_loop_scope = "module"
+asyncio_default_test_loop_scope = "module"
 filterwarnings = [
     "ignore::DeprecationWarning",
+    "ignore::sqlalchemy.exc.SAWarning",
+    # Coroutines created by async mocks that are intentionally never awaited.
+    "ignore:coroutine.*was never awaited:RuntimeWarning",
+    # Starlette >= 1.1 fires its own deprecation at import time of
+    # starlette.testclient asking us to migrate to httpx2. Upstream-internal;
+    # matched by message text so the filter holds whichever class it uses.
+    "ignore:Using .httpx. with .starlette.testclient. is deprecated",
 ]
 markers = [
-    "docker: marks tests that run in Docker integration environment",
+    "unit: Unit tests (fast, no external deps)",
+    "integration: Integration tests (slower, test full API)",
 ]
 
 [dependency-groups]

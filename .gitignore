@@ -68,7 +68,11 @@ firmware/
 # Node modules
 node_modules/
 
-data/
+# Runtime data dir at the repo ROOT only. Root-anchored on purpose: a bare
+# 'data/' also matched backend/app/data/, hiding the vendored HMS catalogs
+# (hms_error_text_en.json.gz, hms_wiki_links_en.json.gz) that
+# services/hms_catalog.py loads at import time.
+/data/
 
 # Local-dev runtime caches (matplotlib MPLCONFIGDIR lands here when DATA_DIR
 # is unset, so base_dir resolves to the repo root). In Docker this sits

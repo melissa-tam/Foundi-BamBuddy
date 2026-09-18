@@ -160,24 +160,25 @@ class TestMaintenanceItemsAPI:
 
     @pytest.fixture
     async def maintenance_item(self, async_client: AsyncClient, printer_factory, db_session):
-        """Create a maintenance item for testing."""
+        """Seed and return one maintenance item for this printer.
+
+        The overview endpoint calls ensure_default_types() and then auto-creates a
+        PrinterMaintenance row for every system type that applies to the model, so
+        it always yields at least the four model-agnostic types. That is asserted
+        rather than returned as None: the tests below used to skip on None, which
+        would turn a seeding regression into silently-passing no-ops.
+        """
         printer = await printer_factory(name="Item Test Printer")
-        # Get the printer's maintenance overview to create items
         response = await async_client.get(f"/api/v1/maintenance/printers/{printer.id}")
         assert response.status_code == 200
         data = response.json()
-        # Return the first maintenance item
-        if data["maintenance_items"]:
-            return data["maintenance_items"][0]
-        return None
+        assert data["maintenance_items"], "overview seeded no maintenance items for the printer"
+        return data["maintenance_items"][0]
 
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_update_maintenance_item(self, async_client: AsyncClient, maintenance_item):
         """Verify maintenance item can be updated."""
-        if not maintenance_item:
-            pytest.skip("No maintenance items available")
-
         item_id = maintenance_item["id"]
         response = await async_client.patch(
             f"/api/v1/maintenance/items/{item_id}", json={"custom_interval_hours": 150.0}
@@ -188,9 +189,6 @@ class TestMaintenanceItemsAPI:
     @pytest.mark.integration
     async def test_disable_maintenance_item(self, async_client: AsyncClient, maintenance_item):
         """Verify maintenance item can be disabled."""
-        if not maintenance_item:
-            pytest.skip("No maintenance items available")
-
         item_id = maintenance_item["id"]
         response = await async_client.patch(f"/api/v1/maintenance/items/{item_id}", json={"enabled": False})
         assert response.status_code == 200
@@ -200,9 +198,6 @@ class TestMaintenanceItemsAPI:
     @pytest.mark.integration
     async def test_perform_maintenance(self, async_client: AsyncClient, maintenance_item):
         """Verify maintenance can be marked as performed."""
-        if not maintenance_item:
-            pytest.skip("No maintenance items available")
-
         item_id = maintenance_item["id"]
         response = await async_client.post(
             f"/api/v1/maintenance/items/{item_id}/perform", json={"notes": "Test maintenance performed"}
@@ -215,9 +210,6 @@ class TestMaintenanceItemsAPI:
     @pytest.mark.integration
     async def test_get_maintenance_history(self, async_client: AsyncClient, maintenance_item):
         """Verify maintenance history can be retrieved."""
-        if not maintenance_item:
-            pytest.skip("No maintenance items available")
-
         item_id = maintenance_item["id"]
         # First perform maintenance to create history
         await async_client.post(f"/api/v1/maintenance/items/{item_id}/perform", json={"notes": "History test"})

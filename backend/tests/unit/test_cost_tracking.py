@@ -47,31 +47,21 @@ def _make_assignment(spool_id=1, printer_id=1, ams_id=0, tray_id=0):
     return assignment
 
 
+_TEMP_ARCHIVE_PATHS: list[str] = []
+
+
 def _make_archive(archive_id=1, file_path=None):
-    """Create a mock PrintArchive object with a temp file, and register cleanup."""
+    """Create a mock PrintArchive object backed by a real temp file."""
     if file_path is None:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf", prefix="test_print_") as tmp:
             file_path = tmp.name
-        # Register cleanup for this file after the test
-        import pytest
-
-        frame = None
-        try:
-            raise Exception
-        except Exception:
-            import sys
-
-            frame = sys._getframe(1)
-        request = frame.f_locals.get("request")
-        if request is not None:
-
-            def cleanup():
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
-
-            request.addfinalizer(cleanup)
+        # Recorded for cleanup_temp_archives below. NamedTemporaryFile puts this
+        # in the SYSTEM temp dir, not the CWD, which is why the old CWD-relative
+        # glob never matched and every run leaked its files. The previous
+        # mechanism -- raise, walk to the caller frame, look for a local named
+        # "request", addfinalizer -- never fired either: no caller of this helper
+        # takes the request fixture.
+        _TEMP_ARCHIVE_PATHS.append(file_path)
     archive = MagicMock()
     archive.id = archive_id
     archive.file_path = file_path
@@ -84,48 +74,19 @@ def _make_archive(archive_id=1, file_path=None):
 
 @pytest.fixture(autouse=True)
 def cleanup_temp_archives():
+    """Delete the temp .3mf files _make_archive created during this test.
+
+    The paths are recorded rather than globbed: they live in the system temp
+    dir, and a CWD-relative glob is shared by every xdist worker, so one worker
+    could delete a sibling's file mid-test. This list is a module global, which
+    under xdist means per worker process.
+    """
     yield
-    # Cleanup any temp .3mf files created by _make_archive
-    import glob
-
-    for f in glob.glob("test_print_*.3mf"):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
-
-
-@pytest.fixture(autouse=True)
-def cleanup_test_print_gcode():
-    yield
-    import os
-
-    path = "archives/test/test_print.gcode.3mf"
-    if os.path.exists(path):
+    while _TEMP_ARCHIVE_PATHS:
+        path = _TEMP_ARCHIVE_PATHS.pop()
         try:
             os.remove(path)
-        except Exception:
-            pass
-
-
-@pytest.fixture
-def archive_factory_temp():
-    import tempfile
-
-    def _factory(*args, **kwargs):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf", prefix="test_print_", dir="archives/test") as tmp:
-            kwargs["file_path"] = tmp.name
-        return kwargs["file_path"]
-
-    yield _factory
-    # Cleanup
-    import glob
-    import os
-
-    for f in glob.glob("archives/test/test_print_*.3mf"):
-        try:
-            os.remove(f)
-        except Exception:
+        except OSError:
             pass
 
 

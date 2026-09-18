@@ -1,13 +1,19 @@
-"""Shared test fixtures for BamBuddy backend tests."""
+"""Shared test fixtures for BamBuddy backend tests.
 
-import asyncio
+Composition root. This module owns the process-wide setup that has to happen
+before the application is imported, and wires in the fixtures that live in
+``backend/tests/_fixtures/``: ``db.py`` (engines, sessions, schema), ``clock.py``
+(the steerable monotonic clock) and ``ast_tree.py`` (the parsed view of
+``backend/app``). Resources belong there; composition belongs here.
+"""
+
 import atexit
 import json
 import logging
 import os
 import shutil
 import tempfile
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,59 +24,101 @@ import pytest
 os.environ["LOG_TO_FILE"] = "false"
 os.environ["DEBUG"] = "false"
 
+# ONE data root for this worker, established before `backend.app.core.config` is
+# imported so every derived path (base_dir, archive_dir, database_url,
+# plate_calibration_dir, erp_config_file) lands in it. Without this the harness
+# inherits the developer's real data root: the module-level engine in
+# `core/database.py` then points at the repo's own 15 MB bambuddy.db, and the 15
+# modules that bound `async_session` at import — which no conftest patch can
+# reach — quietly write to it (see the contemporaneous note at
+# integration/test_security.py:1340-1349).
+#
+# The directory MUST be `<root>/<worker>/data`, not `<root>/<worker>`: config.py
+# derives the config dir from DATA_DIR's PARENT, so a bare worker dir would give
+# every xdist worker the same `<root>/config/erp.env`.
+_TEST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "master")
+_TEST_ROOT_DIR = Path(tempfile.mkdtemp(prefix="bambuddy_tests_"))
+_TEST_DATA_DIR = _TEST_ROOT_DIR / _TEST_WORKER / "data"
+_TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# setdefault, not assignment: an operator (or the ship gate) pinning DATA_DIR
+# explicitly keeps their choice.
+os.environ.setdefault("DATA_DIR", str(_TEST_DATA_DIR))
+
+
+def _cleanup_test_root_dir():
+    shutil.rmtree(_TEST_ROOT_DIR, ignore_errors=True)
+
+
+atexit.register(_cleanup_test_root_dir)
+
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E402
 
 # Ensure settings use our env vars - import and override before database import
 from backend.app.core.config import settings  # noqa: E402
+from backend.app.core.paths import resolve_data_dir  # noqa: E402
 
 settings.log_to_file = False
 
-# Use a temp directory for plate calibration to avoid deleting real calibration files
-_test_plate_cal_dir = Path(tempfile.mkdtemp(prefix="bambuddy_test_plate_cal_"))
-settings.plate_calibration_dir = _test_plate_cal_dir
-
-
-# Clean up temp directory when tests finish
-def _cleanup_test_plate_cal_dir():
-    if _test_plate_cal_dir.exists():
-        shutil.rmtree(_test_plate_cal_dir, ignore_errors=True)
-
-
-atexit.register(_cleanup_test_plate_cal_dir)
-
-from backend.app.core.database import Base  # noqa: E402
-
-# Use in-memory SQLite for tests
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+# Fixtures that own a resource live in _fixtures/ and are re-exported here, so
+# every test file sees them by name with nothing to import.
+from backend.tests._fixtures.ast_tree import app_sources  # noqa: E402,F401
+from backend.tests._fixtures.clock import clock, make_clock, retry_window_clock  # noqa: E402,F401
+from backend.tests._fixtures.db import (  # noqa: E402,F401
+    db_session,
+    dispose_live_engine_after_module,
+    force_sqlite_dialect,
+    live_app_database_schema,
+    module_database,
+    own_session_factory,
+    test_engine,
+)
 
 
 @pytest.fixture(autouse=True)
-def mfa_encryption_isolation(monkeypatch, tmp_path):
+def assert_one_data_root() -> Generator[None, None, None]:
+    """The pin that fires if the two data-root authorities ever diverge again.
+
+    ``settings`` derives every path from ``paths.resolve_data_dir()``; if a test
+    (or a future edit) reintroduces a second reader, this is where it surfaces —
+    at the end of the test that did it, not three files later as a mystery write
+    to the real database.
+    """
+    yield
+    assert Path(settings.base_dir) == resolve_data_dir(), (
+        "settings.base_dir and paths.resolve_data_dir() disagree: "
+        f"{settings.base_dir!r} != {resolve_data_dir()!r}. "
+        "The data root has one authority (core/paths.py) — see "
+        "backend/tests/unit/test_fixture_ownership.py."
+    )
+
+
+@pytest.fixture(autouse=True)
+def mfa_encryption_isolation(monkeypatch):
     """Per-test isolation for MFA encryption state.
 
-    - Sets ``DATA_DIR`` to an isolated tmp path so the auto-bootstrap can
-      never write ``.mfa_encryption_key`` into the repo or share state
-      across tests / xdist workers.
     - Removes any inherited ``MFA_ENCRYPTION_KEY`` env var.
-    - With ``DATA_DIR`` pointing at a writable ``tmp_path``, the default
-      bootstrap path on first ``_get_fernet()`` call is **auto-generation**
-      (key_source='generated'), NOT plaintext fallback. Tests that need the
-      plaintext fallback path must monkeypatch ``_load_or_generate_key`` to
-      return ``(None, 'none')`` (or 'none_write_failed' / 'none_corrupted')
-      explicitly — see ``test_plaintext_passthrough_without_key`` for an
-      example.
     - Resets the ``encryption`` module-level singletons before AND after the
       test so reorder doesn't leak cached Fernet instances.
+
+    It no longer sets ``DATA_DIR``: the harness pins one data root for the whole
+    worker at import (top of this file), which is what keeps
+    ``.mfa_encryption_key`` out of the repo and out of the other workers' way.
+    Every test that needs a *per-test* data dir already sets it itself —
+    ``integration/test_security.py`` does exactly that at :149, :165, :186, :198,
+    :222, :260, :290, :313, :334, :1438, :1454 and throughout the backup/restore
+    class — so this fixture setting it too made two writers of one fact, and the
+    one that lost was the one that ran first.
 
     Tests that want to exercise an active key should call
     ``monkeypatch.setenv("MFA_ENCRYPTION_KEY", valid_key)`` and
     ``enc_mod._fernet_instance = None`` inside the test body — the autouse
-    fixture only sets defaults, it doesn't lock them in.
+    fixture only sets defaults, it doesn't lock them in. A test asserting on
+    ``key_source`` must point ``DATA_DIR`` at its own ``tmp_path`` first, or it
+    will read the key a previous test generated in the worker's data dir.
     """
     from backend.app.core import encryption as enc_mod
 
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.delenv("MFA_ENCRYPTION_KEY", raising=False)
     enc_mod._fernet_instance = None
     enc_mod._warn_shown = False
@@ -159,104 +207,6 @@ def reset_spoolman_location_sync_cache():
     _spoolman_location_sync_cache_clear()
     yield
     _spoolman_location_sync_cache_clear()
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for each test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    # Dispose the module-level engine so aiosqlite worker threads finish
-    # before the event loop closes, preventing "Event loop is closed" errors.
-    from backend.app.core.database import engine
-
-    loop.run_until_complete(engine.dispose())
-    loop.run_until_complete(asyncio.sleep(0.05))
-    loop.close()
-
-
-@pytest.fixture
-async def test_engine():
-    """Create a test database engine."""
-    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-
-    # Import all models to register them
-    from backend.app.models import (
-        active_print_spoolman,  # noqa: F401 — not re-exported by models/__init__
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        auth_ephemeral,
-        color_catalog,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        maintenance,
-        notification,
-        notification_template,
-        oidc_provider,
-        print_log,
-        print_queue,
-        printer,
-        printer_incident,  # noqa: F401 — WS2b durable AMS incidents
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        slot_recheck,  # noqa: F401 — WS11 durable operator re-check intents
-        smart_plug,
-        smart_plug_energy_snapshot,  # noqa: F401
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        spoolman_k_profile,
-        spoolman_slot_assignment,
-        user,
-        user_email_pref,
-        user_otp_code,
-        user_totp,
-        virtual_printer,
-    )
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    yield engine
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await engine.dispose()
-    # Allow aiosqlite's background thread to finish processing the close
-    # response before the per-function event loop shuts down, preventing
-    # "RuntimeError: Event loop is closed" in call_soon_threadsafe.
-    await asyncio.sleep(0.1)
-
-
-@pytest.fixture
-async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
-    """Create a test database session."""
-    async_session_maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-    async with async_session_maker() as session:
-        yield session
-
-
-@pytest.fixture
-def own_session_factory(test_engine):
-    """An INDEPENDENT session maker on the test engine.
-
-    The shape a service that opens its own session takes in production
-    (``core.database.async_session``) — e.g. ``spool_respool.confirm_backup_swaps``,
-    which ``main`` fires as a bare task with no session to borrow. Using this instead of
-    ``db_session`` is what makes such a service run its real commit boundary: work it
-    lands is committed by ANOTHER session, so a test observing it through ``db_session``
-    must ``refresh()`` rather than read a stale identity-mapped instance.
-    """
-    return async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
 
 
 @pytest.fixture
@@ -380,18 +330,6 @@ def mock_homeassistant_service():
 
 
 @pytest.fixture
-def mock_mqtt_client():
-    """Mock the MQTT client for printer communication tests."""
-    with patch("backend.app.services.bambu_mqtt.BambuMQTTClient") as mock:
-        instance = MagicMock()
-        instance.state = MagicMock(connected=True, state="IDLE", progress=0, temperatures={"nozzle": 25, "bed": 25})
-        instance.connect = MagicMock()
-        instance.disconnect = MagicMock()
-        mock.return_value = instance
-        yield mock
-
-
-@pytest.fixture
 def mock_mqtt_smart_plug_service():
     """Mock the MQTT smart plug service for MQTT plug tests."""
     with patch("backend.app.api.routes.smart_plugs.mqtt_relay") as mock:
@@ -407,18 +345,6 @@ def mock_mqtt_smart_plug_service():
 
         mock.smart_plug_service = mock_service
         yield mock
-
-
-@pytest.fixture
-def mock_ftp_client():
-    """Mock the FTP client for file transfer tests."""
-    with (
-        patch("backend.app.services.bambu_ftp.download_file_async") as download_mock,
-        patch("backend.app.services.bambu_ftp.list_files_async") as list_mock,
-    ):
-        download_mock.return_value = True
-        list_mock.return_value = []
-        yield {"download": download_mock, "list": list_mock}
 
 
 @pytest.fixture
@@ -669,56 +595,6 @@ def archive_factory(db_session):
 
 
 # ============================================================================
-# Sample Data Fixtures
-# ============================================================================
-
-
-@pytest.fixture
-def sample_mqtt_print_start():
-    """Sample MQTT message for print start."""
-    return {
-        "print": {
-            "command": "project_file",
-            "param": "/sdcard/test.gcode.3mf",
-            "subtask_name": "test_print",
-            "gcode_state": "RUNNING",
-            "mc_percent": 0,
-        }
-    }
-
-
-@pytest.fixture
-def sample_mqtt_print_complete():
-    """Sample MQTT message for print complete."""
-    return {
-        "print": {
-            "gcode_state": "FINISH",
-            "mc_percent": 100,
-            "subtask_name": "test_print",
-        }
-    }
-
-
-@pytest.fixture
-def sample_printer_status():
-    """Sample printer status data."""
-    return {
-        "connected": True,
-        "state": "IDLE",
-        "progress": 0,
-        "layer_num": 0,
-        "total_layers": 0,
-        "temperatures": {
-            "nozzle": 25.0,
-            "bed": 25.0,
-            "chamber": 25.0,
-        },
-        "remaining_time": 0,
-        "filename": None,
-    }
-
-
-# ============================================================================
 # Log Capture Fixtures for Error Detection
 # ============================================================================
 
@@ -779,19 +655,3 @@ def capture_logs():
     yield handler
 
     root_logger.removeHandler(handler)
-
-
-@pytest.fixture
-def assert_no_log_errors(capture_logs):
-    """Fixture that automatically asserts no errors were logged.
-
-    Usage:
-        def test_something(assert_no_log_errors):
-            # If any ERROR logs occur during this test, it will fail
-            some_function()
-    """
-    yield capture_logs
-
-    errors = capture_logs.get_errors()
-    if errors:
-        pytest.fail(f"Unexpected log errors:\n{capture_logs.format_errors()}")

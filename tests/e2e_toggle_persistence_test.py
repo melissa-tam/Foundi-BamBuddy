@@ -8,7 +8,22 @@ are properly persisted to the database and survive page reloads.
 import os
 import time
 
-from playwright.sync_api import sync_playwright
+import pytest
+
+# playwright is an optional dev extra, and these scripts also need a server on
+# BASE_URL. The ship gate collects this directory (`pytest backend/tests tests`),
+# so without these guards the module is a collection ERROR on every box that has
+# not installed playwright. Skip at import instead; the file stays runnable both
+# as a pytest module and as a standalone script once playwright IS installed.
+#
+# Both are required and they are not the same package: `playwright` supplies
+# sync_api, while the `page` fixture every test below takes is supplied by the
+# pytest-playwright PLUGIN. With only the library installed these would collect
+# and then error on a missing fixture rather than skipping.
+pytest.importorskip("playwright.sync_api")
+pytest.importorskip("pytest_playwright")
+
+from playwright.sync_api import sync_playwright  # noqa: E402
 
 BASE_URL = os.environ.get("BAMBUDDY_URL", "http://localhost:8000")
 
