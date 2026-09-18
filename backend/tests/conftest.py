@@ -379,6 +379,24 @@ def mock_httpx_client():
 
 
 @pytest.fixture
+def existing_3mf_path():
+    """`core.config.settings` patched so ``base_dir / <anything>`` is a path that exists.
+
+    The usage and cost trackers resolve an archive's 3MF as ``settings.base_dir /
+    archive.file_path`` and skip the whole extraction when it does not exist, so
+    every test that wants the extraction to run has to make that path answer
+    True. Yields the path itself, for callers that hand it straight to a
+    pre-resolved ``threemf_path=`` argument.
+    """
+    with patch("backend.app.core.config.settings") as mock_settings:
+        mock_path = MagicMock()
+        mock_path.exists.return_value = True
+        mock_settings.base_dir = MagicMock()
+        mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
+        yield mock_path
+
+
+@pytest.fixture
 def mock_printer_manager():
     """Mock the printer manager for status checks."""
     with patch("backend.app.services.printer_manager.printer_manager") as mock:

@@ -55,12 +55,9 @@ def _make_archive(archive_id=1, file_path=None):
     if file_path is None:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf", prefix="test_print_") as tmp:
             file_path = tmp.name
-        # Recorded for cleanup_temp_archives below. NamedTemporaryFile puts this
-        # in the SYSTEM temp dir, not the CWD, which is why the old CWD-relative
-        # glob never matched and every run leaked its files. The previous
-        # mechanism -- raise, walk to the caller frame, look for a local named
-        # "request", addfinalizer -- never fired either: no caller of this helper
-        # takes the request fixture.
+        # Recorded for cleanup_temp_archives below: NamedTemporaryFile puts the
+        # file in the SYSTEM temp dir, not the CWD, so nothing relative to the
+        # working directory will ever find it again.
         _TEMP_ARCHIVE_PATHS.append(file_path)
     archive = MagicMock()
     archive.id = archive_id
@@ -121,7 +118,7 @@ class TestCostCalculation:
         _active_sessions.clear()
 
     @pytest.mark.asyncio
-    async def test_cost_with_spool_specific_cost_per_kg(self):
+    async def test_cost_with_spool_specific_cost_per_kg(self, existing_3mf_path):
         """Cost is calculated using spool-specific cost_per_kg when available."""
         # Spool with cost_per_kg = 25.00 USD/kg
         spool = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=25.0)
@@ -154,18 +151,12 @@ class TestCostCalculation:
         filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),  # default cost
             patch(
                 "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
                 return_value=filament_usage,
             ),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -181,7 +172,7 @@ class TestCostCalculation:
         assert results[0]["cost"] == 0.50
 
     @pytest.mark.asyncio
-    async def test_cost_with_default_fallback(self):
+    async def test_cost_with_default_fallback(self, existing_3mf_path):
         """Cost uses default_filament_cost from settings when spool cost is None."""
         # Spool without cost_per_kg
         spool = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=None)
@@ -214,18 +205,12 @@ class TestCostCalculation:
         filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),  # default: 15.0/kg
             patch(
                 "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
                 return_value=filament_usage,
             ),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -241,7 +226,7 @@ class TestCostCalculation:
         assert results[0]["cost"] == 0.45
 
     @pytest.mark.asyncio
-    async def test_cost_zero_when_default_cost_is_zero(self):
+    async def test_cost_zero_when_default_cost_is_zero(self, existing_3mf_path):
         """Cost is None when both spool cost and default cost are 0."""
         # Spool without cost_per_kg
         spool = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=None)
@@ -273,18 +258,12 @@ class TestCostCalculation:
         filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="0.0"),  # no default cost
             patch(
                 "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
                 return_value=filament_usage,
             ),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -297,7 +276,7 @@ class TestCostCalculation:
         assert results[0]["cost"] is None
 
     @pytest.mark.asyncio
-    async def test_cost_for_failed_print_uses_actual_usage(self):
+    async def test_cost_for_failed_print_uses_actual_usage(self, existing_3mf_path):
         """Failed print at 50% progress calculates cost from actual usage."""
         spool = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=20.0)
         assignment = _make_assignment(spool_id=1)
@@ -330,7 +309,6 @@ class TestCostCalculation:
         filament_usage = [{"slot_id": 1, "used_g": 40.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),
             patch(
                 "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
@@ -341,11 +319,6 @@ class TestCostCalculation:
                 return_value=None,  # No layer data, use linear scaling
             ),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "failed", "last_progress": 50.0},
@@ -401,7 +374,7 @@ class TestCostCalculation:
         assert results[0]["cost"] == 3.0
 
     @pytest.mark.asyncio
-    async def test_multi_filament_cost_aggregation(self):
+    async def test_multi_filament_cost_aggregation(self, existing_3mf_path):
         """Multiple spools in one print have their costs tracked separately."""
         spool1 = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=20.0)
         spool2 = _make_spool(spool_id=2, label_weight=1000, cost_per_kg=25.0)
@@ -442,18 +415,12 @@ class TestCostCalculation:
         ]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),
             patch(
                 "backend.app.utils.threemf_tools.extract_filament_usage_from_3mf",
                 return_value=filament_usage,
             ),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -503,7 +470,7 @@ class TestCostAggregation:
         assert total_cost == 0.75  # Only spools 1 and 3
 
     @pytest.mark.asyncio
-    async def test_archive_cost_not_overwritten_with_zero(self):
+    async def test_archive_cost_not_overwritten_with_zero(self, existing_3mf_path):
         """archive.cost is preserved when no spool usage has cost data."""
         # Spool without cost_per_kg, default_filament_cost also 0 → cost=None per usage
         spool = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=None)
@@ -573,15 +540,9 @@ class TestCostAggregation:
         filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="0.0"),  # no default cost
             patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -598,7 +559,7 @@ class TestCostAggregation:
         assert archive.cost == 5.00
 
     @pytest.mark.asyncio
-    async def test_archive_cost_set_when_spool_has_cost(self):
+    async def test_archive_cost_set_when_spool_has_cost(self, existing_3mf_path):
         """archive.cost is set from spool usage when cost data exists."""
         spool = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=25.0)
         assignment = _make_assignment(spool_id=1)
@@ -661,15 +622,9 @@ class TestCostAggregation:
         filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),
             patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -684,7 +639,7 @@ class TestCostAggregation:
         assert archive.cost == expected_cost
 
     @pytest.mark.asyncio
-    async def test_archive_cost_includes_untracked_filament_at_default_rate(self):
+    async def test_archive_cost_includes_untracked_filament_at_default_rate(self, existing_3mf_path):
         """#1344: when only some AMS trays have inventory spools, the untracked
         filament weight is charged at the global default rate so the total
         archive cost still reflects the whole print."""
@@ -747,15 +702,9 @@ class TestCostAggregation:
         filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="10.0"),
             patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -773,7 +722,7 @@ class TestCostAggregation:
         assert archive.cost == 1.10
 
     @pytest.mark.asyncio
-    async def test_archive_cost_fully_tracked_unchanged_by_topup(self):
+    async def test_archive_cost_fully_tracked_unchanged_by_topup(self, existing_3mf_path):
         """When every gram is covered by inventory spools, the default-rate
         top-up adds nothing -- the archive cost is just the sum of tracked
         costs, same as before #1344."""
@@ -833,15 +782,9 @@ class TestCostAggregation:
         filament_usage = [{"slot_id": 1, "used_g": 20.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),
             patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -856,7 +799,7 @@ class TestCostAggregation:
         assert archive.cost == 0.50
 
     @pytest.mark.asyncio
-    async def test_cost_with_archive_id(self):
+    async def test_cost_with_archive_id(self, existing_3mf_path):
         """Test cost aggregation using archive_id (3MF path)."""
         spool_new = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=25.0)
         assignment_new = _make_assignment(spool_id=1)
@@ -877,15 +820,9 @@ class TestCostAggregation:
         db = _mock_db_sequential([None, None, None, archive_new, None, assignment_new, spool_new])
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),
             patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage_new),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results_new = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed"},
@@ -899,7 +836,7 @@ class TestCostAggregation:
         assert results_new[0]["cost"] == 0.50  # 20g / 1000 * 25.0
 
     @pytest.mark.asyncio
-    async def test_cost_with_print_name_ams_fallback(self):
+    async def test_cost_with_print_name_ams_fallback(self, existing_3mf_path):
         """Test cost aggregation using print_name (AMS fallback, legacy path)."""
         spool_old = _make_spool(spool_id=2, label_weight=1000, cost_per_kg=15.0)
         assignment_old = _make_assignment(spool_id=2, ams_id=0, tray_id=0)
@@ -926,15 +863,9 @@ class TestCostAggregation:
         db = _mock_db_sequential([None, None, assignment_old, spool_old])
 
         with (
-            patch("backend.app.core.config.settings") as mock_settings,
             patch("backend.app.api.routes.settings.get_setting", return_value="15.0"),
             patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=None),
         ):
-            mock_settings.base_dir = MagicMock()
-            mock_path = MagicMock()
-            mock_path.exists.return_value = True
-            mock_settings.base_dir.__truediv__ = MagicMock(return_value=mock_path)
-
             results_old = await on_print_complete(
                 printer_id=1,
                 data={"status": "completed", "subtask_name": legacy_print_name, "filename": legacy_print_name},
