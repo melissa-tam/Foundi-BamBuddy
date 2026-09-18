@@ -87,6 +87,13 @@ def import_all_models() -> None:
     Derived from the package contents rather than an explicit list: a new model
     module is registered the moment it exists, with nothing to forget to update.
     Idempotent and cheap after the first call (``sys.modules`` hit per module).
+
+    Completeness is not cosmetic. ``run_migrations`` ALTERs tables right across the
+    schema and ``_safe_execute`` deliberately RE-RAISES ``no such table`` — that is
+    schema corruption, not idempotency — so under a PARTIAL ``create_all`` a migration
+    test passes or fails according to which other module happened to import a model
+    first. The 29 hand-written registration helpers this replaced ranged from 5 names
+    to 33; the shortest could not build the tables its own ALTERs named.
     """
     global _models_imported
     if _models_imported:
@@ -241,9 +248,12 @@ def own_session_factory(test_engine: AsyncEngine) -> async_sessionmaker[AsyncSes
 def force_sqlite_dialect(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the SQLite branch regardless of test env settings.
 
-    THE copy. 31 test files each define their own; import this one instead:
+    THE copy, and ``conftest`` re-exports it — a test module needs NO import to reach
+    it, only a request. Where the local copy being replaced was ``autouse`` (all 30 of
+    the migration-test copies were), the equivalent is a module-level mark, because
+    importing a fixture does NOT make it autouse:
 
-        from backend.tests._fixtures.db import force_sqlite_dialect  # noqa: F401
+        pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
     ``database.py`` imported ``is_sqlite`` at module load, so the name has to be
     patched there as well as on ``db_dialect``. Note that two files

@@ -1,90 +1,35 @@
 """Regression test for the printer_model_geometry fleet-seed migration.
 
-``run_migrations`` seeds five additional (published-spec, ``validated=FALSE``)
-geometry rows alongside the existing H2S/H2C seeds — P1S, P2S, H2D, X2D and the
-A2L bed-slinger — via the same idempotent ``INSERT .. SELECT .. WHERE NOT EXISTS``
-shape. This test pins:
+``run_migrations`` seeds five published-spec, ``validated=FALSE`` (MEASURE AT
+LADDER) rows alongside the existing H2S/H2C seeds — P1S, P2S, H2D, X2D and the
+A2L bed-slinger — through the same idempotent ``INSERT .. SELECT .. WHERE NOT
+EXISTS`` shape, so a re-run neither duplicates a row nor clobbers an operator
+edit. Both upgrade paths end at the same seven rows: a DB that already has the
+table, and a FRESH one where ``CREATE TABLE`` has to build it first.
 
-* exactly SEVEN rows after the migration, with no duplicates on a re-run
-  (idempotency);
-* the A2L row's ``z_travel_mm`` is a literal NULL (bed-slinger — the bed-drop
-  assist must fail closed independently of the bedslinger guard);
-* the X2D dual-mode X envelope is the per-side intersection 20.5–235.5;
-* all five new rows are ``validated=FALSE`` (MEASURE AT LADDER);
-* an operator-edited row survives a re-run (WHERE NOT EXISTS never clobbers it);
-* the FRESH-DB path (no table) also ends with seven seeded rows.
+Two seeded values are not derivable from the rest:
 
-Idempotent and SQLite-safe, mirroring ``test_model_geometry_z_travel_migration``.
+* A2L's ``z_travel_mm`` is a literal NULL — it is a bed-slinger, so the bed-drop
+  assist must fail closed independently of the bedslinger guard;
+* X2D's X envelope 20.5–235.5 is the per-side intersection of its dual-mode
+  envelopes, not one head's full range.
+
+The full schema is built (``create_memory_engine``) before ``run_migrations``
+because its many other table ALTERs raise ``no such table`` on a table that was
+never created — an error ``_safe_execute`` does NOT swallow.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _EXPECTED_KEYS = {"H2S", "H2C", "P1S", "P2S", "H2D", "X2D", "A2L"}
-
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        eject_profile,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        library,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        printer_model_geometry,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
-
-
-async def _build_all_tables(conn):
-    """create_all every registered table so run_migrations' other ALTERs have a
-    table to act on (a missing-table error is NOT swallowed by _safe_execute)."""
-    from backend.app.core.database import Base
-
-    _register_all_models()
-    await conn.run_sync(Base.metadata.create_all)
 
 
 async def _keys(conn) -> list[str]:
@@ -107,9 +52,7 @@ async def _row(conn, model_key: str):
 @pytest.fixture
 async def existing_engine():
     """A DB with the current-model geometry table present but unseeded."""
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await _build_all_tables(conn)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
@@ -117,9 +60,8 @@ async def existing_engine():
 @pytest.fixture
 async def fresh_engine():
     """A DB with NO geometry table — run_migrations must CREATE + seed it."""
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    eng = await create_memory_engine()
     async with eng.begin() as conn:
-        await _build_all_tables(conn)
         await conn.execute(text("DROP TABLE printer_model_geometry"))
     yield eng
     await eng.dispose()

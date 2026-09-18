@@ -1,10 +1,9 @@
-"""The ``queue_job_assigned`` template backfill (2026-09-04; the printer-subset POOL wave).
+"""The ``queue_job_assigned`` template backfill.
 
-``{target_model}`` used to be filled with a bare model name, so the default copy supplied
-the article itself ("from Any {target_model} queue"). A unit can now be targeted at a
-PRINTERS pool, which has no single model, so callers pass the whole noun phrase instead
-("Any H2S" / "Any of 001-H2S, 003-H2S" — ``DispatchTarget.describe``, the one phrasing).
-Left as it was, an install would render "from Any Any of 001-H2S, 003-H2S queue".
+``{target_model}`` carries a whole noun phrase ("Any H2S" / "Any of 001-H2S, 003-H2S" —
+``DispatchTarget.describe``, the one phrasing), so the default copy must not supply the
+article itself: the old "from Any {target_model} queue" renders as "from Any Any of
+001-H2S, 003-H2S queue".
 
 ``seed_notification_templates`` only INSERTS missing event types, so an install that
 already seeded the old default keeps the wrong copy without this backfill — and an admin
@@ -16,49 +15,20 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import (
     _QUEUE_ASSIGNED_TEMPLATE_NEW_BODY,
     _QUEUE_ASSIGNED_TEMPLATE_OLD_BODY,
     run_migrations,
 )
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import EVERY model module so `create_all` builds the whole schema (see the
-    sibling migration tests: `run_migrations` ALTERs across the schema and
-    `_safe_execute` re-raises "no such table")."""
-    import importlib
-    import pkgutil
-
-    import backend.app.models as models_pkg
-
-    for module in pkgutil.iter_modules(models_pkg.__path__):
-        importlib.import_module(f"{models_pkg.__name__}.{module.name}")
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 

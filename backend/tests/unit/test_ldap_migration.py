@@ -10,71 +10,24 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """The test engine is SQLite but settings.database_url may point to Postgres in dev
-    configs — that would make run_migrations take the Postgres branch and skip the
-    SQLite-specific writable_schema patch we're verifying. Force the sqlite dialect."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    # database.py imported is_sqlite at module load time — patch there too.
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def legacy_engine():
-    """Simulate an older install by creating all current tables via create_all, then
-    dropping the `users` table and re-creating it with the legacy NOT NULL schema.
-    This matches the real upgrade path — everything else in the DB looks modern, only
-    the users table carries a stale constraint."""
-    # Import every model so Base.metadata knows about them (same set as conftest).
-    from backend.app.core.database import Base
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        maintenance,
-        notification,
-        notification_template,
-        print_queue,
-        printer,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
+    """An install whose `users` table still carries the pre-LDAP NOT NULL constraint.
 
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    `create_all` builds the current (nullable) schema, which would mask the migration
+    entirely, so `users` is dropped and re-created in its legacy shape. That is the real
+    upgrade path: everything else in the DB looks modern, only this one table is stale.
+    """
+    engine = await create_memory_engine()
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Drop the users table created from the current (nullable) model and replace it
-        # with the pre-LDAP schema that real upgrading installations have on disk.
         await conn.execute(text("DROP TABLE IF EXISTS user_groups"))
         await conn.execute(text("DROP TABLE users"))
         await conn.execute(
@@ -111,8 +64,7 @@ async def test_legacy_schema_rejects_null_password_before_migration(legacy_engin
 
 
 async def test_migration_allows_null_password_hash_for_ldap_users(legacy_engine):
-    """After running migrations on a legacy DB, LDAP users (password_hash=NULL) insert
-    successfully — reproduces and verifies the #794 bug reported by DylanBrass."""
+    """A migrated legacy DB accepts the LDAP provisioning insert (password_hash NULL)."""
     async with legacy_engine.begin() as conn:
         await run_migrations(conn)
 

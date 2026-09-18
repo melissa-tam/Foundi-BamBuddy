@@ -1,18 +1,14 @@
-"""Regression tests for the spool-lifecycle migration (WI-1 / WI-5).
+"""Regression tests for the spool-lifecycle migrations appended to ``run_migrations``.
 
-Two migrations, both appended to ``run_migrations``:
+FIFO substrate: ``spool.first_loaded_at`` is added and backfilled with ``created_at``
+for any spool that has ever been in service (has an assignment, usage history, a
+``last_used`` timestamp, or consumed grams). Pristine, never-assigned inventory
+spools stay NULL.
 
-WI-1 (FIFO substrate): add ``spool.first_loaded_at`` and backfill it with
-``created_at`` for any spool that has ever been in service (has an assignment,
-usage history, a ``last_used`` timestamp, or consumed grams). Pristine,
-never-assigned inventory spools stay NULL.
-
-WI-5 (settings remap): the boolean ``prefer_lowest_filament`` setting is
-replaced by the tri-state ``spool_selection_policy``. A truthy legacy flag maps
-to ``spool_selection_policy = 'lowest_remaining'``; false/absent maps to
-nothing (the new ``first_loaded`` default applies); the old key is always
-dropped. Both migrations are idempotent and SQLite-safe (mirrors the other
-migration regression tests in this suite).
+Settings remap: the boolean ``prefer_lowest_filament`` setting is replaced by the
+tri-state ``spool_selection_policy``. A truthy legacy flag maps to
+``spool_selection_policy = 'lowest_remaining'``; false/absent maps to nothing (the
+new ``first_loaded`` default applies); the old key is always dropped.
 """
 
 from __future__ import annotations
@@ -23,71 +19,19 @@ from datetime import datetime
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _FIXED_CREATED = datetime(2026, 1, 1, 12, 0, 0)
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        eject_profile,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        library,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
-
-
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
@@ -109,11 +53,6 @@ async def _make_spool(session: AsyncSession, material: str = "PETG", **kwargs):
     session.add(spool)
     await session.flush()
     return spool
-
-
-# ---------------------------------------------------------------------------
-# WI-1: first_loaded_at column + backfill
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -198,11 +137,6 @@ async def test_backfill_is_idempotent(engine, session_maker):
     assert first_pass == second_pass
     assert first_pass[assigned_id] is not None
     assert first_pass[pristine_id] is None
-
-
-# ---------------------------------------------------------------------------
-# WI-5: prefer_lowest_filament -> spool_selection_policy remap
-# ---------------------------------------------------------------------------
 
 
 async def _seed_settings(session: AsyncSession, **kv):
@@ -302,11 +236,6 @@ async def test_remap_is_idempotent(engine, session_maker):
     assert "prefer_lowest_filament" not in settings
 
 
-# ---------------------------------------------------------------------------
-# FIFO seating-order fix: loaded_at column + backfill
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_migration_readds_loaded_at_column(engine):
     """Dropping the column simulates a pre-migration schema; run_migrations re-adds it
@@ -334,8 +263,8 @@ async def test_loaded_at_backfill_coalesce_order(engine, session_maker):
     async with session_maker() as session:
         # first_loaded_at pre-set and distinct → loaded_at must copy IT, not created_at.
         with_first = await _make_spool(session, first_loaded_at=distinct_first)
-        # bound, no first_loaded_at: WI-1 stamps first_loaded_at=created_at, so loaded_at
-        # resolves to created_at (the in-service COALESCE-fallback value).
+        # bound, no first_loaded_at: the first_loaded_at backfill stamps it from
+        # created_at, so loaded_at resolves to created_at (the in-service fallback).
         bound = await _make_spool(session)
         pristine = await _make_spool(session)
         session.add(SpoolAssignment(spool_id=bound.id, printer_id=1, ams_id=0, tray_id=0))
@@ -384,11 +313,6 @@ async def test_loaded_at_backfill_never_overwrites_and_is_idempotent(engine, ses
     # The pre-existing stamp survived (not overwritten to first_loaded_at).
     assert first_pass[stamped_id] is not None and first_pass[stamped_id] != str(older_first)
     assert first_pass[pristine_id] is None
-
-
-# ---------------------------------------------------------------------------
-# R1: min_start_spool_g default 120 -> 150 migration
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -446,10 +370,6 @@ async def test_min_start_migration_idempotent(engine, session_maker):
     assert settings.get("min_start_spool_g") == "150"
 
 
-# ---------------------------------------------------------------------------
-# 012-H2S: duplicate spool bindings deduped, then ux_spool_assignment_spool_id
-# ---------------------------------------------------------------------------
-
 _DB_LOGGER = "backend.app.core.database"
 _DUP_WARNING = "dropping stale duplicate spool binding"
 
@@ -498,7 +418,7 @@ async def _has_unique_spool_index(conn) -> bool:
 
 
 async def _make_printer(session, printer_id: int = 1):
-    """A real ``printers`` row. Bindings must point at one: the orphan purge (W2)
+    """A real ``printers`` row. Bindings must point at one: the orphan purge
     deletes assignments whose printer no longer exists, so a fixture that relied on
     SQLite's unenforced FK would be swept away by the very migration under test."""
     from backend.app.models.printer import Printer
@@ -539,7 +459,7 @@ async def _seed_pre_migration_bindings(engine, session_maker) -> tuple[int, int]
 
 @pytest.mark.asyncio
 async def test_duplicate_bindings_deduped_to_newest_then_index_created(engine, session_maker, caplog):
-    """Pre-existing duplicates (S10) are dropped keeping MAX(id) — the most recent
+    """Pre-existing duplicates are dropped keeping MAX(id) — the most recent
     physical observation — each drop WARN-logged, untouched spools left alone, and the
     unique index lands afterwards and is enforced."""
     await _downgrade_spool_assignment(engine)
@@ -601,11 +521,6 @@ async def test_binding_dedupe_is_idempotent(engine, session_maker, caplog):
     assert [r.getMessage() for r in caplog.records if _DUP_WARNING in r.getMessage()] == []
 
 
-# ---------------------------------------------------------------------------
-# W2 (spool-core re-architecture): last-location residue, pre_configured_at
-# backfill, orphaned-binding purge
-# ---------------------------------------------------------------------------
-
 _LAST_LOCATION_COLUMNS = (
     "last_location_printer_id",
     "last_location_ams_id",
@@ -621,7 +536,7 @@ async def _assignment_columns(conn) -> set[str]:
 
 @pytest.mark.asyncio
 async def test_migration_readds_the_five_w2_columns(engine):
-    """Dropping the five columns simulates a pre-W2 schema; run_migrations re-adds all
+    """Dropping the five columns simulates a pre-migration schema; run_migrations re-adds all
     of them (four on spool, one on spool_assignment)."""
     async with engine.begin() as conn:
         for column in _LAST_LOCATION_COLUMNS:
@@ -700,10 +615,10 @@ async def test_pre_configured_backfill_never_restamps(engine, session_maker):
 
 @pytest.mark.asyncio
 async def test_orphaned_bindings_are_purged_and_counted(engine, session_maker, caplog):
-    """PRE-EXISTING bug: ``DELETE /printers/{id}`` never removed the printer's
-    SpoolAssignment rows and SQLite enforces no FK cascade, so every printer ever
-    deleted left invisible bindings that still held their spools "assigned". The
-    migration clears the rows already orphaned — and only those."""
+    """``DELETE /printers/{id}`` never removed the printer's SpoolAssignment rows and
+    SQLite enforces no FK cascade, so every printer ever deleted left invisible
+    bindings that still held their spools "assigned". The migration clears the rows
+    already orphaned — and only those."""
     from backend.app.models.spool_assignment import SpoolAssignment
 
     async with session_maker() as session:
@@ -759,11 +674,6 @@ async def test_orphan_purge_is_silent_and_idempotent_on_a_clean_table(engine, se
 
     assert count == 1
     assert [r.getMessage() for r in caplog.records if "orphaned spool binding" in r.getMessage()] == []
-
-
-# ---------------------------------------------------------------------------
-# WS7: sibling_tag_uid column + the false-spent repair
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -895,10 +805,6 @@ async def test_repair_unblocks_the_slot_for_selection(engine, session_maker):
     assert before[0].remaining_g == 0.0, "a spent row prices as empty however full its ledger"
     assert after[0].remaining_g == ledger_remaining, "clearing the stamp restores the intact ledger"
 
-
-# ---------------------------------------------------------------------------
-# WS-G: archive the UNBOUND phantom-presence ams_auto spools (2026-08-09/10)
-# ---------------------------------------------------------------------------
 
 _PHANTOM_ERA = datetime(2026, 8, 9, 14, 30, 0)  # inside the measured phantom window
 _PRE_PHANTOM_ERA = datetime(2026, 8, 8, 23, 59, 59)  # one second before it opens

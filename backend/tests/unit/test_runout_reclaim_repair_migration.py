@@ -1,22 +1,19 @@
-"""The one-time runout-reclaim repair migration (2026-08-13, seven printers).
+"""The one-time runout-reclaim repair migration.
 
-The incident: the AMS clears a drained slot's exist bit ~3 minutes BEFORE the firmware
-declares the runout, so since release-on-empty started firing reliably every natural
-runout's binding was already gone when the runout HMS arrived — and the single spent
-writer resolves its victim from a LIVE assignment. Nothing was stamped for three days,
-and the released rows' ``last_location_*`` residue is exactly what the reclaim lane
-resurrects: seven printers hung an exhausted roll's ledger row, ~900 g of history and
-all, on the brand-new roll the operator had just loaded.
+The AMS clears a drained slot's exist bit ~3 minutes BEFORE the firmware declares the
+runout, so a natural runout's binding is already gone when the runout HMS arrives — and
+the single spent writer resolves its victim from a LIVE assignment. The released row's
+``last_location_*`` residue is exactly what the reclaim lane then resurrects: an
+exhausted roll's ledger row, history and all, lands on the brand-new roll the operator
+just loaded.
 
-``repair_runout_reclaim_20260813`` states what physics already decided, for those seven
-rows and no others: the dead row ran dry (spent + archived) and the roll now in the slot
-is a DIFFERENT spool, so it gets its own row carrying only the grams charged since the
-reclaim. What these tests pin is mostly the REFUSALS — every fact is re-verified against
-live state first, because hours pass between the incident and the deploy that carries the
-repair — plus the durable marker that keeps a repair which writes ``spent_at`` from
-fighting the operator's un-spend route at every boot.
-
-SQLite-safe and self-contained, mirroring the sibling migration regression tests.
+``repair_runout_reclaim_20260813`` states what physics already decided, for the seven
+(spool, printer) pairs it names and no others: the dead row ran dry (spent + archived)
+and the roll now in the slot is a DIFFERENT spool, so it gets its own row carrying only
+the grams charged since the reclaim. What these tests pin is mostly the REFUSALS — every
+fact is re-verified against live state first, because hours pass between the incident and
+the deploy that carries the repair — plus the durable marker that keeps a repair which
+writes ``spent_at`` from fighting the operator's un-spend route at every boot.
 """
 
 from __future__ import annotations
@@ -26,9 +23,12 @@ from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 _MARKER = "repair_runout_reclaim_20260813"
 
@@ -48,40 +48,9 @@ _POST = ((10, 401.6), (40, 45.0))
 _MOVED = 446.6
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import EVERY model module so ``create_all`` builds the whole schema (see the
-    sibling migration tests: ``run_migrations`` ALTERs across the schema and
-    ``_safe_execute`` re-raises "no such table")."""
-    import importlib
-    import pkgutil
-
-    import backend.app.models as models_pkg
-
-    for module in pkgutil.iter_modules(models_pkg.__path__):
-        importlib.import_module(f"{models_pkg.__name__}.{module.name}")
-
-
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 

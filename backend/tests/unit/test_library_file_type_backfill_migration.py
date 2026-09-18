@@ -1,79 +1,26 @@
-"""Regression test for the library_files.file_type backfill migration (#1600).
+"""The library_files.file_type backfill migration (#1600).
 
-Pre-#1600 the upload, ZIP-extract, and in-process ingest paths all stored
-`file_type='3mf'` for sliced `.gcode.3mf` outputs while the external-folder
-scan stored `file_type='gcode.3mf'` — the same on-disk file family split
-across two values depending on how it was ingested. `classify_file_type`
-is now canonical going forward; this migration backfills the legacy `3mf`
-rows so the DB ends up consistent. Idempotent and dialect-neutral.
+The upload, ZIP-extract and in-process ingest paths stored `file_type='3mf'`
+for sliced `.gcode.3mf` outputs while the external-folder scan stored
+`file_type='gcode.3mf'` — one on-disk file family split across two values by
+how it was ingested. `classify_file_type` is canonical now; this migration
+backfills the legacy `3mf` rows. Dialect-neutral.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        library,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def engine():
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    eng = await create_memory_engine()
     yield eng
     await eng.dispose()
 
@@ -152,9 +99,8 @@ async def test_backfill_leaves_unrelated_3mf_rows_alone(engine):
 
     async with engine.connect() as conn:
         result = await conn.execute(text("SELECT file_type FROM library_files WHERE id = 1"))
-        # The LIKE predicate uses '%.gcode.3mf' so a trailing .bak doesn't match.
-        # The row keeps its pre-migration `3mf` — odd, but classify_file_type
-        # returns `bak` for a fresh ingest, so this row simply stays where it
-        # was. The migration's job is to fix the dominant class, not chase
-        # every edge case.
+        # The LIKE predicate is '%.gcode.3mf', so a trailing .bak does not match and
+        # the row keeps `3mf` — while classify_file_type would call a fresh ingest of
+        # it `bak`. The migration fixes the dominant class, it does not chase every
+        # shape.
         assert result.scalar() == "3mf"

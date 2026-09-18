@@ -1,29 +1,30 @@
 """Regression test for the printer_model_geometry z_travel_mm column migration.
 
-Adds ``z_travel_mm`` (nullable — the machine bottom the bed-drop release assist
-drives to) to the geometry registry and backfills the seeded H2S (340) / H2C (325)
-rows. Two upgrade paths are covered:
+``z_travel_mm`` is nullable — the machine bottom the bed-drop release assist
+drives to — and the seeded H2S (340) / H2C (325) rows are backfilled. An
+operator's PUT-set value survives a re-run (the backfill is WHERE IS NULL).
 
-* an EXISTING DB whose table predates the column — the ALTER adds it, the seed
-  INSERTs (which now name z_travel_mm explicitly) stay no-ops for rows that exist,
-  and the DML backfill fills them; an operator's PUT-set value survives a re-run;
-* a FRESH DB with no table — ``CREATE TABLE`` builds it WITH the column and the
-  seeds carry z_travel_mm directly.
+Two traps the migration has to survive, one per fixture:
 
-Idempotent and SQLite-safe (mirrors the other migration regression tests). The
-ordering trap the migration guards against — the seed INSERTs naming z_travel_mm
-before the ALTER has added it — is exactly the existing-DB path here. The full
-schema is built via ``create_all`` first so run_migrations' many other table
-ALTERs (which would raise on a missing table) have their tables present.
+* on an EXISTING DB whose table predates the column, the seed INSERTs name
+  ``z_travel_mm`` and would raise unless the ALTER has added it first;
+* a FRESH DB has no table at all, so ``CREATE TABLE`` must build it WITH the
+  column and the seeds carry the value directly.
+
+The full schema is built (``create_memory_engine``) before ``run_migrations``
+because its many other table ALTERs raise ``no such table`` on a table that was
+never created — an error ``_safe_execute`` does NOT swallow.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 # The pre-z_travel_mm geometry table, recreated verbatim to simulate an old DB.
 _OLD_SCHEMA_NO_Z_TRAVEL = """
@@ -55,65 +56,6 @@ _SEED_H2C = (
 )
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        eject_profile,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        library,
-        maintenance,
-        notification,
-        notification_template,
-        print_log,
-        print_queue,
-        printer,
-        printer_model_geometry,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
-
-
-async def _build_all_tables(conn):
-    """create_all every registered table so run_migrations' other ALTERs have a
-    table to act on (a missing-table error is NOT swallowed by _safe_execute)."""
-    from backend.app.core.database import Base
-
-    _register_all_models()
-    await conn.run_sync(Base.metadata.create_all)
-
-
 async def _columns(conn) -> set[str]:
     rows = (await conn.execute(text("PRAGMA table_info(printer_model_geometry)"))).fetchall()
     return {row[1] for row in rows}
@@ -131,9 +73,8 @@ async def _z_travel(conn, model_key: str):
 @pytest.fixture
 async def existing_engine():
     """A DB whose geometry table predates z_travel_mm, pre-seeded with H2S + H2C."""
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    eng = await create_memory_engine()
     async with eng.begin() as conn:
-        await _build_all_tables(conn)
         # Replace the current-model table with the pre-migration schema + seed rows.
         await conn.execute(text("DROP TABLE printer_model_geometry"))
         await conn.execute(text(_OLD_SCHEMA_NO_Z_TRAVEL))
@@ -146,9 +87,8 @@ async def existing_engine():
 @pytest.fixture
 async def fresh_engine():
     """A DB with NO geometry table — run_migrations must CREATE + seed it."""
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    eng = await create_memory_engine()
     async with eng.begin() as conn:
-        await _build_all_tables(conn)
         await conn.execute(text("DROP TABLE printer_model_geometry"))
     yield eng
     await eng.dispose()

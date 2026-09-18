@@ -1,14 +1,13 @@
 """Regression test for the settings table dedupe + unique-index migration.
 
 Legacy SQLite installs created the `settings` table without a UNIQUE constraint
-on `key`. The seed loop's `INSERT OR IGNORE` silently degraded to a plain INSERT
-on every restart, duplicating rows. After a handful of restarts, any code path
-calling `scalar_one_or_none()` on a `SELECT settings WHERE key = :k` query
-(e.g. `is_advanced_auth_enabled`) blew up with `MultipleResultsFound` and 500'd.
+on `key`. With nothing to conflict on, the seed loop's `INSERT OR IGNORE` is a
+plain INSERT: every restart duplicates a row, and any `scalar_one_or_none()` on
+`SELECT settings WHERE key = :k` (e.g. `is_advanced_auth_enabled`) then raises
+`MultipleResultsFound`.
 
-`run_migrations` now deletes dup rows (keeping MIN(id) per key) and creates the
-missing unique index before the seed loop. This test verifies the fix and its
-idempotency on both fresh and legacy schemas.
+`run_migrations` deletes dup rows (keeping MIN(id) per key) and creates the
+missing unique index before the seed loop, on both fresh and legacy schemas.
 """
 
 from __future__ import annotations
@@ -16,73 +15,23 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch in run_migrations regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import every model so Base.metadata knows about them. run_migrations touches
-    multiple tables, so the full schema has to exist before calling it — mirrors the
-    pattern in test_ldap_migration.py."""
-    from backend.app.models import (  # noqa: F401
-        ams_history,
-        ams_label,
-        api_key,
-        archive,
-        color_catalog,
-        external_link,
-        filament,
-        group,
-        kprofile_note,
-        maintenance,
-        notification,
-        notification_template,
-        print_queue,
-        printer,
-        project,
-        project_bom,
-        settings,
-        slot_preset,
-        smart_plug,
-        smart_plug_energy_snapshot,
-        spool,
-        spool_assignment,
-        spool_catalog,
-        spool_k_profile,
-        spool_usage_history,
-        spoolbuddy_device,
-        user,
-        user_email_pref,
-        virtual_printer,
-    )
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def legacy_engine():
-    """Simulate a pre-UNIQUE install: full schema via create_all, then drop the
-    settings table and re-create it in the legacy shape (no UNIQUE on key).
-    This matches real-world upgrades where everything else is modern and only
-    the settings table carries the stale schema."""
-    from backend.app.core.database import Base
+    """A pre-UNIQUE install.
 
-    _register_all_models()
-
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    `create_all` emits the unique index, which would mask the migration, so the
+    settings table is dropped and re-created in its legacy shape (no UNIQUE on
+    key) — real upgrades look exactly like this, modern everywhere else.
+    """
+    engine = await create_memory_engine()
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
         await conn.execute(text("DROP TABLE settings"))
         await conn.execute(
             text("""
@@ -101,22 +50,11 @@ async def legacy_engine():
 
 @pytest.fixture
 async def fresh_engine():
-    """Simulate a fresh install: every table created from SQLAlchemy models, which
-    DOES emit the unique index on settings.key. Verifies the migration is a no-op."""
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """A fresh install: created from the models, so settings.key already carries
+    the unique index the migration would otherwise add."""
+    engine = await create_memory_engine()
     yield engine
     await engine.dispose()
-
-
-# -----------------------------------------------------------------------------
-# Legacy schema tests
-# -----------------------------------------------------------------------------
 
 
 async def test_legacy_schema_allows_duplicate_keys_before_migration(legacy_engine):
@@ -173,11 +111,6 @@ async def test_migration_is_idempotent_on_already_clean_legacy(legacy_engine):
     async with legacy_engine.begin() as conn:
         count = (await conn.execute(text("SELECT COUNT(*) FROM settings WHERE key = 'k'"))).scalar_one()
         assert count == 1
-
-
-# -----------------------------------------------------------------------------
-# Fresh-install test — migration must be a safe no-op
-# -----------------------------------------------------------------------------
 
 
 async def test_migration_is_noop_on_fresh_install(fresh_engine):

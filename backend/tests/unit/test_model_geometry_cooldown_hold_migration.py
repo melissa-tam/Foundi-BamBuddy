@@ -1,43 +1,43 @@
 """Regression test for the printer_model_geometry cooldown plate-hold columns.
 
-Adds ``cooldown_hold_keepout_y_mm`` + ``cooldown_hold_clear_above_mm`` (both nullable,
-no default) and seeds the H2S row with the operator's 2026-09-10 numbers — keep-out
-Y 285 (the vendor's rear service area Y295 less 10 mm of margin) and the MEASURED clear
+``cooldown_hold_keepout_y_mm`` + ``cooldown_hold_clear_above_mm`` are both
+nullable with no default, and only the H2S row is seeded: keep-out Y 285 (the
+vendor's rear service area Y295 less 10 mm of margin) and the MEASURED clear
 height of 100 mm above the nozzle plane with the toolhead parked at the chute.
 
-This file is the ONLY place the clear height's VALUE is asserted, so it also covers the
-one-time migration that lifts installs which already ran the first wave off its 51 mm
-witnessed-safe placeholder — including the two things a value-keyed rewrite must never
-do: run twice, or undo a later re-measure.
+This file is the ONLY place the clear height's VALUE is asserted, so it also
+covers the one-time migration that lifts installs off the 51 mm witnessed-safe
+placeholder — including the two things a value-keyed rewrite must never do: run
+twice, or undo a later re-measure.
 
-The properties that matter, and why each is pinned here:
+Why each property is pinned here:
 
-* every OTHER model stays NULL — the clearance is a physical fact per machine and has
-  been measured on H2S only, so every other model ships hold-OFF (fan only). A seed that
-  fanned the H2S numbers across the registry would authorise a hold nobody witnessed;
-* the pair is written TOGETHER — ``ModelGeometry`` refuses a one-sided pair outright, so
-  a seed that set one column would fail the geometry read for that model;
-* re-running is a no-op and an operator/DB-set value survives (the ``IS NULL`` guard on
-  the seed, the settings marker on the migration), matching the z_travel backfill's own
-  contract;
-* both upgrade paths work: an EXISTING DB whose table predates the columns (the ALTERs
-  add them, the seed fills H2S) and a FRESH DB with no table at all (``CREATE TABLE``
-  builds it and the seed fills H2S).
-
-Idempotent and SQLite-safe, mirroring the other column-migration regression tests.
+* every OTHER model stays NULL — the clearance is a physical fact per machine and
+  has been measured on H2S only, so every other model ships hold-OFF (fan only).
+  A seed that fanned the H2S numbers across the registry would authorise a hold
+  nobody witnessed;
+* the pair is written TOGETHER — ``ModelGeometry`` refuses a one-sided pair
+  outright, so a seed that set one column would fail that model's geometry read;
+* re-running is a no-op and an operator/DB-set value survives (the ``IS NULL``
+  guard on the seed, the settings marker on the migration), matching the
+  z_travel backfill's own contract;
+* both upgrade paths work: an EXISTING DB whose table predates the columns (the
+  ALTERs add them, the seed fills H2S) and a FRESH DB with no table at all
+  (``CREATE TABLE`` builds it and the seed fills H2S).
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM, run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-# The placeholder the first cooldown-hold wave shipped, and what the marker key is. Both
-# spelled once here because the migration is keyed on the VALUE and the tests below have
-# to be able to state that fact without re-typing it.
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
+
+# The migration is keyed on the placeholder VALUE, and the settings marker is what
+# stops it re-running; both are spelled once here so the tests can state that fact.
 _PLACEHOLDER_CLEAR_MM = 51.0
 _MIGRATION_MARKER = "migration_cooldown_hold_clear_h2s_20260910"
 
@@ -74,51 +74,6 @@ _SEED_H2C = (
 )
 
 
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import the whole model package so ``create_all`` builds EVERY table.
-
-    ``run_migrations`` is one list run top to bottom, and an ``ALTER TABLE`` naming a
-    table a partial import never created raises ``no such table`` — which ``_safe_execute``
-    does NOT swallow. The package ``__init__`` alone is not enough either: a dozen model
-    modules are registered by ``core.database.init_db``'s own import list and not
-    re-exported from the package, so both lists are imported here.
-    """
-    import backend.app.models  # noqa: F401
-    from backend.app.models import (  # noqa: F401
-        active_print_spoolman,
-        bug_report,
-        external_link,
-        filament_sku_settings,
-        print_log,
-        print_queue,
-        project_bom,
-        shopping_list,
-        slot_preset,
-        spoolman_k_profile,
-        spoolman_slot_assignment,
-        virtual_printer,
-    )
-
-
-async def _build_all_tables(conn):
-    from backend.app.core.database import Base
-
-    _register_all_models()
-    await conn.run_sync(Base.metadata.create_all)
-
-
 async def _columns(conn) -> set[str]:
     rows = (await conn.execute(text("PRAGMA table_info(printer_model_geometry)"))).fetchall()
     return {row[1] for row in rows}
@@ -138,12 +93,15 @@ async def _hold(conn, model_key: str) -> tuple | None:
     return None if row is None else (row[0], row[1])
 
 
+async def _marker_rows(conn) -> int:
+    return (await conn.execute(text("SELECT COUNT(*) FROM settings WHERE key = :k"), {"k": _MIGRATION_MARKER})).scalar()
+
+
 @pytest.fixture
 async def existing_engine():
     """A DB whose geometry table predates the columns, pre-seeded with H2S + H2C."""
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    eng = await create_memory_engine()
     async with eng.begin() as conn:
-        await _build_all_tables(conn)
         await conn.execute(text("DROP TABLE printer_model_geometry"))
         await conn.execute(text(_OLD_SCHEMA_NO_COOLDOWN_HOLD))
         await conn.execute(text(_SEED_H2S))
@@ -155,9 +113,8 @@ async def existing_engine():
 @pytest.fixture
 async def fresh_engine():
     """A DB with NO geometry table — run_migrations must CREATE + seed it."""
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    eng = await create_memory_engine()
     async with eng.begin() as conn:
-        await _build_all_tables(conn)
         await conn.execute(text("DROP TABLE printer_model_geometry"))
     yield eng
     await eng.dispose()
@@ -171,9 +128,8 @@ async def placeholder_engine():
     seed's ``IS NULL`` guard will never touch — so without the one-time migration such an
     install would go on holding every plate 49 mm lower than the machine allows.
     """
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    eng = await create_memory_engine()
     async with eng.begin() as conn:
-        await _build_all_tables(conn)
         await conn.execute(text(_SEED_H2S))
         await conn.execute(text(_SEED_H2C))
         await conn.execute(
@@ -186,10 +142,6 @@ async def placeholder_engine():
         )
     yield eng
     await eng.dispose()
-
-
-async def _marker_rows(conn) -> int:
-    return (await conn.execute(text("SELECT COUNT(*) FROM settings WHERE key = :k"), {"k": _MIGRATION_MARKER})).scalar()
 
 
 @pytest.mark.asyncio
@@ -208,8 +160,8 @@ async def test_migration_adds_columns_and_seeds_h2s(existing_engine):
         cols = await _columns(conn)
         assert "cooldown_hold_keepout_y_mm" in cols
         assert "cooldown_hold_clear_above_mm" in cols
-        # The 2026-09-10 numbers: keep-out = vendor rear service Y295 - 10, clear height
-        # MEASURED by the operator the same day.
+        # keep-out = vendor rear service area Y295 - 10 mm margin; clear height MEASURED
+        # above the nozzle plane with the toolhead parked at the chute.
         assert await _hold(conn, "H2S") == (285.0, _H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM)
 
 
@@ -298,9 +250,6 @@ async def test_migration_is_idempotent(existing_engine):
         assert count == 1
 
 
-# --------------------------------------------------------------------------- #
-# The one-time migration: 51 (placeholder) -> 100 (measured)
-# --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_the_placeholder_is_lifted_to_the_measured_value(placeholder_engine, caplog):
     """The whole point: an install already carrying 51.0 gets the measured 100.0, once,

@@ -2,14 +2,12 @@
 
 On SQLite (PRAGMA foreign_keys=OFF by default), the ON DELETE CASCADE
 declared on user_oidc_links.user_id / user_totp.user_id /
-user_otp_codes.user_id is NOT enforced. Users deleted via the API before
-the fix (PR for #1285) left orphan rows pointing to non-existent users.
-The OIDC callback would then find the orphan UserOIDCLink, fail to load
-the deleted user, and redirect to ``account_inactive`` instead of running
-auto_create_users.
+user_otp_codes.user_id is NOT enforced, so deleting a user leaves orphan
+rows pointing at an id that no longer exists — and an orphan UserOIDCLink
+still matches at the OIDC callback, which then cannot load its user.
 
-run_migrations now sweeps orphans on every startup; this test verifies it
-on all three tables and proves idempotency + no-op behaviour on fresh DBs.
+run_migrations sweeps orphans on every startup; this test verifies it on
+all four tables and proves idempotency + no-op behaviour on fresh DBs.
 """
 
 from __future__ import annotations
@@ -18,67 +16,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import run_migrations
+from backend.tests._fixtures.db import create_memory_engine
 
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Pin the SQLite branch in run_migrations regardless of env."""
-    from backend.app.core import database as database_module, db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import the models package so every Base.metadata table is registered.
-
-    Previously this listed each submodule by hand and silently drifted from
-    backend/app/models/__init__.py (#1295 review nit). Importing the package
-    triggers __init__.py which covers most of the schema automatically.
-
-    A handful of submodules are NOT re-exported from __init__.py yet but are
-    required by run_migrations (they touch tables that don't appear in any
-    re-exported model). Those are imported by submodule below so the test
-    engine has the full schema available. Keep this list in sync with the
-    set conftest.py imports for test_engine.
-    """
-    import backend.app.models  # noqa: F401
-
-    # Submodules whose tables are touched by run_migrations but which are
-    # not re-exported from __init__.py.
-    from backend.app.models import (  # noqa: F401
-        external_link,
-        print_log,
-        print_queue,
-        project_bom,
-        slot_preset,
-        spoolman_k_profile,
-        spoolman_slot_assignment,
-        virtual_printer,
-    )
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 
 @pytest.fixture
 async def engine_with_full_schema():
-    """In-memory SQLite with the full schema via create_all (no manual SQL)."""
-    from backend.app.core.database import Base
-
-    _register_all_models()
-
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """The full schema via create_all — this migration needs no legacy shape."""
+    engine = await create_memory_engine()
     yield engine
     await engine.dispose()
-
-
-# -----------------------------------------------------------------------------
-# Per-table orphan cleanup
-# -----------------------------------------------------------------------------
 
 
 async def test_migration_deletes_orphan_user_oidc_links(engine_with_full_schema):
@@ -205,9 +155,8 @@ async def test_migration_deletes_orphan_user_otp_codes(engine_with_full_schema):
 async def test_migration_deletes_orphan_long_lived_tokens(engine_with_full_schema):
     """Orphan rows in long_lived_tokens must be removed; rows for real users must stay.
 
-    Camera-stream tokens whose secret_hash is still valid would otherwise be
-    matchable by verify() via lookup_prefix even after the owning user is gone
-    (#1295 review feedback extended #1285).
+    A camera-stream token whose secret_hash is still valid stays matchable by
+    verify() via lookup_prefix even after the owning user is gone.
     """
     exp = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
     async with engine_with_full_schema.begin() as conn:
@@ -245,11 +194,6 @@ async def test_migration_deletes_orphan_long_lived_tokens(engine_with_full_schem
         assert ids == [10], f"Expected only the valid long-lived token to survive, got {ids}"
 
 
-# -----------------------------------------------------------------------------
-# No-op and idempotency
-# -----------------------------------------------------------------------------
-
-
 async def test_migration_is_noop_on_fresh_install(engine_with_full_schema):
     """A fresh DB with empty users + auth tables must not raise and must not
     modify anything."""
@@ -259,9 +203,8 @@ async def test_migration_is_noop_on_fresh_install(engine_with_full_schema):
 
     # Static queries (one per table) instead of an f-string interpolated loop:
     # Bandit B608 flags f"... FROM {tbl}" as a possible SQL-injection vector
-    # even when ``tbl`` is bound to a tuple of literals. Spelling out each
-    # table name makes the intent clear and silences the false-positive
-    # without resorting to a noqa marker. See PR #1295 CodeQL alert #798.
+    # even when ``tbl`` is bound to a tuple of literals, so spelling each table
+    # out is what silences the false positive without a noqa marker.
     async with engine_with_full_schema.begin() as conn:
         oidc_count = (await conn.execute(text("SELECT COUNT(*) FROM user_oidc_links"))).scalar_one()
         totp_count = (await conn.execute(text("SELECT COUNT(*) FROM user_totp"))).scalar_one()

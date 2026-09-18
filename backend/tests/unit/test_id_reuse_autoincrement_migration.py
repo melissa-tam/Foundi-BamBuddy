@@ -1,12 +1,8 @@
 """Regression test for the AUTOINCREMENT retrofit — a deleted id is never reissued.
 
-005-H2S (2026-09-17). SQLite recycles the rowid of a deleted MAX row unless the table is
-declared AUTOINCREMENT, and this fork deliberately leaves FK enforcement off — so a
-reference to a purged row does not fail, it silently RE-BINDS to whatever row next takes
-that id. On 2026-09-16 ``library_files`` id 109 was purged and re-issued twice; a completed
-unit's ``print_queue.library_file_id`` then pointed at a stranger single-plate file, its
-eject packed the sweep into plate 1 while the dispatcher commanded plate 3, and the printer
-rejected the container as unreadable.
+SQLite recycles the rowid of a deleted MAX row unless the table is declared
+AUTOINCREMENT, and this fork deliberately leaves FK enforcement off — so a reference to
+a purged row does not fail, it silently RE-BINDS to whatever row next takes that id.
 
 ``create_all`` gives a FRESH install the flag from the model, which would mask the
 migration entirely — so the fixture strips ``sqlite_autoincrement`` off every forbidden table
@@ -14,11 +10,10 @@ before ``create_all`` to build the genuine pre-migration shape, seeds every one 
 (including ``print_queue``'s self-referencing retry lineage), adds a hand-written index and
 a trigger the model does not declare, and only then runs ``run_migrations``.
 
-The table rebuild is the risky half of this wave: it DROPs and recreates live tables. Every
-property that could be quietly lost on the way has its own case below — rows, indexes,
-triggers (that they still FIRE, not merely that they exist), the self-FK text, the
-``sqlite_sequence`` floor, idempotence, the two pre-flight refusals and the FK-enforcement
-guard.
+The rebuild DROPs and recreates live tables, so every property that could be quietly lost
+on the way has its own case below — rows, indexes, triggers (that they still FIRE, not
+merely that they exist), the self-FK text, the ``sqlite_sequence`` floor, idempotence, the
+two pre-flight refusals and the FK-enforcement guard.
 """
 
 from __future__ import annotations
@@ -31,6 +26,9 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.app.core.database import _AUTOINCREMENT_TABLES, _rebuild_table_with_autoincrement, run_migrations
+from backend.tests._fixtures.db import import_all_models
+
+pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
 # The hand-written index and trigger the MODEL does not declare. They stand in for the real
 # ones this rebuild has to carry: ``ix_print_queue_dispatch_subtask_id`` and the three
@@ -55,44 +53,6 @@ _SEED_MAX_ID = {
     "print_batches": 8,
     "print_queue": 12,
 }
-
-
-@pytest.fixture(autouse=True)
-def force_sqlite_dialect(monkeypatch):
-    """Force the SQLite branch regardless of test env settings."""
-    from backend.app.core import db_dialect
-
-    monkeypatch.setattr(db_dialect, "is_sqlite", lambda: True)
-    monkeypatch.setattr(db_dialect, "is_postgres", lambda: False)
-    from backend.app.core import database as database_module
-
-    monkeypatch.setattr(database_module, "is_sqlite", lambda: True)
-
-
-def _register_all_models():
-    """Import the whole model package so ``create_all`` builds EVERY table.
-
-    Same reasoning as ``test_backup_group_split_column_migration``: ``run_migrations`` is
-    one list run top to bottom, and an ``ALTER TABLE`` naming a table a partial import never
-    created raises ``no such table``, which ``_safe_execute`` does NOT swallow. A dozen
-    model modules are registered by ``init_db``'s own import list and not re-exported from
-    the package, so both lists are imported here.
-    """
-    import backend.app.models  # noqa: F401
-    from backend.app.models import (  # noqa: F401
-        active_print_spoolman,
-        bug_report,
-        external_link,
-        filament_sku_settings,
-        print_log,
-        print_queue,
-        project_bom,
-        shopping_list,
-        slot_preset,
-        spoolman_k_profile,
-        spoolman_slot_assignment,
-        virtual_printer,
-    )
 
 
 @contextmanager
@@ -220,7 +180,7 @@ async def _seed(conn):
 async def _build_pre_migration_engine(*, enforce_foreign_keys: bool = False):
     from backend.app.core.database import Base
 
-    _register_all_models()
+    import_all_models()
     eng = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
     if enforce_foreign_keys:
 
@@ -295,7 +255,7 @@ class TestPreMigrationShape:
         """The strip mutates module-global metadata — a leak would mis-build every later test."""
         from backend.app.core.database import Base
 
-        _register_all_models()
+        import_all_models()
         with _pre_migration_shape() as tables:
             assert all(t.dialect_options["sqlite"]["autoincrement"] is False for t in tables)
         for name in _AUTOINCREMENT_TABLES:
@@ -365,7 +325,7 @@ class TestRebuild:
         assert hits == [102]
 
     async def test_deleting_the_max_row_does_not_free_its_id(self, migrated):
-        """(c) THE incident. Purge the top library file, upload another: it must not be 9."""
+        """(c) Purge the top library file, upload another: it must not be issued id 9."""
         async with migrated.begin() as conn:
             await conn.execute(text("DELETE FROM library_files WHERE id = 9"))
             await _insert(
@@ -380,7 +340,7 @@ class TestRebuild:
             new_id = (await conn.execute(text("SELECT MAX(id) FROM library_files"))).scalar()
         assert new_id > _SEED_MAX_ID["library_files"], (
             "SQLite reissued the purged id — sku_files/print_queue rows still naming 9 would now "
-            "point at a stranger file, which is exactly the 005-H2S failure"
+            "point at a stranger file"
         )
 
     async def test_every_table_refuses_to_reissue_its_deleted_max_id(self, migrated):
