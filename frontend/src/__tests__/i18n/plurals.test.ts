@@ -12,6 +12,10 @@
  * Families are every base carrying ANY of `_one` / `_other` / `_plural` in ANY
  * locale, so a reintroduced `_plural` family is walked and FAILS here rather
  * than being silently skipped.
+ *
+ * Locales are registered explicitly below: under test the app instance boots on
+ * the `en` baseline alone, and this is the one file that resolves through all
+ * eleven.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -20,6 +24,16 @@ import { describe, expect, it } from 'vitest';
 // @ts-expect-error -- .mjs script with no type declarations; pure JS import is fine for tests
 import { loadLocale } from '../../../scripts/check-i18n-parity.mjs';
 import i18n from '../../i18n';
+import { allResources } from '../../i18n/resources';
+
+// `src/i18n/index.ts` boots the instance with `en` only under test, so that the
+// other 228 test files do not each evaluate 4.0 MB of locale modules they never
+// read. This pin needs the real thing: register the shipped set on the app's own
+// instance. `addResourceBundle` deep-copies what it is handed — that cost is
+// paid once, here, in the only file that asks for it.
+for (const [lng, bundle] of Object.entries(allResources)) {
+  i18n.addResourceBundle(lng, 'translation', bundle.translation);
+}
 
 const readLocale = loadLocale as (filePath: string) => Map<string, string>;
 const translate = (key: string, options: Record<string, unknown>): string => i18n.t(key, options);
@@ -81,6 +95,18 @@ describe('i18n plural families', () => {
   it('discovers the bundled locales and at least one plural family', () => {
     expect(localeCodes).toContain('en');
     expect(families.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The registration above is what makes every `lng` below resolvable. If a
+   * future change drops it, or `allResources` loses a locale, the per-locale
+   * assertions fall back to `en` and fail — but they fail late and confusingly,
+   * so state the precondition here.
+   */
+  it('has every discovered locale registered on the app instance', () => {
+    for (const code of localeCodes) {
+      expect(Object.keys(i18n.store.data), `${code} is not registered`).toContain(code);
+    }
   });
 
   for (const base of families) {
