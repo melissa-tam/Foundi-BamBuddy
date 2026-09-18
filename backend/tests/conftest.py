@@ -36,17 +36,46 @@ os.environ["DEBUG"] = "false"
 # The directory MUST be `<root>/<worker>/data`, not `<root>/<worker>`: config.py
 # derives the config dir from DATA_DIR's PARENT, so a bare worker dir would give
 # every xdist worker the same `<root>/config/erp.env`.
+# An operator pin is DATA_DIR set from outside, which we can only recognise by
+# the absence of our own root marker: under xdist the controller imports this
+# module first and exports DATA_DIR, so the workers inherit a value that looks
+# exactly like a pin and must NOT be reused -- sharing it gave every worker the
+# same database and `table printers already exists` 6,737 times.
 _TEST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "master")
-_TEST_ROOT_DIR = Path(tempfile.mkdtemp(prefix="bambuddy_tests_"))
-_TEST_DATA_DIR = _TEST_ROOT_DIR / _TEST_WORKER / "data"
-_TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
-# setdefault, not assignment: an operator (or the ship gate) pinning DATA_DIR
-# explicitly keeps their choice.
-os.environ.setdefault("DATA_DIR", str(_TEST_DATA_DIR))
+# Deliberately NOT a BAMBUDDY_*/MFA_* name: config.py:184 scans those two
+# prefixes for typos and would rightly warn that this is not a declared Settings
+# field. It is harness state, so it sits in pytest's namespace beside
+# PYTEST_XDIST_WORKER.
+_ROOT_ENV = "PYTEST_BAMBUDDY_DATA_ROOT"
+_OPERATOR_PINNED_DATA_DIR = bool(os.environ.get("DATA_DIR")) and not os.environ.get(_ROOT_ENV)
+
+if _OPERATOR_PINNED_DATA_DIR:
+    _TEST_ROOT_DIR = None
+else:
+    # The root is per RUN (created by whoever arrives first, inherited by the
+    # workers through the environment); the data dir under it is per WORKER.
+    _root = os.environ.get(_ROOT_ENV)
+    if not _root:
+        _root = tempfile.mkdtemp(prefix="bambuddy_tests_")
+        os.environ[_ROOT_ENV] = _root
+    _TEST_ROOT_DIR = Path(_root)
+    _TEST_DATA_DIR = _TEST_ROOT_DIR / _TEST_WORKER / "data"
+    _TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Assignment, not setdefault: see above -- the inherited value is the
+    # controller's, and reusing it is the bug.
+    os.environ["DATA_DIR"] = str(_TEST_DATA_DIR)
 
 
 def _cleanup_test_root_dir():
-    shutil.rmtree(_TEST_ROOT_DIR, ignore_errors=True)
+    # Sweep only this process's own worker subtree. A worker that removed the
+    # shared root would delete its siblings' databases mid-run; the controller
+    # owns the root itself and gets it on the way out.
+    if _TEST_ROOT_DIR is None:
+        return
+    if _TEST_WORKER == "master":
+        shutil.rmtree(_TEST_ROOT_DIR, ignore_errors=True)
+    else:
+        shutil.rmtree(_TEST_ROOT_DIR / _TEST_WORKER, ignore_errors=True)
 
 
 atexit.register(_cleanup_test_root_dir)
