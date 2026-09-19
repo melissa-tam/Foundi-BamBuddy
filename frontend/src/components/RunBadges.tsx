@@ -5,10 +5,15 @@
  * the two surfaces can never drift.
  */
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, CalendarClock, Hand, PauseCircle, ShieldAlert } from 'lucide-react';
-import type { ProductionRun, ProductionRunStatus, RunPauseReason } from '../types/productionRuns';
+import { AlertTriangle, CalendarClock, ChevronDown, Hand, PauseCircle, ShieldAlert } from 'lucide-react';
+import type {
+  ProductionRun,
+  ProductionRunStatus,
+  RunPauseReason,
+  RunPrinterState,
+} from '../types/productionRuns';
 import { formatRelativeTime, type TimeFormat } from '../utils/date';
-import { isScheduled } from '../utils/productionRuns';
+import { hasLiveBlockedPrinters, isScheduled } from '../utils/productionRuns';
 import { humanizeToken, isTokenShaped } from '../utils/waitingReason';
 
 const STATUS_STYLES: Record<ProductionRunStatus, string> = {
@@ -87,16 +92,69 @@ export function PauseReasonChip({ run }: { run: ProductionRun }) {
   );
 }
 
-/** Presence chip for blocked printers; the full per-printer reasons live on
- *  the detail page. */
-export function BlockedPrintersChip({ run }: { run: ProductionRun }) {
+/** Disclosure wiring for the blocked-printers chip. */
+export interface BlockedPrintersDisclosure {
+  expanded: boolean;
+  /** id of the panel the chip controls. */
+  panelId: string;
+  onToggle: () => void;
+}
+
+const BLOCKED_CHIP_CLASS =
+  'inline-flex items-center gap-1 rounded-full border border-red-500/30 bg-red-500/15 px-2 py-0.5 text-xs font-medium text-red-700 dark:text-red-300';
+
+/**
+ * Presence chip for blocked printers.
+ *
+ * Without `disclosure` it is a plain marker — which is what the run detail page
+ * wants, because that page already renders the full per-printer reasons below
+ * it. With `disclosure` it becomes a real `<button>` that opens the reasons
+ * inline (the runs list card), so Enter/Space and the focus ring come from the
+ * element rather than from hand-rolled key handling.
+ */
+export function BlockedPrintersChip({
+  run,
+  printerStates,
+  disclosure,
+}: {
+  run: ProductionRun;
+  /**
+   * The run DETAIL's per-printer states when the caller has them. The list
+   * flag alone misses the filament-short / no-USB / capability dimensions, so a
+   * caller holding the detail must pass it or the chip will under-report
+   * exactly the printers the eligibility panel is about to list.
+   */
+  printerStates?: RunPrinterState[] | null;
+  disclosure?: BlockedPrintersDisclosure;
+}) {
   const { t } = useTranslation();
-  if (!run.has_blocked_printers || run.status === 'completed' || run.status === 'cancelled') return null;
-  return (
-    <span className="inline-flex items-center gap-1 rounded-full border border-red-500/30 bg-red-500/15 px-2 py-0.5 text-xs font-medium text-red-700 dark:text-red-300">
+  if (!hasLiveBlockedPrinters(run, printerStates)) return null;
+
+  const content = (
+    <>
       <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
       {t('productionRuns.blockedPrinters')}
-    </span>
+      {disclosure && (
+        <ChevronDown
+          className={`h-3.5 w-3.5 ${disclosure.expanded ? 'rotate-180' : ''}`}
+          aria-hidden="true"
+        />
+      )}
+    </>
+  );
+
+  if (!disclosure) return <span className={BLOCKED_CHIP_CLASS}>{content}</span>;
+
+  return (
+    <button
+      type="button"
+      className={`${BLOCKED_CHIP_CLASS} hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/70`}
+      aria-expanded={disclosure.expanded}
+      aria-controls={disclosure.panelId}
+      onClick={disclosure.onToggle}
+    >
+      {content}
+    </button>
   );
 }
 

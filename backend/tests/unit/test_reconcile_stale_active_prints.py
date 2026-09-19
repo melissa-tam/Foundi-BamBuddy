@@ -251,6 +251,10 @@ class TestReconcileStaleActivePrints:
         # NOBODY observed this print's layer/progress peaks — see
         # TestReconciledTerminalsGateThePlate for what that now means.
         assert payload["peaks_reliable"] is False
+        # ...and NOBODY observed how it ended either. This branch SAYS so, and the one
+        # classifier turns the flag into the ``reconcile_unknown`` verdict, so the run
+        # holds for a human instead of quietly finishing one plate short (2026-09-19).
+        assert payload["outcome_unknown"] is True
 
     @pytest.mark.asyncio
     async def test_non_stale_archive_does_not_synthesise(self):

@@ -30,6 +30,7 @@ from backend.app.services.bambu_ftp import (
     with_ftp_retry,
 )
 from backend.app.services.bambu_mqtt import ams_mid_filament_change
+from backend.app.services.dispatch_claim import DISPATCH_START_BUDGET_S, register_start_watchdog
 from backend.app.services.dispatch_kick import DispatchKick, dispatch_kick
 from backend.app.services.dispatch_target import DispatchTarget, TargetKind, target_of
 from backend.app.services.eject import progress as dispatch_progress
@@ -92,9 +93,10 @@ logger = logging.getLogger(__name__)
 # RE-EXPORTED from the plate-occupancy authority since 2026-08-30, which is the
 # module that owns "what counts as an active job" (its ``job_active`` refusal on both
 # the dispatch and the eject side, and the transition its dispatch lease settles
-# against). The name stays here because ``farm_stall.check_dead_dispatch_claims``
-# imports it from this module at call time, and because a second SPELLING of the set
-# is how two lanes come to disagree about PAUSE — which for that watch is the
+# against). The name stays here because ``farm_stall.check_ams_wedged_idle`` imports it
+# from this module at call time, and because a second SPELLING of the set is how two
+# lanes come to disagree about PAUSE — which for the dead-claim watch (now asking
+# ``dispatch_claim.judge``, which takes the set from the authority directly) is the
 # difference between leaving a native-vision hold alone and double-dispatching onto an
 # occupied plate.
 ACTIVE_PRINT_STATES = _ACTIVE_PRINT_STATES
@@ -4222,16 +4224,25 @@ class PrintScheduler:
             # that would otherwise cause the item to re-dispatch as a reprint
             # of the just-finished job (#1078).
             if pre_state:
-                spawn_background_task(
-                    self._watchdog_print_start(
-                        item.id,
-                        printer_id,
-                        pre_state,
-                        pre_subtask_id,
-                        pre_gcode_file,
-                        item.batch_id,
+                # Registered as well as spawned: the watchdog's LIVENESS is what
+                # ``farm_stall.check_dead_dispatch_claims`` asks before it calls a claim
+                # dead (``dispatch_claim.has_live_start_watchdog``). Before that handoff
+                # existed, that watch inferred this task's liveness from a 600 s clock
+                # and made every claim with NO watchdog — the post-restart ones nothing
+                # else can retire — wait ~12 minutes.
+                register_start_watchdog(
+                    item.id,
+                    spawn_background_task(
+                        self._watchdog_print_start(
+                            item.id,
+                            printer_id,
+                            pre_state,
+                            pre_subtask_id,
+                            pre_gcode_file,
+                            item.batch_id,
+                        ),
+                        name=f"watchdog-print-start-{item.id}",
                     ),
-                    name=f"watchdog-print-start-{item.id}",
                 )
 
             # Get estimated time for notification
@@ -4299,7 +4310,7 @@ class PrintScheduler:
         pre_subtask_id: str | None = None,
         pre_gcode_file: str | None = None,
         batch_id: int | None = None,
-        timeout: float = 90.0,
+        timeout: float = DISPATCH_START_BUDGET_S,
         phase_b_timeout: float = 180.0,
         poll_interval: float = 3.0,
     ) -> None:
@@ -4328,7 +4339,11 @@ class PrintScheduler:
         a forced reconnect mid-parse triggers 0500_4003 (#1150).
 
         Phase A timeout raised from 45 s → 90 s as belt-and-braces for slow
-        transitions that also don't emit an early subtask_id tick.
+        transitions that also don't emit an early subtask_id tick. That figure now has
+        ONE origin, ``dispatch_claim.DISPATCH_START_BUDGET_S``, because the dead-claim
+        watch needs the same number for the same question when NO watchdog exists to
+        ask (after a restart), and two spellings of "how long may a start take" is how
+        the two lanes would come to disagree about a claim neither of them owns.
         """
         last_status = None
         landed_on_subtask = False

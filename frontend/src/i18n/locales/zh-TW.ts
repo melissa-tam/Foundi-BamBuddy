@@ -173,6 +173,7 @@ export default {
       timeCol: '完成 / 開始',
       stoppedByOperator: '已由操作員停止',
       stoppedByFarmVision: '農場停止：列印板偵測',
+      stoppedByReconcileUnknown: '重新連線後結果未知',
       firstArticleBadge: '首件',
       stagedBadge: '已擱置',
       lowSpoolBadge: '線材不足',
@@ -570,8 +571,6 @@ export default {
     prints: '次列印',
     more: '還有 {{count}} 個',
     moreActions: '更多',
-    ascending: '升序',
-    descending: '降序',
     back: '返回',
     copy: '複製',
     copied: '已複製!',
@@ -585,6 +584,18 @@ export default {
     duplicate: '複製',
     left: '左',
     right: '右',
+    pagination: {
+      showing: '顯示',
+      to: '至',
+      of: '共',
+      show: '每頁',
+      page: '頁',
+      all: '全部',
+      first: '第一頁',
+      previous: '上一頁',
+      next: '下一頁',
+      last: '最後一頁',
+    },
   },
 
   // Printers page
@@ -737,7 +748,6 @@ export default {
       toastEntered: '{{name}} 已進入維護模式',
       toastExited: '{{name}} 已結束維護模式',
       confirmTitle: '讓 {{name}} 進入維護模式？',
-      confirmEffectPrint: '• 停止正在進行的列印 — 生產執行將保持到手動繼續',
       confirmEffectEject: '• 停止彈出清掃 — 列印板閘門保持關閉',
       confirmEffectCooldown: '• 延後彈出 — 冷卻風扇持續運轉至熱床冷卻後停止',
     },
@@ -1342,14 +1352,6 @@ export default {
     originalPrintNotVisible: '原始列印不可見 - 請嘗試清除篩選條件',
     noArchivesYet: '尚無歸檔',
     prints: '條列印',
-    pagination: {
-      showing: '顯示',
-      to: '至',
-      of: '共',
-      show: '每頁',
-      page: '頁',
-      all: '全部',
-    },
     loadingArchives: '載入歸檔中...',
     releaseToUpload: '放開以上傳',
     showAll: '顯示全部',
@@ -1790,6 +1792,8 @@ export default {
       allLocations: '所有位置',
       any: '任意',
       anyOf: '任一',
+      emptyTitle: '沒有符合篩選條件的項目',
+      clearFilters: '清除篩選條件',
     },
     // Sort
     sort: {
@@ -1800,6 +1804,11 @@ export default {
       byDate: '按日期排序',
       ascendingOldest: '升序（最舊優先）',
       descendingNewest: '降序（最新優先）',
+      ascending: '升序排序',
+      descending: '降序排序',
+    },
+    reorder: {
+      requiresPositionSort: '重新排序需使用「位置」升序排列且關閉 SJF',
     },
     // Badges
     badges: {

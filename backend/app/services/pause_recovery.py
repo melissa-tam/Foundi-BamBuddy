@@ -213,10 +213,22 @@ def note_status_push(printer_id: int, state) -> None:
         was_at_prompt = prev.at_prompt if prev is not None else False
         _seen[printer_id] = _WireSample(epoch=epoch, outage_s=outage_s, at_prompt=at_prompt)
 
+        if reconnected:
+            # AHEAD of the maintenance-mode return, and deliberately the only thing that
+            # is. The lost-Z row is a REFUSAL RECORD, not a recovery act: it opens no
+            # driver, resumes nothing, stops nothing and moves nothing — all it does is
+            # make every LATER eject refuse until a human clears it. So it sits outside
+            # the "the farm stands aside while a human owns the machine" ruling, which is
+            # about the farm ACTING. An outage that lands during a hold destroys the Z
+            # datum exactly as one outside a hold does, and skipping the record here
+            # would leave the printer with a trustworthy-looking Z frame that is fiction
+            # — the 2026-09-04 bed-past-the-floor mechanism, arrived at by omission.
+            _maybe_arm_z_reference_hold(printer_id, anchor)
+
         if printer_incidents.automation_held(printer_id):
             # MAINTENANCE MODE: the power-loss prompt and the plate-vision trip are the
-            # operator's to answer — they are standing at the screen. Nothing is opened,
-            # nothing is resumed and nothing is stopped.
+            # operator's to answer — they are standing at the screen. Nothing is resumed
+            # and nothing is stopped.
             #
             # The wire sample above is still recorded, deliberately: the sampler's memory
             # stays current, so an edge that happened DURING the hold is consumed by the
@@ -228,9 +240,6 @@ def note_status_push(printer_id: int, state) -> None:
                     "reconnected" if reconnected else "at the power-loss prompt",
                 )
             return
-
-        if reconnected:
-            _maybe_arm_z_reference_hold(printer_id, anchor)
 
         if not at_prompt or was_at_prompt:
             # Level, not edge: the prompt either is not standing, or it was already

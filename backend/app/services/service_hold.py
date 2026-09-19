@@ -1,4 +1,4 @@
-"""Maintenance mode: keep the session, quiesce the automation, keep watching.
+"""Maintenance mode: keep the session, keep the print, quiesce the farm's own actions.
 
 THE owner of the operator verb "I am taking this printer" — enter, exit, and the
 graceful stand-down in between. Four things live here and nowhere else:
@@ -20,6 +20,18 @@ watch reads the hold's level on its next tick and releases. Only a session teard
 retires a watch. The cost, stated rather than hidden: a cooldown that ARMS under a hold
 is fan-only (the plate hold moves the machine, so it is refused and never re-attempted),
 which is slower than a production one.
+
+**NO MODE VERB ENDS A PRINT (2026-09-19 ruling).** Entering maintenance mode used to
+call ``print_control.stop_as_operator`` on anything RUNNING/PAUSE/PREPARE/SLICING, and
+deactivation inherited that through :func:`quiesce_for_teardown`. It no longer does, and
+neither verb may grow it back (``test_code_quality.TestOperatorStopOwnership`` fails CI
+on a third caller). The reason is an ownership one: what a hold stands down is the
+FARM'S OWN actions — a sweep it commanded, a dispatch it has not yet put on the wire, a
+page it would send — and a running print is not one of them. It is the operator's, and
+its terminal rides the ordinary lanes (correlation, the plate authority, ``farm_policy``)
+exactly as it would have without the hold. An operator who wants the print to end has a
+Stop button; a mode switch that also stopped the print gave them no way to take a printer
+without losing the plate on it.
 
 **The hold is a ``printer_incident`` row of kind ``service_hold``** (``printer_incidents``
 owns the record, this module owns the verb). That is what makes every automation lane's
@@ -59,13 +71,7 @@ from backend.app.models.printer_incident import (
 from backend.app.services import printer_incidents
 from backend.app.services.eject import remote as eject_remote
 from backend.app.services.eject.monitor import eject_cooldown_monitor
-
-# ACTIVE_PRINT_STATES lives with the occupancy domain, which owns "what counts as an
-# active job" (``print_scheduler`` re-exports the same object). Imported from the origin
-# so the quiesce cannot come to disagree with the plate authority about PAUSE — a paused
-# job IS a job to stop before hands go in.
-from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
-from backend.app.services.print_control import stop_as_operator
+from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 
 if TYPE_CHECKING:
@@ -94,18 +100,18 @@ _STAND_DOWN_WAIT_S = 10.0
 class QuiesceReport:
     """What the quiesce actually had to do — one bool per action it took.
 
-    The operator's toast reads these back ("the print was stopped, the sweep was
-    stopped"), so each one means *this call changed that*, never *that was in some
-    state*: a second enter on an already-quiet printer reports three Falses, which is
-    the honest answer.
+    The operator's toast reads these back ("the sweep was stopped"), so each one means
+    *this call changed that*, never *that was in some state*: a second enter on an
+    already-quiet printer reports two Falses, which is the honest answer.
 
-    There is deliberately no cooldown bool: entering a hold no longer ENDS a cooldown
-    (the fans finish their curve and the eject is withheld), so the only honest value
-    such a field could ever carry is False.
+    Two fields are deliberately absent, for the same reason in two directions: a
+    cooldown bool, because entering a hold no longer ENDS a cooldown (the fans finish
+    their curve and the eject is withheld); and a job bool, because entering a hold no
+    longer stops a PRINT. Neither could carry anything but False, and a field that is
+    always False is a claim the UI would go on making.
     """
 
     eject_stopped: bool = False
-    job_stopped: bool = False
     lease_revoked: bool = False
 
 
@@ -121,25 +127,30 @@ class HoldVerdict:
     held: bool
     already_held: bool
     eject_stopped: bool = False
-    job_stopped: bool = False
     lease_revoked: bool = False
 
 
 async def quiesce(printer_id: int, *, cause: str) -> QuiesceReport:
-    """Stop ``printer_id``'s automatic ACTIONS, session and watch intact. NEVER raises.
+    """Stop ``printer_id``'s automatic ACTIONS, session, watch and PRINT intact. NEVER raises.
 
-    In order, and each step guarded so one failure cannot skip the rest:
+    Every step here is something the FARM did and can take back. That is the whole
+    selection rule, and it is what keeps the list short:
 
-    1. **an in-flight eject sweep** — re-driven through the ONE kill path
-       (``eject.remote.redrive_eject_stop``, stage ``service_hold``). A sweep is never
-       resumed; the stopped job's terminal resolves the eject ``unverified`` and the
-       plate gate stays human-clear.
-    2. **a running or paused job** (farm or foreign) — the operator stop, so the unit
-       lands ``cancelled`` with a ``stop_source`` and the run holds for RESUME instead
-       of counting a failure.
-    3. **the dispatch lease** — revoked, so a dispatch already past its decision point
+    1. **an in-flight eject sweep** — a job the farm itself commanded, re-driven through
+       the ONE kill path (``eject.remote.redrive_eject_stop``, stage ``service_hold``).
+       A sweep is never resumed; the stopped job's terminal resolves the eject
+       ``unverified`` and the plate gate stays human-clear.
+    2. **the dispatch lease** — revoked, so a dispatch already past its decision point
        is refused ``lease_revoked`` at commit and the scheduler unwinds the row rather
        than printing onto a printer somebody has taken.
+
+    **A RUNNING PRINT IS NOT ONE OF THEM (2026-09-19).** Step 2 used to be
+    ``print_control.stop_as_operator`` over ``ACTIVE_PRINT_STATES``. It is gone, and
+    with it the last mode verb that ended a print: the print belongs to the operator,
+    not to the farm, and its terminal rides the ordinary lanes under a hold exactly as
+    it would without one (FINISH → completed, the plate gated, the eject withheld until
+    the hold lifts). A print that FAULTS while held gets no farm recovery — every
+    automatic lane keeps standing down — which is the ruling, not an oversight.
 
     **The armed plate watch is deliberately LEFT RUNNING (2026-09-13).** Standing it down
     used to be step 1, and it retired the cooldown with it — both fans commanded off over
@@ -152,7 +163,6 @@ async def quiesce(printer_id: int, *, cause: str) -> QuiesceReport:
     :func:`quiesce_for_teardown`.
     """
     eject_stopped = False
-    job_stopped = False
     lease_revoked = False
 
     try:
@@ -174,27 +184,18 @@ async def quiesce(printer_id: int, *, cause: str) -> QuiesceReport:
         logger.exception("[service-hold] printer %s: stopping the in-flight eject failed (%s)", printer_id, cause)
 
     try:
-        state = printer_manager.get_status(printer_id)
-        live = (getattr(state, "state", None) or "").upper() if state is not None else ""
-        if live in ACTIVE_PRINT_STATES:
-            job_stopped = stop_as_operator(printer_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("[service-hold] printer %s: stopping the running job failed (%s)", printer_id, cause)
-
-    try:
         lease_revoked = plate_occupancy.revoke_lease(printer_id, cause)
     except Exception:  # noqa: BLE001
         logger.exception("[service-hold] printer %s: revoking the dispatch lease failed (%s)", printer_id, cause)
 
     logger.info(
-        "[service-hold] printer %s quiesced (%s): eject_stopped=%s job_stopped=%s lease_revoked=%s",
+        "[service-hold] printer %s quiesced (%s): eject_stopped=%s lease_revoked=%s (any running print is left alone)",
         printer_id,
         cause,
         eject_stopped,
-        job_stopped,
         lease_revoked,
     )
-    return QuiesceReport(eject_stopped=eject_stopped, job_stopped=job_stopped, lease_revoked=lease_revoked)
+    return QuiesceReport(eject_stopped=eject_stopped, lease_revoked=lease_revoked)
 
 
 async def quiesce_for_teardown(printer_id: int, *, cause: str) -> QuiesceReport:
@@ -204,6 +205,11 @@ async def quiesce_for_teardown(printer_id: int, *, cause: str) -> QuiesceReport:
     deactivate branch of ``PATCH /printers/{id}``, tomorrow ``POST /printers/{id}/disconnect``
     and ``DELETE /printers/{id}``, which orphan the automation today and should inherit
     this order rather than re-derive it.
+
+    It is the plate watch PLUS :func:`quiesce`, so it inherits that function's rule
+    too: **deactivating a printer does not end its print either.** The printer keeps
+    printing from its own USB storage with nobody watching; the queue row stays
+    ``printing`` until the reconcile that runs on re-activation resolves it.
 
     The watch goes FIRST and is AWAITED, bounded. ``stand_down``'s cancellation runs the
     watch task's own ``finally``, which retires the :mod:`cooldown_prep` — plate hold
@@ -250,13 +256,15 @@ async def enter(db: AsyncSession, printer_id: int, *, actor: str) -> HoldVerdict
 
     An operator re-entering a hold that already stands gets ``already_held=True`` **and
     a fresh quiesce**: the second click means "make this machine quiet", and the reason
-    it is being clicked again is usually that something came back (a screen-started
-    print, a sweep, a lease) which the first entry never saw.
+    it is being clicked again is usually that something came back (a sweep, a lease)
+    which the first entry never saw.
 
-    What it does NOT stop is the cooling: an armed plate watch keeps running (fans only,
-    its eject withheld until the release), because a hot bed has to cool whoever owns the
-    printer. The plate stays raised where the hold left it, and the eject's own first Z
-    move takes it from there whenever it finally runs.
+    What it does NOT stop is the PRINT: a running job — farm or foreign — keeps printing
+    and reaches its own terminal through the ordinary lanes. Nor the cooling: an armed
+    plate watch keeps running (fans only, its eject withheld until the release), because
+    a hot bed has to cool whoever owns the printer. The plate stays raised where the hold
+    left it, and the eject's own first Z move takes it from there whenever it finally
+    runs.
 
     Works on a DEACTIVATED printer too (``is_active=False``): there is nothing to
     quiesce with no session, and the hold is still worth recording — it is what stops
@@ -277,7 +285,6 @@ async def enter(db: AsyncSession, printer_id: int, *, actor: str) -> HoldVerdict
         held=True,
         already_held=already_held,
         eject_stopped=report.eject_stopped,
-        job_stopped=report.job_stopped,
         lease_revoked=report.lease_revoked,
     )
 

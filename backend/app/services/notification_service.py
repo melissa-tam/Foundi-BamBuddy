@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.notification import NotificationDigestQueue, NotificationLog, NotificationProvider
 from backend.app.models.notification_template import NotificationTemplate
+from backend.app.models.printer import Printer
 from backend.app.services import notify_dedup, printer_incidents
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,48 @@ HELD_PRINTER_SUPPRESSED_EVENTS: frozenset[str] = frozenset(
         "run_unit_stopped",  # the quiesce's own stop, among others
     }
 )
+
+
+async def _farm_reactions_stood_down(db: AsyncSession, printer_id: int) -> bool:
+    """Is every automatic lane on ``printer_id`` deliberately standing down?
+
+    ONE predicate for the ONE gate, over the two ways an operator says "leave this
+    machine alone", because a farm-reaction page is equally unwanted under both:
+
+    * **maintenance mode** — ``printer_incidents.automation_held``, the durable hold
+      every other lane reads;
+    * **deactivated** (``Printer.is_active`` False, the grey "Deactivated" pill on the
+      card) — the printer has no MQTT session at all because a human switched it off.
+
+    The second half is why this function exists rather than the bare hold read that used
+    to be inline. Deactivation opens no incident row, and ``farm_stall.check_stalled_prints``
+    has no ``is_active`` read of its own — so a printer deliberately deactivated mid-print
+    paged ``print_stalled`` 30 minutes later, about a print its operator had already taken
+    out of the farm's hands. Widening HERE rather than in ``farm_stall`` is the same
+    argument the hold gate was built on: one read at the fan-out covers all ten
+    farm-reaction events, where a second suppression site would cover exactly one and the
+    eleventh event would forget it. The ``printer_offline_stalled`` FLAG on the queue row
+    is deliberately NOT affected — the run surface must still say why the unit is not
+    moving; what is suppressed is the PAGE.
+
+    ``is_active`` costs a DB read, which the hold read does not — so the hold is asked
+    first and the query runs only for a suppressed-class event on a printer no hold
+    covers. It is the honest source: nothing caches ``is_active`` for services (the
+    card's pill is served straight off the row), and "no MQTT client registered" would
+    read every not-yet-connected printer as deactivated during startup.
+
+    Fails OPEN. A read that cannot answer sends the page: an extra page is noise, while
+    a wrongly suppressed one is silence, and silence is the failure this whole gate is
+    trying not to cause in the other direction.
+    """
+    if printer_incidents.automation_held(printer_id):
+        return True
+    try:
+        printer = await db.get(Printer, printer_id)
+    except Exception:  # noqa: BLE001 — a notification must not die on a status read
+        logger.warning("could not read printer %s activation state — sending the notification", printer_id)
+        return False
+    return printer is not None and not printer.is_active
 
 
 def _looks_like_cloudflare_challenge(response: httpx.Response) -> bool:
@@ -932,18 +975,19 @@ class NotificationService:
         All notifications are always sent immediately. If digest mode is enabled,
         the notification is ALSO queued for the daily digest summary.
 
-        THE one fan-out every event crosses, which is why the held-printer suppression
-        lives here: one read of ``printer_incidents.automation_held`` covers all ten
+        THE one fan-out every event crosses, which is why the stood-down suppression
+        lives here: one call to :func:`_farm_reactions_stood_down` covers all ten
         farm-reaction events (:data:`HELD_PRINTER_SUPPRESSED_EVENTS`) instead of ten
         emitters each growing a gate that the eleventh would forget.
         """
         if printer_id is not None and event_type in HELD_PRINTER_SUPPRESSED_EVENTS:
-            if printer_incidents.automation_held(printer_id):
+            if await _farm_reactions_stood_down(db, printer_id):
                 # Not sent, and not queued for the digest either: a page an operator
                 # should never have received is not worth summarising tomorrow. INFO,
                 # because the absence of a page has to be explainable from the log.
                 logger.info(
-                    "notification %s for printer %s suppressed: printer in maintenance mode",
+                    "notification %s for printer %s suppressed: the farm is standing down on it "
+                    "(maintenance mode or deactivated)",
                     event_type,
                     printer_id,
                 )

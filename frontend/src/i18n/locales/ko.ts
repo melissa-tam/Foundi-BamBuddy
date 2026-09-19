@@ -173,6 +173,7 @@ export default {
       timeCol: '완료 / 시작',
       stoppedByOperator: '운영자가 중지함',
       stoppedByFarmVision: '팜이 중지함: 플레이트 검사',
+      stoppedByReconcileUnknown: '재연결 후 결과 불명',
       firstArticleBadge: '초도품',
       stagedBadge: '보류',
       lowSpoolBadge: '필라멘트 부족',
@@ -567,8 +568,6 @@ export default {
     prints: '인쇄',
     more: '+{{count}}개 더',
     moreActions: '더 보기',
-    ascending: '오름차순',
-    descending: '내림차순',
     back: '뒤로',
     copy: '복사',
     copied: '복사됨!',
@@ -581,7 +580,19 @@ export default {
     create: '만들기',
     duplicate: '복제',
     left: '왼쪽',
-    right: '오른쪽'
+    right: '오른쪽',
+    pagination: {
+      showing: '표시 중',
+      to: '~',
+      of: '/',
+      show: '표시',
+      page: '페이지',
+      all: '전체',
+      first: '첫 페이지',
+      previous: '이전 페이지',
+      next: '다음 페이지',
+      last: '마지막 페이지',
+    },
   },
   printers: {
     title: '프린터',
@@ -720,7 +731,6 @@ export default {
       toastEntered: '{{name}} 유지보수 모드',
       toastExited: '{{name}} 유지보수 모드 해제',
       confirmTitle: '{{name}}을(를) 유지보수 모드로 전환할까요?',
-      confirmEffectPrint: '• 진행 중인 인쇄 중지 — 재개할 때까지 런이 보류됩니다',
       confirmEffectEject: '• 배출 스윕 중지 — 플레이트는 계속 잠깁니다',
       confirmEffectCooldown: '• 배출 연기 — 냉각 팬은 베드가 식을 때까지 돌고 그 후 정지합니다',
     },
@@ -1299,14 +1309,6 @@ export default {
     originalPrintNotVisible: '원본 인쇄가 보이지 않음 - 필터를 지워보세요',
     noArchivesYet: '아직 아카이브가 없습니다',
     prints: '인쇄',
-    pagination: {
-      showing: '표시 중',
-      to: '~',
-      of: '/',
-      show: '표시',
-      page: '페이지',
-      all: '전체'
-    },
     loadingArchives: '아카이브 로딩 중...',
     releaseToUpload: '놓아서 업로드',
     showAll: '모두 보기',
@@ -1709,6 +1711,8 @@ export default {
       allLocations: '모든 위치',
       any: '전체',
       anyOf: '다음 중 하나',
+      emptyTitle: '필터와 일치하는 항목이 없습니다',
+      clearFilters: '필터 지우기',
     },
     sort: {
       byPosition: '위치별 정렬',
@@ -1717,7 +1721,12 @@ export default {
       bySchedule: '예약별 정렬',
       byDate: '날짜별 정렬',
       ascendingOldest: '오름차순 (오래된 것 먼저)',
-      descendingNewest: '내림차순 (최신 것 먼저)'
+      descendingNewest: '내림차순 (최신 것 먼저)',
+      ascending: '오름차순 정렬',
+      descending: '내림차순 정렬',
+    },
+    reorder: {
+      requiresPositionSort: '순서 변경은 위치 정렬(오름차순, SJF 해제)에서만 가능합니다',
     },
     badges: {
       staged: '준비됨',

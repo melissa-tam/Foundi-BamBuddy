@@ -432,12 +432,17 @@ export interface ClearPlateResult {
   incidents_closed: PrinterIncidentKind[];
 }
 
-/** `POST /printers/{id}/service-hold` — what entering the hold actually did. */
+/**
+ * `POST /printers/{id}/service-hold` — what entering the hold actually did.
+ *
+ * The hold stops the FARM'S OWN actions only: a sweep it commanded and a
+ * dispatch not yet on the wire. A running print is the operator's and keeps
+ * printing, so there is no job-stopped outcome to report.
+ */
 export interface ServiceHoldEnterResult {
   held: boolean;
   already_held: boolean;
   eject_stopped: boolean;
-  job_stopped: boolean;
   lease_revoked: boolean;
 }
 
@@ -5710,10 +5715,17 @@ export const api = {
     }),
   removeFromQueue: (id: number) =>
     request<{ message: string }>(`/queue/${id}`, { method: 'DELETE' }),
-  reorderQueue: (items: { id: number; position: number }[]) =>
+  /**
+   * Reorder the pending queue. The client sends the full pending DISPLAY order
+   * as ids only; the server assigns positions per its own scope (pinned
+   * printer vs the shared NULL-printer sequence), so a mixed pinned/pool/
+   * unassigned drag can no longer mint duplicate positions from a client that
+   * cannot see the scopes.
+   */
+  reorderQueue: (orderedIds: number[]) =>
     request<{ message: string }>('/queue/reorder', {
       method: 'POST',
-      body: JSON.stringify({ items }),
+      body: JSON.stringify({ ordered_ids: orderedIds }),
     }),
   cancelQueueItem: (id: number) =>
     request<{ message: string }>(`/queue/${id}/cancel`, { method: 'POST' }),

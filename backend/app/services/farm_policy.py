@@ -41,6 +41,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.printer_incident import (
+    FAULT_KINDS,
     KIND_PLATE_VISION,
     RESOLVE_TERMINAL,
     STATUS_ESCALATED,
@@ -554,12 +555,21 @@ async def on_terminal(
             await _on_item_completed(db, batch, item, archive_data)
         elif final_status == "failed":
             await _on_item_failed(db, batch, item)
-        elif final_status == "cancelled" and item.stop_source:
-            # Operator stop (UI or printer screen), attributed by the terminal
-            # handler. NOT a failure: no retry, no quarantine contribution — just
-            # a visible hold + notification (Phase 3.1). A 'cancelled' with NO
-            # stop_source (e.g. a run-abort or an unattributed interruption) is a
-            # deliberate no-op here.
+        elif final_status == "cancelled":
+            # A farm unit that ended WITHOUT producing its plate and without failing.
+            # NOT a failure: no retry, no quarantine contribution — a visible hold +
+            # notification, and RESUME tops the deficit back up (Phase 3.1).
+            #
+            # An attributed stop (`operator_ui` / `operator_screen`) is the ordinary
+            # case. A `cancelled` with NO ``stop_source`` takes the SAME disposition
+            # since 2026-09-19, and that is the point: it used to be a deliberate
+            # no-op, which meant an interruption nobody could attribute — the downtime
+            # reconcile's IDLE branch was the live one — left the run ACTIVE, one plate
+            # short, with nothing on any surface to say so. An unknown outcome is not a
+            # completed one; the honest reading is "a human has to look", which is
+            # exactly what this disposition arranges. (The reconcile now also STAMPS
+            # ``reconcile_unknown`` so the lineage says WHY, but the fork no longer
+            # depends on the stamp having been written.)
             await on_operator_stop(db, batch, item)
     except Exception:  # noqa: BLE001 — policy must never crash the callback chain
         logger.exception("farm_policy.on_terminal failed for item=%s status=%s", queue_item_id, final_status)
@@ -731,10 +741,14 @@ async def _genuine_failure_count(db: AsyncSession, item: PrintQueueItem) -> int:
 
 
 async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
-    """A farm unit was deliberately stopped by the operator (Phase 3.1).
+    """A farm unit ended without its plate and without failing (Phase 3.1).
 
-    Called from :func:`on_terminal` when a farm item lands terminal ``cancelled``
-    WITH ``stop_source`` set. Deliberately does the OPPOSITE of a failure:
+    Called from :func:`on_terminal` for EVERY farm item that lands terminal
+    ``cancelled`` — the operator's stop (``stop_source`` set) and, since 2026-09-19,
+    an outcome the farm could not learn at all (``reconcile_unknown``, or no stamp).
+    The name is the common case, not the whole set: what unites them is that the unit
+    produced no part and nothing failed, so the run must HOLD for a human rather than
+    count it either way. Deliberately does the OPPOSITE of a failure:
 
     - NO auto-retry (the operator chose to stop this unit);
     - NOT counted toward quarantine — ``cancelled`` is already outside
@@ -760,9 +774,10 @@ async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueue
     run = await _load_run(db, batch.id)
     await notification_service.on_run_unit_stopped(item.printer_id, printer_name, run.name, db)
     logger.info(
-        "farm_policy: unit %s stopped by operator (%s) on run %s — no retry, no quarantine, run held (active)",
+        "farm_policy: unit %s ended without a plate (stop_source=%s) on run %s — "
+        "no retry, no quarantine, run held (active)",
         item.id,
-        item.stop_source,
+        item.stop_source or "unattributed",
         batch.id,
     )
 
@@ -795,17 +810,26 @@ async def _requeues_gracefully(db: AsyncSession, item: PrintQueueItem, verdict: 
 
     * the FARM stopped the print — the pre-print plate check tripped and
       ``pause_recovery`` sent the stop. Nothing was consumed and nothing failed;
-    * an OPERATOR stopped a print on a printer that carries an OPEN incident. The
-      machine was already holding (jam, runout, physical fault, plate check, power
+    * an OPERATOR stopped a print on a printer that carries an open EQUIPMENT FAULT.
+      The machine was already holding (jam, runout, physical fault, plate check, power
       loss) and the human stopping it is finishing what the hold started — the plate
-      still has to be made. A plain operator stop with NO incident is unchanged: it
+      still has to be made. A plain operator stop with NO fault is unchanged: it
       means "cancel this work", and keeps :func:`on_operator_stop`'s semantics
       (cancelled, the run holds, RESUME tops the deficit back up).
+
+    **A HOLD IS NOT A FAULT**, which is why the second route reads
+    :data:`FAULT_KINDS` and not every open row. A ``service_hold`` is the operator
+    saying "I am taking this machine" — nothing is broken and nothing was interrupted
+    by the equipment — so an operator who then presses Stop means exactly what they
+    would mean on a healthy printer: cancel this unit. Reading the un-narrowed "any
+    open incident" question instead would silently requeue the plate, and the run
+    would never hold for the RESUME that tops it back up. A real fault standing
+    BESIDE a hold still requeues: the fault is what the question is about.
     """
     if verdict == farm_correlation.STOP_SOURCE_FARM_VISION_ABORT:
         return True
     if verdict in _INCIDENT_REQUEUE_VERDICTS and item.printer_id is not None:
-        return await printer_incidents.get_open(db, item.printer_id) is not None
+        return await printer_incidents.get_open(db, item.printer_id, kinds=FAULT_KINDS) is not None
     return False
 
 

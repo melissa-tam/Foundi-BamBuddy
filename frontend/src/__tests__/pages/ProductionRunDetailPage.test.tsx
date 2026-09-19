@@ -281,6 +281,14 @@ describe('ProductionRunDetailPage', () => {
                 status: 'cancelled',
                 stop_source: 'farm_vision_abort',
               }),
+              // Downtime reconcile: the printer could no longer state this
+              // print's outcome (idle, or a subtask id that no longer matches).
+              // Nobody stopped it, so the operator badge would be a lie.
+              unit({
+                id: 106,
+                status: 'cancelled',
+                stop_source: 'reconcile_unknown',
+              }),
             ],
           }),
         ),
@@ -296,6 +304,8 @@ describe('ProductionRunDetailPage', () => {
     // The farm's own plate-check stop carries its own attribution, and the
     // operator badge stays a one-off (unit 103) rather than covering both.
     expect(within(table).getByText('Stopped by the farm: plate check')).toBeInTheDocument();
+    // A reconcile-unknown outcome gets its own label for the same reason.
+    expect(within(table).getByText('Outcome unknown after reconnect')).toBeInTheDocument();
     expect(within(table).getAllByText('Stopped by operator')).toHaveLength(1);
     expect(within(table).getByText('Retry #1 of unit 101')).toBeInTheDocument();
     expect(within(table).getByText('HMS 0300_8017')).toBeInTheDocument();

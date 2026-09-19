@@ -253,8 +253,86 @@ _INCIDENT_CLOSERS = {
 }
 
 
+# --- The operator stop, and who may send one (2026-09-19) --------------------------
+
+# WHO may call ``print_control.stop_as_operator``. The pair it sends (MQTT ``print.stop``
+# plus the user-stopped mark) MEANS "a human pressed Stop", and the whole terminal
+# disposition downstream is built on that meaning: the unit lands ``cancelled`` with a
+# ``stop_source``, the run holds, RESUME tops the deficit back up. Two routes are the two
+# Stop buttons an operator can actually press:
+#   * ``api/routes/printers.py``    — the printer card's stop;
+#   * ``api/routes/print_queue.py`` — the queue page's stop.
+# The third caller used to be ``service_hold.quiesce``, and deleting it IS the 2026-09-19
+# ruling: **no mode verb ends a print.** Entering maintenance mode or deactivating a
+# printer stands the FARM's own actions down — a sweep it commanded, a dispatch not yet on
+# the wire — while the print, which belongs to the operator, runs to its own terminal. A
+# future mode verb that reaches for this pair is a silent plate cancellation, and this
+# test is what turns it into a CI failure with a decision to argue in the diff.
+_OPERATOR_STOP_CALLERS = {
+    ("services", "print_control.py"),  # defines it
+    ("api", "routes", "printers.py"),
+    ("api", "routes", "print_queue.py"),
+}
+
+
 def _relative_parts(py_file: Path) -> tuple[str, ...]:
     return py_file.relative_to(BACKEND_DIR).parts
+
+
+def _scan_operator_stops(py_file: Path) -> list[tuple[str, int]]:
+    """Every CALL of ``stop_as_operator``, however the module was imported.
+
+    AST rather than grep for the same reason the incident scan is: the verb is named in
+    prose all over this codebase (it is the thing the rulings are about), and pinning the
+    prose would make the rule unwritable.
+    """
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name == "stop_as_operator":
+            hits.append(("stop_as_operator()", node.lineno))
+    return hits
+
+
+class TestOperatorStopOwnership:
+    """Only an operator's Stop button may send an operator stop.
+
+    A SOURCE pin, deliberately: the failure it catches is a new mode verb that quietly
+    cancels the running print — behaviour every other test in the suite is happy with,
+    because the resulting cancel is perfectly well-formed. It is the ATTRIBUTION that is
+    a lie.
+    """
+
+    def test_only_the_two_stop_routes_send_an_operator_stop(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts in _OPERATOR_STOP_CALLERS:
+                continue
+            for symbol, line in _scan_operator_stops(py_file):
+                strays.append(f"  - {'/'.join(parts)}:{line} calls {symbol}")
+
+        if strays:
+            pytest.fail(
+                "Something outside the two Stop routes sends an operator stop:\n"
+                + "\n".join(strays)
+                + "\n\nNo mode verb ends a print (2026-09-19): maintenance mode and deactivation "
+                "stand the FARM's actions down and leave the operator's print running. If a new "
+                "caller really is a human pressing Stop, add it here with its reason."
+            )
+
+    def test_the_allowlisted_stop_routes_are_still_there(self):
+        """The liveness half: an allowlist whose entries have all moved away stops
+        policing anything, and the scan above would then pass on an empty set."""
+        # ``print_control`` DEFINES the verb with a ``def`` rather than calling it, so it
+        # is allowlisted but never a hit — every other entry must be.
+        callers = _OPERATOR_STOP_CALLERS - {("services", "print_control.py")}
+        senders = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_operator_stops(f)}
+        assert senders == callers
 
 
 def _scan_resolution_vocabulary(py_file: Path) -> list[tuple[str, int]]:

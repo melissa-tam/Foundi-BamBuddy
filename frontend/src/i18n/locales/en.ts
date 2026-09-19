@@ -173,6 +173,7 @@ export default {
       timeCol: 'Finished / started',
       stoppedByOperator: 'Stopped by operator',
       stoppedByFarmVision: 'Stopped by the farm: plate check',
+      stoppedByReconcileUnknown: 'Outcome unknown after reconnect',
       firstArticleBadge: 'First article',
       stagedBadge: 'Staged',
       lowSpoolBadge: 'Low filament',
@@ -572,8 +573,6 @@ export default {
     prints: 'prints',
     more: '+{{count}} more',
     moreActions: 'More',
-    ascending: 'Ascending',
-    descending: 'Descending',
     back: 'Back',
     copy: 'Copy',
     copied: 'Copied!',
@@ -587,6 +586,18 @@ export default {
     duplicate: 'Duplicate',
     left: 'Left',
     right: 'Right',
+    pagination: {
+      showing: 'Showing',
+      to: 'to',
+      of: 'of',
+      show: 'Show',
+      page: 'Page',
+      all: 'All',
+      first: 'First page',
+      previous: 'Previous page',
+      next: 'Next page',
+      last: 'Last page',
+    },
   },
 
   // Printers page
@@ -744,7 +755,6 @@ export default {
       toastEntered: '{{name}} in maintenance mode',
       toastExited: '{{name}} out of maintenance mode',
       confirmTitle: 'Enter maintenance mode on {{name}}?',
-      confirmEffectPrint: '• Stop the running print — the run holds until Resume',
       confirmEffectEject: '• Stop the eject sweep — the plate stays gated',
       confirmEffectCooldown: '• Defer the eject — the cooldown fans run until the bed has cooled, then stop',
     },
@@ -1357,14 +1367,6 @@ export default {
     originalPrintNotVisible: 'Original print not visible - try clearing filters',
     noArchivesYet: 'No archives yet',
     prints: 'prints',
-    pagination: {
-      showing: 'Showing',
-      to: 'to',
-      of: 'of',
-      show: 'Show',
-      page: 'Page',
-      all: 'All',
-    },
     loadingArchives: 'Loading archives...',
     releaseToUpload: 'Release to upload',
     showAll: 'Show all',
@@ -1811,6 +1813,8 @@ export default {
       allLocations: 'All Locations',
       any: 'Any',
       anyOf: 'Any of',
+      emptyTitle: 'No items match the filters',
+      clearFilters: 'Clear filters',
     },
     // Sort
     sort: {
@@ -1821,6 +1825,11 @@ export default {
       byDate: 'Sort by Date',
       ascendingOldest: 'Ascending (oldest first)',
       descendingNewest: 'Descending (newest first)',
+      ascending: 'Sort ascending',
+      descending: 'Sort descending',
+    },
+    reorder: {
+      requiresPositionSort: 'Reordering needs the Position sort, ascending, with SJF off',
     },
     // Badges
     badges: {

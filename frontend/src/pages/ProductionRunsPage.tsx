@@ -6,12 +6,17 @@
  * plates/units bars, status badges, humane ETA, and pause/resume/abort
  * controls (abort behind a required confirmation).
  *
+ * Master–detail on ONE screen: starting a run never navigates away. The new
+ * run's card discloses its blocked-printers panel inline (seeded from the POST
+ * response, which is the detail body), so the operator sees which printers
+ * won't participate and can start the next run without a round trip.
+ *
  * The list polls every 5s via TanStack Query. Numeric form fields are held as
  * strings and coerced/validated once on submit. All copy is i18n; inputs are
  * label-linked (WCAG AA) and keyboard operable.
  */
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -45,7 +50,9 @@ import {
   RunStatusBadge,
   ScheduledChip,
 } from '../components/RunBadges';
-import { isScheduled } from '../utils/productionRuns';
+import { NotEligibleBanner } from '../components/RunEligibility';
+import { useProductionRunDetail } from '../hooks/useProductionRunDetail';
+import { hasLiveBlockedPrinters, isScheduled } from '../utils/productionRuns';
 import { printingUnitPrinters } from '../utils/printingUnitsRefusal';
 import { RunRescheduleDialog } from '../components/RunRescheduleDialog';
 import { ScheduledStartField } from '../components/ScheduledStartField';
@@ -781,6 +788,8 @@ function RunCard({
   canRunAgain,
   canUpdate,
   mutatingId,
+  eligibilityOpen,
+  onToggleEligibility,
 }: {
   run: ProductionRun;
   onPause: (id: number) => void;
@@ -794,6 +803,9 @@ function RunCard({
   canRunAgain: boolean;
   canUpdate: boolean;
   mutatingId: number | null;
+  /** Whether this card's blocked-printers panel is disclosed (per visit). */
+  eligibilityOpen: boolean;
+  onToggleEligibility: (id: number) => void;
 }) {
   const { t } = useTranslation();
   const busy = mutatingId === run.id;
@@ -801,6 +813,27 @@ function RunCard({
   const platePct =
     run.plates_total > 0 ? Math.min(100, Math.round((run.plates_completed / run.plates_total) * 100)) : 0;
   const isTerminal = run.status === 'completed' || run.status === 'cancelled';
+
+  // Blocked-printers disclosure.
+  //
+  // Per-printer reasons live on the DETAIL response only, so the query is
+  // enabled by the DISCLOSURE, never by the list flag: `has_blocked_printers`
+  // is computed without the filament-short / no-USB / capability dimensions, so
+  // gating the fetch on it would hide exactly the runs whose panel has
+  // something to say. Never polled — `production_run_changed` invalidates this
+  // key — and a run just started from this page is already in the cache (the
+  // POST returns the detail body), so its panel opens without a request.
+  const panelId = useId();
+  const { data: detail } = useProductionRunDetail(run.id, {
+    enabled: eligibilityOpen && !isTerminal,
+    poll: false,
+  });
+  const printerStates = detail?.printer_states ?? null;
+  // ONE predicate for the toggle and the thing it toggles: the chip appears
+  // whenever the loaded detail has something to list, so a visible panel always
+  // has a control that can collapse it again.
+  const blocked = hasLiveBlockedPrinters(run, printerStates);
+  const expanded = blocked && eligibilityOpen;
 
   return (
     <Card>
@@ -822,7 +855,15 @@ function RunCard({
               </h3>
               <RunStatusBadge status={run.status} scheduledStartAt={run.scheduled_start_at} />
               <PauseReasonChip run={run} />
-              <BlockedPrintersChip run={run} />
+              <BlockedPrintersChip
+                run={run}
+                printerStates={printerStates}
+                disclosure={{
+                  expanded,
+                  panelId,
+                  onToggle: () => onToggleEligibility(run.id),
+                }}
+              />
               <ScheduledChip run={run} />
             </div>
             <p className="text-sm text-bambu-gray mt-0.5">
@@ -933,6 +974,31 @@ function RunCard({
           </div>
         </div>
 
+        {/* Blocked-printers disclosure panel — the reasons the chip stands for,
+            without leaving the list. The wrapper is always in the DOM while the
+            chip is, so `aria-controls` always resolves; its contents render
+            only while open. The banner self-hides when every printer turns out
+            eligible, leaving the detail link as the only escape hatch. */}
+        {blocked && (
+          <div id={panelId} hidden={!expanded} className="mt-3 space-y-2">
+            {expanded && (
+              <>
+                <NotEligibleBanner
+                  printerStates={printerStates ?? []}
+                  headingLevel={4}
+                  chrome="inline"
+                />
+                <Link
+                  to={`/production-runs/${run.id}`}
+                  className="inline-block text-sm text-bambu-green hover:underline rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green/60"
+                >
+                  {t('productionRuns.viewDetails')}
+                </Link>
+              </>
+            )}
+          </div>
+        )}
+
         {/* Plate progress bar */}
         <div className="mt-4">
           <div className="flex items-center justify-between text-xs text-bambu-gray mb-1">
@@ -1006,7 +1072,6 @@ export function ProductionRunsPage() {
   const { showToast } = useToast();
   const { hasPermission } = useAuth();
   const queryClient = useQueryClient();
-  const navigate = useNavigate();
 
   const canDelete = hasPermission('production_runs:delete');
   const canCreate = hasPermission('production_runs:create');
@@ -1019,6 +1084,17 @@ export function ProductionRunsPage() {
   const [pendingDelete, setPendingDelete] = useState<ProductionRun | null>(null);
   // The run whose start time is being edited in the reschedule dialog (Phase 5).
   const [pendingReschedule, setPendingReschedule] = useState<ProductionRun | null>(null);
+  // Which run cards have their blocked-printers panel disclosed. Per VISIT and
+  // deliberately not persisted: starting a run opens its own card's panel so
+  // the eligibility feedback is immediate without leaving the list, and the
+  // operator may open any other card from there.
+  const [openEligibility, setOpenEligibility] = useState<ReadonlySet<number>>(() => new Set());
+  const toggleEligibility = (id: number) =>
+    setOpenEligibility((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
 
   const {
     data: runs,
@@ -1045,11 +1121,18 @@ export function ProductionRunsPage() {
     onSuccess: (created) => {
       showToast(t('productionRuns.started'));
       invalidate();
+      // `POST /production-runs` answers with the same body as
+      // `GET /production-runs/{id}` (printer_states populated), so seed the
+      // detail cache and let the new card's panel open from this response
+      // instead of issuing its own request. AFTER `invalidate()`, which by
+      // prefix match would otherwise mark this very key stale — writing the
+      // data clears that flag, and the order is the whole point.
+      queryClient.setQueryData(['production-runs', created.id], created);
       setDialogOpen(false);
       setPrefill(null);
-      // Land on the new run's detail page so the eligibility feedback is
-      // immediate on send (the one UX flow change).
-      navigate(`/production-runs/${created.id}`);
+      // Stay on the list — the new run's card discloses its eligibility panel
+      // inline, so starting the next run needs no navigation back.
+      setOpenEligibility((prev) => new Set(prev).add(created.id));
     },
     // No error toast: the failure detail renders inline inside the open
     // dialog (StartRunDialog `error` prop) so it cannot be missed/dismissed.
@@ -1233,6 +1316,8 @@ export function ProductionRunsPage() {
               canRunAgain={canCreate}
               canUpdate={canUpdate}
               mutatingId={mutatingId}
+              eligibilityOpen={openEligibility.has(run.id)}
+              onToggleEligibility={toggleEligibility}
             />
           ))}
         </div>

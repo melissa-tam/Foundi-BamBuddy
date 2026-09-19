@@ -783,6 +783,40 @@ class TestRunDetailPhase4:
         ):
             assert key in unit
 
+    async def test_create_body_equals_get_by_id_body(self, async_client, db_session, tmp_path):
+        """PIN: ``POST /production-runs`` returns exactly what ``GET /{id}`` returns.
+
+        The operator starts a run from the LIST page and stays there, so the new
+        run's card renders its eligibility panel straight from the create body.
+        That only holds while the two payloads are the same object — if create
+        ever drops back to the lean list shape, the card silently loses its panel
+        and the page would have to re-fetch. No field is normalised away here:
+        both bodies are derived from the same committed rows, and nothing in the
+        payload is a wall-clock value, so any difference IS the regression.
+        """
+        eject = await _make_eject_profile(async_client, name="ep-pin")
+        _, file_link_id = await _make_sku_with_file(async_client, db_session, tmp_path, code="SKU406.01")
+        created = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": file_link_id,
+                "target_units": 2,
+                "target_model": "H2S",
+                "eject_profile_id": eject,
+                "require_first_article": False,
+            },
+        )
+        assert created.status_code == 201, created.text
+        body = created.json()
+
+        fetched = await async_client.get(f"/api/v1/production-runs/{body['id']}")
+        assert fetched.status_code == 200, fetched.text
+        assert body == fetched.json()
+
+        # And it really is the DETAIL shape, not a lean body that happens to match.
+        assert isinstance(body["printer_states"], list)
+        assert len(body["units"]) == 2
+
     async def test_pause_reason_lifecycle_over_http(self, async_client, db_session, tmp_path):
         run_id = await self._make_run(async_client, db_session, tmp_path, "SKU402.01")
 

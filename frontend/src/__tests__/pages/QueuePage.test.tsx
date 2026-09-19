@@ -5,8 +5,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { render } from '../utils';
 import { QueuePage } from '../../pages/QueuePage';
+import { api } from '../../api/client';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
 
@@ -913,5 +917,270 @@ describe('QueuePage printers-pool targets', () => {
     expect(namedOutsideFilter('H2C-Beta')).toHaveLength(2);
     // A pool is a target, so nothing lands in the unassigned bucket.
     expect(namedOutsideFilter('Unassigned')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queue ORDER and FILTERS. The page owns neither: order comes from
+// `utils/queueSort`, the predicates from `utils/queueFilter`. These drive the
+// real controls and assert what the DOM ends up showing.
+// ---------------------------------------------------------------------------
+describe('QueuePage sorting', () => {
+  // Position order C, A, B — so every key produces a visibly different list.
+  const sortFleet = [{ ...mockPrinters[0], id: 1, name: 'Zulu' }, { ...mockPrinters[0], id: 2, name: 'Alpha' }];
+  const sortItems = [
+    { ...mockQueueItems[0], id: 51, position: 1, archive_name: 'Unit C', printer_id: 1, printer_name: 'Zulu', scheduled_time: '2026-03-01T10:00:00Z' },
+    { ...mockQueueItems[0], id: 52, position: 2, archive_name: 'Unit A', printer_id: 2, printer_name: 'Alpha', scheduled_time: '2026-01-01T10:00:00Z' },
+    { ...mockQueueItems[0], id: 53, position: 3, archive_name: 'Unit B', printer_id: 1, printer_name: 'Zulu', scheduled_time: '2026-02-01T10:00:00Z' },
+  ];
+
+  const shownUnits = () => screen.getAllByText(/^Unit [A-Z]$/).map((el) => el.textContent);
+
+  beforeEach(() => {
+    vi.mocked(localStorage.getItem).mockImplementation(() => null);
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(sortFleet)),
+      http.get('/api/v1/queue/', () => HttpResponse.json(sortItems)),
+    );
+  });
+
+  it('starts in stored position order', async () => {
+    render(<QueuePage />);
+    await screen.findByText('Unit C');
+    // Position lanes by TARGET first: Zulu's two units in position order, then
+    // Alpha's — the same lanes the scheduler drains.
+    expect(shownUnits()).toEqual(['Unit C', 'Unit B', 'Unit A']);
+  });
+
+  it('reorders the DOM for every sort key, and for the direction toggle', async () => {
+    const user = userEvent.setup();
+    render(<QueuePage />);
+    await screen.findByText('Unit C');
+    const sortSelect = screen.getByDisplayValue('Sort by Position');
+
+    await user.selectOptions(sortSelect, 'name');
+    await waitFor(() => expect(shownUnits()).toEqual(['Unit A', 'Unit B', 'Unit C']));
+
+    // The button names the CURRENT direction (the page's existing reading);
+    // clicking it flips the list.
+    await user.click(screen.getByRole('button', { name: 'Sort ascending' }));
+    await waitFor(() => expect(shownUnits()).toEqual(['Unit C', 'Unit B', 'Unit A']));
+
+    await user.click(screen.getByRole('button', { name: 'Sort descending' }));
+    // By printer: Alpha's unit first, then Zulu's two in position order.
+    await user.selectOptions(sortSelect, 'printer');
+    await waitFor(() => expect(shownUnits()).toEqual(['Unit A', 'Unit C', 'Unit B']));
+
+    await user.selectOptions(sortSelect, 'time');
+    await waitFor(() => expect(shownUnits()).toEqual(['Unit A', 'Unit B', 'Unit C']));
+  });
+
+  it('sorts the history tab and names its direction by the date reading', async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([
+          { ...sortItems[0], id: 61, status: 'completed', archive_name: 'Unit C', completed_at: '2026-01-03T00:00:00Z' },
+          { ...sortItems[1], id: 62, status: 'completed', archive_name: 'Unit A', completed_at: '2026-01-01T00:00:00Z' },
+          { ...sortItems[2], id: 63, status: 'completed', archive_name: 'Unit B', completed_at: '2026-01-02T00:00:00Z' },
+        ]),
+      ),
+    );
+
+    render(<QueuePage />);
+    await user.click(await screen.findByRole('button', { name: /^History/ }));
+
+    // Default is newest first.
+    await waitFor(() => expect(shownUnits()).toEqual(['Unit C', 'Unit B', 'Unit A']));
+    await user.click(screen.getByRole('button', { name: 'Descending (newest first)' }));
+    await waitFor(() => expect(shownUnits()).toEqual(['Unit A', 'Unit B', 'Unit C']));
+    await waitFor(() => expect(shownUnits()).toEqual(['Unit A', 'Unit B', 'Unit C']));
+
+    // A non-date key drops the oldest/newest wording.
+    await user.selectOptions(screen.getByDisplayValue('Sort by Date'), 'name');
+    expect(await screen.findByRole('button', { name: 'Sort ascending' })).toBeInTheDocument();
+  });
+});
+
+describe('QueuePage filters', () => {
+  beforeEach(() => {
+    vi.mocked(localStorage.getItem).mockImplementation(() => null);
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(mockPrinters)),
+      http.get('/api/v1/queue/', () => HttpResponse.json(mockQueueItems)),
+    );
+  });
+
+  it('applies the status filter as a VIEW — one fetch, not a narrowed one', async () => {
+    const user = userEvent.setup();
+    const statuses: (string | null)[] = [];
+    server.use(
+      http.get('/api/v1/queue/', ({ request }) => {
+        statuses.push(new URL(request.url).searchParams.get('status'));
+        return HttpResponse.json(mockQueueItems);
+      }),
+    );
+
+    render(<QueuePage />);
+    await screen.findByText('Test Print 1');
+    await user.selectOptions(screen.getByDisplayValue('All Status'), 'completed');
+
+    // The page never asks the server to narrow by status.
+    await waitFor(() => expect(screen.queryByText('Test Print 1')).not.toBeInTheDocument());
+    expect(statuses.every((s) => s === null)).toBe(true);
+  });
+
+  it('shows the filtered-empty card, and Clear filters brings the rows back', async () => {
+    const user = userEvent.setup();
+    render(<QueuePage />);
+    await screen.findByText('Test Print 1');
+
+    // Nothing pending or printing is "completed" — the queue tab empties.
+    await user.selectOptions(screen.getByDisplayValue('All Status'), 'completed');
+    expect(await screen.findByText('No items match the filters')).toBeInTheDocument();
+    // NOT the "queue is empty" copy: the queue has rows, the filters hid them.
+    expect(screen.queryByText('No prints scheduled')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(await screen.findByText('Test Print 1')).toBeInTheDocument();
+  });
+
+  it('shows the filtered-empty card on the history tab too', async () => {
+    const user = userEvent.setup();
+    render(<QueuePage />);
+    await user.click(await screen.findByRole('button', { name: /^History/ }));
+    await screen.findByText('Completed Print');
+
+    await user.selectOptions(screen.getByDisplayValue('All Status'), 'pending');
+    expect(await screen.findByText('No items match the filters')).toBeInTheDocument();
+  });
+});
+
+describe('QueuePage history paging', () => {
+  // 60 terminal units: more than the old hard `slice(0, 50)`, which simply
+  // dropped everything past the 50th with no way to reach it.
+  const many = Array.from({ length: 60 }, (_, i) => ({
+    ...mockQueueItems[2],
+    id: 100 + i,
+    archive_name: `Hist ${i + 1}`,
+    completed_at: `2026-01-01T00:${String(i).padStart(2, '0')}:00Z`,
+  }));
+
+  beforeEach(() => {
+    vi.mocked(localStorage.getItem).mockImplementation(() => null);
+    server.use(http.get('/api/v1/queue/', () => HttpResponse.json(many)));
+  });
+
+  it('pages past 50 instead of truncating', async () => {
+    const user = userEvent.setup();
+    render(<QueuePage />);
+    await user.click(await screen.findByRole('button', { name: /^History/ }));
+
+    // Newest first: page 1 ends at Hist 11, so Hist 1 is on page 2.
+    expect(await screen.findByText('Hist 60')).toBeInTheDocument();
+    expect(screen.queryByText('Hist 1')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Next page' }));
+
+    expect(await screen.findByText('Hist 1')).toBeInTheDocument();
+    expect(screen.queryByText('Hist 60')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'First page' }));
+    expect(await screen.findByText('Hist 60')).toBeInTheDocument();
+  });
+});
+
+describe('QueuePage reorder', () => {
+  beforeEach(() => {
+    vi.mocked(localStorage.getItem).mockImplementation(() => null);
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(mockPrinters)),
+      http.get('/api/v1/queue/', () => HttpResponse.json(mockQueueItems)),
+    );
+  });
+
+  it('offers the drag handle under the stored order', async () => {
+    render(<QueuePage />);
+    await screen.findByText('Test Print 1');
+    expect(screen.queryByTitle(/Reordering needs the Position sort/)).not.toBeInTheDocument();
+  });
+
+  it('disables dragging under any other sort, and says why', async () => {
+    const user = userEvent.setup();
+    render(<QueuePage />);
+    await screen.findByText('Test Print 1');
+
+    await user.selectOptions(screen.getByDisplayValue('Sort by Position'), 'name');
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByTitle('Reordering needs the Position sort, ascending, with SJF off').length,
+      ).toBeGreaterThan(0),
+    );
+  });
+
+  it('disables dragging when the displayed order is the SJF reading', async () => {
+    server.use(
+      http.get('/api/v1/settings/', () => HttpResponse.json({ queue_shortest_first: true })),
+    );
+
+    render(<QueuePage />);
+    await screen.findByText('Test Print 1');
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByTitle('Reordering needs the Position sort, ascending, with SJF off').length,
+      ).toBeGreaterThan(0),
+    );
+  });
+
+  it('sends the display order as ids only — the server owns positions', async () => {
+    let body: unknown = null;
+    server.use(
+      http.post('/api/v1/queue/reorder', async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json({ message: 'ok' });
+      }),
+    );
+
+    await api.reorderQueue([7, 3, 11]);
+
+    expect(body).toEqual({ ordered_ids: [7, 3, 11] });
+  });
+});
+
+describe('QueuePage owns no queue comparator', () => {
+  /**
+   * Display order has ONE owner (`utils/queueSort`). The page may not grow a
+   * second reading of it — that is how the flat list, the batch children and
+   * the bucket lanes drifted apart in the first place.
+   *
+   * The banner comparator below is allowlisted BY ITS TEXT: it orders the
+   * resume-after-failure banner's PRINTERS by name, not queue rows, so it is
+   * not queue order at all. Same idiom as the backend's AST call-site
+   * allowlists — a new comparator has to be argued for here before it lands.
+   */
+  const ALLOWED_INLINE_COMPARATORS = ['a.printerName.localeCompare(b.printerName)'];
+
+  const readSource = (): string =>
+    fs.readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../pages/QueuePage.tsx'),
+      'utf8',
+    );
+
+  it('declares every inline comparator left in QueuePage.tsx', () => {
+    const source = readSource();
+    const offenders = source
+      .split('\n')
+      .filter((line) => line.includes('.sort(('))
+      .filter((line) => !ALLOWED_INLINE_COMPARATORS.some((allowed) => line.includes(allowed)));
+
+    expect(offenders).toEqual([]);
+  });
+
+  it('reads its order from the one origin', () => {
+    const source = readSource();
+    expect(source).toContain("from '../utils/queueSort'");
+    expect(source).toContain("from '../utils/queueFilter'");
   });
 });

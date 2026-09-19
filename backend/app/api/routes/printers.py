@@ -421,6 +421,9 @@ async def update_printer(
             # (watch retired and awaited, then the quiesce); deactivation is not
             # maintenance mode — no hold is opened here — but losing the session is the
             # one thing that genuinely ends a cooldown, which entering a hold does not.
+            # What it does NOT do is end the PRINT (2026-09-19): no mode verb does. The
+            # printer keeps printing from its own USB storage, unobserved, and the
+            # reconcile that runs on re-activation resolves the queue row's real outcome.
             await service_hold.quiesce_for_teardown(printer_id, cause="deactivate")
         printer_manager.disconnect_printer(printer_id)
         if printer.is_active:

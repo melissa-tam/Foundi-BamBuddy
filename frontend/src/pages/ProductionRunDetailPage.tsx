@@ -12,14 +12,14 @@
 import { useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueries, useQueryClient } from '@tanstack/react-query';
 import {
   AlertCircle,
-  AlertTriangle,
   ArrowLeft,
   CalendarClock,
   Factory,
   Hand,
+  HelpCircle,
   Loader2,
   Pause,
   Play,
@@ -27,6 +27,7 @@ import {
   ScanEye,
   Square,
   Zap,
+  type LucideIcon,
 } from 'lucide-react';
 import { api, type PrinterStatus } from '../api/client';
 import { Card, CardContent } from '../components/Card';
@@ -41,13 +42,15 @@ import {
   RunStatusBadge,
   ScheduledChip,
 } from '../components/RunBadges';
+import { NotEligibleBanner } from '../components/RunEligibility';
+import { useProductionRunDetail } from '../hooks/useProductionRunDetail';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { isScheduled } from '../utils/productionRuns';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { formatDateTime, formatRelativeTime, parseUTCDate } from '../utils/date';
 import { waitingReasonText } from '../utils/waitingReason';
-import type { ProductionRun, RunPrinterState, RunUnit } from '../types/productionRuns';
+import type { RunPrinterState, RunUnit } from '../types/productionRuns';
 
 // ---------------------------------------------------------------------------
 // Unit status pill
@@ -173,125 +176,55 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
 }
 
 // ---------------------------------------------------------------------------
-// Not-eligible panel (immediate dispatch feedback)
-// ---------------------------------------------------------------------------
-
-/**
- * The reasons — as short translated labels — that make one printer ineligible
- * to take a unit from this run right now. Derived from the SAME live flags the
- * chips read (no extra API call): offline, quarantined, awaiting-plate-clear,
- * model mismatch, live filament shortage, no USB drive, and the capability
- * gate. An empty list means the printer is eligible. Busy / stagger-hold are
- * NOT listed — they self-resolve. `capability_reason` and `filament_short_detail`
- * are backend-authored human sentences and render verbatim.
- */
-function eligibilityReasons(state: RunPrinterState, t: (k: string) => string): string[] {
-  const reasons: string[] = [];
-  if (!state.connected) reasons.push(t('productionRuns.detail.eligibility.offline'));
-  if (state.quarantined) reasons.push(t('productionRuns.detail.eligibility.quarantined'));
-  if (state.awaiting_plate_clear) reasons.push(t('productionRuns.detail.eligibility.awaitingPlateClear'));
-  if (state.model_mismatch) {
-    reasons.push(
-      state.model_mismatch_reason
-        ? `${t('productionRuns.detail.eligibility.modelMismatch')} — ${state.model_mismatch_reason}`
-        : t('productionRuns.detail.eligibility.modelMismatch'),
-    );
-  }
-  if (state.filament_short_live) {
-    reasons.push(
-      state.filament_short_detail
-        ? `${t('productionRuns.detail.eligibility.filamentShort')} — ${state.filament_short_detail}`
-        : t('productionRuns.detail.eligibility.filamentShort'),
-    );
-  }
-  if (state.no_usb_drive) reasons.push(t('productionRuns.detail.eligibility.noUsbDrive'));
-  if (state.capability_reason) reasons.push(state.capability_reason);
-  return reasons;
-}
-
-/**
- * Banner card listing every printer the run targets that won't participate yet,
- * with each printer's blocking reasons. Renders nothing when every printer is
- * eligible (no empty-state card). Mirrors the RunStagedBanner tone/styling and
- * reuses the chips' red "blocked" palette; the detail query's 5 s poll + WS
- * invalidation keep it live, so a resolved printer drops off on the next fetch.
- */
-function NotEligibleBanner({ printerStates }: { printerStates: RunPrinterState[] }) {
-  const { t } = useTranslation();
-  const ineligible = printerStates
-    .map((state) => ({ state, reasons: eligibilityReasons(state, t) }))
-    .filter((entry) => entry.reasons.length > 0);
-
-  if (ineligible.length === 0) return null;
-
-  return (
-    <Card>
-      <CardContent>
-        <div className="flex items-start gap-2 rounded-lg border border-red-500/40 bg-red-500/10 p-3">
-          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-red-300" aria-hidden="true" />
-          <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-red-200">
-              {t('productionRuns.detail.eligibility.title')}
-            </h2>
-            <p className="mt-0.5 text-xs text-red-300/90">
-              {t('productionRuns.detail.eligibility.description')}
-            </p>
-            <ul className="mt-2 space-y-2">
-              {ineligible.map(({ state, reasons }) => (
-                <li key={state.printer_id}>
-                  <span className="text-sm font-medium text-white">{state.name}</span>
-                  <ul className="mt-0.5 space-y-0.5">
-                    {reasons.map((reason) => (
-                      <li key={reason} className="text-xs text-red-300">
-                        {reason}
-                      </li>
-                    ))}
-                  </ul>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Unit table row
 // ---------------------------------------------------------------------------
 
+/** How one `PrintQueueItem.stop_source` token renders on the unit row. */
+interface StopSourceLabel {
+  icon: LucideIcon;
+  key: string;
+}
+
 /**
- * `PrintQueueItem.stop_source` written by the FARM, not by a human: the
- * plate-check trip the farm answers by stopping the print (stamped on the row
- * before the stop command — 2026-09-04 pause-recovery wave). Every other value
- * (`operator_ui`, `operator_screen`) is an operator act, so this one must not
- * render "Stopped by operator" — nobody touched the printer.
+ * THE `stop_source` → copy map. Two tokens are NOT a human and must never
+ * render "Stopped by operator" — nobody touched the printer:
+ *
+ * - `farm_vision_abort` — the plate-check trip the farm answers by stopping the
+ *   print (stamped on the row before the stop command, 2026-09-04 wave).
+ * - `reconcile_unknown` — the downtime reconcile found a print it could not
+ *   read an outcome for (printer idle, or a subtask id that no longer matches),
+ *   so the unit is cancelled with the outcome unknown and the run holds.
+ *
+ * Every other value (`operator_ui`, `operator_screen`) is an operator act and
+ * falls through to the operator label.
  */
-const FARM_VISION_ABORT = 'farm_vision_abort';
+const STOP_SOURCE_LABELS: Readonly<Record<string, StopSourceLabel>> = {
+  farm_vision_abort: { icon: ScanEye, key: 'productionRuns.detail.stoppedByFarmVision' },
+  reconcile_unknown: { icon: HelpCircle, key: 'productionRuns.detail.stoppedByReconcileUnknown' },
+};
+
+const OPERATOR_STOP_LABEL: StopSourceLabel = {
+  icon: Hand,
+  key: 'productionRuns.detail.stoppedByOperator',
+};
 
 function UnitRow({ unit }: { unit: RunUnit }) {
   const { t } = useTranslation();
   const waiting = waitingReasonText(unit.waiting_reason, t);
-  const farmStopped = unit.stop_source === FARM_VISION_ABORT;
+  const stopLabel = unit.stop_source
+    ? (STOP_SOURCE_LABELS[unit.stop_source] ?? OPERATOR_STOP_LABEL)
+    : null;
+  const StopIcon = stopLabel?.icon;
   return (
     <tr className="border-b border-bambu-dark-tertiary/60 last:border-0">
       <td className="px-3 py-2 text-sm tabular-nums text-gray-400">#{unit.id}</td>
       <td className="px-3 py-2">
         <div className="flex flex-wrap items-center gap-1.5">
           <UnitStatusPill status={unit.status} />
-          {unit.stop_source && (
+          {stopLabel && StopIcon && (
             <span className="inline-flex items-center gap-1 rounded-full border border-orange-500/30 bg-orange-500/15 px-2 py-0.5 text-xs font-medium text-orange-300">
-              {farmStopped ? (
-                <ScanEye className="h-3 w-3" aria-hidden="true" />
-              ) : (
-                <Hand className="h-3 w-3" aria-hidden="true" />
-              )}
-              {t(
-                farmStopped
-                  ? 'productionRuns.detail.stoppedByFarmVision'
-                  : 'productionRuns.detail.stoppedByOperator',
-              )}
+              <StopIcon className="h-3 w-3" aria-hidden="true" />
+              {t(stopLabel.key)}
             </span>
           )}
           {unit.first_article && (
@@ -361,6 +294,8 @@ export function ProductionRunDetailPage() {
   const [abortConfirmOpen, setAbortConfirmOpen] = useState(false);
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
 
+  // The shared detail query (hooks/useProductionRunDetail). This page is the
+  // whole screen for one run, so it polls; the runs list's cards do not.
   const {
     data: run,
     isLoading,
@@ -368,12 +303,7 @@ export function ProductionRunDetailPage() {
     error,
     refetch,
     isFetching,
-  } = useQuery<ProductionRun, Error>({
-    queryKey: ['production-runs', runId],
-    queryFn: () => api.getProductionRun(runId),
-    enabled: Number.isFinite(runId),
-    refetchInterval: 5000,
-  });
+  } = useProductionRunDetail(runId, { poll: true });
 
   // Live phase inputs for the printer chips (shared cache the WebSocket keeps
   // fresh; 30 s REST fallback mirrors the printer card).
@@ -489,7 +419,10 @@ export function ProductionRunDetailPage() {
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <RunStatusBadge status={run.status} scheduledStartAt={run.scheduled_start_at} />
                     <PauseReasonChip run={run} />
-                    <BlockedPrintersChip run={run} />
+                    {/* This page holds the detail, so the chip reads the same
+                        printer states the eligibility banner below prints —
+                        the list flag alone would under-report them. */}
+                    <BlockedPrintersChip run={run} printerStates={printerStates} />
                     <ScheduledChip run={run} />
                   </div>
                   {run.sku_code && <p className="mt-2 text-sm text-gray-400">{run.sku_code}</p>}
@@ -620,7 +553,7 @@ export function ProductionRunDetailPage() {
           {/* Not-eligible feedback (immediate on send): which targeted printers
               won't participate yet, and why. Above the chips per operator
               placement; self-hides when every printer is eligible. */}
-          <NotEligibleBanner printerStates={printerStates} />
+          <NotEligibleBanner printerStates={printerStates} headingLevel={2} chrome="card" />
 
           {/* Printer states */}
           <Card>

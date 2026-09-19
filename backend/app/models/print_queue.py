@@ -139,10 +139,15 @@ class PrintQueueItem(Base):
     #                       onto the ``printing`` row BEFORE the stop goes out, so the
     #                       terminal HONOURS the mark however the firmware echoes it
     #                       (the ``note_eject_runtime_exceeded`` contract).
-    # NULL for a genuine failure, a normal completion, or a reconcile-synthesised
-    # interruption (unknown cause). Drives the farm policy: an attributed operator stop
-    # takes NO auto-retry and does NOT count toward quarantine (Phase 3), while a farm
-    # abort REQUEUES the plate lineage-only (``farm_policy.on_farm_requeue``, W10).
+    #   'reconcile_unknown' the DOWNTIME reconcile could not learn this print's outcome
+    #                       (the printer came back IDLE, or echoing a different job).
+    #                       Nobody stopped it and nothing failed — the farm simply never
+    #                       saw how it ended, which is a hold for a human, not a silent
+    #                       one-short run.
+    # NULL for a genuine failure or a normal completion. Drives the farm policy: an
+    # attributed operator stop takes NO auto-retry and does NOT count toward quarantine
+    # (Phase 3), while a farm abort REQUEUES the plate lineage-only
+    # (``farm_policy.on_farm_requeue``, W10).
     stop_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Durable mirror of the in-memory PendingEject (services/eject/remote.py): the

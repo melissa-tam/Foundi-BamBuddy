@@ -173,6 +173,7 @@ export default {
       timeCol: '完成 / 开始',
       stoppedByOperator: '已由操作员停止',
       stoppedByFarmVision: '农场停止：打印板检测',
+      stoppedByReconcileUnknown: '重新连接后结果未知',
       firstArticleBadge: '首件',
       stagedBadge: '已搁置',
       lowSpoolBadge: '耗材不足',
@@ -570,8 +571,6 @@ export default {
     prints: '次打印',
     more: '还有 {{count}} 个',
     moreActions: '更多',
-    ascending: '升序',
-    descending: '降序',
     back: '返回',
     copy: '复制',
     copied: '已复制!',
@@ -585,6 +584,18 @@ export default {
     duplicate: '复制',
     left: '左',
     right: '右',
+    pagination: {
+      showing: '显示',
+      to: '至',
+      of: '共',
+      show: '每页',
+      page: '页',
+      all: '全部',
+      first: '第一页',
+      previous: '上一页',
+      next: '下一页',
+      last: '最后一页',
+    },
   },
 
   // Printers page
@@ -737,7 +748,6 @@ export default {
       toastEntered: '{{name}} 已进入维护模式',
       toastExited: '{{name}} 已退出维护模式',
       confirmTitle: '让 {{name}} 进入维护模式？',
-      confirmEffectPrint: '• 停止正在进行的打印 — 生产运行将保持到手动继续',
       confirmEffectEject: '• 停止弹出清扫 — 打印板闸门保持关闭',
       confirmEffectCooldown: '• 延后弹出 — 冷却风扇继续运行至热床冷却后停止',
     },
@@ -1342,14 +1352,6 @@ export default {
     originalPrintNotVisible: '原始打印不可见 - 请尝试清除筛选条件',
     noArchivesYet: '暂无归档',
     prints: '条打印',
-    pagination: {
-      showing: '显示',
-      to: '至',
-      of: '共',
-      show: '每页',
-      page: '页',
-      all: '全部',
-    },
     loadingArchives: '加载归档中...',
     releaseToUpload: '释放以上传',
     showAll: '显示全部',
@@ -1790,6 +1792,8 @@ export default {
       allLocations: '所有位置',
       any: '任意',
       anyOf: '任一',
+      emptyTitle: '没有符合筛选条件的项目',
+      clearFilters: '清除筛选条件',
     },
     // Sort
     sort: {
@@ -1800,6 +1804,11 @@ export default {
       byDate: '按日期排序',
       ascendingOldest: '升序（最旧优先）',
       descendingNewest: '降序（最新优先）',
+      ascending: '升序排序',
+      descending: '降序排序',
+    },
+    reorder: {
+      requiresPositionSort: '重新排序需使用“位置”升序排列且关闭 SJF',
     },
     // Badges
     badges: {

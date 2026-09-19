@@ -2744,8 +2744,9 @@ function PrinterCard({
 
   // What entering the hold will stop, read off live status — the dialog body IS
   // this list, and an empty list is why an idle printer enters on one click.
+  // A RUNNING print is NOT on it: no mode verb ends a print (only Stop does),
+  // so a printer that is merely printing enters on one click too.
   const serviceHoldEffects: string[] = [];
-  if (isActivePrintState) serviceHoldEffects.push(t('printers.maintenance.confirmEffectPrint'));
   if (ejectClaim) serviceHoldEffects.push(t('printers.maintenance.confirmEffectEject'));
   if (status?.eject_watch) serviceHoldEffects.push(t('printers.maintenance.confirmEffectCooldown'));
 

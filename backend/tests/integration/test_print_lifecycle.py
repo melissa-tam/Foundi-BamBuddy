@@ -663,6 +663,96 @@ class TestFarmVisionAbortPrecedence:
         assert stop_source is None
 
 
+class TestReconciledUnknownOutcome:
+    """The downtime reconcile's IDLE branch, end to end (2026-09-19).
+
+    The printer came back with no FINISH/FAILED to believe, so the farm never learned
+    how the print ended. The synthesised terminal used to land as ``aborted`` with a
+    NULL ``stop_source``, which matched no branch in ``farm_policy.on_terminal`` at
+    all — the run stayed ACTIVE, one plate short, with nothing on any surface saying
+    so, and the operator found it by counting parts.
+
+    Three links are pinned here as ONE chain, because each is useless without the next:
+    the reconcile branch SAYS it does not know (``outcome_unknown``), the one classifier
+    turns that into the ``reconcile_unknown`` verdict, and the terminal handler records
+    it — status normalised to ``cancelled``, the verdict stamped on the row. What
+    ``farm_policy`` then does with it (the run holds, RESUME tops the deficit up) is
+    pinned in ``test_farm_policy.TestAnUnknownOutcomeHoldsTheRun``.
+    """
+
+    @staticmethod
+    async def _run_terminal(test_engine, *, outcome_unknown: bool):
+        import contextlib
+        from contextlib import ExitStack
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.farm_correlation import PAYLOAD_KEY_OUTCOME_UNKNOWN
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            printer_id, item_id = await TestPlateClearGate._seed_printing_item(
+                mocks.maker, serial="RCN-1", dispatch_subtask_id="SUB-R"
+            )
+            # The status the POLICY is handed is the load-bearing half: ``aborted``
+            # matched no branch in its disposition fork, which is why the run went
+            # quietly one plate short.
+            policy = stack.enter_context(patch("backend.app.services.farm_policy.on_terminal", new_callable=AsyncMock))
+
+            from backend.app.main import on_print_complete
+
+            # Byte-for-byte the shape ``reconcile_stale_active_prints`` synthesises on
+            # its IDLE / subtask-mismatch branch.
+            payload = {
+                "status": "aborted",
+                "filename": "/data/Metadata/test.gcode",
+                "subtask_name": "Test",
+                "subtask_id": "SUB-R",
+                "timelapse_was_active": False,
+                "peaks_reliable": False,
+                "_reconciled": True,
+            }
+            if outcome_unknown:
+                payload[PAYLOAD_KEY_OUTCOME_UNKNOWN] = True
+            await on_print_complete(printer_id, payload)
+            # The farm hook for a print with no archive rides the ``notify-no-archive``
+            # task, so it is AWAITED rather than drained — a cancel would race the very
+            # call this test reads.
+            for task in asyncio.all_tasks() - tasks_before:
+                if (task.get_name() or "") == "notify-no-archive":
+                    with contextlib.suppress(Exception):
+                        await task
+            await TestPlateClearGate._drain(tasks_before)
+
+            async with mocks.maker() as s:
+                item = await s.get(PrintQueueItem, item_id)
+                policy_status = policy.await_args[0][3] if policy.await_args is not None else None
+                return item.status, item.stop_source, policy_status
+
+    @pytest.mark.asyncio
+    async def test_the_reconcile_abort_records_cancelled_with_the_unknown_verdict(self, test_engine):
+        """LIVENESS — on the pre-2026-09-19 build this row read ``cancelled`` with a
+        NULL ``stop_source`` while the POLICY was handed ``aborted``, and its
+        disposition fork skipped it entirely."""
+        status, stop_source, policy_status = await self._run_terminal(test_engine, outcome_unknown=True)
+
+        assert status == "cancelled"
+        assert stop_source == "reconcile_unknown"
+        # ONE word for this terminal everywhere — including the one the fork reads.
+        assert policy_status == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_abort_is_untouched(self, test_engine):
+        """The flag is what carries the meaning, not the ``aborted`` status: a terminal
+        that simply reports aborted still records no verdict, because nobody said the
+        outcome was unknown — and the policy still sees the raw word."""
+        status, stop_source, policy_status = await self._run_terminal(test_engine, outcome_unknown=False)
+
+        assert status == "cancelled"  # the queue row's own aborted -> cancelled normalisation
+        assert stop_source is None
+        assert policy_status == "aborted"
+
+
 class TestEjectJobCallbacks:
     """C2: a server-dispatched eject sweep (a PendingEject, NO queue item, NO
     archive) must be exempt from the no-deposit status rewrite and the user-facing

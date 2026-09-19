@@ -173,6 +173,7 @@ export default {
       timeCol: 'Bitti / başladı',
       stoppedByOperator: 'Operatör tarafından durduruldu',
       stoppedByFarmVision: 'Çiftlik tarafından durduruldu: plaka kontrolü',
+      stoppedByReconcileUnknown: 'Yeniden bağlantı sonrası sonuç bilinmiyor',
       firstArticleBadge: 'İlk parça',
       stagedBadge: 'Bekletildi',
       lowSpoolBadge: 'Filament az',
@@ -570,8 +571,6 @@ export default {
     prints: 'baskı',
     more: '+{{count}} daha',
     moreActions: 'Daha fazla',
-    ascending: 'Artan',
-    descending: 'Azalan',
     back: 'Geri',
     copy: 'Kopyala',
     copied: 'Kopyalandı!',
@@ -585,6 +584,18 @@ export default {
     duplicate: 'Çoğalt',
     left: 'Sol',
     right: 'Sağ',
+    pagination: {
+      showing: 'Gösterilen',
+      to: '-',
+      of: '/',
+      show: 'Göster',
+      page: 'Sayfa',
+      all: 'Tümü',
+      first: 'İlk sayfa',
+      previous: 'Önceki sayfa',
+      next: 'Sonraki sayfa',
+      last: 'Son sayfa',
+    },
   },
 
   // Yazıcılar sayfası
@@ -737,7 +748,6 @@ export default {
       toastEntered: '{{name}} bakım modunda',
       toastExited: '{{name}} bakım modundan çıktı',
       confirmTitle: '{{name}} bakım moduna alınsın mı?',
-      confirmEffectPrint: '• Süren baskıyı durdur — seri, Sürdür denene kadar bekler',
       confirmEffectEject: '• Çıkarma süpürmesini durdur — plaka kilitli kalır',
       confirmEffectCooldown: '• Çıkarmayı ertele — soğutma fanları tabla soğuyana kadar çalışır, sonra durur',
     },
@@ -1342,14 +1352,6 @@ export default {
     originalPrintNotVisible: 'Orijinal baskı görünmüyor - filtreleri temizlemeyi deneyin',
     noArchivesYet: 'Henüz arşiv yok',
     prints: 'baskı',
-    pagination: {
-      showing: 'Gösterilen',
-      to: '-',
-      of: '/',
-      show: 'Göster',
-      page: 'Sayfa',
-      all: 'Tümü',
-    },
     loadingArchives: 'Arşivler yükleniyor...',
     releaseToUpload: 'Yüklemek için bırakın',
     showAll: 'Tümünü göster',
@@ -1790,6 +1792,8 @@ export default {
       allLocations: 'Tüm Konumlar',
       any: 'Herhangi',
       anyOf: 'Şunlardan biri',
+      emptyTitle: 'Filtrelerle eşleşen öğe yok',
+      clearFilters: 'Filtreleri temizle',
     },
     // Sıralama
     sort: {
@@ -1800,6 +1804,11 @@ export default {
       byDate: 'Tarihe Göre Sırala',
       ascendingOldest: 'Artan (önce en eski)',
       descendingNewest: 'Azalan (önce en yeni)',
+      ascending: 'Artan sırada sırala',
+      descending: 'Azalan sırada sırala',
+    },
+    reorder: {
+      requiresPositionSort: 'Yeniden sıralama için konum sıralaması (artan, SJF kapalı) gerekir',
     },
     // Rozetler
     badges: {
