@@ -104,6 +104,22 @@ AMS_FAULT_KINDS: frozenset[str] = frozenset({KIND_JAM, KIND_RUNOUT, KIND_PHYSICA
 # set, so a second declared kind joins the fleet-wide quiesce by registering here.
 DECLARED_KINDS: frozenset[str] = frozenset({KIND_SERVICE_HOLD})
 
+# Every kind this store knows, as the UNION of the three vocabularies above — so a
+# fourth vocabulary joins by being registered rather than by being remembered here.
+ALL_KINDS: frozenset[str] = AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS
+# **A HOLD IS NOT A FAULT.** The kinds that mean *the equipment is faulted* — everything
+# a fault produced, which is everything a human did NOT simply declare. DERIVED by
+# subtraction rather than re-listed, so a new declared kind leaves this set the moment it
+# is registered and a new fault kind joins it the same way.
+#
+# The distinction is load-bearing exactly once, and that once is worth the name: an
+# operator Stop on a printer whose only open row is a ``service_hold`` must keep the
+# ordinary operator-stop disposition (cancelled, the run holds, RESUME tops the deficit
+# back up). Read through the un-narrowed "any open incident" question it would instead
+# be "do this plate again" — a requeue, because the printer was HELD — which is exactly
+# the wrong answer for the one hold that means nothing is broken.
+FAULT_KINDS: frozenset[str] = ALL_KINDS - DECLARED_KINDS
+
 # The RETURN-TO-NORMAL rule: what evidence ends a hold of each kind.
 #
 # ``"wire"``    the printer's own state answers it — a PAUSE->RUNNING edge, a job

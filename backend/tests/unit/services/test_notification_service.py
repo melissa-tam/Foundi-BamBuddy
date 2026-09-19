@@ -3699,3 +3699,98 @@ class TestHeldPrinterSuppression:
         send, _digest, _logged = await self._fan_out(service, event_type="plate_not_empty", printer_id=None)
 
         send.assert_called_once()
+
+
+class TestDeactivatedPrinterSuppression:
+    """A DEACTIVATED printer is standing down too (2026-09-19).
+
+    Deactivation opens no incident row, and ``farm_stall.check_stalled_prints`` has no
+    ``is_active`` read of its own — so a printer an operator deliberately switched off
+    mid-print paged ``print_stalled`` 30 minutes later, about a print the farm had
+    already been taken out of. Widened at the ONE gate rather than in ``farm_stall``,
+    for the reason the gate exists: one predicate covers all ten farm-reaction events,
+    where a second suppression site would cover exactly one.
+
+    Driven over a REAL session, because the ``is_active`` half is a DB read — nothing
+    caches that fact for services, and the card's Deactivated pill is served straight
+    off the row.
+    """
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
+
+    async def _fan_out(self, service, db, *, event_type, printer_id):
+        provider = MagicMock()
+        provider.id = 1
+        provider.name = "Test Provider"
+        provider.provider_type = "ntfy"
+        provider.enabled = True
+        provider.daily_digest_enabled = True
+        provider.daily_digest_time = "23:59"
+        provider.config = '{"server": "https://ntfy.sh", "topic": "test"}'
+        with (
+            patch.object(service, "_send_to_provider", new_callable=AsyncMock) as send,
+            patch.object(service, "_queue_for_digest", new_callable=AsyncMock) as digest,
+            patch.object(service, "_update_provider_status", new_callable=AsyncMock),
+            patch.object(service, "_log_notification", new_callable=AsyncMock),
+        ):
+            send.return_value = (True, None)
+            await service._send_to_providers(
+                providers=[provider],
+                title="t",
+                message="m",
+                db=db,
+                event_type=event_type,
+                printer_id=printer_id,
+            )
+        return send, digest
+
+    @pytest.mark.asyncio
+    async def test_a_deactivated_printer_suppresses_a_farm_reaction_page(self, service, db_session, printer_factory):
+        """LIVENESS — the ``print_stalled`` page 30 minutes after a deliberate
+        deactivation is the shape this closes."""
+        printer = await printer_factory(is_active=False)
+
+        send, digest = await self._fan_out(service, db_session, event_type="print_stalled", printer_id=printer.id)
+
+        send.assert_not_called()
+        digest.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_active_unheld_printer_still_pages(self, service, db_session, printer_factory):
+        """The other direction, and the one that matters most: an UNPLUGGED printer is
+        active, so its stall page still goes out. Deactivated is an operator statement;
+        offline is a fault."""
+        printer = await printer_factory(is_active=True)
+
+        send, _digest = await self._fan_out(service, db_session, event_type="print_stalled", printer_id=printer.id)
+
+        send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_deactivated_printer_still_gets_its_own_alarms(self, service, db_session, printer_factory):
+        """The set is unchanged: only FARM-REACTION events are suppressed. A printer
+        that is deactivated has nothing to say on MQTT, but if something does emit a
+        printer-originated event for it, the gate is not what stops it."""
+        printer = await printer_factory(is_active=False)
+
+        send, _digest = await self._fan_out(service, db_session, event_type="print_complete", printer_id=printer.id)
+
+        send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_printer_id_does_not_suppress(self, service, db_session):
+        """Fails OPEN: no row to read means no statement that the farm is standing
+        down, and an extra page is noise where a wrongly suppressed one is silence."""
+        send, _digest = await self._fan_out(service, db_session, event_type="print_stalled", printer_id=424242)
+
+        send.assert_called_once()

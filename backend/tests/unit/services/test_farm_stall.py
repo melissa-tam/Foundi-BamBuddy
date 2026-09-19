@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from backend.app.models.print_queue import PrintQueueItem
-from backend.app.services import farm_stall, notify_dedup
+from backend.app.services import dispatch_claim, farm_stall, notify_dedup
 from backend.app.services.notification_service import notification_service
 
 pytestmark = pytest.mark.asyncio
@@ -35,6 +35,22 @@ class _FakeState:
         self.subtask_id = subtask_id
 
 
+class _FakeClient:
+    """The one question ``farm_stall._live_state_is_fresh`` asks the MQTT client.
+
+    Its own double rather than a flag on the manager, because the freshness fact lives
+    on the CLIENT in production (``BambuMQTTClient.is_stale``) — ``is_connected`` can
+    still answer True over a snapshot nobody is refreshing, for up to the stale-reconnect
+    cooldown, and that gap is exactly what this evidence field closes.
+    """
+
+    def __init__(self, stale: bool = False):
+        self.stale = stale
+
+    def is_stale(self) -> bool:
+        return self.stale
+
+
 def _runout_demand(ams_id: int, tray_id: int):
     """A slot-attributed runout DEMAND ("AMS X Slot N ... Please insert a new
     filament.") in the HMSError shape the decoder consumes."""
@@ -43,15 +59,25 @@ def _runout_demand(ams_id: int, tray_id: int):
 
 
 class _FakeManager:
-    def __init__(self, connected: dict[int, bool], states: dict[int, _FakeState] | None = None):
+    def __init__(
+        self,
+        connected: dict[int, bool],
+        states: dict[int, _FakeState] | None = None,
+        *,
+        stale: bool = False,
+    ):
         self._connected = connected
         self._states = states or {}
+        self._client = _FakeClient(stale=stale)
 
     def is_connected(self, pid: int) -> bool:
         return self._connected.get(pid, False)
 
     def get_status(self, pid: int):
         return self._states.get(pid)
+
+    def get_client(self, pid: int):
+        return self._client
 
 
 @pytest.fixture(autouse=True)
@@ -798,7 +824,11 @@ class TestForeignPausedPrinters:
 # The dead dispatch claim (2026-08-29, 001-H2S item 1010)
 # --------------------------------------------------------------------------- #
 _NOW = 1_800_000_000.0  # a plausible epoch, since this watch compares against started_at
-_MIN_AGE = farm_stall._DEAD_CLAIM_MIN_AGE_S
+# The start budget REPLACED the old ``_DEAD_CLAIM_MIN_AGE_S = 600`` (a timer guessing at
+# the start watchdog's liveness). It is the watchdog's own Phase A figure, and it only
+# applies to a claim NO watchdog is watching — a live one answers ``watchdog_owns`` at
+# any age.
+_BUDGET = dispatch_claim.DISPATCH_START_BUDGET_S
 _CLAIM_DWELL = farm_stall._DEAD_CLAIM_DWELL_S
 
 
@@ -808,7 +838,7 @@ def _stamp(age_s: float):
     return datetime.fromtimestamp(_NOW - age_s, tz=timezone.utc).replace(tzinfo=None)
 
 
-async def _add_claim(db, printer_id, *, age_s=_MIN_AGE + 60, dispatch_subtask_id="dispatch-1", pos=1):
+async def _add_claim(db, printer_id, *, age_s=_BUDGET + 60, dispatch_subtask_id="dispatch-1", pos=1):
     """A unit claiming ``printing`` on ``printer_id`` since ``age_s`` ago."""
     it = PrintQueueItem(
         printer_id=printer_id,
@@ -879,14 +909,64 @@ class TestDeadDispatchClaims:
 
         assert 22 not in await _busy_printer_ids(db_session)
 
-    async def test_a_young_claim_is_untouched(self, db_session):
-        """Clock A: the dispatch watchdog owns the first 270 s and is always the
-        first responder — this watch only ever sees what it missed."""
-        item = await _add_claim(db_session, 23, age_s=120)
+    async def test_a_claim_inside_the_start_budget_is_untouched(self, db_session):
+        """The measured non-active window after a job is accepted: a printer may still
+        be digesting the file. This is the floor for an UNWATCHED claim — the
+        post-restart case, where there is no watchdog left to ask."""
+        item = await _add_claim(db_session, 23, age_s=_BUDGET - 30)
         mgr = _FakeManager({23: True}, {23: _FakeState("IDLE")})
 
         await _mature(db_session, mgr)
 
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
+
+    async def test_a_live_start_watchdog_owns_the_claim_at_any_age(self, db_session):
+        """Ownership is ASKED, not timed (2026-09-19). This is the case the old 600 s
+        minimum age was a proxy for — and asking is what let the floor drop to the start
+        budget for every claim that has NO watchdog."""
+
+        class _Live:
+            def done(self) -> bool:
+                return False
+
+        item = await _add_claim(db_session, 35, age_s=20 * 60)
+        dispatch_claim._start_watchdogs[item.id] = _Live()
+        mgr = _FakeManager({35: True}, {35: _FakeState("IDLE")})
+
+        await _mature(db_session, mgr)
+
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
+
+    async def test_an_exited_watchdog_no_longer_owns_it(self, db_session):
+        """LIVENESS of the handoff: a registry entry whose task is done reads as no
+        watchdog, so the claim it left behind is released on the ordinary clocks
+        instead of waiting for a timer nobody reset."""
+
+        class _Done:
+            def done(self) -> bool:
+                return True
+
+        item = await _add_claim(db_session, 36)
+        dispatch_claim._start_watchdogs[item.id] = _Done()
+        mgr = _FakeManager({36: True}, {36: _FakeState("IDLE")})
+
+        await _mature(db_session, mgr)
+
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).status == "pending"
+
+    async def test_a_stale_live_state_does_not_advance_the_dwell(self, db_session):
+        """``is_connected`` can answer True over a snapshot nobody is refreshing (the
+        stale-reconnect cooldown). A release decided on that is a guess, and the cost of
+        a wrong one is a print onto an occupied plate."""
+        item = await _add_claim(db_session, 37)
+        stale = _FakeManager({37: True}, {37: _FakeState("IDLE")}, stale=True)
+
+        await _mature(db_session, stale)
+
+        assert farm_stall._dead_claim_since == {}
         db_session.expunge_all()
         assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
 

@@ -1045,10 +1045,19 @@ class TestOnPlateCleared:
 class TestMaintenanceModeStandsAside:
     """Maintenance mode (2026-09-12): the prompt in front of the operator is theirs.
 
-    The sampler's two acts are the power-loss driver and the lost-Z arm, and a held
-    printer gets neither: nothing is resumed, nothing is stopped, and no hold is opened —
-    a human is at the screen, and the farm answering the prompt behind them is exactly the
-    surprise the hold exists to prevent.
+    The sampler has two acts and they are held down DIFFERENTLY, because only one of
+    them is the farm ACTING:
+
+    * the power-loss driver is an act — it resumes or stops somebody else's print — so a
+      held printer gets none of it. Nothing is resumed, nothing is stopped, and no
+      ``power_loss`` row is opened: a human is at the screen, and the farm answering the
+      prompt behind them is exactly the surprise the hold exists to prevent;
+    * the lost-Z arm is a REFUSAL RECORD (2026-09-19). It opens no driver and moves
+      nothing; all it does is make every LATER eject refuse until a human clears the
+      plate. An outage destroys the Z datum whether or not a hold happens to stand at
+      that moment, so skipping the record would leave the printer looking trustworthy
+      when it is not — the 2026-09-04 bed-past-the-floor mechanism, arrived at by
+      omission.
     """
 
     async def _hold(self, db, printer_id):
@@ -1076,30 +1085,47 @@ class TestMaintenanceModeStandsAside:
 
         assert [row.kind for row in await _open_incidents(db_session, 41)] == [KIND_SERVICE_HOLD]
 
-    async def test_a_reconnect_during_the_hold_opens_no_lost_z_row(self, monkeypatch, db_session):
-        """The outage-burst arm is the other act, and it is held down by the same read."""
+    async def test_an_outage_during_the_hold_still_opens_the_lost_z_row(self, monkeypatch, db_session):
+        """LIVENESS — the assertion that used to be its own opposite (2026-09-19).
+
+        The row is a refusal record, not a recovery act: a power cycle destroys the Z
+        datum regardless of who owns the machine, and an eject dispatched after the hold
+        lifts would drive a sweep against a Z frame that is fiction. Nothing is resumed
+        and nothing is stopped — only the record is written.
+        """
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD, KIND_Z_REFERENCE_LOST
+
         await _printer(db_session, 42)
-        await _geometry(db_session)
+        await _geometry(db_session)  # z_reference_validated False — no witnessed Z stop
         await self._hold(db_session, 42)
         page = _spy(monkeypatch, "on_z_reference_lost")
         anchor = time.time() - 300.0
         state = _make_state(gcode_state="IDLE", hms=[], epoch=2, disconnected_at=anchor)
-        _wire(monkeypatch, state, None, fleet={pid: _make_state(disconnected_at=anchor + pid) for pid in range(1, 5)})
+        client = FakeClient(state)
+        calls = _wire(
+            monkeypatch, state, client, fleet={pid: _make_state(disconnected_at=anchor + pid) for pid in range(1, 5)}
+        )
         plate_occupancy.note_plate_detected(42, "part on the plate")
 
         pause_recovery.note_status_push(42, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(42, state)  # the reconnect edge
         await _drain_z_arm(42)
 
-        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
-
-        assert [row.kind for row in await _open_incidents(db_session, 42)] == [KIND_SERVICE_HOLD]
-        page.assert_not_awaited()
+        assert sorted(row.kind for row in await _open_incidents(db_session, 42)) == sorted(
+            [KIND_SERVICE_HOLD, KIND_Z_REFERENCE_LOST]
+        )
+        # The page is deliberately NOT a suppressed farm-reaction event: the hold it
+        # names outlives the maintenance window and refuses every later eject.
+        page.assert_awaited_once()
+        # ...and the acting half of the sampler still stood aside.
+        assert client.calls == [], "nothing resumed"
+        assert calls == [], "nothing stopped"
 
     async def test_releasing_the_hold_does_not_replay_the_edge(self, monkeypatch, db_session):
         """The wire sample is still RECORDED while held, so an edge consumed during the
-        hold is not waiting to fire at the printer the moment it is released."""
-        from backend.app.models.printer_incident import KIND_SERVICE_HOLD, STATUS_RESOLVED
+        hold is not waiting to fire a SECOND time at the printer the moment it is
+        released — the lost-Z row was already written at the edge itself, once."""
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD, KIND_Z_REFERENCE_LOST, STATUS_RESOLVED
 
         await _printer(db_session, 43)
         await _geometry(db_session)
@@ -1111,8 +1137,9 @@ class TestMaintenanceModeStandsAside:
         plate_occupancy.note_plate_detected(43, "part on the plate")
 
         pause_recovery.note_status_push(43, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
-        pause_recovery.note_status_push(43, after)  # the reconnect edge, consumed by the hold
+        pause_recovery.note_status_push(43, after)  # the reconnect edge
         await _drain_z_arm(43)
+        assert page.await_count == 1
 
         row = await printer_incidents.get_open(db_session, 43, kinds={KIND_SERVICE_HOLD})
         assert row is not None
@@ -1121,7 +1148,7 @@ class TestMaintenanceModeStandsAside:
         pause_recovery.note_status_push(43, after)  # same epoch: no edge left to replay
         await _drain_z_arm(43)
 
-        # The hold row (now closed) is the ONLY row this printer ever got: the released
-        # printer did not earn a lost-Z hold for an outage that happened during the hold.
-        assert [row.kind for row in await _open_incidents(db_session, 43)] == [KIND_SERVICE_HOLD]
-        page.assert_not_awaited()
+        # Still exactly ONE lost-Z row and one page: the release replayed nothing.
+        kinds = [row.kind for row in await _open_incidents(db_session, 43)]
+        assert kinds.count(KIND_Z_REFERENCE_LOST) == 1
+        assert page.await_count == 1

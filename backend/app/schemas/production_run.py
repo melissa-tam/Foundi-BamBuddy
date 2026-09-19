@@ -23,7 +23,8 @@ class RunPrinterState(BaseModel):
     Fully DERIVED (never stored): quarantine from the printer row, plate gate /
     model mismatch / connectivity from the live printer manager, stall and
     printer-vision holds from the run's items' ``waiting_reason`` machine codes.
-    Only present on ``GET /production-runs/{id}`` — the list stays lean.
+    Present on the single-run responses (``POST /production-runs`` and
+    ``GET /production-runs/{id}``) — the list stays lean.
     """
 
     printer_id: int
@@ -149,7 +150,9 @@ class RunResponse(BaseModel):
     # True when any printer the run targets is blocked (quarantined, plate gate,
     # model mismatch, offline-stalled, vision hold, or connected-then-lost).
     has_blocked_printers: bool = False
-    # Detail-only payloads (GET /production-runs/{id}); null on the list.
+    # Carried by the two SINGLE-RUN responses — POST /production-runs (create)
+    # and GET /production-runs/{id} — which return byte-identical bodies for the
+    # same run; null on the list, which stays lean.
     printer_states: list[RunPrinterState] | None = None
     units: list[RunUnit] | None = None
     # Farm first-article + failure policy (Phase 3).

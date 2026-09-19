@@ -173,6 +173,7 @@ export default {
       timeCol: 'Fertig / gestartet',
       stoppedByOperator: 'Vom Bediener gestoppt',
       stoppedByFarmVision: 'Von der Farm gestoppt: Plattenprüfung',
+      stoppedByReconcileUnknown: 'Ergebnis nach Wiederverbindung unbekannt',
       firstArticleBadge: 'Erstmuster',
       stagedBadge: 'Zurückgestellt',
       lowSpoolBadge: 'Filament knapp',
@@ -570,8 +571,6 @@ export default {
     prints: 'Drucke',
     more: '+{{count}} weitere',
     moreActions: 'Mehr',
-    ascending: 'Aufsteigend',
-    descending: 'Absteigend',
     back: 'Zurück',
     copy: 'Kopieren',
     copied: 'Kopiert!',
@@ -585,6 +584,18 @@ export default {
     duplicate: 'Duplizieren',
     left: 'Links',
     right: 'Rechts',
+    pagination: {
+      showing: 'Zeige',
+      to: 'bis',
+      of: 'von',
+      show: 'Zeige',
+      page: 'Seite',
+      all: 'Alle',
+      first: 'Erste Seite',
+      previous: 'Vorherige Seite',
+      next: 'Nächste Seite',
+      last: 'Letzte Seite',
+    },
   },
 
   // Printers page
@@ -737,7 +748,6 @@ export default {
       toastEntered: '{{name}} im Wartungsmodus',
       toastExited: '{{name}} nicht mehr im Wartungsmodus',
       confirmTitle: 'Wartungsmodus für {{name}} aktivieren?',
-      confirmEffectPrint: '• Laufenden Druck stoppen — der Auftrag wartet bis Fortsetzen',
       confirmEffectEject: '• Auswurf-Sweep stoppen — die Platte bleibt gesperrt',
       confirmEffectCooldown: '• Auswurf verschieben — die Abkühl-Lüfter laufen, bis das Bett abgekühlt ist, dann stoppen sie',
     },
@@ -1342,14 +1352,6 @@ export default {
     originalPrintNotVisible: 'Ursprünglicher Druck nicht sichtbar - versuchen Sie, die Filter zu löschen',
     noArchivesYet: 'Noch keine Archive',
     prints: 'Drucke',
-    pagination: {
-      showing: 'Zeige',
-      to: 'bis',
-      of: 'von',
-      show: 'Zeige',
-      page: 'Seite',
-      all: 'Alle',
-    },
     loadingArchives: 'Lade Archive...',
     releaseToUpload: 'Loslassen zum Hochladen',
     showAll: 'Alle anzeigen',
@@ -1790,6 +1792,8 @@ export default {
       allLocations: 'Alle Standorte',
       any: 'Beliebig',
       anyOf: 'Beliebig aus',
+      emptyTitle: 'Keine Einträge entsprechen den Filtern',
+      clearFilters: 'Filter zurücksetzen',
     },
     // Sort
     sort: {
@@ -1800,6 +1804,11 @@ export default {
       byDate: 'Nach Datum sortieren',
       ascendingOldest: 'Aufsteigend (älteste zuerst)',
       descendingNewest: 'Absteigend (neueste zuerst)',
+      ascending: 'Aufsteigend sortieren',
+      descending: 'Absteigend sortieren',
+    },
+    reorder: {
+      requiresPositionSort: 'Neu anordnen erfordert die Sortierung nach Position, aufsteigend, ohne SJF',
     },
     // Badges
     badges: {

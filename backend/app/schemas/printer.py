@@ -188,18 +188,18 @@ class OpenIncidentState(BaseModel):
 class ServiceHoldEnterResponse(BaseModel):
     """``POST /printers/{id}/service-hold``: the hold's state plus what the quiesce did.
 
-    The three quiesce bools are the API's and the log's record of what this call actually
-    changed — a second click on an already-quiet printer answers three Falses. (The
+    The two quiesce bools are the API's and the log's record of what this call actually
+    changed — a second click on an already-quiet printer answers two Falses. (The
     operator's toast is static copy: it names the hold's effects, not this payload.)
 
-    There is no cooldown bool: entering a hold no longer ends a cooldown — the fans finish
-    their curve and the eject is withheld — so the only value it could carry is False.
+    There is no cooldown bool and no job bool: entering a hold neither ends a cooldown
+    (the fans finish their curve and the eject is withheld) nor stops a print (no mode
+    verb does — only Stop), so the only value either could carry is False.
     """
 
     held: bool
     already_held: bool
     eject_stopped: bool
-    job_stopped: bool
     lease_revoked: bool
 
 

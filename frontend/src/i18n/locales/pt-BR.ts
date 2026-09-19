@@ -173,6 +173,7 @@ export default {
       timeCol: 'Concluída / iniciada',
       stoppedByOperator: 'Parada pelo operador',
       stoppedByFarmVision: 'Parada pela fazenda: verificação da placa',
+      stoppedByReconcileUnknown: 'Resultado desconhecido após a reconexão',
       firstArticleBadge: 'Primeira peça',
       stagedBadge: 'Retida',
       lowSpoolBadge: 'Filamento insuficiente',
@@ -570,8 +571,6 @@ export default {
     prints: 'impressões',
     more: '+{{count}} mais',
     moreActions: 'Mais',
-    ascending: 'Crescente',
-    descending: 'Decrescente',
     back: 'Voltar',
     copy: 'Copiar',
     copied: 'Copiado!',
@@ -585,6 +584,18 @@ export default {
     duplicate: 'Duplicar',
     left: 'Esquerda',
     right: 'Direita',
+    pagination: {
+      showing: 'Mostrando',
+      to: 'a',
+      of: 'de',
+      show: 'Mostrar',
+      page: 'Página',
+      all: 'Todos',
+      first: 'Primeira página',
+      previous: 'Página anterior',
+      next: 'Próxima página',
+      last: 'Última página',
+    },
   },
 
   // Printers page
@@ -737,7 +748,6 @@ export default {
       toastEntered: '{{name}} em modo manutenção',
       toastExited: '{{name}} fora do modo manutenção',
       confirmTitle: 'Entrar no modo manutenção em {{name}}?',
-      confirmEffectPrint: '• Parar a impressão em andamento — a série aguarda até Retomar',
       confirmEffectEject: '• Parar a varredura de ejeção — a placa continua bloqueada',
       confirmEffectCooldown: '• Adiar a ejeção — os ventiladores de resfriamento funcionam até a mesa esfriar e depois param',
     },
@@ -1342,14 +1352,6 @@ export default {
     originalPrintNotVisible: 'Impressão original não visível - tente limpar os filtros',
     noArchivesYet: 'Ainda não há arquivos',
     prints: 'impressões',
-    pagination: {
-      showing: 'Mostrando',
-      to: 'a',
-      of: 'de',
-      show: 'Mostrar',
-      page: 'Página',
-      all: 'Todos',
-    },
     loadingArchives: 'Carregando arquivos...',
     releaseToUpload: 'Solte para enviar',
     showAll: 'Mostrar todos',
@@ -1790,6 +1792,8 @@ export default {
       allLocations: 'Todos os Locais',
       any: 'Qualquer',
       anyOf: 'Qualquer uma de',
+      emptyTitle: 'Nenhum item corresponde aos filtros',
+      clearFilters: 'Limpar filtros',
     },
     // Sort
     sort: {
@@ -1800,6 +1804,11 @@ export default {
       byDate: 'Ordenar por Data',
       ascendingOldest: 'Crescente (mais antigo primeiro)',
       descendingNewest: 'Decrescente (mais recente primeiro)',
+      ascending: 'Ordenar em ordem crescente',
+      descending: 'Ordenar em ordem decrescente',
+    },
+    reorder: {
+      requiresPositionSort: 'Reordenar exige a ordenação por posição, crescente, com SJF desativado',
     },
     // Badges
     badges: {

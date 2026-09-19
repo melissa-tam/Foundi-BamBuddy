@@ -21,7 +21,7 @@ import { http, HttpResponse } from 'msw';
 import { render } from '../utils';
 import { server } from '../mocks/server';
 import { ProductionRunsPage } from '../../pages/ProductionRunsPage';
-import type { ProductionRun } from '../../types/productionRuns';
+import type { ProductionRun, RunPrinterState } from '../../types/productionRuns';
 import type { Sku } from '../../types/skus';
 
 function run(overrides: Partial<ProductionRun> = {}): ProductionRun {
@@ -960,5 +960,215 @@ describe('ProductionRunsPage', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('abort it first');
+  });
+
+  // -------------------------------------------------------------------------
+  // Master–detail: starting a run stays on the list, and the blocked-printers
+  // chip discloses the eligibility panel inline.
+  // -------------------------------------------------------------------------
+
+  describe('inline eligibility panel', () => {
+    function printerState(overrides: Partial<RunPrinterState> = {}): RunPrinterState {
+      return {
+        printer_id: 1,
+        name: 'H2S-Alpha',
+        connected: true,
+        quarantined: false,
+        awaiting_plate_clear: false,
+        model_mismatch: false,
+        model_mismatch_reason: null,
+        stalled: false,
+        vision_hold: false,
+        filament_short_live: false,
+        filament_short_detail: null,
+        no_usb_drive: false,
+        capability_reason: null,
+        ...overrides,
+      };
+    }
+
+    /** The start dialog's own queries, plus a SKU with one runnable file. */
+    const dialogHandlers = [
+      http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+      http.get('*/api/v1/printers/', () =>
+        HttpResponse.json([{ id: 1, name: 'H2S-Alpha', model: 'H2S' }]),
+      ),
+      emptyEjectProfiles,
+    ];
+
+    /** Fill in the start dialog and submit it. */
+    async function startRun(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(screen.getByRole('button', { name: /start run/i }));
+      const dialog = await screen.findByRole('dialog');
+      const target = screen.getByLabelText(/target units/i);
+      await user.clear(target);
+      await user.type(target, '10');
+      await user.click(within(dialog).getByRole('button', { name: /start run/i }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    }
+
+    it('stays on the list and renders the panel from the POST body, with no extra GET', async () => {
+      const created = run({
+        has_blocked_printers: true,
+        printer_states: [printerState({ connected: false })],
+      });
+      let started = false;
+      let detailGets = 0;
+
+      server.use(
+        ...dialogHandlers,
+        http.get('*/api/v1/production-runs', () => HttpResponse.json(started ? [created] : [])),
+        http.get('*/api/v1/production-runs/:id', () => {
+          detailGets += 1;
+          return HttpResponse.json(created);
+        }),
+        http.post('*/api/v1/production-runs', () => {
+          started = true;
+          // The POST answers with the DETAIL body (printer_states populated).
+          return HttpResponse.json(created, { status: 201 });
+        }),
+      );
+
+      const pathnameBefore = window.location.pathname;
+      const user = userEvent.setup();
+      render(<ProductionRunsPage />);
+      await screen.findByText('No production runs yet');
+
+      await startRun(user);
+
+      // The panel opens on the new run's card…
+      expect(await screen.findByText('Printers not participating')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /printer blocked/i })).toHaveAttribute(
+        'aria-expanded',
+        'true',
+      );
+      // …the reason comes from the POST body's printer_states…
+      expect(screen.getByText('Offline')).toBeInTheDocument();
+      // …and the operator never left the list.
+      expect(window.location.pathname).toBe(pathnameBefore);
+      // The seeded cache answers the panel — no follow-up GET for the detail.
+      expect(detailGets).toBe(0);
+    });
+
+    /**
+     * The list flag is NARROWER than the panel: the backend computes
+     * `has_blocked_printers` without the filament-short / no-USB / capability
+     * dimensions, which live on the detail response only. Gating the chip on
+     * the flag alone hid exactly the runs whose panel had something to say.
+     */
+    it('shows the chip and panel for a detail-only block the list flag misses', async () => {
+      const created = run({
+        has_blocked_printers: false,
+        printer_states: [
+          printerState({
+            filament_short_live: true,
+            filament_short_detail: 'needs 455 g, 260 g on spool',
+          }),
+        ],
+      });
+      let started = false;
+      let detailGets = 0;
+
+      server.use(
+        ...dialogHandlers,
+        http.get('*/api/v1/production-runs', () => HttpResponse.json(started ? [created] : [])),
+        http.get('*/api/v1/production-runs/:id', () => {
+          detailGets += 1;
+          return HttpResponse.json(created);
+        }),
+        http.post('*/api/v1/production-runs', () => {
+          started = true;
+          return HttpResponse.json(created, { status: 201 });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<ProductionRunsPage />);
+      await screen.findByText('No production runs yet');
+
+      await startRun(user);
+
+      expect(await screen.findByText('Printers not participating')).toBeInTheDocument();
+      expect(screen.getByText(/needs 455 g, 260 g on spool/)).toBeInTheDocument();
+      // The toggle exists, so the operator can collapse what was opened for them.
+      const chip = screen.getByRole('button', { name: /printer blocked/i });
+      expect(chip).toHaveAttribute('aria-expanded', 'true');
+      await user.click(chip);
+      await waitFor(() => expect(chip).toHaveAttribute('aria-expanded', 'false'));
+      // Still served entirely by the seeded POST body.
+      expect(detailGets).toBe(0);
+    });
+
+    it('adds no panel when the started run has no blocked printers', async () => {
+      const created = run({ has_blocked_printers: false, printer_states: [printerState()] });
+      let started = false;
+
+      server.use(
+        ...dialogHandlers,
+        http.get('*/api/v1/production-runs', () => HttpResponse.json(started ? [created] : [])),
+        http.post('*/api/v1/production-runs', () => {
+          started = true;
+          return HttpResponse.json(created, { status: 201 });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<ProductionRunsPage />);
+      await screen.findByText('No production runs yet');
+
+      await startRun(user);
+
+      await screen.findByText('WID-001 run');
+      expect(screen.queryByRole('button', { name: /printer blocked/i })).not.toBeInTheDocument();
+      expect(screen.queryByText('Printers not participating')).not.toBeInTheDocument();
+    });
+
+    it('toggles the panel from the keyboard and fetches the detail once', async () => {
+      let detailGets = 0;
+      server.use(
+        http.get('*/api/v1/production-runs', () =>
+          HttpResponse.json([run({ has_blocked_printers: true })]),
+        ),
+        http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
+        http.get('*/api/v1/production-runs/:id', () => {
+          detailGets += 1;
+          return HttpResponse.json(
+            run({
+              has_blocked_printers: true,
+              printer_states: [printerState({ quarantined: true })],
+            }),
+          );
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<ProductionRunsPage />);
+
+      const chip = await screen.findByRole('button', { name: /printer blocked/i });
+      expect(chip).toHaveAttribute('aria-expanded', 'false');
+      // The panel the chip controls is in the DOM even while collapsed, so the
+      // reference always resolves.
+      const panelId = chip.getAttribute('aria-controls')!;
+      expect(document.getElementById(panelId)).not.toBeNull();
+      expect(detailGets).toBe(0);
+
+      // Enter opens it (a real <button>, so no key handling of our own).
+      chip.focus();
+      await user.keyboard('{Enter}');
+      expect(await screen.findByText('Printers not participating')).toBeInTheDocument();
+      expect(screen.getByText('Quarantined')).toBeInTheDocument();
+      await waitFor(() => expect(detailGets).toBe(1));
+      expect(chip).toHaveAttribute('aria-expanded', 'true');
+
+      // Space closes it…
+      await user.keyboard(' ');
+      await waitFor(() => expect(chip).toHaveAttribute('aria-expanded', 'false'));
+      expect(screen.queryByText('Printers not participating')).not.toBeInTheDocument();
+
+      // …and re-opening serves the cache: a card never polls this endpoint.
+      await user.keyboard('{Enter}');
+      expect(await screen.findByText('Printers not participating')).toBeInTheDocument();
+      expect(detailGets).toBe(1);
+    });
   });
 });

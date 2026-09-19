@@ -80,8 +80,10 @@ export interface RunPrinterState {
 export interface RunUnit {
   id: number;
   status: 'pending' | 'printing' | 'completed' | 'failed' | 'skipped' | 'cancelled';
-  /** Who stopped it on purpose: 'operator_ui' / 'operator_screen' (a human) or
-   *  'farm_vision_abort' (the farm, on a plate-check trip — 2026-09-04); else null. */
+  /** Who stopped it on purpose: 'operator_ui' / 'operator_screen' (a human),
+   *  'farm_vision_abort' (the farm, on a plate-check trip — 2026-09-04), or
+   *  'reconcile_unknown' (the downtime reconcile could not read this print's
+   *  outcome off the printer); else null. */
   stop_source: string | null;
   waiting_reason: string | null;
   /** One-time deferred start (UTC ISO); future = held until then, null = ASAP. */

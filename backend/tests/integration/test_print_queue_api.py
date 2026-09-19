@@ -4,6 +4,7 @@ import pytest
 from httpx import AsyncClient
 
 from backend.app.services import spool_selection
+from backend.app.services.dispatch_target import encode_printer_ids
 
 
 class TestPrintQueueAPI:
@@ -3375,17 +3376,28 @@ class TestResumeQueueAfterFailure:
 
 
 class TestReorderEndpoint:
-    """Tests for the /queue/reorder endpoint (#1625-followup duplicate-position validator)."""
+    """``POST /queue/reorder`` takes the display ORDER as ids; the backend numbers it.
+
+    The queue UI renders pinned, model-pool, printer-set-pool and unassigned rows
+    in one list, but positions are scoped (``queue_builder`` position-scope rule:
+    one sequence per pinned printer, one shared sequence for every NULL-printer
+    row). A client numbering its own drag could therefore only mint duplicates, so
+    it sends ids and ``queue_builder.renumber_pending`` assigns ``1..N`` per scope.
+    """
 
     @pytest.fixture
     async def printer_factory(self, db_session):
+        _printer_counter = [0]
+
         async def _create(**kwargs):
             from backend.app.models.printer import Printer
 
+            _printer_counter[0] += 1
+            n = _printer_counter[0]
             defaults = {
-                "name": "Reorder Test Printer",
-                "ip_address": "192.168.1.220",
-                "serial_number": "TESTREORDER001",
+                "name": f"Reorder Test Printer {n}",
+                "ip_address": f"192.168.1.{219 + n}",
+                "serial_number": f"TESTREORDER{n:03d}",
                 "access_code": "12345678",
                 "model": "X1C",
             }
@@ -3423,78 +3435,195 @@ class TestReorderEndpoint:
 
         return _create
 
+    async def _item(self, db_session, archive_factory, **kwargs):
+        from backend.app.models.print_queue import PrintQueueItem
+
+        archive = await archive_factory()
+        item = PrintQueueItem(archive_id=archive.id, status="pending", **kwargs)
+        db_session.add(item)
+        await db_session.commit()
+        await db_session.refresh(item)
+        return item
+
+    async def _positions(self, db_session, items):
+        """``{item_id: (scope, position)}`` read back from the DB."""
+        out = {}
+        for item in items:
+            await db_session.refresh(item)
+            out[item.id] = (item.printer_id, item.position)
+        return out
+
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_reorder_rejects_duplicate_positions(
+    async def test_reorder_renumbers_each_backend_scope(
         self, async_client: AsyncClient, db_session, printer_factory, archive_factory
     ):
-        """Reorder payload with duplicate positions → 422 at schema layer.
+        """One mixed drag → 1..N per scope, no duplicates, requested order kept.
 
-        Regression guard: pre-fix, a buggy client sending two items at the
-        same position would leave the queue in an inconsistent state (the
-        scheduler's ORDER BY (printer_id, position) tie would be broken by
-        physical row order — non-deterministic dispatch order).
+        The operator sees a single list holding a pinned row for each of two
+        printers plus three NULL-printer rows of all three pool shapes (model,
+        printer-set, unassigned). The three NULL rows share ONE sequence, each
+        pinned printer has its own, and nothing the client sent named a position.
         """
-        from backend.app.models.print_queue import PrintQueueItem
+        p1 = await printer_factory()
+        p2 = await printer_factory()
 
-        printer = await printer_factory()
-        a1 = await archive_factory()
-        a2 = await archive_factory()
-        item1 = PrintQueueItem(printer_id=printer.id, archive_id=a1.id, status="pending", position=1)
-        item2 = PrintQueueItem(printer_id=printer.id, archive_id=a2.id, status="pending", position=2)
-        db_session.add_all([item1, item2])
-        await db_session.commit()
-        await db_session.refresh(item1)
-        await db_session.refresh(item2)
+        pinned_a = await self._item(db_session, archive_factory, printer_id=p1.id, position=1)
+        pinned_b = await self._item(db_session, archive_factory, printer_id=p1.id, position=2)
+        pinned_c = await self._item(db_session, archive_factory, printer_id=p2.id, position=1)
+        model_pool = await self._item(db_session, archive_factory, target_model="H2S", position=1)
+        printers_pool = await self._item(
+            db_session,
+            archive_factory,
+            target_printer_ids=encode_printer_ids([p1.id, p2.id]),
+            position=2,
+        )
+        unassigned = await self._item(db_session, archive_factory, position=3)
 
+        # A display order that reverses every scope at once.
+        display = [unassigned, pinned_b, printers_pool, pinned_a, model_pool, pinned_c]
         response = await async_client.post(
             "/api/v1/queue/reorder",
-            json={
-                "items": [
-                    {"id": item1.id, "position": 1},
-                    {"id": item2.id, "position": 1},  # duplicate
-                ]
-            },
+            json={"ordered_ids": [item.id for item in display]},
         )
-        assert response.status_code == 422
-        body = response.json()
-        # Pydantic v2 wraps custom validator errors; the message must mention "Duplicate"
-        # so the FE can surface the actionable detail.
-        assert any("duplicate" in str(err).lower() for err in body.get("detail", []))
+        assert response.status_code == 200, response.text
+        assert response.json() == {"message": "Reordered 6 items"}
+
+        placed = await self._positions(db_session, display)
+
+        # No duplicate position within any scope.
+        per_scope: dict[int | None, list[int]] = {}
+        for scope, position in placed.values():
+            per_scope.setdefault(scope, []).append(position)
+        for scope, positions in per_scope.items():
+            assert sorted(positions) == list(range(1, len(positions) + 1)), scope
+
+        # Requested relative order preserved inside each scope.
+        assert placed[pinned_b.id][1] < placed[pinned_a.id][1]
+        assert placed[pinned_c.id][1] == 1
+        pool_order = sorted(
+            [unassigned.id, printers_pool.id, model_pool.id],
+            key=lambda item_id: placed[item_id][1],
+        )
+        assert pool_order == [unassigned.id, printers_pool.id, model_pool.id]
+
+        # The pool shapes really did share one scope (no printer_id was written).
+        assert placed[model_pool.id][0] is None
+        assert placed[printers_pool.id][0] is None
+        assert placed[unassigned.id][0] is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_reorder_accepts_unique_positions(
+    async def test_reorder_ignores_unknown_and_non_pending_ids(
         self, async_client: AsyncClient, db_session, printer_factory, archive_factory
     ):
-        """Reorder with unique positions succeeds and updates them in DB."""
-        from backend.app.models.print_queue import PrintQueueItem
-
+        """A dispatch racing the drag is not a 4xx: such ids are simply skipped."""
         printer = await printer_factory()
-        a1 = await archive_factory()
-        a2 = await archive_factory()
-        item1 = PrintQueueItem(printer_id=printer.id, archive_id=a1.id, status="pending", position=1)
-        item2 = PrintQueueItem(printer_id=printer.id, archive_id=a2.id, status="pending", position=2)
-        db_session.add_all([item1, item2])
+        printing = await self._item(db_session, archive_factory, printer_id=printer.id, position=1)
+        printing.status = "printing"
+        pending_a = await self._item(db_session, archive_factory, printer_id=printer.id, position=2)
+        pending_b = await self._item(db_session, archive_factory, printer_id=printer.id, position=3)
         await db_session.commit()
-        await db_session.refresh(item1)
-        await db_session.refresh(item2)
 
         response = await async_client.post(
             "/api/v1/queue/reorder",
-            json={
-                "items": [
-                    {"id": item1.id, "position": 2},
-                    {"id": item2.id, "position": 1},
-                ]
-            },
+            json={"ordered_ids": [999999, printing.id, pending_b.id, pending_a.id]},
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
+        assert response.json() == {"message": "Reordered 2 items"}
 
-        await db_session.refresh(item1)
-        await db_session.refresh(item2)
-        assert item1.position == 2
-        assert item2.position == 1
+        placed = await self._positions(db_session, [printing, pending_a, pending_b])
+        assert placed[pending_b.id][1] == 1
+        assert placed[pending_a.id][1] == 2
+        # The printing row is outside the pending scope and was left alone.
+        assert placed[printing.id][1] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_named_rows_permute_their_own_slots(
+        self, async_client: AsyncClient, db_session, printer_factory, archive_factory
+    ):
+        """Unnamed rows keep their EXACT slot; the named ones swap among theirs.
+
+        The client sent a display order, not the world, so a partial list may only
+        rearrange the places it already occupied — never push an unnamed row down.
+        """
+        printer = await printer_factory()
+        first = await self._item(db_session, archive_factory, printer_id=printer.id, position=1)
+        second = await self._item(db_session, archive_factory, printer_id=printer.id, position=2)
+        third = await self._item(db_session, archive_factory, printer_id=printer.id, position=3)
+        fourth = await self._item(db_session, archive_factory, printer_id=printer.id, position=4)
+
+        response = await async_client.post(
+            "/api/v1/queue/reorder",
+            json={"ordered_ids": [fourth.id, second.id]},
+        )
+        assert response.status_code == 200, response.text
+
+        placed = await self._positions(db_session, [first, second, third, fourth])
+        # Slots 2 and 4 were the named rows'; they are re-filled in the requested
+        # order. Slots 1 and 3 belonged to rows nobody named and do not move.
+        assert placed[first.id][1] == 1
+        assert placed[fourth.id][1] == 2
+        assert placed[third.id][1] == 3
+        assert placed[second.id][1] == 4
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_filtered_partial_reorder_leaves_hidden_rows_in_place(
+        self, async_client: AsyncClient, db_session, printer_factory, archive_factory
+    ):
+        """A drag under a FILTER must not reorder work the operator cannot see.
+
+        The queue page filters by printer/status/location, so ``ordered_ids`` is
+        routinely a partial view of the shared NULL-printer sequence: another
+        pool's units are interleaved with the visible ones and off screen. Those
+        hidden rows keep their exact slots while the visible ones permute theirs.
+        """
+        visible_a = await self._item(db_session, archive_factory, target_model="H2S", position=1)
+        hidden_x = await self._item(db_session, archive_factory, target_model="X1C", position=2)
+        visible_b = await self._item(db_session, archive_factory, target_model="H2S", position=3)
+        hidden_y = await self._item(db_session, archive_factory, target_model="X1C", position=4)
+        visible_c = await self._item(db_session, archive_factory, target_model="H2S", position=5)
+
+        # Filtered to the H2S pool, the operator drags C to the front.
+        response = await async_client.post(
+            "/api/v1/queue/reorder",
+            json={"ordered_ids": [visible_c.id, visible_a.id, visible_b.id]},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"message": "Reordered 3 items"}
+
+        placed = await self._positions(db_session, [visible_a, hidden_x, visible_b, hidden_y, visible_c])
+        # Hidden rows: untouched slots.
+        assert placed[hidden_x.id][1] == 2
+        assert placed[hidden_y.id][1] == 4
+        # Visible rows: the requested order across slots 1, 3, 5.
+        assert placed[visible_c.id][1] == 1
+        assert placed[visible_a.id][1] == 3
+        assert placed[visible_b.id][1] == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_reorder_heals_duplicate_and_gapped_positions(
+        self, async_client: AsyncClient, db_session, printer_factory, archive_factory
+    ):
+        """A scope that starts with duplicates/gaps ends contiguous 1..N."""
+        printer = await printer_factory()
+        r1 = await self._item(db_session, archive_factory, printer_id=printer.id, position=5)
+        r2 = await self._item(db_session, archive_factory, printer_id=printer.id, position=5)
+        r3 = await self._item(db_session, archive_factory, printer_id=printer.id, position=9)
+
+        response = await async_client.post(
+            "/api/v1/queue/reorder",
+            json={"ordered_ids": [r3.id, r1.id]},
+        )
+        assert response.status_code == 200, response.text
+
+        placed = await self._positions(db_session, [r1, r2, r3])
+        # Sequence read as (position, id): r1, r2, r3. Slots 1 and 3 are the named
+        # rows'; r2 keeps slot 2. Everything renumbers contiguously.
+        assert [placed[item.id][1] for item in (r3, r2, r1)] == [1, 2, 3]
 
 
 class TestReorderRoutePermission:
@@ -3552,13 +3681,12 @@ class TestReorderRoutePermission:
         gid = await self._make_group(async_client, admin_token, "ReorderOnly", ["queue:reorder", "websocket:connect"])
         token = await self._make_user_token(async_client, admin_token, "reorderuser", gid)
 
-        # A valid payload (no duplicate positions); the id need not exist —
-        # the route no-ops unknown ids and returns 200. The permission
-        # dependency is what decides allow vs 403.
+        # The id need not exist — the route ignores unknown ids and returns 200.
+        # The permission dependency is what decides allow vs 403.
         resp = await async_client.post(
             "/api/v1/queue/reorder",
             headers={"Authorization": f"Bearer {token}"},
-            json={"items": [{"id": 999999, "position": 1}]},
+            json={"ordered_ids": [999999]},
         )
         assert resp.status_code == 200, resp.text
 
@@ -3573,7 +3701,7 @@ class TestReorderRoutePermission:
         resp = await async_client.post(
             "/api/v1/queue/reorder",
             headers={"Authorization": f"Bearer {token}"},
-            json={"items": [{"id": 999999, "position": 1}]},
+            json={"ordered_ids": [999999]},
         )
         assert resp.status_code == 403, resp.text
 

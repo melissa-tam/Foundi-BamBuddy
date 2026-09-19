@@ -19,6 +19,7 @@ from backend.app.models.printer_incident import (
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
     KIND_RUNOUT,
+    KIND_SERVICE_HOLD,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
 )
@@ -596,8 +597,21 @@ class TestOperatorStop:
         assert batch.pause_reason == "operator_stop"
         assert batch.status == "active"  # run STAYS active with a visible hold
 
-    async def test_cancelled_without_stop_source_is_noop(self, db_session):
-        # A run-abort cancel (no stop_source) must NOT trigger operator-stop handling.
+    async def test_cancelled_without_stop_source_holds_the_run_too(self, db_session):
+        """An UNATTRIBUTED cancel takes the same disposition (2026-09-19).
+
+        This assertion used to be its opposite — "a run-abort cancel must NOT trigger
+        operator-stop handling" — on a premise that does not hold: ``abort`` cancels a
+        run's PENDING items through ``cancel_pending_items``, and a pending row has no
+        terminal echo, so it never reaches this hook at all. What actually arrived here
+        with a NULL ``stop_source`` was the downtime reconcile's IDLE branch: an outcome
+        the farm never learned. The no-op left the run ACTIVE and one plate short with
+        nothing on any surface saying so.
+
+        An unknown outcome is not a completed one. The full narrative, and the
+        ``reconcile_unknown`` token that now names it, are in
+        ``TestAnUnknownOutcomeHoldsTheRun``.
+        """
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
         item = PrintQueueItem(
             batch_id=batch.id,
@@ -615,9 +629,11 @@ class TestOperatorStop:
 
         with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock) as mock_n:
             await farm_policy.on_terminal(db_session, 3, item.id, "cancelled")
-            mock_n.assert_not_awaited()
+            mock_n.assert_awaited_once()
         await db_session.refresh(batch)
-        assert batch.pause_reason is None
+        assert batch.pause_reason == "operator_stop"
+        assert batch.status == "active"
+        assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
 
     async def test_operator_stop_not_counted_toward_quarantine(self, db_session):
         # A prior failure + an operator stop must NOT quarantine (cancelled is
@@ -2886,6 +2902,61 @@ class TestGracefulRequeue:
         assert batch.status == "active"
         assert batch.pause_reason == "operator_stop"  # RESUME tops the deficit back up
 
+    async def test_operator_stop_under_a_service_hold_alone_keeps_the_cancel(self, db_session):
+        """**A HOLD IS NOT A FAULT** (2026-09-19). Maintenance mode means "I am taking
+        this machine", not "the equipment is broken" — so an operator who then presses
+        Stop means what they would mean on a healthy printer: cancel this unit.
+
+        Read through the un-narrowed "any open incident" question it silently requeued
+        instead, and the run never held for the RESUME that tops it back up. The gate is
+        ``FAULT_KINDS``, derived by subtraction from the store's own vocabularies."""
+        printer = await _mk_printer_row(db_session, "GRQSH")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        item = await _mk_live_unit(
+            db_session, batch, prof, printer_id=printer.id, status="cancelled", stop_source="operator_ui"
+        )
+        assert await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD) is not None
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
+            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+
+        assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
+        await db_session.refresh(batch)
+        assert batch.pause_reason == "operator_stop"  # RESUME tops the deficit back up
+        # The hold itself is untouched — only its own verb ends it.
+        assert await printer_incidents.get_open(db_session, printer.id, kinds={KIND_SERVICE_HOLD}) is not None
+
+    async def test_a_real_fault_beside_a_hold_still_requeues(self, db_session):
+        """The other half of the narrowing: a fault standing BESIDE a hold is what the
+        question is about, so the plate is still made again."""
+        printer = await _mk_printer_row(db_session, "GRQSH2")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        item = await _mk_live_unit(
+            db_session, batch, prof, printer_id=printer.id, status="cancelled", stop_source="operator_ui"
+        )
+        assert await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD) is not None
+        assert (
+            await printer_incidents.open_new(
+                db_session,
+                printer_id=printer.id,
+                job_id="task-runout",
+                item_id=item.id,
+                kind=KIND_RUNOUT,
+                code="0700_8011",
+                codes="0700_8011",
+                slot_global_tray=None,
+                status=STATUS_ESCALATED,
+            )
+            is not None
+        )
+
+        await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
+        assert len(retries) == 1
+        await db_session.refresh(batch)
+        assert batch.pause_reason is None  # the requeue, not the operator-stop hold
+
     async def test_a_completed_terminal_is_never_requeued(self, db_session):
         """A stop that lost the race to a finishing print produced a part."""
         printer = await _mk_printer_row(db_session, "GRQ4")
@@ -2903,6 +2974,77 @@ class TestGracefulRequeue:
         await farm_policy.on_terminal(db_session, printer.id, item.id, "completed")
 
         assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
+
+
+class TestAnUnknownOutcomeHoldsTheRun:
+    """A farm unit can end ``cancelled`` with nobody to attribute it to.
+
+    The live producer is ``main.reconcile_stale_active_prints``' IDLE branch: the
+    printer came back with no FINISH/FAILED to believe, so the farm never learned how
+    the print ended. That used to be a deliberate no-op in the disposition fork — the
+    run stayed ACTIVE, one plate short, with nothing on any surface saying so, and the
+    operator found it by counting parts.
+
+    An unknown outcome is not a completed one. It takes the operator-stop disposition:
+    the run holds, a human is paged, and RESUME tops the deficit back up.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_incidents(self):
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
+
+    async def test_the_reconcile_token_takes_the_same_disposition(self, db_session):
+        """``reconcile_unknown`` joins the closed ``StopVerdict`` Literal so the lineage
+        can SAY why — but the fork no longer depends on the stamp having been written."""
+        printer = await _mk_printer_row(db_session, "UNK2")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        item = await _mk_live_unit(
+            db_session,
+            batch,
+            prof,
+            printer_id=printer.id,
+            status="cancelled",
+            stop_source=farm_correlation.STOP_SOURCE_RECONCILE_UNKNOWN,
+        )
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
+            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+
+        await db_session.refresh(batch)
+        assert batch.pause_reason == "operator_stop"
+        # It is a recognised verdict, not an unknown string the policy must ignore.
+        assert farm_policy._stop_verdict(item) == farm_correlation.STOP_SOURCE_RECONCILE_UNKNOWN
+
+    async def test_an_unknown_outcome_over_a_fault_still_requeues(self, db_session):
+        """Precedence is unchanged: the requeue question is asked first, and it is
+        about ``operator_ui``/``operator_screen`` over a FAULT — an unattributed cancel
+        is not one of those, so a fault alone does not turn it into a requeue."""
+        printer = await _mk_printer_row(db_session, "UNK3")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        item = await _mk_live_unit(db_session, batch, prof, printer_id=printer.id, status="cancelled", stop_source=None)
+        assert (
+            await printer_incidents.open_new(
+                db_session,
+                printer_id=printer.id,
+                job_id="task-runout",
+                item_id=item.id,
+                kind=KIND_RUNOUT,
+                code="0700_8011",
+                codes="0700_8011",
+                slot_global_tray=None,
+                status=STATUS_ESCALATED,
+            )
+            is not None
+        )
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
+            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+
+        assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
+        await db_session.refresh(batch)
+        assert batch.pause_reason == "operator_stop"
 
 
 class TestPlateVisionTerminal:

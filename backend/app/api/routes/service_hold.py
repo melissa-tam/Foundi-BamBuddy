@@ -9,9 +9,10 @@ same card) and the two must never be greppable as one thing.
 Its own module rather than more of the 159 KB ``printers.py``, per the fork's
 large-route-file convention.
 
-Permission ``PRINTERS_CONTROL``: entering the hold STOPS a running print and an
-in-flight sweep, which is the stop/pause/motion class — ``PRINTERS_UPDATE`` is the
-*edit the printer record* permission and deactivation (the other, unrelated flag) keeps it.
+Permission ``PRINTERS_CONTROL``: entering the hold STOPS an in-flight sweep and revokes
+a dispatch lease, which is the stop/pause/motion class — ``PRINTERS_UPDATE`` is the
+*edit the printer record* permission and deactivation (the other, unrelated flag) keeps
+it. (It does NOT stop a running print: no mode verb ends a print, only Stop does.)
 """
 
 from __future__ import annotations

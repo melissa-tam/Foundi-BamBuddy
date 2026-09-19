@@ -494,6 +494,46 @@ class TestMigration:
             await engine.dispose()
 
 
+class TestTheKindVocabularies:
+    """``FAULT_KINDS`` is DERIVED, so a new kind cannot land on the wrong side of it.
+
+    The distinction is load-bearing exactly once — ``farm_policy._requeues_gracefully``
+    asks "was this printer FAULTED when the operator stopped the print?" — and it has to
+    answer no for a ``service_hold``, which is an operator statement that nothing is
+    broken. Read through the un-narrowed "any open incident" question, a Stop under
+    maintenance mode silently requeued the plate and the run never held for RESUME.
+    """
+
+    async def test_all_kinds_is_the_union_of_the_three_vocabularies(self):
+        from backend.app.models.printer_incident import (
+            ALL_KINDS,
+            AMS_FAULT_KINDS,
+            DECLARED_KINDS,
+            PAUSE_CAUSE_KINDS,
+        )
+
+        assert ALL_KINDS == AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS
+
+    async def test_fault_kinds_is_everything_a_human_did_not_declare(self):
+        from backend.app.models.printer_incident import ALL_KINDS, DECLARED_KINDS, FAULT_KINDS, KIND_SERVICE_HOLD
+
+        assert FAULT_KINDS == ALL_KINDS - DECLARED_KINDS
+        assert KIND_SERVICE_HOLD not in FAULT_KINDS
+        assert FAULT_KINDS, "a subtraction that emptied the set would silence the requeue lane"
+
+    async def test_a_service_hold_alone_is_not_an_open_fault(self, db_session, printer_factory):
+        """The consequence, over the real store: the row is OPEN and the printer IS
+        held, but a FAULT-scoped read answers None."""
+        from backend.app.models.printer_incident import FAULT_KINDS, KIND_SERVICE_HOLD
+
+        printer = await printer_factory()
+        assert await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD) is not None
+
+        assert await printer_incidents.get_open(db_session, printer.id) is not None  # the un-narrowed question
+        assert await printer_incidents.get_open(db_session, printer.id, kinds=FAULT_KINDS) is None
+        assert printer_incidents.automation_held(printer.id) is True
+
+
 class TestWaitingReasonVocabulary:
     """The kind -> token table, moved here 2026-09-04 from ``spool_recovery``.
 

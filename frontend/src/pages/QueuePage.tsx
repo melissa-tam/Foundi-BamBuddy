@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
@@ -78,9 +78,40 @@ import { QueueTimelineView } from '../components/QueueTimelineView';
 import { WaitingReason } from '../components/ui/WaitingReason';
 import { QueuePhaseChip } from '../components/QueuePhaseChip';
 import { waitingReasonText } from '../utils/waitingReason';
-import { describeQueueTarget, queueTargetSortKey } from '../utils/queueTarget';
-import type { QueueTarget } from '../utils/queueTarget';
+import { describeQueueTarget } from '../utils/queueTarget';
+import { buildRows, bucketRowsByTarget, sortItems, sortRows } from '../utils/queueSort';
+import type { QueueRow, QueueSortContext, QueueSortKey, QueueTargetBucket } from '../utils/queueSort';
+import { matchesLocation, matchesStatus } from '../utils/queueFilter';
 import { Modal } from '../components/ui/Modal';
+import { Pager, PAGE_SIZE_ALL } from '../components/ui/Pager';
+
+/**
+ * Direction tooltip + accessible name for one sort key. A date reads
+ * oldest/newest because that is what an operator asks of it; every other key
+ * reads plain ascending/descending.
+ */
+function sortDirectionLabel(
+  key: QueueSortKey,
+  asc: boolean,
+  t: (key: string) => string,
+): string {
+  if (key === 'date') {
+    return asc ? t('queue.sort.ascendingOldest') : t('queue.sort.descendingNewest');
+  }
+  return asc ? t('queue.sort.ascending') : t('queue.sort.descending');
+}
+
+/** The statuses that put a unit in History. One origin for every reader. */
+const TERMINAL_STATUSES: ReadonlyArray<PrintQueueItem['status']> = [
+  'completed',
+  'failed',
+  'skipped',
+  'cancelled',
+];
+
+function isTerminal(status: PrintQueueItem['status']): boolean {
+  return TERMINAL_STATUSES.includes(status);
+}
 
 function formatWeight(g: number, useKg = false): string {
   if (useKg && g >= 1000) return `${(g / 1000).toFixed(1)}kg`;
@@ -325,6 +356,7 @@ function SortableQueueItem({
   canModify,
   printerState,
   printerNameById,
+  storedOrder = true,
   t,
 }: {
   item: PrintQueueItem;
@@ -343,6 +375,12 @@ function SortableQueueItem({
   printerState?: string | null;
   /** Fleet names for the pool-target label, built once by the page. */
   printerNameById: ReadonlyMap<number, string>;
+  /**
+   * True when what the operator SEES is the order the backend stores. Dragging
+   * a row is a statement about stored order, so it is refused under any other
+   * sort — a drop under "by name" would silently renumber the real queue.
+   */
+  storedOrder?: boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   // What this unit dispatches against — pinned printer, printers pool, model
@@ -381,6 +419,7 @@ function SortableQueueItem({
   const plates = platesData?.plates ?? [];
 
   const canReorder = hasPermission('queue:reorder');
+  const dragDisabled = item.status !== 'pending' || !canReorder || !storedOrder;
   const {
     attributes,
     listeners,
@@ -388,7 +427,7 @@ function SortableQueueItem({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: item.id, disabled: item.status !== 'pending' || !canReorder });
+  } = useSortable({ id: item.id, disabled: dragDisabled });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -397,7 +436,7 @@ function SortableQueueItem({
 
   const isPrinting = item.status === 'printing';
   const isPending = item.status === 'pending';
-  const isHistory = ['completed', 'failed', 'skipped', 'cancelled'].includes(item.status);
+  const isHistory = isTerminal(item.status);
 
   const isMobileSelectable = isPending && onToggleSelect;
 
@@ -454,7 +493,12 @@ function SortableQueueItem({
           <div
             {...attributes}
             {...listeners}
-            className="hidden sm:flex items-center justify-center w-8 h-8 rounded-lg bg-bambu-dark cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary transition-colors touch-manipulation shrink-0"
+            title={!storedOrder ? t('queue.reorder.requiresPositionSort') : undefined}
+            className={`hidden sm:flex items-center justify-center w-8 h-8 rounded-lg bg-bambu-dark transition-colors touch-manipulation shrink-0 ${
+              storedOrder
+                ? 'cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary'
+                : 'cursor-not-allowed opacity-40'
+            }`}
           >
             <GripVertical className="w-4 h-4 text-bambu-gray" />
           </div>
@@ -780,10 +824,6 @@ function SortableQueueItem({
   );
 }
 
-type QueueRow =
-  | { kind: 'item'; item: PrintQueueItem }
-  | { kind: 'batch'; batchId: number; batchName: string; items: PrintQueueItem[] };
-
 interface QueueRowRenderProps {
   row: QueueRow;
   collapsed: boolean;
@@ -801,6 +841,8 @@ interface QueueRowRenderProps {
   canModify: (resource: any, action: any, createdById?: number | null) => boolean;
   /** Fleet names for the pool-target label, built once by the page. */
   printerNameById: ReadonlyMap<number, string>;
+  /** Displayed order == stored order; see `SortableQueueItem`. */
+  storedOrder: boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
   aggregateForRows: (rows: QueueRow[]) => { count: number; time: number; weight: number };
 }
@@ -820,6 +862,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
     hasPermission,
     canModify,
     printerNameById,
+    storedOrder,
     t,
   } = props;
 
@@ -844,6 +887,7 @@ function QueueRowRender(props: QueueRowRenderProps) {
         hasPermission={hasPermission}
         canModify={canModify}
         printerNameById={printerNameById}
+        storedOrder={storedOrder}
         t={t}
       />
     );
@@ -869,6 +913,7 @@ function SortableBatchRow({
   hasPermission,
   canModify,
   printerNameById,
+  storedOrder,
   t,
   aggregateForRows,
 }: QueueRowRenderProps) {
@@ -883,7 +928,7 @@ function SortableBatchRow({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: `batch-${batchRow.batchId}`, disabled: !canReorder });
+  } = useSortable({ id: `batch-${batchRow.batchId}`, disabled: !canReorder || !storedOrder });
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -937,8 +982,16 @@ function SortableBatchRow({
           <div
             {...attributes}
             {...listeners}
-            className="hidden sm:flex items-center justify-center w-8 h-8 rounded-lg bg-bambu-dark cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary transition-colors touch-manipulation shrink-0"
-            title={t('queue.batch.dragGroup', { defaultValue: 'Drag group' })}
+            className={`hidden sm:flex items-center justify-center w-8 h-8 rounded-lg bg-bambu-dark transition-colors touch-manipulation shrink-0 ${
+              storedOrder
+                ? 'cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary'
+                : 'cursor-not-allowed opacity-40'
+            }`}
+            title={
+              storedOrder
+                ? t('queue.batch.dragGroup', { defaultValue: 'Drag group' })
+                : t('queue.reorder.requiresPositionSort')
+            }
           >
             <GripVertical className="w-4 h-4 text-bambu-gray" />
           </div>
@@ -1025,6 +1078,7 @@ function SortableBatchRow({
               hasPermission={hasPermission}
               canModify={canModify}
               printerNameById={printerNameById}
+              storedOrder={storedOrder}
               t={t}
             />
           ))}
@@ -1034,13 +1088,14 @@ function SortableBatchRow({
   );
 }
 
-type HistoryRow =
-  | { kind: 'item'; item: PrintQueueItem }
-  | { kind: 'batch'; batchId: number; batchName: string; items: PrintQueueItem[] };
+/** Rows per history page. Kept generous — history is scanned, not paged through. */
+const HISTORY_PAGE_SIZE = 50;
 
 interface HistorySectionProps {
-  items: PrintQueueItem[];
-  collapsed: boolean;
+  /** Already grouped and ordered by `utils/queueSort` — this section paginates. */
+  rows: QueueRow[];
+  /** Units behind those rows (a batch row is many units), for the heading. */
+  itemCount: number;
   sortBy: 'date' | 'name' | 'printer';
   sortAsc: boolean;
   onSortByChange: (v: 'date' | 'name' | 'printer') => void;
@@ -1058,7 +1113,8 @@ interface HistorySectionProps {
 }
 
 function HistorySection({
-  items,
+  rows,
+  itemCount,
   sortBy,
   sortAsc,
   onSortByChange,
@@ -1072,7 +1128,20 @@ function HistorySection({
   canModify,
   t,
 }: HistorySectionProps) {
-  if (items.length === 0) {
+  const [pageSize, setPageSize] = useState<number>(HISTORY_PAGE_SIZE);
+  const [pageIndex, setPageIndex] = useState(0);
+
+  const showAll = pageSize === PAGE_SIZE_ALL;
+  const totalPages = showAll ? 1 : Math.max(1, Math.ceil(rows.length / pageSize));
+  // Derived, never synced: a shrinking list (a filter, a clear) can leave the
+  // stored index past the end, and an effect that wrote it back would render
+  // one empty frame first.
+  const safePageIndex = Math.min(pageIndex, totalPages - 1);
+  const pageRows = showAll
+    ? rows
+    : rows.slice(safePageIndex * pageSize, (safePageIndex + 1) * pageSize);
+
+  if (rows.length === 0) {
     return (
       <Card className="p-12 text-center border-dashed">
         <ListOrdered className="w-16 h-16 text-bambu-gray mx-auto mb-4 opacity-50" />
@@ -1082,34 +1151,13 @@ function HistorySection({
     );
   }
 
-  // Group siblings sharing a batch_id into a single collapsible row.
-  // First-seen order is preserved for batches; items keep their sorted
-  // position from the parent's sort selector.
-  const rows: HistoryRow[] = [];
-  const seenBatches = new Set<number>();
-  for (const item of items.slice(0, 50)) {
-    if (item.batch_id != null) {
-      if (seenBatches.has(item.batch_id)) continue;
-      seenBatches.add(item.batch_id);
-      const siblings = items.filter((s) => s.batch_id === item.batch_id);
-      rows.push({
-        kind: 'batch',
-        batchId: item.batch_id,
-        batchName: item.batch_name || t('queue.batch.defaultName'),
-        items: siblings,
-      });
-    } else {
-      rows.push({ kind: 'item', item });
-    }
-  }
-
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3 sm:mb-4">
         <h2 className="text-base sm:text-lg font-semibold text-white flex items-center gap-2">
           {t('queue.sections.history')}
           <span className="text-xs sm:text-sm font-normal text-bambu-gray">
-            ({t('queue.itemCount', { count: items.length })})
+            ({t('queue.itemCount', { count: itemCount })})
           </span>
         </h2>
         <div className="flex items-center gap-2">
@@ -1126,7 +1174,8 @@ function HistorySection({
             variant="ghost"
             size="sm"
             onClick={onSortAscToggle}
-            title={sortAsc ? t('queue.sort.ascendingOldest') : t('queue.sort.descendingNewest')}
+            aria-label={sortDirectionLabel(sortBy, sortAsc, t)}
+            title={sortDirectionLabel(sortBy, sortAsc, t)}
             className="px-2"
           >
             {sortAsc ? <ArrowUp className="w-4 h-4" /> : <ArrowDown className="w-4 h-4" />}
@@ -1134,7 +1183,7 @@ function HistorySection({
         </div>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
-        {rows.map((row) => {
+        {pageRows.map((row) => {
           if (row.kind === 'item') {
             return (
               <CompactHistoryRow
@@ -1235,6 +1284,19 @@ function HistorySection({
           );
         })}
       </div>
+      <Pager
+        pageIndex={safePageIndex}
+        pageSize={pageSize}
+        totalRows={rows.length}
+        totalPages={totalPages}
+        onPageChange={setPageIndex}
+        onPageSizeChange={(size) => {
+          setPageSize(size);
+          setPageIndex(0);
+        }}
+        unitLabel={t('common.prints')}
+        t={t}
+      />
     </div>
   );
 }
@@ -1358,9 +1420,13 @@ export function QueuePage() {
 
   const timeFormat: TimeFormat = settings?.time_format || 'system';
 
+  // The status filter is a VIEW over the fetched queue, not a fetch parameter:
+  // sending it narrowed the server's answer, so the tab counts, the stats bar
+  // and the history list all reported the filtered slice as the whole queue.
+  // The printer filter stays server-side — it is a genuinely different query.
   const { data: queue, isLoading } = useQuery({
-    queryKey: ['queue', filterPrinter, filterStatus],
-    queryFn: () => api.getQueue(filterPrinter || undefined, filterStatus || undefined),
+    queryKey: ['queue', filterPrinter],
+    queryFn: () => api.getQueue(filterPrinter || undefined),
     // WS `queue_item_status` is now the primary liveness signal (Phase C); the
     // poll is a slower fallback for missed messages / reconnect gaps.
     refetchInterval: 15000,
@@ -1478,8 +1544,11 @@ export function QueuePage() {
     },
   });
 
+  // Ids only: position SCOPE is the backend's (pinned printer vs the shared
+  // NULL-printer sequence), and a client that cannot see the scopes cannot
+  // number them without colliding.
   const reorderMutation = useMutation({
-    mutationFn: (items: { id: number; position: number }[]) => api.reorderQueue(items),
+    mutationFn: (orderedIds: number[]) => api.reorderQueue(orderedIds),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
     },
@@ -1488,9 +1557,7 @@ export function QueuePage() {
 
   const clearHistoryMutation = useMutation({
     mutationFn: async () => {
-      const historyItems = queue?.filter(i =>
-        ['completed', 'failed', 'skipped', 'cancelled'].includes(i.status)
-      ) || [];
+      const historyItems = queue?.filter((i) => isTerminal(i.status)) || [];
       for (const item of historyItems) {
         await api.removeFromQueue(item.id);
       }
@@ -1603,74 +1670,57 @@ export function QueuePage() {
     return Array.from(locations).sort();
   }, [printers, queue]);
 
-  // Helper to check if a queue item matches the location filter
-  const matchesLocationFilter = useCallback((item: PrintQueueItem): boolean => {
-    if (!filterLocation) return true;
-    // For model-based assignments, check target_location
-    if (item.target_location) return item.target_location === filterLocation;
-    // For printer-based assignments, check the printer's location
-    if (item.printer_id) {
-      const printer = printers?.find(p => p.id === item.printer_id);
-      return printer?.location === filterLocation;
-    }
-    return false;
-  }, [filterLocation, printers]);
+  // Filters are applied HERE, over the whole fetched queue, so every tab reads
+  // one predicate pair (`utils/queueFilter`) instead of three near-copies.
+  const filteredQueue = useMemo(
+    () =>
+      (queue ?? []).filter(
+        (item) =>
+          matchesStatus(item, filterStatus) &&
+          matchesLocation(item, filterLocation, printers ?? []),
+      ),
+    [queue, filterStatus, filterLocation, printers],
+  );
 
-  const pendingItems = useMemo(() => {
-    let items = queue?.filter(i => i.status === 'pending') || [];
+  const filtersActive = filterPrinter !== null || filterStatus !== '' || filterLocation !== '';
 
-    // Apply location filter
-    if (filterLocation) {
-      items = items.filter(matchesLocationFilter);
-    }
+  const clearFilters = () => {
+    setFilterPrinter(null);
+    setFilterStatus('');
+    setFilterLocation('');
+  };
 
-    // Helper to get scheduled time as timestamp (ASAP/placeholder = 0 for earliest)
-    const getScheduledTime = (item: PrintQueueItem): number => {
-      if (!item.scheduled_time) return 0;
-      const time = parseUTCDate(item.scheduled_time)?.getTime() ?? 0;
-      // Placeholder dates (> 6 months out) are treated as ASAP
-      const sixMonthsFromNow = Date.now() + (180 * 24 * 60 * 60 * 1000);
-      return time > sixMonthsFromNow ? 0 : time;
-    };
+  // Ordering inputs shared by every list on the page. `queue_shortest_first`
+  // re-points the Position key at the scheduler's own order and nothing else.
+  const sortContext = useMemo<QueueSortContext>(
+    () => ({
+      t,
+      printerNameById,
+      shortestFirst: settings?.queue_shortest_first ?? false,
+      batchFallbackName: t('queue.batch.defaultName'),
+    }),
+    [t, printerNameById, settings?.queue_shortest_first],
+  );
 
-    // When SJF is enabled, override sort to match scheduler order
-    if (settings?.queue_shortest_first) {
-      return [...items].sort((a, b) => {
-        // Group by target first: pinned printers, then each pool lane, then
-        // unassigned (`utils/queueTarget`).
-        const aTarget = queueTargetSortKey(a);
-        const bTarget = queueTargetSortKey(b);
-        if (aTarget !== bTarget) return aTarget < bTarget ? -1 : 1;
-        // Within same printer/model: jumped items first (starvation guard)
-        const aJumped = a.been_jumped ? 1 : 0;
-        const bJumped = b.been_jumped ? 1 : 0;
-        if (aJumped !== bJumped) return bJumped - aJumped;
-        // Shortest print time next (nulls last)
-        const aTime = a.print_time_seconds ?? Infinity;
-        const bTime = b.print_time_seconds ?? Infinity;
-        if (aTime !== bTime) return aTime - bTime;
-        // Position as tiebreaker
-        return a.position - b.position;
-      });
-    }
+  // Batches are grouped BEFORE ordering, so a batch lands where its contents
+  // belong and a 120-unit run stays one row.
+  const groupedRows = useMemo<QueueRow[]>(() => {
+    const pending = filteredQueue.filter((i) => i.status === 'pending');
+    return sortRows(
+      buildRows(pending, sortContext.batchFallbackName),
+      pendingSortBy,
+      pendingSortAsc,
+      sortContext,
+    );
+  }, [filteredQueue, pendingSortBy, pendingSortAsc, sortContext]);
 
-    return [...items].sort((a, b) => {
-      let cmp: number;
-      if (pendingSortBy === 'name') {
-        const aName = a.archive_name || a.library_file_name || '';
-        const bName = b.archive_name || b.library_file_name || '';
-        cmp = aName.localeCompare(bName);
-      } else if (pendingSortBy === 'printer') {
-        cmp = (a.printer_name || '').localeCompare(b.printer_name || '');
-      } else if (pendingSortBy === 'time') {
-        // Sort by scheduled start time (when print will begin)
-        cmp = getScheduledTime(a) - getScheduledTime(b);
-      } else {
-        cmp = a.position - b.position;
-      }
-      return pendingSortAsc ? cmp : -cmp;
-    });
-  }, [queue, pendingSortBy, pendingSortAsc, matchesLocationFilter, filterLocation, settings?.queue_shortest_first]);
+  // The flat display order, derived from the rows rather than sorted a second
+  // time — drag anchors, select-all and the reorder payload all read the order
+  // the operator is actually looking at.
+  const pendingItems = useMemo(
+    () => groupedRows.flatMap((row) => (row.kind === 'item' ? [row.item] : row.items)),
+    [groupedRows],
+  );
 
   const handleSelectAll = () => {
     const allPendingIds = pendingItems.map(i => i.id);
@@ -1681,13 +1731,19 @@ export function QueuePage() {
     }
   };
 
-  const activeItems = useMemo(() => {
-    let items = queue?.filter(i => i.status === 'printing') || [];
-    if (filterLocation) {
-      items = items.filter(matchesLocationFilter);
-    }
-    return items;
-  }, [queue, filterLocation, matchesLocationFilter]);
+  // Active prints ride the same comparator as the pending list — the section
+  // above it was previously in raw API order, so "sort by name" moved half the
+  // page and left the other half alone.
+  const activeItems = useMemo(
+    () =>
+      sortItems(
+        filteredQueue.filter((i) => i.status === 'printing'),
+        pendingSortBy,
+        pendingSortAsc,
+        sortContext,
+      ),
+    [filteredQueue, pendingSortBy, pendingSortAsc, sortContext],
+  );
 
   // Get unique printer IDs from active items to fetch their statuses
   const activePrinterIds = useMemo(() => {
@@ -1735,26 +1791,23 @@ export function QueuePage() {
     return map;
   }, [activePrinterIds, printerStatusQueries]);
 
-  const historyItems = useMemo(() => {
-    let items = queue?.filter(i => ['completed', 'failed', 'skipped', 'cancelled'].includes(i.status)) || [];
-    if (filterLocation) {
-      items = items.filter(matchesLocationFilter);
-    }
-    return [...items].sort((a, b) => {
-      let cmp: number;
-      if (historySortBy === 'name') {
-        const aName = a.archive_name || a.library_file_name || '';
-        const bName = b.archive_name || b.library_file_name || '';
-        cmp = aName.localeCompare(bName);
-      } else if (historySortBy === 'printer') {
-        cmp = (a.printer_name || '').localeCompare(b.printer_name || '');
-      } else {
-        // Default: by date - most recent first (desc) is the natural order
-        cmp = (parseUTCDate(b.completed_at || b.created_at)?.getTime() ?? 0) - (parseUTCDate(a.completed_at || a.created_at)?.getTime() ?? 0);
-      }
-      return historySortAsc ? -cmp : cmp;
-    });
-  }, [queue, historySortBy, historySortAsc, matchesLocationFilter, filterLocation]);
+  const historyItems = useMemo(
+    () => filteredQueue.filter((i) => TERMINAL_STATUSES.includes(i.status)),
+    [filteredQueue],
+  );
+
+  // History reads the printer key as "where it actually ran"; otherwise the
+  // same grouping and the same comparators as the pending list.
+  const historyRows = useMemo<QueueRow[]>(
+    () =>
+      sortRows(
+        buildRows(historyItems, sortContext.batchFallbackName),
+        historySortBy,
+        historySortAsc,
+        { ...sortContext, history: true },
+      ),
+    [historyItems, historySortBy, historySortAsc, sortContext],
+  );
 
   // Calculate total queue time
   const totalQueueTime = useMemo(() => {
@@ -1787,12 +1840,10 @@ export function QueuePage() {
       movingIds = pendingItems.filter((i) => i.batch_id === batchId).map((i) => i.id);
     } else {
       const draggedId = activeId as number;
+      // Multi-drag: take the selection in DISPLAY order by walking the list
+      // itself — the order is `utils/queueSort`'s, never re-derived here.
       movingIds = selectedItems.includes(draggedId) && selectedItems.length > 1
-        ? selectedItems.slice().sort((a, b) => {
-            const ai = pendingItems.findIndex((i) => i.id === a);
-            const bi = pendingItems.findIndex((i) => i.id === b);
-            return ai - bi;
-          })
+        ? pendingItems.filter((i) => selectedItems.includes(i.id)).map((i) => i.id)
         : [draggedId];
     }
     if (movingIds.length === 0) return;
@@ -1827,37 +1878,9 @@ export function QueuePage() {
       ...remaining.slice(insertAt),
     ];
 
-    const updates = reordered.map((item, index) => ({
-      id: item.id,
-      position: index + 1,
-    }));
-    reorderMutation.mutate(updates);
+    // The whole pending display order, ids only — the server numbers it.
+    reorderMutation.mutate(reordered.map((item) => item.id));
   };
-
-  // Group pending items by batch_id. Items with batch_id null render as
-  // standalone rows; items sharing a batch_id render as a collapsible
-  // group keyed by that id. Items inside a group keep their original
-  // relative order from pendingItems.
-  const groupedRows = useMemo<QueueRow[]>(() => {
-    const rows: QueueRow[] = [];
-    const seenBatches = new Set<number>();
-    for (const item of pendingItems) {
-      if (item.batch_id != null) {
-        if (seenBatches.has(item.batch_id)) continue;
-        seenBatches.add(item.batch_id);
-        const siblings = pendingItems.filter((s) => s.batch_id === item.batch_id);
-        rows.push({
-          kind: 'batch',
-          batchId: item.batch_id,
-          batchName: item.batch_name || t('queue.batch.defaultName'),
-          items: siblings,
-        });
-      } else {
-        rows.push({ kind: 'item', item });
-      }
-    }
-    return rows;
-  }, [pendingItems, t]);
 
   // SortableContext ID list.
   // - Standalone pending items: their numeric id.
@@ -1897,31 +1920,19 @@ export function QueuePage() {
     setBatchCollapsed((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
   };
 
-  // Group by target view. One bucket per distinct target — a pinned printer,
-  // a printers pool, a model pool, or unassigned (`utils/queueTarget`).
-  type PrinterBucket = QueueTarget & { rows: QueueRow[] };
-
-  const printerBuckets = useMemo<PrinterBucket[]>(() => {
-    const buckets = new Map<string, PrinterBucket>();
-    const bucketForItem = (item: PrintQueueItem): QueueTarget =>
-      describeQueueTarget(item, t, printerNameById);
-
-    for (const row of groupedRows) {
-      const representative = row.kind === 'item' ? row.item : row.items[0];
-      if (!representative) continue;
-      const meta = bucketForItem(representative);
-      if (!buckets.has(meta.key)) {
-        buckets.set(meta.key, { ...meta, rows: [] });
-      }
-      buckets.get(meta.key)!.rows.push(row);
-    }
-    return Array.from(buckets.values()).sort((a, b) => {
-      const aUnassigned = a.kind === 'unassigned';
-      const bUnassigned = b.kind === 'unassigned';
-      if (aUnassigned !== bUnassigned) return aUnassigned ? 1 : -1;
-      return a.label.localeCompare(b.label);
-    });
-  }, [groupedRows, printerNameById, t]);
+  // Group-by-target view. Units are bucketed FIRST and grouped per bucket, so
+  // a batch spanning two targets can no longer drag its siblings into one
+  // lane on the strength of its first child.
+  const printerBuckets = useMemo<QueueTargetBucket[]>(
+    () =>
+      bucketRowsByTarget(
+        pendingItems,
+        pendingSortBy,
+        pendingSortAsc,
+        sortContext,
+      ),
+    [pendingItems, pendingSortBy, pendingSortAsc, sortContext],
+  );
 
   // #1818: printers whose queue is gated by a prior failure that's poisoning
   // downstream `require_previous_success` items. We surface a per-printer
@@ -1994,6 +2005,12 @@ export function QueuePage() {
     }
     return out;
   }, [queue]);
+
+  // A drop renumbers the STORED queue, so dragging is offered only while the
+  // displayed order IS the stored one. Under any other sort the handle stays
+  // visible but disabled, and says why.
+  const storedOrder =
+    pendingSortBy === 'position' && pendingSortAsc && !settings?.queue_shortest_first;
 
   const aggregateForRows = (rows: QueueRow[]) => {
     let count = 0;
@@ -2260,7 +2277,7 @@ export function QueuePage() {
 
       {isLoading ? (
         <div className="text-center py-12 text-bambu-gray">{t('common.loading')}</div>
-      ) : queue?.length === 0 ? (
+      ) : queue?.length === 0 && !filtersActive ? (
         <Card className="p-12 text-center border-dashed">
           <Calendar className="w-16 h-16 text-bambu-gray mx-auto mb-4 opacity-50" />
           <h3 className="text-xl font-medium text-white mb-2">{t('queue.empty.title')}</h3>
@@ -2268,13 +2285,25 @@ export function QueuePage() {
             {t('queue.empty.description')}
           </p>
         </Card>
+      ) : filtersActive &&
+        ((activeTab === 'history' && historyItems.length === 0) ||
+          (activeTab === 'queue' && pendingItems.length === 0 && activeItems.length === 0)) ? (
+        /* The tab is empty because of the filters, not because the queue is:
+           say so and offer the one action that fixes it. */
+        <Card className="p-12 text-center border-dashed">
+          <Calendar className="w-16 h-16 text-bambu-gray mx-auto mb-4 opacity-50" />
+          <h3 className="text-xl font-medium text-white mb-2">{t('queue.filter.emptyTitle')}</h3>
+          <Button variant="secondary" size="sm" onClick={clearFilters} className="mt-2">
+            {t('queue.filter.clearFilters')}
+          </Button>
+        </Card>
       ) : activeTab === 'timeline' ? (
         <QueueTimelineView
           queueItems={queue || []}
           printers={printers || []}
           printerStatuses={printerStatusMap}
           onItemClick={(item) => {
-            if (['completed', 'failed', 'skipped', 'cancelled'].includes(item.status)) {
+            if (isTerminal(item.status)) {
               setRequeueItem(item);
             } else if (item.status === 'pending') {
               setEditItem(item);
@@ -2286,8 +2315,8 @@ export function QueuePage() {
         />
       ) : activeTab === 'history' ? (
         <HistorySection
-          items={historyItems}
-          collapsed={false}
+          rows={historyRows}
+          itemCount={historyItems.length}
           sortBy={historySortBy}
           sortAsc={historySortAsc}
           onSortByChange={setHistorySortBy}
@@ -2362,7 +2391,8 @@ export function QueuePage() {
                     variant="ghost"
                     size="sm"
                     onClick={() => setPendingSortAsc(!pendingSortAsc)}
-                    title={pendingSortAsc ? t('common.ascending') : t('common.descending')}
+                    aria-label={sortDirectionLabel(pendingSortBy, pendingSortAsc, t)}
+                    title={sortDirectionLabel(pendingSortBy, pendingSortAsc, t)}
                     className="px-2"
                   >
                     {pendingSortAsc ? <ArrowUp className="w-4 h-4" /> : <ArrowDown className="w-4 h-4" />}
@@ -2457,6 +2487,7 @@ export function QueuePage() {
                           hasPermission={hasPermission}
                           canModify={canModify}
                           printerNameById={printerNameById}
+                          storedOrder={storedOrder}
                           t={t}
                           aggregateForRows={aggregateForRows}
                         />
@@ -2494,6 +2525,7 @@ export function QueuePage() {
                                   hasPermission={hasPermission}
                                   canModify={canModify}
                                   printerNameById={printerNameById}
+                                  storedOrder={storedOrder}
                                   t={t}
                                   aggregateForRows={aggregateForRows}
                                 />

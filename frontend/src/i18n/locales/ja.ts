@@ -173,6 +173,7 @@ export default {
       timeCol: '完了 / 開始',
       stoppedByOperator: 'オペレーターによる停止',
       stoppedByFarmVision: 'ファームによる停止: プレート検査',
+      stoppedByReconcileUnknown: '再接続後、結果不明',
       firstArticleBadge: '初品',
       stagedBadge: '保留',
       lowSpoolBadge: 'フィラメント不足',
@@ -570,8 +571,6 @@ export default {
     prints: 'プリント',
     more: '+{{count}}件',
     moreActions: 'その他',
-    ascending: '昇順',
-    descending: '降順',
     back: '戻る',
     copy: 'コピー',
     copied: 'コピーしました!',
@@ -585,6 +584,18 @@ export default {
     duplicate: '複製',
     left: '左',
     right: '右',
+    pagination: {
+      showing: '表示中',
+      to: '〜',
+      of: '/',
+      show: '表示',
+      page: 'ページ',
+      all: 'すべて',
+      first: '最初のページ',
+      previous: '前のページ',
+      next: '次のページ',
+      last: '最後のページ',
+    },
   },
   // Printers page
   printers: {
@@ -736,7 +747,6 @@ export default {
       toastEntered: '{{name}} をメンテナンスモードにしました',
       toastExited: '{{name}} のメンテナンスモードを解除しました',
       confirmTitle: '{{name}} をメンテナンスモードにしますか？',
-      confirmEffectPrint: '• 実行中の印刷を停止 — 再開するまでランは保留されます',
       confirmEffectEject: '• 排出スイープを停止 — プレートはゲートされたままです',
       confirmEffectCooldown: '• 排出を延期 — 冷却ファンはベッドが冷えるまで稼働し、その後停止します',
     },
@@ -1341,14 +1351,6 @@ export default {
     originalPrintNotVisible: '元の印刷が表示されていません - フィルターをクリアしてみてください',
     noArchivesYet: 'アーカイブはまだありません',
     prints: '件',
-    pagination: {
-      showing: '表示中',
-      to: '〜',
-      of: '/',
-      show: '表示',
-      page: 'ページ',
-      all: 'すべて',
-    },
     loadingArchives: 'アーカイブを読み込み中...',
     releaseToUpload: 'ドロップしてアップロード',
     showAll: 'すべて表示',
@@ -1789,6 +1791,8 @@ export default {
       allLocations: 'すべてのロケーション',
       any: 'すべて',
       anyOf: 'いずれか',
+      emptyTitle: 'フィルターに一致する項目がありません',
+      clearFilters: 'フィルターをクリア',
     },
     // Sort
     sort: {
@@ -1799,6 +1803,11 @@ export default {
       byDate: '日付で並べ替え',
       ascendingOldest: '昇順（古い順）',
       descendingNewest: '降順（新しい順）',
+      ascending: '昇順で並べ替え',
+      descending: '降順で並べ替え',
+    },
+    reorder: {
+      requiresPositionSort: '並べ替えには「順番」の昇順表示（SJF オフ）が必要です',
     },
     // Badges
     badges: {

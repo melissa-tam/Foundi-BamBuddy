@@ -448,8 +448,31 @@ class TestClassifyStop:
         assert classify_stop({}, 1, set()) is None
 
     def test_no_echo_key_is_none(self):
-        # A reconcile-synthesised payload carries neither signal.
+        # A terminal carrying neither operator signal nor an unknown-outcome flag.
         assert classify_stop({"status": "aborted"}, 1, {2, 3}) is None
+
+    def test_the_reconcile_flag_is_its_own_verdict(self):
+        """The only verdict no ACTOR produced: the downtime reconcile could not learn
+        the outcome, and an unknown outcome is not a completed one. Before it existed,
+        such a terminal classified ``None`` and the disposition fork skipped it, so the
+        run finished one plate short in silence."""
+        assert classify_stop({"outcome_unknown": True}, 1, set()) == "reconcile_unknown"
+
+    @pytest.mark.parametrize(
+        "payload, membership, mark, expected",
+        [
+            ({"outcome_unknown": True}, {1}, None, "operator_ui"),
+            ({"outcome_unknown": True, "user_cancel_observed": True}, set(), None, "operator_screen"),
+            ({"outcome_unknown": True}, set(), "farm_vision_abort", "farm_vision_abort"),
+        ],
+    )
+    def test_the_unknown_ranks_below_every_real_signal(self, payload, membership, mark, expected):
+        """It is what is LEFT when nothing speaks — a reconciled terminal that does
+        carry a mark or an echo has a real cause, and that cause decides."""
+        assert classify_stop(payload, 1, membership, item_stop_source=mark) == expected
+
+    def test_a_false_flag_is_not_a_verdict(self):
+        assert classify_stop({"outcome_unknown": False}, 1, set()) is None
 
     def test_false_echo_is_none(self):
         assert classify_stop({"user_cancel_observed": False}, 1, set()) is None

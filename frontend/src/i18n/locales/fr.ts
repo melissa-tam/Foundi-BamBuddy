@@ -173,6 +173,7 @@ export default {
       timeCol: 'Terminée / démarrée',
       stoppedByOperator: 'Arrêtée par l\'opérateur',
       stoppedByFarmVision: 'Arrêtée par la ferme : contrôle du plateau',
+      stoppedByReconcileUnknown: 'Résultat inconnu après reconnexion',
       firstArticleBadge: 'Première pièce',
       stagedBadge: 'Retenue',
       lowSpoolBadge: 'Filament insuffisant',
@@ -570,8 +571,6 @@ export default {
     prints: 'impressions',
     more: '+{{count}} de plus',
     moreActions: 'Plus',
-    ascending: 'Croissant',
-    descending: 'Décroissant',
     back: 'Retour',
     copy: 'Copier',
     copied: 'Copié !',
@@ -585,6 +584,18 @@ export default {
     duplicate: 'Dupliquer',
     left: 'Gauche',
     right: 'Droite',
+    pagination: {
+      showing: 'Affichage',
+      to: 'à',
+      of: 'sur',
+      show: 'Afficher',
+      page: 'Page',
+      all: 'Tout',
+      first: 'Première page',
+      previous: 'Page précédente',
+      next: 'Page suivante',
+      last: 'Dernière page',
+    },
   },
 
   // Printers page
@@ -737,7 +748,6 @@ export default {
       toastEntered: '{{name}} en mode maintenance',
       toastExited: '{{name}} hors du mode maintenance',
       confirmTitle: 'Activer le mode maintenance sur {{name}} ?',
-      confirmEffectPrint: '• Arrêter l\'impression en cours — la série attend jusqu\'à Reprendre',
       confirmEffectEject: '• Arrêter le balayage d\'éjection — le plateau reste bloqué',
       confirmEffectCooldown: '• Différer l\'éjection — les ventilateurs de refroidissement tournent jusqu\'à ce que le plateau chauffant ait refroidi, puis s\'arrêtent',
     },
@@ -1342,14 +1352,6 @@ export default {
     originalPrintNotVisible: 'Impression d\'origine non visible - essayez d\'effacer les filtres',
     noArchivesYet: 'Pas encore d\'archive',
     prints: 'impressions',
-    pagination: {
-      showing: 'Affichage',
-      to: 'à',
-      of: 'sur',
-      show: 'Afficher',
-      page: 'Page',
-      all: 'Tout',
-    },
     loadingArchives: 'Chargement...',
     releaseToUpload: 'Relâcher pour téléverser',
     showAll: 'Tout afficher',
@@ -1790,6 +1792,8 @@ export default {
       allLocations: 'Tous les emplacements',
       any: 'Tout',
       anyOf: "L'une de",
+      emptyTitle: 'Aucun élément ne correspond aux filtres',
+      clearFilters: 'Effacer les filtres',
     },
     // Sort
     sort: {
@@ -1800,6 +1804,11 @@ export default {
       byDate: 'Par date',
       ascendingOldest: 'Croissant (plus vieux)',
       descendingNewest: 'Décroissant (plus récent)',
+      ascending: 'Trier par ordre croissant',
+      descending: 'Trier par ordre décroissant',
+    },
+    reorder: {
+      requiresPositionSort: 'Le réordonnancement exige le tri par position, croissant, avec SJF désactivé',
     },
     // Badges
     badges: {

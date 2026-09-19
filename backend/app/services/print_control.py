@@ -7,12 +7,18 @@ pair is what makes the resulting terminal an operator CANCEL rather than a failu
 ``operator_ui`` verdict) and rewrites the firmware's ``failed``/``aborted`` status to
 ``cancelled``, which is what keeps a stop out of the retry/quarantine accounting.
 
-It exists because that pair had THREE call sites and was about to get a fourth: the
-printer-card route (``api/routes/printers.py``), the queue-page route
-(``api/routes/print_queue.py``) and now the service-hold quiesce, which stops whatever
-is running before a human puts their hands in the machine. Each copy carried its own
-spelling of the mark's lazy import and its own log line, and a fourth copy is how the
+It exists because that pair had THREE hand-rolled call sites, each with its own
+spelling of the mark's lazy import and its own log line — and a fourth copy is how the
 mark eventually goes missing on the path that needs it most.
+
+**Two callers remain, and the set is CLOSED:** the printer-card route
+(``api/routes/printers.py``) and the queue-page route (``api/routes/print_queue.py``).
+Both are an operator pressing Stop. The third caller — the service-hold quiesce — was
+deleted on 2026-09-19 with the ruling that **no mode verb ends a print**: entering
+maintenance mode, or deactivating a printer, stands the FARM down, and a running print
+is the operator's, not the farm's. ``test_code_quality.TestOperatorStopOwnership``
+pins the two allowed callers by AST, so a future mode verb that reaches for this pair
+fails CI instead of silently cancelling somebody's plate.
 
 What it deliberately does NOT own: the queue row's transitions (status, ``stop_source``,
 ``error_message``), the smart-plug auto-off and the HTTP shapes. Those differ per

@@ -187,6 +187,24 @@ def reset_plate_occupancy_authority():
     plate_occupancy.reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def reset_dispatch_claim_registry():
+    """Start and leave every test with an EMPTY start-watchdog registry.
+
+    ``dispatch_claim._start_watchdogs`` is a process singleton keyed by queue-item id,
+    and queue ids restart at 1 in every file's fresh DB — so a watchdog task registered
+    by one module (and left un-popped, because its done-callback never ran on that
+    file's closed loop) answers "this dispatch is owned" for a LATER module's item 1 and
+    silently vetoes every dead-claim release in it. Same class as the two resets above,
+    and for the same reason it lives here rather than per file.
+    """
+    from backend.app.services import dispatch_claim
+
+    dispatch_claim._reset_state()
+    yield
+    dispatch_claim._reset_state()
+
+
 def _reset_printer_manager(pm):
     """Drop every per-printer-id record the manager singleton carries."""
     pm.disconnect_all(timeout=0)

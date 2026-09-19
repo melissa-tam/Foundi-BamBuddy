@@ -15,6 +15,7 @@ Neither helper commits; the caller owns the transaction.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select, text, update
@@ -24,6 +25,7 @@ from backend.app.services.dispatch_target import target_of
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.elements import ColumnElement
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +161,50 @@ def requeue_fields(item: PrintQueueItem) -> dict[str, Any]:
     return fields
 
 
+# --------------------------------------------------------------------------- #
+# Position SCOPE — the ONE rule, shared by every writer of ``position``
+# --------------------------------------------------------------------------- #
+# A queue position is unique within its SCOPE, and there are exactly two scope
+# shapes: a PINNED row (``printer_id == X``, the operator's machine pin) and the
+# single shared sequence every NULL-printer row lives in — model pools, printer-
+# subset pools and unassigned rows alike, because none of them has a machine yet
+# and the scheduler draws them from one list. Both the allocator
+# (:func:`allocate_queue_positions`) and the renumberer (:func:`renumber_pending`)
+# read the rule from here; it is never restated at a call site.
+
+
+def position_scope_of(item: PrintQueueItem) -> int | None:
+    """The scope ``item.position`` is numbered within: its pin, or the pool."""
+    return item.printer_id
+
+
+def position_scope_filter(printer_id: int | None) -> tuple[ColumnElement[bool], ...]:
+    """WHERE clauses selecting the ``pending`` rows of one position scope."""
+    if printer_id is not None:
+        return (
+            PrintQueueItem.printer_id == printer_id,
+            PrintQueueItem.status == "pending",
+        )
+    return (
+        PrintQueueItem.printer_id.is_(None),
+        PrintQueueItem.status == "pending",
+    )
+
+
+async def _lock_position_scope(db: AsyncSession, printer_id: int | None) -> None:
+    """Serialize concurrent position writers within one scope (Postgres only).
+
+    SQLite serializes writes implicitly, so this is a no-op there. Dialect is
+    checked against the LIVE binding, not the ``is_sqlite()`` settings helper,
+    because the test fixture overrides ``get_db`` with a SQLite engine while
+    ``settings.database_url`` may still point at Postgres.
+    """
+    bind = db.get_bind()
+    if bind.dialect.name == "postgresql":
+        scope_key = printer_id if printer_id is not None else 0
+        await db.execute(text("SELECT pg_advisory_xact_lock(1625, :k)"), {"k": scope_key})
+
+
 async def allocate_queue_positions(
     db: AsyncSession,
     *,
@@ -169,30 +215,13 @@ async def allocate_queue_positions(
 ) -> int:
     """Reserve ``count`` contiguous queue positions and return the first one.
 
-    Serializes concurrent inserts to the same scope (a specific printer, or the
-    shared unassigned/model-based pool) with a Postgres transaction-scoped
-    advisory lock — SQLite serializes writes implicitly so it's a no-op there.
-    When ``insert_at_top`` or an explicit ``insert_position`` is given, existing
-    rows at/after that position are shifted up by ``count`` to make room.
+    Serializes concurrent inserts to the same :func:`position_scope_filter`
+    scope with a transaction-scoped advisory lock. When ``insert_at_top`` or an
+    explicit ``insert_position`` is given, existing rows at/after that position
+    are shifted up by ``count`` to make room.
     """
-    if printer_id is not None:
-        queue_scope = (
-            PrintQueueItem.printer_id == printer_id,
-            PrintQueueItem.status == "pending",
-        )
-    else:
-        queue_scope = (
-            PrintQueueItem.printer_id.is_(None),
-            PrintQueueItem.status == "pending",
-        )
-
-    # Dialect is checked against the live binding, NOT the is_sqlite() settings
-    # helper, because the test fixture overrides get_db with a SQLite engine
-    # while settings.database_url may still point at Postgres.
-    bind = db.get_bind()
-    if bind.dialect.name == "postgresql":
-        scope_key = printer_id if printer_id is not None else 0
-        await db.execute(text("SELECT pg_advisory_xact_lock(1625, :k)"), {"k": scope_key})
+    queue_scope = position_scope_filter(printer_id)
+    await _lock_position_scope(db, printer_id)
 
     if insert_at_top or insert_position is not None:
         pos = max(1, insert_position or 1)
@@ -210,6 +239,81 @@ async def allocate_queue_positions(
     result = await db.execute(select(func.max(PrintQueueItem.position)).where(*queue_scope))
     max_pos = result.scalar() or 0
     return max_pos + 1
+
+
+async def renumber_pending(db: AsyncSession, ordered_ids: Sequence[int]) -> int:
+    """Apply a requested display order to the pending queue. Returns rows applied.
+
+    ``ordered_ids`` is ONE flat list — the order the operator sees and dragged,
+    which freely mixes pinned, pool and unassigned rows because the UI shows them
+    together. It is also, in general, a PARTIAL view of each scope: the queue page
+    filters by printer, status and location, so a scope's other rows — another
+    pool's units sharing the NULL-printer sequence, say — are simply off screen.
+    A drag must therefore not move work the operator never saw.
+
+    So the rule is a SLOT PERMUTATION, not an append. Within each touched scope,
+    take the current sequence (``ORDER BY position, id``); the slots currently
+    held by named rows are re-filled with those rows in the requested relative
+    order, and every unnamed row keeps its exact slot. The whole scope is then
+    numbered ``1..N``, which also heals any duplicate or gapped positions it
+    started with. When ``ordered_ids`` happens to name every pending row of a
+    scope, this is exactly "apply the requested order".
+
+    An id that is not found, or whose row is no longer ``pending``, is IGNORED
+    rather than an error: the list the operator dragged is a snapshot that races
+    the dispatcher, and a unit claimed for a print mid-drag must not turn the
+    whole reorder into a 4xx. Does not commit — the caller owns the transaction.
+    """
+    # First occurrence wins: a duplicated id is one row, at the earliest rank the
+    # client gave it.
+    unique_ids: list[int] = []
+    seen: set[int] = set()
+    for item_id in ordered_ids:
+        if item_id not in seen:
+            seen.add(item_id)
+            unique_ids.append(item_id)
+    if not unique_ids:
+        return 0
+
+    result = await db.execute(
+        select(PrintQueueItem).where(
+            PrintQueueItem.id.in_(unique_ids),
+            PrintQueueItem.status == "pending",
+        )
+    )
+    named: dict[int, PrintQueueItem] = {item.id: item for item in result.scalars().all()}
+    if not named:
+        return 0
+
+    # Lock the touched scopes in a deterministic order (pool first, then printer
+    # id ascending) so two concurrent reorders can never deadlock on each other.
+    scopes = sorted({position_scope_of(item) for item in named.values()}, key=lambda s: (s is not None, s or 0))
+    for scope in scopes:
+        await _lock_position_scope(db, scope)
+
+    for scope in scopes:
+        result = await db.execute(
+            select(PrintQueueItem)
+            .where(*position_scope_filter(scope))
+            .order_by(PrintQueueItem.position, PrintQueueItem.id)
+        )
+        existing = list(result.scalars().all())
+        requested = [named[i] for i in unique_ids if i in named and position_scope_of(named[i]) == scope]
+        requested_ids = {item.id for item in requested}
+
+        # The named rows' own slots, re-filled in the requested order; every other
+        # row stays exactly where it was. ``strict=True`` pins the invariant that
+        # the two lists are the same length — a named row of this scope is
+        # pending, so it IS in ``existing``.
+        placed = list(existing)
+        slots = [index for index, row in enumerate(existing) if row.id in requested_ids]
+        for slot, item in zip(slots, requested, strict=True):
+            placed[slot] = item
+
+        for index, item in enumerate(placed, start=1):
+            item.position = index
+
+    return len(named)
 
 
 async def create_queue_items(

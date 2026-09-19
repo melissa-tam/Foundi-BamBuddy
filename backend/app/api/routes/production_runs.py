@@ -61,8 +61,15 @@ async def create_run(
     db: AsyncSession = Depends(get_db),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.PRODUCTION_RUNS_CREATE),
 ):
+    """Create a production run and return its FULL detail payload.
+
+    ``detail=True`` deliberately matches ``GET /production-runs/{run_id}``: the
+    operator starts a run from the list page and stays there, so the created
+    run's card renders its eligibility panel straight from this body instead of
+    navigating to the detail page for a second, identical fetch.
+    """
     run = await create_production_run(db, data, current_user)
-    return await build_run_response(db, run)
+    return await build_run_response(db, run, detail=True)
 
 
 @router.get("", response_model=list[RunResponse])

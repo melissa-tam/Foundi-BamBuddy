@@ -25,6 +25,9 @@ reconcile / operator resolves the true outcome.
   un-claiming a dispatch that never landed, not fabricating an outcome. Nothing else
   could retire such a row — no terminal echo ever arrives for a print that never
   began (2026-08-29, 001-H2S item 1010: 15 h, seven units queued behind it).
+  It gathers and applies; the DECISION is ``dispatch_claim.judge``, a pure verdict
+  over frozen evidence, and the start watchdog's ownership is ASKED
+  (``dispatch_claim.has_live_start_watchdog``) rather than inferred from a clock.
 
   Its eject sibling rides the same call (``_reconcile_unowned_ejects``): a pending
   eject whose runtime verdict fired and whose terminal never arrived is the same
@@ -64,6 +67,7 @@ from backend.app.models.printer_incident import (
     STATUS_RECOVERING,
 )
 from backend.app.services import notify_dedup
+from backend.app.services.dispatch_claim import ClaimEvidence, has_live_start_watchdog, judge
 from backend.app.services.hms_errors import current_runout_demand
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.printer_incidents import (
@@ -426,23 +430,34 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
 # --------------------------------------------------------------------------- #
 # The dead dispatch claim: a ``printing`` row whose print never started
 # --------------------------------------------------------------------------- #
-# item_id -> the ts every dead-claim guard was FIRST seen holding together. Popped
-# the moment any guard breaks, and pruned against the live ``printing`` set, so the
-# dwell measures one continuous dead shape rather than an accumulation of glimpses.
+# item_id -> the ts ``dispatch_claim.judge`` FIRST answered ``dead`` for this item.
+# Popped the moment any other verdict comes back, and pruned against the live
+# ``printing`` set, so the dwell measures one continuous dead shape rather than an
+# accumulation of glimpses.
 #
 # Process-lifetime (derive-don't-store): a restart re-derives the whole shape from
 # the DB row plus the live wire on the next tick, and the dwell simply restarts —
-# the safe direction, worst cost one extra 120 s before a stranded unit is freed.
+# the safe direction, worst cost one extra dwell before a stranded unit is freed.
 _dead_claim_since: dict[int, float] = {}
 
-# Clock A: how old a claim must be before it can be called dead. Comfortably past
-# the dispatch watchdog's own full budget (90 s Phase A + 180 s Phase B = 270 s) plus
-# the slowest observed H2D digestion, so the watchdog is ALWAYS the first responder
-# and this watch only ever sees what it missed.
-_DEAD_CLAIM_MIN_AGE_S = 600.0
-# Clock B: how long the dead shape must hold continuously. A printer's live state and
-# subtask echo both flap around a dispatch; one poll is not evidence.
-_DEAD_CLAIM_DWELL_S = 120.0
+# How long the ``dead`` verdict must hold continuously: two consecutive scheduler
+# ticks. A printer's live state and subtask echo both flap around a dispatch, so one
+# poll is not evidence — but two are, now that each observation is additionally
+# required to rest on a NON-STALE live state (``ClaimEvidence.state_fresh``), which is
+# what a longer dwell was really standing in for.
+#
+# It was 120 s beside a 600 s minimum age, ~12 min in total. Both numbers existed to
+# keep this watch behind the start watchdog without asking whether that watchdog was
+# alive; ``dispatch_claim`` asks instead, so the age floor is gone and what remains is
+# a genuine flap filter.
+_DEAD_CLAIM_DWELL_S = 30.0
+
+# The EJECT sibling's own dwell. It shared ``_DEAD_CLAIM_DWELL_S``'s NAME, never its
+# reasoning: there the wait is for the LIVE terminal handler, the first responder to a
+# stopped sweep, and nothing about the dispatch-ownership handoff says anything about
+# how long that takes. Split so the dead-claim value could move without silently
+# re-timing an eject lane nobody had measured. Eject behaviour is unchanged.
+_UNOWNED_EJECT_DWELL_S = 120.0
 
 # printer_id -> the eject runtime VERDICT this watch has already re-triggered the
 # reconciler on. The trigger below is level-shaped (an unowned eject stays unowned
@@ -467,11 +482,11 @@ async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
     Two conditions, both required. The printer must be CONNECTED (a disconnected one is
     the connected-edge trigger's business, and reconciling against a dead session can
     only guess), and the watchdog's verdict must be at least
-    :data:`_DEAD_CLAIM_DWELL_S` old — the same dwell, for the same reason it exists on
-    the sibling watch: the LIVE terminal handler is the first responder to a stopped
-    sweep and this must only ever see what it missed. A record with no verdict at all
-    (a hydrated one the startup sweep left in flight) is deliberately not touched here:
-    nothing has judged it, so there is nothing to conclude.
+    :data:`_UNOWNED_EJECT_DWELL_S` old — because the LIVE terminal handler is the first
+    responder to a stopped sweep and this must only ever see what it missed. A record
+    with no verdict at all (a hydrated one the startup sweep left in flight) is
+    deliberately not touched here: nothing has judged it, so there is nothing to
+    conclude.
 
     Spawned as a background task per printer, never awaited: the reconcile replays a
     terminal through ``farm_policy`` and may re-drive a stop, and the tick must not
@@ -494,7 +509,7 @@ async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
                 continue
             if not manager.is_connected(pid):
                 continue
-            if (wall - verdict).total_seconds() < _DEAD_CLAIM_DWELL_S:
+            if (wall - verdict).total_seconds() < _UNOWNED_EJECT_DWELL_S:
                 continue
             if _eject_verdict_reconciled.get(pid) == verdict:
                 continue
@@ -509,6 +524,34 @@ async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
             spawn_background_task(reconcile_pending_eject(pid), name=f"eject-pending-reconcile-{pid}")
         except Exception:  # noqa: BLE001 — one printer must not abort the sweep
             logger.exception("farm_stall: unowned-eject reconcile trigger failed for printer %s", pid)
+
+
+def _live_state_is_fresh(manager, printer_id: int) -> bool:
+    """Is this printer's cached ``PrinterState`` backed by a RECENT message?
+
+    ``is_connected`` is not the same question. It calls ``check_staleness``, which
+    declines to force-close a second time inside ``STALE_RECONNECT_COOLDOWN`` — so for
+    up to 30 s a genuinely silent printer still answers connected, over a snapshot
+    nobody is refreshing. A release decided on that snapshot is a guess, and the cost
+    of a wrong one is a print onto an occupied plate.
+
+    Fails OPEN (a printer whose client cannot be reached reads FRESH), because past the
+    ``connected`` guard a missing client is the test doubles' shape rather than a
+    printer's: ``printer_manager`` answers ``is_connected`` False for an id it holds no
+    client for. Opening here therefore changes no production verdict, and closing would
+    make the freshness test silently veto every release in a double-driven test.
+    """
+    get_client = getattr(manager, "get_client", None)
+    if get_client is None:
+        return True
+    client = get_client(printer_id)
+    if client is None:
+        return True
+    try:
+        return not client.is_stale()
+    except Exception:  # noqa: BLE001 — a staleness probe must not abort the watch
+        logger.exception("farm_stall: staleness probe failed for printer %s", printer_id)
+        return True
 
 
 async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
@@ -526,38 +569,36 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
     01:25:13, the print never started, and the row seeded ``busy_printers`` every
     30 s for 15 hours with seven pending units queued behind it.
 
-    Six guards, ALL required, because the failure mode of a wrong release is a
-    DOUBLE DISPATCH onto an occupied plate:
+    **This function GATHERS and APPLIES; it does not decide.** The decision is
+    ``dispatch_claim.judge`` — a pure, table-tested function over a frozen
+    :class:`~backend.app.services.dispatch_claim.ClaimEvidence`, whose six verdicts are
+    the six guards this docstring used to enumerate in prose. What is gathered, per
+    claim: the live wire (connected, non-stale, state, echoed subtask), the DB (the
+    archive-printing disjointness, the claim's age), and the two liveness registries
+    (``dispatch_claim.has_live_start_watchdog``, ``spool_recovery.has_live_recovery``).
 
-    1. the printer is CONNECTED (an offline printer belongs to
-       :func:`check_stalled_prints`, which owns that story and its own token);
-    2. its live state exists and is NOT in
-       ``print_scheduler.ACTIVE_PRINT_STATES`` — one origin, imported at call time.
-       PAUSE counts as ACTIVE on purpose: a native-vision trip pauses at print start
-       with the plate occupied, and releasing that unit would re-dispatch onto it;
-    3. the print never started, EVIDENCE-LED: no ``PrintArchive`` on this printer
-       reads ``printing`` (hard disjointness with ``main.reconcile_stale_active_prints``
-       — the two reconcilers can never both act on one printer), and when the item
-       carries a ``dispatch_subtask_id``, the printer's live ``subtask_id`` differs
-       from it. That id test is CORROBORATION, never a precondition: a NULL id proves
-       nothing either way, and requiring one would strand exactly the rows that need
-       this most. A live subtask that MATCHES our dispatch id, on the other hand, is
-       proof the print landed — the watch stands down;
-    4. the claim is at least :data:`_DEAD_CLAIM_MIN_AGE_S` old, measured from
-       ``started_at`` (naive stamps read as UTC, as ``stagger`` does). A claim with no
-       ``started_at`` at all is left alone: without it the age is unknowable, and an
-       unknowable age is not evidence;
-    5. the dead shape has held for :data:`_DEAD_CLAIM_DWELL_S`;
-    6. nobody else owns the printer — no OPEN incident and no LIVE recovery task.
-       This is why the wire-clear sweep runs first in the tick: it can only ever
-       DELAY a release, never cause a wrong one.
+    **Ownership is ASKED, not timed (2026-09-19).** The old guard 4 required a claim to
+    be 600 s old before this watch would look at it, so that the start watchdog was
+    "ALWAYS the first responder" — a clock standing in for another task's liveness.
+    Since the watchdog exits on any active state and dies with every restart, the claims
+    with NO watchdog (the ones nothing else on the farm can retire) waited ~12 minutes
+    while the UI said "printing" over a demonstrably idle printer, and operators stopped
+    them by hand first. Now a live watchdog answers ``watchdog_owns`` at any age and
+    keeps its full budget, while an unwatched claim needs only
+    ``DISPATCH_START_BUDGET_S`` — the watchdog's own Phase A figure, one origin — plus
+    this watch's dwell.
+
+    The APPLY half is two rules: any verdict but ``dead`` pops the dwell (so it measures
+    one continuous dead shape, never an accumulation of glimpses), and ``dead`` seeds it
+    and then, past :data:`_DEAD_CLAIM_DWELL_S`, releases.
 
     The module's "never writes a terminal status" charter is intact — ``pending`` is
     un-claiming, not an outcome. The unit goes back where it came from and the
     scheduler re-dispatches it, so there is no new notification event: the
     run-changed broadcast and the WARNING below are the operator surface.
 
-    Injectable ``manager``/``now`` (epoch seconds — it drives both clocks) for tests.
+    Injectable ``manager``/``now`` (epoch seconds — it drives the age and the dwell)
+    for tests.
 
     The EJECT sibling of the same question rides this call
     (:func:`_reconcile_unowned_ejects`): "a claim on a printer that nothing will ever
@@ -573,7 +614,6 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
 
     from backend.app.models.archive import PrintArchive
     from backend.app.services import printer_incidents, spool_recovery
-    from backend.app.services.print_scheduler import ACTIVE_PRINT_STATES
     from backend.app.services.queue_transitions import release_unstarted_claim
 
     try:
@@ -611,45 +651,34 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
         if pid is None:
             continue
         try:
-            if not manager.is_connected(pid) or item.waiting_reason == "printer_offline_stalled":
-                _dead_claim_since.pop(item.id, None)
-                continue
-
             st = manager.get_status(pid)
-            live = (getattr(st, "state", None) or "").upper()
-            if not live or live in ACTIVE_PRINT_STATES:
-                _dead_claim_since.pop(item.id, None)
-                continue
-
-            if pid in archive_printers:
-                _dead_claim_since.pop(item.id, None)
-                continue
-
-            dispatch_id = (item.dispatch_subtask_id or "").strip()
-            live_subtask = (getattr(st, "subtask_id", None) or "").strip()
-            if dispatch_id and live_subtask and live_subtask == dispatch_id:
-                _dead_claim_since.pop(item.id, None)
-                continue
-
             started_at = item.started_at
-            if started_at is None:
-                _dead_claim_since.pop(item.id, None)
-                continue
-            if started_at.tzinfo is None:
+            if started_at is not None and started_at.tzinfo is None:
+                # Naive stamps read as UTC, as ``stagger`` does.
                 started_at = started_at.replace(tzinfo=timezone.utc)
-            age_s = (wall - started_at).total_seconds()
-            if age_s < _DEAD_CLAIM_MIN_AGE_S:
-                _dead_claim_since.pop(item.id, None)
-                continue
-
-            # Guard 6, narrowed 2026-09-11: stand down only while somebody is ACTING
-            # on the printer — a ``recovering`` row (a driver, or the startup re-entry's
-            # own lane) or a live recovery task. An ESCALATED hold is a human's, not an
-            # actor that can land a print, and under the equipment-fault model it can
-            # be PERMANENT: 003-H2S's item 1988 (dispatched, never started, behind a
-            # physical hold the terminal no longer launders) must still be released.
-            acting = any(row.status == STATUS_RECOVERING for row in await printer_incidents.open_rows(db, pid))
-            if acting or spool_recovery.has_live_recovery(pid):
+            evidence = ClaimEvidence(
+                connected=bool(manager.is_connected(pid)),
+                state_fresh=_live_state_is_fresh(manager, pid),
+                live_state=(getattr(st, "state", None) or "").upper(),
+                offline_stalled=item.waiting_reason == "printer_offline_stalled",
+                archive_printing=pid in archive_printers,
+                dispatch_subtask=(item.dispatch_subtask_id or "").strip(),
+                live_subtask=(getattr(st, "subtask_id", None) or "").strip(),
+                claim_age_s=None if started_at is None else (wall - started_at).total_seconds(),
+                watchdog_live=has_live_start_watchdog(item.id),
+                # Stand down only while somebody is ACTING on the printer — a
+                # ``recovering`` row (a driver, or the startup re-entry's own lane) or a
+                # live recovery task. An ESCALATED hold is a human's, not an actor that
+                # can land a print, and under the equipment-fault model it can be
+                # PERMANENT: 003-H2S's item 1988 (dispatched, never started, behind a
+                # physical hold the terminal no longer launders) must still be released.
+                recovery_acting=(
+                    any(row.status == STATUS_RECOVERING for row in await printer_incidents.open_rows(db, pid))
+                    or spool_recovery.has_live_recovery(pid)
+                ),
+            )
+            verdict = judge(evidence)
+            if verdict != "dead":
                 _dead_claim_since.pop(item.id, None)
                 continue
 
@@ -672,15 +701,17 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
             plate_occupancy.release_dispatch(pid, "dead dispatch claim")
             _dead_claim_since.pop(item.id, None)
             await _notify_run_changed(db, item)
+            # The WARNING carries the EVIDENCE the verdict was read off, not a summary
+            # of it: a release is the one thing this module does that changes a queue
+            # row, so the log line has to be enough to re-judge the decision afterwards.
             logger.warning(
-                "farm_stall: printer %s unit %s claimed 'printing' %.0f min ago but never started "
-                "(state=%s, dispatch subtask=%s, live subtask=%s) — released to 'pending' for re-dispatch",
+                "farm_stall: printer %s unit %s claimed 'printing' %.1f min ago but never started — "
+                "released to 'pending' for re-dispatch (verdict=%s, %s)",
                 pid,
                 item.id,
-                age_s / 60.0,
-                live,
-                dispatch_id or "-",
-                live_subtask or "-",
+                (evidence.claim_age_s or 0.0) / 60.0,
+                verdict,
+                evidence,
             )
         except Exception:  # noqa: BLE001 — one bad item must not abort the watch
             logger.exception("farm_stall: dead-claim watch failed for printer %s item %s", pid, item.id)

@@ -624,9 +624,8 @@ describe('PrintersPage', () => {
       await waitFor(() => expect(released).toEqual(['1']));
     });
 
-    it('enters on one click when live status shows nothing to stop', async () => {
-      const entered: string[] = [];
-      serveOne(mockPrinters[0]);
+    /** Capture every enter POST; the result body carries no job outcome. */
+    const captureEnter = (entered: string[]) =>
       server.use(
         http.post('/api/v1/printers/:id/service-hold', ({ params }) => {
           entered.push(String(params.id));
@@ -634,11 +633,15 @@ describe('PrintersPage', () => {
             held: true,
             already_held: false,
             eject_stopped: false,
-            job_stopped: false,
             lease_revoked: false,
           });
         }),
       );
+
+    it('enters on one click when live status shows nothing to stop', async () => {
+      const entered: string[] = [];
+      serveOne(mockPrinters[0]);
+      captureEnter(entered);
       render(<PrintersPage />);
       await screen.findByText('X1 Carbon');
 
@@ -650,21 +653,32 @@ describe('PrintersPage', () => {
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
-    it('asks for confirmation first when a print is running', async () => {
+    /**
+     * No mode verb ends a print — only Stop does. A RUNNING print is therefore
+     * NOT an effect of entering the hold, so it raises no dialog: the print
+     * keeps going and its terminal rides the ordinary lanes.
+     */
+    it('enters on one click while a print is RUNNING — the print is not stopped', async () => {
       const entered: string[] = [];
       serveOne(mockPrinters[0], { state: 'RUNNING', progress: 42, current_print: 'part.3mf' });
-      server.use(
-        http.post('/api/v1/printers/:id/service-hold', ({ params }) => {
-          entered.push(String(params.id));
-          return HttpResponse.json({
-            held: true,
-            already_held: false,
-            eject_stopped: false,
-            job_stopped: true,
-            lease_revoked: false,
-          });
-        }),
-      );
+      captureEnter(entered);
+      render(<PrintersPage />);
+      await screen.findByText('X1 Carbon');
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'More' }));
+      await user.click(await screen.findByRole('button', { name: /enter maintenance mode/i }));
+
+      await waitFor(() => expect(entered).toEqual(['1']));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    /** The dialog survives for the farm's OWN live actions — here an armed
+     *  cooldown watch, whose eject the hold defers. */
+    it('asks for confirmation first when a cooldown watch is armed', async () => {
+      const entered: string[] = [];
+      serveOne(mockPrinters[0], { state: 'FINISH', eject_watch: { threshold_c: 33 } });
+      captureEnter(entered);
       render(<PrintersPage />);
       await screen.findByText('X1 Carbon');
 

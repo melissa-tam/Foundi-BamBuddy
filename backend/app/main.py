@@ -3904,6 +3904,7 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
         return 0
 
     from backend.app.models.archive import PrintArchive
+    from backend.app.services.farm_correlation import PAYLOAD_KEY_OUTCOME_UNKNOWN
 
     reconciled = 0
     async with async_session() as db:
@@ -3969,6 +3970,13 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
                 "_reconciled": True,
             }
         else:
+            # ``outcome_unknown`` is this branch SAYING what it knows: the printer came
+            # back IDLE (or echoing a different job), so nobody stopped this print and
+            # nothing failed — the farm simply never saw how it ended. It reaches the
+            # queue row as ``stop_source='reconcile_unknown'`` through the ONE
+            # classifier (``farm_correlation.classify_stop``), which is what makes the
+            # disposition the operator-stop one: the run HOLDS and a human is paged,
+            # instead of the silent no-op that let a run finish one plate short.
             reconcile_payload = {
                 "status": "aborted",
                 "filename": archive.filename,
@@ -3977,6 +3985,7 @@ async def reconcile_stale_active_prints(printer_id: int) -> int:
                 "peaks_reliable": False,
                 "raw_data": state.raw_data or {},
                 "_reconciled": True,
+                PAYLOAD_KEY_OUTCOME_UNKNOWN: True,
             }
         try:
             await on_print_complete(printer_id, reconcile_payload)
@@ -4410,6 +4419,14 @@ async def on_print_complete(printer_id: int, data: dict):
         # handles the thermal-less case). Normalise to "cancelled" so it records a
         # stop, not a failure, and farm_policy takes the no-retry / no-quarantine
         # operator-stop path (Phase 3.1).
+        data = {**data, "status": "cancelled"}
+    elif _stop_source == farm_correlation.STOP_SOURCE_RECONCILE_UNKNOWN and _raw_status in ("failed", "aborted"):
+        # The downtime reconcile could not learn this print's outcome. It is NOT a
+        # failure — nothing was observed to fail — so it must not feed retry or
+        # quarantine accounting; normalising here is what makes ONE word describe this
+        # terminal everywhere (the archive row, the queue row, and the ``final_status``
+        # ``farm_policy.on_terminal`` forks on). Without it the policy saw ``aborted``,
+        # matched no branch at all, and the run quietly finished one plate short.
         data = {**data, "status": "cancelled"}
 
     # Raise the plate-clear gate for queued dispatch (#961). Any terminal status may

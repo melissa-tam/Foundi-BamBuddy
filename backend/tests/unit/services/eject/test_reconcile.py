@@ -746,12 +746,14 @@ class TestTheTickTrigger:
         await farm_stall._reconcile_unowned_ejects(manager=self._Mgr(), now=now + 1.0)
         assert names == []  # inside the dwell
 
-        await farm_stall._reconcile_unowned_ejects(manager=self._Mgr(), now=now + farm_stall._DEAD_CLAIM_DWELL_S + 1)
+        await farm_stall._reconcile_unowned_ejects(manager=self._Mgr(), now=now + farm_stall._UNOWNED_EJECT_DWELL_S + 1)
         assert names == ["eject-pending-reconcile-14"]
 
         # Level-triggered: the record is still there on the next tick, and it must not
         # fire again for the same verdict.
-        await farm_stall._reconcile_unowned_ejects(manager=self._Mgr(), now=now + farm_stall._DEAD_CLAIM_DWELL_S + 60)
+        await farm_stall._reconcile_unowned_ejects(
+            manager=self._Mgr(), now=now + farm_stall._UNOWNED_EJECT_DWELL_S + 60
+        )
         assert names == ["eject-pending-reconcile-14"]
 
     async def test_a_disconnected_printer_is_the_other_triggers_business(self, monkeypatch):
@@ -762,7 +764,7 @@ class TestTheTickTrigger:
         verdict = plate_occupancy.pending_eject_view(15).runtime_exceeded_at
 
         await farm_stall._reconcile_unowned_ejects(
-            manager=self._Mgr(connected=False), now=verdict.timestamp() + farm_stall._DEAD_CLAIM_DWELL_S + 1
+            manager=self._Mgr(connected=False), now=verdict.timestamp() + farm_stall._UNOWNED_EJECT_DWELL_S + 1
         )
 
         assert names == []

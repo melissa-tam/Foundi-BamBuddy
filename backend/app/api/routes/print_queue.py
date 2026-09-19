@@ -43,7 +43,7 @@ from backend.app.services.dispatch_target import (
 )
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
-from backend.app.services.queue_builder import create_queue_items
+from backend.app.services.queue_builder import create_queue_items, renumber_pending
 from backend.app.services.queue_transitions import cancel_pending_items
 from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
 from backend.app.utils.threemf_tools import (
@@ -1198,16 +1198,18 @@ async def reorder_queue(
     # operators out of the control the UI showed them (D13 contract fix).
     _: User | None = RequirePermissionIfAuthEnabled(Permission.QUEUE_REORDER),
 ):
-    """Bulk update positions for queue items."""
-    for reorder_item in data.items:
-        result = await db.execute(select(PrintQueueItem).where(PrintQueueItem.id == reorder_item.id))
-        item = result.scalar_one_or_none()
-        if item and item.status == "pending":
-            item.position = reorder_item.position
+    """Apply the queue's pending DISPLAY order, sent as ids.
 
+    The client sends one flat list of ids — the order it renders, which mixes
+    pinned, pool and unassigned rows. The SCOPE that order is numbered within is
+    the backend's (``queue_builder.renumber_pending``); this route is the
+    permission check plus the transaction. Ids that are gone or no longer pending
+    are ignored, so a dispatch racing the drag is not a 4xx.
+    """
+    applied = await renumber_pending(db, data.ordered_ids)
     await db.commit()
-    logger.info("Reordered %s queue items", len(data.items))
-    return {"message": f"Reordered {len(data.items)} items"}
+    logger.info("Reordered %s queue items", applied)
+    return {"message": f"Reordered {applied} items"}
 
 
 @router.post("/printer/{printer_id}/resume")

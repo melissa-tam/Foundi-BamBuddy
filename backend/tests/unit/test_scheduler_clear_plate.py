@@ -667,9 +667,9 @@ class TestDeadDispatchClaimReleasesTheLease:
         printer = await printer_factory(model="H2S")
         printer_id = printer.id
         now = 1_800_000_000.0
-        started = datetime.fromtimestamp(now - farm_stall._DEAD_CLAIM_MIN_AGE_S - 60, tz=timezone.utc).replace(
-            tzinfo=None
-        )
+        from backend.app.services.dispatch_claim import DISPATCH_START_BUDGET_S
+
+        started = datetime.fromtimestamp(now - DISPATCH_START_BUDGET_S - 60, tz=timezone.utc).replace(tzinfo=None)
         item = PrintQueueItem(
             printer_id=printer_id,
             status="printing",
@@ -713,9 +713,9 @@ class TestDeadDispatchClaimReleasesTheLease:
         assert plate_occupancy.is_plate_occupied(printer_id) is False
 
     async def test_a_claim_the_watch_leaves_alone_keeps_its_lease(self, db_session, printer_factory):
-        """The guard side: a young claim is the dispatch watchdog's business, and the
-        printer claim must survive with it — releasing the lease under a live
-        dispatch is a double-dispatch onto an occupied plate."""
+        """The guard side: a claim inside the start budget is still the dispatch
+        watchdog's business, and the printer claim must survive with it — releasing the
+        lease under a live dispatch is a double-dispatch onto an occupied plate."""
         from backend.app.services import farm_stall
 
         printer = await printer_factory(model="H2S")

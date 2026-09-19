@@ -236,7 +236,7 @@ class TestEnterOpensTheHold:
         verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
 
         assert (verdict.held, verdict.already_held) == (True, False)
-        assert (verdict.eject_stopped, verdict.job_stopped, verdict.lease_revoked) == (False, False, False)
+        assert (verdict.eject_stopped, verdict.lease_revoked) == (False, False)
         assert printer_incidents.automation_held(printer.id) is True
 
     async def test_re_entering_reports_already_held_and_quiesces_again(self, db_session, printer_factory):
@@ -430,7 +430,22 @@ class TestQuiesceStopsTheSweep:
         assert verdict.eject_stopped is False
 
 
-class TestQuiesceStopsTheJob:
+class TestQuiesceLeavesTheJobRunning:
+    """**No mode verb ends a print (2026-09-19 ruling).**
+
+    Entering maintenance mode used to call ``print_control.stop_as_operator`` on
+    anything RUNNING/PAUSE/PREPARE/SLICING, and deactivation inherited it through
+    ``quiesce_for_teardown``. The ownership argument is the whole reason it is gone: a
+    hold stands the FARM's actions down — a sweep it commanded, a dispatch it has not
+    yet put on the wire — and a running print is the OPERATOR's. An operator who wants
+    the print to end has a Stop button; a mode switch that also stopped it gave them no
+    way to take a printer without losing the plate on it.
+
+    Pinned as the absence of BOTH halves of the operator stop (the wire ``print.stop``
+    and the user-stopped mark), over every state the plate authority calls a job, while
+    the steps that genuinely ARE the farm's still run.
+    """
+
     @pytest.fixture()
     def _marks(self, monkeypatch):
         """Record the user-stopped mark ``print_control`` sets through ``main``."""
@@ -440,26 +455,8 @@ class TestQuiesceStopsTheJob:
         monkeypatch.setattr(main_mod, "mark_printer_stopped_by_user", marked.append)
         return marked
 
-    @pytest.mark.parametrize("live", ["RUNNING", "PAUSE", "PREPARE", "SLICING"])
-    async def test_an_active_job_is_stopped_as_the_operator(
-        self, db_session, printer_factory, monkeypatch, _marks, live
-    ):
-        """Every state the plate authority calls a job — a PAUSEd print is still a job
-        to stop before hands go in, and PREPARE is about to deposit onto the plate."""
-        printer = await printer_factory()
-        manager = _FakeManager(_SpyClient(), state=live)
-        monkeypatch.setattr(service_hold, "printer_manager", manager)
-        monkeypatch.setattr(print_control, "printer_manager", manager)
-
-        verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
-
-        assert manager.stopped == [printer.id]
-        # The mark is the half that makes the terminal a CANCEL rather than a failure.
-        assert _marks == [printer.id]
-        assert verdict.job_stopped is True
-
-    @pytest.mark.parametrize("live", ["IDLE", "FINISH", "FAILED", None])
-    async def test_an_idle_printer_is_not_stopped(self, db_session, printer_factory, monkeypatch, _marks, live):
+    @pytest.mark.parametrize("live", ["RUNNING", "PAUSE", "PREPARE", "SLICING", "IDLE", "FINISH", "FAILED", None])
+    async def test_no_live_state_is_ever_stopped(self, db_session, printer_factory, monkeypatch, _marks, live):
         printer = await printer_factory()
         manager = _FakeManager(_SpyClient(), state=live)
         monkeypatch.setattr(service_hold, "printer_manager", manager)
@@ -468,8 +465,64 @@ class TestQuiesceStopsTheJob:
         verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
 
         assert manager.stopped == []
+        # The mark is the half that would relabel the terminal a CANCEL. Neither half
+        # is sent: the print reaches its own terminal through the ordinary lanes.
         assert _marks == []
-        assert verdict.job_stopped is False
+        assert verdict.held is True
+
+    async def test_the_verdict_no_longer_carries_a_job_field(self, db_session, printer_factory, monkeypatch):
+        """A field that could only ever be False is a claim the UI would go on making,
+        so it is deleted rather than hard-coded — same rule that removed the cooldown
+        bool when a hold stopped ending cooldowns."""
+        printer = await printer_factory()
+        monkeypatch.setattr(service_hold, "printer_manager", _FakeManager(_SpyClient(), state="RUNNING"))
+
+        verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
+
+        assert not hasattr(verdict, "job_stopped")
+        assert not hasattr(service_hold.QuiesceReport(), "job_stopped")
+
+    async def test_the_other_quiesce_steps_still_run_over_a_running_job(
+        self, db_session, printer_factory, monkeypatch, _marks
+    ):
+        """The selection rule is "what the FARM did", not "do less": a sweep the farm
+        commanded is still taken back while the print runs on. (The lease step is
+        state-independent and pinned in ``TestQuiesceRevokesTheLease``.)"""
+        printer = await printer_factory()
+        manager = _FakeManager(_SpyClient(), state="RUNNING")
+        monkeypatch.setattr(service_hold, "printer_manager", manager)
+        monkeypatch.setattr(print_control, "printer_manager", manager)
+        calls: list[tuple[int, str]] = []
+
+        async def _fake_redrive(printer_id, *, stage, sleep=None):
+            calls.append((printer_id, stage))
+            return True
+
+        monkeypatch.setattr(eject_remote, "redrive_eject_stop", _fake_redrive)
+        plate_occupancy.hydrate_eject(printer.id, PendingEject(purpose="production", run_id=None, queue_item_id=1857))
+
+        verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
+
+        assert calls == [(printer.id, "service_hold")]
+        assert verdict.eject_stopped is True
+        assert manager.stopped == [] and _marks == []
+
+    async def test_the_teardown_verb_does_not_stop_a_print_either(
+        self, db_session, printer_factory, monkeypatch, _marks
+    ):
+        """Deactivation inherits the rule: the printer keeps printing from its own USB
+        storage with nobody watching, and the reconcile on re-activation resolves the
+        queue row."""
+        printer = await printer_factory()
+        manager = _FakeManager(_SpyClient(), state="RUNNING")
+        monkeypatch.setattr(service_hold, "printer_manager", manager)
+        monkeypatch.setattr(print_control, "printer_manager", manager)
+        _fake_spawns(monkeypatch)
+
+        await service_hold.quiesce_for_teardown(printer.id, cause="deactivate")
+
+        assert manager.stopped == []
+        assert _marks == []
 
 
 class TestQuiesceRevokesTheLease:
@@ -530,14 +583,28 @@ class TestExit:
     async def test_exit_closes_the_row_leaves_the_watch_alone_and_kicks_dispatch(
         self, db_session, printer_factory, monkeypatch
     ):
+        """The whole hold, end to end, over a print that was RUNNING when it started.
+
+        The 2026-09-19 extension is the first three lines: the printer is mid-print at
+        entry, nothing stops it, and the plate it goes on to deposit gates normally.
+        That is what makes the rest of the sequence reachable at all — before the
+        ruling, entering the hold cancelled the unit, so there was no FINISH to gate a
+        plate with and no eject waiting for the release.
+        """
         printer = await printer_factory()
         spawned = _fake_spawns(monkeypatch)
+        manager = _FakeManager(_SpyClient(), state="RUNNING")
+        monkeypatch.setattr(service_hold, "printer_manager", manager)
+        monkeypatch.setattr(print_control, "printer_manager", manager)
         plate_occupancy.configure(policy_driver=eject_cooldown_monitor.on_occupancy_change)
         await service_hold.enter(db_session, printer.id, actor="raymond")
+        assert manager.stopped == []  # the print is the operator's, and it is still running
 
-        # A plate that deposits DURING the hold arms its watch: the hold decides what that
-        # watch may DO (fans only, eject withheld), never whether it exists.
+        # The print then FINISHes under the hold and deposits. The plate gates and arms
+        # its watch: the hold decides what that watch may DO (fans only, eject withheld),
+        # never whether it exists.
         _occupy(printer.id, CooldownEject(unit_id=1857, run_id=None))
+        assert plate_occupancy.is_plate_occupied(printer.id) is True
         assert spawned == [f"eject-cooldown-watch-{printer.id}"]
         armed = eject_cooldown_monitor._armed[printer.id]
 

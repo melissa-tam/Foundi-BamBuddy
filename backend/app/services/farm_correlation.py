@@ -111,10 +111,27 @@ Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 # a durable marker is how one of them ends up not matching.
 STOP_SOURCE_FARM_VISION_ABORT = "farm_vision_abort"
 
+# "The farm never learned how this print ended." Stamped when the DOWNTIME reconcile
+# synthesises a terminal for a print whose outcome the wire cannot supply — the printer
+# came back IDLE, or echoing a different job, so there is no FINISH/FAILED to believe.
+# Nobody stopped it and nothing failed; the OUTCOME is simply unknown, and the honest
+# disposition for an unknown outcome is the operator-stop one (the run holds, a human is
+# paged, RESUME tops the deficit back up) rather than the silent no-op that let a run
+# finish one plate short. Its own token beside the three above because it is the only
+# verdict no ACTOR produced, exactly as ``RESOLVE_WIRE_CLEAR`` is on the incident side.
+# 17 characters — inside ``print_queue.stop_source``'s VARCHAR(20).
+STOP_SOURCE_RECONCILE_UNKNOWN = "reconcile_unknown"
+
+# The key the reconcile's own branch sets on its synthesised payload to SAY that. One
+# origin for the spelling, because the writer (``main.reconcile_stale_active_prints``)
+# and the reader (:func:`classify_stop`) are in different modules and a second spelling
+# is how the verdict would quietly stop being reached.
+PAYLOAD_KEY_OUTCOME_UNKNOWN = "outcome_unknown"
+
 # Why a terminal happened, as a CLOSED set. The disposition is selected from this
 # verdict once, ahead of the ``final_status`` fork, so a new reason for a print to end
 # has to be added here rather than sniffed out of a status string downstream.
-StopVerdict = Literal["farm_vision_abort", "operator_ui", "operator_screen"]
+StopVerdict = Literal["farm_vision_abort", "operator_ui", "operator_screen", "reconcile_unknown"]
 
 # ``WAITING_REASON_PLATE_VISION`` used to be defined here. Its ORIGIN moved to
 # ``printer_incidents`` (2026-09-04) when the plate check became an incident KIND: the
@@ -609,8 +626,12 @@ def classify_stop(
     - ``operator_screen``   — the payload carries ``user_cancel_observed`` True: the
       firmware emitted a cancel-echo HMS code, i.e. the operator stopped the print
       on the printer's own touchscreen.
-    - ``None``              — none of them (a genuine failure, a normal finish, or a
-      reconcile-synthesised interruption that carries no echo/membership).
+    - ``reconcile_unknown`` — LAST, and the only verdict no actor produced: the payload
+      carries ``outcome_unknown``, the flag the downtime reconcile sets on the branch
+      that could not learn how the print ended. It ranks below all three signals on
+      purpose — a reconciled terminal that DOES carry a mark or an echo has a real
+      cause, and the unknown is what is left when none of them speaks.
+    - ``None``              — none of them (a genuine failure, or a normal finish).
 
     The farm mark outranks the ECHO for a reason the design cannot afford to guess at:
     an MQTT ``print.stop`` plausibly produces the same cancel-echo a touchscreen stop
@@ -639,6 +660,8 @@ def classify_stop(
         return "operator_ui"
     if payload.get("user_cancel_observed"):
         return "operator_screen"
+    if payload.get(PAYLOAD_KEY_OUTCOME_UNKNOWN):
+        return STOP_SOURCE_RECONCILE_UNKNOWN
     return None
 
 
