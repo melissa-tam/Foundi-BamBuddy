@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import defusedxml.ElementTree as ET
@@ -723,64 +724,37 @@ def _inject_end_before_marker(content: str, snippet: str) -> str:
     return content[:line_start] + snippet.rstrip("\n") + "\n" + content[line_start:]
 
 
-def inject_gcode_into_3mf(
-    source_path: Path,
-    plate_id: int,
-    start_gcode: str | None,
-    end_gcode: str | None,
-):
-    """Create a temp copy of a 3MF with G-code injected at start/end.
+def apply_gcode_snippets(content: str, start_gcode: str | None, end_gcode: str | None) -> str:
+    """Return plate G-code `content` with the upstream start/end snippets injected (#422).
 
-    Snippets support `{placeholder}` substitution against values parsed from
-    the 3MF G-code header block (e.g. `{max_layer_z}` → `16.00`). Start
-    snippets are anchored to the `; MACHINE_START_GCODE_END` marker so they
-    run after the printer's own startup (#422). End snippets are inserted just
-    before `; EXECUTABLE_BLOCK_END` so they run inside the executable block —
-    Bambu firmware (P1S) ignores g-code placed after that marker.
+    PURE: text in, text out — no container, no temp file, no MD5. The container half is
+    :func:`transform_plate_gcode`, which is what turns any ``bytes -> bytes`` transform
+    into a repacked 3MF; keeping the two apart is what lets the dispatch seam fold this
+    step together with others in ONE repack pass instead of rewriting the archive per
+    transform.
 
-    The plate's `.gcode.md5` sidecar is recomputed so firmware that validates
-    it against the gcode (e.g. P1S) still accepts the modified file.
+    Snippets support `{placeholder}` substitution against values parsed from `content`'s
+    own HEADER_BLOCK (e.g. `{max_layer_z}` → `16.00`). The start snippet is anchored to
+    `; MACHINE_START_GCODE_END` so it runs after the printer's own startup; the end
+    snippet is inserted just before `; EXECUTABLE_BLOCK_END` so it runs INSIDE the
+    executable block — Bambu firmware (P1S) ignores G-code placed after that marker.
+    Each anchor keeps its own documented fallback when the marker is absent.
 
-    Args:
-        source_path: Path to the original 3MF file.
-        plate_id: Plate number (1-indexed) to inject into.
-        start_gcode: G-code to insert after printer startup, or None.
-        end_gcode: G-code to append, or None.
-
-    Returns:
-        Path to temp file with injected G-code, or None if injection failed —
-        including when the container carries no ``plate_{plate_id}.gcode`` member
-        (the injection has no target; another plate is never substituted).
-        Caller is responsible for cleaning up the temp file.
+    An empty / None snippet is a no-op, so `apply_gcode_snippets(text, None, None)` is
+    `text` — the caller decides whether a no-op transform is worth a repack.
     """
-    if not start_gcode and not end_gcode:
-        return None
-
-    try:
-        # Find the target gcode file inside the 3MF and inject into a copy of it.
-        with zipfile.ZipFile(source_path, "r") as zf:
-            target_gcode = _find_target_gcode_name(zf.namelist(), plate_id)
-            if target_gcode is None:
-                return None
-
-            gcode_content = zf.read(target_gcode).decode("utf-8", errors="ignore")
-            header = _parse_3mf_gcode_header(gcode_content)
-
-            if start_gcode:
-                resolved = _substitute_placeholders(start_gcode, header)
-                # Log the post-substitution snippet so the actually-injected G-code
-                # (placeholders like {max_layer_z} already resolved) is visible at DEBUG.
-                logger.debug("G-code injection [%s]: resolved START snippet:\n%s", target_gcode, resolved)
-                gcode_content = _inject_start_at_marker(gcode_content, resolved)
-            if end_gcode:
-                resolved = _substitute_placeholders(end_gcode, header)
-                logger.debug("G-code injection [%s]: resolved END snippet:\n%s", target_gcode, resolved)
-                gcode_content = _inject_end_before_marker(gcode_content, resolved)
-
-        return _write_repacked_3mf(source_path, target_gcode, gcode_content.encode("utf-8"))
-
-    except Exception:
-        return None
+    header = _parse_3mf_gcode_header(content)
+    if start_gcode:
+        resolved = _substitute_placeholders(start_gcode, header)
+        # Log the post-substitution snippet so the actually-injected G-code
+        # (placeholders like {max_layer_z} already resolved) is visible at DEBUG.
+        logger.debug("G-code injection: resolved START snippet:\n%s", resolved)
+        content = _inject_start_at_marker(content, resolved)
+    if end_gcode:
+        resolved = _substitute_placeholders(end_gcode, header)
+        logger.debug("G-code injection: resolved END snippet:\n%s", resolved)
+        content = _inject_end_before_marker(content, resolved)
+    return content
 
 
 def _find_target_gcode_name(namelist: list[str], plate_id: int) -> str | None:
@@ -957,6 +931,33 @@ def _write_repacked_3mf(
     return tmp_path
 
 
+def transform_plate_gcode(source_path: Path, plate_id: int, transform: Callable[[bytes], bytes]) -> Path | None:
+    """Repack `source_path` with plate `plate_id`'s G-code passed through `transform`.
+
+    The BYTES entry to the one repack writer (:func:`_write_repacked_3mf`): the exact
+    ``plate_{plate_id}.gcode`` member is read, handed to `transform`, and written back
+    with a recomputed uppercase `.gcode.md5` sidecar; every other member is copied
+    verbatim, keeping its original compression. Returns the caller-owned temp file, or
+    ``None`` when the container carries no such plate (:func:`_find_target_gcode_name` —
+    another plate is never substituted).
+
+    Bytes rather than text because a transform may need to splice a byte prefix back
+    (the chute-prime head rewrite does), and a decode/encode round trip is not
+    guaranteed to be identity.
+
+    Unlike :func:`repack_3mf_with_gcode` this does NOT swallow exceptions. Its caller is
+    the derived-artifact cache, which turns a raising builder into ``BuildFailed`` and
+    logs the traceback — and a traceback naming the transform that failed is exactly the
+    diagnosis a silent ``None`` costs us.
+    """
+    with zipfile.ZipFile(source_path, "r") as zf:
+        target_gcode = _find_target_gcode_name(zf.namelist(), plate_id)
+        if target_gcode is None:
+            return None
+        original = zf.read(target_gcode)
+    return _write_repacked_3mf(source_path, target_gcode, transform(original))
+
+
 def repack_3mf_with_gcode(source_path: Path, plate_id: int, new_gcode_content: str):
     """Write a temp copy of `source_path` whose plate `plate_id` G-code is
     REPLACED ENTIRELY by `new_gcode_content`, recomputing the `.gcode.md5`
@@ -1128,6 +1129,56 @@ def read_plate_gcode_header(source_path: Path, plate_id: int, max_bytes: int = 6
         return _parse_3mf_gcode_header(prefix.decode("utf-8", errors="ignore"))
     except Exception:
         return {}
+
+
+def read_plate_gcode_start_block(source_path: Path, plate_id: int, max_bytes: int = 4 * 1024 * 1024) -> bytes | None:
+    """Return plate `plate_id`'s G-code from byte 0 through the machine-start block.
+
+    The returned bytes start at the very beginning of the member and end with the newline
+    that closes the ``; MACHINE_START_GCODE_END`` line, so ``member_bytes.startswith(head)``
+    holds and a caller that rewrites the head can splice it back at BYTE level — which is
+    why this returns raw bytes rather than text: a decode/encode round trip is not
+    guaranteed to be identity, and the splice must be.
+
+    Streams the member and stops at the marker, so a plate whose print body runs to
+    hundreds of MB still costs one small read. ``max_bytes`` bounds the FAILURE case only
+    (a member with no marker), not the success case.
+
+    Returns ``None`` when the container carries no ``plate_{plate_id}.gcode`` member
+    (:func:`_find_target_gcode_name` — an absent plate is never answered with another
+    plate's block), when the marker is not found within ``max_bytes``, or when the
+    container cannot be read.
+    """
+    marker = _START_GCODE_END_MARKER.encode("utf-8")
+    try:
+        with zipfile.ZipFile(source_path, "r") as zf:
+            target = _find_target_gcode_name(zf.namelist(), plate_id)
+            if target is None:
+                return None
+            with zf.open(target, "r") as fh:
+                buf = bytearray()
+                search_from = 0
+                while True:
+                    chunk = fh.read(262144)
+                    if not chunk:
+                        return None
+                    buf += chunk
+                    # The marker only counts at the start of a line — the CONFIG_BLOCK's
+                    # own ``; machine_start_gcode = …`` line quotes start-block text.
+                    idx = buf.find(marker, search_from)
+                    while idx != -1 and idx != 0 and buf[idx - 1] != 0x0A:
+                        idx = buf.find(marker, idx + 1)
+                    if idx != -1:
+                        nl = buf.find(b"\n", idx)
+                        if nl != -1:
+                            return bytes(buf[: nl + 1])
+                    else:
+                        # Re-scan only the tail a straddling marker could hide in.
+                        search_from = max(0, len(buf) - len(marker))
+                    if len(buf) >= max_bytes:
+                        return None
+    except Exception:
+        return None
 
 
 def read_plate_gcode_machine_end(source_path: Path, plate_id: int) -> str | None:

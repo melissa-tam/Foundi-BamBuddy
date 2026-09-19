@@ -2723,6 +2723,8 @@ export default {
     farmIdleParkHelp: '生產彈出正常完成且該印表機沒有排隊任務時，熱床下降到設定的 Z 行程百分比。',
     farmIdleParkPercent: '下降深度（Z 行程百分比）',
     farmIdleParkPercentHelp: '依機型 Z 行程的百分比計算；床身移動機型不會下降（10–95）',
+    farmChutePrimeEnabled: '預擠出排入落料口',
+    farmChutePrimeEnabledHelp: '起始程式碼區塊的預擠出線擠入落料口，而不是熱床前緣。起始程式碼區塊無法識別的檔案按原樣派發。',
     dispatchResponsiveness: '派發回應速度',
     dispatchResponsivenessDescription: '微調列印農場做出反應並開始下一次列印的速度。農場通常會即時回應事件——這些是其背後的安全網計時器與限制。預設值適用於大多數車間。',
     queueCheckInterval: '備援檢查間隔（秒）',

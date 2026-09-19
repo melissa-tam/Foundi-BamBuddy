@@ -2722,6 +2722,8 @@ export default {
     farmIdleParkHelp: 'Nach einem sauberen Produktions-Auswurf ohne weitere Aufträge für den Drucker senkt sich das Bett auf den eingestellten Prozentsatz des Z-Wegs.',
     farmIdleParkPercent: 'Parktiefe (% des Z-Wegs)',
     farmIdleParkPercentHelp: 'Tiefe als Prozentsatz des Z-Wegs des Modells; Bedslinger-Modelle parken nie (10–95)',
+    farmChutePrimeEnabled: 'Prime-Linie in den Auswurfschacht extrudieren',
+    farmChutePrimeEnabledHelp: 'Die Prime-Linie aus dem Start-Block wird in den Auswurfschacht statt auf die Plattenkante extrudiert. Dateien mit unbekanntem Start-Block werden unverändert versendet.',
     dispatchResponsiveness: 'Reaktionsfähigkeit beim Versand',
     dispatchResponsivenessDescription: 'Feinabstimmung, wie schnell die Farm reagiert und den nächsten Druck startet. Die Farm reagiert normalerweise sofort auf Ereignisse – dies sind die Sicherheitstimer und -grenzen im Hintergrund. Die Standardwerte sind für die meisten Betriebe gut geeignet.',
     queueCheckInterval: 'Fallback-Prüfintervall (Sek.)',

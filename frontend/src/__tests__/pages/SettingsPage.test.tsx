@@ -864,6 +864,60 @@ describe('SettingsPage', () => {
       expect((screen.getByLabelText('Park depth (% of Z travel)') as HTMLInputElement).disabled).toBe(true);
     });
 
+    // Chute prime: the dispatch-time start-block rewrite. The switch is the
+    // operator's off (no deploy needed) and the mechanism lives in the tooltip.
+    it('renders chute prime on by default and saves the off state', async () => {
+      let receivedBody: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          receivedBody = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...receivedBody });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const toggle = await waitFor(
+        () => screen.getByRole('checkbox', { name: 'Prime into chute' }) as HTMLInputElement,
+      );
+      // mockSettings omits the key, so the component's `?? true` fallback shows.
+      expect(toggle.checked).toBe(true);
+
+      await user.click(toggle);
+
+      await waitFor(
+        () => {
+          expect(receivedBody).not.toBeNull();
+          expect(receivedBody!.farm_chute_prime_enabled).toBe(false);
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('keeps the chute-prime mechanism copy in a tooltip, not inline', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+
+      const hint = await waitFor(() =>
+        screen.getByRole('button', { name: /start-block prime line/ }),
+      );
+      await user.click(hint);
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(
+        /dispatch unmodified/,
+      );
+    });
+
     it('cross-tab search finds the Dispatch responsiveness card', async () => {
       const user = userEvent.setup();
       render(<SettingsPage />);

@@ -1,14 +1,20 @@
-"""Tests for the off-loop, content-addressed eject build cache (latency Phase C2)."""
+"""Tests for the eject lane's FACADE onto the generic derived-3MF cache.
+
+The mechanism (keys, eviction, locking, atomic install, caller-owned copies) is tested
+once, in ``unit/services/test_derived_3mf_cache.py``. What is tested HERE is only what
+the facade itself owns: its unchanged signature and return type, the namespace / cap /
+builder it binds, the ``cache_dir`` passthrough, and the mapping of the core's
+``BuildFailed`` result onto the ``EjectBuildError`` its callers already catch.
+"""
 
 from __future__ import annotations
 
-import asyncio
-import os
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from backend.app.services.derived_3mf_cache import BuildFailed, Derived
 from backend.app.services.eject import build_cache
 from backend.app.services.eject.build_cache import EjectBuildError, get_or_build_eject_file
 
@@ -32,123 +38,80 @@ def _read_plate(path: Path, plate_id: int = 1) -> bytes:
         return zf.read(f"Metadata/plate_{plate_id}.gcode")
 
 
-async def test_miss_then_hit_same_inputs(tmp_path):
+async def test_returns_a_caller_owned_path_to_the_built_eject_file(tmp_path):
+    """The signature and contract callers depend on: a bare ``Path``, freshly copied,
+    safe to unlink, carrying the eject G-code on the requested plate."""
     cache = tmp_path / "cache"
     src = _make_source(tmp_path)
 
-    out1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    # Exactly one cached artifact after the miss.
+    out = await get_or_build_eject_file(src, 2, _EJECT_GCODE, cache_dir=cache)
+
+    assert isinstance(out, Path)
+    assert _read_plate(out, 2) == _EJECT_GCODE.encode("utf-8")
     cached = list(cache.glob("*.3mf"))
     assert len(cached) == 1
-    assert _read_plate(out1) == _EJECT_GCODE.encode("utf-8")
-
-    out2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    # A HIT reuses the same single cache entry (no new artifact) and returns a
-    # DISTINCT caller-owned copy.
-    assert len(list(cache.glob("*.3mf"))) == 1
-    assert out1 != out2
-    assert out2 != cached[0]
-    assert _read_plate(out2) == _EJECT_GCODE.encode("utf-8")
-
-    out1.unlink(missing_ok=True)
-    out2.unlink(missing_ok=True)
-
-
-async def test_returned_path_is_copy_not_cache_file(tmp_path):
-    cache = tmp_path / "cache"
-    src = _make_source(tmp_path)
-
-    out = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    cached = list(cache.glob("*.3mf"))
-    assert len(cached) == 1
-    # Unlinking the returned path must NOT remove the cache entry (contract: callers
-    # unlink what they are handed).
     out.unlink()
     assert cached[0].exists()
 
-    # The next call is still a hit off the surviving cache file.
-    out2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    assert len(list(cache.glob("*.3mf"))) == 1
-    out2.unlink(missing_ok=True)
 
-
-async def test_gcode_change_is_a_new_key(tmp_path):
-    cache = tmp_path / "cache"
-    src = _make_source(tmp_path)
-
-    o1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    o2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE + "M18\n", cache_dir=cache)
-    # Distinct gcode → distinct cache entries.
-    assert len(list(cache.glob("*.3mf"))) == 2
-    o1.unlink(missing_ok=True)
-    o2.unlink(missing_ok=True)
-
-
-async def test_plate_change_is_a_new_key(tmp_path):
-    cache = tmp_path / "cache"
-    src = _make_source(tmp_path)
-
-    o1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    o2 = await get_or_build_eject_file(src, 2, _EJECT_GCODE, cache_dir=cache)
-    assert len(list(cache.glob("*.3mf"))) == 2
-    o1.unlink(missing_ok=True)
-    o2.unlink(missing_ok=True)
-
-
-async def test_source_mtime_change_is_a_new_key(tmp_path):
-    cache = tmp_path / "cache"
-    src = _make_source(tmp_path)
-
-    o1 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    # Bump the donor's mtime (an edit / re-slice) — same size, new key.
-    st = src.stat()
-    os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
-    o2 = await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
-    assert len(list(cache.glob("*.3mf"))) == 2
-    o1.unlink(missing_ok=True)
-    o2.unlink(missing_ok=True)
-
-
-async def test_lru_evicts_oldest_beyond_cap(tmp_path, monkeypatch):
-    cache = tmp_path / "cache"
-    monkeypatch.setattr(build_cache, "_LRU_MAX", 3)
-    src = _make_source(tmp_path)
-
-    outs = []
-    for i in range(5):
-        # Distinct gcode text → distinct keys → 5 inserts against a cap of 3.
-        out = await get_or_build_eject_file(src, 1, _EJECT_GCODE + f"; n{i}\n", cache_dir=cache)
-        outs.append(out)
-        # Space mtimes so eviction order is deterministic.
-        await asyncio.sleep(0.01)
-
-    remaining = list(cache.glob("*.3mf"))
-    assert len(remaining) == 3
-    for out in outs:
-        out.unlink(missing_ok=True)
-
-
-async def test_no_gcode_member_raises(tmp_path):
-    # A donor with NO gcode member at all → EjectBuildError (a specific-plate miss
-    # falls back to the first gcode, so this needs a gcode-less donor).
+async def test_build_failure_becomes_an_eject_build_error(tmp_path):
+    """A donor with NO gcode member at all: the core answers ``BuildFailed`` and the
+    facade must raise the error its two callers catch, naming plate and donor."""
     cache = tmp_path / "cache"
     src = tmp_path / "no_gcode.3mf"
     with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("3D/3dmodel.model", "<model/>")
-    with pytest.raises(EjectBuildError):
+
+    with pytest.raises(EjectBuildError) as excinfo:
         await get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache)
 
+    message = str(excinfo.value)
+    assert "plate 1" in message
+    assert "no_gcode.3mf" in message
 
-async def test_concurrent_same_key_both_succeed(tmp_path):
+
+async def test_binds_the_eject_namespace_cap_builder_and_cache_dir(tmp_path, monkeypatch):
+    """Everything the facade exists to decide, in one place."""
     cache = tmp_path / "cache"
     src = _make_source(tmp_path)
+    seen: dict[str, object] = {}
 
-    paths = await asyncio.gather(*[get_or_build_eject_file(src, 1, _EJECT_GCODE, cache_dir=cache) for _ in range(6)])
-    # Every concurrent caller got a valid, distinct, correctly-built artifact...
-    assert len({str(p) for p in paths}) == 6
-    for out in paths:
-        assert _read_plate(out) == _EJECT_GCODE.encode("utf-8")
-    # ...and the cache converged to a single shared entry.
-    assert len(list(cache.glob("*.3mf"))) == 1
-    for out in paths:
-        out.unlink(missing_ok=True)
+    async def _spy(source_path, plate_id, fingerprint, builder, **kwargs):
+        seen.update(source_path=source_path, plate_id=plate_id, fingerprint=fingerprint, builder=builder, **kwargs)
+        built = builder()
+        assert built is not None
+        return Derived(built)
+
+    monkeypatch.setattr(build_cache, "get_or_build", _spy)
+
+    out = await get_or_build_eject_file(src, 2, _EJECT_GCODE, cache_dir=cache)
+
+    assert seen["source_path"] == src
+    assert seen["plate_id"] == 2
+    # The eject lane's fingerprint IS the eject G-code text.
+    assert seen["fingerprint"] == _EJECT_GCODE
+    assert seen["namespace"] == "eject_cache"
+    assert seen["max_bytes"] == 64 * 1024 * 1024
+    assert seen["cache_dir"] == cache
+    # ...and the bound builder is the one-pass eject repack of THAT plate.
+    assert _read_plate(out, 2) == _EJECT_GCODE.encode("utf-8")
+    out.unlink(missing_ok=True)
+
+
+async def test_cache_dir_defaults_to_the_namespace_directory(tmp_path, monkeypatch):
+    """Omitting ``cache_dir`` passes ``None`` through, so the core resolves
+    ``<data dir>/eject_cache`` — the facade never computes a path of its own."""
+    src = _make_source(tmp_path)
+    seen: dict[str, object] = {}
+
+    async def _spy(source_path, plate_id, fingerprint, builder, **kwargs):
+        seen.update(kwargs)
+        return BuildFailed("stubbed")
+
+    monkeypatch.setattr(build_cache, "get_or_build", _spy)
+
+    with pytest.raises(EjectBuildError):
+        await get_or_build_eject_file(src, 1, _EJECT_GCODE)
+
+    assert seen["cache_dir"] is None
+    assert seen["namespace"] == "eject_cache"

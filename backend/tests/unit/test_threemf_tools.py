@@ -28,6 +28,7 @@ from backend.app.utils.threemf_tools import (
     parse_gcode_layer_filament_usage,
     read_plate_gcode_header,
     read_plate_gcode_machine_end,
+    read_plate_gcode_start_block,
     read_plate_json,
     repack_3mf_eject,
     repack_3mf_with_gcode,
@@ -1145,6 +1146,83 @@ class TestReadPlateGcodeMachineEnd:
         path = self._write_plate(tmp_path, gcode)
         tail = read_plate_gcode_machine_end(path, 1)
         assert tail == "; MACHINE_END_GCODE_START\nM18\n; EXECUTABLE_BLOCK_END\n"
+
+
+class TestReadPlateGcodeStartBlock:
+    """Tests for read_plate_gcode_start_block() — the bounded machine-start head reader
+    the chute-prime rewrite decides on. It returns RAW BYTES because the caller splices
+    the rewritten head back over the member's prefix at byte level."""
+
+    _HEAD = (
+        "; HEADER_BLOCK_START\n; max_z_height: 20.00\n; HEADER_BLOCK_END\n"
+        "; CONFIG_BLOCK_START\n; machine_start_gcode = G90\\n; MACHINE_START_GCODE_END\n"
+        "; CONFIG_BLOCK_END\n"
+        "; EXECUTABLE_BLOCK_START\n"
+        "M104 S220\nG150.3\n"
+        "; MACHINE_START_GCODE_END\n"
+    )
+    _BODY = "G1 X100 Y100 E5\n; MACHINE_END_GCODE_START\nM18\n; EXECUTABLE_BLOCK_END\n"
+
+    @staticmethod
+    def _write_plate(tmp_path, gcode: str, *, plate_id: int = 1, name: str = "p.gcode.3mf"):
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"Metadata/plate_{plate_id}.gcode", gcode)
+            zf.writestr("3D/3dmodel.model", "<model/>")
+        return path
+
+    def test_returns_a_byte_prefix_ending_at_the_marker_line(self, tmp_path):
+        gcode = self._HEAD + self._BODY
+        path = self._write_plate(tmp_path, gcode)
+        head = read_plate_gcode_start_block(path, 1)
+        assert head is not None
+        # The splice contract: the member starts with exactly these bytes.
+        assert gcode.encode("utf-8").startswith(head)
+        assert head.endswith(b"; MACHINE_START_GCODE_END\n")
+        assert b"G1 X100 Y100 E5" not in head
+
+    def test_config_block_copy_does_not_terminate_the_read_early(self, tmp_path):
+        # The CONFIG_BLOCK quotes the start G-code with escaped newlines, so the marker
+        # text appears MID-LINE above the executable block. The reader is line-anchored
+        # for that reason — stopping there would hand the rewrite a head with no section.
+        path = self._write_plate(tmp_path, self._HEAD + self._BODY)
+        head = read_plate_gcode_start_block(path, 1)
+        assert head is not None
+        assert b"; EXECUTABLE_BLOCK_START" in head
+        assert head.count(b"; MACHINE_START_GCODE_END") == 2  # the quoted copy, then the real one
+
+    def test_returns_none_when_marker_absent(self, tmp_path):
+        path = self._write_plate(tmp_path, "; EXECUTABLE_BLOCK_START\nG1 X1 E1\n; EXECUTABLE_BLOCK_END\n")
+        assert read_plate_gcode_start_block(path, 1) is None
+
+    def test_returns_none_when_no_gcode_member_for_that_plate(self, tmp_path):
+        # An absent plate is answered None, never another plate's block.
+        path = self._write_plate(tmp_path, self._HEAD + self._BODY, plate_id=2)
+        assert read_plate_gcode_start_block(path, 1) is None
+        assert read_plate_gcode_start_block(path, 2) is not None
+
+    def test_returns_none_when_marker_lies_beyond_max_bytes(self, tmp_path):
+        padding = "".join(f"; pad {i}\n" for i in range(50_000))
+        path = self._write_plate(tmp_path, padding + self._HEAD + self._BODY)
+        assert len(padding) > 65536
+        assert read_plate_gcode_start_block(path, 1, max_bytes=65536) is None
+        # Same file, same marker — the bound is the only thing that refused it.
+        assert read_plate_gcode_start_block(path, 1) is not None
+
+    def test_stops_early_on_a_huge_body(self, tmp_path):
+        big_body = "".join(f"G1 X{i % 300} Y{i % 300} E0.1\n" for i in range(300_000))
+        gcode = self._HEAD + big_body
+        assert len(gcode) > 4 * 1024 * 1024
+        path = self._write_plate(tmp_path, gcode)
+        head = read_plate_gcode_start_block(path, 1)
+        assert head is not None
+        assert len(head) < 4096  # the default bound never came into it
+        assert head.endswith(b"; MACHINE_START_GCODE_END\n")
+
+    def test_returns_none_on_an_unreadable_container(self, tmp_path):
+        path = tmp_path / "not-a-zip.gcode.3mf"
+        path.write_bytes(b"definitely not a zip")
+        assert read_plate_gcode_start_block(path, 1) is None
 
 
 class TestZeroSliceUsageBytes:

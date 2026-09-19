@@ -2678,6 +2678,8 @@ export default {
     farmIdleParkHelp: 'Após uma ejeção de produção bem-sucedida e sem nada na fila para a impressora, a mesa desce até a porcentagem configurada do curso Z.',
     farmIdleParkPercent: 'Profundidade de estacionamento (% do curso Z)',
     farmIdleParkPercentHelp: 'Profundidade como porcentagem do curso Z do modelo; modelos bedslinger nunca estacionam (10–95)',
+    farmChutePrimeEnabled: 'Purga inicial na rampa',
+    farmChutePrimeEnabledHelp: 'A linha de purga inicial do bloco inicial é extrudada na rampa de purga em vez de na borda da mesa. Arquivos com bloco inicial não reconhecido são despachados sem modificação.',
     dispatchResponsiveness: 'Responsividade do despacho',
     dispatchResponsivenessDescription: 'Ajuste finamente a rapidez com que a fazenda reage e inicia a próxima impressão. A fazenda normalmente reage aos eventos instantaneamente — estes são os temporizadores e limites de segurança por trás disso. Os padrões são bons para a maioria das oficinas.',
     queueCheckInterval: 'Intervalo de verificação de reserva (seg)',

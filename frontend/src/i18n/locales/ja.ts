@@ -2721,6 +2721,8 @@ export default {
     farmIdleParkHelp: '生産イジェクトが正常に終わり、そのプリンターに次の予定がない場合、ベッドを設定した Z 移動距離の割合まで下げます。',
     farmIdleParkPercent: '退避深さ（Z 移動距離の割合）',
     farmIdleParkPercentHelp: 'モデルの Z 移動距離に対する割合。ベッドスリンガー機は退避しません（10〜95）',
+    farmChutePrimeEnabled: 'プライムをシュートへ排出',
+    farmChutePrimeEnabledHelp: '開始ブロックのプライムラインを、プレート手前の縁ではなくパージシュートへ押し出します。開始ブロックを認識できないファイルは変更せずにディスパッチします。',
     dispatchResponsiveness: 'ディスパッチの応答性',
     dispatchResponsivenessDescription: 'ファームが反応して次の印刷を開始する速さを微調整します。ファームは通常イベントに即座に反応します。これらはその背後にある安全網としてのタイマーと制限です。デフォルト値はほとんどの現場に適しています。',
     queueCheckInterval: 'フォールバック確認間隔（秒）',

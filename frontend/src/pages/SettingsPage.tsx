@@ -80,7 +80,7 @@ registerSettingsSearch({ labelKey: 'settings.plateClear', labelFallback: 'Plate-
 registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-code Injection', tab: 'queue', keywords: 'gcode injection start end autoprint farmloop swapmod autoclear printflow', anchor: 'card-gcode' });
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
-registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position', anchor: 'card-farm-production' });
+registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position chute prime purge start block plate lip', anchor: 'card-farm-production' });
 registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine aux fan auxiliary speed percent hold plate position fan part top chamber exhaust air duct airduct boost sustain toggle enable', anchor: 'card-farm-cooldown' });
 registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
 registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool observation prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
@@ -1080,6 +1080,7 @@ export function SettingsPage() {
       (settings.farm_usb_auto_cleanup ?? true) !== (localSettings.farm_usb_auto_cleanup ?? true) ||
       (settings.farm_idle_park_enabled ?? true) !== (localSettings.farm_idle_park_enabled ?? true) ||
       (settings.farm_idle_park_percent ?? 75) !== (localSettings.farm_idle_park_percent ?? 75) ||
+      (settings.farm_chute_prime_enabled ?? true) !== (localSettings.farm_chute_prime_enabled ?? true) ||
       (settings.queue_check_interval_seconds ?? 30) !== (localSettings.queue_check_interval_seconds ?? 30) ||
       (settings.dispatch_kick_debounce_seconds ?? 1) !== (localSettings.dispatch_kick_debounce_seconds ?? 1) ||
       (settings.usb_preflight_fresh_window_seconds ?? 10) !== (localSettings.usb_preflight_fresh_window_seconds ?? 10) ||
@@ -1209,6 +1210,7 @@ export function SettingsPage() {
         farm_usb_auto_cleanup: localSettings.farm_usb_auto_cleanup,
         farm_idle_park_enabled: localSettings.farm_idle_park_enabled,
         farm_idle_park_percent: localSettings.farm_idle_park_percent,
+        farm_chute_prime_enabled: localSettings.farm_chute_prime_enabled,
         queue_check_interval_seconds: localSettings.queue_check_interval_seconds,
         dispatch_kick_debounce_seconds: localSettings.dispatch_kick_debounce_seconds,
         usb_preflight_fresh_window_seconds: localSettings.usb_preflight_fresh_window_seconds,
@@ -5143,6 +5145,12 @@ export function SettingsPage() {
                 min={10}
                 max={95}
                 enabled={localSettings.farm_idle_park_enabled ?? true}
+              />
+              <SettingSwitch
+                label={t('settings.farmChutePrimeEnabled', 'Prime into chute')}
+                hint={t('settings.farmChutePrimeEnabledHelp', 'The start-block prime line is extruded into the purge chute instead of onto the plate lip. Files with an unrecognised start block dispatch unmodified.')}
+                checked={localSettings.farm_chute_prime_enabled ?? true}
+                onChange={(checked) => updateSetting('farm_chute_prime_enabled', checked)}
               />
             </CardContent>
           </Card>

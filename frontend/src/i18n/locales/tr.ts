@@ -2726,6 +2726,8 @@ export default {
     farmIdleParkHelp: 'Sorunsuz bir üretim çıkarma işleminden sonra yazıcı için kuyrukta iş yoksa tabla, ayarlanan Z hareket yüzdesine iner.',
     farmIdleParkPercent: 'Park derinliği (Z hareketi yüzdesi)',
     farmIdleParkPercentHelp: 'Model Z hareketine oranla derinlik; bedslinger modeller asla park etmez (10–95)',
+    farmChutePrimeEnabled: 'Prime çizgisini oluğa ekstrüde et',
+    farmChutePrimeEnabledHelp: 'Başlangıç bloğundaki prime çizgisi, tablanın ön kenarı yerine tahliye oluğuna ekstrüde edilir. Başlangıç bloğu tanınmayan dosyalar değiştirilmeden gönderilir.',
     dispatchResponsiveness: 'Gönderim tepkiselliği',
     dispatchResponsivenessDescription: 'Çiftliğin ne kadar hızlı tepki verip bir sonraki baskıyı başlattığını ince ayarlayın. Çiftlik olaylara normalde anında tepki verir; bunlar bunun arkasındaki güvenlik ağı zamanlayıcıları ve sınırlarıdır. Varsayılanlar çoğu atölye için uygundur.',
     queueCheckInterval: 'Yedek kontrol aralığı (sn)',

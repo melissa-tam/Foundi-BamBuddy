@@ -737,6 +737,12 @@ class AppSettings(BaseModel):
         le=95,
         description="Idle park depth as a percentage of the model's commandable Z travel (10-95)",
     )
+    farm_chute_prime_enabled: bool = Field(
+        default=True,
+        description="Rewrite the sliced file's start-block prime line at dispatch so the prime is extruded into "
+        "the purge chute instead of onto the plate's front lip; a file whose start block is not recognised "
+        "dispatches unmodified",
+    )
 
     # Reused-tag auto re-spool (peel a spent Bambu RFID tag onto a fresh
     # third-party spool). `respool_prompt_threshold_g` is the remaining-grams
@@ -919,6 +925,7 @@ class AppSettingsUpdate(BaseModel):
     farm_cooldown_hold_part_top_mm: int | None = Field(default=None, ge=-50, le=200)
     farm_idle_park_enabled: bool | None = None
     farm_idle_park_percent: int | None = Field(default=None, ge=10, le=95)
+    farm_chute_prime_enabled: bool | None = None
     respool_prompt_threshold_g: int | None = Field(default=None, ge=0, le=1000)
     respool_last_brand: str | None = None
 

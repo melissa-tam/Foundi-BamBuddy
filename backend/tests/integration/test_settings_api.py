@@ -104,6 +104,28 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_update_farm_chute_prime(self, async_client: AsyncClient):
+        """The chute-prime kill switch round-trips TYPED (bool) through the coercion
+        whitelist — without the entry a stored setting reads back as the string
+        ``"false"``, which is truthy, and dispatch would go on rewriting every file the
+        operator just switched the rewrite off for.
+
+        Default ON: the prime belongs in the purge chute, and a file whose start block is
+        not recognised dispatches unmodified anyway, so the feature is safe to ship armed.
+        """
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_chute_prime_enabled"] is True
+
+        response = await async_client.put("/api/v1/settings/", json={"farm_chute_prime_enabled": False})
+        assert response.status_code == 200
+        assert response.json()["farm_chute_prime_enabled"] is False
+
+        # Persisted read-back through the boolean-parse whitelist.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_chute_prime_enabled"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_get_farm_cooldown_fan_defaults(self, async_client: AsyncClient):
         """Both cooldown fan lanes default ON at their shipped speeds when nothing has
         ever been written — the operator gets cooling without configuring anything.

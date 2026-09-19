@@ -7,6 +7,11 @@
 # merge materialises a new one (2026-09-04: the two zref_* goldens landed CRLF in the ship gate).
 backend/tests/unit/services/eject/golden/*.gcode text eol=lf
 
+# Chute-prime fixtures are REAL slicer heads, compared byte-identical against the rewrite
+# (goldens) and asserted LF-only. Same reason as the eject goldens above: under
+# core.autocrlf=true an unattributed .gcode checks out CRLF and every byte assertion fails.
+backend/tests/unit/services/fixtures/chute_prime/*.gcode text eol=lf
+
 # Shell scripts must stay LF. Under core.autocrlf=true (this dev box) a .sh
 # with no attribute is checked out CRLF, which makes '#!/bin/sh' parse as
 # '/bin/sh\r' -- Git Bash reports a bad interpreter and every line ends in a

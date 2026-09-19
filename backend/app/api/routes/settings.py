@@ -297,6 +297,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "farm_cooldown_aux_fan_enabled",
             "farm_cooldown_chamber_fan_enabled",
             "farm_idle_park_enabled",
+            "farm_chute_prime_enabled",
             "queue_shortest_first",
             "default_bed_levelling",
             "default_flow_cali",
