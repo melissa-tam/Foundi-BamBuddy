@@ -31,6 +31,7 @@ from backend.app.services.bambu_ftp import (
 )
 from backend.app.services.bambu_mqtt import ams_mid_filament_change
 from backend.app.services.dispatch_claim import DISPATCH_START_BUDGET_S, register_start_watchdog
+from backend.app.services.dispatch_file import build_dispatch_file
 from backend.app.services.dispatch_kick import DispatchKick, dispatch_kick
 from backend.app.services.dispatch_target import DispatchTarget, TargetKind, target_of
 from backend.app.services.eject import progress as dispatch_progress
@@ -3869,42 +3870,27 @@ class PrintScheduler:
         # #1166 FTP-free cover on every injected dispatch.
         durable_path = file_path
 
-        # G-code injection for auto-print systems (#422): the upstream global
-        # per-model start/end snippets only. Farm auto-eject is NOT injected here
-        # anymore (it is a separate server-dispatched motion-only job).
-        injected_path = None
-        start_gc: str | None = None
-        end_gc: str | None = None
-        if item.gcode_injection:
-            try:
-                snippets_raw = await self._get_setting(db, "gcode_snippets")
-                if snippets_raw:
-                    snippets = json.loads(snippets_raw)
-                    model_snippets = snippets.get(printer.model, {})
-                    start_gc = (model_snippets.get("start_gcode") or "").strip() or None
-                    end_gc = (model_snippets.get("end_gcode") or "").strip() or None
-            except Exception as e:
-                logger.warning("Queue item %s: G-code snippet load failed, using original: %s", item.id, e)
-                start_gc = end_gc = None
-
-        # Farm auto-eject no longer injects anything here: the eject sweep is a
-        # SEPARATE server-dispatched motion-only job (the eject monitor dispatches
-        # it after the unit's cooldown gate releases). Print files ship UNMODIFIED
-        # apart from the upstream global per-model start/end snippets below.
-        if start_gc or end_gc:
-            try:
-                from backend.app.utils.threemf_tools import inject_gcode_into_3mf
-
-                injected_path = inject_gcode_into_3mf(file_path, item.plate_id or 1, start_gc, end_gc)
-            except Exception as e:
-                injected_path = None
-                logger.warning("Queue item %s: G-code injection failed: %s", item.id, e)
-
-            if injected_path:
-                file_path = injected_path
-                logger.info("Queue item %s: G-code injected for model %s", item.id, printer.model)
-            else:
-                logger.warning("Queue item %s: G-code injection returned no result, using original", item.id)
+        # WHICH BYTES this dispatch uploads is decided in ONE place — the dispatch-file
+        # seam. It folds every per-dispatch transform into a single repack behind a
+        # content-addressed cache: the chute-prime start-block rewrite, then the upstream
+        # global per-model start/end snippets (#422). Farm auto-eject is NOT injected
+        # here (it is a separate server-dispatched motion-only job the eject monitor
+        # sends once the unit's cooldown gate releases).
+        #
+        # A file the recipe cannot read, a bad snippet blob and a failed build all mean
+        # the same thing at this call site: ``path is None`` — upload the durable file
+        # exactly as sliced. The seam logs WHICH of those happened, and never raises.
+        dispatch_file = await build_dispatch_file(
+            db,
+            file_path,
+            item.plate_id or 1,
+            item_id=item.id,
+            gcode_injection=bool(item.gcode_injection),
+            printer_model=printer.model,
+        )
+        injected_path = dispatch_file.path
+        if injected_path:
+            file_path = injected_path
 
         # Upload to root directory (not /cache/) - the start_print command references
         # files by name only (ftp://{filename}), so they must be in the root

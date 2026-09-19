@@ -1,4 +1,3 @@
-import json
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +13,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.dispatch_file import DispatchFile
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import PrintScheduler
 
@@ -401,11 +401,15 @@ async def test_transient_row_without_the_dispatch_flag_survives(queue_factory):
 async def test_cover_cache_receives_the_durable_path_not_the_injected_temp(queue_factory, tmp_path):
     """#1166 cover reuse must be handed a path that still exists after dispatch.
 
-    With ``gcode_injection`` on, the upload source is rebound to an injected
-    system-temp 3MF which is unlinked the moment the upload finishes. Caching THAT
-    published an already-deleted path, so every injected dispatch silently defeated
-    the FTP-free cover it was supposed to enable. The cache must get the durable
-    copy — here the archive copy, since this case also reaps its transient source.
+    When the dispatch-file seam DERIVES a file (a chute-prime rewrite, the upstream
+    snippets, or both), the upload source is rebound to that system-temp 3MF, which is
+    unlinked the moment the upload finishes. Caching THAT published an already-deleted
+    path, so every derived dispatch silently defeated the FTP-free cover it was supposed
+    to enable. The cache must get the durable copy — here the archive copy, since this
+    case also reaps its transient source.
+
+    The seam itself is stubbed: what this case is about is which of the two paths the
+    scheduler hands onwards, not how the bytes were derived (``test_dispatch_file``).
     """
     ctx = await queue_factory(cleanup=True, transient=True)
 
@@ -417,15 +421,14 @@ async def test_cover_cache_receives_the_durable_path_not_the_injected_temp(queue
         item.gcode_injection = True
         await db.commit()
 
-    snippets = json.dumps({"X1C": {"start_gcode": "M117 hello", "end_gcode": "M117 bye"}})
-    with (
-        patch.object(PrintScheduler, "_get_setting", AsyncMock(return_value=snippets)),
-        patch(
-            "backend.app.utils.threemf_tools.inject_gcode_into_3mf",
-            MagicMock(return_value=injected_path),
-        ),
-    ):
+    seam = AsyncMock(return_value=DispatchFile(injected_path, "derived"))
+    with patch("backend.app.services.print_scheduler.build_dispatch_file", seam):
         await _dispatch_library_item(ctx)
+
+    # The seam was asked about THIS unit's durable file and plate, not something else.
+    assert seam.await_args.args[1] == ctx.archive_path
+    assert seam.await_args.kwargs["item_id"] == ctx.queue_item_id
+    assert seam.await_args.kwargs["gcode_injection"] is True
 
     item, _library_file, _archive = await _queue_snapshot(ctx)
     assert item.status == "printing"

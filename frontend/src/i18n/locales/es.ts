@@ -2725,6 +2725,8 @@ export default {
     farmIdleParkHelp: 'Tras una expulsión de producción correcta y sin nada en cola para la impresora, la cama baja al porcentaje configurado del recorrido Z.',
     farmIdleParkPercent: 'Profundidad de aparcado (% del recorrido Z)',
     farmIdleParkPercentHelp: 'Profundidad como porcentaje del recorrido Z del modelo; los modelos bedslinger nunca aparcan (10–95)',
+    farmChutePrimeEnabled: 'Cebado en la rampa',
+    farmChutePrimeEnabledHelp: 'La línea de cebado del bloque de inicio se extruye en la rampa de purga en lugar de sobre el borde de la placa. Los archivos con un bloque de inicio no reconocido se despachan sin modificar.',
     dispatchResponsiveness: 'Capacidad de respuesta del despacho',
     dispatchResponsivenessDescription: 'Ajusta con precisión la rapidez con que la granja reacciona e inicia la siguiente impresión. La granja normalmente reacciona a los eventos al instante; estos son los temporizadores y límites de seguridad que hay detrás. Los valores predeterminados son buenos para la mayoría de los talleres.',
     queueCheckInterval: 'Intervalo de comprobación de respaldo (seg)',

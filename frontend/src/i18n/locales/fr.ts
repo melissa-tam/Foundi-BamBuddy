@@ -2678,6 +2678,8 @@ export default {
     farmIdleParkHelp: 'Après une éjection de production réussie et sans rien en file d’attente pour l’imprimante, le plateau descend au pourcentage de course Z défini.',
     farmIdleParkPercent: 'Profondeur de parcage (% de la course Z)',
     farmIdleParkPercentHelp: 'Profondeur en pourcentage de la course Z du modèle ; les modèles bedslinger ne se parquent jamais (10–95)',
+    farmChutePrimeEnabled: 'Amorçage dans la goulotte',
+    farmChutePrimeEnabledHelp: 'La ligne d\'amorçage du bloc de démarrage est extrudée dans la goulotte de purge au lieu du bord du plateau. Les fichiers dont le bloc de démarrage n\'est pas reconnu sont envoyés sans modification.',
     dispatchResponsiveness: 'Réactivité de l\'envoi',
     dispatchResponsivenessDescription: 'Ajustez précisément la rapidité avec laquelle la ferme réagit et lance l\'impression suivante. La ferme réagit normalement aux événements instantanément — voici les minuteries et limites de sécurité qui se cachent derrière. Les valeurs par défaut conviennent à la plupart des ateliers.',
     queueCheckInterval: 'Intervalle de vérification de secours (s)',

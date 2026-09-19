@@ -2678,6 +2678,8 @@ export default {
     farmIdleParkHelp: 'Dopo un’espulsione di produzione riuscita e senza nulla in coda per la stampante, il piano scende alla percentuale impostata della corsa Z.',
     farmIdleParkPercent: 'Profondità di parcheggio (% della corsa Z)',
     farmIdleParkPercentHelp: 'Profondità come percentuale della corsa Z del modello; i modelli bedslinger non parcheggiano mai (10–95)',
+    farmChutePrimeEnabled: 'Innesco nello scivolo',
+    farmChutePrimeEnabledHelp: 'La linea di innesco del blocco iniziale viene estrusa nello scivolo di spurgo invece che sul bordo del piatto. I file con un blocco iniziale non riconosciuto vengono inviati senza modifiche.',
     dispatchResponsiveness: 'Reattività dell\'invio',
     dispatchResponsivenessDescription: 'Regola con precisione la rapidità con cui la farm reagisce e avvia la stampa successiva. La farm normalmente reagisce agli eventi all\'istante: questi sono i timer e i limiti di sicurezza dietro le quinte. I valori predefiniti vanno bene per la maggior parte delle officine.',
     queueCheckInterval: 'Intervallo di controllo di riserva (sec)',

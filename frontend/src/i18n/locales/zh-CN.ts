@@ -2723,6 +2723,8 @@ export default {
     farmIdleParkHelp: '生产弹出正常完成且该打印机没有排队任务时，热床下降到设定的 Z 行程百分比。',
     farmIdleParkPercent: '下降深度（Z 行程百分比）',
     farmIdleParkPercentHelp: '按机型 Z 行程的百分比计算；床身移动机型不会下降（10–95）',
+    farmChutePrimeEnabled: '预挤出排入落料口',
+    farmChutePrimeEnabledHelp: '起始代码块的预挤出线挤入落料口，而不是热床前缘。起始代码块无法识别的文件按原样派发。',
     dispatchResponsiveness: '派发响应速度',
     dispatchResponsivenessDescription: '微调打印农场做出反应并开始下一次打印的速度。农场通常会即时响应事件——这些是其背后的安全网计时器和限制。默认值适用于大多数车间。',
     queueCheckInterval: '兜底检查间隔（秒）',

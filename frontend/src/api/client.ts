@@ -1558,6 +1558,11 @@ export interface AppSettings {
   // travel never park.
   farm_idle_park_enabled: boolean;
   farm_idle_park_percent: number;
+  // Chute prime: at dispatch the sliced file's start-block prime line is
+  // rewritten so the prime is extruded into the purge chute instead of onto the
+  // plate's front lip. A file whose start block is not recognised dispatches
+  // unmodified.
+  farm_chute_prime_enabled: boolean;
   // Dispatch responsiveness (latency-reduction wave). Event kicks make dispatch
   // immediate; these tune the fallback poll, kick coalescing, USB-preflight
   // freshness, upload concurrency, and eject-file upload optimizations.

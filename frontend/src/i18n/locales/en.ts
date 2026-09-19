@@ -2747,6 +2747,8 @@ export default {
     farmIdleParkHelp: 'After a clean production eject with nothing queued for the printer, the bed lowers to the set percentage of Z travel.',
     farmIdleParkPercent: 'Park depth (% of Z travel)',
     farmIdleParkPercentHelp: 'Depth as a percentage of the model Z travel; bedslinger models never park (10–95)',
+    farmChutePrimeEnabled: 'Prime into chute',
+    farmChutePrimeEnabledHelp: 'The start-block prime line is extruded into the purge chute instead of onto the plate lip. Files with an unrecognised start block dispatch unmodified.',
     dispatchResponsiveness: 'Dispatch responsiveness',
     dispatchResponsivenessDescription: 'Fine-tune how quickly the farm reacts and starts the next print. The farm normally reacts to events instantly — these are the safety-net timers and limits behind that. The defaults are good for most shops.',
     queueCheckInterval: 'Fallback check interval (sec)',

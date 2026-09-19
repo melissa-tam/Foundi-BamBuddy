@@ -2605,6 +2605,8 @@ export default {
     farmIdleParkHelp: '생산 이젝트가 정상 종료되고 해당 프린터에 대기 중인 작업이 없으면 베드를 설정한 Z 이동 거리 비율까지 내립니다.',
     farmIdleParkPercent: '하강 깊이 (Z 이동 거리 비율)',
     farmIdleParkPercentHelp: '모델 Z 이동 거리에 대한 비율. 베드슬링어 모델은 하강하지 않습니다 (10–95)',
+    farmChutePrimeEnabled: '프라임을 슈트로 배출',
+    farmChutePrimeEnabledHelp: '시작 블록의 프라임 라인을 플레이트 앞쪽 가장자리가 아니라 퍼지 슈트로 압출합니다. 시작 블록을 인식할 수 없는 파일은 변경 없이 디스패치합니다.',
     dispatchResponsiveness: '디스패치 응답성',
     dispatchResponsivenessDescription: '팜이 얼마나 빠르게 반응하고 다음 인쇄를 시작할지 미세 조정합니다. 팜은 보통 이벤트에 즉시 반응하며, 이 값들은 그 뒤에서 동작하는 안전망 타이머와 한계입니다. 기본값은 대부분의 작업장에 적합합니다.',
     queueCheckInterval: '대체 확인 간격(초)',

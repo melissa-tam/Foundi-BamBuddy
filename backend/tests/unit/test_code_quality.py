@@ -439,6 +439,203 @@ class TestIncidentResolutionOwnership:
         assert closers_with_a_close == callers
 
 
+# --- The derived-3MF cache mechanism, and which module owns it (2026-09-19) --------
+
+# The content-addressed cache MECHANISM — the sha256 key, the system-temp caller copies,
+# the atomic ``os.replace`` install, the ``*.3mf`` glob the byte-bounded LRU walks, the
+# per-key lock dict — lives ONCE, in ``services/derived_3mf_cache.py``, because a second
+# lane (the per-dispatch print file) builds derived artifacts the same way.
+# ``eject/build_cache.py`` is a FACADE over it and decides only what is genuinely the
+# eject lane's own: WHAT is built, into WHICH namespace, under WHICH byte cap, and with
+# WHICH error vocabulary its callers catch.
+#
+# The failure this pins is the mechanism growing back where it used to live — one "just
+# this once" hashlib key, one local lock dict, one extra glob in the facade. Every
+# behaviour test in the suite passes that, and it is how one data directory ends up with
+# two eviction policies and two locking rules that disagree under load.
+_CACHE_FACADE = ("services", "eject", "build_cache.py")
+_CACHE_CORE = ("services", "derived_3mf_cache.py")
+
+_MECHANISM_MODULES = {"hashlib", "tempfile", "glob"}
+
+
+def _scan_cache_mechanism(py_file: Path) -> list[tuple[str, int]]:
+    """Every USE of the cache mechanism's own primitives: the key hash, the temp-file
+    maker, the atomic install, the artifact glob and the per-key lock.
+
+    AST rather than grep, like the scans above: the facade's docstring NAMES all of
+    these (explaining what it deliberately no longer does), and pinning the prose would
+    make the rule unwritable.
+    """
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in _MECHANISM_MODULES:
+                    hits.append((f"import {alias.name}", node.lineno))
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in _MECHANISM_MODULES:
+                hits.append((f"import {root}", node.lineno))
+            elif root == "asyncio" and any(alias.name == "Lock" for alias in node.names):
+                hits.append(("asyncio.Lock", node.lineno))
+        elif isinstance(node, ast.Attribute):
+            owner = node.value
+            owner_name = owner.id if isinstance(owner, ast.Name) else None
+            if owner_name in _MECHANISM_MODULES:
+                hits.append((f"{owner_name}.{node.attr}", node.lineno))
+            elif owner_name == "os" and node.attr == "replace":
+                hits.append(("os.replace", node.lineno))
+            elif owner_name == "asyncio" and node.attr == "Lock":
+                hits.append(("asyncio.Lock", node.lineno))
+            elif node.attr == "glob":
+                hits.append((".glob()", node.lineno))
+    return hits
+
+
+class TestDerivedCacheOwnership:
+    """One cache mechanism, in one module, with the eject lane as a facade over it.
+
+    A SOURCE pin: the failure it catches is a perfectly working private helper in the
+    wrong module — a second implementation of a cache that is already canonical.
+    """
+
+    def test_the_eject_facade_carries_no_cache_mechanism(self):
+        facade = BACKEND_DIR.joinpath(*_CACHE_FACADE)
+        assert facade.exists(), f"{'/'.join(_CACHE_FACADE)} is gone — this pin now polices nothing"
+
+        strays = [
+            f"  - {'/'.join(_CACHE_FACADE)}:{line} uses {symbol}" for symbol, line in _scan_cache_mechanism(facade)
+        ]
+        if strays:
+            pytest.fail(
+                "The derived-3MF cache mechanism reappeared in the eject facade:\n"
+                + "\n".join(strays)
+                + "\n\nCall derived_3mf_cache.get_or_build(..., namespace=, max_bytes=) instead — the "
+                "facade owns WHAT is built and where, never HOW it is keyed, installed, locked or evicted."
+            )
+
+    def test_the_mechanism_is_still_in_the_core(self):
+        """The liveness half: if the mechanism moved somewhere else entirely, the scan
+        above would pass on an empty facade while policing nothing at all."""
+        core = BACKEND_DIR.joinpath(*_CACHE_CORE)
+        assert core.exists(), f"{'/'.join(_CACHE_CORE)} is gone — the cache core moved without this pin"
+
+        found = {symbol for symbol, _ in _scan_cache_mechanism(core)}
+        for primitive in ("import hashlib", "import tempfile", "os.replace", ".glob()", "asyncio.Lock"):
+            assert primitive in found, f"{'/'.join(_CACHE_CORE)} no longer uses {primitive}"
+
+
+# --- Which bytes a dispatch uploads, and who decides that (2026-09-19) --------------
+
+# The question "what does the printer actually receive" has ONE owner:
+# ``services/dispatch_file.py``. It builds the transform stack (the chute-prime rewrite,
+# then the upstream per-model snippets), DERIVES the cache key from that stack, and hands
+# ``print_scheduler._start_print`` a verdict. Two things are pinned here:
+#
+#   * the two transform entry points — ``chute_prime.rewrite_head`` and
+#     ``threemf_tools.apply_gcode_snippets`` — are called from the seam and nowhere else;
+#   * the two settings keys that SELECT them are spelled only by the seam that reads them
+#     and by the two modules that define the setting (the schema twin, the PUT coercion
+#     whitelist).
+#
+# The failure this catches is a second rewrite site: a perfectly working injection added
+# back into the scheduler, a route or a recovery lane. Every behaviour test would pass —
+# and the cache key would stop describing the bytes, which is precisely how a kill switch
+# turned off still serves chute-primed files out of the cache.
+_DISPATCH_SEAM = ("services", "dispatch_file.py")
+
+_DISPATCH_TRANSFORM_CALLS = {"rewrite_head", "apply_gcode_snippets"}
+
+_DISPATCH_SETTING_KEYS = {"farm_chute_prime_enabled", "gcode_snippets"}
+
+_DISPATCH_SETTING_SPELLERS = {
+    _DISPATCH_SEAM,
+    ("schemas", "settings.py"),  # defines the typed field + its update twin
+    ("api", "routes", "settings.py"),  # the boolean-coercion whitelist
+}
+
+# What ``print_scheduler`` may no longer import from ``threemf_tools``: it does not
+# rewrite print bytes any more, it ASKS. ``inject_gcode_into_3mf`` is in the set although
+# it is deleted — re-adding it is exactly the regression, and a set that names it fails
+# on the import rather than on a behaviour nobody wrote a test for.
+_INJECTION_IMPORT_SYMBOLS = {"inject_gcode_into_3mf", "apply_gcode_snippets", "transform_plate_gcode"}
+
+
+def _scan_dispatch_decisions(py_file: Path) -> list[tuple[str, int]]:
+    """Every CALL of a transform entry point, and every EXACT spelling of a settings key.
+
+    AST, and exact string equality for the keys: both keys are named in prose in this
+    codebase (the seam's own docstring explains the kill switch), and a substring scan
+    would pin the documentation instead of the code.
+    """
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name in _DISPATCH_TRANSFORM_CALLS:
+                hits.append((f"{name}()", node.lineno))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in _DISPATCH_SETTING_KEYS:
+            hits.append((f'"{node.value}"', node.lineno))
+    return hits
+
+
+class TestDispatchFileOwnership:
+    """One seam decides which bytes a dispatch uploads, and one module reads its switch."""
+
+    def test_only_the_seam_applies_a_dispatch_transform(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts == _DISPATCH_SEAM:
+                continue
+            for symbol, line in _scan_dispatch_decisions(py_file):
+                if symbol.startswith('"') and parts in _DISPATCH_SETTING_SPELLERS:
+                    continue
+                strays.append(f"  - {'/'.join(parts)}:{line} uses {symbol}")
+
+        if strays:
+            pytest.fail(
+                "Something outside the dispatch-file seam decides which bytes a dispatch uploads:\n"
+                + "\n".join(strays)
+                + "\n\nCall services/dispatch_file.build_dispatch_file(...) instead, and add a new "
+                "per-dispatch transform as one more STEP in its stack (a fingerprint plus a pure "
+                "bytes -> bytes). A second rewrite site means a cache key that no longer describes "
+                "the bytes it names."
+            )
+
+    def test_the_scheduler_imports_no_injection_symbol(self):
+        """The one print-upload lane asks the seam; it does not reach for the injector."""
+        scheduler = BACKEND_DIR / "services" / "print_scheduler.py"
+        assert scheduler.exists(), "print_scheduler.py is gone — this pin now polices nothing"
+
+        tree = ast.parse(scheduler.read_text(encoding="utf-8"))
+        strays = [
+            f"  - print_scheduler.py:{node.lineno} imports {alias.name}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("threemf_tools")
+            for alias in node.names
+            if alias.name in _INJECTION_IMPORT_SYMBOLS
+        ]
+        if strays:
+            pytest.fail(
+                "print_scheduler reached back into threemf_tools for an injection symbol:\n" + "\n".join(strays)
+            )
+
+    def test_the_seam_still_owns_both_transforms_and_both_keys(self):
+        """The liveness half: an ownership pin whose owner has moved away polices nothing,
+        and the scan above would then pass on a codebase with no seam at all."""
+        seam = BACKEND_DIR.joinpath(*_DISPATCH_SEAM)
+        assert seam.exists(), f"{'/'.join(_DISPATCH_SEAM)} is gone — the seam moved without this pin"
+
+        found = {symbol for symbol, _ in _scan_dispatch_decisions(seam)}
+        for expected in ("rewrite_head()", "apply_gcode_snippets()", '"farm_chute_prime_enabled"', '"gcode_snippets"'):
+            assert expected in found, f"{'/'.join(_DISPATCH_SEAM)} no longer uses {expected}"
+
+
 class TestModuleImports:
     """Tests for module import health."""
 

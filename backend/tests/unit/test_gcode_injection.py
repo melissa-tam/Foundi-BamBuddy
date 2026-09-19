@@ -1,15 +1,39 @@
-"""Unit tests for G-code injection into 3MF files (#422)."""
+"""Unit tests for G-code injection into 3MF files (#422).
+
+``inject_gcode_into_3mf`` was one function doing two jobs — resolve + insert the snippets
+(text), and repack the container around the result (bytes, MD5, members). It is DELETED,
+and every behaviour it pinned is re-driven here onto the two functions that replaced it:
+
+* snippet SEMANTICS (placeholders, anchors, fallbacks, no-ops) →
+  :func:`threemf_tools.apply_gcode_snippets`, a pure ``str -> str``;
+* CONTAINER behaviour (plate targeting, the ``.gcode.md5`` sidecar, other members,
+  absent plates) → :func:`threemf_tools.transform_plate_gcode`, which applies ANY
+  ``bytes -> bytes`` in one repack pass.
+
+The container cases below drive ``transform_plate_gcode`` with a snippet transform —
+the exact shape the dispatch seam folds into its stack — so the pairing the old function
+provided is still exercised end to end.
+
+ONE deliberate behaviour change, pinned by ``test_unreadable_container_raises``: the
+container half no longer swallows exceptions. Its caller is the derived-artifact cache,
+which turns a raising builder into ``BuildFailed`` plus a logged traceback, and the
+dispatch seam turns that into "upload the original". A silent ``None`` there would cost
+the diagnosis and buy nothing the lane does not already have.
+"""
 
 import hashlib
 import tempfile
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from backend.app.utils.threemf_tools import (
     _inject_start_at_marker,
     _parse_3mf_gcode_header,
     _substitute_placeholders,
-    inject_gcode_into_3mf,
+    apply_gcode_snippets,
+    transform_plate_gcode,
 )
 
 
@@ -34,89 +58,69 @@ def _make_test_3mf(gcode_content: str = "G28\nG1 X0 Y0\nM400\n", plate_id: int =
     return tmp_path
 
 
-class TestInjectGcodeInto3mf:
-    """Tests for inject_gcode_into_3mf()."""
+def _snippets(start: str | None = None, end: str | None = None):
+    """The snippet step as the dispatch seam builds it: decode, inject, encode."""
+
+    def _apply(member: bytes) -> bytes:
+        return apply_gcode_snippets(member.decode("utf-8", errors="ignore"), start, end).encode("utf-8")
+
+    return _apply
+
+
+class TestSnippetSemantics:
+    """What the snippets do to the TEXT (was: TestInjectGcodeInto3mf's snippet cases)."""
 
     def test_inject_start_gcode(self):
-        """Start G-code is prepended before the original content."""
-        source = _make_test_3mf("G28\nM400\n")
-        try:
-            result = inject_gcode_into_3mf(source, 1, "M117 Start\nG92 E0", None)
-            assert result is not None
+        """Start G-code is prepended before the original content (no marker present)."""
+        gcode = apply_gcode_snippets("G28\nM400\n", "M117 Start\nG92 E0", None)
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert gcode.startswith("M117 Start\nG92 E0\n")
-            assert "G28\nM400\n" in gcode
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        assert gcode.startswith("M117 Start\nG92 E0\n")
+        assert "G28\nM400\n" in gcode
 
     def test_inject_end_gcode(self):
-        """End G-code is appended after the original content."""
-        source = _make_test_3mf("G28\nM400")
-        try:
-            result = inject_gcode_into_3mf(source, 1, None, "M104 S0\nG28 X")
-            assert result is not None
+        """End G-code is appended after the original content (no marker present)."""
+        gcode = apply_gcode_snippets("G28\nM400", None, "M104 S0\nG28 X")
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert gcode.endswith("M104 S0\nG28 X\n")
-            assert gcode.startswith("G28\nM400")
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        assert gcode.endswith("M104 S0\nG28 X\n")
+        assert gcode.startswith("G28\nM400")
 
     def test_inject_both_start_and_end(self):
         """Both start and end G-code are injected."""
-        source = _make_test_3mf("G28\n")
-        try:
-            result = inject_gcode_into_3mf(source, 1, "; START", "; END")
-            assert result is not None
+        gcode = apply_gcode_snippets("G28\n", "; START", "; END")
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
+        assert gcode.startswith("; START\n")
+        assert gcode.endswith("; END\n")
+        assert "G28" in gcode
 
-            assert gcode.startswith("; START\n")
-            assert gcode.endswith("; END\n")
-            assert "G28" in gcode
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+    def test_no_injection_is_a_no_op(self):
+        """Both snippets None: the text comes back identical.
 
-    def test_no_injection_returns_none(self):
-        """Returns None when both start and end are None."""
-        source = _make_test_3mf()
-        try:
-            result = inject_gcode_into_3mf(source, 1, None, None)
-            assert result is None
-        finally:
-            source.unlink(missing_ok=True)
+        The old function answered ``None`` here, meaning "no file to upload"; that
+        decision belongs to the caller now — the dispatch seam simply builds no step, so
+        nothing is repacked at all (``test_dispatch_file.TestEmptyStack``).
+        """
+        assert apply_gcode_snippets("G28\nM400\n", None, None) == "G28\nM400\n"
 
-    def test_empty_strings_returns_none(self):
-        """Returns None when both start and end are empty strings."""
-        source = _make_test_3mf()
-        try:
-            result = inject_gcode_into_3mf(source, 1, "", "")
-            assert result is None
-        finally:
-            source.unlink(missing_ok=True)
+    def test_empty_strings_are_a_no_op(self):
+        """Empty snippets are as absent as None — an empty ``start_gcode`` row in the
+        settings blob must not rewrite the file."""
+        assert apply_gcode_snippets("G28\nM400\n", "", "") == "G28\nM400\n"
+
+
+class TestContainerRepack:
+    """What the REPACK does to the container (was: TestInjectGcodeInto3mf's file cases)."""
 
     def test_plate_id_selection(self):
-        """Injects into the correct plate's G-code file."""
+        """Transforms the correct plate's G-code member."""
         source = _make_temp_path()
 
         with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("Metadata/plate_1.gcode", "PLATE1\n")
             zf.writestr("Metadata/plate_2.gcode", "PLATE2\n")
 
+        result = None
         try:
-            result = inject_gcode_into_3mf(source, 2, "; INJECTED", None)
+            result = transform_plate_gcode(source, 2, _snippets(start="; INJECTED"))
             assert result is not None
 
             with zipfile.ZipFile(result, "r") as zf:
@@ -134,8 +138,9 @@ class TestInjectGcodeInto3mf:
     def test_preserves_other_files(self):
         """Non-gcode files in the 3MF are preserved unchanged."""
         source = _make_test_3mf()
+        result = None
         try:
-            result = inject_gcode_into_3mf(source, 1, "; START", None)
+            result = transform_plate_gcode(source, 1, _snippets(start="; START"))
             assert result is not None
 
             with zipfile.ZipFile(result, "r") as zf:
@@ -157,19 +162,24 @@ class TestInjectGcodeInto3mf:
             zf.writestr("3D/3dmodel.model", "<model></model>")
 
         try:
-            result = inject_gcode_into_3mf(source, 1, "; START", None)
-            assert result is None
+            assert transform_plate_gcode(source, 1, _snippets(start="; START")) is None
         finally:
             source.unlink(missing_ok=True)
 
-    def test_invalid_file_returns_none(self):
-        """Returns None for a non-ZIP file."""
+    def test_unreadable_container_raises(self):
+        """A non-ZIP donor RAISES — it no longer answers None.
+
+        The old swallow turned "this file is not a 3MF" into the same ``None`` an absent
+        plate produced, and the dispatch lane logged one generic line for both. The cache
+        that calls this now reports ``BuildFailed`` with the exception type and a logged
+        traceback, so the two are told apart in the production log.
+        """
         source = _make_temp_path()
         source.write_bytes(b"not a zip file")
 
         try:
-            result = inject_gcode_into_3mf(source, 1, "; START", None)
-            assert result is None
+            with pytest.raises(zipfile.BadZipFile):
+                transform_plate_gcode(source, 1, _snippets(start="; START"))
         finally:
             source.unlink(missing_ok=True)
 
@@ -186,11 +196,18 @@ class TestInjectGcodeInto3mf:
         before = source.read_bytes()
         temp_dir = Path(tempfile.gettempdir())
         temps_before = set(temp_dir.glob("*.3mf"))
+        applied: list[bytes] = []
+
+        def _record(member: bytes) -> bytes:
+            applied.append(member)
+            return member
 
         try:
-            assert inject_gcode_into_3mf(source, 5, "; INJECTED", None) is None
+            assert transform_plate_gcode(source, 5, _record) is None
 
-            # Nothing was written: no new temp container, and the donor is untouched.
+            # Nothing was read and nothing was written: the transform never ran, no new
+            # temp container exists, and the donor is untouched.
+            assert applied == []
             assert set(temp_dir.glob("*.3mf")) - temps_before == set()
             assert source.read_bytes() == before
             with zipfile.ZipFile(source, "r") as zf:
@@ -201,8 +218,9 @@ class TestInjectGcodeInto3mf:
     def test_original_file_unchanged(self):
         """The source 3MF is never modified."""
         source = _make_test_3mf("ORIGINAL\n")
+        result = None
         try:
-            result = inject_gcode_into_3mf(source, 1, "; START", "; END")
+            result = transform_plate_gcode(source, 1, _snippets(start="; START", end="; END"))
             assert result is not None
 
             # Verify original is untouched
@@ -240,7 +258,7 @@ M104 S0
 
 
 class TestMd5SidecarRecompute:
-    """The plate `.gcode.md5` sidecar must match the injected gcode (P1S rejects
+    """The plate `.gcode.md5` sidecar must match the transformed gcode (P1S rejects
     a stale hash with HMS 0500-4003)."""
 
     def _make_3mf_with_md5(self, gcode: str, plate_id: int = 1) -> Path:
@@ -257,7 +275,7 @@ class TestMd5SidecarRecompute:
         source = self._make_3mf_with_md5("G28\nM400\n")
         result = None
         try:
-            result = inject_gcode_into_3mf(source, 1, None, "M104 S0")
+            result = transform_plate_gcode(source, 1, _snippets(end="M104 S0"))
             assert result is not None
             with zipfile.ZipFile(result, "r") as zf:
                 gcode = zf.read("Metadata/plate_1.gcode")
@@ -275,7 +293,7 @@ class TestMd5SidecarRecompute:
         source = self._make_3mf_with_md5("G28\n")
         result = None
         try:
-            result = inject_gcode_into_3mf(source, 1, "; START", None)
+            result = transform_plate_gcode(source, 1, _snippets(start="; START"))
             assert result is not None
             with zipfile.ZipFile(result, "r") as zf:
                 sidecar = zf.read("Metadata/plate_1.gcode.md5")
@@ -293,7 +311,7 @@ class TestMd5SidecarRecompute:
         source = _make_test_3mf("G28\n")  # no .md5 member
         result = None
         try:
-            result = inject_gcode_into_3mf(source, 1, "; START", None)
+            result = transform_plate_gcode(source, 1, _snippets(start="; START"))
             assert result is not None
             with zipfile.ZipFile(result, "r") as zf:
                 names = zf.namelist()
@@ -315,7 +333,7 @@ class TestMd5SidecarRecompute:
             zf.writestr(stored, b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
         result = None
         try:
-            result = inject_gcode_into_3mf(tmp_path, 1, None, "; END")
+            result = transform_plate_gcode(tmp_path, 1, _snippets(end="; END"))
             assert result is not None
             with zipfile.ZipFile(result, "r") as zf:
                 assert zf.getinfo("Metadata/plate_1.png").compress_type == zipfile.ZIP_STORED
@@ -330,64 +348,34 @@ class TestStartAnchoredInjection:
 
     def test_start_lands_after_printer_startup(self):
         """Start snippet sits immediately before MACHINE_START_GCODE_END, not at file head."""
-        source = _make_test_3mf(_BAMBU_GCODE_TEMPLATE)
-        try:
-            result = inject_gcode_into_3mf(source, 1, "; SWAPMOD-START", None)
-            assert result is not None
+        gcode = apply_gcode_snippets(_BAMBU_GCODE_TEMPLATE, "; SWAPMOD-START", None)
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            # Original file head is preserved — snippet does NOT prepend.
-            assert gcode.startswith("; HEADER_BLOCK_START\n")
-            # Snippet sits right above the marker.
-            marker_idx = gcode.index("; MACHINE_START_GCODE_END")
-            snippet_idx = gcode.index("; SWAPMOD-START")
-            assert snippet_idx < marker_idx
-            # Nothing else between snippet and marker except the trailing newline.
-            between = gcode[snippet_idx:marker_idx]
-            assert between == "; SWAPMOD-START\n"
-            # Printer's own startup commands still come BEFORE the snippet.
-            startup_idx = gcode.index("M109 S220")
-            assert startup_idx < snippet_idx
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        # Original file head is preserved — snippet does NOT prepend.
+        assert gcode.startswith("; HEADER_BLOCK_START\n")
+        # Snippet sits right above the marker.
+        marker_idx = gcode.index("; MACHINE_START_GCODE_END")
+        snippet_idx = gcode.index("; SWAPMOD-START")
+        assert snippet_idx < marker_idx
+        # Nothing else between snippet and marker except the trailing newline.
+        between = gcode[snippet_idx:marker_idx]
+        assert between == "; SWAPMOD-START\n"
+        # Printer's own startup commands still come BEFORE the snippet.
+        startup_idx = gcode.index("M109 S220")
+        assert startup_idx < snippet_idx
 
     def test_no_marker_falls_back_to_prepend(self):
         """Files without MACHINE_START_GCODE_END (older slicers) keep prepend behaviour."""
-        source = _make_test_3mf("G28\nM400\n")
-        try:
-            result = inject_gcode_into_3mf(source, 1, "; LEGACY-START", None)
-            assert result is not None
+        gcode = apply_gcode_snippets("G28\nM400\n", "; LEGACY-START", None)
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert gcode.startswith("; LEGACY-START\n")
-            assert "G28" in gcode
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        assert gcode.startswith("; LEGACY-START\n")
+        assert "G28" in gcode
 
     def test_end_falls_back_to_eof_without_block_marker(self):
         """Files without ; EXECUTABLE_BLOCK_END (older / non-Bambu slicers) keep the
         append-to-EOF fallback for end snippets."""
-        source = _make_test_3mf(_BAMBU_GCODE_TEMPLATE)  # template has no EXECUTABLE_BLOCK_END
-        try:
-            result = inject_gcode_into_3mf(source, 1, None, "; SWAPMOD-END")
-            assert result is not None
+        gcode = apply_gcode_snippets(_BAMBU_GCODE_TEMPLATE, None, "; SWAPMOD-END")
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert gcode.endswith("; SWAPMOD-END\n")
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        assert gcode.endswith("; SWAPMOD-END\n")
 
     def test_end_lands_before_executable_block_end(self):
         """With ; EXECUTABLE_BLOCK_END present, the end snippet sits INSIDE the
@@ -401,26 +389,17 @@ class TestStartAnchoredInjection:
             "M104 S0 ; printer machine-end\n"
             "; EXECUTABLE_BLOCK_END\n"
         )
-        source = _make_test_3mf(gcode_src)
-        try:
-            result = inject_gcode_into_3mf(source, 1, None, "; EJECT-SWEEP")
-            assert result is not None
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
+        gcode = apply_gcode_snippets(gcode_src, None, "; EJECT-SWEEP")
 
-            snippet_idx = gcode.index("; EJECT-SWEEP")
-            marker_idx = gcode.index("; EXECUTABLE_BLOCK_END")
-            # Snippet is inside the block, before the end marker.
-            assert snippet_idx < marker_idx
-            # The printer's own machine-end still precedes our snippet.
-            assert gcode.index("M104 S0 ; printer machine-end") < snippet_idx
-            # Nothing executable remains after the marker.
-            assert gcode[marker_idx:].strip() == "; EXECUTABLE_BLOCK_END"
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        snippet_idx = gcode.index("; EJECT-SWEEP")
+        marker_idx = gcode.index("; EXECUTABLE_BLOCK_END")
+        # Snippet is inside the block, before the end marker.
+        assert snippet_idx < marker_idx
+        # The printer's own machine-end still precedes our snippet.
+        assert gcode.index("M104 S0 ; printer machine-end") < snippet_idx
+        # Nothing executable remains after the marker.
+        assert gcode[marker_idx:].strip() == "; EXECUTABLE_BLOCK_END"
 
 
 class TestPlaceholderSubstitution:
@@ -428,72 +407,32 @@ class TestPlaceholderSubstitution:
 
     def test_max_z_height_substituted_in_end_snippet(self):
         """`G1 Z{max_layer_z}` resolves to the model's actual top-layer Z (DevScarabyte safety bug)."""
-        source = _make_test_3mf(_BAMBU_GCODE_TEMPLATE)
-        try:
-            # Prusa-style alias: max_layer_z → max_z_height in the Bambu header
-            result = inject_gcode_into_3mf(source, 1, None, "G1 Z{max_layer_z} F600")
-            assert result is not None
+        # Prusa-style alias: max_layer_z → max_z_height in the Bambu header
+        gcode = apply_gcode_snippets(_BAMBU_GCODE_TEMPLATE, None, "G1 Z{max_layer_z} F600")
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            # max_z_height in the template is 16.00 — the dangerous Z1 fallback is gone.
-            assert "G1 Z16.00 F600" in gcode
-            assert "{max_layer_z}" not in gcode
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        # max_z_height in the template is 16.00 — the dangerous Z1 fallback is gone.
+        assert "G1 Z16.00 F600" in gcode
+        assert "{max_layer_z}" not in gcode
 
     def test_direct_header_key_lookup(self):
         """Snippets can reference normalised header keys directly without going through aliases."""
-        source = _make_test_3mf(_BAMBU_GCODE_TEMPLATE)
-        try:
-            result = inject_gcode_into_3mf(
-                source, 1, None, "; layers={total_layer_number} weight={total_filament_weight}"
-            )
-            assert result is not None
+        gcode = apply_gcode_snippets(
+            _BAMBU_GCODE_TEMPLATE, None, "; layers={total_layer_number} weight={total_filament_weight}"
+        )
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert "; layers=80 weight=36.55" in gcode
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        assert "; layers=80 weight=36.55" in gcode
 
     def test_unknown_placeholder_left_intact(self):
         """A typo or unsupported placeholder is preserved verbatim instead of becoming empty."""
-        source = _make_test_3mf(_BAMBU_GCODE_TEMPLATE)
-        try:
-            result = inject_gcode_into_3mf(source, 1, None, "; nope={does_not_exist}")
-            assert result is not None
+        gcode = apply_gcode_snippets(_BAMBU_GCODE_TEMPLATE, None, "; nope={does_not_exist}")
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert "; nope={does_not_exist}" in gcode
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        assert "; nope={does_not_exist}" in gcode
 
     def test_no_placeholders_no_header_required(self):
         """Snippets without placeholders inject correctly even when the header is absent."""
-        source = _make_test_3mf("G28\nM400\n")
-        try:
-            result = inject_gcode_into_3mf(source, 1, "; PLAIN", None)
-            assert result is not None
+        gcode = apply_gcode_snippets("G28\nM400\n", "; PLAIN", None)
 
-            with zipfile.ZipFile(result, "r") as zf:
-                gcode = zf.read("Metadata/plate_1.gcode").decode("utf-8")
-
-            assert gcode.startswith("; PLAIN\n")
-        finally:
-            source.unlink(missing_ok=True)
-            if result:
-                result.unlink(missing_ok=True)
+        assert gcode.startswith("; PLAIN\n")
 
 
 class TestHeaderParser:
