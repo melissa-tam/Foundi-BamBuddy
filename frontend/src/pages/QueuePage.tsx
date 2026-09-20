@@ -2512,17 +2512,13 @@ export function QueuePage() {
                         return (
                           // The 3px accent runs the FULL height of the group —
                           // it is the group's border, not the header's — so a
-                          // scrolled-into group is identifiable by its edge
-                          // alone. No `overflow-hidden` here: it would make this
-                          // element a scrollport and defeat the sticky header.
+                          // group whose header has scrolled out of view is
+                          // still identifiable by its edge alone.
                           <div
                             key={bucket.key}
                             className={`rounded-lg border border-l-[3px] border-bambu-dark-tertiary ${kindClasses.rail}`}
                           >
-                            {/* Sticky within the page's scroll container
-                                (Layout's <main>): the group name stays readable
-                                while its rows scroll past. */}
-                            <div className="sticky top-0 z-10 flex items-center gap-3 px-3 py-2 bg-bambu-dark-secondary rounded-t-lg">
+                            <div className="flex items-center gap-3 px-3 py-2 bg-bambu-dark-secondary rounded-t-lg">
                               <Printer className={`w-4 h-4 shrink-0 ${kindClasses.icon}`} />
                               {/* A heading, not a styled span: the group is a
                                   section of the pending list (under its h2), so
