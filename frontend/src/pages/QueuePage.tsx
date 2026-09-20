@@ -78,7 +78,8 @@ import { QueueTimelineView } from '../components/QueueTimelineView';
 import { WaitingReason } from '../components/ui/WaitingReason';
 import { QueuePhaseChip } from '../components/QueuePhaseChip';
 import { waitingReasonText } from '../utils/waitingReason';
-import { describeQueueTarget } from '../utils/queueTarget';
+import { describeQueueTarget, queueTargetKindClasses } from '../utils/queueTarget';
+import { QueueTargetChip } from '../components/QueueTargetChip';
 import { buildRows, bucketRowsByTarget, sortItems, sortRows } from '../utils/queueSort';
 import type { QueueRow, QueueSortContext, QueueSortKey, QueueTargetBucket } from '../utils/queueSort';
 import { matchesLocation, matchesStatus } from '../utils/queueFilter';
@@ -383,11 +384,6 @@ function SortableQueueItem({
   storedOrder?: boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
-  // What this unit dispatches against — pinned printer, printers pool, model
-  // pool, or nothing yet. One origin (`utils/queueTarget`), shared with the
-  // printer buckets and the timeline lanes.
-  const target = describeQueueTarget(item, t, printerNameById);
-
   // Fetch printer status every 30 seconds while printing to monitor progress
   const { data: status } = useQuery({
     queryKey: ['printerStatus', item.printer_id],
@@ -583,16 +579,7 @@ function SortableQueueItem({
           </div>
 
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm text-bambu-gray">
-            <span className={`flex items-center gap-1 sm:gap-1.5 ${target.kind === 'unassigned' ? 'text-orange-700 dark:text-orange-400' : ''} ${target.kind === 'model' || target.kind === 'printers' ? 'text-blue-700 dark:text-blue-400' : ''}`}>
-              <Printer className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
-              <span className="truncate max-w-[120px] sm:max-w-none">
-              {/* A pool target carries the unit's own narrowing suffixes; a
-                  pinned or unassigned row is the bare target. */}
-              {target.kind === 'model' || target.kind === 'printers'
-                ? `${target.label}${item.target_location ? ` @ ${item.target_location}` : ''}${item.required_filament_types?.length ? ` (${item.required_filament_types.join(', ')})` : ''}`
-                : target.label}
-              </span>
-            </span>
+            <QueueTargetChip item={item} t={t} printerNameById={printerNameById} />
             {item.print_time_seconds && (
               <span className="flex items-center gap-1 sm:gap-1.5">
                 <Timer className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
@@ -948,6 +935,19 @@ function SortableBatchRow({
       : 'pending';
   const pendingChildren = batchRow.items.filter((i) => i.status === 'pending').length;
 
+  // A collapsed run states its target like any other row. Members are minted
+  // together, so this is normally ONE chip; a batch whose members drifted apart
+  // (a pool unit that landed on a printer) shows each distinct target rather
+  // than picking one of them to speak for the group.
+  const targetMembers: { key: string; item: PrintQueueItem }[] = [];
+  const seenTargets = new Set<string>();
+  for (const member of batchRow.items) {
+    const key = describeQueueTarget(member, t, printerNameById).key;
+    if (seenTargets.has(key)) continue;
+    seenTargets.add(key);
+    targetMembers.push({ key, item: member });
+  }
+
   return (
     <div
       ref={setNodeRef}
@@ -1022,6 +1022,14 @@ function SortableBatchRow({
             </span>
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm text-bambu-gray">
+            {targetMembers.map((member) => (
+              <QueueTargetChip
+                key={member.key}
+                item={member.item}
+                t={t}
+                printerNameById={printerNameById}
+              />
+            ))}
             {agg.time > 0 && (
               <span className="flex items-center gap-1 sm:gap-1.5">
                 <Timer className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
@@ -2497,18 +2505,36 @@ export function QueuePage() {
                     <div className="space-y-4">
                       {printerBuckets.map((bucket) => {
                         const agg = aggregateForRows(bucket.rows);
+                        // One kind → colour table (`QueueTargetChip`), so the
+                        // rail, the header icon and every row chip in the group
+                        // read one mapping.
+                        const kindClasses = queueTargetKindClasses(bucket.kind);
                         return (
-                          <div key={bucket.key}>
-                            <div className="flex items-center gap-3 px-3 py-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-t-lg">
-                              <Printer className={`w-4 h-4 ${bucket.kind === 'unassigned' ? 'text-orange-700 dark:text-orange-400' : bucket.kind === 'printer' ? 'text-bambu-green' : 'text-blue-700 dark:text-blue-400'}`} />
-                              <span className="font-semibold text-white text-sm">{bucket.label}</span>
-                              <span className="text-xs text-bambu-gray flex flex-wrap gap-x-3">
+                          // The 3px accent runs the FULL height of the group —
+                          // it is the group's border, not the header's — so a
+                          // scrolled-into group is identifiable by its edge
+                          // alone. No `overflow-hidden` here: it would make this
+                          // element a scrollport and defeat the sticky header.
+                          <div
+                            key={bucket.key}
+                            className={`rounded-lg border border-l-[3px] border-bambu-dark-tertiary ${kindClasses.rail}`}
+                          >
+                            {/* Sticky within the page's scroll container
+                                (Layout's <main>): the group name stays readable
+                                while its rows scroll past. */}
+                            <div className="sticky top-0 z-10 flex items-center gap-3 px-3 py-2 bg-bambu-dark-secondary rounded-t-lg">
+                              <Printer className={`w-4 h-4 shrink-0 ${kindClasses.icon}`} />
+                              {/* A heading, not a styled span: the group is a
+                                  section of the pending list (under its h2), so
+                                  it names itself in the outline too. */}
+                              <h3 className="font-semibold text-white text-base truncate" title={bucket.label}>{bucket.label}</h3>
+                              <span className="text-xs text-bambu-gray flex flex-wrap gap-x-3 shrink-0">
                                 <span>{t('queue.itemCount', { count: agg.count })}</span>
                                 {agg.time > 0 && <span>{formatDuration(agg.time)}</span>}
                                 {agg.weight > 0 && <span>{formatWeight(agg.weight)}</span>}
                               </span>
                             </div>
-                            <div className="bg-bambu-dark/40 border border-t-0 border-bambu-dark-tertiary rounded-b-lg p-2 space-y-2">
+                            <div className="bg-bambu-dark/40 border-t border-bambu-dark-tertiary rounded-b-lg p-2 space-y-2">
                               {bucket.rows.map((row) => (
                                 <QueueRowRender
                                   key={row.kind === 'item' ? `item-${row.item.id}` : `batch-${row.batchId}`}

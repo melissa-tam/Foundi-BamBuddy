@@ -6,6 +6,17 @@
  * a second comparator is how the flat list, the batch children and the bucket
  * lanes drifted into three different readings of "sorted by printer".
  *
+ * SCOPE — the stored order lanes on `queuePositionScopeKey`, the position
+ * SCOPE, and never on target identity. A `position` is unique within its scope
+ * and the backend has exactly two (`queue_builder.position_scope_of`): a
+ * pinned printer, and the one shared sequence every NULL-`printer_id` row
+ * lives in. Target identity cuts that shared sequence into finer lanes than
+ * the backend numbers, so an appended pool run renders above older pool runs
+ * that hold lower positions — and because a drag POSTS the displayed order
+ * back as `ordered_ids`, which `renumber_pending` faithfully stores, a lane
+ * the backend does not number by does not merely mis-display the queue, it
+ * rewrites it on the first drop.
+ *
  * MIRROR — the SJF comparator mirrors the scheduler's pending-item query
  * (`backend/app/services/print_scheduler.py`, the `sjf_enabled` branch of
  * `check_queue`): target lane, then `been_jumped` first, then shortest
@@ -19,11 +30,14 @@
  * sort option stays labelled "Position" rather than naming the scheduler.
  *
  * Direction is applied ONCE, to the primary comparator only; the deterministic
- * tie-break (`queueTargetSortKey` → `position` → id) runs AFTER it, so two rows
- * the operator cannot distinguish never swap places between renders.
+ * tie-break (`queuePositionScopeKey` → `position` → id) runs AFTER it, so two
+ * rows the operator cannot distinguish never swap places between renders. It
+ * lanes on the scope for the same reason the stored order does: it is the
+ * final say on a stored-order list, so it must not reorder across scopes by
+ * anything but the number the backend assigned.
  */
 import type { PrintQueueItem } from '../api/client';
-import { describeQueueTarget, queueTargetSortKey } from './queueTarget';
+import { describeQueueTarget, queuePositionScopeKey, queueTargetSortKey } from './queueTarget';
 import type { PrinterNameSource, QueueTarget } from './queueTarget';
 import { parseUTCDate } from './date';
 
@@ -145,6 +159,13 @@ function rowTargetKey(row: QueueRow): string {
   return rep ? queueTargetSortKey(rep) : '';
 }
 
+/** Batch: its members' shared position scope — they are minted together, into
+ *  one scope, so the group is numbered where its first member is. */
+function rowScopeKey(row: QueueRow): string {
+  const rep = representative(row);
+  return rep ? queuePositionScopeKey(rep) : '';
+}
+
 function rowId(row: QueueRow): number {
   let lowest = Number.POSITIVE_INFINITY;
   for (const item of members(row)) lowest = Math.min(lowest, item.id);
@@ -158,9 +179,18 @@ function compareTargetKey(a: QueueRow, b: QueueRow): number {
   return ak < bk ? -1 : 1;
 }
 
-/** Stored order: the lane, then the position the backend assigned in it. */
+function compareScopeKey(a: QueueRow, b: QueueRow): number {
+  const ak = rowScopeKey(a);
+  const bk = rowScopeKey(b);
+  if (ak === bk) return 0;
+  return ak < bk ? -1 : 1;
+}
+
+/** Stored order: the position SCOPE, then the position the backend assigned
+ *  in it — see the SCOPE note in the module docstring for why the lane is the
+ *  scope and never the target. */
 function compareStoredOrder(a: QueueRow, b: QueueRow): number {
-  const lane = compareTargetKey(a, b);
+  const lane = compareScopeKey(a, b);
   if (lane !== 0) return lane;
   return rowPosition(a) - rowPosition(b);
 }
@@ -193,7 +223,7 @@ const COMPARATORS: Record<QueueSortKey, RowComparator> = {
  * equal keep one stable order across renders and across both directions.
  */
 function tieBreak(a: QueueRow, b: QueueRow): number {
-  const lane = compareTargetKey(a, b);
+  const lane = compareScopeKey(a, b);
   if (lane !== 0) return lane;
   const position = rowPosition(a) - rowPosition(b);
   if (position !== 0) return position;

@@ -8,6 +8,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   describeQueueTarget,
+  queuePositionScopeKey,
+  queueTargetKindClasses,
   queueTargetSortKey,
   type QueueTargetItem,
 } from '../../utils/queueTarget';
@@ -189,5 +191,67 @@ describe('queueTargetSortKey', () => {
     expect(queueTargetSortKey(item({ target_printer_ids: [1] }))).not.toBe(
       queueTargetSortKey(item()),
     );
+  });
+});
+
+/**
+ * The scope a `position` is numbered within — the mirror of backend
+ * `queue_builder.position_scope_of`. Exactly TWO shapes, and the difference
+ * from `queueTargetSortKey` is the whole point: a target is not a scope.
+ */
+describe('queuePositionScopeKey', () => {
+  it('puts all four target shapes into the two scopes the backend numbers', () => {
+    // Every NULL-printer shape shares ONE sequence...
+    expect(queuePositionScopeKey(item({ target_model: 'H2S' }))).toBe('0:shared');
+    expect(queuePositionScopeKey(item({ target_printer_ids: [1, 2] }))).toBe('0:shared');
+    expect(queuePositionScopeKey(item())).toBe('0:shared');
+    // ...and a pin is numbered against its own printer.
+    expect(queuePositionScopeKey(item({ printer_id: 7 }))).toBe('1:0000000007');
+  });
+
+  it('gives the three NULL-printer shapes ONE key, unlike the target key', () => {
+    const model = item({ target_model: 'H2S' });
+    const pool = item({ target_printer_ids: [1, 2] });
+    const unassigned = item();
+    expect(new Set([model, pool, unassigned].map(queuePositionScopeKey)).size).toBe(1);
+    // The defect this closes: the target key gives them three lanes, so a
+    // stored-order sort laned by it reorders rows the backend numbered as one.
+    expect(new Set([model, pool, unassigned].map(queueTargetSortKey)).size).toBe(3);
+  });
+
+  it('sorts the shared sequence ahead of every pinned scope', () => {
+    // The scheduler's `ORDER BY printer_id, position` yields NULL rows first
+    // on SQLite, so the display order follows.
+    expect(queuePositionScopeKey(item()) < queuePositionScopeKey(item({ printer_id: 1 }))).toBe(true);
+  });
+
+  it('orders pinned scopes numerically, not lexically', () => {
+    expect(
+      queuePositionScopeKey(item({ printer_id: 2 })) < queuePositionScopeKey(item({ printer_id: 10 })),
+    ).toBe(true);
+  });
+
+  it('reads the pin alone — a pinned row keeps its scope whatever pools it names', () => {
+    expect(
+      queuePositionScopeKey(item({ printer_id: 3, target_model: 'H2S', target_printer_ids: [1, 2] })),
+    ).toBe('1:0000000003');
+  });
+});
+
+describe('queueTargetKindClasses', () => {
+  it('is ONE table — the pools share a colour, the other kinds each own one', () => {
+    expect(queueTargetKindClasses('model')).toEqual(queueTargetKindClasses('printers'));
+    const rails = (['printer', 'model', 'unassigned'] as const).map(
+      (kind) => queueTargetKindClasses(kind).rail,
+    );
+    expect(new Set(rails).size).toBe(3);
+  });
+
+  it('pairs a light and a dark token for every kind the theme tints', () => {
+    for (const kind of ['model', 'printers', 'unassigned'] as const) {
+      const classes = queueTargetKindClasses(kind);
+      expect(classes.chip).toMatch(/dark:/);
+      expect(classes.rail).toMatch(/dark:/);
+    }
   });
 });
