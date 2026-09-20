@@ -1002,6 +1002,175 @@ describe('QueuePage sorting', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The STORED order is what a drag posts back, so what the page displays under
+// the Position sort has to be the order the backend numbered — laned on the
+// position SCOPE (`utils/queueTarget.queuePositionScopeKey`), never on target
+// identity. The 09-19 defect: an appended "Any <model>" run rendered at the top
+// of a queue of printer-subset runs, and the next drop stored that reading.
+// ---------------------------------------------------------------------------
+/**
+ * dnd-kit measures droppables with `getBoundingClientRect`, and jsdom answers
+ * every element with a zero rect — so a drag finds no drop target and the drop
+ * is a no-op. Give the document a plain vertical stack (10px rows in DOM
+ * order) for the duration of one drag; the caller restores it.
+ */
+function stubVerticalRects(): () => void {
+  const original = Element.prototype.getBoundingClientRect;
+  Element.prototype.getBoundingClientRect = function (this: Element): DOMRect {
+    const top = Array.from(document.querySelectorAll('*')).indexOf(this) * 10;
+    return {
+      x: 0,
+      y: top,
+      top,
+      left: 0,
+      bottom: top + 10,
+      right: 300,
+      width: 300,
+      height: 10,
+      toJSON: () => ({}),
+    } as DOMRect;
+  };
+  return () => {
+    Element.prototype.getBoundingClientRect = original;
+  };
+}
+
+describe('QueuePage stored order across target shapes', () => {
+  const scopeFleet = [
+    { ...mockPrinters[0], id: 1, name: 'H2S-Alpha', model: 'H2S' },
+    { ...mockPrinters[0], id: 2, name: 'H2C-Beta', model: 'H2C' },
+  ];
+
+  /** Positions 1..4 in ONE shared sequence, across all four target shapes.
+   *  The model pool is APPENDED — highest position, so it renders LAST. */
+  const scopeItems = [
+    {
+      ...mockQueueItems[0],
+      id: 71,
+      position: 1,
+      printer_id: null,
+      printer_name: null,
+      target_printer_ids: [1, 2],
+      archive_name: 'Unit A',
+    },
+    {
+      ...mockQueueItems[0],
+      id: 72,
+      position: 2,
+      printer_id: null,
+      printer_name: null,
+      archive_name: 'Unit B',
+    },
+    {
+      ...mockQueueItems[0],
+      id: 73,
+      position: 3,
+      printer_id: null,
+      printer_name: null,
+      target_model: 'H2S',
+      archive_name: 'Unit C',
+    },
+  ];
+
+  const shownUnits = () => screen.getAllByText(/^Unit [A-Z]$/).map((el) => el.textContent);
+
+  beforeEach(() => {
+    vi.mocked(localStorage.getItem).mockImplementation(() => null);
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(scopeFleet)),
+      http.get('/api/v1/queue/', () => HttpResponse.json(scopeItems)),
+    );
+  });
+
+  it('renders a mixed-pool pending list in POSITION order', async () => {
+    render(<QueuePage />);
+    await screen.findByText('Unit A');
+    expect(shownUnits()).toEqual(['Unit A', 'Unit B', 'Unit C']);
+  });
+
+  it('posts the DISPLAYED order as ordered_ids after a drag', async () => {
+    let body: { ordered_ids: number[] } | null = null;
+    server.use(
+      http.post('/api/v1/queue/reorder', async ({ request }) => {
+        body = (await request.json()) as { ordered_ids: number[] };
+        return HttpResponse.json({ message: 'ok' });
+      }),
+    );
+
+    const restoreRects = stubVerticalRects();
+    try {
+      const user = userEvent.setup();
+      render(<QueuePage />);
+      await screen.findByText('Unit A');
+      expect(shownUnits()).toEqual(['Unit A', 'Unit B', 'Unit C']);
+
+      // Keyboard drag on the first row's handle: lift, move, drop.
+      const handle = screen
+        .getAllByRole('button')
+        .find((el) => el.getAttribute('aria-roledescription') === 'sortable');
+      expect(handle).toBeDefined();
+      handle!.focus();
+      await user.keyboard(' ');
+      await user.keyboard('{ArrowDown}');
+      await user.keyboard(' ');
+
+      await waitFor(() => expect(body).not.toBeNull());
+    } finally {
+      restoreRects();
+    }
+
+    const ids = body!.ordered_ids;
+    // Nothing is dropped from the list, and the drop was honoured — a
+    // cross-target-shape drag used to snap back, because the lane outranked
+    // the position.
+    expect([...ids].sort((a, b) => a - b)).toEqual([71, 72, 73]);
+    expect(ids[0]).not.toBe(71);
+    // The rows the operator did NOT touch keep the order they were DISPLAYED
+    // in — which is the stored position order. Laned by target identity they
+    // would go back as the model pool ahead of the unassigned row.
+    expect(ids.indexOf(72)).toBeLessThan(ids.indexOf(73));
+  });
+
+  it('shows the target on a COLLAPSED run row', async () => {
+    // A run row is collapsed by default, so without a chip on the header the
+    // operator could not see what the run targets without expanding it.
+    server.use(
+      http.get('/api/v1/queue/', () =>
+        HttpResponse.json([
+          { ...scopeItems[2], id: 81, batch_id: 5, batch_name: 'SKU007 run', archive_name: 'Unit D' },
+          { ...scopeItems[2], id: 82, batch_id: 5, batch_name: 'SKU007 run', archive_name: 'Unit E' },
+        ]),
+      ),
+    );
+
+    render(<QueuePage />);
+    await screen.findByText('SKU007 run');
+
+    // Collapsed: the children are not rendered, so the one label is the
+    // header's own chip.
+    expect(screen.queryByText('Unit D')).not.toBeInTheDocument();
+    expect(screen.getAllByText('Any H2S')).toHaveLength(1);
+  });
+
+  it('gives each target its own labelled group in the by-target layout', async () => {
+    const user = userEvent.setup();
+    render(<QueuePage />);
+    await screen.findByText('Unit A');
+
+    await user.click(screen.getByRole('button', { name: 'By Printer' }));
+
+    // One heading per distinct target — the group names itself, and says so in
+    // the outline as well as in colour.
+    expect(
+      await screen.findByRole('heading', { level: 3, name: 'Any of H2S-Alpha, H2C-Beta' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 3, name: 'Any H2S' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 3, name: 'Unassigned' })).toBeInTheDocument();
+    expect(screen.getAllByRole('heading', { level: 3 })).toHaveLength(3);
+  });
+});
+
 describe('QueuePage filters', () => {
   beforeEach(() => {
     vi.mocked(localStorage.getItem).mockImplementation(() => null);

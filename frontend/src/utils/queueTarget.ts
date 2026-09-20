@@ -111,12 +111,17 @@ export function describeQueueTarget(
 }
 
 /**
- * Sort key grouping units by target, in the scheduler's own order: the pool
- * lanes first (each distinct pool its own group, by key), then unassigned,
- * then pinned printers in numeric id order. That is the order the backend's
- * SJF pending query yields on the farm's SQLite store (NULL `printer_id` rows
- * sort first) and the order the previous `printer_id ?? -charCodeAt` key
- * produced for the shapes it could express.
+ * Sort key grouping units by target IDENTITY, in the scheduler's own order:
+ * the pool lanes first (each distinct pool its own group, by key), then
+ * unassigned, then pinned printers in numeric id order.
+ *
+ * Its two readers are the SJF mirror (`queueSort.compareShortestFirst`, which
+ * lanes by target because `print_scheduler.check_queue` does) and the
+ * by-target buckets (`queueSort.bucketRowsByTarget`, whose lanes ARE targets).
+ * It is NEVER the lane for the stored order — target identity is not the scope
+ * a `position` is numbered within, and `queuePositionScopeKey` is. Laning the
+ * stored order by identity displays an appended pool run above older ones and
+ * then posts that display order back as `ordered_ids`.
  *
  * A string rather than a number so the key itself separates the pool lanes —
  * every distinct pool gets its own group, which the old arithmetic could not
@@ -136,4 +141,81 @@ export function queueTargetSortKey(item: QueueTargetItem): string {
       // Zero-padded so printer 2 sorts before printer 10.
       return `2:${String(identity.printerId).padStart(10, '0')}`;
   }
+}
+
+/** Kind → the classes every surface that colours a target reads. */
+export interface QueueTargetKindClasses {
+  /** Tint for a row chip's icon + label. A pinned printer is deliberately
+   *  UNTINTED: on a row the printer name is the row's own fact and reads in
+   *  the row's grey, while the accent colour is reserved for the two surfaces
+   *  below, where the target IS the subject rather than one detail of a row. */
+  chip: string;
+  /** Tint for the by-target group header's icon. */
+  icon: string;
+  /** The by-target group's 3px left accent, running header + body. */
+  rail: string;
+}
+
+/**
+ * The ONE kind → colour table. `components/QueueTargetChip`, the by-target
+ * group header icon and that group's left accent all read it, so a target
+ * cannot be blue in one surface and grey in the next. It lives beside the kind
+ * it keys on rather than in the chip, because three surfaces read it and only
+ * one of them is that component.
+ *
+ * Class strings are literals because Tailwind scans source text — never
+ * compose them. Each tinted kind carries a light/dark pair.
+ */
+const KIND_CLASSES: Record<QueueTargetKind, QueueTargetKindClasses> = {
+  printer: {
+    chip: '',
+    icon: 'text-bambu-green',
+    rail: 'border-l-bambu-green',
+  },
+  model: {
+    chip: 'text-blue-700 dark:text-blue-400',
+    icon: 'text-blue-700 dark:text-blue-400',
+    rail: 'border-l-blue-700 dark:border-l-blue-400',
+  },
+  printers: {
+    chip: 'text-blue-700 dark:text-blue-400',
+    icon: 'text-blue-700 dark:text-blue-400',
+    rail: 'border-l-blue-700 dark:border-l-blue-400',
+  },
+  unassigned: {
+    chip: 'text-orange-700 dark:text-orange-400',
+    icon: 'text-orange-700 dark:text-orange-400',
+    rail: 'border-l-orange-700 dark:border-l-orange-400',
+  },
+};
+
+export function queueTargetKindClasses(kind: QueueTargetKind): QueueTargetKindClasses {
+  return KIND_CLASSES[kind];
+}
+
+/**
+ * The SCOPE a unit's `position` is numbered within — the frontend mirror of
+ * backend `queue_builder.position_scope_of`.
+ *
+ * There are exactly two shapes, and neither is a target: a PINNED row is
+ * numbered against its own printer, and every NULL-`printer_id` row — model
+ * pool, printers pool and unassigned alike — shares ONE sequence, because none
+ * of them has a machine yet and the scheduler draws them from one list. Two
+ * rows in different scopes can both hold position 1; two rows in the same
+ * scope never can.
+ *
+ * The shared sequence sorts FIRST because the scheduler's `ORDER BY
+ * printer_id, position` yields NULL-`printer_id` rows first on the farm's
+ * SQLite store. Pinned scopes follow in numeric printer order, zero-padded so
+ * printer 2 precedes printer 10.
+ *
+ * This is the ONLY correct lane for a stored-order comparator: the display
+ * order of a stored-order list is what a drag posts back as `ordered_ids`, so
+ * laning it by anything the backend does not number by rewrites the real
+ * queue.
+ */
+export function queuePositionScopeKey(item: QueueTargetItem): string {
+  const printerId = item.printer_id;
+  if (printerId == null) return '0:shared';
+  return `1:${String(printerId).padStart(10, '0')}`;
 }

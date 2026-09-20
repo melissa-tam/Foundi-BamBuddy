@@ -125,13 +125,48 @@ describe('sortRows — position', () => {
     expect(order(sortRows(buildRows(units, 'Batch'), 'position', false, ctx()))).toEqual(['1', '3', '2']);
   });
 
-  it('lanes pool units ahead of pinned ones, unassigned between, per queueTargetSortKey', () => {
-    const mixed = [
-      item({ id: 1, printer_id: 2, printer_name: 'Bravo', position: 1 }),
-      item({ id: 2, position: 1 }),
-      item({ id: 3, target_model: 'H2S', position: 1 }),
+  it('orders every NULL-printer row by POSITION, whatever its target shape', () => {
+    // Model pool, printers pool and unassigned share ONE position sequence in
+    // the backend (`queue_builder.position_scope_of`), so the display order is
+    // the sequence — target shape says nothing about where a row sits.
+    const shared = [
+      item({ id: 1, target_model: 'H2S', position: 3 }),
+      item({ id: 2, target_printer_ids: [1, 2], position: 1 }),
+      item({ id: 3, position: 2 }),
     ];
-    expect(order(sortRows(buildRows(mixed, 'Batch'), 'position', true, ctx()))).toEqual(['3', '2', '1']);
+    expect(order(sortRows(buildRows(shared, 'Batch'), 'position', true, ctx()))).toEqual(['2', '3', '1']);
+  });
+
+  it('puts the shared sequence first, then pinned rows by printer id then position', () => {
+    const mixed = [
+      item({ id: 1, printer_id: 2, printer_name: 'Bravo', position: 2 }),
+      item({ id: 2, printer_id: 1, printer_name: 'Alpha', position: 2 }),
+      item({ id: 3, printer_id: 1, printer_name: 'Alpha', position: 1 }),
+      item({ id: 4, target_model: 'H2S', position: 9 }),
+    ];
+    expect(order(sortRows(buildRows(mixed, 'Batch'), 'position', true, ctx()))).toEqual([
+      '4',
+      '3',
+      '2',
+      '1',
+    ]);
+  });
+
+  it('REGRESSION: an appended pool run sorts after the older pool runs', () => {
+    // The 09-19 defect: laning by target IDENTITY put `0:model:H2S` ahead of
+    // `0:printers:…`, so a freshly appended "Any H2S" run rendered at the TOP
+    // of the queue — and the next drag posted that display order back as
+    // `ordered_ids`, storing it.
+    const queue = [
+      item({ id: 10, target_printer_ids: [1, 5], position: 1 }),
+      item({ id: 11, target_printer_ids: [4, 5], position: 2 }),
+      item({ id: 12, target_model: 'H2S', position: 3 }),
+    ];
+    expect(order(sortRows(buildRows(queue, 'Batch'), 'position', true, ctx()))).toEqual([
+      '10',
+      '11',
+      '12',
+    ]);
   });
 
   it('gives a batch its LOWEST member position', () => {
@@ -294,15 +329,19 @@ describe('sortRows — date', () => {
 });
 
 describe('sortRows — ties', () => {
-  it('breaks a tie by target, then position, then id — in BOTH directions', () => {
+  it('breaks a tie by position SCOPE, then position, then id — in BOTH directions', () => {
     const units = [
       item({ id: 9, archive_name: 'Same', printer_id: 1, printer_name: 'Alpha', position: 2 }),
       item({ id: 4, archive_name: 'Same', printer_id: 1, printer_name: 'Alpha', position: 1 }),
       item({ id: 7, archive_name: 'Same', printer_id: 1, printer_name: 'Alpha', position: 1 }),
+      // Two shapes of NULL-printer row: one scope, so they tie-break against
+      // each other by position alone — not by which pool they name.
+      item({ id: 2, archive_name: 'Same', target_model: 'H2S', position: 2 }),
+      item({ id: 5, archive_name: 'Same', target_printer_ids: [1, 3], position: 1 }),
     ];
     const asc = order(sortRows(buildRows(units, 'Batch'), 'name', true, ctx()));
     const desc = order(sortRows(buildRows(units, 'Batch'), 'name', false, ctx()));
-    expect(asc).toEqual(['4', '7', '9']);
+    expect(asc).toEqual(['5', '2', '4', '7', '9']);
     // The tie-break is NOT inverted with the direction: equal rows keep one order.
     expect(desc).toEqual(asc);
   });
