@@ -652,6 +652,13 @@ export const BUCKET_HOURS: Record<FleetBucket, number> = { hour: 1, day: 24, wee
 export const BUCKET_COLUMN_WIDTH_PX: Record<FleetBucket, number> = { hour: 14, day: 28, week: 40 };
 
 /**
+ * localStorage key of the Fleet tab's widget grid. Here rather than beside the
+ * grid because the Stats page header also reads it: "Reset layout" and the
+ * hidden-widget count act on whichever tab is open.
+ */
+export const FLEET_DASHBOARD_STORAGE_KEY = 'farm-fleet-dashboard-layout-v1';
+
+/**
  * The hours-down band edges for a DAY bucket, in hours: `<1 · 1–4 · 4–12 · 12+`.
  *
  * ABSOLUTE, not relative to the window: four hours down is four hours down
