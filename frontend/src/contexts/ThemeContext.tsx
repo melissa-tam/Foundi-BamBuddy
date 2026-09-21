@@ -3,6 +3,15 @@ import { api } from '../api/client';
 import { useAuth } from './AuthContext';
 
 type ThemeMode = 'light' | 'dark' | 'system';
+/**
+ * What is ACTUALLY applied — `system` already resolved against the OS
+ * preference. Named so that code which must branch on the real appearance
+ * (data encodings whose emphasis direction flips between light and dark
+ * grounds, e.g. `utils/fleetMetrics.lensRamp`) can take it as a parameter
+ * instead of re-resolving `system` itself. The one resolver is `resolvedMode`
+ * below; there must never be a second.
+ */
+type ResolvedThemeMode = 'light' | 'dark';
 type ThemeStyle = 'classic' | 'glow' | 'vibrant';
 type DarkBackground = 'neutral' | 'warm' | 'cool' | 'oled' | 'slate' | 'forest';
 type LightBackground = 'neutral' | 'warm' | 'cool';
@@ -10,7 +19,7 @@ type ThemeAccent = 'green' | 'teal' | 'blue' | 'orange' | 'purple' | 'red';
 
 interface ThemeContextType {
   mode: ThemeMode;
-  resolvedMode: 'light' | 'dark';
+  resolvedMode: ResolvedThemeMode;
   // Dark mode settings
   darkStyle: ThemeStyle;
   darkBackground: DarkBackground;
@@ -63,7 +72,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Resolved mode: what's actually applied (always 'light' or 'dark')
-  const resolvedMode: 'light' | 'dark' = mode === 'system' ? systemPreference : mode;
+  const resolvedMode: ResolvedThemeMode = mode === 'system' ? systemPreference : mode;
 
   // Dark mode settings
   const [darkStyle, setDarkStyleState] = useState<ThemeStyle>(() => {
@@ -217,4 +226,4 @@ export function useTheme() {
   return context;
 }
 
-export type { ThemeMode, ThemeStyle, DarkBackground, LightBackground, ThemeAccent };
+export type { ThemeMode, ResolvedThemeMode, ThemeStyle, DarkBackground, LightBackground, ThemeAccent };

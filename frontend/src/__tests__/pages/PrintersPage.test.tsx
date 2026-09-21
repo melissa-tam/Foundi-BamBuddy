@@ -2,7 +2,7 @@
  * Tests for the PrintersPage component.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { render } from '../utils';
@@ -1856,5 +1856,126 @@ describe('PrintersPage Phase 14 — Local-Branch BL-detection symmetry', () => {
       p => typeof (p.inventory as { onUnassignSpool?: () => void } | undefined)?.onUnassignSpool === 'function'
     );
     expect(definedUnassign.length).toBe(0);
+  });
+});
+
+/**
+ * `/?printer=<id>` — the link the Fleet tab's "Down now" rows and its bucket
+ * detail hand the operator.
+ *
+ * Until this wiring the param landed on a page that read no URL state, so
+ * "Open printer" opened the printer list and left them to find the machine
+ * themselves — on a twelve-printer farm, the one fact the link existed to
+ * deliver. Three things are load-bearing: the right card is scrolled to and
+ * marked, an id that names nothing is ignored rather than guessed at, and the
+ * param is CONSUMED so a refetch or a Back cannot re-fire the jump.
+ *
+ * Its OWN describe with its own narrow handlers, deliberately: the suites above
+ * mock a printer status per scenario, and a card that re-renders against a
+ * partial one is a different test's concern.
+ *
+ * The card is located by its `printer-card-<id>` id because that id is this
+ * feature's own contract — it is what `scrollPrinterIntoView` looks up — and
+ * not an incidental styling hook.
+ */
+describe('PrintersPage — the ?printer= deep link', () => {
+  const deepLinkPrinters = [
+    {
+      id: 1, name: 'X1 Carbon', ip_address: '192.168.1.100',
+      serial_number: '00M09A350100001', access_code: '12345678', model: 'X1C',
+      enabled: true, is_active: true, nozzle_diameter: 0.4,
+      nozzle_type: 'hardened_steel', location: 'Workshop', auto_archive: true,
+      created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z',
+    },
+    {
+      id: 2, name: 'P1S Backup', ip_address: '192.168.1.101',
+      serial_number: '00W00A123456789', access_code: '87654321', model: 'P1S',
+      enabled: true, is_active: true, nozzle_diameter: 0.4,
+      nozzle_type: 'stainless_steel', location: null, auto_archive: true,
+      created_at: '2024-01-02T00:00:00Z', updated_at: '2024-01-02T00:00:00Z',
+    },
+  ];
+
+  const deepLinkStatus = {
+    connected: true, state: 'IDLE', awaiting_plate_clear: false, progress: 0,
+    layer_num: 0, total_layers: 0,
+    temperatures: { nozzle: 25, bed: 25, chamber: 25 },
+    remaining_time: 0, filename: null, wifi_signal: -50, vt_tray: [],
+  };
+
+  const cardFor = (id: number): HTMLElement | null =>
+    document.getElementById(`printer-card-${id}`);
+
+  /** Whether a card carries the transient highlight, read off the style it sets. */
+  const isMarked = (id: number): boolean => (cardFor(id)?.style.outline ?? '') !== '';
+
+  /**
+   * Drain the two animation frames `scrollPrinterIntoView` waits on before it
+   * measures. Without this a "did not scroll" assertion passes because the
+   * scroll simply had not happened YET — and then fires inside the next test.
+   */
+  const flushFrames = (): Promise<void> =>
+    new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+
+  beforeEach(() => {
+    vi.mocked(window.scrollTo).mockClear();
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(deepLinkPrinters)),
+      http.get('/api/v1/printers/:id/status', () => HttpResponse.json(deepLinkStatus)),
+    );
+  });
+
+  afterEach(async () => {
+    // Let each test's own scroll frames land before the next one clears the
+    // spy — a frame scheduled here and fired there is how "did not scroll"
+    // fails in a test that never asked for one.
+    await flushFrames();
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('scrolls the named printer into view and marks it', async () => {
+    window.history.replaceState({}, '', '/?printer=2');
+    render(<PrintersPage />);
+
+    await screen.findByText('P1S Backup');
+    await waitFor(() => expect(isMarked(2)).toBe(true));
+
+    await waitFor(() => expect(window.scrollTo).toHaveBeenCalled());
+    // Exactly one card is marked — the highlight names a printer, not a page.
+    expect(isMarked(1)).toBe(false);
+  });
+
+  it('consumes the param so a refetch cannot re-fire the jump', async () => {
+    window.history.replaceState({}, '', '/?printer=2');
+    render(<PrintersPage />);
+
+    await waitFor(() => expect(window.location.search).not.toContain('printer=2'));
+  });
+
+  it('ignores an id that names no rendered printer', async () => {
+    window.history.replaceState({}, '', '/?printer=999');
+    render(<PrintersPage />);
+
+    await screen.findByText('X1 Carbon');
+    await waitFor(() => expect(window.location.search).not.toContain('printer=999'));
+    await flushFrames();
+
+    // No scroll, nothing marked: a bad id is not a reason to move the page or
+    // to point at whichever printer happened to sort first.
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(isMarked(1)).toBe(false);
+    expect(isMarked(2)).toBe(false);
+  });
+
+  it('does nothing at all when the page is opened without the param', async () => {
+    render(<PrintersPage />);
+
+    await screen.findByText('X1 Carbon');
+    await flushFrames();
+
+    expect(window.scrollTo).not.toHaveBeenCalled();
+    expect(isMarked(1)).toBe(false);
   });
 });

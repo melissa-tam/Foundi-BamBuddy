@@ -125,7 +125,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, formatTimeOnly, parseUTCDate } from '../utils/date';
 import { OWN_SURFACE_INCIDENT_KINDS } from '../api/client';
@@ -1740,6 +1740,22 @@ const DRYING_PRESETS: Record<string, { n3f: number; n3s: number; n3f_hours: numb
   'PVA':   { n3f: 65, n3s: 85, n3f_hours: 12, n3s_hours: 18 },
 };
 
+/** The search param other pages link a printer by: `/?printer=<id>`. */
+const PRINTER_DEEP_LINK_PARAM = 'printer';
+
+/** How long a deep-linked printer keeps its highlight. The house figure (ArchivesPage). */
+const PRINTER_HIGHLIGHT_MS = 5000;
+
+/**
+ * The house highlight: a thick amber outline, cleared after a few seconds.
+ *
+ * An OUTLINE and not a ring, and an inline style and not a class, because that
+ * is exactly how `ArchivesPage` marks a deep-linked row — the same treatment
+ * means the same thing on both pages. Amber is not one of the selectable
+ * accents, so it cannot collide with the green selection ring beside it.
+ */
+const PRINTER_HIGHLIGHT_STYLE = { outline: '4px solid #facc15', outlineOffset: '2px' } as const;
+
 function PrinterCard({
   printer,
   hideIfDisconnected,
@@ -1765,6 +1781,7 @@ function PrinterCard({
   requirePlateClear = false,
   selectionMode = false,
   isSelected = false,
+  isHighlighted = false,
   onToggleSelect,
   onOpenCompactCard,
   nozzleTempPresets = NOZZLE_TEMP_DEFAULTS,
@@ -1804,6 +1821,8 @@ function PrinterCard({
   requirePlateClear?: boolean;
   selectionMode?: boolean;
   isSelected?: boolean;
+  /** Arrived here from a `?printer=` deep link: mark it until the reader finds it. */
+  isHighlighted?: boolean;
   onToggleSelect?: (id: number) => void;
   onOpenCompactCard?: (id: number) => void;
   nozzleTempPresets?: readonly [number, number, number];
@@ -3707,6 +3726,7 @@ function PrinterCard({
     <Card
       id={`printer-card-${printer.id}`}
       className={`relative flex h-full flex-col ${isSelected ? 'ring-2 ring-bambu-green' : ''} ${selectionMode || viewMode === 'compact' ? 'cursor-pointer' : ''}`}
+      style={isHighlighted ? PRINTER_HIGHLIGHT_STYLE : undefined}
       onClick={handleCardClick}
       onDragEnter={handleCardDragEnter}
       onDragOver={handleCardDragOver}
@@ -8760,6 +8780,7 @@ export function PrintersPage() {
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const { hasPermission } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
   // Embedded camera viewer state - supports multiple simultaneous viewers
   // Persisted to localStorage so cameras reopen after navigation
   const [embeddedCameraPrinters, setEmbeddedCameraPrinters] = useState<Map<number, { id: number; name: string }>>(() => {
@@ -9260,6 +9281,60 @@ export function PrintersPage() {
 
     return sorted;
   }, [filteredPrinters, sortBy, sortAsc, queryClient]);
+
+  // ── ?printer=<id> deep link ───────────────────────────────────────────────
+  //
+  // The Fleet tab's "Down now" rows and its bucket detail link here with
+  // `/?printer=<id>`. One-shot, the way InventoryPage consumes `?spool=`: act
+  // once, then DELETE the param with `replace` so a refetch, a re-render or the
+  // Back button cannot re-fire it; the highlight is ArchivesPage's transient
+  // outline.
+  //
+  // The highlight is genuinely its own state, not a mirror of the URL: it
+  // outlives the param by design and decays on its own clock.
+  const [highlightedPrinterId, setHighlightedPrinterId] = useState<number | null>(null);
+  const deepLinkPrinterId = (() => {
+    const raw = searchParams.get(PRINTER_DEEP_LINK_PARAM);
+    if (raw === null) return null;
+    const parsed = Number(raw);
+    return Number.isInteger(parsed) ? parsed : null;
+  })();
+  // An id that names no rendered printer is ignored outright — no scroll, no
+  // highlight, and the param is still consumed so it cannot retry forever.
+  const deepLinkTargetRendered =
+    deepLinkPrinterId !== null && sortedPrinters.some((p) => p.id === deepLinkPrinterId);
+  // …but "names no printer" is only knowable once the ROSTER is in. Acting on
+  // the first render would consume the param while the list is still empty,
+  // and every deep link would read as an unknown id. A roster that never
+  // arrives leaves the param alone, so a retry can still land it.
+  const rosterLoaded = printers !== undefined;
+
+  useEffect(() => {
+    if (deepLinkPrinterId === null || !rosterLoaded) return;
+    if (deepLinkTargetRendered) {
+      scrollPrinterIntoView(deepLinkPrinterId);
+      setHighlightedPrinterId(deepLinkPrinterId);
+    }
+    setSearchParams(
+      (prev) => {
+        prev.delete(PRINTER_DEEP_LINK_PARAM);
+        return prev;
+      },
+      { replace: true },
+    );
+  }, [
+    deepLinkPrinterId,
+    deepLinkTargetRendered,
+    rosterLoaded,
+    scrollPrinterIntoView,
+    setSearchParams,
+  ]);
+
+  useEffect(() => {
+    if (highlightedPrinterId === null) return undefined;
+    const timer = setTimeout(() => setHighlightedPrinterId(null), PRINTER_HIGHLIGHT_MS);
+    return () => clearTimeout(timer);
+  }, [highlightedPrinterId]);
 
   const selectAll = useCallback(() => {
     setSelectedPrinterIds(new Set(sortedPrinters.map(p => p.id)));
@@ -9824,6 +9899,7 @@ export function PrintersPage() {
                       requirePlateClear={settings?.require_plate_clear === true}
                       selectionMode={selectionMode}
                       isSelected={selectedPrinterIds.has(printer.id)}
+                      isHighlighted={highlightedPrinterId === printer.id}
                       onToggleSelect={toggleSelect}
                       onOpenCompactCard={openCompactCard}
                       farmContext={farmContextByPrinter.get(printer.id)}
@@ -9874,6 +9950,7 @@ export function PrintersPage() {
               requirePlateClear={settings?.require_plate_clear === true}
               selectionMode={selectionMode}
               isSelected={selectedPrinterIds.has(printer.id)}
+              isHighlighted={highlightedPrinterId === printer.id}
               onToggleSelect={toggleSelect}
               onOpenCompactCard={openCompactCard}
               farmContext={farmContextByPrinter.get(printer.id)}

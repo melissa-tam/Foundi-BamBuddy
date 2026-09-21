@@ -206,7 +206,7 @@ describe('QueuePage', () => {
       render(<QueuePage />);
 
       // The History tab now owns the completed/cancelled/failed list.
-      await user.click(await screen.findByRole('button', { name: /^History/ }));
+      await user.click(await screen.findByRole('tab', { name: /^History/ }));
 
       await waitFor(() => {
         expect(screen.getByText('Completed Print')).toBeInTheDocument();
@@ -340,7 +340,7 @@ describe('QueuePage', () => {
       const user = userEvent.setup();
       render(<QueuePage />);
 
-      await user.click(await screen.findByRole('button', { name: /^History/ }));
+      await user.click(await screen.findByRole('tab', { name: /^History/ }));
 
       await waitFor(() => {
         expect(screen.getByText('Completed Print')).toBeInTheDocument();
@@ -357,7 +357,7 @@ describe('QueuePage', () => {
       render(<QueuePage />);
 
       // Clear History only renders inside the History tab now.
-      await user.click(await screen.findByRole('button', { name: /^History/ }));
+      await user.click(await screen.findByRole('tab', { name: /^History/ }));
 
       await waitFor(() => {
         expect(screen.getByText('Clear History')).toBeInTheDocument();
@@ -368,7 +368,7 @@ describe('QueuePage', () => {
       const user = userEvent.setup();
       render(<QueuePage />);
 
-      await user.click(await screen.findByRole('button', { name: /^History/ }));
+      await user.click(await screen.findByRole('tab', { name: /^History/ }));
 
       await waitFor(() => {
         expect(screen.getByText('Clear History')).toBeInTheDocument();
@@ -988,7 +988,7 @@ describe('QueuePage sorting', () => {
     );
 
     render(<QueuePage />);
-    await user.click(await screen.findByRole('button', { name: /^History/ }));
+    await user.click(await screen.findByRole('tab', { name: /^History/ }));
 
     // Default is newest first.
     await waitFor(() => expect(shownUnits()).toEqual(['Unit C', 'Unit B', 'Unit A']));
@@ -1217,7 +1217,7 @@ describe('QueuePage filters', () => {
   it('shows the filtered-empty card on the history tab too', async () => {
     const user = userEvent.setup();
     render(<QueuePage />);
-    await user.click(await screen.findByRole('button', { name: /^History/ }));
+    await user.click(await screen.findByRole('tab', { name: /^History/ }));
     await screen.findByText('Completed Print');
 
     await user.selectOptions(screen.getByDisplayValue('All Status'), 'pending');
@@ -1243,7 +1243,7 @@ describe('QueuePage history paging', () => {
   it('pages past 50 instead of truncating', async () => {
     const user = userEvent.setup();
     render(<QueuePage />);
-    await user.click(await screen.findByRole('button', { name: /^History/ }));
+    await user.click(await screen.findByRole('tab', { name: /^History/ }));
 
     // Newest first: page 1 ends at Hist 11, so Hist 1 is on page 2.
     expect(await screen.findByText('Hist 60')).toBeInTheDocument();

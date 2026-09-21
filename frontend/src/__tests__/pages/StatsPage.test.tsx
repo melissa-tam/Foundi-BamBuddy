@@ -2,12 +2,27 @@
  * Tests for the StatsPage component.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { render } from '../utils';
 import { StatsPage } from '../../pages/StatsPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
+import i18n from '../../i18n';
+import { FLEET_DASHBOARD_STORAGE_KEY } from '../../utils/fleetMetrics';
+import {
+  makeFleetOverviewDay,
+  makeFleetOverviewFirstRun,
+  makeFleetOverviewHour,
+  makeFleetOverviewWeek,
+  makeFleetStatus,
+  makeFleetStatusFirstRun,
+  makePrinterIntervals,
+} from '../fixtures/fleetMetrics';
+
+/** The Prints grid's layout key, spelled here so the reset test can prove it is untouched. */
+const PRINTS_DASHBOARD_STORAGE_KEY = 'bambusy-dashboard-layout-v2';
 
 // Complete mock stats matching ArchiveStats interface
 const mockStats = {
@@ -141,6 +156,9 @@ const mockFailureAnalysis = {
 
 describe('StatsPage', () => {
   beforeEach(() => {
+    // The tab selection lives in the URL, and `BrowserRouter` reads the real
+    // one — so a test that deep-links must not leak its search into the next.
+    window.history.replaceState({}, '', '/');
     server.use(
       http.get('/api/v1/archives/stats', () => {
         return HttpResponse.json(mockStats);
@@ -579,6 +597,336 @@ describe('StatsPage', () => {
       expect(totalPrints?.querySelector('svg[aria-label]')).toBeNull();
       const printTime = screen.getByText('Print Time').closest('div');
       expect(printTime?.querySelector('svg[aria-label]')).toBeNull();
+    });
+  });
+
+  describe('the Prints / Fleet tab bar', () => {
+    it('opens the Fleet tab from a ?tab=fleet deep link', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+
+      render(<StatsPage />);
+
+      expect(
+        await screen.findByRole('tab', { name: 'Fleet', selected: true }),
+      ).toBeInTheDocument();
+    });
+
+    it('defaults to Prints when the URL says nothing', async () => {
+      render(<StatsPage />);
+
+      expect(
+        await screen.findByRole('tab', { name: 'Prints', selected: true }),
+      ).toBeInTheDocument();
+    });
+
+    it('writes the selection into the URL without adding a history entry', async () => {
+      const pushState = vi.spyOn(window.history, 'pushState');
+      render(<StatsPage />);
+
+      await userEvent.click(await screen.findByRole('tab', { name: 'Fleet' }));
+
+      await waitFor(() => expect(window.location.search).toBe('?tab=fleet'));
+      expect(pushState).not.toHaveBeenCalled();
+      pushState.mockRestore();
+    });
+
+    it('drops the param again on the way back to Prints', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+      render(<StatsPage />);
+
+      await userEvent.click(await screen.findByRole('tab', { name: 'Prints' }));
+
+      await waitFor(() => expect(window.location.search).toBe(''));
+    });
+  });
+
+  describe('tab-aware header controls', () => {
+    it('hides the archive controls on the Fleet tab', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+      render(<StatsPage />);
+      await screen.findByRole('tab', { name: 'Fleet', selected: true });
+
+      // All three act on print ARCHIVES, which the Fleet tab does not read.
+      expect(screen.queryByText('Recalculate Costs')).not.toBeInTheDocument();
+      expect(screen.queryByText('Export Stats')).not.toBeInTheDocument();
+      expect(screen.queryByText('All Users')).not.toBeInTheDocument();
+      // The layout and timeframe controls serve both tabs and stay.
+      expect(screen.getByText('Reset Layout')).toBeInTheDocument();
+    });
+
+    it('keeps the archive controls on the Prints tab', async () => {
+      render(<StatsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Recalculate Costs')).toBeInTheDocument();
+      });
+      expect(screen.getByText('Export Stats')).toBeInTheDocument();
+    });
+
+    it('resets only the active tab’s layout', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+      const removeItem = vi.mocked(localStorage.removeItem);
+      removeItem.mockClear();
+
+      render(<StatsPage />);
+      await screen.findByRole('tab', { name: 'Fleet', selected: true });
+      await userEvent.click(screen.getByText('Reset Layout'));
+
+      expect(removeItem).toHaveBeenCalledWith(FLEET_DASHBOARD_STORAGE_KEY);
+      expect(removeItem).not.toHaveBeenCalledWith(PRINTS_DASHBOARD_STORAGE_KEY);
+    });
+
+    it('resets the Prints layout when Prints is the active tab', async () => {
+      const removeItem = vi.mocked(localStorage.removeItem);
+      removeItem.mockClear();
+
+      render(<StatsPage />);
+      await waitFor(() => expect(screen.getByText('Reset Layout')).toBeInTheDocument());
+      await userEvent.click(screen.getByText('Reset Layout'));
+
+      expect(removeItem).toHaveBeenCalledWith(PRINTS_DASHBOARD_STORAGE_KEY);
+      expect(removeItem).not.toHaveBeenCalledWith(FLEET_DASHBOARD_STORAGE_KEY);
+    });
+  });
+
+  /**
+   * The Fleet tab as a whole page — the three sections wired together, which is
+   * the one thing no component test can see.
+   *
+   * Each section is proven on its own elsewhere (`FleetSummaryCard`,
+   * `FleetMatrix`, `FleetWidgets`). What is only true HERE is the seam: that the
+   * matrix and the grid render from the same loaded window the card does, that
+   * they stay out of the way while that window is in flight or has failed, that
+   * a keyboard drill-down works from the real page rather than from a component
+   * mounted in isolation, and that the page's own Reset layout reaches the grid
+   * the tab mounted.
+   *
+   * Copy is resolved through i18n, never typed, so a wording change moves the
+   * test with it.
+   */
+  describe('the Fleet tab, end to end', () => {
+    const t = (key: string, options?: Record<string, unknown>): string =>
+      i18n.t(key, options as never) as string;
+
+    /** The six grid widgets, in the order the wireframe lays them out. */
+    const WIDGET_TITLES = (): string[] =>
+      [
+        'fleetMetrics.sections.stateOverTime',
+        'fleetMetrics.sections.printsPerDay',
+        'fleetMetrics.sections.downtimeByCause',
+        'fleetMetrics.sections.coolingAndEject',
+        'fleetMetrics.sections.recovery',
+        'fleetMetrics.sections.partsBySku',
+      ].map((key) => t(key));
+
+    const summaryTable = (): HTMLElement => screen.getByRole('table', { name: t('fleetMetrics.sections.fleet') });
+    const widgetTitles = (): (string | null)[] =>
+      screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent);
+
+    /** Wait until the history sweep has landed and the matrix is on screen. */
+    const historyLanded = async (): Promise<HTMLElement> => screen.findByRole('grid');
+
+    beforeEach(() => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+      server.use(
+        http.get('/api/v1/fleet-metrics/status', () => HttpResponse.json(makeFleetStatus())),
+        http.get('/api/v1/fleet-metrics/overview', () => HttpResponse.json(makeFleetOverviewDay())),
+        http.get('/api/v1/fleet-metrics/printers/:id/intervals', () =>
+          HttpResponse.json(makePrinterIntervals()),
+        ),
+      );
+    });
+
+    it('lays the tab out summary → matrix → widgets, each under its own heading', async () => {
+      render(<StatsPage />);
+      await historyLanded();
+
+      expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual([
+        t('fleetMetrics.sections.fleet'),
+        t('fleetMetrics.sections.matrix'),
+      ]);
+      expect(widgetTitles()).toEqual(WIDGET_TITLES());
+
+      // …and in that document order, which the two queries above cannot state.
+      const matrixHeading = screen.getByRole('heading', {
+        level: 2,
+        name: t('fleetMetrics.sections.matrix'),
+      });
+      const firstWidget = screen.getAllByRole('heading', { level: 3 })[0];
+      expect(
+        matrixHeading.compareDocumentPosition(firstWidget) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it('answers "is anything down" while the window is still being swept', async () => {
+      server.use(
+        // Never settles: a year of history is still being classified.
+        http.get('/api/v1/fleet-metrics/overview', () => new Promise<never>(() => {})),
+      );
+
+      render(<StatsPage />);
+
+      // The live column is up…
+      await waitFor(() => {
+        const down = within(summaryTable()).getByRole('rowheader', { name: /^Down/ });
+        expect(within(down.closest('tr') as HTMLElement).getAllByRole('cell')[0]).toHaveTextContent(
+          '1',
+        );
+      });
+      // …the wait is ANNOUNCED once rather than left as a blank page…
+      const announcing = screen
+        .getAllByRole('status')
+        .filter((node) => node.textContent !== '')
+        .map((node) => node.textContent);
+      expect(announcing).toEqual([t('fleetMetrics.states.loading')]);
+      // …and it is announced INSIDE the matrix section, which is always in the
+      // flow. The section used to appear only once history landed, with a
+      // reserved status row of its own above it; that row cost ~83 px of dead
+      // space in the steady state to report a condition that is normally
+      // absent, and its arrival moved the page.
+      expect(
+        screen.getByRole('heading', { level: 2, name: t('fleetMetrics.sections.matrix') }),
+      ).toBeInTheDocument();
+      // The grid itself and the widget grid still wait for real data.
+      expect(screen.queryByRole('grid')).toBeNull();
+      expect(screen.queryAllByRole('heading', { level: 3 })).toHaveLength(0);
+    });
+
+    it('brings both sections in when a failed sweep is retried', async () => {
+      const user = userEvent.setup();
+      let calls = 0;
+      server.use(
+        http.get('/api/v1/fleet-metrics/overview', () => {
+          calls += 1;
+          return calls === 1
+            ? HttpResponse.json({ detail: 'boom' }, { status: 500 })
+            : HttpResponse.json(makeFleetOverviewDay());
+        }),
+      );
+
+      render(<StatsPage />);
+
+      const retry = await screen.findByRole('button', { name: t('fleetMetrics.states.retry') });
+      // A failed history sweep says nothing about now, so nothing below the
+      // card is rendered and nothing above it is blanked.
+      expect(screen.queryByRole('grid')).toBeNull();
+      expect(summaryTable()).toBeInTheDocument();
+
+      await user.click(retry);
+
+      await historyLanded();
+      expect(widgetTitles()).toEqual(WIDGET_TITLES());
+    });
+
+    it('drills down from the page with the keyboard alone, and comes back', async () => {
+      const user = userEvent.setup();
+      render(<StatsPage />);
+      const grid = await historyLanded();
+
+      // ONE tab stop for the whole grid, however many cells it holds.
+      expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+
+      const start = grid.querySelector<HTMLElement>('[tabindex="0"]');
+      expect(start).not.toBeNull();
+      start!.focus();
+
+      // Down into the first printer row, then right into a bucket column.
+      await user.keyboard('{ArrowDown}{ArrowRight}{ArrowRight}{ArrowRight}{ArrowRight}');
+      const cell = document.activeElement as HTMLElement;
+      expect(grid.contains(cell)).toBe(true);
+
+      await user.keyboard('{Enter}');
+      expect(await screen.findByRole('dialog')).toBeInTheDocument();
+
+      await user.keyboard('{Escape}');
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      // Back on the SAME cell — a drill-down that dumped focus at the top of
+      // the page would make the grid unusable without a pointer.
+      expect(document.activeElement).toBe(cell);
+    });
+
+    it('resets the Fleet grid to its defaults without touching the Prints layout', async () => {
+      const user = userEvent.setup();
+      const removeItem = vi.mocked(localStorage.removeItem);
+      render(<StatsPage />);
+      await historyLanded();
+
+      const before = widgetTitles();
+      expect(before).toHaveLength(6);
+
+      // Hide the last widget through the grid's own control.
+      const hideControls = screen.getAllByRole('button', { name: 'Hide widget' });
+      expect(hideControls).toHaveLength(before.length);
+      await user.click(hideControls[hideControls.length - 1]);
+      await waitFor(() => expect(widgetTitles()).toHaveLength(before.length - 1));
+
+      removeItem.mockClear();
+      await user.click(screen.getByText('Reset Layout'));
+
+      expect(removeItem).toHaveBeenCalledWith(FLEET_DASHBOARD_STORAGE_KEY);
+      expect(removeItem).not.toHaveBeenCalledWith(PRINTS_DASHBOARD_STORAGE_KEY);
+      // Clearing the key is not enough on its own: the grid reads its layout
+      // once, at mount. The header bumps a remount key, and this is the only
+      // place that whole mechanism is visible.
+      await waitFor(() => expect(widgetTitles()).toEqual(before));
+    });
+
+    it('states the first-run situation once, and opens the matrix on Prints', async () => {
+      server.use(
+        http.get('/api/v1/fleet-metrics/status', () =>
+          HttpResponse.json(makeFleetStatusFirstRun()),
+        ),
+        http.get('/api/v1/fleet-metrics/overview', () =>
+          HttpResponse.json(makeFleetOverviewFirstRun()),
+        ),
+      );
+
+      render(<StatsPage />);
+      await historyLanded();
+
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+      expect(screen.getByRole('tab', { selected: true, name: t('fleetMetrics.matrix.lens.prints') }))
+        .toBeInTheDocument();
+      expect(
+        screen.getByRole('tab', { name: t('fleetMetrics.matrix.lens.timeSplit') }),
+      ).toHaveAttribute('aria-disabled', 'true');
+      // `recording_since` is null here, so the reason is the one that claims no
+      // date rather than the one that names the window's own end.
+      expect(
+        screen.getByRole('button', { name: t('fleetMetrics.matrix.timeSplitDisabledNoData') }),
+      ).toBeInTheDocument();
+    });
+
+    it('follows the bucket the SERVER echoed into the matrix column set', async () => {
+      const columnNames = (grid: HTMLElement): string[] =>
+        within(grid)
+          .getAllByRole('columnheader')
+          .map((header) => header.textContent ?? '');
+
+      server.use(
+        http.get('/api/v1/fleet-metrics/overview', () => HttpResponse.json(makeFleetOverviewWeek())),
+      );
+      const week = render(<StatsPage />);
+      expect(columnNames(await historyLanded()).some((name) => /Week of/.test(name))).toBe(true);
+      week.unmount();
+
+      server.use(
+        http.get('/api/v1/fleet-metrics/overview', () => HttpResponse.json(makeFleetOverviewHour())),
+      );
+      const hour = render(<StatsPage />);
+      const hourNames = columnNames(await historyLanded());
+      // An hour column names its own hour; a week column never could.
+      expect(hourNames.some((name) => /\d{2}:\d{2}/.test(name))).toBe(true);
+      expect(hourNames.some((name) => /Week of/.test(name))).toBe(false);
+      hour.unmount();
+
+      server.use(
+        http.get('/api/v1/fleet-metrics/overview', () => HttpResponse.json(makeFleetOverviewDay())),
+      );
+      render(<StatsPage />);
+      const dayNames = columnNames(await historyLanded());
+      expect(dayNames.some((name) => /Week of/.test(name))).toBe(false);
+      expect(dayNames.some((name) => /\d{2}:\d{2}/.test(name))).toBe(false);
     });
   });
 });

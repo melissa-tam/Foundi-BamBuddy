@@ -16,6 +16,14 @@ import type { ArchiveSlim } from '../api/client';
 import { MetricToggle, type Metric } from './MetricToggle';
 import { parseUTCDate } from '../utils/date';
 import { formatWeight } from '../utils/weight';
+import {
+  CHART_AXIS_STROKE,
+  CHART_GRID_DASH,
+  CHART_GRID_STROKE,
+  CHART_TOOLTIP_CONTENT_STYLE,
+  CHART_TOOLTIP_LABEL_STYLE,
+  chartAxisTick,
+} from '../utils/chartChrome';
 
 interface FilamentTrendsProps {
   archives: ArchiveSlim[];
@@ -285,25 +293,21 @@ export function FilamentTrends({ archives, currency = '$', dateFrom, dateTo }: F
                   <stop offset="95%" stopColor="#00ae42" stopOpacity={0}/>
                 </linearGradient>
               </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
+              <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
               <XAxis
                 dataKey="dateLabel"
-                stroke="#9ca3af"
-                tick={{ fontSize: 12 }}
+                stroke={CHART_AXIS_STROKE}
+                tick={chartAxisTick(12)}
                 interval="preserveStartEnd"
               />
               <YAxis
-                stroke="#9ca3af"
-                tick={{ fontSize: 12 }}
+                stroke={CHART_AXIS_STROKE}
+                tick={chartAxisTick(12)}
                 tickFormatter={(value) => `${value}g`}
               />
               <Tooltip
-                contentStyle={{
-                  backgroundColor: '#2d2d2d',
-                  border: '1px solid #3d3d3d',
-                  borderRadius: '8px',
-                }}
-                labelStyle={{ color: '#fff' }}
+                contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
+                labelStyle={CHART_TOOLTIP_LABEL_STYLE}
                 formatter={(value) => [`${Number(value ?? 0).toFixed(0)}g`, 'Filament']}
               />
               <Area
@@ -349,11 +353,7 @@ export function FilamentTrends({ archives, currency = '$', dateFrom, dateTo }: F
                     ))}
                   </Pie>
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: '#2d2d2d',
-                      border: '1px solid #3d3d3d',
-                      borderRadius: '8px',
-                    }}
+                    contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
                     formatter={(value) => [
                       filamentTypeMetric === 'weight' ? formatWeight(Number(value ?? 0)) :
                       filamentTypeMetric === 'time' ? `${Number(value ?? 0)}h` :
@@ -450,11 +450,7 @@ export function FilamentTrends({ archives, currency = '$', dateFrom, dateTo }: F
                         ))}
                       </Pie>
                       <Tooltip
-                        contentStyle={{
-                          backgroundColor: '#2d2d2d',
-                          border: '1px solid #3d3d3d',
-                          borderRadius: '8px',
-                        }}
+                        contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
                         formatter={(value) => [
                           colorMetric === 'weight' ? formatWeight(Number(value ?? 0)) : `${value ?? 0}`,
                           colorMetric === 'weight' ? t('stats.filamentByWeight') : t('stats.filamentByPrints'),

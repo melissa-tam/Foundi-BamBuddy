@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import {
   Package,
   Clock,
@@ -42,56 +43,43 @@ import { Dashboard, type DashboardWidget } from '../components/Dashboard';
 import { getCurrencySymbol } from '../utils/currency';
 import { formatWeight } from '../utils/weight';
 import { parseUTCDate, formatDuration } from '../utils/date';
+import {
+  TIMEFRAME_PRESETS,
+  computeDateRange,
+  utcToday,
+  type TimeframeState,
+} from '../utils/timeframe';
+import {
+  CHART_AXIS_STROKE,
+  CHART_GRID_DASH,
+  CHART_GRID_STROKE,
+  CHART_TOOLTIP_CONTENT_STYLE,
+  chartAxisTick,
+} from '../utils/chartChrome';
 import { MetricToggle, type Metric } from '../components/MetricToggle';
-
-// Timeframe types and helpers
-type TimeframePreset = 'today' | 'this-week' | 'this-month' | 'last-7' | 'last-30' | 'last-90' | 'this-year' | 'all-time' | 'custom';
-
-interface TimeframeState {
-  preset: TimeframePreset;
-  dateFrom: string | undefined; // YYYY-MM-DD
-  dateTo: string | undefined;   // YYYY-MM-DD
-}
-
-function computeDateRange(preset: TimeframePreset): { dateFrom?: string; dateTo?: string } {
-  const now = new Date();
-  const y = now.getUTCFullYear(), m = now.getUTCMonth(), d = now.getUTCDate();
-  const fmt = (dt: Date) => dt.toISOString().split('T')[0];
-  const todayStr = fmt(now);
-
-  switch (preset) {
-    case 'today':
-      return { dateFrom: todayStr, dateTo: todayStr };
-    case 'this-week': {
-      const day = now.getUTCDay();
-      const start = new Date(Date.UTC(y, m, d - (day === 0 ? 6 : day - 1)));
-      return { dateFrom: fmt(start), dateTo: todayStr };
-    }
-    case 'this-month':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, 1))), dateTo: todayStr };
-    case 'last-7':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, d - 6))), dateTo: todayStr };
-    case 'last-30':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, d - 29))), dateTo: todayStr };
-    case 'last-90':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, d - 89))), dateTo: todayStr };
-    case 'this-year':
-      return { dateFrom: fmt(new Date(Date.UTC(y, 0, 1))), dateTo: todayStr };
-    case 'all-time':
-      return { dateFrom: undefined, dateTo: undefined };
-    case 'custom':
-      return {};
-  }
-}
-
-const TIMEFRAME_PRESETS: TimeframePreset[] = [
-  'today', 'this-week', 'this-month',
-  'last-7', 'last-30', 'last-90',
-  'this-year', 'all-time',
-];
+import { TabList, TabPanel } from '../components/ui/Tabs';
+import { useTabs } from '../hooks/useTabs';
+import { InfoHint } from '../components/ui/InfoHint';
+import { FleetTab, FleetTimeframeHint } from '../components/fleet/FleetTab';
+import { FLEET_DASHBOARD_STORAGE_KEY } from '../utils/fleetMetrics';
 
 // Constants
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+/**
+ * The two lenses on this page. `prints` is the default, so it is the ABSENCE
+ * of the search param rather than a value — a URL nobody has touched opens
+ * where it always did.
+ */
+type StatsTab = 'prints' | 'fleet';
+
+/**
+ * The Prints grid's layout key. Its Fleet twin is `FLEET_DASHBOARD_STORAGE_KEY`
+ * (declared beside the fleet encoding, because the header reads it too): the
+ * header's "Reset layout" and hidden-widget count act on whichever tab is open,
+ * so the key is a function of the active tab and not a literal at each site.
+ */
+const PRINTS_DASHBOARD_STORAGE_KEY = 'bambusy-dashboard-layout-v2';
 
 const HOUR_LABELS = [
   '12am', '1am', '2am', '3am', '4am', '5am',
@@ -110,12 +98,6 @@ const DURATION_BUCKETS = [
   { key: '12-24h', max: 86400 },
   { key: '24h+', max: Infinity },
 ];
-
-const RECHARTS_TOOLTIP_STYLE = {
-  backgroundColor: '#2d2d2d',
-  border: '1px solid #3d3d3d',
-  borderRadius: '8px',
-};
 
 // Widget Components
 function QuickStatsWidget({
@@ -641,11 +623,11 @@ function PrinterStatsWidget({
         {printerData.length > 0 ? (
           <ResponsiveContainer width="100%" height={Math.max(140, printerData.length * 40)}>
             <BarChart data={printerData} layout="vertical" margin={{ left: 10 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-              <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 11 }} unit={ps.unit} />
-              <YAxis type="category" dataKey="name" stroke="#9ca3af" tick={{ fontSize: 11 }} width={100} />
+              <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+              <XAxis type="number" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} unit={ps.unit} />
+              <YAxis type="category" dataKey="name" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} width={100} />
               <Tooltip
-                contentStyle={RECHARTS_TOOLTIP_STYLE}
+                contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
                 formatter={(v: number | undefined) => [
                   printerMetric === 'weight' ? formatWeight(Number(v ?? 0)) : `${v ?? 0}${ps.unit}`,
                   pLabel,
@@ -666,10 +648,10 @@ function PrinterStatsWidget({
           {archives.length > 0 ? (
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={durationData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-                <XAxis dataKey="name" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-                <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} allowDecimals={false} />
-                <Tooltip contentStyle={RECHARTS_TOOLTIP_STYLE} />
+                <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+                <XAxis dataKey="name" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} />
+                <YAxis stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} allowDecimals={false} />
+                <Tooltip contentStyle={CHART_TOOLTIP_CONTENT_STYLE} />
                 <Bar dataKey="count" name={t('common.prints')} fill="#00ae42" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -687,10 +669,10 @@ function PrinterStatsWidget({
           {archives.length > 0 ? (
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={habitsData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-                <XAxis dataKey="name" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-                <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} unit={hs.unit} />
-                <Tooltip contentStyle={RECHARTS_TOOLTIP_STYLE} formatter={(v: number | undefined) => [`${v ?? 0}${hs.unit}`, hLabel]} />
+                <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+                <XAxis dataKey="name" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} />
+                <YAxis stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} unit={hs.unit} />
+                <Tooltip contentStyle={CHART_TOOLTIP_CONTENT_STYLE} formatter={(v: number | undefined) => [`${v ?? 0}${hs.unit}`, hLabel]} />
                 <Bar dataKey="avg" fill={hs.color} radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -705,10 +687,10 @@ function PrinterStatsWidget({
           {archives.length > 0 ? (
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={hourlyData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-                <XAxis dataKey="label" stroke="#9ca3af" tick={{ fontSize: 10 }} interval={5} />
-                <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} allowDecimals={false} />
-                <Tooltip contentStyle={RECHARTS_TOOLTIP_STYLE} />
+                <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+                <XAxis dataKey="label" stroke={CHART_AXIS_STROKE} tick={chartAxisTick(10)} interval={5} />
+                <YAxis stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} allowDecimals={false} />
+                <Tooltip contentStyle={CHART_TOOLTIP_CONTENT_STYLE} />
                 <Bar dataKey="total" name={t('stats.totalPrints')} fill="#00ae42" radius={[2, 2, 0, 0]} />
                 <Bar dataKey="failures" name={t('stats.failed')} fill="#ef4444" radius={[2, 2, 0, 0]} />
               </BarChart>
@@ -968,6 +950,11 @@ export function StatsPage() {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const { hasPermission, authEnabled } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // DERIVED from the URL, never mirrored into state: a deep link and a click
+  // land in exactly the same place, and there is no second copy to get out of
+  // step with the address bar.
+  const activeTab: StatsTab = searchParams.get('tab') === 'fleet' ? 'fleet' : 'prints';
   const [isExporting, setIsExporting] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [dashboardKey, setDashboardKey] = useState(0);
@@ -988,6 +975,31 @@ export function StatsPage() {
   });
   const [showTimeframePicker, setShowTimeframePicker] = useState(false);
 
+  const handleTabChange = (tab: StatsTab) => {
+    if (tab === 'fleet') {
+      searchParams.set('tab', 'fleet');
+    } else {
+      searchParams.delete('tab');
+    }
+    // `replace`: arrowing across a two-tab strip is not navigation, and a
+    // history entry per keystroke would make Back mean "the tab I was on a
+    // moment ago" instead of "the page I came from".
+    setSearchParams(searchParams, { replace: true });
+  };
+
+  const tabs = useTabs<StatsTab>({
+    value: activeTab,
+    onChange: handleTabChange,
+    items: [
+      { id: 'prints', label: t('fleetMetrics.tabs.prints') },
+      { id: 'fleet', label: t('fleetMetrics.tabs.fleet') },
+    ],
+  });
+
+  /** The grid the header's layout controls act on: whichever tab is open. */
+  const layoutStorageKey =
+    activeTab === 'fleet' ? FLEET_DASHBOARD_STORAGE_KEY : PRINTS_DASHBOARD_STORAGE_KEY;
+
   // Persist timeframe selection
   useEffect(() => {
     localStorage.setItem('bambusy-stats-timeframe', JSON.stringify(timeframe));
@@ -997,14 +1009,14 @@ export function StatsPage() {
     if (timeframe.preset === 'custom') {
       return { dateFrom: timeframe.dateFrom, dateTo: timeframe.dateTo };
     }
-    return computeDateRange(timeframe.preset);
+    return computeDateRange(timeframe.preset, utcToday());
   }, [timeframe]);
 
-  // Read hidden count from localStorage
+  // Read hidden count from the ACTIVE tab's layout
   useEffect(() => {
     const updateHiddenCount = () => {
       try {
-        const saved = localStorage.getItem('bambusy-dashboard-layout-v2');
+        const saved = localStorage.getItem(layoutStorageKey);
         if (saved) {
           const layout = JSON.parse(saved);
           setHiddenCount(layout.hidden?.length || 0);
@@ -1022,7 +1034,7 @@ export function StatsPage() {
       window.removeEventListener('storage', updateHiddenCount);
       clearInterval(interval);
     };
-  }, [dashboardKey]);
+  }, [dashboardKey, layoutStorageKey]);
 
   // Only pass createdById when a user is actually selected (not "All Users")
   const createdByIdParam = selectedUserId !== null ? selectedUserId : undefined;
@@ -1101,13 +1113,9 @@ export function StatsPage() {
   const printerMap = new Map(printers?.map((p) => [String(p.id), p.name]) || []);
   const printDates = useMemo(() => archives?.map((a) => a.created_at) || [], [archives]);
 
-  if (isLoading) {
-    return (
-      <div className="p-4 md:p-8">
-        <div className="text-center py-12 text-bambu-gray">{t('stats.loadingStats')}</div>
-      </div>
-    );
-  }
+  // The archive queries are the PRINTS tab's, so their loading state belongs
+  // inside that panel. Returning early here would make a `?tab=fleet` deep
+  // link wait on print archives before it could say whether a printer is down.
 
   // Define dashboard widgets
   // Sizes: 1 = quarter (1/4), 2 = half (1/2), 4 = full width
@@ -1194,7 +1202,7 @@ export function StatsPage() {
           <Button
             variant="secondary"
             onClick={() => {
-              localStorage.removeItem('bambusy-dashboard-layout-v2');
+              localStorage.removeItem(layoutStorageKey);
               setDashboardKey(prev => prev + 1);
               showToast(t('stats.layoutReset'));
             }}
@@ -1204,6 +1212,11 @@ export function StatsPage() {
             <RotateCcw className="w-4 h-4" />
             {t('stats.resetLayout')}
           </Button>
+          {/* Recalculate costs, Export and the user filter all act on print
+              ARCHIVES, so they are absent on the Fleet tab rather than present
+              and inert. */}
+          {activeTab === 'prints' && (
+            <>
           {/* Recalculate Costs */}
           <Button
             variant="secondary"
@@ -1308,6 +1321,8 @@ export function StatsPage() {
               )}
             </div>
           )}
+            </>
+          )}
           {/* Timeframe Selector */}
           <div className="relative">
             <Button
@@ -1392,16 +1407,39 @@ export function StatsPage() {
               </>
             )}
           </div>
+          {/* The picker serves both tabs, and the two read a different day.
+              Which one is in force is supplementary detail, so it rides a
+              tooltip on the control rather than a line of the header. */}
+          {activeTab === 'fleet' ? (
+            <FleetTimeframeHint />
+          ) : (
+            <InfoHint text={t('fleetMetrics.hints.timeframePrints')} />
+          )}
         </div>
       </div>
 
-      <Dashboard
-        key={dashboardKey}
-        widgets={widgets}
-        storageKey="bambusy-dashboard-layout-v2"
-        stackBelow={640}
-        hideControls
+      <TabList
+        tabs={tabs}
+        ariaLabel={t('fleetMetrics.tabs.ariaLabel')}
+        variant="underline"
+        className="mb-6 overflow-x-auto"
       />
+
+      <TabPanel tabs={tabs}>
+        {activeTab === 'fleet' ? (
+          <FleetTab timeframe={timeframe} gridKey={dashboardKey} />
+        ) : isLoading ? (
+          <div className="text-center py-12 text-bambu-gray">{t('stats.loadingStats')}</div>
+        ) : (
+          <Dashboard
+            key={dashboardKey}
+            widgets={widgets}
+            storageKey={PRINTS_DASHBOARD_STORAGE_KEY}
+            stackBelow={640}
+            hideControls
+          />
+        )}
+      </TabPanel>
     </div>
   );
 }

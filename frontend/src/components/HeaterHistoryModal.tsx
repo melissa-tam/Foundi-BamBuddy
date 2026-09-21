@@ -13,6 +13,13 @@ import {
 } from 'recharts';
 import { api, type HeaterSensorKind, type PrinterSensorHistoryResponse } from '../api/client';
 import { parseUTCDate, applyTimeFormat, type TimeFormat } from '../utils/date';
+import {
+  CHART_AXIS_STROKE,
+  CHART_GRID_DASH,
+  CHART_GRID_STROKE,
+  CHART_TOOLTIP_CONTENT_STYLE,
+  chartAxisTick,
+} from '../utils/chartChrome';
 import { useTranslation } from 'react-i18next';
 
 interface HeaterHistoryModalProps {
@@ -144,7 +151,6 @@ export function HeaterHistoryModal({
   const borderColor = 'var(--border-color)';
   const textPrimary = 'var(--text-primary)';
   const textSecondary = 'var(--text-secondary)';
-  const axisColor = 'var(--text-muted)';
 
   const kindLabel = (k: HeaterSensorKind) => {
     switch (k) {
@@ -274,7 +280,7 @@ export function HeaterHistoryModal({
             ) : (
               <ResponsiveContainer width="100%" height={300}>
                 <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={borderColor} />
+                  <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
                   <XAxis
                     dataKey="time"
                     type="number"
@@ -285,22 +291,17 @@ export function HeaterHistoryModal({
                         applyTimeFormat({ hour: '2-digit', minute: '2-digit' }, timeFormat),
                       )
                     }
-                    stroke={axisColor}
-                    fontSize={11}
+                    stroke={CHART_AXIS_STROKE}
+                    tick={chartAxisTick()}
                   />
                   <YAxis
-                    stroke={axisColor}
-                    fontSize={11}
+                    stroke={CHART_AXIS_STROKE}
+                    tick={chartAxisTick()}
                     domain={[0, 'auto']}
                     tickFormatter={v => `${Math.round(v)}°`}
                   />
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: modalBg,
-                      border: `1px solid ${borderColor}`,
-                      borderRadius: 6,
-                      color: textPrimary,
-                    }}
+                    contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
                     labelFormatter={(ts) =>
                       new Date(ts as number).toLocaleString(
                         undefined,

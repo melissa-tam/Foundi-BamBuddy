@@ -3,6 +3,11 @@
  */
 
 import { http, HttpResponse } from 'msw';
+import {
+  makeFleetOverviewDay,
+  makeFleetStatus,
+  makePrinterIntervals,
+} from '../fixtures/fleetMetrics';
 
 // Sample data
 const mockSmartPlugs = [
@@ -537,6 +542,13 @@ export const handlers = [
     })
   ),
   http.get('/api/v1/printers/:id/current-print-user', () => HttpResponse.json(null)),
+  // Fleet metrics. The day variant is the default everywhere; a test that needs
+  // the week / hour / first-run shape overrides these with its own handler.
+  http.get('/api/v1/fleet-metrics/status', () => HttpResponse.json(makeFleetStatus())),
+  http.get('/api/v1/fleet-metrics/overview', () => HttpResponse.json(makeFleetOverviewDay())),
+  http.get('/api/v1/fleet-metrics/printers/:id/intervals', () =>
+    HttpResponse.json(makePrinterIntervals())
+  ),
   http.get('/api/v1/settings/check-ffmpeg', () =>
     HttpResponse.json({ available: false, version: null })
   ),

@@ -1384,7 +1384,7 @@ describe('SettingsPage', () => {
 
       // Find the tab button (not the header) — it's the <button> containing the SpoolBuddy text
       const tabButton = await waitFor(() => {
-        const buttons = screen.getAllByRole('button').filter((b) => b.textContent?.includes('SpoolBuddy'));
+        const buttons = screen.getAllByRole('tab').filter((b) => b.textContent?.includes('SpoolBuddy'));
         expect(buttons.length).toBeGreaterThan(0);
         return buttons[0];
       });
@@ -1409,7 +1409,7 @@ describe('SettingsPage', () => {
       render(<SettingsPage />);
 
       const tabButton = await waitFor(() => {
-        const buttons = screen.getAllByRole('button').filter((b) => b.textContent?.includes('SpoolBuddy'));
+        const buttons = screen.getAllByRole('tab').filter((b) => b.textContent?.includes('SpoolBuddy'));
         expect(buttons.length).toBeGreaterThan(0);
         return buttons[0];
       });
@@ -1427,7 +1427,7 @@ describe('SettingsPage', () => {
       render(<SettingsPage />);
 
       const tabButton = await waitFor(() => {
-        const buttons = screen.getAllByRole('button').filter((b) => b.textContent?.includes('SpoolBuddy'));
+        const buttons = screen.getAllByRole('tab').filter((b) => b.textContent?.includes('SpoolBuddy'));
         expect(buttons.length).toBeGreaterThan(0);
         return buttons[0];
       });
