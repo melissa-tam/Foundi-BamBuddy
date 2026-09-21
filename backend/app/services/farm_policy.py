@@ -57,6 +57,7 @@ from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items, requeue_fields
+from backend.app.services.sku_catalog import plate_units
 from backend.app.utils.printer_models import is_bedslinger_model
 
 if TYPE_CHECKING:
@@ -175,10 +176,6 @@ async def _load_run(db: AsyncSession, run_id: int) -> PrintBatch:
 
 def _sku_code(run: PrintBatch) -> str | None:
     return run.sku_file.sku.code if (run.sku_file and run.sku_file.sku) else None
-
-
-def _units_per_plate(run: PrintBatch) -> int:
-    return (run.sku_file.units_per_plate if run.sku_file else 1) or 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1513,7 +1510,7 @@ async def _maybe_complete_run(db: AsyncSession, batch: PrintBatch) -> None:
     await db.commit()
     broadcast_production_run_changed(batch.id)
     run = await _load_run(db, batch.id)
-    upp = _units_per_plate(run)
+    upp = plate_units(run.sku_file.units_per_plate if run.sku_file else None)
     await notification_service.on_run_completed(run.name, _sku_code(run), completed * upp, completed, db)
     logger.info("farm_policy: run %s completed (%d plates)", batch.id, completed)
 

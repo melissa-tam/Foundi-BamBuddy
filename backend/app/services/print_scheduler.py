@@ -78,7 +78,7 @@ from backend.app.services.spool_selection import (
 )
 from backend.app.services.stagger import stagger_policy
 from backend.app.services.tray_fields import parse_tray_state, tray_presence, tray_unread
-from backend.app.services.usb_storage import upload_in_flight
+from backend.app.services.usb_storage import upload_in_flight, usb_present
 from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
 
@@ -3633,17 +3633,20 @@ class PrintScheduler:
         # opaque 553. The firmware only reports USB presence (state.sdcard) in a
         # FULL status report, which Bambuddy requests on connect / manual
         # refresh — so a stick pulled while the printer idles goes unnoticed
-        # until dispatch fails. Fail-OPEN: ONLY an explicit False (drive confirmed
-        # absent) holds dispatch; None/missing (never reported / stale) proceeds,
-        # mirroring the UI chip's fail-safe. This is a WAIT, not a failure — the item
-        # stays pending, no manual_start, no retry burn; the next tick re-checks and
-        # self-clears it when the drive returns (via the capability gate's existing
-        # waiting_reason reset below, since this block sits BEFORE it on the path).
-        # Smart pre-flight (latency Phase A): the firmware reports USB presence only
-        # inside a FULL status report. If one already landed within the fresh window
-        # we trust the cached flag (no request, no wait). Otherwise request a fresh
-        # report and wait on the client's full-report Event — which fires the instant
-        # a report carrying `sdcard` merges — up to the max-wait cap, then read.
+        # until dispatch fails. The VERDICT is ``usb_storage.usb_present`` — the one
+        # decider this shares with the eligibility panel and the fleet recorder —
+        # and it is fail-OPEN: ONLY a genuine False holds dispatch; None (never
+        # reported, stale, or an upload masking the flag) proceeds. This is a WAIT,
+        # not a failure — the item stays pending, no manual_start, no retry burn;
+        # the next tick re-checks and self-clears it when the drive returns (via the
+        # capability gate's existing waiting_reason reset below, since this block
+        # sits BEFORE it on the path).
+        # Smart pre-flight (latency Phase A) — the FRESHNESS half, which is this
+        # scheduler's alone: the firmware reports USB presence only inside a FULL
+        # status report. If one already landed within the fresh window we trust the
+        # cached flag (no request, no wait). Otherwise request a fresh report and
+        # wait on the client's full-report Event — which fires the instant a report
+        # carrying `sdcard` merges — up to the max-wait cap, then ask for the verdict.
         fresh_window = max(
             0, min(120, await self._get_int_setting(db, "usb_preflight_fresh_window_seconds", default=10))
         )
@@ -3665,8 +3668,7 @@ class PrintScheduler:
                     await asyncio.wait_for(report_event.wait(), max_wait)
                 except asyncio.TimeoutError:
                     pass
-            usb_status = printer_manager.get_status(printer_id)
-        if usb_status is not None and getattr(usb_status, "sdcard", None) is False:
+        if usb_present(printer_id) is False:
             await self._hold_dispatch_precondition(db, item, printer, "no_usb_drive")
             logger.info(
                 "Queue item %s: USB pre-flight held dispatch — no USB drive in printer %s",

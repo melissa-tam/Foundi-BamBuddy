@@ -48,13 +48,16 @@ class _FakeClient:
 
 
 class _FakeManager:
-    """Injectable stand-in for printer_manager exposing get_client()."""
+    """Injectable stand-in for printer_manager exposing get_client()/get_status()."""
 
     def __init__(self, client: _FakeClient | None = None):
         self._client = client
 
     def get_client(self, printer_id: int):
         return self._client
+
+    def get_status(self, printer_id: int):
+        return getattr(self._client, "state", None)
 
 
 def _mtime(age_s: float) -> datetime:
