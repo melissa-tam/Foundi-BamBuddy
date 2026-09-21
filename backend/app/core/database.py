@@ -175,6 +175,7 @@ async def init_db():
         color_catalog,
         eject_profile,
         external_link,
+        farm_cycle_episode,
         filament,
         filament_sku_settings,
         github_backup,
@@ -198,6 +199,7 @@ async def init_db():
         printer,
         printer_incident,
         printer_model_geometry,
+        printer_observation_span,
         printer_sensor_history,
         project,
         project_bom,
@@ -5401,6 +5403,26 @@ async def run_migrations(conn):
             "farm_cooldown_aux_fan_enabled=false and the '0' row deleted (the speed setting no longer "
             "encodes off; an absent row now means the schema default)"
         )
+
+    # print_log_entries is append-only and never pruned, and EVERY reader of it asks a
+    # window question — the archive stats, the print-log page, the failure analysis and
+    # the fleet throughput series all filter or order on ``created_at`` — so without an
+    # index a question about one day scans the whole table. Same name the model's
+    # ``index=True`` generates, so create_all and this DDL converge on ONE index.
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_print_log_entries_created_at ON print_log_entries (created_at)",
+    )
+
+    # Completed queue rows are kept for ever and the units series reads them by window
+    # ("plates delivered between these two instants"), so the same reasoning applies:
+    # unindexed, a question about one day scans every plate the farm has ever finished.
+    # Same name the model's ``index=True`` generates, so create_all and this DDL
+    # converge on ONE index.
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_print_queue_completed_at ON print_queue (completed_at)",
+    )
 
     # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds
     # from and the live table agree. A deleted id is never reused (005-H2S 2026-09-17) —

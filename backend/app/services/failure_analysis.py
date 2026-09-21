@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.print_log import PrintLogEntry
 from backend.app.models.printer import Printer
+from backend.app.services.print_log import COMPLETED_STATUS, FAILED_STATUSES
 
 
 class FailureAnalysisService:
@@ -76,14 +77,12 @@ class FailureAnalysisService:
         total_prints = total_result.scalar() or 0
 
         successful_result = await self.db.execute(
-            select(func.count(PrintLogEntry.id)).where(and_(*base_filter, PrintLogEntry.status == "completed"))
+            select(func.count(PrintLogEntry.id)).where(and_(*base_filter, PrintLogEntry.status == COMPLETED_STATUS))
         )
         successful_prints = successful_result.scalar() or 0
 
         failed_result = await self.db.execute(
-            select(func.count(PrintLogEntry.id)).where(
-                and_(*base_filter, PrintLogEntry.status.in_(["failed", "aborted"]))
-            )
+            select(func.count(PrintLogEntry.id)).where(and_(*base_filter, PrintLogEntry.status.in_(FAILED_STATUSES)))
         )
         failed_prints = failed_result.scalar() or 0
 
@@ -102,7 +101,7 @@ class FailureAnalysisService:
                 PrintLogEntry.failure_reason,
                 func.count(PrintLogEntry.id).label("count"),
             )
-            .where(and_(*base_filter, PrintLogEntry.status.in_(["failed", "aborted"])))
+            .where(and_(*base_filter, PrintLogEntry.status.in_(FAILED_STATUSES)))
             .group_by(PrintLogEntry.failure_reason)
             .order_by(func.count(PrintLogEntry.id).desc())
         )
@@ -114,7 +113,7 @@ class FailureAnalysisService:
                 PrintLogEntry.filament_type,
                 func.count(PrintLogEntry.id).label("count"),
             )
-            .where(and_(*base_filter, PrintLogEntry.status.in_(["failed", "aborted"])))
+            .where(and_(*base_filter, PrintLogEntry.status.in_(FAILED_STATUSES)))
             .group_by(PrintLogEntry.filament_type)
             .order_by(func.count(PrintLogEntry.id).desc())
         )
@@ -129,7 +128,7 @@ class FailureAnalysisService:
             .where(
                 and_(
                     *base_filter,
-                    PrintLogEntry.status.in_(["failed", "aborted"]),
+                    PrintLogEntry.status.in_(FAILED_STATUSES),
                     PrintLogEntry.printer_id.isnot(None),
                 )
             )
@@ -155,7 +154,7 @@ class FailureAnalysisService:
             select(PrintLogEntry.started_at).where(
                 and_(
                     *base_filter,
-                    PrintLogEntry.status.in_(["failed", "aborted"]),
+                    PrintLogEntry.status.in_(FAILED_STATUSES),
                     PrintLogEntry.started_at.isnot(None),
                 )
             )
@@ -170,7 +169,7 @@ class FailureAnalysisService:
         # Recent failures
         recent_result = await self.db.execute(
             select(PrintLogEntry)
-            .where(and_(*base_filter, PrintLogEntry.status.in_(["failed", "aborted"])))
+            .where(and_(*base_filter, PrintLogEntry.status.in_(FAILED_STATUSES)))
             .order_by(PrintLogEntry.created_at.desc())
             .limit(10)
         )
@@ -201,11 +200,11 @@ class FailureAnalysisService:
 
             week_total = await self.db.execute(select(func.count(PrintLogEntry.id)).where(and_(*week_filter)))
             week_successful = await self.db.execute(
-                select(func.count(PrintLogEntry.id)).where(and_(*week_filter, PrintLogEntry.status == "completed"))
+                select(func.count(PrintLogEntry.id)).where(and_(*week_filter, PrintLogEntry.status == COMPLETED_STATUS))
             )
             week_failed = await self.db.execute(
                 select(func.count(PrintLogEntry.id)).where(
-                    and_(*week_filter, PrintLogEntry.status.in_(["failed", "aborted"]))
+                    and_(*week_filter, PrintLogEntry.status.in_(FAILED_STATUSES))
                 )
             )
 

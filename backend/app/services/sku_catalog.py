@@ -155,6 +155,24 @@ def resolve_file_capabilities(
     }
 
 
+def plate_units(units_per_plate: int | None) -> int:
+    """How many sellable units one plate of a SKU file yields.
+
+    THE owner of the rule "missing, absent or below 1 means 1".
+    ``SkuFile.units_per_plate`` carries no DB check and its ``ge=1`` floor
+    lives only in the create schema, so a stored 0 (or a negative) is
+    reachable; None arrives from the callers that cannot prove a value — a row
+    read as a plain dict, and a run whose ``sku_file`` is gone. A consumer that
+    skips this multiplies a run's whole unit arithmetic by the bad value.
+
+    Takes the VALUE rather than a ``SkuFile``: two consumers never hold a row
+    (a dict row, and ``plates_needed``'s plain int).
+    """
+    if units_per_plate is None or units_per_plate < 1:
+        return 1
+    return units_per_plate
+
+
 def _median(values: list[float]) -> float | None:
     """Median of ``values``, or None if empty."""
     if not values:
@@ -200,7 +218,7 @@ def compute_stats_from_rows(rows: list[dict]) -> dict:
     plates_failed = 0
 
     for row in rows:
-        upp = row.get("units_per_plate") or 1
+        upp = plate_units(row.get("units_per_plate"))
         status = row.get("status")
         if status == "completed":
             plates_completed += 1

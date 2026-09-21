@@ -37,6 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
+from backend.app.models.farm_cycle_episode import KIND_EJECT
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
@@ -50,6 +51,7 @@ from backend.app.models.printer_incident import (
 from backend.app.models.sku import SkuFile
 from backend.app.schemas.settings import AppSettings
 from backend.app.services import farm_correlation, pause_recovery, printer_incidents
+from backend.app.services.cycle_episodes import record_episode
 from backend.app.services.dispatch_target import DispatchTarget, target_of
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
 from backend.app.services.hms_errors import format_hms_error_summary
@@ -57,6 +59,7 @@ from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items, requeue_fields
+from backend.app.services.sku_catalog import plate_units
 from backend.app.utils.printer_models import is_bedslinger_model
 
 if TYPE_CHECKING:
@@ -175,10 +178,6 @@ async def _load_run(db: AsyncSession, run_id: int) -> PrintBatch:
 
 def _sku_code(run: PrintBatch) -> str | None:
     return run.sku_file.sku.code if (run.sku_file and run.sku_file.sku) else None
-
-
-def _units_per_plate(run: PrintBatch) -> int:
-    return (run.sku_file.units_per_plate if run.sku_file else 1) or 1
 
 
 # --------------------------------------------------------------------------- #
@@ -351,10 +350,11 @@ async def on_terminal(
                 # incident's timeline had to be rebuilt by hand from print history
                 # because nothing ever recorded how long a sweep took; one INFO line
                 # per eject makes "is 179 s unusual?" answerable from the logs alone.
+                # ONE "now" for both the log line and the ledger row, so the two can
+                # never disagree about when this sweep ended.
+                eject_ended_at = datetime.now(timezone.utc)
                 actual_s = (
-                    (datetime.now(timezone.utc) - pending.started_at).total_seconds()
-                    if pending.started_at is not None
-                    else None
+                    (eject_ended_at - pending.started_at).total_seconds() if pending.started_at is not None else None
                 )
                 if actual_s is not None:
                     # ``start_z`` rides the line because the expectation is a function of
@@ -369,6 +369,38 @@ async def on_terminal(
                         f"{pending.expected_runtime_s:.0f}s" if pending.expected_runtime_s is not None else "n/a",
                         f"{pending.start_z:g}" if pending.start_z is not None else "unseeded",
                     )
+                    # The same measurement, kept. Written for EVERY purpose and ahead
+                    # of the watchdog/never-started branches below: a sweep the
+                    # watchdog stopped is still a measured episode, and its ``outcome``
+                    # — the printer's own terminal word — is what says it did not
+                    # complete.
+                    #
+                    # It rides THIS session, inside its own savepoint: the row is then
+                    # atomic with the terminal's own writes, opens no second connection
+                    # (which on SQLite would queue behind this very transaction on every
+                    # eject) and leaves nothing running after the handler returns.
+                    await record_episode(
+                        db,
+                        printer_id,
+                        KIND_EJECT,
+                        started_at=pending.started_at,
+                        ended_at=eject_ended_at,
+                        expected_s=pending.expected_runtime_s,
+                        outcome=final_status,
+                        variant=pending.purpose,
+                    )
+                    # This branch had no DB write of its own until the episode, and so
+                    # no commit: every one of its four callers (main's two notification
+                    # lanes, the monitor's two downtime reconciles) hands over a session
+                    # inside `async with async_session() as db:` and closes it without
+                    # committing, and the plate authority persists through its own
+                    # injected writer. The first writer on a path owns establishing the
+                    # commit — the same thing this handler already does for
+                    # ``waiting_reason`` further down. Nothing else is pending here: the
+                    # eject branch is the handler's first act and the notification pass
+                    # ahead of it never touches this session, so this publishes exactly
+                    # the row above.
+                    await db.commit()
                 if pending.runtime_exceeded_at is not None:
                     # The in-flight watchdog already stopped this job and paged the
                     # operator. Whatever status the printer echoed — cancelled/failed
@@ -1513,7 +1545,7 @@ async def _maybe_complete_run(db: AsyncSession, batch: PrintBatch) -> None:
     await db.commit()
     broadcast_production_run_changed(batch.id)
     run = await _load_run(db, batch.id)
-    upp = _units_per_plate(run)
+    upp = plate_units(run.sku_file.units_per_plate if run.sku_file else None)
     await notification_service.on_run_completed(run.name, _sku_code(run), completed * upp, completed, db)
     logger.info("farm_policy: run %s completed (%d plates)", batch.id, completed)
 

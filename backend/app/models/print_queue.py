@@ -221,7 +221,11 @@ class PrintQueueItem(Base):
 
     # Tracking
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Indexed: completed rows are never pruned, so the queue keeps every plate the farm
+    # has ever delivered, and the units series asks a WINDOW question of it ("plates
+    # completed between these two instants"). Without the index that question scans the
+    # whole queue, and the scan grows with production for ever.
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Timestamps

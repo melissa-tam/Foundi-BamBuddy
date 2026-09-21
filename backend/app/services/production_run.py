@@ -56,7 +56,8 @@ from backend.app.services.queue_transitions import (
     delete_items_unless_printing,
     printing_units_conflict,
 )
-from backend.app.services.sku_catalog import median_cycle_seconds
+from backend.app.services.sku_catalog import median_cycle_seconds, plate_units
+from backend.app.services.usb_storage import usb_present
 from backend.app.utils.printer_models import is_dual_nozzle_model
 
 if TYPE_CHECKING:
@@ -80,11 +81,11 @@ def plates_needed(target_units: int, units_per_plate: int) -> int:
     """Plates required to reach ``target_units`` at ``units_per_plate`` each.
 
     ``ceil(target_units / units_per_plate)`` — may over-produce (e.g. target 10
-    at 3/plate → 4 plates = 12 units). ``units_per_plate`` is guaranteed ≥1.
+    at 3/plate → 4 plates = 12 units). The ≥1 floor is
+    :func:`sku_catalog.plate_units`'s rule, so a caller may pass the column
+    straight through.
     """
-    if units_per_plate < 1:
-        units_per_plate = 1
-    return max(1, math.ceil(target_units / units_per_plate))
+    return max(1, math.ceil(target_units / plate_units(units_per_plate)))
 
 
 def can_transition(current_status: str, action: str) -> bool:
@@ -201,7 +202,7 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
             raise HTTPException(status_code=422, detail=f"Printer(s) not found: {missing}")
     target = DispatchTarget.for_run(printer_ids=printer_ids, target_model=data.target_model)
 
-    upp = sku_file.units_per_plate or 1
+    upp = plate_units(sku_file.units_per_plate)
     n_plates = plates_needed(data.target_units, upp)
 
     # A SKU file whose library file is GONE can only produce a run that fails or
@@ -534,10 +535,11 @@ async def _build_printer_eligibility(
         except Exception as e:  # noqa: BLE001 — malformed 3MF / stale spool data: default, don't 500
             logger.warning("eligibility: filament deficit check failed for printer %s: %s", printer.id, e)
 
-        # 2. USB drive: ONLY an explicit live "absent" holds (fail-open on
-        # unknown/offline, mirroring the dispatch pre-flight, scheduler :2384).
+        # 2. USB drive: the same question the dispatch pre-flight asks, so the same
+        # decider answers it — ONLY a genuine absence flags the printer (fail-open
+        # on unknown/offline, and on the flag an in-flight upload transiently drops).
         try:
-            if status is not None and getattr(status, "sdcard", None) is False:
+            if usb_present(printer.id) is False:
                 st["no_usb_drive"] = True
         except Exception as e:  # noqa: BLE001
             logger.warning("eligibility: usb check failed for printer %s: %s", printer.id, e)
@@ -651,7 +653,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     """
     items = list(run.queue_items)
     sku_file = run.sku_file
-    upp = sku_file.units_per_plate if sku_file else 1
+    upp = plate_units(sku_file.units_per_plate if sku_file else None)
     sku_code = sku_file.sku.code if (sku_file and sku_file.sku) else None
 
     counts = Counter(item.status for item in items)

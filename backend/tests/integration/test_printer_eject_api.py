@@ -14,18 +14,37 @@ The pinned shapes:
 * 409 ``{"code": "bed_hot", "bed_c", "threshold_c", "message"}``;
 * one ``{code, message}`` shape for every refusal, 404 for the two that are a missing
   resource, with ``eject_in_flight`` alone carrying ``started``/``age_s``.
+
+Both closed vocabularies are read off their ``Literal`` with ``get_args`` rather than
+re-typed here: a hand-kept list is how ``z_unreferenced`` shipped with no message and
+answered a bodyless 500, and a list that has to be extended by hand would let the next
+one do the same.
 """
 
+from typing import get_args
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from backend.app.api.routes.printer_eject import _NOT_FOUND_REASONS, _REFUSAL_MESSAGES
+from backend.app.schemas.printer import EjectOrigin, EjectRefusalReason
 from backend.app.services.eject.manual import EjectVerdict
 from backend.app.services.eject.remote import EjectDispatchError
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+# No ``pytest.mark.asyncio`` here: the suite runs ``asyncio_mode = "auto"``, so the async
+# tests are collected without it and the module mark only mis-marked the sync pins below.
+pytestmark = pytest.mark.integration
 
 _MANUAL = "backend.app.api.routes.printer_eject.manual_eject"
+
+#: The refusals that are a plain 409 ``{code, message}`` — every member of the literal
+#: except the two missing-resource 404s and ``eject_in_flight``, which ships extras.
+#: Derived, so a reason added to the vocabulary is exercised here without being added.
+_CONFLICT_REASONS = [
+    reason
+    for reason in get_args(EjectRefusalReason)
+    if reason not in _NOT_FOUND_REASONS and reason != "eject_in_flight"
+]
 
 
 async def _post(async_client, printer_id, verdict, body=None):
@@ -86,7 +105,7 @@ class TestNeedsInput:
     — the contract ``useEjectPlate`` has always branched on — and ``origin`` is what
     widened underneath it."""
 
-    @pytest.mark.parametrize("origin", ["foreign", "farm_unit", "declared"])
+    @pytest.mark.parametrize("origin", get_args(EjectOrigin))
     async def test_each_origin_carries_its_own_message(self, async_client, printer_factory, origin):
         printer = await printer_factory(name=f"EJRN{origin}", model="H2S")
         verdict = EjectVerdict.needs_input(
@@ -106,15 +125,20 @@ class TestNeedsInput:
         assert isinstance(detail["message"], str) and detail["message"]
 
     async def test_messages_differ_per_origin(self, async_client, printer_factory):
+        # The origin totality pin: ``_needs_input_message`` ends in the ``foreign``
+        # sentence as its fallback, so an origin added to the literal without its own
+        # branch reads as a foreign plate — a wrong sentence, not a visible omission.
+        # Distinctness across the WHOLE literal is what catches that.
+        origins = get_args(EjectOrigin)
         printer = await printer_factory(name="EJRNM", model="H2S")
         messages = set()
-        for origin in ("foreign", "farm_unit", "declared"):
+        for origin in origins:
             verdict = EjectVerdict.needs_input(
                 origin=origin, print_name="Widget", max_z_height_mm=None, suggested_eject_profile_id=None
             )
             r, _ = await _post(async_client, printer.id, verdict)
             messages.add(r.json()["detail"]["message"])
-        assert len(messages) == 3
+        assert len(messages) == len(origins)
 
     async def test_farm_unit_message_names_the_unit(self, async_client, printer_factory):
         printer = await printer_factory(name="EJRNF", model="H2S")
@@ -151,19 +175,36 @@ class TestBedHot:
         assert "50.0" in detail["message"] and "33.0" in detail["message"]
 
 
+class TestRefusalMessageTotality:
+    """``_REFUSAL_MESSAGES`` is TOTAL over the refusal vocabulary, and holds nothing else.
+
+    The route indexes the table directly — a reason with no entry raises ``KeyError``
+    inside the handler and the operator gets a bodyless 500 where every sibling refusal
+    is a 409 with a sentence. Nothing else catches that: the reason is declared, the
+    service returns it, and the type checker cannot see a partial ``dict`` literal.
+    """
+
+    def test_every_refusal_reason_has_a_message(self):
+        assert set(_REFUSAL_MESSAGES) >= set(get_args(EjectRefusalReason))
+
+    def test_the_table_holds_no_reason_outside_the_vocabulary(self):
+        # The other half: a token that no longer exists (or never did) keeps a sentence
+        # alive that nothing can reach, and reads as coverage it is not.
+        assert set(_REFUSAL_MESSAGES) <= set(get_args(EjectRefusalReason))
+
+    def test_every_reason_states_its_own_case(self):
+        # A reason added by copying its neighbour's row would satisfy totality while
+        # telling the operator about the wrong state.
+        assert len(set(_REFUSAL_MESSAGES.values())) == len(_REFUSAL_MESSAGES)
+
+    def test_the_not_found_reasons_are_part_of_the_vocabulary(self):
+        # The status half of the same table: a token here that is not a refusal reason
+        # would silently never select 404.
+        assert _NOT_FOUND_REASONS.issubset(get_args(EjectRefusalReason))
+
+
 class TestRefusals:
-    @pytest.mark.parametrize(
-        "reason",
-        [
-            "job_active",
-            "dispatch_in_flight",
-            "not_connected",
-            "no_plate_gate",
-            "bed_unreadable",
-            "first_article",
-            "no_donor",
-        ],
-    )
+    @pytest.mark.parametrize("reason", _CONFLICT_REASONS)
     async def test_conflict_refusals_carry_code_and_message(self, async_client, printer_factory, reason):
         printer = await printer_factory(name=f"EJRR{reason}", model="H2S")
         r, _ = await _post(async_client, printer.id, EjectVerdict.refused(reason))
@@ -174,7 +215,21 @@ class TestRefusals:
         # Only eject_in_flight ships extras; every other refusal is exactly two fields.
         assert set(detail) == {"code", "message"}
 
-    @pytest.mark.parametrize("reason", ["not_found", "profile_not_found"])
+    async def test_a_lost_z_reference_refuses_with_its_own_sentence(self, async_client, printer_factory):
+        # The refusal the operator cannot wait out: the printer rebooted with a part on
+        # the plate, so the sentence has to name the hand clear, not a retry.
+        printer = await printer_factory(name="EJRZU", model="H2S")
+        r, _ = await _post(async_client, printer.id, EjectVerdict.refused("z_unreferenced"))
+        assert r.status_code == 409
+        assert r.json()["detail"] == {
+            "code": "z_unreferenced",
+            "message": (
+                "Printer restarted with a part on the plate and its Z reference is lost — remove the part by hand "
+                "and Mark plate cleared"
+            ),
+        }
+
+    @pytest.mark.parametrize("reason", sorted(_NOT_FOUND_REASONS))
     async def test_missing_resource_refusals_are_404_and_still_structured(self, async_client, printer_factory, reason):
         printer = await printer_factory(name=f"EJR404{reason}", model="H2S")
         r, _ = await _post(async_client, printer.id, EjectVerdict.refused(reason))

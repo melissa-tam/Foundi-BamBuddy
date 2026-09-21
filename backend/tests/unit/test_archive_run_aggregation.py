@@ -126,6 +126,65 @@ async def test_archive_list_includes_run_aggregates(
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_archive_list_counts_an_aborted_run_as_failed(
+    async_client: AsyncClient, archive_factory, printer_factory, db_session
+):
+    """``failed_run_count`` folds ``aborted`` in, the way ``/archives/stats`` always has.
+
+    The per-archive tally used to count ``failed`` alone, so an aborted reprint
+    showed on the card as neither successful nor failed while the same run was
+    counted as a failure in Quick Stats. Both reads now share
+    ``services.print_log.FAILED_STATUSES``.
+    """
+    printer = await printer_factory()
+    archive = await archive_factory(printer.id, status="completed", with_run=False)
+    db_session.add_all(
+        [
+            PrintLogEntry(
+                archive_id=archive.id,
+                printer_id=archive.printer_id,
+                status="completed",
+                created_at=datetime(2026, 6, 1, 11, 0, tzinfo=timezone.utc),
+            ),
+            PrintLogEntry(
+                archive_id=archive.id,
+                printer_id=archive.printer_id,
+                status="failed",
+                created_at=datetime(2026, 6, 2, 11, 0, tzinfo=timezone.utc),
+            ),
+            PrintLogEntry(
+                archive_id=archive.id,
+                printer_id=archive.printer_id,
+                status="aborted",
+                created_at=datetime(2026, 6, 3, 11, 0, tzinfo=timezone.utc),
+            ),
+            # A stopped run is neither: somebody interrupted it, nothing broke.
+            PrintLogEntry(
+                archive_id=archive.id,
+                printer_id=archive.printer_id,
+                status="stopped",
+                created_at=datetime(2026, 6, 4, 11, 0, tzinfo=timezone.utc),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    rows = (await async_client.get("/api/v1/archives/")).json()
+    row = next(r for r in rows if r["id"] == archive.id)
+
+    assert row["run_count"] == 4
+    assert row["successful_run_count"] == 1
+    assert row["failed_run_count"] == 2
+
+    # The same four rows, through the stats endpoint: the two reads agree.
+    stats = (await async_client.get("/api/v1/archives/stats")).json()
+    assert stats["successful_prints"] == 1
+    assert stats["failed_prints"] == 2
+    assert stats["cancelled_prints"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_runs_endpoint_returns_runs_newest_first(
     async_client: AsyncClient, archive_factory, printer_factory, db_session
 ):

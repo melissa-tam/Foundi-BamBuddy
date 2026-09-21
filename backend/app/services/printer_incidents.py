@@ -47,10 +47,12 @@ exists", and neither is derivable from the other.
 from __future__ import annotations
 
 import logging
+import statistics
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func as sa_func, select
+from sqlalchemy import func as sa_func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.models.printer_incident import (
@@ -936,6 +938,104 @@ def outcome_of(incident: PrinterIncident) -> str:
     return OUTCOME_RESOLVED_UNPAGED
 
 
+def held_seconds(incident: PrinterIncident, now: datetime) -> float:
+    """How long this row has HELD its printer: ``created_at`` → close, or → ``now`` while open.
+
+    THE one derivation of an incident's duration, so the row a reader sees on
+    ``GET /incidents`` and the seconds a metrics overlay sums are the same number.
+    Clamped at zero: a close stamped before the open (a clock step between two
+    ``utcnow`` calls) is a broken row, not negative downtime.
+
+    ``created_at`` is ``nullable=False``, so the missing-stamp arm answers for an
+    instance that has not been flushed yet rather than for anything the table can
+    hold — it returns 0.0 rather than raising, because a ledger read must not die
+    on one malformed row.
+
+    It measures the LEDGER's interval, not the hardware's: a close can trail the
+    physical clear by the recovery lane's own dwell. That is the honest figure for
+    "how long was this printer held", which is the question every caller asks.
+    """
+    if not incident.created_at:
+        return 0.0
+    end = incident.resolved_at or now
+    return max(0.0, (end - incident.created_at).total_seconds())
+
+
+@dataclass(frozen=True, slots=True)
+class HeldStats:
+    """The TIME facts about one kind's rows. The outcome tally stays :func:`summary`'s.
+
+    ``total_held_s`` sums every row, open ones clamped at ``now``; the two
+    percentiles describe RESOLVED rows only, because how long a still-open hold
+    will take to end is not a measurement — including it would drag every figure
+    toward zero exactly while a printer is down.
+    """
+
+    #: Rows of this kind in the window.
+    count: int
+    #: ...of which still open at ``now``.
+    open_count: int
+    #: Printer-seconds held, open rows counted up to ``now``.
+    total_held_s: float
+    #: Time to recover over the CLOSED rows; ``None`` when none has closed yet.
+    median_recover_s: float | None
+    p90_recover_s: float | None
+
+
+def nearest_rank_p90(ordered: list[float]) -> float:
+    """Nearest-rank p90 of an already-sorted, non-empty list.
+
+    Nearest rank rather than an interpolating quantile for two reasons: it is
+    total from a single sample (a kind often has one or two closed rows, and
+    ``statistics.quantiles`` raises below two), and every value it returns is a
+    recovery that actually happened — a figure an operator can go and find in the
+    log, rather than one interpolated between two that did. The rank is computed
+    in integer arithmetic so it cannot land a position early on a float a hair
+    under the boundary.
+    """
+    rank = -(-len(ordered) * 9 // 10)
+    return ordered[rank - 1]
+
+
+def held_stats(rows: list[PrinterIncident], now: datetime) -> dict[str, HeldStats]:
+    """Per-kind hold durations over ``rows``. Pure; the caller chooses the window.
+
+    Keyed by kind over EVERY row, declared kinds included — the same reach as
+    :func:`summary`'s ``by_kind``, and for the same reason: a maintenance hold
+    genuinely holds a printer for a duration, so its seconds are real even though
+    it is no equipment fault. What its percentiles measure is how long the hold
+    STOOD, not a recovery from anything; a caller that wants faults alone filters
+    on :data:`~backend.app.models.printer_incident.FAULT_KINDS` before calling.
+
+    Deliberately NOT a second outcome tally: which rows the farm ended by itself
+    is :func:`summary`'s question, over :func:`outcome_of`, and one fact keeps one
+    owner. ``open_count`` here is read straight off ``resolved_at`` — the same
+    column :func:`held_seconds` reads — because it is what makes the percentiles'
+    denominator legible, not an outcome classification.
+    """
+    held: dict[str, list[float]] = {}
+    recovered: dict[str, list[float]] = {}
+    open_counts: dict[str, int] = {}
+    for row in rows:
+        seconds = held_seconds(row, now)
+        held.setdefault(row.kind, []).append(seconds)
+        if row.resolved_at is None:
+            open_counts[row.kind] = open_counts.get(row.kind, 0) + 1
+        else:
+            recovered.setdefault(row.kind, []).append(seconds)
+    stats: dict[str, HeldStats] = {}
+    for kind, seconds_held in held.items():
+        closed = sorted(recovered.get(kind, []))
+        stats[kind] = HeldStats(
+            count=len(seconds_held),
+            open_count=open_counts.get(kind, 0),
+            total_held_s=sum(seconds_held),
+            median_recover_s=float(statistics.median(closed)) if closed else None,
+            p90_recover_s=nearest_rank_p90(closed) if closed else None,
+        )
+    return stats
+
+
 def summary(rows: list[PrinterIncident]) -> dict:
     """The tally over ``rows``: total, zero-human count, declared count, and the two breakdowns.
 
@@ -984,6 +1084,34 @@ async def list_recent(
         stmt = stmt.where(PrinterIncident.printer_id == printer_id)
     # id DESC is the tiebreak, not decoration: rows opened in one push share a stamp.
     stmt = stmt.order_by(PrinterIncident.created_at.desc(), PrinterIncident.id.desc()).limit(limit)
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def list_overlapping(db: AsyncSession, *, start: datetime, end: datetime) -> list[PrinterIncident]:
+    """Every row whose hold INTERSECTS ``[start, end)``, oldest first, uncapped.
+
+    The question a timeline asks, which :func:`list_recent` cannot answer: that one
+    filters on ``created_at >= since``, so an incident that opened before the window
+    and was still holding right through it — the longest outages, exactly the ones a
+    downtime figure must not miss — is invisible to it. Here an incident is the
+    half-open interval ``[created_at, resolved_at or +inf)`` and the test is the
+    standard overlap: it began before the window ended, and it had not ended when the
+    window began.
+
+    No ``limit``: a cap on a row set a caller is about to SUM would silently
+    under-report, which is the failure mode :func:`list_recent`'s cap is acceptable
+    for (a page a human reads) and this one's would not be. The window is the bound.
+
+    ``(created_at, id)`` ordering so a sweep over the rows is deterministic —
+    incidents opened in one push share a stamp. Plain SQL comparisons on two
+    columns, valid on SQLite and Postgres alike.
+    """
+    stmt = (
+        select(PrinterIncident)
+        .where(PrinterIncident.created_at < end)
+        .where(or_(PrinterIncident.resolved_at.is_(None), PrinterIncident.resolved_at > start))
+        .order_by(PrinterIncident.created_at, PrinterIncident.id)
+    )
     return list((await db.execute(stmt)).scalars().all())
 
 

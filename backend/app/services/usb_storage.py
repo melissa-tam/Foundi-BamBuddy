@@ -232,15 +232,49 @@ async def upload_in_flight(printer_id: int) -> AsyncIterator[None]:
         _uploads_in_flight.discard(printer_id)
 
 
-def _live_sdcard_present(manager, printer_id: int) -> bool:
-    """Whether the printer's live state currently reports the USB (`sdcard`) present."""
+def _live_sdcard(manager, printer_id: int) -> bool | None:
+    """THE reader of the live ``sdcard`` field — the reported value, or None.
+
+    None means there is no reading to interpret: no live status at all, a
+    dropped session (a disconnected printer's last flag is a memory, not an
+    observation), or a status that never carried the field — the firmware
+    reports ``sdcard`` only inside a FULL status report. Only an explicit
+    boolean is an answer, matching the fail-open grammar every consumer uses.
+    """
     try:
-        client = manager.get_client(printer_id)
-    except Exception:  # noqa: BLE001 — manager access must never crash the verifier
-        return False
-    if client is None or getattr(client, "state", None) is None:
-        return False
-    return bool(getattr(client.state, "sdcard", False))
+        status = manager.get_status(printer_id)
+    except Exception:  # noqa: BLE001 — manager access must never crash a caller
+        return None
+    if status is None or getattr(status, "connected", None) is False:
+        return None
+    value = getattr(status, "sdcard", None)
+    return value if isinstance(value, bool) else None
+
+
+def usb_present(printer_id: int) -> bool | None:
+    """Is the USB drive genuinely present on ``printer_id``? Sync, DB-free.
+
+    THE decider behind every "no USB drive" verdict — the dispatch pre-flight's
+    hold, the run-detail eligibility panel, the fleet observation recorder — so
+    one question has one answer instead of three readings of a flag that lies
+    for ~1 s per upload.
+
+      * ``True``  — the live status reports the drive present.
+      * ``False`` — GENUINELY absent: a live status reads ``sdcard`` False and
+        no FTPS upload is in flight to this printer.
+      * ``None``  — unknown: no live status, a dropped session, the field never
+        reported, or an in-flight upload masking a False reading.
+
+    The blip suppression covers every lane that registers in
+    ``_uploads_in_flight`` (dispatch, remote eject, firmware): H2S firmware
+    transiently reports ``sdcard=false`` while an upload runs, which is a
+    dispatch blip, not a missing stick. A genuinely absent drive instead makes
+    the upload itself fail, and that path owns its own failure handling.
+    """
+    present = _live_sdcard(printer_manager, printer_id)
+    if present is False and printer_id in _uploads_in_flight:
+        return None
+    return present
 
 
 async def _usb_probe_entry_count(ip: str, code: str, model: str | None) -> int | None:
@@ -345,7 +379,7 @@ async def verify_and_alert_usb_drop(
             return
 
         # (c) Cancellation — the printer reported the USB back before we alerted.
-        if _live_sdcard_present(manager, printer_id):
+        if _live_sdcard(manager, printer_id) is True:
             logger.info("[USB-STORAGE] printer %s sdcard restored during verification; no alert", printer_id)
             return
 
