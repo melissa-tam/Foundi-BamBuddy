@@ -114,6 +114,32 @@ export function weekStart(date: string): string {
 }
 
 /**
+ * Shift a `YYYY-MM-DD` calendar date by whole days, rolling months and years
+ * (and leap days) the way `Date.UTC` does. Negative shifts go backwards.
+ *
+ * Exported because calendar arithmetic belongs to ONE module: the Fleet tab
+ * clamps a range to 366 days and resolves "all time" to the day before the
+ * first recorded instant, and doing that with its own `Date` maths would be a
+ * second week-and-month definition sitting next to this one.
+ */
+export function addCalendarDays(date: string, days: number): string {
+  const { year, month, day } = parseAnchor(date);
+  return calendarKey(year, month, day + days);
+}
+
+/**
+ * How many days the inclusive range `from`..`to` spans — 1 for a single day.
+ * Negative when `to` precedes `from`, so a caller can detect a reversed range
+ * rather than silently getting a plausible number.
+ */
+export function daysInclusive(from: string, to: string): number {
+  const a = parseAnchor(from);
+  const b = parseAnchor(to);
+  const ms = Date.UTC(b.year, b.month, b.day) - Date.UTC(a.year, a.month, a.day);
+  return Math.round(ms / 86_400_000) + 1;
+}
+
+/**
  * Today as a UTC calendar date — the Prints tab's anchor, and the ONE place in
  * this module that reads a clock. `now` is injectable so callers and tests can
  * pin it.

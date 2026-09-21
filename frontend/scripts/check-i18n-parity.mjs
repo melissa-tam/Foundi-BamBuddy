@@ -194,6 +194,7 @@ const FR_COGNATES = [
   'Job', 'Modal', 'Pin', 'Pro', 'Mini', 'Studio', 'Excellent', 'Description',
   'Action', 'Actions', 'Date', 'Type', 'Cache', 'Service', 'Configuration',
   'Archives', 'Maintenance', 'Notifications', 'Notification', 'Position',
+  'Incidents',  // "un incident" / "des incidents" — the same word in French
   'Pause', 'Solution', 'Source', 'Version', 'Format', 'Documentation',
   'Mode', 'Format', 'Default', 'Auto', 'Image', 'Audio', 'Video', 'Hex',
   'Camera', 'Avatar', 'Information', 'Initialization', 'Inactive', 'Active',
@@ -382,17 +383,28 @@ const TR_COGNATES = [
   '{{filament}} @ {{temp}}°C',  // drying badge: filament code + universal °C
 ];
 
+// Fleet-tab FORMAT templates: separator-and-placeholder strings that contain no
+// word to translate. The language is carried entirely by the slot values (the
+// bucket name, the timezone label, the printer name, the localized number), so
+// these ship verbatim in every locale the same way '{{filament}} @ {{temp}}°C'
+// above does. Not a shortcut: there is nothing in them to render differently.
+const FLEET_FORMAT_TEMPLATES = [
+  '{{hours}} h+',
+  '{{printer}} · {{bucket}}',
+  '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+];
+
 const IDENTICAL_TO_EN_ALLOWED = {
-  de: new Set(DE_COGNATES),
-  fr: new Set(FR_COGNATES),
-  it: new Set(IT_COGNATES),
-  ja: new Set(JA_COGNATES),
-  ko: new Set(KO_COGNATES),
-  es: new Set(ES_COGNATES),
-  'pt-BR': new Set(PT_BR_COGNATES),
-  'zh-CN': new Set(ZH_CN_COGNATES),
-  'zh-TW': new Set(ZH_TW_COGNATES),
-  tr: new Set(TR_COGNATES),
+  de: new Set([...DE_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  fr: new Set([...FR_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  it: new Set([...IT_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  ja: new Set([...JA_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  ko: new Set([...KO_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  es: new Set([...ES_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  'pt-BR': new Set([...PT_BR_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  'zh-CN': new Set([...ZH_CN_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  'zh-TW': new Set([...ZH_TW_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
+  tr: new Set([...TR_COGNATES, ...FLEET_FORMAT_TEMPLATES]),
 };
 
 // CLDR forms i18next would resolve, or that other i18n stacks use, but that this

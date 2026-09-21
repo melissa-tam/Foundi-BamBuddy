@@ -28,6 +28,12 @@ import type {
   FirstArticleApproveRequest,
   FirstArticleRejectRequest,
 } from '../types/productionRuns';
+import type {
+  FleetBucket,
+  FleetOverview,
+  FleetStatus,
+  PrinterIntervalsResponse,
+} from '../types/fleetMetrics';
 export type { FarmPrinterContext } from '../types/productionRuns';
 
 const API_BASE = '/api/v1';
@@ -7266,6 +7272,34 @@ export const api = {
     request<{ success: boolean }>(`/local-presets/${id}`, { method: 'DELETE' }),
   refreshBaseProfileCache: () =>
     request<{ refreshed: number; failed: number; total: number }>('/local-presets/base-cache/refresh', { method: 'POST' }),
+
+  // Fleet metrics — the Fleet tab on the Stats page.
+  //
+  // Three reads, deliberately separate: `/status` is the live tile and is
+  // polled, `/overview` is one window's whole history, `/intervals` is the
+  // matrix drill-down and is fetched only when a cell is opened. Callers go
+  // through `hooks/useFleetMetrics.ts`, which owns the query keys.
+  getFleetStatus: () => request<FleetStatus>('/fleet-metrics/status'),
+  /**
+   * One window's history. `bucket` is deliberately optional and normally
+   * omitted: the server picks it from the window length and ECHOES its choice,
+   * and the matrix's column layout follows what the server actually used.
+   */
+  getFleetOverview: (options: { dateFrom: string; dateTo: string; bucket?: FleetBucket }) => {
+    const params = new URLSearchParams();
+    params.set('date_from', options.dateFrom);
+    params.set('date_to', options.dateTo);
+    if (options.bucket !== undefined) params.set('bucket', options.bucket);
+    return request<FleetOverview>(`/fleet-metrics/overview?${params.toString()}`);
+  },
+  getFleetPrinterIntervals: (printerId: number, options: { dateFrom: string; dateTo: string }) => {
+    const params = new URLSearchParams();
+    params.set('date_from', options.dateFrom);
+    params.set('date_to', options.dateTo);
+    return request<PrinterIntervalsResponse>(
+      `/fleet-metrics/printers/${printerId}/intervals?${params.toString()}`,
+    );
+  },
 };
 
 // AMS History types
