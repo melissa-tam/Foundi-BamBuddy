@@ -982,7 +982,7 @@ class HeldStats:
     p90_recover_s: float | None
 
 
-def _p90(ordered: list[float]) -> float:
+def nearest_rank_p90(ordered: list[float]) -> float:
     """Nearest-rank p90 of an already-sorted, non-empty list.
 
     Nearest rank rather than an interpolating quantile for two reasons: it is
@@ -1031,7 +1031,7 @@ def held_stats(rows: list[PrinterIncident], now: datetime) -> dict[str, HeldStat
             open_count=open_counts.get(kind, 0),
             total_held_s=sum(seconds_held),
             median_recover_s=float(statistics.median(closed)) if closed else None,
-            p90_recover_s=_p90(closed) if closed else None,
+            p90_recover_s=nearest_rank_p90(closed) if closed else None,
         )
     return stats
 

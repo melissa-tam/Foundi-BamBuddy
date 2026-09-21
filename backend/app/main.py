@@ -30,6 +30,7 @@ from backend.app.api.routes import (
     external_links,
     filaments,
     firmware,
+    fleet_metrics,
     github_backup,
     groups,
     hms,
@@ -7510,6 +7511,9 @@ app.include_router(service_hold.router, prefix=app_settings.api_prefix)
 app.include_router(hms.router, prefix=app_settings.api_prefix)
 # The equipment-fault ledger read (2026-09-11): the outcome tally's query surface.
 app.include_router(incidents.router, prefix=app_settings.api_prefix)
+# Fleet availability and throughput read: the same ledger plus the observation log,
+# classified at read time.
+app.include_router(fleet_metrics.router, prefix=app_settings.api_prefix)
 app.include_router(archives.router, prefix=app_settings.api_prefix)
 app.include_router(filaments.router, prefix=app_settings.api_prefix)
 app.include_router(inventory.router, prefix=app_settings.api_prefix)

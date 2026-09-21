@@ -82,13 +82,13 @@ from backend.app.services.fleet_metrics.timeline import (
 )
 from backend.app.services.print_log import outcome_bucket
 
-# ``_p90`` is the fork's ONE nearest-rank p90 — the incident ledger pins it, with its
+# ``nearest_rank_p90`` is the fork's ONE p90 — the incident ledger defines it, with its
 # rationale, and a second percentile method would make "p90" mean two things on one
-# page. It is private there only because it had one caller; importing it is reuse,
-# copying it would be the drift this package exists to avoid.
+# page. Importing it is reuse; copying it would be the drift this package exists to
+# avoid.
 from backend.app.services.printer_incidents import (
-    _p90,
     held_stats,
+    nearest_rank_p90,
     summary as incident_summary,
 )
 from backend.app.services.sku_catalog import plate_units
@@ -734,7 +734,7 @@ def _cycle_stats(kind: str, rows: list[EpisodeRow]) -> CycleStats:
     return CycleStats(
         count=len(finished),
         median_s=float(statistics.median(durations)) if durations else None,
-        p90_s=_p90(durations) if durations else None,
+        p90_s=nearest_rank_p90(durations) if durations else None,
         not_completed=len(rows) - len(finished),
         over_expected=over if predicted else None,
         over_expected_share=over / len(predicted) if predicted else None,
