@@ -636,6 +636,131 @@ class TestDispatchFileOwnership:
             assert expected in found, f"{'/'.join(_DISPATCH_SEAM)} no longer uses {expected}"
 
 
+# --- Fleet history: who may write it (2026-09-21) ---------------------------------
+
+# The observation log and the episode ledger are APPEND-shaped records of what was
+# observed and what was measured, and every reader downstream — the availability
+# classifier, the timeline, every series on the Fleet tab — trusts that the rows came
+# from the one sampler and the two instruments. A second writer would not fail any
+# behaviour test: it would quietly produce rows that look identical and mean something
+# else (a hand-closed span, a fabricated episode), and nothing later could tell them
+# apart. So the writers are pinned by SOURCE, like the incident closers above.
+_SPAN_WRITER = ("services", "fleet_activity.py")
+_EPISODE_WRITER = ("services", "cycle_episodes.py")
+
+# WHO may hand a measurement to the ledger. The writer itself (it defines the verb)
+# plus the two owners that actually TIME an episode: the eject terminal, which reads
+# the sweep's own start echo, and the cooldown prep's retirement, which is the end of
+# the cooling episode. A third caller is a duration nobody measured.
+_EPISODE_CALLERS = {
+    _EPISODE_WRITER,
+    ("services", "farm_policy.py"),
+    ("services", "eject", "cooldown_prep.py"),
+}
+
+_FLEET_MODELS = {"PrinterObservationSpan": _SPAN_WRITER, "FarmCycleEpisode": _EPISODE_WRITER}
+
+# The Core statements that WRITE a table, as opposed to selecting from it. Reads are
+# deliberately unrestricted — the whole point of recording raw rows is that anything
+# may classify them.
+_TABLE_WRITE_VERBS = {"insert", "update", "delete"}
+
+
+def _scan_fleet_history_writes(py_file: Path) -> list[tuple[str, str, int]]:
+    """Every ORM construction of a fleet-history row, and every Core write of its table.
+
+    Returns ``(model_name, symbol, lineno)``. AST rather than grep because both model
+    names appear in prose all over these modules' docstrings, which is where the rule
+    is explained.
+    """
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name in _FLEET_MODELS:
+            hits.append((name, f"{name}()", node.lineno))
+        elif name in _TABLE_WRITE_VERBS and node.args:
+            target = node.args[0]
+            model = target.id if isinstance(target, ast.Name) else getattr(target, "attr", None)
+            if model in _FLEET_MODELS:
+                hits.append((model, f"{name}({model})", node.lineno))
+    return hits
+
+
+def _scan_episode_notes(py_file: Path) -> list[tuple[str, int]]:
+    """Every CALL of ``note_episode``, however the module was imported."""
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name == "note_episode":
+            hits.append(("note_episode()", node.lineno))
+    return hits
+
+
+class TestFleetActivityOwnership:
+    """One sampler writes the observation log; one leaf writes the episode ledger."""
+
+    def test_each_fleet_history_table_has_exactly_one_writer(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            for model, symbol, line in _scan_fleet_history_writes(py_file):
+                if parts == _FLEET_MODELS[model]:
+                    continue
+                strays.append(f"  - {'/'.join(parts)}:{line} uses {symbol}")
+
+        if strays:
+            pytest.fail(
+                "Something outside the declared writer writes fleet history:\n"
+                + "\n".join(strays)
+                + "\n\nObservation spans are written ONLY by services/fleet_activity.py (the sampler "
+                "owns the run-length encoding, and a row written anywhere else breaks the one-open-span "
+                "invariant the partial unique index exists to hold); cycle episodes are written ONLY by "
+                "services/cycle_episodes.note_episode, which the two measuring owners call. Reading "
+                "either table is unrestricted — recording raw and classifying at read time is the point."
+            )
+
+    def test_only_the_measuring_owners_note_an_episode(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts in _EPISODE_CALLERS:
+                continue
+            for symbol, line in _scan_episode_notes(py_file):
+                strays.append(f"  - {'/'.join(parts)}:{line} calls {symbol}")
+
+        if strays:
+            pytest.fail(
+                "A new cycle-episode writer appeared outside the two instruments:\n"
+                + "\n".join(strays)
+                + "\n\nAn episode row is a DURATION somebody measured — the eject terminal reads the "
+                "sweep's own start echo, and cooldown_prep.end() is the end of the cooling episode. A "
+                "caller that did not time the episode is recording a guess."
+            )
+
+    def test_the_declared_writers_are_still_there(self):
+        """The liveness half. An allowlist whose entries have all moved away silently
+        stops policing anything, and both scans would then pass on an empty set."""
+        for model, owner in _FLEET_MODELS.items():
+            path = BACKEND_DIR.joinpath(*owner)
+            assert path.exists(), f"{'/'.join(owner)} is gone — the writer moved without this pin"
+            found = {symbol for _, symbol, _ in _scan_fleet_history_writes(path)}
+            assert f"{model}()" in found, f"{'/'.join(owner)} no longer constructs {model}"
+
+        # ``cycle_episodes`` DEFINES the verb rather than calling it, so it is
+        # allowlisted but never a hit — both hook modules must be.
+        hooks = _EPISODE_CALLERS - {_EPISODE_WRITER}
+        callers = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_episode_notes(f)}
+        assert callers == hooks
+
+
 class TestModuleImports:
     """Tests for module import health."""
 

@@ -37,6 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
+from backend.app.models.farm_cycle_episode import KIND_EJECT
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
@@ -50,6 +51,7 @@ from backend.app.models.printer_incident import (
 from backend.app.models.sku import SkuFile
 from backend.app.schemas.settings import AppSettings
 from backend.app.services import farm_correlation, pause_recovery, printer_incidents
+from backend.app.services.cycle_episodes import note_episode
 from backend.app.services.dispatch_target import DispatchTarget, target_of
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
 from backend.app.services.hms_errors import format_hms_error_summary
@@ -348,10 +350,11 @@ async def on_terminal(
                 # incident's timeline had to be rebuilt by hand from print history
                 # because nothing ever recorded how long a sweep took; one INFO line
                 # per eject makes "is 179 s unusual?" answerable from the logs alone.
+                # ONE "now" for both the log line and the ledger row, so the two can
+                # never disagree about when this sweep ended.
+                eject_ended_at = datetime.now(timezone.utc)
                 actual_s = (
-                    (datetime.now(timezone.utc) - pending.started_at).total_seconds()
-                    if pending.started_at is not None
-                    else None
+                    (eject_ended_at - pending.started_at).total_seconds() if pending.started_at is not None else None
                 )
                 if actual_s is not None:
                     # ``start_z`` rides the line because the expectation is a function of
@@ -365,6 +368,20 @@ async def on_terminal(
                         actual_s,
                         f"{pending.expected_runtime_s:.0f}s" if pending.expected_runtime_s is not None else "n/a",
                         f"{pending.start_z:g}" if pending.start_z is not None else "unseeded",
+                    )
+                    # The same measurement, kept. Written for EVERY purpose and ahead
+                    # of the watchdog/never-started branches below: a sweep the
+                    # watchdog stopped is still a measured episode, and its ``outcome``
+                    # — the printer's own terminal word — is what says it did not
+                    # complete.
+                    note_episode(
+                        printer_id,
+                        KIND_EJECT,
+                        started_at=pending.started_at,
+                        ended_at=eject_ended_at,
+                        expected_s=pending.expected_runtime_s,
+                        outcome=final_status,
+                        variant=pending.purpose,
                     )
                 if pending.runtime_exceeded_at is not None:
                     # The in-flight watchdog already stopped this job and paged the

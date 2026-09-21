@@ -110,6 +110,10 @@ class _PrepRecorder:
         # Every temperature map the bed poll handed the prep — the boost-end lane.
         self.samples: list[dict] = []
         self.ended: list[bool] = []
+        # What ``outcome`` stood at on the FIRST ``end()`` — i.e. the verdict the
+        # episode ledger would have recorded. One entry per cooling episode, so a
+        # deferred cooldown whose watch exits later still shows exactly one.
+        self.measured: list[str | None] = []
         self.order: list[str] = []
 
     def install(self, monkeypatch) -> None:
@@ -118,6 +122,12 @@ class _PrepRecorder:
         class _Prep:
             hold = recorder.hold
             hold_z = recorder.hold_z
+            # The two fields the watch WRITES on the real prep. ``retired`` gates the
+            # verdict write (only an unretired prep may still be told how the cooling
+            # ended), so a double without them would let the wiring pass here while
+            # raising AttributeError in production.
+            retired = False
+            outcome = None
 
             async def observe_start(self) -> None:
                 recorder.order.append("observe")
@@ -128,6 +138,12 @@ class _PrepRecorder:
             def end(self, *, fan_off: bool) -> None:
                 recorder.ended.append(fan_off)
                 recorder.order.append("end")
+                # The real ``end()`` measures on the first call and only retries the
+                # fans-off on any later one; the double records the same split, which
+                # is what makes "one episode, one verdict" assertable from here.
+                if not self.retired:
+                    recorder.measured.append(self.outcome)
+                self.retired = True
 
         async def fake_begin(printer_id, *, queue_item_id, fans, release_threshold_c, model, **kwargs):
             recorder.begun.append((printer_id, queue_item_id, fans))
@@ -2480,6 +2496,72 @@ class TestCooldownPrepWiring:
         # that second call does (one summary, a re-attempt of any OFF that did not land).
         assert prep.ended == [True, True]
         assert mon.deferred(7) is False  # no record survives the watch
+
+    @pytest.mark.parametrize("verdict", ["released", "stalled", "cleared"])
+    async def test_the_polls_verdict_reaches_the_prep_before_it_is_retired(self, monkeypatch, verdict):
+        """The cooling's own outcome, in the watch's words, written before the measurement.
+
+        A cooldown an operator cut short (``cleared``) or one that gave up hot
+        (``stalled``) is not a cooldown DURATION, and the cycle statistics read
+        ``released`` rows alone — so the verdict has to be on the prep by the time
+        ``end()`` takes the measurement, not afterwards."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            return verdict
+
+        self._install(monkeypatch, mon, watch=fake_watch, prep=prep)
+        await mon._watch(7, 42, release_now=asyncio.Event())
+
+        assert prep.measured == [verdict]
+
+    async def test_a_cooling_that_ended_without_a_verdict_records_none(self, monkeypatch):
+        """A cancelled watch names no outcome — and an invented one would read, later,
+        as a cooldown that finished normally."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        task = await self._cancelled_watch(monkeypatch, mon, prep)
+
+        mon.stand_down(7, "plate cleared")
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert prep.measured == [None]
+
+    async def test_a_deferred_cooldown_records_released_once_and_the_exit_cannot_rewrite_it(self, monkeypatch):
+        """The FIRST ``end()`` is the measurement, and the hold's business is not the cooling's.
+
+        Under a service hold the bed DID meet its release condition — that is the whole
+        of what a cooldown measures — so the deferral edge records ``released``. The
+        watch then goes on polling for however long the hold stands, and whatever it
+        returns when it finally exits (here: nothing, it is cancelled) must not reach
+        the episode that was already measured."""
+        mon = EjectCooldownMonitor()
+        prep = _PrepRecorder()
+        holds = {7}
+        deferred_at_measure: dict[str, object] = {}
+        parked = asyncio.Event()
+
+        async def fake_watch(pid, threshold, **kwargs):
+            kwargs["held"]()
+            kwargs["on_cooldown_over"]("threshold")  # the bed reached the line while held
+            deferred_at_measure["measured"] = list(prep.measured)
+            parked.set()
+            await asyncio.sleep(3600)  # the hold stands; the watch keeps polling
+
+        monkeypatch.setattr(monitor_mod.printer_incidents, "automation_held", lambda pid: pid in holds)
+        self._patch_deps(monkeypatch, watch=fake_watch, prep=prep)
+        task = asyncio.create_task(mon._watch(7, 42, release_now=asyncio.Event()))
+        mon._armed[7] = _ArmedWatch(policy=CooldownEject(unit_id=42, run_id=None), task=task)
+        await parked.wait()
+        mon.stand_down(7, "plate cleared by an operator")
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert deferred_at_measure["measured"] == ["released"]
+        assert prep.ended == [True, True], "both calls ran — the second is the fans-off retry"
+        assert prep.measured == ["released"], "exactly ONE episode, and the cancel never rewrote it"
 
     async def test_the_watch_resolves_the_model_and_the_threshold_for_the_prep(self, monkeypatch):
         """The prep gates its chamber lane on the MODEL and steps its boost down at the

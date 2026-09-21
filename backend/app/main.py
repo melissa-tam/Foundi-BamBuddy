@@ -89,6 +89,7 @@ from backend.app.services.archive import ArchiveService
 from backend.app.services.archive_purge import archive_purge_service
 from backend.app.services.bambu_ftp import clear_3mf_cache
 from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES, PrinterState
+from backend.app.services.fleet_activity import fleet_activity_recorder
 from backend.app.services.foreign_archive import locate_3mf_for_print, maybe_schedule_foreign_3mf_retry
 from backend.app.services.github_backup import github_backup_service
 from backend.app.services.homeassistant import homeassistant_service
@@ -6996,6 +6997,9 @@ async def lifespan(app: FastAPI):
     # Start printer runtime tracking
     start_runtime_tracking()
 
+    # Start the fleet observation recorder (printer state history)
+    await fleet_activity_recorder.start()
+
     # Start SpoolBuddy device watchdog
     start_spoolbuddy_watchdog()
 
@@ -7042,6 +7046,7 @@ async def lifespan(app: FastAPI):
     stop_ams_history_recording()
     stop_printer_sensor_history_recording()
     stop_runtime_tracking()
+    fleet_activity_recorder.stop()
     stop_spoolbuddy_watchdog()
     stop_camera_cleanup()
     from backend.app.services.loop_watchdog import stop_loop_watchdog

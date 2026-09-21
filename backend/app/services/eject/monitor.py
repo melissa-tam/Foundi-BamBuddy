@@ -60,6 +60,7 @@ from backend.app.core.tasks import spawn_background_task
 from backend.app.schemas.settings import AppSettings
 from backend.app.services import printer_incidents
 from backend.app.services.eject import cooldown_prep, remote as eject_remote
+from backend.app.services.eject.cooldown_prep import WatchVerdict
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     EscalationOnly,
@@ -275,7 +276,7 @@ async def watch_bed_and_clear(
     on_sample: Callable[[Mapping[str, float | None]], None] | None = None,
     held: Callable[[], bool] | None = None,
     on_cooldown_over: Callable[[str], None] | None = None,
-) -> str:
+) -> WatchVerdict:
     """Poll the live bed temperature and enact the cooldown → eject policy.
 
     The monitor NO LONGER clears the plate gate — the gate drops only when the
@@ -1713,12 +1714,22 @@ class EjectCooldownMonitor:
                 deferral on our own record — for the card's "cooled, eject deferred" phase
                 — and retires the prep, so the fans stop when the cooling stops instead of
                 running for the length of the hold.
+
+                The verdict is ``released``, not a deferral word: the bed DID meet its
+                release condition, which is the whole of what a cooldown measures. That
+                the sweep is being withheld is the hold's business, and the hold has its
+                own durable record.
                 """
                 record = self._armed.get(printer_id)
                 if record is not None and record.task is asyncio.current_task():
                     record.deferred = True
+                prep.outcome = "released"
                 prep.end(fan_off=True)
 
+            # How the COOLING ended, for the episode ledger. None until the poll
+            # returns one, so a cancel or an exception records no verdict rather than
+            # an invented one.
+            verdict: WatchVerdict | None = None
             try:
                 # The fan witness waits INSIDE the guarded span: a cancel during its
                 # settle must still retire the prep below, or a fan commanded ON in
@@ -1726,7 +1737,7 @@ class EjectCooldownMonitor:
                 # guards also feeds the prep its samples, which is what ends the
                 # chamber lane's boost — one loop, two consumers, no second timer.
                 await prep.observe_start()
-                await watch_bed_and_clear(
+                verdict = await watch_bed_and_clear(
                     printer_id,
                     threshold,
                     stall_window_s=settings.stall_window_s,
@@ -1752,6 +1763,14 @@ class EjectCooldownMonitor:
                 # is already retired: this call emits no second summary and only
                 # re-attempts a fan whose OFF did not land — the deferral has no eject
                 # job to carry the durable ``M106 P2 S0``, so this is that retry.
+                #
+                # The verdict is written only while the prep is UNRETIRED, which makes
+                # the FIRST ``end()`` the measurement in fact and not merely by
+                # convention: a deferred cooldown already recorded ``released`` when the
+                # cooling ended, and whatever this watch goes on to return hours later
+                # — including nothing, on a cancel — cannot rewrite it.
+                if not prep.retired:
+                    prep.outcome = verdict
                 prep.end(fan_off=not self._cooldown_armed(printer_id, other_than=asyncio.current_task()))
         except asyncio.CancelledError:
             raise  # the driver cancelled us because the policy changed — not a failure
