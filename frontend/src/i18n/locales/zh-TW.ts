@@ -1732,6 +1732,7 @@ export default {
       dragGroup: '拖曳批次',
     },
     tabs: {
+      ariaLabel: '佇列檢視',
       queue: '佇列',
       history: '歷史',
       timeline: '時間軸',
@@ -2183,6 +2184,8 @@ export default {
     title: '設定',
     general: '通用',
     // Tab names
+    tabsAriaLabel: '設定區塊',
+    usersTabsAriaLabel: '使用者設定區塊',
     tabs: {
       general: '通用',
       smartPlugs: '智慧插座',

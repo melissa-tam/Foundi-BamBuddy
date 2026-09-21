@@ -28,8 +28,8 @@ describe('SettingsPage LDAP sub-tab gating', () => {
     render(<SettingsPage />);
 
     // The Users sub-tab nav has rendered once the Email Authentication tab shows.
-    await screen.findByRole('button', { name: /email authentication/i });
-    expect(screen.getByRole('button', { name: /ldap/i })).toBeInTheDocument();
+    await screen.findByRole('tab', { name: /email authentication/i });
+    expect(screen.getByRole('tab', { name: /ldap/i })).toBeInTheDocument();
   });
 
   it('hides the LDAP tab for a non-admin (auth enabled, no session)', async () => {
@@ -41,10 +41,10 @@ describe('SettingsPage LDAP sub-tab gating', () => {
 
     render(<SettingsPage />);
 
-    await screen.findByRole('button', { name: /email authentication/i });
+    await screen.findByRole('tab', { name: /email authentication/i });
     // OIDC/Security are already admin-only; LDAP now matches them.
     await waitFor(() =>
-      expect(screen.queryByRole('button', { name: /ldap/i })).not.toBeInTheDocument(),
+      expect(screen.queryByRole('tab', { name: /ldap/i })).not.toBeInTheDocument(),
     );
   });
 });

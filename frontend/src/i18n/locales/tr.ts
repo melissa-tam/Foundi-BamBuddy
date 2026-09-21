@@ -1732,6 +1732,7 @@ export default {
       dragGroup: 'Grubu sürükle',
     },
     tabs: {
+      ariaLabel: 'Kuyruk görünümleri',
       queue: 'Kuyruk',
       history: 'Geçmiş',
       timeline: 'Zaman çizelgesi',
@@ -2185,6 +2186,8 @@ export default {
     title: 'Ayarlar',
     general: 'Genel',
     // Sekme adları
+    tabsAriaLabel: 'Ayar bölümleri',
+    usersTabsAriaLabel: 'Kullanıcı ayarı bölümleri',
     tabs: {
       general: 'Genel',
       smartPlugs: 'Akıllı Prizler',

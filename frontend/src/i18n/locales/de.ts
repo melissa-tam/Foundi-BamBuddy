@@ -1732,6 +1732,7 @@ export default {
       dragGroup: 'Gruppe ziehen',
     },
     tabs: {
+      ariaLabel: 'Warteschlangenansichten',
       queue: 'Warteschlange',
       history: 'Verlauf',
       timeline: 'Zeitachse',
@@ -2183,6 +2184,8 @@ export default {
     title: 'Einstellungen',
     general: 'Allgemein',
     // Tab names
+    tabsAriaLabel: 'Einstellungsbereiche',
+    usersTabsAriaLabel: 'Benutzereinstellungsbereiche',
     tabs: {
       general: 'Allgemein',
       smartPlugs: 'Smart Plugs',

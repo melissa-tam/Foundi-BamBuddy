@@ -1732,6 +1732,7 @@ export default {
       dragGroup: 'Arrastar grupo',
     },
     tabs: {
+      ariaLabel: 'Visualizações da fila',
       queue: 'Fila',
       history: 'Histórico',
       timeline: 'Linha do tempo',
@@ -2183,6 +2184,8 @@ export default {
     title: 'Configurações',
     general: 'Geral',
     // Tab names
+    tabsAriaLabel: 'Seções de configurações',
+    usersTabsAriaLabel: 'Seções de configurações de usuários',
     tabs: {
       general: 'Geral',
       smartPlugs: 'Tomadas Inteligentes',

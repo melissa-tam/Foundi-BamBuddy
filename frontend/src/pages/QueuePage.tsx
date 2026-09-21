@@ -1,4 +1,6 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
+import { TabList, TabPanel } from '../components/ui/Tabs';
+import { useTabs } from '../hooks/useTabs';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
@@ -91,6 +93,19 @@ import { Pager, PAGE_SIZE_ALL } from '../components/ui/Pager';
  * oldest/newest because that is what an operator asks of it; every other key
  * reads plain ascending/descending.
  */
+/** Count pill after a tab label; absent at zero, as this strip has always been. */
+const tabCount = (count: number, selected: boolean) =>
+  count > 0 ? (
+    <span
+      className={`text-xs px-1.5 py-0.5 rounded-full ${
+        selected ? 'bg-bambu-green/20 text-bambu-green' : 'bg-bambu-dark-tertiary text-bambu-gray'
+      }`}
+    >
+      {count}
+    </span>
+  ) : undefined;
+
+
 function sortDirectionLabel(
   key: QueueSortKey,
   asc: boolean,
@@ -2035,6 +2050,30 @@ export function QueuePage() {
     return { count, time, weight };
   };
 
+  // Active queue is the main view; History and Timeline live in their own tabs
+  // so the queue page stays focused. Selection stays in localStorage-backed
+  // state (see `activeTab` above) — the tablist owns focus only.
+  const queueTabs = useTabs<'queue' | 'history' | 'timeline'>({
+    value: activeTab,
+    onChange: setActiveTab,
+    items: [
+      {
+        id: 'queue',
+        label: t('queue.tabs.queue'),
+        icon: Clock,
+        badge: tabCount(pendingItems.length + activeItems.length, activeTab === 'queue'),
+      },
+      {
+        id: 'history',
+        label: t('queue.tabs.history'),
+        icon: ListOrdered,
+        badge: tabCount(historyItems.length, activeTab === 'history'),
+      },
+      { id: 'timeline', label: t('queue.tabs.timeline'), icon: GanttChart },
+    ],
+  });
+
+
   return (
     <div className="p-4 md:p-8">
       {/* Header */}
@@ -2050,33 +2089,12 @@ export function QueuePage() {
 
       {/* Tab strip — Active queue is the main view; History and Timeline
           live in their own tabs so the queue page stays focused. */}
-      <div className="flex gap-1 border-b border-bambu-dark-tertiary mb-6 overflow-x-auto">
-        {([
-          { id: 'queue' as const, label: t('queue.tabs.queue'), icon: Clock, count: pendingItems.length + activeItems.length },
-          { id: 'history' as const, label: t('queue.tabs.history'), icon: ListOrdered, count: historyItems.length },
-          { id: 'timeline' as const, label: t('queue.tabs.timeline'), icon: GanttChart, count: null as number | null },
-        ]).map(({ id, label, icon: Icon, count }) => (
-          <button
-            key={id}
-            onClick={() => setActiveTab(id)}
-            className={`px-4 py-2.5 text-sm flex items-center gap-2 border-b-2 -mb-px transition-colors whitespace-nowrap ${
-              activeTab === id
-                ? 'text-white border-bambu-green font-medium'
-                : 'text-bambu-gray border-transparent hover:text-white'
-            }`}
-          >
-            <Icon className="w-4 h-4" />
-            {label}
-            {count !== null && count > 0 && (
-              <span className={`text-xs px-1.5 py-0.5 rounded-full ${
-                activeTab === id ? 'bg-bambu-green/20 text-bambu-green' : 'bg-bambu-dark-tertiary text-bambu-gray'
-              }`}>
-                {count}
-              </span>
-            )}
-          </button>
-        ))}
-      </div>
+      <TabList
+        tabs={queueTabs}
+        ariaLabel={t('queue.tabs.ariaLabel')}
+        variant="underline"
+        className="mb-6 overflow-x-auto"
+      />
 
       {/* Summary Stats */}
       <QueueStatsBar
@@ -2283,6 +2301,7 @@ export function QueuePage() {
         </div>
       )}
 
+      <TabPanel tabs={queueTabs}>
       {isLoading ? (
         <div className="text-center py-12 text-bambu-gray">{t('common.loading')}</div>
       ) : queue?.length === 0 && !filtersActive ? (
@@ -2596,6 +2615,7 @@ export function QueuePage() {
           )}
         </div>
       )}
+      </TabPanel>
 
       {/* Edit Modal */}
       {editItem && (

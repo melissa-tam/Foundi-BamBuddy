@@ -11,6 +11,8 @@ import { PRESET_CATEGORIES, parsePresetTriple } from '../utils/temperatureFanPre
 import type { APIKey, AppSettings, AppSettingsUpdate, SmartPlug, SmartPlugStatus, NotificationProvider, NotificationTemplate, UpdateStatus, GitHubBackupStatus, CloudAuthStatus, UserCreate, UserUpdate, UserResponse, UserDeleteImpact, StorageUsageResponse } from '../api/client';
 import { Card, CardContent, CardDensityProvider, CardHeader } from '../components/Card';
 import { Modal } from '../components/ui/Modal';
+import { TabList, TabPanel } from '../components/ui/Tabs';
+import { useTabs, type TabDefinition } from '../hooks/useTabs';
 import { SlicerBundlesPanel } from '../components/SlicerBundlesPanel';
 import { CameraTokensSection } from './CameraTokensPage';
 import { Collapsible } from '../components/Collapsible';
@@ -57,6 +59,16 @@ import type { UsersSubTab } from '../lib/settingsSearch';
 
 const validTabs = ['general', 'plugs', 'notifications', 'queue', 'farm', 'filament', 'network', 'apikeys', 'virtual-printer', 'spoolbuddy', 'failure-detection', 'users', 'backup'] as const;
 type TabType = typeof validTabs[number];
+
+/** Count pill rendered after a tab label. */
+const tabCount = (n: number) => (
+  <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">{n}</span>
+);
+
+/** Liveness dot rendered after a tab label. */
+const tabDot = (on: boolean, offClass = 'bg-gray-500') => (
+  <span className={`w-2 h-2 rounded-full ${on ? 'bg-green-400' : offClass}`} />
+);
 
 // Cross-tab search registrations for cards rendered inline in this file.
 // Adding a new settings card? Register it here (or, if the card lives in its
@@ -1341,6 +1353,140 @@ export function SettingsPage() {
     updatePrinterMutation.mutate({ id: printerId, data });
   };
 
+  // One tablist per strip (components/ui/Tabs). Selection keeps living where
+  // it already did — `activeTab` mirrors the `?tab=` search param and the
+  // Users sub-tab is local state — and the primitive owns focus only.
+  const mainTabs = useTabs<TabType>({
+    value: activeTab,
+    onChange: handleTabChange,
+    items: [
+      { id: 'general', label: t('settings.tabs.general'), icon: SettingsIcon },
+      {
+        id: 'plugs',
+        label: t('settings.tabs.smartPlugs'),
+        icon: Plug,
+        badge: smartPlugs && smartPlugs.length > 0 ? tabCount(smartPlugs.length) : undefined,
+      },
+      {
+        id: 'notifications',
+        label: t('settings.tabs.notifications'),
+        icon: Bell,
+        badge:
+          notificationProviders && notificationProviders.length > 0
+            ? tabCount(notificationProviders.length)
+            : undefined,
+      },
+      { id: 'queue', label: t('settings.tabs.queue', 'Workflow'), icon: ListOrdered },
+      { id: 'farm', label: t('settings.tabs.farm', 'Farm'), icon: Factory },
+      { id: 'filament', label: t('settings.tabs.filament'), icon: Cylinder },
+      { id: 'network', label: t('settings.tabs.network'), icon: Wifi, badge: tabDot(!!mqttStatus?.enabled) },
+      {
+        id: 'apikeys',
+        label: t('settings.tabs.apiKeys'),
+        icon: Key,
+        badge: apiKeys && apiKeys.length > 0 ? tabCount(apiKeys.length) : undefined,
+      },
+      {
+        id: 'virtual-printer',
+        label: t('settings.tabs.virtualPrinter'),
+        icon: Printer,
+        badge: tabDot(virtualPrinterRunning),
+      },
+      {
+        id: 'spoolbuddy',
+        label: t('settings.tabs.spoolbuddy'),
+        icon: Scale,
+        badge: (
+          <>
+            {spoolbuddyDeviceCount > 0 && tabCount(spoolbuddyDeviceCount)}
+            {tabDot(spoolbuddyAnyOnline)}
+          </>
+        ),
+      },
+      {
+        id: 'failure-detection',
+        label: t('settings.tabs.failureDetection'),
+        icon: ScanEye,
+        badge: tabDot(obicoActive),
+      },
+      {
+        id: 'users',
+        label: t('settings.tabs.users'),
+        icon: Users,
+        badge: authEnabled ? tabDot(true) : undefined,
+      },
+      {
+        id: 'backup',
+        label: t('settings.tabs.backup'),
+        icon: Database,
+        badge: tabDot(
+          !!(
+            (cloudAuthStatus?.is_authenticated &&
+              githubBackupStatus?.configured &&
+              githubBackupStatus?.enabled) ||
+            settings?.local_backup_enabled
+          ),
+        ),
+      },
+    ],
+  });
+
+  // The LDAP, OIDC and Security sub-tabs are admin-only: they are absent from
+  // the list rather than disabled, so arrow keys never land on a tab a
+  // non-admin cannot open.
+  const usersTabItems: TabDefinition<UsersSubTab>[] = [
+    { id: 'users', label: t('settings.tabs.users'), icon: Users },
+    {
+      id: 'email',
+      label: t('settings.tabs.emailAuth') || 'Email Authentication',
+      icon: Mail,
+      badge: advancedAuthStatus?.advanced_auth_enabled ? tabDot(true) : undefined,
+    },
+    ...(isAdmin
+      ? [
+          {
+            id: 'ldap' as const,
+            label: t('settings.tabs.ldap') || 'LDAP',
+            icon: Shield,
+            badge: ldapStatus?.ldap_enabled ? tabDot(true) : undefined,
+          },
+        ]
+      : []),
+    {
+      id: 'twofa',
+      label: t('settings.tabs.twoFa'),
+      icon: Shield,
+      badge: tabDot(!!(twoFAStatus?.totp_enabled || twoFAStatus?.email_otp_enabled), 'bg-bambu-gray/40'),
+    },
+    ...(isAdmin
+      ? [
+          {
+            id: 'oidc' as const,
+            label: t('settings.tabs.oidc'),
+            icon: Globe,
+            badge: tabDot(oidcProvidersAll.some((p) => p.is_enabled), 'bg-bambu-gray/40'),
+          },
+        ]
+      : []),
+    ...(isAdmin
+      ? [{ id: 'security' as const, label: t('settings.tabs.security'), icon: Shield }]
+      : []),
+  ];
+  const usersTabs = useTabs<UsersSubTab>({
+    value: usersSubTab,
+    onChange: setUsersSubTab,
+    items: usersTabItems,
+  });
+
+  const createUserTabs = useTabs<'local' | 'ldap'>({
+    value: createUserTab,
+    onChange: setCreateUserTab,
+    items: [
+      { id: 'local', label: t('users.modal.localTab') },
+      { id: 'ldap', label: t('users.modal.ldapTab') },
+    ],
+  });
+
   if (isLoading || !localSettings) {
     return (
       <div className="p-4 md:p-8 flex justify-center">
@@ -1381,6 +1527,137 @@ export function SettingsPage() {
       }
     }, 50);
   };
+
+  // The two halves of the create-user dialog. Named because each is a tab
+  // panel when LDAP is enabled and the local one is the whole dialog body when
+  // it is not — with no tablist there is no tab to label a panel.
+  const createUserLdapPanel = (
+
+      <>
+        <LdapUserPicker
+          onSuccess={(user) => {
+            setShowCreateUserModal(false);
+            setCreateUserTab('local');
+            setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+            showToast(t('users.toast.ldapProvisioned', { username: user.username }));
+          }}
+        />
+        <div className="mt-6 flex justify-end">
+          <Button
+            variant="secondary"
+            onClick={() => {
+              setShowCreateUserModal(false);
+              setCreateUserTab('local');
+              setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+            }}
+          >
+            {t('common.cancel')}
+          </Button>
+        </div>
+      </>
+  );
+
+  const createUserLocalPanel = (
+    <>
+    <div className="space-y-3">
+      <div>
+        <label className="block text-sm font-medium text-white mb-2">{t('settings.username')}</label>
+        <input
+          type="text"
+          value={userFormData.username}
+          onChange={(e) => setUserFormData({ ...userFormData, username: e.target.value })}
+          className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
+          placeholder={t('settings.enterUsername')}
+          autoComplete="username"
+        />
+      </div>
+      <div>
+        <label className="block text-sm font-medium text-white mb-2">{t('settings.password')}</label>
+        <input
+          type="password"
+          value={userFormData.password}
+          onChange={(e) => setUserFormData({ ...userFormData, password: e.target.value })}
+          className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
+          placeholder={t('settings.enterPassword')}
+          autoComplete="new-password"
+          minLength={8}
+        />
+        <p className="text-bambu-gray text-xs mt-1">{t('settings.passwordRequirements')}</p>
+      </div>
+      <div>
+        <label className="block text-sm font-medium text-white mb-2">{t('settings.confirmPassword')}</label>
+        <input
+          type="password"
+          value={userFormData.confirmPassword}
+          onChange={(e) => setUserFormData({ ...userFormData, confirmPassword: e.target.value })}
+          className={`w-full px-4 py-3 bg-bambu-dark-secondary border rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors ${
+            userFormData.confirmPassword && userFormData.password !== userFormData.confirmPassword
+              ? 'border-red-500'
+              : 'border-bambu-dark-tertiary'
+          }`}
+          placeholder={t('settings.confirmPasswordPlaceholder')}
+          autoComplete="new-password"
+          minLength={6}
+        />
+        {userFormData.confirmPassword && userFormData.password !== userFormData.confirmPassword && (
+          <p className="text-red-400 text-xs mt-1">{t('settings.passwordsDoNotMatch')}</p>
+        )}
+      </div>
+      <div>
+        <label className="block text-sm font-medium text-white mb-2">{t('settings.groups')}</label>
+        <div className="space-y-2 max-h-40 overflow-y-auto p-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg">
+          {groupsData.map(group => (
+            <label
+              key={group.id}
+              className="flex items-center gap-3 px-2 py-1.5 rounded hover:bg-bambu-dark-tertiary cursor-pointer"
+            >
+              <input
+                type="checkbox"
+                checked={userFormData.group_ids.includes(group.id)}
+                onChange={() => toggleUserGroup(group.id)}
+                className="w-4 h-4 rounded border-bambu-gray text-bambu-green focus:ring-bambu-green focus:ring-offset-0 bg-bambu-dark"
+              />
+              <span className="text-sm text-white">{group.name}</span>
+              {group.is_system && (
+                <span className="text-xs text-yellow-400">{t('settings.systemBadge')}</span>
+              )}
+            </label>
+          ))}
+          {groupsData.length === 0 && (
+            <p className="text-sm text-bambu-gray">{t('settings.noGroupsAvailable')}</p>
+          )}
+        </div>
+      </div>
+    </div>
+    <div className="mt-6 flex justify-end gap-3">
+      <Button
+        variant="secondary"
+        onClick={() => {
+          setShowCreateUserModal(false);
+          setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+        }}
+      >
+        {t('common.cancel')}
+      </Button>
+      <Button
+        onClick={handleCreateUser}
+        disabled={createUserMutation.isPending || !userFormData.username || !userFormData.password || userFormData.password !== userFormData.confirmPassword || checkPasswordComplexity(userFormData.password) !== null}
+      >
+        {createUserMutation.isPending ? (
+          <>
+            <Loader2 className="w-4 h-4 animate-spin" />
+            {t('settings.creating')}
+          </>
+        ) : (
+          <>
+            <Plus className="w-4 h-4" />
+            {t('settings.createUser')}
+          </>
+        )}
+      </Button>
+    </div>
+    </>
+  );
 
   return (
     <CardDensityProvider density="dense">
@@ -1439,180 +1716,13 @@ export function SettingsPage() {
 
       {/* Tab Navigation + content: horizontal tabs on mobile, vertical rail on lg+ */}
       <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
-      <nav className="flex flex-wrap gap-1 border-b border-bambu-dark-tertiary lg:flex-col lg:flex-nowrap lg:gap-0 lg:border-b-0 lg:border-r lg:w-48 lg:flex-shrink-0 lg:self-start lg:sticky lg:top-4">
-        <button
-          onClick={() => handleTabChange('general')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'general'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <SettingsIcon className="w-4 h-4" />
-          {t('settings.tabs.general')}
-        </button>
-        <button
-          onClick={() => handleTabChange('plugs')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'plugs'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Plug className="w-4 h-4" />
-          {t('settings.tabs.smartPlugs')}
-          {smartPlugs && smartPlugs.length > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
-              {smartPlugs.length}
-            </span>
-          )}
-        </button>
-        <button
-          onClick={() => handleTabChange('notifications')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'notifications'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Bell className="w-4 h-4" />
-          {t('settings.tabs.notifications')}
-          {notificationProviders && notificationProviders.length > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
-              {notificationProviders.length}
-            </span>
-          )}
-        </button>
-        <button
-          onClick={() => handleTabChange('queue')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'queue'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <ListOrdered className="w-4 h-4" />
-          {t('settings.tabs.queue', 'Workflow')}
-        </button>
-        <button
-          onClick={() => handleTabChange('farm')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'farm'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Factory className="w-4 h-4" />
-          {t('settings.tabs.farm', 'Farm')}
-        </button>
-        <button
-          onClick={() => handleTabChange('filament')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'filament'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Cylinder className="w-4 h-4" />
-          {t('settings.tabs.filament')}
-        </button>
-        <button
-          onClick={() => handleTabChange('network')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'network'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Wifi className="w-4 h-4" />
-          {t('settings.tabs.network')}
-          <span className={`w-2 h-2 rounded-full ${mqttStatus?.enabled ? 'bg-green-400' : 'bg-gray-500'}`} />
-        </button>
-        <button
-          onClick={() => handleTabChange('apikeys')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'apikeys'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Key className="w-4 h-4" />
-          {t('settings.tabs.apiKeys')}
-          {apiKeys && apiKeys.length > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
-              {apiKeys.length}
-            </span>
-          )}
-        </button>
-        <button
-          onClick={() => handleTabChange('virtual-printer')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'virtual-printer'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Printer className="w-4 h-4" />
-          {t('settings.tabs.virtualPrinter')}
-          <span className={`w-2 h-2 rounded-full ${virtualPrinterRunning ? 'bg-green-400' : 'bg-gray-500'}`} />
-        </button>
-        <button
-          onClick={() => handleTabChange('spoolbuddy')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'spoolbuddy'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Scale className="w-4 h-4" />
-          {t('settings.tabs.spoolbuddy')}
-          {spoolbuddyDeviceCount > 0 && (
-            <span className="text-xs bg-bambu-dark-tertiary px-1.5 py-0.5 rounded-full">
-              {spoolbuddyDeviceCount}
-            </span>
-          )}
-          <span className={`w-2 h-2 rounded-full ${spoolbuddyAnyOnline ? 'bg-green-400' : 'bg-gray-500'}`} />
-        </button>
-        <button
-          onClick={() => handleTabChange('failure-detection')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'failure-detection'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <ScanEye className="w-4 h-4" />
-          {t('settings.tabs.failureDetection')}
-          <span className={`w-2 h-2 rounded-full ${obicoActive ? 'bg-green-400' : 'bg-gray-500'}`} />
-        </button>
-        <button
-          onClick={() => handleTabChange('users')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'users'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Users className="w-4 h-4" />
-          {t('settings.tabs.users')}
-          {authEnabled && (
-            <span className="w-2 h-2 rounded-full bg-green-400" />
-          )}
-        </button>
-        <button
-          onClick={() => handleTabChange('backup')}
-          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-            activeTab === 'backup'
-              ? 'text-bambu-green border-bambu-green'
-              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-          }`}
-        >
-          <Database className="w-4 h-4" />
-          {t('settings.tabs.backup')}
-          <span className={`w-2 h-2 rounded-full ${(cloudAuthStatus?.is_authenticated && githubBackupStatus?.configured && githubBackupStatus?.enabled) || settings?.local_backup_enabled ? 'bg-green-400' : 'bg-gray-500'}`} />
-        </button>
-      </nav>
-      <div className="flex-1 min-w-0">
+      <TabList
+        tabs={mainTabs}
+        ariaLabel={t('settings.tabsAriaLabel')}
+        variant="rail"
+        className="lg:flex-col lg:flex-nowrap lg:gap-0 lg:border-b-0 lg:border-r lg:w-48 lg:flex-shrink-0 lg:self-start lg:sticky lg:top-4"
+      />
+      <TabPanel tabs={mainTabs} className="flex-1 min-w-0">
       {activeTab === 'general' && (
       <>
       {/* Sponsor banner — prominent independence callout */}
@@ -6127,102 +6237,10 @@ export function SettingsPage() {
       {activeTab === 'users' && (
         <div className="space-y-3">
           {/* Sub-tab Navigation */}
-          <div className="flex gap-1 border-b border-bambu-dark-tertiary">
-            <button
-              onClick={() => setUsersSubTab('users')}
-              className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-                usersSubTab === 'users'
-                  ? 'text-bambu-green border-bambu-green'
-                  : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-              }`}
-            >
-              <Users className="w-4 h-4" />
-              {t('settings.tabs.users')}
-            </button>
-            <button
-              onClick={() => setUsersSubTab('email')}
-              className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-                usersSubTab === 'email'
-                  ? 'text-bambu-green border-bambu-green'
-                  : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-              }`}
-            >
-              <Mail className="w-4 h-4" />
-              {t('settings.tabs.emailAuth') || 'Email Authentication'}
-              {advancedAuthStatus?.advanced_auth_enabled && (
-                <span className="w-2 h-2 rounded-full bg-green-400" />
-              )}
-            </button>
-            {isAdmin && (
-              <button
-                onClick={() => setUsersSubTab('ldap')}
-                className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
-                  usersSubTab === 'ldap'
-                    ? 'text-bambu-green border-bambu-green'
-                    : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-                }`}
-              >
-                <Shield className="w-4 h-4" />
-                {t('settings.tabs.ldap') || 'LDAP'}
-                {ldapStatus?.ldap_enabled && (
-                  <span className="w-2 h-2 rounded-full bg-green-400" />
-                )}
-              </button>
-            )}
-            <button
-              onClick={() => setUsersSubTab('twofa')}
-              className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px flex items-center gap-2 ${
-                usersSubTab === 'twofa'
-                  ? 'text-bambu-green border-bambu-green'
-                  : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-              }`}
-            >
-              <Shield className="w-4 h-4" />
-              {t('settings.tabs.twoFa')}
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  twoFAStatus?.totp_enabled || twoFAStatus?.email_otp_enabled
-                    ? 'bg-green-400'
-                    : 'bg-bambu-gray/40'
-                }`}
-              />
-            </button>
-            {isAdmin && (
-              <button
-                onClick={() => setUsersSubTab('oidc')}
-                className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px flex items-center gap-2 ${
-                  usersSubTab === 'oidc'
-                    ? 'text-bambu-green border-bambu-green'
-                    : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-                }`}
-              >
-                <Globe className="w-4 h-4" />
-                {t('settings.tabs.oidc')}
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    oidcProvidersAll.some((p) => p.is_enabled)
-                      ? 'bg-green-400'
-                      : 'bg-bambu-gray/40'
-                  }`}
-                />
-              </button>
-            )}
-            {isAdmin && (
-              <button
-                onClick={() => setUsersSubTab('security')}
-                className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px flex items-center gap-2 ${
-                  usersSubTab === 'security'
-                    ? 'text-bambu-green border-bambu-green'
-                    : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
-                }`}
-              >
-                <Shield className="w-4 h-4" />
-                {t('settings.tabs.security')}
-              </button>
-            )}
-          </div>
+          <TabList tabs={usersTabs} ariaLabel={t('settings.usersTabsAriaLabel')} variant="rail" />
 
           {/* Users Sub-tab */}
+          <TabPanel tabs={usersTabs}>
           {usersSubTab === 'users' && (
           <>
           {/* Auth Toggle Header */}
@@ -6646,6 +6664,7 @@ export function SettingsPage() {
               <SecurityStatusCard />
             </div>
           )}
+          </TabPanel>
         </div>
       )}
 
@@ -6678,165 +6697,22 @@ export function SettingsPage() {
               </div>
             </CardHeader>
             <CardContent>
-              {ldapStatus?.ldap_enabled && (
-                <div
-                  className="mb-4 flex items-center gap-1 p-1 bg-bambu-dark-secondary rounded-lg"
-                  role="tablist"
-                  aria-label={t('users.modal.tabsAriaLabel')}
-                >
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={createUserTab === 'local'}
-                    onClick={() => setCreateUserTab('local')}
-                    className={`flex-1 px-3 py-2 text-sm rounded-md transition-colors ${
-                      createUserTab === 'local'
-                        ? 'bg-bambu-green/15 text-bambu-green'
-                        : 'text-bambu-gray hover:text-white'
-                    }`}
-                  >
-                    {t('users.modal.localTab')}
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={createUserTab === 'ldap'}
-                    onClick={() => setCreateUserTab('ldap')}
-                    className={`flex-1 px-3 py-2 text-sm rounded-md transition-colors ${
-                      createUserTab === 'ldap'
-                        ? 'bg-bambu-green/15 text-bambu-green'
-                        : 'text-bambu-gray hover:text-white'
-                    }`}
-                  >
-                    {t('users.modal.ldapTab')}
-                  </button>
-                </div>
-              )}
-
-              {createUserTab === 'ldap' && ldapStatus?.ldap_enabled ? (
+              {ldapStatus?.ldap_enabled ? (
                 <>
-                  <LdapUserPicker
-                    onSuccess={(user) => {
-                      setShowCreateUserModal(false);
-                      setCreateUserTab('local');
-                      setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
-                      showToast(t('users.toast.ldapProvisioned', { username: user.username }));
-                    }}
+                  <TabList
+                    tabs={createUserTabs}
+                    ariaLabel={t('users.modal.tabsAriaLabel')}
+                    variant="pill"
+                    className="mb-4"
                   />
-                  <div className="mt-6 flex justify-end">
-                    <Button
-                      variant="secondary"
-                      onClick={() => {
-                        setShowCreateUserModal(false);
-                        setCreateUserTab('local');
-                        setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
-                      }}
-                    >
-                      {t('common.cancel')}
-                    </Button>
-                  </div>
+                  <TabPanel tabs={createUserTabs}>
+                    {createUserTab === 'ldap' ? createUserLdapPanel : createUserLocalPanel}
+                  </TabPanel>
                 </>
               ) : (
-              <>
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">{t('settings.username')}</label>
-                  <input
-                    type="text"
-                    value={userFormData.username}
-                    onChange={(e) => setUserFormData({ ...userFormData, username: e.target.value })}
-                    className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
-                    placeholder={t('settings.enterUsername')}
-                    autoComplete="username"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">{t('settings.password')}</label>
-                  <input
-                    type="password"
-                    value={userFormData.password}
-                    onChange={(e) => setUserFormData({ ...userFormData, password: e.target.value })}
-                    className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
-                    placeholder={t('settings.enterPassword')}
-                    autoComplete="new-password"
-                    minLength={8}
-                  />
-                  <p className="text-bambu-gray text-xs mt-1">{t('settings.passwordRequirements')}</p>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">{t('settings.confirmPassword')}</label>
-                  <input
-                    type="password"
-                    value={userFormData.confirmPassword}
-                    onChange={(e) => setUserFormData({ ...userFormData, confirmPassword: e.target.value })}
-                    className={`w-full px-4 py-3 bg-bambu-dark-secondary border rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors ${
-                      userFormData.confirmPassword && userFormData.password !== userFormData.confirmPassword
-                        ? 'border-red-500'
-                        : 'border-bambu-dark-tertiary'
-                    }`}
-                    placeholder={t('settings.confirmPasswordPlaceholder')}
-                    autoComplete="new-password"
-                    minLength={6}
-                  />
-                  {userFormData.confirmPassword && userFormData.password !== userFormData.confirmPassword && (
-                    <p className="text-red-400 text-xs mt-1">{t('settings.passwordsDoNotMatch')}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">{t('settings.groups')}</label>
-                  <div className="space-y-2 max-h-40 overflow-y-auto p-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg">
-                    {groupsData.map(group => (
-                      <label
-                        key={group.id}
-                        className="flex items-center gap-3 px-2 py-1.5 rounded hover:bg-bambu-dark-tertiary cursor-pointer"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={userFormData.group_ids.includes(group.id)}
-                          onChange={() => toggleUserGroup(group.id)}
-                          className="w-4 h-4 rounded border-bambu-gray text-bambu-green focus:ring-bambu-green focus:ring-offset-0 bg-bambu-dark"
-                        />
-                        <span className="text-sm text-white">{group.name}</span>
-                        {group.is_system && (
-                          <span className="text-xs text-yellow-400">{t('settings.systemBadge')}</span>
-                        )}
-                      </label>
-                    ))}
-                    {groupsData.length === 0 && (
-                      <p className="text-sm text-bambu-gray">{t('settings.noGroupsAvailable')}</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-              <div className="mt-6 flex justify-end gap-3">
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    setShowCreateUserModal(false);
-                    setUserFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
-                  }}
-                >
-                  {t('common.cancel')}
-                </Button>
-                <Button
-                  onClick={handleCreateUser}
-                  disabled={createUserMutation.isPending || !userFormData.username || !userFormData.password || userFormData.password !== userFormData.confirmPassword || checkPasswordComplexity(userFormData.password) !== null}
-                >
-                  {createUserMutation.isPending ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      {t('settings.creating')}
-                    </>
-                  ) : (
-                    <>
-                      <Plus className="w-4 h-4" />
-                      {t('settings.createUser')}
-                    </>
-                  )}
-                </Button>
-              </div>
-              </>
+                createUserLocalPanel
               )}
+
             </CardContent>
         </Modal>
       )}
@@ -7372,7 +7248,7 @@ export function SettingsPage() {
             </CardContent>
         </Modal>
       )}
-      </div>
+      </TabPanel>
       </div>
     </div>
     </CardDensityProvider>

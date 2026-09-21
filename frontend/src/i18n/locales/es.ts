@@ -1732,6 +1732,7 @@ export default {
       dragGroup: 'Arrastrar grupo',
     },
     tabs: {
+      ariaLabel: 'Vistas de la cola',
       queue: 'Cola',
       history: 'Historial',
       timeline: 'Cronología',
@@ -2184,6 +2185,8 @@ export default {
     title: 'Ajustes',
     general: 'General',
     // Tab names
+    tabsAriaLabel: 'Secciones de ajustes',
+    usersTabsAriaLabel: 'Secciones de ajustes de usuarios',
     tabs: {
       general: 'General',
       smartPlugs: 'Enchufes inteligentes',

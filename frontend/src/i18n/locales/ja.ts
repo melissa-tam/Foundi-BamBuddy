@@ -1731,6 +1731,7 @@ export default {
       dragGroup: 'グループをドラッグ',
     },
     tabs: {
+      ariaLabel: 'キューの表示',
       queue: 'キュー',
       history: '履歴',
       timeline: 'タイムライン',
@@ -2182,6 +2183,8 @@ export default {
     title: '設定',
     general: '一般',
     // Tab names
+    tabsAriaLabel: '設定セクション',
+    usersTabsAriaLabel: 'ユーザー設定セクション',
     tabs: {
       general: '一般',
       smartPlugs: 'スマートプラグ',

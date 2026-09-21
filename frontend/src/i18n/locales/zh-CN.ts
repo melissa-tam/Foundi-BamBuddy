@@ -1732,6 +1732,7 @@ export default {
       dragGroup: '拖动批次',
     },
     tabs: {
+      ariaLabel: '队列视图',
       queue: '队列',
       history: '历史',
       timeline: '时间线',
@@ -2183,6 +2184,8 @@ export default {
     title: '设置',
     general: '通用',
     // Tab names
+    tabsAriaLabel: '设置分区',
+    usersTabsAriaLabel: '用户设置分区',
     tabs: {
       general: '通用',
       smartPlugs: '智能插座',

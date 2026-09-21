@@ -1748,6 +1748,7 @@ export default {
     },
     // Tabs
     tabs: {
+      ariaLabel: 'Queue views',
       queue: 'Queue',
       history: 'History',
       timeline: 'Timeline',
@@ -2206,6 +2207,8 @@ export default {
     title: 'Settings',
     general: 'General',
     // Tab names
+    tabsAriaLabel: 'Settings sections',
+    usersTabsAriaLabel: 'User settings sections',
     tabs: {
       general: 'General',
       smartPlugs: 'Smart Plugs',

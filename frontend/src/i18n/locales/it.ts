@@ -1732,6 +1732,7 @@ export default {
       dragGroup: 'Trascina gruppo',
     },
     tabs: {
+      ariaLabel: 'Viste della coda',
       queue: 'Coda',
       history: 'Cronologia',
       timeline: 'Linea temporale',
@@ -2183,6 +2184,8 @@ export default {
     title: 'Impostazioni',
     general: 'Generale',
     // Tab names
+    tabsAriaLabel: 'Sezioni delle impostazioni',
+    usersTabsAriaLabel: 'Sezioni delle impostazioni utenti',
     tabs: {
       general: 'Generale',
       smartPlugs: 'Prese smart',

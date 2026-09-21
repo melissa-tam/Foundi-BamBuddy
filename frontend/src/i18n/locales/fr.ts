@@ -1732,6 +1732,7 @@ export default {
       dragGroup: 'Faire glisser le groupe',
     },
     tabs: {
+      ariaLabel: 'Vues de la file',
       queue: 'File',
       history: 'Historique',
       timeline: 'Chronologie',
@@ -2183,6 +2184,8 @@ export default {
     title: 'Paramètres',
     general: 'Général',
     // Tab names
+    tabsAriaLabel: 'Sections des paramètres',
+    usersTabsAriaLabel: 'Sections des paramètres utilisateurs',
     tabs: {
       general: 'Général',
       smartPlugs: 'Prises connectées',

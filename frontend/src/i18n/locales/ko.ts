@@ -1655,6 +1655,7 @@ export default {
       dragGroup: '그룹 드래그',
     },
     tabs: {
+      ariaLabel: '대기열 보기',
       queue: '큐',
       history: '기록',
       timeline: '타임라인',
@@ -2099,6 +2100,8 @@ export default {
   settings: {
     title: '설정',
     general: '일반',
+    tabsAriaLabel: '설정 섹션',
+    usersTabsAriaLabel: '사용자 설정 섹션',
     tabs: {
       general: '일반',
       smartPlugs: '스마트 플러그',

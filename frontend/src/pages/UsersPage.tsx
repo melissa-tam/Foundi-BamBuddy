@@ -10,6 +10,8 @@ import { useToast } from '../contexts/ToastContext';
 import { Button } from '../components/Button';
 import { Card, CardContent, CardHeader } from '../components/Card';
 import { Modal } from '../components/ui/Modal';
+import { TabList, TabPanel } from '../components/ui/Tabs';
+import { useTabs } from '../hooks/useTabs';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { CreateUserAdvancedAuthModal } from '../components/CreateUserAdvancedAuthModal';
 import { LdapUserPicker } from '../components/LdapUserPicker';
@@ -32,6 +34,14 @@ export function UsersPage() {
   // Basic-mode (non-advanced-auth) modal: track which tab is active so the
   // LDAP picker can replace the local form when LDAP is enabled.
   const [basicCreateTab, setBasicCreateTab] = useState<'local' | 'ldap'>('local');
+  const createTabs = useTabs<'local' | 'ldap'>({
+    value: basicCreateTab,
+    onChange: setBasicCreateTab,
+    items: [
+      { id: 'local', label: t('users.modal.localTab') },
+      { id: 'ldap', label: t('users.modal.ldapTab') },
+    ],
+  });
   const [showEditModal, setShowEditModal] = useState(false);
   const [editingUserId, setEditingUserId] = useState<number | null>(null);
   const [deleteUserId, setDeleteUserId] = useState<number | null>(null);
@@ -281,6 +291,144 @@ export function UsersPage() {
     );
   }
 
+  // The two halves of the basic create-user dialog, named because each is a
+  // tab panel when LDAP is enabled and the local one is the whole dialog body
+  // when it is not (no tablist then, so no tabpanel either — a panel labelled
+  // by a tab that does not exist is a dangling reference).
+  const ldapCreatePanel = (
+    <>
+      <LdapUserPicker
+        onSuccess={(user) => {
+          setShowCreateModal(false);
+          setBasicCreateTab('local');
+          setFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+          showToast(t('users.toast.ldapProvisioned', { username: user.username }));
+        }}
+      />
+      <div className="mt-6 flex justify-end">
+        <Button
+          variant="secondary"
+          onClick={() => {
+            setShowCreateModal(false);
+            setBasicCreateTab('local');
+            setFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+          }}
+        >
+          {t('users.modal.cancel')}
+        </Button>
+      </div>
+    </>
+  );
+
+  const localCreatePanel = (
+    <>
+      <div className="space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-white mb-2">
+            {t('users.form.username')}
+          </label>
+          <input
+            type="text"
+            value={formData.username}
+            onChange={(e) => setFormData({ ...formData, username: e.target.value })}
+            className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
+            placeholder={t('users.form.usernamePlaceholder')}
+            autoComplete="username"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-white mb-2">
+            {t('users.form.password')}
+          </label>
+          <input
+            type="password"
+            value={formData.password}
+            onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+            className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
+            placeholder={t('users.form.passwordPlaceholder')}
+            autoComplete="new-password"
+            minLength={6}
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-white mb-2">
+            {t('users.form.confirmPassword')}
+          </label>
+          <input
+            type="password"
+            value={formData.confirmPassword}
+            onChange={(e) => setFormData({ ...formData, confirmPassword: e.target.value })}
+            className={`w-full px-4 py-3 bg-bambu-dark-secondary border rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors ${
+              formData.confirmPassword && formData.password !== formData.confirmPassword
+                ? 'border-red-500'
+                : 'border-bambu-dark-tertiary'
+            }`}
+            placeholder={t('users.form.confirmPasswordPlaceholder')}
+            autoComplete="new-password"
+            minLength={6}
+          />
+          {formData.confirmPassword && formData.password !== formData.confirmPassword && (
+            <p className="text-red-400 text-xs mt-1">{t('users.toast.passwordsDoNotMatch')}</p>
+          )}
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-white mb-2">
+            {t('users.form.groups')}
+          </label>
+          <div className="space-y-2 max-h-40 overflow-y-auto p-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg">
+            {groups.map(group => (
+              <label
+                key={group.id}
+                className="flex items-center gap-3 px-2 py-1.5 rounded hover:bg-bambu-dark-tertiary cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  checked={formData.group_ids.includes(group.id)}
+                  onChange={() => toggleGroup(group.id)}
+                  className="w-4 h-4 rounded border-bambu-gray text-bambu-green focus:ring-bambu-green focus:ring-offset-0 bg-bambu-dark"
+                />
+                <span className="text-sm text-white">{group.name}</span>
+                {group.is_system && (
+                  <span className="text-xs text-yellow-400">({t('users.system')})</span>
+                )}
+              </label>
+            ))}
+            {groups.length === 0 && (
+              <p className="text-sm text-bambu-gray">{t('users.noGroupsAvailable')}</p>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="mt-6 flex justify-end gap-3">
+        <Button
+          variant="secondary"
+          onClick={() => {
+            setShowCreateModal(false);
+            setFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
+          }}
+        >
+          {t('users.modal.cancel')}
+        </Button>
+        <Button
+          onClick={handleCreate}
+          disabled={isCreateButtonDisabled}
+        >
+          {createMutation.isPending ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin" />
+              {t('users.modal.creating')}
+            </>
+          ) : (
+            <>
+              <Plus className="w-4 h-4" />
+              {t('users.modal.createUser')}
+            </>
+          )}
+        </Button>
+      </div>
+    </>
+  );
+
   return (
     <div className="p-6">
       <div className="flex justify-between items-center mb-6">
@@ -452,171 +600,20 @@ export function UsersPage() {
               </div>
             </CardHeader>
             <CardContent>
-              {ldapStatus?.ldap_enabled && (
-                <div
-                  className="mb-4 flex items-center gap-1 p-1 bg-bambu-dark-secondary rounded-lg"
-                  role="tablist"
-                  aria-label={t('users.modal.tabsAriaLabel')}
-                >
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={basicCreateTab === 'local'}
-                    onClick={() => setBasicCreateTab('local')}
-                    className={`flex-1 px-3 py-2 text-sm rounded-md transition-colors ${
-                      basicCreateTab === 'local'
-                        ? 'bg-bambu-green/15 text-bambu-green'
-                        : 'text-bambu-gray hover:text-white'
-                    }`}
-                  >
-                    {t('users.modal.localTab')}
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={basicCreateTab === 'ldap'}
-                    onClick={() => setBasicCreateTab('ldap')}
-                    className={`flex-1 px-3 py-2 text-sm rounded-md transition-colors ${
-                      basicCreateTab === 'ldap'
-                        ? 'bg-bambu-green/15 text-bambu-green'
-                        : 'text-bambu-gray hover:text-white'
-                    }`}
-                  >
-                    {t('users.modal.ldapTab')}
-                  </button>
-                </div>
-              )}
-
-              {basicCreateTab === 'ldap' && ldapStatus?.ldap_enabled ? (
+              {ldapStatus?.ldap_enabled ? (
                 <>
-                  <LdapUserPicker
-                    onSuccess={(user) => {
-                      setShowCreateModal(false);
-                      setBasicCreateTab('local');
-                      setFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
-                      showToast(t('users.toast.ldapProvisioned', { username: user.username }));
-                    }}
+                  <TabList
+                    tabs={createTabs}
+                    ariaLabel={t('users.modal.tabsAriaLabel')}
+                    variant="pill"
+                    className="mb-4"
                   />
-                  <div className="mt-6 flex justify-end">
-                    <Button
-                      variant="secondary"
-                      onClick={() => {
-                        setShowCreateModal(false);
-                        setBasicCreateTab('local');
-                        setFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
-                      }}
-                    >
-                      {t('users.modal.cancel')}
-                    </Button>
-                  </div>
+                  <TabPanel tabs={createTabs}>
+                    {basicCreateTab === 'ldap' ? ldapCreatePanel : localCreatePanel}
+                  </TabPanel>
                 </>
               ) : (
-              <>
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">
-                    {t('users.form.username')}
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.username}
-                    onChange={(e) => setFormData({ ...formData, username: e.target.value })}
-                    className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
-                    placeholder={t('users.form.usernamePlaceholder')}
-                    autoComplete="username"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">
-                    {t('users.form.password')}
-                  </label>
-                  <input
-                    type="password"
-                    value={formData.password}
-                    onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-                    className="w-full px-4 py-3 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors"
-                    placeholder={t('users.form.passwordPlaceholder')}
-                    autoComplete="new-password"
-                    minLength={6}
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">
-                    {t('users.form.confirmPassword')}
-                  </label>
-                  <input
-                    type="password"
-                    value={formData.confirmPassword}
-                    onChange={(e) => setFormData({ ...formData, confirmPassword: e.target.value })}
-                    className={`w-full px-4 py-3 bg-bambu-dark-secondary border rounded-lg text-white placeholder-bambu-gray focus:outline-none focus:ring-2 focus:ring-bambu-green/50 focus:border-bambu-green transition-colors ${
-                      formData.confirmPassword && formData.password !== formData.confirmPassword
-                        ? 'border-red-500'
-                        : 'border-bambu-dark-tertiary'
-                    }`}
-                    placeholder={t('users.form.confirmPasswordPlaceholder')}
-                    autoComplete="new-password"
-                    minLength={6}
-                  />
-                  {formData.confirmPassword && formData.password !== formData.confirmPassword && (
-                    <p className="text-red-400 text-xs mt-1">{t('users.toast.passwordsDoNotMatch')}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-white mb-2">
-                    {t('users.form.groups')}
-                  </label>
-                  <div className="space-y-2 max-h-40 overflow-y-auto p-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg">
-                    {groups.map(group => (
-                      <label
-                        key={group.id}
-                        className="flex items-center gap-3 px-2 py-1.5 rounded hover:bg-bambu-dark-tertiary cursor-pointer"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={formData.group_ids.includes(group.id)}
-                          onChange={() => toggleGroup(group.id)}
-                          className="w-4 h-4 rounded border-bambu-gray text-bambu-green focus:ring-bambu-green focus:ring-offset-0 bg-bambu-dark"
-                        />
-                        <span className="text-sm text-white">{group.name}</span>
-                        {group.is_system && (
-                          <span className="text-xs text-yellow-400">({t('users.system')})</span>
-                        )}
-                      </label>
-                    ))}
-                    {groups.length === 0 && (
-                      <p className="text-sm text-bambu-gray">{t('users.noGroupsAvailable')}</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-              <div className="mt-6 flex justify-end gap-3">
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    setShowCreateModal(false);
-                    setFormData({ username: '', password: '', email: '', confirmPassword: '', role: 'user', group_ids: [] });
-                  }}
-                >
-                  {t('users.modal.cancel')}
-                </Button>
-                <Button
-                  onClick={handleCreate}
-                  disabled={isCreateButtonDisabled}
-                >
-                  {createMutation.isPending ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      {t('users.modal.creating')}
-                    </>
-                  ) : (
-                    <>
-                      <Plus className="w-4 h-4" />
-                      {t('users.modal.createUser')}
-                    </>
-                  )}
-                </Button>
-              </div>
-              </>
+                localCreatePanel
               )}
             </CardContent>
         </Modal>
