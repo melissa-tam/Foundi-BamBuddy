@@ -165,8 +165,18 @@ async def overview(
     span_printers = await _span_printer_ids(db)
     evidence = await _load_evidence(db, printer_ids=span_printers)
     since = await _history_since(db)
+    # The print log's own history start, resolved ONCE for both windows: it is a fact
+    # about the table, not about either range.
+    printed_since = await _prints_since(db)
     facts = await _load_window(
-        db, window, roster=roster, evidence=evidence, printer_ids=span_printers, now=moment, history_since=since
+        db,
+        window,
+        roster=roster,
+        evidence=evidence,
+        printer_ids=span_printers,
+        now=moment,
+        history_since=since,
+        prints_since=printed_since,
     )
     previous_from, previous_to = previous_window(date_from, date_to)
     previous = await _load_window(
@@ -177,6 +187,7 @@ async def overview(
         printer_ids=span_printers,
         now=moment,
         history_since=since,
+        prints_since=printed_since,
         include_output=False,
     )
 
@@ -215,6 +226,7 @@ async def printer_intervals(
         # The drill-down lists intervals and computes no rate, so nothing reads it
         # here; it is passed for one timeline shape rather than two.
         history_since=None,
+        prints_since=None,
         printer_id=printer_id,
         include_output=False,
     )
@@ -276,6 +288,23 @@ async def status_now(db: AsyncSession, *, now: datetime | None = None, tz: tzinf
         counts_by_group=by_group,
         counts_by_class=by_class,
     )
+
+
+async def _prints_since(db: AsyncSession) -> datetime | None:
+    """The first print-log row's instant — where the PRINT record's own history begins.
+
+    A separate fact from :func:`_history_since`, and it has to be: the print log is a
+    different record with a different start, complete from its first row onward while
+    the observation recorder may be minutes old. A summary compares a window against
+    its predecessor, and a comparison needs evidence on both sides — so the rule that
+    decides whether a print row may be compared (``SummaryInputs.prints_comparable``)
+    reads this instant and not the state record's.
+
+    ONE index-served query: ``min(created_at)`` is a b-tree seek into
+    ``ix_print_log_entries_created_at``, not a scan, so it costs the same on a farm
+    with a million print rows as on one with ten.
+    """
+    return await db.scalar(select(func.min(PrintLogEntry.created_at)))
 
 
 async def _history_since(db: AsyncSession, *, recording_since: datetime | None = None) -> datetime | None:
@@ -404,6 +433,9 @@ class _WindowFacts:
     #: Whole-table, window-independent: the earliest evidence of any kind. A rate that
     #: divides by "days the farm could have known about" reads it.
     history_since: datetime | None
+    #: Whole-table: where the PRINT log's own history begins. A print row may only be
+    #: compared against a previous window that overlaps it.
+    prints_since: datetime | None
 
 
 async def _load_window(
@@ -415,6 +447,7 @@ async def _load_window(
     printer_ids: Sequence[int],
     now: datetime,
     history_since: datetime | None,
+    prints_since: datetime | None,
     printer_id: int | None = None,
     include_output: bool = True,
 ) -> _WindowFacts:
@@ -432,6 +465,7 @@ async def _load_window(
     return _WindowFacts(
         window=window,
         history_since=history_since,
+        prints_since=prints_since,
         roster=roster,
         spans=await _load_spans(db, window, printer_ids=printer_ids, now=now, printer_id=printer_id),
         incidents=incidents,
@@ -706,6 +740,8 @@ def _compose_overview(facts: _WindowFacts, previous: _WindowFacts, now: datetime
     previous_inputs = projections.SummaryInputs(
         fleet=projections.fleet_series(previous_totals),
         prints=projections.throughput(previous_totals, projections.print_tally(previous_timeline, previous.prints)),
+        window_end=previous.window.end,
+        prints_since=previous.prints_since,
     )
 
     window = facts.window
@@ -717,7 +753,12 @@ def _compose_overview(facts: _WindowFacts, previous: _WindowFacts, now: datetime
         generated_at=now,
         window_start=window.start,
         window_end=window.end,
-        summary=projections.compose_summary(projections.SummaryInputs(fleet=fleet, prints=prints), previous_inputs),
+        summary=projections.compose_summary(
+            projections.SummaryInputs(
+                fleet=fleet, prints=prints, window_end=window.end, prints_since=facts.prints_since
+            ),
+            previous_inputs,
+        ),
         matrix=projections.matrix(totals, tally),
         fleet_series=fleet,
         throughput=prints,

@@ -1103,11 +1103,35 @@ class SummaryInputs:
 
     fleet: SeriesEnvelope[FleetSeriesValues]
     prints: SeriesEnvelope[ThroughputValues]
+    #: The window's own end, and where the PRINT log's history begins. Both default to
+    #: None so a caller that asks for no comparison need not supply them — and the
+    #: conservative direction is the safe one: with either missing, a print row is not
+    #: compared rather than compared against nothing.
+    window_end: datetime | None = None
+    prints_since: datetime | None = None
 
     @property
     def observed(self) -> bool:
         """Did the state recorder cover ANY of this window?"""
         return any(bucket.basis == BASIS_OBSERVED for bucket in self.fleet.buckets)
+
+    @property
+    def prints_comparable(self) -> bool:
+        """Does this window overlap the print log's own history at all?
+
+        A comparison needs evidence on BOTH sides. The print log is complete from its
+        first row onward, so a window that reaches that instant compares honestly —
+        zero prints included, because there a zero is a measurement. A window lying
+        entirely before it has no print data to be zero, and reporting 0 made the page
+        render "vs previous +129" against a period in which the farm had no record at
+        all. Withholding is the only honest answer, and it is the same answer the state
+        rows already give for their own record.
+
+        The bound is the print log's start and NOT the state recorder's: the two
+        records begin at different instants, and a print row compared on the recorder's
+        history would be withheld for weeks of perfectly good print data.
+        """
+        return self.prints_since is not None and self.window_end is not None and self.window_end > self.prints_since
 
 
 def compose_summary(current: SummaryInputs, previous: SummaryInputs | None) -> SummaryProjection:
@@ -1143,7 +1167,11 @@ def compose_summary(current: SummaryInputs, previous: SummaryInputs | None) -> S
             SummaryRow(
                 key=key,
                 figure=print_read(current.prints.totals),
-                previous=print_read(previous.prints.totals) if previous is not None else None,
+                # ...but a print row IS withheld when the previous window predates the
+                # print log entirely: see ``SummaryInputs.prints_comparable``.
+                previous=(
+                    print_read(previous.prints.totals) if previous is not None and previous.prints_comparable else None
+                ),
                 series=[print_read(bucket.values) for bucket in current.prints.buckets],
             )
         )

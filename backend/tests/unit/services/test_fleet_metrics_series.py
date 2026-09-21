@@ -669,13 +669,16 @@ class TestCycleEpisodes:
 class TestTheSummaryCard:
     """The card reads the series' own numbers, and compares like with like."""
 
-    def _inputs(self, date_from: date, date_to: date, *, spans, now):
+    def _inputs(self, date_from: date, date_to: date, *, spans, now, prints=(), prints_since=None):
         window = build_window(date_from, date_to, "day", NY)
         timeline = _timeline(window, now, roster=_roster(1, 2), spans=spans)
         totals = projections.class_totals(timeline)
-        tally = projections.print_tally(timeline, [])
+        tally = projections.print_tally(timeline, list(prints))
         return projections.SummaryInputs(
-            fleet=projections.fleet_series(totals), prints=projections.throughput(totals, tally)
+            fleet=projections.fleet_series(totals),
+            prints=projections.throughput(totals, tally),
+            window_end=window.end,
+            prints_since=prints_since,
         )
 
     def test_the_figure_and_the_sparkline_are_the_series_own_numbers(self):
@@ -704,8 +707,95 @@ class TestTheSummaryCard:
         assert earlier.observed is False
         for key in _STATE_ROW_KEYS:
             assert rows[key].previous is None, key
-        # A print row still compares: the print log was complete before recording began.
-        assert rows[projections.ROW_PRINTS_PER_DAY].previous == 0.0
+        # ...and with an EMPTY print log there is nothing on the print side either, so
+        # that row is withheld too rather than compared against a period with no record.
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous is None
+
+    def test_a_previous_window_before_the_first_print_is_not_compared(self):
+        """The reported defect: "vs previous +129" against a period with no record.
+
+        The previous window ends before the print log's first row, so there is no print
+        data there to be zero. Reporting 0 made the page render a rise against a period
+        that does not exist — every state row correctly showed a dash beside it.
+        """
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        prints = [projections.PrintLogRow(created_at=SEP1 + HOUR, status="completed", printer_id=1)]
+        first_print = SEP1 + HOUR
+        current = self._inputs(
+            date(2026, 9, 1),
+            date(2026, 9, 2),
+            spans=spans,
+            now=SEP1 + 48 * HOUR,
+            prints=prints,
+            prints_since=first_print,
+        )
+        earlier = self._inputs(
+            date(2026, 8, 30),
+            date(2026, 8, 31),
+            spans=[],
+            now=SEP1 + 48 * HOUR,
+            prints_since=first_print,
+        )
+        assert earlier.prints_comparable is False
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous is None
+        assert rows[projections.ROW_PRINTS_PER_PRINTER_PER_DAY].previous is None
+        # The current figure is untouched — this rule is about the comparison only.
+        assert rows[projections.ROW_PRINTS_PER_DAY].figure == pytest.approx(0.5)
+
+    def test_a_previous_window_that_straddles_the_first_print_is_compared(self):
+        # The log is complete from its first row on, so a window reaching that instant
+        # compares honestly — and a zero there IS a measurement.
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        # The first print lands inside the PREVIOUS window (2026-08-30..08-31).
+        first_print = datetime(2026, 8, 31, 12, 0, 0)
+        current = self._inputs(
+            date(2026, 9, 1), date(2026, 9, 2), spans=spans, now=SEP1 + 48 * HOUR, prints_since=first_print
+        )
+        earlier = self._inputs(
+            date(2026, 8, 30),
+            date(2026, 8, 31),
+            spans=[],
+            now=SEP1 + 48 * HOUR,
+            prints=[projections.PrintLogRow(created_at=first_print, status="completed", printer_id=1)],
+            prints_since=first_print,
+        )
+        assert earlier.prints_comparable is True
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous == pytest.approx(0.5)
+
+    def test_an_empty_print_log_is_never_compared(self):
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        current = self._inputs(date(2026, 9, 1), date(2026, 9, 2), spans=spans, now=SEP1 + 48 * HOUR)
+        earlier = self._inputs(date(2026, 8, 30), date(2026, 8, 31), spans=[], now=SEP1 + 48 * HOUR)
+        assert earlier.prints_comparable is False
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous is None
+
+    def test_the_state_rows_keep_their_own_rule(self):
+        # A window the RECORDER never covered withholds its state rows even when the
+        # print log reaches right through it: the two records are bounded separately.
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        first_print = datetime(2026, 8, 1, 0, 0, 0)
+        current = self._inputs(
+            date(2026, 9, 1), date(2026, 9, 2), spans=spans, now=SEP1 + 48 * HOUR, prints_since=first_print
+        )
+        earlier = self._inputs(
+            date(2026, 8, 30),
+            date(2026, 8, 31),
+            spans=[],
+            now=SEP1 + 48 * HOUR,
+            prints=[
+                projections.PrintLogRow(created_at=datetime(2026, 8, 30, 6, 0, 0), status="completed", printer_id=1)
+            ],
+            prints_since=first_print,
+        )
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert earlier.observed is False
+        assert earlier.prints_comparable is True
+        for key in _STATE_ROW_KEYS:
+            assert rows[key].previous is None, key
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous == pytest.approx(0.5)
 
     def test_every_row_appears_once_in_the_cards_reading_order(self):
         spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
