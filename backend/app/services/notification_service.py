@@ -3041,9 +3041,13 @@ class NotificationService:
         elif kind == "physical":
             slot_txt = f" ({runout_slot})" if runout_slot else ""
             title = f"Filament hardware fault — {printer_name}"
+            # The "no swap" statement lives in ``detail`` alone (the physical reason
+            # copy in ``spool_recovery._ESCALATE_DETAIL`` says it), so this wrapper
+            # states only what the detail cannot: who has to act. Saying it here as
+            # well printed the same sentence twice in one page.
             message = (
                 f"{printer_name}: '{job_name}'{foreign_txt} is left PAUSED by a physical filament fault{slot_txt}. "
-                f"{detail} The farm will NOT attempt a spool swap — this needs hands at the printer."
+                f"{detail} This needs hands at the printer."
             )
         elif foreign:
             # A jam on a foreign print: the swap machine needs the dispatch mapping to

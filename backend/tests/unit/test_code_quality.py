@@ -335,6 +335,63 @@ class TestOperatorStopOwnership:
         assert senders == callers
 
 
+def _scan_recovery_incident_constructions(py_file: Path) -> list[int]:
+    """Every CONSTRUCTION of ``RecoveryIncident``, however the module was imported.
+
+    AST, not grep, for the usual reason: the type is named in annotations, docstrings
+    and comments throughout ``spool_recovery`` — only a ``Call`` counts.
+    """
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name == "RecoveryIncident":
+            hits.append(node.lineno)
+    return hits
+
+
+class TestRecoveryIncidentOwnership:
+    """ONE factory builds the recovery context — ``spool_recovery._build_incident``.
+
+    A SOURCE pin, like its neighbours above: two call sites open an incident (the
+    per-push entry gate and the startup re-entry) and both must derive the SAME facts
+    from the same candidate set. They were two 17-field literals, each re-deriving
+    ``extruder_side_only`` inline, and a third would be a perfectly well-formed
+    behaviour no test would notice — until a restart read one printer's fault
+    differently from the push that raised it.
+    """
+
+    def test_exactly_one_construction_in_the_app_package(self):
+        sites = [
+            f"  - {'/'.join(_relative_parts(py_file))}:{line}"
+            for py_file in get_python_files(BACKEND_DIR)
+            for line in _scan_recovery_incident_constructions(py_file)
+        ]
+        if len(sites) != 1:
+            pytest.fail(
+                f"RecoveryIncident must be constructed in exactly one place, found {len(sites)}:\n"
+                + "\n".join(sites)
+                + "\n\nBuild it through spool_recovery._build_incident: it owns every fact derived "
+                "from the wire (the code set, extruder_side_only, retract_failure, the layer, the "
+                "job name), so the entry gate and the startup re-entry cannot drift apart."
+            )
+
+    def test_that_construction_is_the_factory(self):
+        """The liveness half — a pin that counts one site is satisfied by the WRONG one."""
+        import inspect
+
+        from backend.app.services import spool_recovery
+
+        source, start = inspect.getsourcelines(spool_recovery._build_incident)  # noqa: SLF001
+        (line,) = [
+            line for py_file in get_python_files(BACKEND_DIR) for line in _scan_recovery_incident_constructions(py_file)
+        ]
+        assert start <= line < start + len(source), "the one construction must live inside _build_incident"
+
+
 def _scan_resolution_vocabulary(py_file: Path) -> list[tuple[str, int]]:
     """Every USE (never a mention in prose) of a class literal or ``resolution_class``.
 

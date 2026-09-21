@@ -174,7 +174,27 @@ class SpoolUpdate(BaseModel):
     # Manual clear of the out-of-rotation (feed-fault) marker: PATCH with an
     # explicit null returns a jammed spool to service (route uses
     # model_dump(exclude_unset=True), so an omitted field is left untouched).
+    # CLEAR-ONLY — see the validator below.
     feed_fault_at: datetime | None = None
+
+    @field_validator("feed_fault_at")
+    @classmethod
+    def _feed_fault_at_is_clear_only(cls, v: datetime | None) -> None:
+        """Only ``null`` may be sent: this field clears, it never parks.
+
+        Parking a spool is the recovery driver's verdict about a live fault, and it
+        writes the PAIR — ``feed_fault_at`` and the ``feed_fault_code`` that explains
+        it. A non-null PATCH reached the spool through a bare ``setattr``, so it parked
+        a roll with a NULL diagnosis: the mirror of the 002-H2S pair bug the null path
+        was fixed for (2026-09-11). There is no operator route to "take this roll out of
+        service" — the only sender is ``OutOfRotationChip``, which PATCHes
+        ``{"feed_fault_at": null}`` — so refusing the other half costs nothing and the
+        contract is visible in OpenAPI.
+        """
+        if v is not None:
+            raise ValueError("feed_fault_at is clear-only: send null to return a spool to rotation")
+        return None
+
     # User-defined category + per-spool low-stock threshold override (#729).
     category: str | None = Field(default=None, max_length=50)
     low_stock_threshold_pct: int | None = Field(default=None, ge=1, le=99)

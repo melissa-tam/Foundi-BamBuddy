@@ -2299,6 +2299,7 @@ async def _runout_incident(db, printer_id, *, external):
         kind=spool_recovery.KIND_RUNOUT,
         external=external,
         extruder_side_only=False,
+        retract_failure=False,
         layer_at_fault=50,
         code="07FF_8011" if external else "0700_8011",
         printer_name="003-H2S",

@@ -5424,6 +5424,123 @@ async def run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_print_queue_completed_at ON print_queue (completed_at)",
     )
 
+    # Repair (2026-09-21, the 006-H2S extruder-overload incident): return to rotation
+    # every roll an EXTRUDER-side fault parked, once.
+    #
+    # What happened (observed-incidents shape 40, ``bambu-ams-behavior`` skill): the
+    # recovery driver has always held that an extruder-side fault's common factor is the
+    # EXTRUDER, not the spool — but it applied that rule only to the replacement roll it
+    # picked. The JAMMED slot's spool was stamped out of rotation and paged regardless,
+    # so a healthy roll was taken out of service for a fault it did not cause, and a
+    # printer working through repeat ``0300_801E`` overloads walked its own inventory
+    # down (printer 8, 09-11/12: 2 → 1 → 3 → 0 eligible spools → ``no_eligible_spool``).
+    # P1 makes the commit verb the one home of the rule; this states the same fact about
+    # the stamps already standing, which no live lane will revisit on its own — nothing
+    # re-reads a parked roll's diagnosis, and physical re-insertion is the only clear.
+    #
+    # Scope is the LIVE population, not a hand-listed set: every ``feed_fault_at IS NOT
+    # NULL`` row, its ``feed_fault_code`` classified through the taxonomy that decided
+    # the stamp in the first place. Extruder-side ⇒ NULL the PAIR (the flag and the code
+    # it was stamped with — the semantics of ``spool_recovery.clear_out_of_rotation``,
+    # restated in SQL because a repair must not drag a service singleton and its live
+    # dependencies into startup; ``hms_errors`` is a leaf over the catalogs and is
+    # imported at call time, the same way the reclaim repair above reaches
+    # ``spool_tagless``). Anything else — an AMS-side code, a NULL or blank code, a code
+    # the taxonomy has no row for — is left exactly as it stands.
+    #
+    # KNOWN LIMIT, accepted: ``feed_fault_code`` holds ONE representative short code
+    # (``spool_recovery._primary_code``), so a mixed incident whose lowest-sorted feed
+    # code happened to be ``0300_801E`` is cleared here even though an AMS-side code
+    # stood beside it. That is the safe direction: a wrongly returned roll re-parks
+    # itself on its next genuine jam, while a wrongly parked roll never returns itself.
+    # A later re-stamp is a new, correct stamp the marker never revisits.
+    #
+    # Shape B (durable settings marker) because the repair's own output — a cleared pair
+    # — is indistinguishable from a roll that was never parked, so there is no
+    # self-predicating condition to re-test; the marker INSERT rides the SAME savepoint
+    # as the DML, so the pair is all-or-nothing and a second boot is a no-op. Fully
+    # guarded: a repair that cannot run must never take startup down for every install,
+    # and its rollback leaves the marker unwritten so a fixed build simply tries again.
+    # One line per DECISION, clears and skips alike, each carrying the pre-image — the
+    # log is the only rollback this repair has.
+    _oor_repair_marker = "repair_extruder_side_oor_20260921"
+    _oor_repair_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _oor_repair_marker})
+    ).scalar()
+    if not _oor_repair_done:
+        _oor_log_tag = f"[REPAIR] {_oor_repair_marker}:"
+        try:
+            from backend.app.services.hms_errors import classify_short_code
+
+            _parked_rows = (
+                await conn.execute(
+                    text(
+                        "SELECT id, feed_fault_at, feed_fault_code FROM spool "
+                        "WHERE feed_fault_at IS NOT NULL ORDER BY id"
+                    )
+                )
+            ).fetchall()
+            _oor_cleared = 0
+            async with conn.begin_nested():
+                for _oor_spool_id, _oor_fault_at, _oor_fault_code in _parked_rows:
+                    _oor_verdict = classify_short_code(_oor_fault_code) if _oor_fault_code else None
+                    if _oor_verdict is None:
+                        logger.info(
+                            "%s skip spool %s (feed_fault_at=%s, feed_fault_code=%r): no taxonomy row — "
+                            "the stamp names nothing this repair can rule on",
+                            _oor_log_tag,
+                            _oor_spool_id,
+                            _oor_fault_at,
+                            _oor_fault_code,
+                        )
+                        continue
+                    if not _oor_verdict.extruder_side:
+                        logger.info(
+                            "%s skip spool %s (feed_fault_at=%s, feed_fault_code=%r): %s, not extruder-side — "
+                            "the roll is the common factor and the stamp stands",
+                            _oor_log_tag,
+                            _oor_spool_id,
+                            _oor_fault_at,
+                            _oor_fault_code,
+                            _oor_verdict.fault_class.value,
+                        )
+                        continue
+                    await conn.execute(
+                        text("UPDATE spool SET feed_fault_at = NULL, feed_fault_code = NULL WHERE id = :id"),
+                        {"id": _oor_spool_id},
+                    )
+                    _oor_cleared += 1
+                    logger.info(
+                        "%s spool %s returned to rotation (was feed_fault_at=%s, feed_fault_code=%r): "
+                        "extruder-side %s — the extruder was the common factor, not this roll",
+                        _oor_log_tag,
+                        _oor_spool_id,
+                        _oor_fault_at,
+                        _oor_fault_code,
+                        _oor_verdict.fault_class.value,
+                    )
+                await conn.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _oor_repair_marker},
+                )
+            logger.info(
+                "%s %d of %d out-of-rotation spool(s) returned, %d left parked (one-time; a roll parked "
+                "again after this runs carries a new, correct stamp)",
+                _oor_log_tag,
+                _oor_cleared,
+                len(_parked_rows),
+                len(_parked_rows) - _oor_cleared,
+            )
+        except Exception:  # noqa: BLE001 — a repair must never take startup down for every install
+            logger.exception(
+                "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a "
+                "later boot retries it",
+                _oor_repair_marker,
+            )
+
     # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds
     # from and the live table agree. A deleted id is never reused (005-H2S 2026-09-17) —
     # rationale, refusals and failure semantics live on the helper.

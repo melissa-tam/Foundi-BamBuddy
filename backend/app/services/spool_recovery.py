@@ -419,9 +419,12 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "extruder-side problem, not the spool. Left PAUSED for a human."
     ),
     # WS2b: the two classes that reach escalation without ever entering the loop.
+    # The resume instruction is deliberately NOT here — it lives in
+    # :func:`_retract_clause`, because on a latched pull-back "resume" is the wrong
+    # next action and the copy must be able to say so (006-H2S 2026-09-21, incident 289).
     "physical_fault": (
         "A physical filament fault (broken filament, a clog, or a failed pull-back) — fresh filament "
-        "cannot clear it, so no swap was attempted. Check the filament path at the printer, then resume."
+        "cannot clear it, so the farm will not swap. Check the filament path at the printer."
     ),
     "recovery_interrupted": (
         "A recovery was interrupted (the server restarted mid-swap) and the printer is still PAUSED with no "
@@ -516,8 +519,18 @@ class RecoveryIncident:
     external: bool
     # True when EVERY mechanical-feed code is extruder-side (main extruder
     # overloaded). A re-jam then keeps the replacement in rotation — the extruder,
-    # not the spool, is the common factor.
+    # not the spool, is the common factor, and since 006-H2S 2026-09-21 (incident 289)
+    # neither does the JAMMED spool get parked: :func:`_commit_out_of_rotation` is the
+    # one place that rule lives.
     extruder_side_only: bool
+    # True when ANY physical-fault candidate is a pull-back the firmware could not
+    # finish (``hms_errors`` ``retract_failure``). FROZEN at entry from the candidate
+    # set that opened the incident, like every other fact here: the escalation copy is
+    # composed later, possibly after the wire has moved on, and it must describe the
+    # fault the operator was paged about. 006-H2S 2026-09-21, incident 289 — the copy
+    # said "check the filament path, then resume" on a screen whose only button repeats
+    # the pull-back against the stuck filament.
+    retract_failure: bool
     layer_at_fault: int
     code: str
     printer_name: str
@@ -527,6 +540,63 @@ class RecoveryIncident:
     def is_feed_fault(self) -> bool:
         """Does the swap machine own this incident? (Derived — never stored twice.)"""
         return self.kind == KIND_JAM
+
+
+def _build_incident(
+    state,
+    candidates: frozenset[FaultCandidate],
+    *,
+    incident_id: int,
+    printer_id: int,
+    job_id: str,
+    settings: RecoverySettings,
+    item_id: int | None,
+    kind: str,
+    code: str,
+    fingerprint: str,
+    tray: int | None,
+    external: bool,
+    printer_name: str,
+    fallback_code: str | None = None,
+) -> RecoveryIncident:
+    """THE one construction of :class:`RecoveryIncident` (pinned by AST test).
+
+    Two callers open an incident — the per-push entry gate (:func:`on_ams_fault`) and
+    the startup re-entry (:func:`_reenter_recovering_incident`) — and they must produce
+    the SAME facts from the same candidate set, or a restart silently re-reads a fault
+    differently from the push that raised it. They had been two 17-field literals, each
+    re-deriving ``extruder_side_only`` inline; the drift that invites is exactly the
+    class the routing table (:func:`_route_fault`) was factored out to close.
+
+    Everything DERIVED from the wire lives here — the code set, the two fault-shape
+    flags, the layer and the job name — while everything the caller RESOLVED (the row
+    id, the routed kind, the tray, the primary code) is passed in. ``fallback_code`` is
+    the re-entry's one asymmetry: a wire with no actionable fault left still names the
+    fault the stored row carried, because that row is all the evidence there is.
+    """
+    mechanical = {c for c in candidates if c.fault_class is AmsFaultClass.MECHANICAL_FEED}
+    return RecoveryIncident(
+        incident_id=incident_id,
+        printer_id=printer_id,
+        job_id=job_id,
+        codes=frozenset(c.short_code for c in candidates)
+        or (frozenset({fallback_code}) if fallback_code else frozenset()),
+        fingerprint=fingerprint,
+        item_id=item_id,
+        settings=settings,
+        jammed_global_tray=tray,
+        kind=kind,
+        external=external,
+        extruder_side_only=bool(mechanical) and all(c.extruder_side for c in mechanical),
+        # Read off the PHYSICAL candidates only: the flag answers "is the printer
+        # holding a failed pull-back", and only that class can be one. A mechanical
+        # sibling standing beside it (006's ``0700_0017``) says nothing about it.
+        retract_failure=any(c.retract_failure for c in candidates if c.fault_class is AmsFaultClass.PHYSICAL_FAULT),
+        layer_at_fault=int(getattr(state, "layer_num", 0) or 0),
+        code=code,
+        printer_name=printer_name,
+        job_name=(getattr(state, "subtask_name", None) or "").strip() or "print",
+    )
 
 
 # --- Module edge state -------------------------------------------------------
@@ -1004,15 +1074,38 @@ async def _resolve_farm_item(db: AsyncSession, printer_id: int, job_id: str) -> 
     return result.scalar_one_or_none()
 
 
-def _candidate_slot(candidates, fault_class: AmsFaultClass) -> tuple[int, int] | None:
-    """The slot the FIRMWARE named for the deciding class, if any.
+def _candidate_slots(candidates, fault_class: AmsFaultClass) -> list[tuple[int, int]]:
+    """Every DISTINCT slot the FIRMWARE named for one class, lowest first.
 
-    Only the attr-aware ``hms[]`` lane carries one (the short-code lane discarded the
-    attr low byte), and only the per-slot families use it — a jam's 8010 code names
-    the AMS unit, never the tray. Lowest slot first so the answer is stable.
+    Only the attr-aware ``hms[]`` lane carries a slot (the short-code lane discarded
+    the attr low byte), and only the per-slot families use it — a jam's 8010 code names
+    the AMS unit, never the tray. Sorted so the answer is stable; de-duplicated because
+    two entries of the same family on one slot are one slot, and the callers below are
+    asking HOW MANY slots the class names as much as which.
     """
-    slots = sorted(c.slot for c in candidates if c.fault_class is fault_class and c.slot is not None)
+    return sorted({c.slot for c in candidates if c.fault_class is fault_class and c.slot is not None})
+
+
+def _candidate_slot(candidates, fault_class: AmsFaultClass) -> tuple[int, int] | None:
+    """The LOWEST slot the class names, or None. Stable, and arbitrary when it is not
+    alone — which is why a caller that must not arbitrate asks
+    :func:`_sole_candidate_slot` instead."""
+    slots = _candidate_slots(candidates, fault_class)
     return slots[0] if slots else None
+
+
+def _sole_candidate_slot(candidates, fault_class: AmsFaultClass) -> tuple[int, int] | None:
+    """The slot the class names when it names EXACTLY one; ``None`` when it names
+    several (or none).
+
+    The difference from :func:`_candidate_slot` is the whole point: that one picks the
+    lowest of several, which is a deterministic answer to a question nobody asked. A
+    caller borrowing another class's attribution (the PHYSICAL fallback below) must
+    refuse to arbitrate — a slot chosen by sort order would be a confident lie about
+    which tray a human should go and look at.
+    """
+    slots = _candidate_slots(candidates, fault_class)
+    return slots[0] if len(slots) == 1 else None
 
 
 def _resolve_fault_tray(
@@ -1040,24 +1133,48 @@ def _resolve_fault_tray(
       demand also settles the verdict as ``single``: it names ONE exact slot to
       refill, honest guidance even on a multi-feeder job (a runout never enters the
       swap machine anyway, doctrine invariant 9).
-    * PHYSICAL — the attr-named slot only. These escalate either way, so a missing
-      slot costs a less specific message, never a wrong one.
+    * PHYSICAL — the attr-named slot, then the slot a CO-STANDING mechanical-feed
+      candidate names, and only when those name exactly ONE distinct slot. A physical
+      fault rarely carries its own attribution (006-H2S 2026-09-21: ``0700_8003``
+      names none) while the mechanical sibling it arrived with does (``0700_0017@0-0``)
+      — they are one physical event on one path, so borrowing that attribution is
+      reading the evidence, not inventing it. Two distinct slots means the wire is
+      describing more than one tray and the fallback REFUSES rather than arbitrating;
+      the lowest-sorted slot would be a confident lie. These escalate either way, so a
+      missing slot costs a less specific message, never a wrong one.
     * JAM — :func:`_resolve_jammed_tray`; the 8010 family carries no slot attribution.
+
+    Every ``(ams_id, tray_id)`` becomes a global tray through the ONE codec
+    (``spool_respool.encode_global_tray``, invariant 1), which knows the AMS-HT and
+    vt_tray conventions a bare ``ams_id * 4 + tray_id`` silently drops. A slot the
+    codec cannot NAME falls through to the next tier exactly as a missing slot does —
+    that is the fail-closed reading, not a new one: an AMS-HT unit encoded by hand
+    produced a well-formed id belonging to some OTHER real slot, and a wrong tray is
+    worse than none on every surface this answer reaches (the operator's refill
+    instruction, the out-of-rotation stamp, the incident row).
     """
     if external:
         return None, "single"
     if kind == KIND_RUNOUT:
         demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
         if demand is not None:
-            return demand[0] * 4 + demand[1], "single"
+            tray = encode_global_tray(*demand)
+            if tray is not None:
+                return tray, "single"
     if kind in (KIND_RUNOUT, KIND_PHYSICAL):
         slot = _candidate_slot(
             candidates, AmsFaultClass.RUNOUT if kind == KIND_RUNOUT else AmsFaultClass.PHYSICAL_FAULT
         )
-        if slot is not None:
-            return slot[0] * 4 + slot[1], "single"
+        tray = encode_global_tray(*slot) if slot is not None else None
+        if tray is not None:
+            return tray, "single"
         if kind == KIND_PHYSICAL:
-            return None, "single"
+            # The 006 shape: the physical code names no slot, but the mechanical-feed
+            # candidate standing WITH it does. One event, one path — so its attribution
+            # carries, and only when it is unambiguous.
+            slot = _sole_candidate_slot(candidates, AmsFaultClass.MECHANICAL_FEED)
+            tray = encode_global_tray(*slot) if slot is not None else None
+            return tray, "single"
     return _resolve_jammed_tray(state, candidates=candidates, item=item, printer_id=printer_id)
 
 
@@ -1159,7 +1276,9 @@ def _resolve_jammed_tray(
     Evidence order, strongest first:
 
     1. The fault's OWN slot attribution — only the attr-aware ``hms[]`` lane carries
-       one, and when it does it is the firmware naming the tray directly.
+       one, and when it does it is the firmware naming the tray directly. Encoded
+       through the one codec, so a slot it cannot NAME falls to tier 2 rather than
+       becoming a well-formed id belonging to a different tray.
     2. The multi-feeder verdict from :func:`_job_feeders`, evaluated BEFORE the live
        feeder: a live ``tray_now`` on a multi-material job is a true answer to the
        wrong question, because the swap it would authorise cannot hold.
@@ -1171,8 +1290,9 @@ def _resolve_jammed_tray(
     4. The single mapped feeder, when the wire named none.
     """
     slot = _candidate_slot(candidates, AmsFaultClass.MECHANICAL_FEED)
-    if slot is not None:
-        return slot[0] * 4 + slot[1], "single"
+    tray = encode_global_tray(*slot) if slot is not None else None
+    if tray is not None:
+        return tray, "single"
 
     feeders, _source = _job_feeders(state, item, printer_id)
     if len(feeders) > 1:
@@ -1423,6 +1543,72 @@ def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None) -> 
     return None
 
 
+def _retract_clause(incident: RecoveryIncident) -> str:
+    """The sentence a PHYSICAL escalation appends: what to do at the screen.
+
+    The physical class's static copy says what the fault IS; this says what the one
+    button in front of the operator will do. 006-H2S 2026-09-21 (incident 289) is why
+    the distinction is load-bearing: the printer sat latched in a pull-back the farm's
+    own unload had commanded, and the page said "check the filament path, then resume"
+    — but there was no Resume on that screen. Retry/CONTINUE on a ``0700_8003`` re-runs
+    the pull-back, against the same filament that would not come out, which is the
+    action most likely to break it off inside the extruder.
+
+    Reads the FROZEN :attr:`RecoveryIncident.retract_failure`, never the live wire: the
+    page describes the fault the operator is being called about, and by the time the
+    detail is composed the firmware may already have moved on.
+
+    The otherwise-arm carries the resume instruction that the ``physical_fault`` copy
+    gives up, so exactly one of the two sentences is ever rendered — which is also why
+    :func:`_compose_detail` calls this for that reason ALONE: a reason whose own copy
+    still ends in "resume on the printer" would then say it twice.
+    """
+    if incident.retract_failure:
+        return (
+            "The printer is holding a failed filament pull-back: Retry on the screen repeats the pull-back. "
+            "Free the filament at the extruder first, then press Retry."
+        )
+    return "Then resume on the printer."
+
+
+def _compose_detail(incident: RecoveryIncident, reason: str, restore: RestoreVerdict | None) -> str:
+    """THE human detail of an escalation: static reason copy plus at most one clause.
+
+    The reason copy says WHY the farm gave up — one string per reason token, shared by
+    every kind that can reach it. The clause says what the operator is walking up to,
+    and that IS kind-specific, so it is keyed on the incident's kind rather than woven
+    into the reason table (which would multiply out to reason × kind copies).
+
+    Exactly two kinds carry one:
+
+    * JAM → :func:`_feeder_clause` — where the filament sits, read off the live wire
+      plus the driver's own restore verdict (incident 192's missing half).
+    * PHYSICAL, and only under the ``physical_fault`` reason → :func:`_retract_clause`
+      — what the screen's Retry will do (incident 289's missing half).
+
+    A RUNOUT or an EXTERNAL fault gets none: their copy already carries the slot
+    instruction, and the swap machine never moved their filament.
+
+    The physical clause is REASON-gated where the feed one is not, and the asymmetry is
+    the evidence, not caution. ``physical_fault`` is the one physical reason a live
+    candidate set produced, so it is the one whose ``retract_failure`` reading means
+    anything; the other reason a physical row can carry is ``recovery_interrupted``,
+    minted by the startup re-entry when the wire has NO actionable fault left — the
+    flag is False by construction there, and appending the otherwise-arm printed "and
+    resume on the printer. Then resume on the printer." One instruction, once.
+    """
+    detail = _ESCALATE_DETAIL.get(reason, reason)
+    clause: str | None = None
+    if incident.is_feed_fault:
+        clause = _feeder_clause(
+            _feeder_position(_get_state(incident.printer_id), incident.jammed_global_tray, incident.printer_id),
+            restore,
+        )
+    elif incident.kind == KIND_PHYSICAL and reason == "physical_fault":
+        clause = _retract_clause(incident)
+    return f"{detail} {clause}" if clause is not None else detail
+
+
 async def _route_fault(
     db: AsyncSession,
     *,
@@ -1660,25 +1846,20 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                     return None
 
             printer = await db.get(Printer, printer_id)
-            printer_name = (printer.name if printer else None) or f"printer {printer_id}"
-            job_name = (getattr(state, "subtask_name", None) or "").strip() or "print"
-            mechanical = {c for c in candidates if c.fault_class is AmsFaultClass.MECHANICAL_FEED}
-            incident = RecoveryIncident(
+            incident = _build_incident(
+                state,
+                candidates,
                 incident_id=row.id,
                 printer_id=printer_id,
                 job_id=job_id,
-                codes=frozenset(c.short_code for c in candidates),
-                fingerprint=fingerprint,
-                item_id=item.id if item is not None else None,
                 settings=settings,
-                jammed_global_tray=tray,
+                item_id=item.id if item is not None else None,
                 kind=kind,
-                external=external,
-                extruder_side_only=bool(mechanical) and all(c.extruder_side for c in mechanical),
-                layer_at_fault=int(getattr(state, "layer_num", 0) or 0),
                 code=code,
-                printer_name=printer_name,
-                job_name=job_name,
+                fingerprint=fingerprint,
+                tray=tray,
+                external=external,
+                printer_name=(printer.name if printer else None) or f"printer {printer_id}",
             )
 
         _note_outcome(
@@ -1811,10 +1992,12 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         #     loading again.
         tried: set[int] = set()
         evidence = _RecoveryEvidence()
-        # The jammed spool is taken out of rotation exactly ONCE, at the swap-commit
-        # boundary (a reset that leaves recovery committed to a swap or wedged), never
-        # at entry — so a no-swap self-heal leaves the spool untouched.
-        oor_stamped = False
+        # The commit boundary (a reset that leaves recovery committed to a swap or
+        # wedged) is crossed exactly ONCE per incident, never at entry — so a no-swap
+        # self-heal leaves the spool untouched. What the crossing DOES about the spool
+        # is `_commit_out_of_rotation`'s alone: on an extruder-side fault it parks
+        # nothing, which is why this flag records the BOUNDARY rather than a stamp.
+        oor_committed = False
         for _round in range(_MAX_CANDIDATES):
             if await _takeover_exit(incident, awaiting="PAUSE", step="round_start"):
                 return
@@ -1828,11 +2011,11 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                 return
             if reset == "fail":
                 # The feeder is genuinely wedged — hands are needed and the jammed
-                # spool is legitimately out of rotation. Commit the stamp (once) at
-                # this boundary, THEN give up.
-                if not oor_stamped and incident.jammed_global_tray is not None:
-                    await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
-                    oor_stamped = True
+                # spool is legitimately out of rotation. Cross the commit boundary
+                # (once) here, THEN give up.
+                if not oor_committed and incident.jammed_global_tray is not None:
+                    await _commit_out_of_rotation(incident, incident.jammed_global_tray, role="jammed")
+                    oor_committed = True
                 await _give_up(incident, client, "stuck_reset_failed", evidence=evidence)
                 return
             if reset == "recovered":
@@ -1888,16 +2071,18 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                 return
             tried.add(target)
 
-            # A replacement is in hand → the swap COMMITS: take the jammed spool out of
-            # rotation ONCE, right before the first unload. Boundary semantics: the
-            # stamp means "recovery is abandoning this spool", so every give-up that can
-            # follow this point (ams_drying, unload_failed, load exhaustion) correctly
-            # KEEPS the stamp; only a clean swap-and-resume or an external-takeover
-            # abort resolves it (the latter's _clear reverses it when the operator
-            # resumed on the jammed feeder — never on a feeder the driver restored).
-            if not oor_stamped and incident.jammed_global_tray is not None:
-                await _mark_out_of_rotation(incident, incident.jammed_global_tray, notify=True)
-                oor_stamped = True
+            # A replacement is in hand → the swap COMMITS, ONCE, right before the first
+            # unload. Boundary semantics: a stamp written here means "recovery is
+            # abandoning this spool", so every give-up that can follow this point
+            # (ams_drying, unload_failed, load exhaustion) correctly KEEPS it; only a
+            # clean swap-and-resume or an external-takeover abort resolves it (the
+            # latter's _clear reverses it when the operator resumed on the jammed feeder
+            # — never on a feeder the driver restored). Whether a stamp is written at
+            # all is `_commit_out_of_rotation`'s call: an extruder-side fault commits
+            # the SWAP and parks nothing (006-H2S 2026-09-21, incident 289).
+            if not oor_committed and incident.jammed_global_tray is not None:
+                await _commit_out_of_rotation(incident, incident.jammed_global_tray, role="jammed")
+                oor_committed = True
             unload = await _unload_and_confirm(incident, client)
             if unload in ("ok", "fail"):
                 # The command went out — confirmed or not, the FARM moved this feeder,
@@ -1987,25 +2172,17 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                 continue
 
             # resume2 == "repause": the print RAN and a recoverable fault stopped it
-            # again — the ONE path on which a replacement may be stamped. Ask the WIRE
-            # which tray it blames (the same evidence order the entry gate used;
+            # again — the ONE path on which a replacement may be parked at all. Ask the
+            # WIRE which tray it blames (the same evidence order the entry gate used;
             # ``item=None`` because the dispatch mapping now names the replacement
-            # itself, so it cannot corroborate anything). Only take the replacement out
-            # of rotation when the firmware names IT, and never on an extruder-side
-            # fault, where the extruder is the common factor and the spool is probably
-            # healthy (``tried`` already bars re-selecting it this job).
+            # itself, so it cannot corroborate anything). This site keeps ONLY that
+            # EVIDENCE test; the extruder-side rule that used to sit beside it moved
+            # into `_commit_out_of_rotation`, where the jammed spool's commit reads it
+            # too (``tried`` already bars re-selecting this tray for the job either way).
             st = _get_state(pid)
             jammed_now, _verdict = _resolve_jammed_tray(st, candidates=live_candidates(st), item=None, printer_id=pid)
-            if jammed_now == target and not incident.extruder_side_only:
-                await _mark_out_of_rotation(incident, target, notify=True)
-            elif incident.extruder_side_only:
-                logger.info(
-                    "spool_recovery: printer %s replacement tray %s kept IN rotation — "
-                    "extruder-side fault %s is the common factor, not the spool",
-                    pid,
-                    target,
-                    incident.code,
-                )
+            if jammed_now == target:
+                await _commit_out_of_rotation(incident, target, role="replacement")
             else:
                 logger.info(
                     "spool_recovery: printer %s re-PAUSEd with the fault attributed to tray %s, not the "
@@ -3167,10 +3344,54 @@ async def _close_incident(incident: RecoveryIncident, *, status: str, source: st
         return False
 
 
-async def _mark_out_of_rotation(incident: RecoveryIncident, global_tray: int, *, notify: bool) -> None:
+async def _commit_out_of_rotation(
+    incident: RecoveryIncident, global_tray: int, *, role: Literal["jammed", "replacement"]
+) -> None:
+    """THE one verb that parks a spool for this incident (pinned by AST test).
+
+    It exists so "an extruder-side fault never parks a spool" is stated ONCE. The rule
+    itself is not new — the driver has applied it to the REPLACEMENT since WS2 — but it
+    lived at that one call site, so the JAMMED spool at the swap-commit boundary was
+    parked by the same fault the rule says is not the spool's doing. 006-H2S 2026-09-21
+    (incident 289): a ``0300_801E`` extruder overload, and 12 ms later a healthy roll
+    was stamped out of rotation and the operator paged about it. Printer 8 on 09-11/12
+    shows where that ends — the same fault parked trays 2→1→3→0 across one job and the
+    run finished on ``no_eligible_spool``.
+
+    ``role`` names WHICH spool for the log line only; both take the same rule, because
+    the fault is the same fault whichever tray was feeding when it fired.
+
+    No stamp means no page: the out-of-rotation notification fires INSIDE
+    :func:`_mark_out_of_rotation`, so suppressing the write suppresses the announcement
+    by construction rather than by a second condition. Everything downstream tolerates
+    an unwritten stamp already — the clears (:func:`_clear_out_of_rotation_for_slot`)
+    resolve nothing and return False, and no closer reads "was it stamped".
+    """
+    if incident.extruder_side_only:
+        logger.info(
+            "spool_recovery: printer %s %s tray %s kept IN rotation — extruder-side fault %s is the "
+            "common factor, not the spool",
+            incident.printer_id,
+            role,
+            global_tray,
+            incident.code,
+        )
+        return
+    await _mark_out_of_rotation(incident, global_tray)
+
+
+async def _mark_out_of_rotation(incident: RecoveryIncident, global_tray: int) -> None:
     """Stamp ``feed_fault_at``/``feed_fault_code`` on the spool bound to
-    ``global_tray`` (unbound slot → proceed anyway), broadcast inventory_changed,
-    and optionally fire the out-of-rotation notification."""
+    ``global_tray`` (unbound slot → proceed anyway), broadcast inventory_changed, and
+    fire the out-of-rotation notification.
+
+    The WRITER only. Whether a spool may be parked at all is
+    :func:`_commit_out_of_rotation`'s question, and it is this function's sole caller.
+
+    The page is NOT optional and has no flag: parking a spool silently would take a
+    roll out of every future dispatch with nothing telling the operator why their
+    inventory shrank. The old ``notify`` parameter was single-valued at all three
+    historical call sites — a switch nobody ever threw is a path nobody ever tested."""
     from backend.app.core.database import async_session
     from backend.app.core.websocket import ws_manager
     from backend.app.models.printer import Printer
@@ -3215,20 +3436,19 @@ async def _mark_out_of_rotation(incident: RecoveryIncident, global_tray: int, *,
                     "spool_recovery: inventory_changed broadcast failed for printer %s", incident.printer_id
                 )
 
-            if notify:
-                printer = await db.get(Printer, incident.printer_id)
-                printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
-                try:
-                    await notification_service.on_spool_out_of_rotation(
-                        printer_id=incident.printer_id,
-                        printer_name=printer_name,
-                        spool_desc=spool_desc,
-                        slot_desc=slot_desc,
-                        code=incident.code,
-                        db=db,
-                    )
-                except Exception:  # noqa: BLE001 — notification failure is non-fatal
-                    logger.exception("spool_recovery: OOR notification failed for printer %s", incident.printer_id)
+            printer = await db.get(Printer, incident.printer_id)
+            printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
+            try:
+                await notification_service.on_spool_out_of_rotation(
+                    printer_id=incident.printer_id,
+                    printer_name=printer_name,
+                    spool_desc=spool_desc,
+                    slot_desc=slot_desc,
+                    code=incident.code,
+                    db=db,
+                )
+            except Exception:  # noqa: BLE001 — notification failure is non-fatal
+                logger.exception("spool_recovery: OOR notification failed for printer %s", incident.printer_id)
     except Exception:  # noqa: BLE001 — marking is best-effort; recovery continues
         logger.exception("spool_recovery: mark_out_of_rotation failed for printer %s", incident.printer_id)
 
@@ -3482,9 +3702,10 @@ async def _escalate(incident: RecoveryIncident, reason: str, *, restore: Restore
     why an escalation, and not a wire edge, is what a hold spanning a deploy can rely on.
 
     ``restore`` is :func:`_give_up`'s statement about an extruder the DRIVER emptied,
-    and it is what lets the composed detail say where the filament is (:func:`
-    _feeder_clause`). It is passed explicitly and never inferred: the default ``None``
-    is the truthful answer for every caller that unloaded nothing.
+    and it is what lets the composed detail say where the filament is (:func:
+    `_compose_detail` → :func:`_feeder_clause`). It is passed explicitly and never
+    inferred: the default ``None`` is the truthful answer for every caller that
+    unloaded nothing.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -3493,17 +3714,7 @@ async def _escalate(incident: RecoveryIncident, reason: str, *, restore: Restore
     # Per-tray diagnostic snapshot on every escalation (the 18:45 forensics gap).
     await _log_tray_snapshot(incident)
 
-    detail = _ESCALATE_DETAIL.get(reason, reason)
-    # Where the filament actually IS, read once off the live wire and appended to the
-    # static reason copy — feed faults only, because that is the machine that moves
-    # filament. Runout / physical / external copy already carries its slot instruction.
-    if incident.is_feed_fault:
-        clause = _feeder_clause(
-            _feeder_position(_get_state(incident.printer_id), incident.jammed_global_tray, incident.printer_id),
-            restore,
-        )
-        if clause is not None:
-            detail = f"{detail} {clause}"
+    detail = _compose_detail(incident, reason, restore)
     # The hold's projection onto the farm unit, one token per kind. A foreign print
     # has no unit — the incident row carries the whole state there.
     token = waiting_reason_for(incident.kind, external=incident.external)
@@ -4184,24 +4395,21 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                 # ``service_hold``.
                 escalate_reason = escalate_reason or _held_escalate_reason(kind, external=external)
             printer = await db.get(Printer, printer_id)
-            printer_name = (printer.name if printer else None) or f"printer {printer_id}"
-            mechanical = {c for c in candidates if c.fault_class is AmsFaultClass.MECHANICAL_FEED}
-            incident = RecoveryIncident(
+            incident = _build_incident(
+                state,
+                candidates,
                 incident_id=incident_id,
                 printer_id=printer_id,
                 job_id=job_id,
-                codes=frozenset(c.short_code for c in candidates) or frozenset({row.code}),
-                fingerprint=fingerprint,
-                item_id=item.id if item is not None else None,
                 settings=settings,
-                jammed_global_tray=tray,
+                item_id=item.id if item is not None else None,
                 kind=kind,
-                external=external,
-                extruder_side_only=bool(mechanical) and all(c.extruder_side for c in mechanical),
-                layer_at_fault=int(getattr(state, "layer_num", 0) or 0),
                 code=code,
-                printer_name=printer_name,
-                job_name=(getattr(state, "subtask_name", None) or "").strip() or "print",
+                fingerprint=fingerprint,
+                tray=tray,
+                external=external,
+                printer_name=(printer.name if printer else None) or f"printer {printer_id}",
+                fallback_code=row.code,
             )
 
         logger.info(
@@ -4275,7 +4483,12 @@ async def maybe_refresh_runout_guidance(printer_id: int, new_full_codes, state) 
         demand = current_runout_demand(hms_list)
         if demand is None:
             return False
-        global_tray = demand[0] * 4 + demand[1]
+        # The one codec (invariant 1). A slot it cannot NAME stands down exactly as a
+        # missing demand does: this message's whole job is to tell the operator WHICH
+        # slot to refill, and a hand-rolled id would send them to a different tray.
+        global_tray = encode_global_tray(*demand)
+        if global_tray is None:
+            return False
 
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer
@@ -4747,7 +4960,12 @@ async def _close_runout_hold_and_notify(printer_id: int, slot: tuple[int, int] |
             item_id = incident.item_id if incident is not None else None
             tray = incident.slot_global_tray if incident is not None else None
             if slot is not None:
-                tray = slot[0] * 4 + slot[1]
+                # The live slot OVERRIDES the stored one — but only when the codec can
+                # name it (invariant 1). An unnameable slot leaves the incident's own
+                # tray standing rather than blanking a good answer with a bad one.
+                encoded = encode_global_tray(*slot)
+                if encoded is not None:
+                    tray = encoded
             slot_desc = runout_slot_desc(tray) or "the filament slot"
             if incident is not None:
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_AUTO_RESUME)

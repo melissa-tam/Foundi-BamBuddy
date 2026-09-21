@@ -1043,6 +1043,30 @@ async def bulk_create_spools(
     return list(result.scalars().all())
 
 
+def _apply_spool_update(spool: Spool, data: dict) -> None:
+    """Write one prepared update payload onto one spool row.
+
+    THE one place a spool update lands — the per-spool PATCH and the bulk lane share
+    it — because exactly one field in it is not a plain column write. "Return to
+    rotation" is ONE verb with one owner: a null ``feed_fault_at`` clears the PAIR
+    (the flag and the code it was stamped with) through ``spool_recovery``, so a
+    stale diagnosis cannot outlive the flag it explained (002-H2S 2026-09-11). A bare
+    ``setattr`` loop nulls exactly the column it names, which IS that bug; the bulk
+    lane carried a second copy of it until this helper existed.
+
+    The field is clear-only — ``SpoolUpdate`` 422s a non-null value — so PRESENCE is
+    the clear and nothing here re-tests the value. ``data`` is read, never mutated:
+    the bulk caller applies one prepared payload to every spool in its batch.
+    """
+    from backend.app.services import spool_recovery
+
+    for field, value in data.items():
+        if field == "feed_fault_at":
+            spool_recovery.clear_out_of_rotation(spool)
+            continue
+        setattr(spool, field, value)
+
+
 @router.patch("/spools/{spool_id}", response_model=SpoolResponse)
 async def update_spool(
     spool_id: int,
@@ -1065,17 +1089,7 @@ async def update_spool(
     if "weight_used" in update_data and "weight_locked" not in update_data:
         update_data["weight_locked"] = True
 
-    # "Return to rotation" is ONE verb with one owner: a null ``feed_fault_at`` clears
-    # the PAIR (the flag and the code it was stamped with) through ``spool_recovery``,
-    # so a stale diagnosis cannot outlive the flag it explained (002-H2S 2026-09-11).
-    if "feed_fault_at" in update_data and update_data["feed_fault_at"] is None:
-        from backend.app.services import spool_recovery
-
-        update_data.pop("feed_fault_at")
-        spool_recovery.clear_out_of_rotation(spool)
-
-    for field, value in update_data.items():
-        setattr(spool, field, value)
+    _apply_spool_update(spool, update_data)
 
     await db.commit()
     result = await db.execute(select(Spool).options(selectinload(Spool.k_profiles)).where(Spool.id == spool_id))
@@ -1520,8 +1534,7 @@ async def bulk_update_spools(
     not_found = [sid for sid in payload.ids if sid not in spools]
     updated_ids: list[int] = []
     for sid, spool in spools.items():
-        for field, value in prepared.items():
-            setattr(spool, field, value)
+        _apply_spool_update(spool, prepared)
         updated_ids.append(sid)
     await db.commit()
     if updated_ids:
