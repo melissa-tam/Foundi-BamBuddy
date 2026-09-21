@@ -9,6 +9,7 @@ from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.permissions import Permission
 from backend.app.models.user import User
 from backend.app.services.local_backup import local_backup_service
+from backend.app.utils import site_time
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,6 @@ async def get_status(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_BACKUP),
 ):
     """Get local backup scheduler status and configuration."""
-    from backend.app.services.local_backup import _local_zone
-
     settings = await local_backup_service._load_settings()
     status = local_backup_service.get_status()
     return {
@@ -32,10 +31,9 @@ async def get_status(
         "retention": settings["retention"],
         "path": settings["path"],
         "default_path": str(local_backup_service._resolve_backup_dir("")),
-        # IANA zone name the HH:MM picker is interpreted in (TZ env, UTC fallback).
-        # Frontend renders this next to the time field so users see the same
-        # zone the backend will use. #1602 follow-up.
-        "timezone": str(_local_zone()),
+        # The zone the HH:MM picker is interpreted in. Frontend renders it next
+        # to the time field so users see the same zone the backend will use.
+        "timezone": site_time.site_zone_name(),
     }
 
 

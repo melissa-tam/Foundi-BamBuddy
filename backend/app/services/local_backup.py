@@ -6,45 +6,17 @@ on a configurable schedule with retention management.
 
 import asyncio
 import logging
-import os
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
 from backend.app.core.config import settings as app_settings
 from backend.app.core.database import async_session
 from backend.app.models.settings import Settings
+from backend.app.utils import site_time
 
 logger = logging.getLogger(__name__)
-
-
-def _local_zone() -> tzinfo:
-    """Resolve the local timezone for scheduled-backup HH:MM interpretation.
-
-    Uses the container's ``TZ`` env var (the same value the support package
-    surfaces); falls back to UTC when unset or unrecognised so a missing TZ
-    keeps the legacy behaviour rather than crashing. See #1602 follow-up.
-
-    On Windows the embedded Python in our installer doesn't carry an IANA
-    tz database, so ``ZoneInfo(...)`` — including ``ZoneInfo("UTC")`` —
-    raises ``ZoneInfoNotFoundError`` unless the ``tzdata`` PyPI package is
-    installed. requirements.txt now pins ``tzdata`` on win32, but to keep
-    this resilient on installs that haven't refreshed deps we fall through
-    to the stdlib ``datetime.timezone.utc`` as a last resort; it satisfies
-    every ``astimezone`` / ``str()`` call site without needing the IANA DB.
-    """
-    tz_name = os.environ.get("TZ", "").strip()
-    if tz_name:
-        try:
-            return ZoneInfo(tz_name)
-        except ZoneInfoNotFoundError:
-            logger.warning("Unrecognised TZ env value %r, scheduling in UTC", tz_name)
-    try:
-        return ZoneInfo("UTC")
-    except ZoneInfoNotFoundError:
-        return timezone.utc
 
 
 SCHEDULE_INTERVALS = {
@@ -153,9 +125,9 @@ class LocalBackupService:
         """Calculate the next scheduled run time.
 
         For hourly: next full hour (timezone-agnostic).
-        For daily/weekly: next occurrence of the configured HH:MM, interpreted
-        in the container's local timezone (TZ env var, UTC fallback). Returns
-        a UTC-aware datetime for storage / comparison against ``now``.
+        For daily/weekly: next occurrence of the configured HH:MM in the SITE
+        zone (``utils.site_time``: TZ env var, else the host's own zone).
+        Returns a UTC-aware datetime for storage / comparison against ``now``.
         """
         now_utc = datetime.now(timezone.utc)
 
@@ -172,21 +144,19 @@ class LocalBackupService:
         except (ValueError, IndexError):
             hour, minute = 3, 0
 
-        local_tz = _local_zone()
-        now_local = now_utc.astimezone(local_tz)
-        # Next occurrence of HH:MM local time, today or tomorrow.
-        # ``fold=0`` resolves the ambiguous wall-clock window at DST fall-back
-        # to the earlier instance (consistent with cron's behaviour). On the
-        # spring-forward gap the synthesized local time will normalise to the
-        # next valid instant when converted to UTC.
-        next_local = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0, fold=0)
-        if next_local <= now_local:
-            next_local += timedelta(days=1)
+        at = time(hour=hour, minute=minute)
+        # Next occurrence of HH:MM site time, today or tomorrow. Each candidate
+        # is re-resolved from its own site DATE rather than shifted by a
+        # timedelta: a run a day or a week out can sit on the far side of a DST
+        # transition, where the offset that applies at ``now`` no longer does.
+        run_date = site_time.site_today(now_utc)
+        if site_time.site_instant(run_date, at).replace(tzinfo=timezone.utc) <= now_utc:
+            run_date += timedelta(days=1)
 
         if schedule_type == "weekly":
-            next_local += timedelta(weeks=1)
+            run_date += timedelta(days=7)
 
-        return next_local.astimezone(timezone.utc)
+        return site_time.site_instant(run_date, at).replace(tzinfo=timezone.utc)
 
     def _resolve_backup_dir(self, path_setting: str) -> Path:
         """Resolve the backup output directory from settings."""
