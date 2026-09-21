@@ -397,6 +397,10 @@ const FLEET_FORMAT_TEMPLATES = [
   '{{from}} – {{to}} · {{bucket}} · {{tz}}',
   // The same header before the server has echoed its bucket choice.
   '{{from}} – {{to}} · {{tz}}',
+  // …and both again for a window that starts and ends on the same site date,
+  // which names that date once rather than either side of a dash.
+  '{{date}} · {{bucket}} · {{tz}}',
+  '{{date}} · {{tz}}',
 ];
 
 const IDENTICAL_TO_EN_ALLOWED = {

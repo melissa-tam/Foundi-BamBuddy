@@ -15,9 +15,11 @@ import {
   makeFleetOverviewDay,
   makeFleetOverviewFirstRun,
   makeFleetOverviewHour,
+  makeFleetOverviewProduction,
   makeFleetOverviewWeek,
   makeFleetStatus,
   makeFleetStatusFirstRun,
+  makeFleetStatusProduction,
   makePrinterIntervals,
 } from '../fixtures/fleetMetrics';
 
@@ -927,6 +929,104 @@ describe('StatsPage', () => {
       const dayNames = columnNames(await historyLanded());
       expect(dayNames.some((name) => /Week of/.test(name))).toBe(false);
       expect(dayNames.some((name) => /\d{2}:\d{2}/.test(name))).toBe(false);
+    });
+
+    /**
+     * PRODUCTION, as of this wave: a state recorder under an hour old beneath a
+     * forty-four-day window, with the print log and the fault ledger going back
+     * weeks. Nearly every bucket is "faults and holds only" and the newest one
+     * is barely observed.
+     *
+     * This is not an edge case — it is what every farm's Fleet tab looks like
+     * for its first month — so the whole tab is rendered in it and read for the
+     * four ways a surface lies when its data is mostly absent: a computed
+     * `NaN`, a rate divided by a zero denominator, a translation key that
+     * reached the screen as text, and a silence about the absence itself.
+     */
+    describe('the production shape — an hour of recording under a six-week window', () => {
+      beforeEach(() => {
+        server.use(
+          http.get('/api/v1/fleet-metrics/status', () =>
+            HttpResponse.json(makeFleetStatusProduction()),
+          ),
+          http.get('/api/v1/fleet-metrics/overview', () =>
+            HttpResponse.json(makeFleetOverviewProduction()),
+          ),
+        );
+      });
+
+      it('renders the whole tab with no NaN, no Infinity and no raw i18n key', async () => {
+        render(<StatsPage />);
+        await historyLanded();
+
+        const text = (document.body.textContent ?? '').replace(/\s+/g, ' ');
+        expect(text).not.toMatch(/NaN/);
+        expect(text).not.toMatch(/Infinity/);
+
+        // A dotted lowercase token standing alone in a text node is a key that
+        // never resolved — `printers.incident.service_hold` reached the screen
+        // exactly that way.
+        const rawKey = /^[a-z]+(\.[a-zA-Z_]+)+$/;
+        const leaked: string[] = [];
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+          const value = (node.textContent ?? '').trim();
+          if (value !== '' && rawKey.test(value)) leaked.push(value);
+        }
+        expect(leaked).toEqual([]);
+      });
+
+      it('says up front that most of the window has no state history', async () => {
+        render(<StatsPage />);
+        await historyLanded();
+
+        // Both dates are the site's, and they differ: the ledger reaches back
+        // six weeks while the recorder started this morning.
+        const alert = screen.getByRole('alert');
+        expect(alert).toHaveTextContent('Sep 21, 2026');
+        expect(alert).toHaveTextContent('Aug 8, 2026');
+      });
+
+      it('keeps the summary readable: units on the rates, no figure without one', async () => {
+        render(<StatsPage />);
+        await historyLanded();
+
+        const table = summaryTable();
+        const cellsOf = (name: string | RegExp): HTMLElement[] => {
+          const header = within(table).getByRole('rowheader', { name });
+          return within(header.closest('tr') as HTMLElement).getAllByRole('cell');
+        };
+        // The print log is complete for its own history, so the plain rate is
+        // a real figure — and it now says what it is a rate OF.
+        expect(cellsOf('Prints')[1].textContent).toContain(t('fleetMetrics.units.perDay'));
+      });
+
+      it('never announces "No data" beside a number it is showing', async () => {
+        render(<StatsPage />);
+        const grid = await historyLanded();
+
+        await userEvent.click(
+          screen.getByRole('tab', { name: t('fleetMetrics.matrix.lens.hoursDown') }),
+        );
+
+        const cells = [...screen.getByRole('grid').querySelectorAll('td')];
+        const withFigure = cells.filter((cell) => /\d/.test(cell.textContent ?? ''));
+
+        // Non-vacuous: the ledger proves real fault hours in the unrecorded
+        // stretch, so cells DO carry figures here…
+        expect(
+          withFigure.some((cell) =>
+            (cell.textContent ?? '').includes(t('fleetMetrics.class.incidents_only')),
+          ),
+        ).toBe(true);
+        // …and not one of them announces "No data" beside the number it shows.
+        expect(
+          withFigure.filter((cell) =>
+            (cell.textContent ?? '').includes(t('fleetMetrics.class.unobserved')),
+          ),
+        ).toHaveLength(0);
+        expect(grid).toBeInTheDocument();
+      });
     });
   });
 });

@@ -95,7 +95,7 @@ def _roster(*printer_ids: int):
     ]
 
 
-def _timeline(window, now, *, roster=(), spans=(), incidents=(), evidence=None):
+def _timeline(window, now, *, roster=(), spans=(), incidents=(), evidence=None, history_since=None):
     """Build a timeline, deriving the whole-table evidence from the spans given."""
     if evidence is None:
         facts: dict[int, list[datetime]] = {}
@@ -123,21 +123,33 @@ def _timeline(window, now, *, roster=(), spans=(), incidents=(), evidence=None):
         spans=list(spans),
         incidents=list(incidents),
         evidence=list(evidence),
+        history_since=history_since,
     )
 
 
 def _assert_identities(timeline, totals, fleet, matrix, recovery):
-    """Every identity in the module docstring, checked against one built window."""
+    """Every identity in the module docstring, checked against one built window.
+
+    The state identities are asserted INSIDE THE OBSERVED MASK, which is where the
+    figures are measured: the mask's length per bucket is ``observed_seconds``, and the
+    clipped class seconds are what the averages divide by it. An ``incidents_only``
+    bucket measures nothing, so it is checked for what it must WITHHOLD instead.
+    """
     known = timeline.printers_known
     for index, bucket in enumerate(fleet.buckets):
-        cell = totals.fleet[index]
-        elapsed = bucket.elapsed_seconds
+        masked = totals.fleet_masked[index]
+        observed = bucket.observed_seconds
         values = bucket.values
 
-        # (a) every printer-second of the bucket is classified, exactly once.
-        assert sum(cell.values()) == pytest.approx(known * elapsed)
-        if elapsed > 0:
+        if observed > 0:
+            # (a) inside the mask every known printer accounts for exactly |M| seconds
+            # across all classes — including printers that had no span of their own
+            # there, which read as unobserved.
+            assert sum(masked.values()) == pytest.approx(known * observed)
             assert sum(values.avg_by_group.values()) == pytest.approx(float(known))
+            for printer in timeline.printers:
+                own = sum(totals.per_printer_masked[printer.printer_id][index].values())
+                assert own == pytest.approx(observed), printer.printer_id
             # (b) in-fleet is the roster less the two "not counted" groups.
             assert values.printers_in_fleet == pytest.approx(
                 known
@@ -146,19 +158,25 @@ def _assert_identities(timeline, totals, fleet, matrix, recovery):
             )
             # (c) the causes account for all of down.
             assert sum(values.avg_down_by_cause.values()) == pytest.approx(values.avg_down)
-            # (d) ...and so do the printers, one by one.
+            # (d) ...and so do the printers, one by one, over the same mask.
             per_printer = sum(
                 seconds
                 for printer in timeline.printers
-                for klass, seconds in totals.per_printer[printer.printer_id][index].items()
+                for klass, seconds in totals.per_printer_masked[printer.printer_id][index].items()
                 if klass.is_down
             )
-            assert per_printer / elapsed == pytest.approx(values.avg_down)
+            assert per_printer / observed == pytest.approx(values.avg_down)
             # (f) an average can never exceed the peak, nor the peak the fleet.
             assert values.avg_down <= values.peak_down + 1e-9
+        elif bucket.elapsed_seconds > 0:
+            # An unwatched bucket reports the ledger and nothing else.
+            assert values.uptime is None
+            assert values.time_printing is None
+            assert set(values.avg_by_group) <= {GROUP_DOWN, GROUP_PLANNED}
         assert values.peak_down <= known
 
-    # (h) one printer's intervals sum, per class, to its own matrix cell.
+    # (h) one printer's intervals sum, per class, to its own MATRIX cell — the full
+    # elapsed fold, ledger included, which is the matrix's own coverage.
     for printer in timeline.printers:
         by_key: dict[str, float] = {}
         for interval in printer.intervals:
@@ -174,6 +192,16 @@ def _assert_identities(timeline, totals, fleet, matrix, recovery):
         seconds for cell in totals.fleet for klass, seconds in cell.items() if fault_kind_of(klass) is not None
     )
     assert fault_seconds <= recovery.fault_open_seconds + 1e-6
+
+    # (e) the window totals are the SUMS re-divided, never an average of averages.
+    if timeline.total.observed_seconds > 0:
+        assert sum(totals.fleet_masked_window.values()) == pytest.approx(known * timeline.total.observed_seconds)
+        assert sum(fleet.totals.avg_by_group.values()) == pytest.approx(float(known))
+        for group, average in fleet.totals.avg_by_group.items():
+            summed = sum(
+                seconds for cell in totals.fleet_masked for klass, seconds in cell.items() if klass.group == group
+            )
+            assert average == pytest.approx(summed / timeline.total.observed_seconds)
 
 
 class TestIdentitiesOnAHandBuiltFleet:
@@ -307,6 +335,11 @@ class TestIdentitiesOnASeededFleet:
         timeline = _timeline(window, now, roster=_roster(1, 2, 3, 4, 5), spans=spans, incidents=incidents)
         totals = projections.class_totals(timeline)
         tally = projections.print_tally(timeline, [])
+        # The scenario is only worth running if it actually produces partly-observed
+        # buckets — otherwise the mask rule is never exercised and the identities pass
+        # for the wrong reason.
+        partial = [h for h in timeline.headers if 0 < h.observed_seconds < h.elapsed_seconds]
+        assert partial, "seed produced no partly-observed bucket"
         _assert_identities(
             timeline,
             totals,
@@ -526,17 +559,34 @@ class TestThroughputAndUnits:
         assert series.totals.success_pct == pytest.approx(2 / 3)
         assert all(bucket.basis is None for bucket in series.buckets)
 
-    def test_the_per_printer_rate_uses_in_service_time_and_nulls_before_recording(self):
+    def test_prints_per_day_divides_by_elapsed_days_whatever_the_recorder_saw(self):
+        # The print log is complete for its own history, so this rate never asks the
+        # recorder anything: two days elapsed, one completed print, half a print a day.
         window, timeline, totals = self._window()
         rows = [projections.PrintLogRow(created_at=SEP1 + HOUR, status="completed", printer_id=1)]
         series = projections.throughput(totals, projections.print_tally(timeline, rows))
-        # Printer 2 has no record at all, so only printer 1's two days are in service.
-        assert series.totals.prints_per_printer_per_day == pytest.approx(0.5)
         assert series.totals.prints_per_day == pytest.approx(0.5)
 
+    def test_the_per_printer_rate_divides_by_measured_printers_times_elapsed_days(self):
+        # Printer 1 is observed for the whole window and printer 2 never, so inside the
+        # mask the fleet measures ONE printer: 1 print / (1 printer x 2 days).
+        window, timeline, totals = self._window()
+        rows = [projections.PrintLogRow(created_at=SEP1 + HOUR, status="completed", printer_id=1)]
+        series = projections.throughput(totals, projections.print_tally(timeline, rows))
+        assert totals.printers_in_fleet_window == pytest.approx(1.0)
+        assert series.totals.prints_per_printer_per_day == pytest.approx(0.5)
+
+    def test_the_per_printer_rate_is_null_where_no_fleet_size_was_measured(self):
+        # Prints happened; nothing measured how many printers there were to divide them
+        # among. "We cannot say" is not "none", and it is certainly not the roster.
+        window = build_window(date(2026, 9, 1), date(2026, 9, 2), "day", NY)
         bare = _timeline(window, window.end, roster=_roster(1, 2))
-        empty = projections.throughput(projections.class_totals(bare), projections.print_tally(bare, rows))
-        assert empty.totals.prints_per_printer_per_day is None
+        rows = [projections.PrintLogRow(created_at=SEP1 + HOUR, status="completed", printer_id=1)]
+        series = projections.throughput(projections.class_totals(bare), projections.print_tally(bare, rows))
+        assert series.totals.prints_per_printer_per_day is None
+        assert all(bucket.values.prints_per_printer_per_day is None for bucket in series.buckets)
+        # ...while the complete-data rate still answers.
+        assert series.totals.prints_per_day == pytest.approx(0.5)
 
     def test_units_are_plates_times_the_skus_units_per_plate(self):
         window, timeline, totals = self._window()
@@ -619,13 +669,16 @@ class TestCycleEpisodes:
 class TestTheSummaryCard:
     """The card reads the series' own numbers, and compares like with like."""
 
-    def _inputs(self, date_from: date, date_to: date, *, spans, now):
+    def _inputs(self, date_from: date, date_to: date, *, spans, now, prints=(), prints_since=None):
         window = build_window(date_from, date_to, "day", NY)
         timeline = _timeline(window, now, roster=_roster(1, 2), spans=spans)
         totals = projections.class_totals(timeline)
-        tally = projections.print_tally(timeline, [])
+        tally = projections.print_tally(timeline, list(prints))
         return projections.SummaryInputs(
-            fleet=projections.fleet_series(totals), prints=projections.throughput(totals, tally)
+            fleet=projections.fleet_series(totals),
+            prints=projections.throughput(totals, tally),
+            window_end=window.end,
+            prints_since=prints_since,
         )
 
     def test_the_figure_and_the_sparkline_are_the_series_own_numbers(self):
@@ -654,8 +707,95 @@ class TestTheSummaryCard:
         assert earlier.observed is False
         for key in _STATE_ROW_KEYS:
             assert rows[key].previous is None, key
-        # A print row still compares: the print log was complete before recording began.
-        assert rows[projections.ROW_PRINTS_PER_DAY].previous == 0.0
+        # ...and with an EMPTY print log there is nothing on the print side either, so
+        # that row is withheld too rather than compared against a period with no record.
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous is None
+
+    def test_a_previous_window_before_the_first_print_is_not_compared(self):
+        """The reported defect: "vs previous +129" against a period with no record.
+
+        The previous window ends before the print log's first row, so there is no print
+        data there to be zero. Reporting 0 made the page render a rise against a period
+        that does not exist — every state row correctly showed a dash beside it.
+        """
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        prints = [projections.PrintLogRow(created_at=SEP1 + HOUR, status="completed", printer_id=1)]
+        first_print = SEP1 + HOUR
+        current = self._inputs(
+            date(2026, 9, 1),
+            date(2026, 9, 2),
+            spans=spans,
+            now=SEP1 + 48 * HOUR,
+            prints=prints,
+            prints_since=first_print,
+        )
+        earlier = self._inputs(
+            date(2026, 8, 30),
+            date(2026, 8, 31),
+            spans=[],
+            now=SEP1 + 48 * HOUR,
+            prints_since=first_print,
+        )
+        assert earlier.prints_comparable is False
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous is None
+        assert rows[projections.ROW_PRINTS_PER_PRINTER_PER_DAY].previous is None
+        # The current figure is untouched — this rule is about the comparison only.
+        assert rows[projections.ROW_PRINTS_PER_DAY].figure == pytest.approx(0.5)
+
+    def test_a_previous_window_that_straddles_the_first_print_is_compared(self):
+        # The log is complete from its first row on, so a window reaching that instant
+        # compares honestly — and a zero there IS a measurement.
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        # The first print lands inside the PREVIOUS window (2026-08-30..08-31).
+        first_print = datetime(2026, 8, 31, 12, 0, 0)
+        current = self._inputs(
+            date(2026, 9, 1), date(2026, 9, 2), spans=spans, now=SEP1 + 48 * HOUR, prints_since=first_print
+        )
+        earlier = self._inputs(
+            date(2026, 8, 30),
+            date(2026, 8, 31),
+            spans=[],
+            now=SEP1 + 48 * HOUR,
+            prints=[projections.PrintLogRow(created_at=first_print, status="completed", printer_id=1)],
+            prints_since=first_print,
+        )
+        assert earlier.prints_comparable is True
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous == pytest.approx(0.5)
+
+    def test_an_empty_print_log_is_never_compared(self):
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        current = self._inputs(date(2026, 9, 1), date(2026, 9, 2), spans=spans, now=SEP1 + 48 * HOUR)
+        earlier = self._inputs(date(2026, 8, 30), date(2026, 8, 31), spans=[], now=SEP1 + 48 * HOUR)
+        assert earlier.prints_comparable is False
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous is None
+
+    def test_the_state_rows_keep_their_own_rule(self):
+        # A window the RECORDER never covered withholds its state rows even when the
+        # print log reaches right through it: the two records are bounded separately.
+        spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
+        first_print = datetime(2026, 8, 1, 0, 0, 0)
+        current = self._inputs(
+            date(2026, 9, 1), date(2026, 9, 2), spans=spans, now=SEP1 + 48 * HOUR, prints_since=first_print
+        )
+        earlier = self._inputs(
+            date(2026, 8, 30),
+            date(2026, 8, 31),
+            spans=[],
+            now=SEP1 + 48 * HOUR,
+            prints=[
+                projections.PrintLogRow(created_at=datetime(2026, 8, 30, 6, 0, 0), status="completed", printer_id=1)
+            ],
+            prints_since=first_print,
+        )
+        rows = {row.key: row for row in projections.compose_summary(current, earlier).rows}
+        assert earlier.observed is False
+        assert earlier.prints_comparable is True
+        for key in _STATE_ROW_KEYS:
+            assert rows[key].previous is None, key
+        assert rows[projections.ROW_PRINTS_PER_DAY].previous == pytest.approx(0.5)
 
     def test_every_row_appears_once_in_the_cards_reading_order(self):
         spans = [_span(1, SEP1, SEP1 + 48 * HOUR)]
@@ -676,3 +816,175 @@ class TestTheSummaryCard:
             projections.ROW_UPTIME,
             projections.ROW_TIME_PRINTING,
         ]
+
+
+class TestTheProductionShape:
+    """The farm on the day the recorder shipped: 44 days of ledger, 45 minutes of spans.
+
+    This is the arrangement that exposed both arithmetic rules in production, and it is
+    the shape every farm passes through exactly once — so it is pinned rather than
+    remembered. Twelve printers have been printing and failing for 44 days, all of it
+    in the print log and the incident ledger; the observation recorder started 45
+    minutes ago and has seen 8 printing, 1 cooling and 3 offline.
+
+    Dividing state figures by elapsed time reported that farm as ``printers_in_fleet
+    = 1.29`` and ``avg_printing = 0.04``. Every identity held. The headline lied.
+    """
+
+    DAYS = 44
+    PRINTERS = 12
+    PRINTING = 8
+    COOLING = 1
+    DOWN = 3
+    MASK = timedelta(minutes=45)
+
+    @pytest.fixture
+    def built(self):
+        date_to = date(2026, 9, 13)
+        date_from = date_to - timedelta(days=self.DAYS - 1)
+        window = build_window(date_from, date_to, "day", NY)
+        # ``now`` is the end of the last site day, so its elapsed time is a whole day
+        # and the window is exactly 44 days — the recorder is still 45 minutes old.
+        now = window.end
+        mask_start = now - self.MASK
+
+        spans = []
+        for printer_id in range(1, self.PRINTERS + 1):
+            if printer_id <= self.PRINTING:
+                shape = {"gcode_state": "RUNNING"}
+            elif printer_id <= self.PRINTING + self.COOLING:
+                shape = {"gcode_state": "FINISH", "plate_phase": PLATE_PHASE_COOLING}
+            else:
+                shape = {"connected": False, "gcode_state": None}
+            spans.append(_span(printer_id, mask_start, None, last=now, **shape))
+
+        # The ledger: two full-day outages on days 5 and 6, deliberately NOT overlapping,
+        # so the window's peak is today's three offline printers and every summary row's
+        # figure can be compared with its own last series point.
+        day_five = window.grid.buckets[5].start
+        day_six = window.grid.buckets[6].start
+        incidents = [
+            IncidentRow(id=1, printer_id=1, kind=KIND_JAM, created_at=day_five, resolved_at=day_five + DAY),
+            IncidentRow(id=2, printer_id=2, kind=KIND_JAM, created_at=day_six, resolved_at=day_six + DAY),
+        ]
+        # One completed print per printer per day, for all 44 days.
+        prints = [
+            projections.PrintLogRow(created_at=edge.start + 6 * HOUR, status="completed", printer_id=printer_id)
+            for edge in window.grid.buckets
+            for printer_id in range(1, self.PRINTERS + 1)
+        ]
+        timeline = _timeline(
+            window,
+            now,
+            roster=_roster(*range(1, self.PRINTERS + 1)),
+            spans=spans,
+            incidents=incidents,
+            history_since=day_five,
+        )
+        totals = projections.class_totals(timeline)
+        tally = projections.print_tally(timeline, prints)
+        fleet = projections.fleet_series(totals)
+        prints_series = projections.throughput(totals, tally)
+        return {
+            "window": window,
+            "timeline": timeline,
+            "totals": totals,
+            "fleet": fleet,
+            "prints": prints_series,
+            "matrix": projections.matrix(totals, tally),
+            "summary": projections.compose_summary(projections.SummaryInputs(fleet=fleet, prints=prints_series), None),
+        }
+
+    def test_today_reads_the_fleet_that_is_actually_there(self, built):
+        today = built["fleet"].buckets[-1]
+        assert today.basis == "observed"
+        assert today.observed_seconds == self.MASK.total_seconds()
+        assert today.elapsed_seconds == 86400.0
+        # THE headline: eight printers are printing, and the page says eight.
+        assert today.values.avg_by_group["printing"] == pytest.approx(float(self.PRINTING))
+        assert today.values.avg_by_group["cycle_overhead"] == pytest.approx(float(self.COOLING))
+        assert today.values.avg_down == pytest.approx(float(self.DOWN))
+        assert sum(today.values.avg_by_group.values()) == pytest.approx(float(self.PRINTERS))
+        assert today.values.printers_in_fleet == pytest.approx(float(self.PRINTERS))
+
+    def test_the_window_reports_twelve_printers_not_one(self, built):
+        # The production bug, exactly: 44 days of unwatched time diluted the fleet to
+        # 1.29 printers. Measured inside the mask, the window IS the 45 minutes that
+        # were measured, and it says twelve.
+        assert built["fleet"].totals.printers_in_fleet == pytest.approx(float(self.PRINTERS))
+        assert built["fleet"].totals.avg_by_group["printing"] == pytest.approx(float(self.PRINTING))
+        assert built["timeline"].total.observed_seconds == self.MASK.total_seconds()
+
+    def test_the_ratios_come_from_the_observed_45_minutes_only(self, built):
+        today = built["fleet"].buckets[-1].values
+        # scheduled = 12 printers x the mask; nothing is out of fleet, unobserved or
+        # held inside it, so uptime is the three offline machines and nothing else.
+        assert today.time_printing == pytest.approx(self.PRINTING / self.PRINTERS)
+        assert today.uptime == pytest.approx((self.PRINTERS - self.DOWN) / self.PRINTERS)
+        assert built["fleet"].totals.uptime == pytest.approx(today.uptime)
+
+    def test_the_earlier_days_report_the_ledger_and_withhold_the_rest(self, built):
+        buckets = built["fleet"].buckets
+        for bucket in buckets[:-1]:
+            assert bucket.basis == "incidents_only"
+            assert bucket.values.uptime is None
+            assert bucket.values.time_printing is None
+            assert set(bucket.values.avg_by_group) <= {"down", "planned"}
+        # ...and the two full-day outages are intact, at one whole printer each.
+        assert buckets[5].values.avg_down_by_cause == {f"fault:{KIND_JAM}": pytest.approx(1.0)}
+        assert buckets[6].values.avg_down_by_cause == {f"fault:{KIND_JAM}": pytest.approx(1.0)}
+        assert buckets[4].values.avg_by_group == {}
+
+    def test_per_printer_prints_per_day_is_completed_over_the_elapsed_days(self, built):
+        # 44 completed prints over 44 elapsed days. The old rule divided by "printer-days
+        # in service", which only the 45-minute-old recorder could see, and answered 48.
+        row = next(row for row in built["matrix"].printers if row.printer_id == 1)
+        assert row.prints_per_day == pytest.approx(1.0)
+        assert built["timeline"].total.elapsed_seconds == self.DAYS * 86400.0
+
+    def test_per_printer_hours_down_per_day_ignores_days_with_no_record(self, built):
+        # The farm's downtime record begins with the first incident, on day 5 — the
+        # print log reaches further back, but no span and no incident does, so nothing
+        # could have been known about days 0-4. They are excluded from the denominator
+        # rather than counted as days the printer was fine: a rate that divided 24 h of
+        # outage by 44 days would report a machine that lost a whole day as healthier
+        # than one that lost the same day inside the recorded period.
+        row = next(row for row in built["matrix"].printers if row.printer_id == 1)
+        with_history = self.DAYS - 5
+        assert built["totals"].history_elapsed_seconds == with_history * 86400.0
+        assert row.hours_down_per_day == pytest.approx(24.0 / with_history)
+        # The complete-data rate is unaffected: it divides by every elapsed day.
+        assert row.prints_per_day == pytest.approx(1.0)
+
+    def test_the_per_printer_rate_is_a_believable_number(self, built):
+        # 12 prints completed in the one observed bucket, 12 printers measured in it.
+        totals = built["prints"].totals
+        assert totals.prints_per_day == pytest.approx(float(self.PRINTERS))
+        assert totals.prints_per_printer_per_day == pytest.approx(1.0)
+        # The order check the production number failed: 22.8 per printer per day beside
+        # a fleet rate of 12 a day is arithmetically impossible on twelve machines.
+        assert totals.prints_per_printer_per_day == pytest.approx(totals.prints_per_day / self.PRINTERS)
+        assert all(bucket.values.prints_per_printer_per_day is None for bucket in built["prints"].buckets[:-1])
+
+    def test_the_summary_shows_today_and_nothing_before_it(self, built):
+        rows = {row.key: row for row in built["summary"].rows}
+        for key in _STATE_ROW_KEYS:
+            row = rows[key]
+            assert all(value is None for value in row.series[:-1]), key
+            assert row.series[-1] is not None, key
+            # Only one bucket was observed, so the window figure IS that bucket's.
+            assert row.figure == pytest.approx(row.series[-1]), key
+        assert rows[projections.ROW_AVG_PRINTING].figure == pytest.approx(float(self.PRINTING))
+        assert rows[projections.ROW_PRINTERS_IN_FLEET].figure == pytest.approx(float(self.PRINTERS))
+        # The print rows are never withheld — the log is complete for its own history.
+        assert rows[projections.ROW_PRINTS_PER_DAY].figure == pytest.approx(float(self.PRINTERS))
+        assert all(value is not None for value in rows[projections.ROW_PRINTS_PER_DAY].series)
+
+    def test_the_matrix_still_sees_the_whole_ledger(self, built):
+        # Rule C: the matrix keeps the FULL elapsed bucket with ledger evidence, so the
+        # outage on day 5 is visible in printer 1's cell even though no recorder existed
+        # then — the opposite coverage from the averages above, deliberately.
+        cell = built["matrix"].series.buckets[5].values.printers[1]
+        assert cell.basis == "incidents_only"
+        assert cell.class_seconds[f"down:fault:{KIND_JAM}"] == pytest.approx(86400.0)
+        assert cell.down_seconds == pytest.approx(86400.0)

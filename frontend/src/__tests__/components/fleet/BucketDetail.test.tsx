@@ -38,14 +38,25 @@ const naive = (ms: number): string => new Date(ms).toISOString().slice(0, 19);
 
 interface RenderOptions {
   bucketWidth?: FleetBucket;
-  /** Which bucket of the window to open. Defaults to the last complete one. */
+  /** Which bucket of the window to open. Defaults to the canned day's own. */
   bucketIndex?: number;
 }
+
+/**
+ * The bucket whose span IS the day `makePrinterIntervals` answers for.
+ *
+ * It has to be named now that BOTH lists are filtered to the bucket. The canned
+ * response covers the site day 2026-09-19, i.e. naive UTC 2026-09-18T12:00 to
+ * 2026-09-19T12:00 at the fixtures' +12 — bucket 4 of the seven-day window.
+ * Opening a different bucket against it used to "pass" only because a day
+ * bucket listed whatever the endpoint returned, which is the defect.
+ */
+const CANNED_DAY_BUCKET = 4;
 
 function renderDetail({ bucketWidth = 'day', bucketIndex }: RenderOptions = {}) {
   const overview = makeFleetOverview({ bucket: bucketWidth });
   const buckets = overview.matrix.series.buckets;
-  const index = bucketIndex ?? buckets.length - 2;
+  const index = bucketIndex ?? (bucketWidth === 'day' ? CANNED_DAY_BUCKET : buckets.length - 2);
   const seriesBucket = buckets[index]!;
   const printer = overview.matrix.printers.find((row) => row.printer_id === PROBLEM_PRINTER_ID)!;
 
@@ -240,6 +251,74 @@ describe('BucketDetail', () => {
 
     expect(await screen.findByText(t('fleetMetrics.detail.noIntervals'))).toBeInTheDocument();
     expect(screen.getByText(t('fleetMetrics.detail.noIncidents'))).toBeInTheDocument();
+  });
+
+  describe('the incident list', () => {
+    it('lists only the incidents that overlap the bucket', async () => {
+      // Production: a 16:00–17:00 hour listed an incident that ran 19:18 the
+      // previous day to 00:37 — the intervals were filtered to the bucket and
+      // the incidents were not, so the dialog reported a fault from an hour the
+      // reader had not asked about.
+      const overview = makeFleetOverview({ bucket: 'hour' });
+      const seriesBucket = overview.matrix.series.buckets[5]!;
+      const startMs = Date.parse(`${seriesBucket.start}Z`);
+      const inside = {
+        incident_id: 11,
+        kind: 'jam' as const,
+        created_at: naive(startMs + 600_000),
+        resolved_at: naive(startMs + 1_800_000),
+      };
+      const elsewhere = {
+        incident_id: 12,
+        kind: 'runout' as const,
+        created_at: naive(startMs - 30 * 3_600_000),
+        resolved_at: naive(startMs - 16 * 3_600_000),
+      };
+      captureIntervals({ intervals: [], incidents: [elsewhere, inside] });
+
+      const printer = overview.matrix.printers.find((row) => row.printer_id === PROBLEM_PRINTER_ID)!;
+      render(
+        <BucketDetail
+          printer={printer}
+          cell={seriesBucket.values.printers[String(PROBLEM_PRINTER_ID)]}
+          seriesBucket={seriesBucket}
+          bucketWidth="hour"
+          tzName={overview.tz_name}
+          onClose={() => {}}
+        />,
+      );
+
+      await loaded();
+      const list = region(t('fleetMetrics.detail.incidents'));
+      expect(within(list).getAllByRole('listitem')).toHaveLength(1);
+      expect(within(list).getByText(t('printers.incident.jam'))).toBeInTheDocument();
+      expect(within(list).queryByText(t('printers.incident.runout'))).not.toBeInTheDocument();
+    });
+
+    it('names a declared service hold as maintenance, never as a raw key', () => {
+      // `printers.incident.service_hold` is a leaf nobody wrote — the declared
+      // kind is not a fault — so building the key here printed it on screen.
+      expect(t('fleetMetrics.class.planned')).not.toMatch(/^printers\./);
+    });
+
+    it('renders the maintenance label for a service hold in the list', async () => {
+      captureIntervals({
+        incidents: [
+          {
+            incident_id: 9,
+            kind: 'service_hold',
+            created_at: '2026-09-18T19:03:25',
+            resolved_at: '2026-09-19T03:03:25',
+          },
+        ],
+      });
+      renderDetail();
+      await loaded();
+
+      const list = region(t('fleetMetrics.detail.incidents'));
+      expect(within(list).getByText(t('fleetMetrics.class.planned'))).toBeInTheDocument();
+      expect(within(list).queryByText(/^printers\.incident\./)).not.toBeInTheDocument();
+    });
   });
 });
 

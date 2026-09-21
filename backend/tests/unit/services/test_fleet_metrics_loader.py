@@ -370,6 +370,41 @@ class TestStraddlingSpans:
         assert result.fleet_series.buckets[0].values.avg_down_by_cause["offline"] == pytest.approx(0.5)
 
 
+class TestThePreviousWindowComparison:
+    """A print row is compared only where the print log has evidence on both sides.
+
+    The rule itself is pinned over hand-built inputs in ``test_fleet_metrics_series``;
+    what these two cases pin is that the LOADER resolves the print log's first instant
+    and hands it to the rule. Without that the rule would be fed ``None`` for ever and
+    would withhold every comparison — green unit tests, a permanently blank column.
+    """
+
+    async def test_a_previous_window_straddling_the_first_print_is_compared(self, db_session):
+        # The seed's first print is at SEP1 + 2 h, inside the previous window below.
+        await _seed(db_session)
+        result = await loader.overview(db_session, date_from=date(2026, 9, 2), date_to=date(2026, 9, 2), now=NOW, tz=NY)
+        row = next(row for row in result.summary.rows if row.key == loader.projections.ROW_PRINTS_PER_DAY)
+        assert row.figure is not None
+        assert row.previous is not None
+
+    async def test_a_previous_window_before_the_first_print_is_not_compared(self, db_session):
+        # Previous window = 2026-08-31, which ends before any print exists.
+        await _seed(db_session)
+        result = await loader.overview(db_session, date_from=date(2026, 9, 1), date_to=date(2026, 9, 1), now=NOW, tz=NY)
+        rows = {row.key: row for row in result.summary.rows}
+        assert rows[loader.projections.ROW_PRINTS_PER_DAY].figure is not None
+        assert rows[loader.projections.ROW_PRINTS_PER_DAY].previous is None
+        assert rows[loader.projections.ROW_PRINTS_PER_PRINTER_PER_DAY].previous is None
+
+    async def test_an_empty_print_log_is_never_compared(self, db_session):
+        printer = await _printer(db_session, "006-H2S")
+        await _span(db_session, printer.id, SEP1, NOW)
+        await db_session.commit()
+        result = await loader.overview(db_session, date_from=date(2026, 9, 2), date_to=date(2026, 9, 2), now=NOW, tz=NY)
+        row = next(row for row in result.summary.rows if row.key == loader.projections.ROW_PRINTS_PER_DAY)
+        assert row.previous is None
+
+
 class TestValidation:
     async def test_a_backwards_window_is_refused(self, db_session):
         with pytest.raises(loader.InvalidWindow):

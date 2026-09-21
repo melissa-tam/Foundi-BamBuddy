@@ -18,8 +18,10 @@ import {
   FIXTURE_TZ_NAME,
   makeFleetOverviewDay,
   makeFleetOverviewFirstRun,
+  makeFleetOverviewProduction,
   makeFleetStatus,
   makeFleetStatusFirstRun,
+  makeFleetStatusProduction,
 } from '../../fixtures/fleetMetrics';
 import type { TimeframeState } from '../../../utils/timeframe';
 
@@ -119,7 +121,71 @@ describe('FleetTab', () => {
         within(summaryTable())
           .getAllByRole('rowheader')
           .map((header) => header.textContent),
-      ).toEqual(['Prints', 'Prints per printer']);
+      ).toEqual(['Prints']);
+    });
+  });
+
+  describe('the recording notice', () => {
+    /**
+     * PRODUCTION, as of this wave: the recorder is an hour old and the window
+     * is six weeks deep. The notice used to fire only when NOTHING had ever
+     * been observed, so in the one state it was written for it said nothing.
+     */
+    it('fires when the window starts before the recorder did', async () => {
+      server.use(
+        http.get('/api/v1/fleet-metrics/status', () =>
+          HttpResponse.json(makeFleetStatusProduction()),
+        ),
+        http.get('/api/v1/fleet-metrics/overview', () =>
+          HttpResponse.json(makeFleetOverviewProduction()),
+        ),
+      );
+
+      render(<FleetTab timeframe={preset('last-90')} />);
+
+      const alert = await screen.findByRole('alert');
+      // The dates are the SITE's, through the util's own formatters.
+      expect(alert).toHaveTextContent('Sep 21, 2026');
+      expect(alert).toHaveTextContent('Aug 8, 2026');
+    });
+
+    it('fires when nothing has ever been recorded', async () => {
+      server.use(
+        http.get('/api/v1/fleet-metrics/status', () => HttpResponse.json(makeFleetStatusFirstRun())),
+      );
+
+      render(<FleetTab timeframe={preset('last-30')} />);
+
+      expect(await screen.findByRole('alert')).toBeInTheDocument();
+    });
+
+    it('stays silent when the window starts after the recorder did', async () => {
+      // The default status records from 2026-09-01; "today" resolves to the
+      // site's 21st, which is well inside recorded history.
+      render(<FleetTab timeframe={preset('today')} />);
+
+      await waitFor(() => expect(screen.getByRole('grid')).toBeInTheDocument());
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('holds the place of the summary card while /status is still in flight', async () => {
+      server.use(
+        http.get('/api/v1/fleet-metrics/status', () =>
+          HttpResponse.json(makeFleetStatusProduction()),
+        ),
+      );
+
+      const { container } = render(<FleetTab timeframe={preset('last-90')} />);
+
+      // The notice's slot is the tab's first child BEFORE the answer lands and
+      // the same element after, so the card below it never moves: only the
+      // slot's contents arrive late.
+      const slotBefore = container.firstElementChild?.firstElementChild;
+      expect(slotBefore).not.toBeNull();
+      expect(slotBefore?.children).toHaveLength(0);
+
+      const alert = await screen.findByRole('alert');
+      expect(slotBefore?.contains(alert)).toBe(true);
     });
   });
 

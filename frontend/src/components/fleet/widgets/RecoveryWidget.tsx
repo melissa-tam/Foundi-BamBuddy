@@ -43,6 +43,7 @@ import {
   recoveryKinds,
   recoveryRows,
   recoveryTotals,
+  type Nullable,
   type RecoveryRowValues,
 } from './rows';
 import type { FleetOverview } from '../../../types/fleetMetrics';
@@ -99,16 +100,20 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
     textColor: incidentKindTextColor(kind),
   }));
 
-  const columns: ChartDataColumn<RecoveryRowValues>[] = [
+  /** A count, or a dash where the bucket has not happened. */
+  const count = (value: number | null | undefined): string =>
+    value === null || value === undefined ? NO_VALUE : formatCount(value, locale);
+
+  const columns: ChartDataColumn<Nullable<RecoveryRowValues>>[] = [
     ...kinds.map((kind) => ({
       key: kind,
       header: t(incidentKindLabelKey(kind)),
-      format: (values: RecoveryRowValues) => formatCount(values[kind] ?? 0, locale),
+      format: (values: Nullable<RecoveryRowValues>) => count(values[kind]),
     })),
     {
       key: 'opened',
       header: t('fleetMetrics.widgets.opened'),
-      format: (values: RecoveryRowValues) => formatCount(values.opened, locale),
+      format: (values: Nullable<RecoveryRowValues>) => count(values.opened),
     },
   ];
 
@@ -199,7 +204,7 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
         </ResponsiveContainer>
       }
       table={
-        <ChartDataTable<RecoveryRowValues>
+        <ChartDataTable<Nullable<RecoveryRowValues>>
           caption={t('fleetMetrics.sections.recovery')}
           rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}

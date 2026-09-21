@@ -18,10 +18,13 @@ import i18n from '../../../i18n';
 import {
   DEACTIVATED_PRINTER_ID,
   HEALTHY_PRINTER_ID,
+  TODAY_FUTURE_HOURS,
   makeFleetOverview,
   makeFleetOverviewFirstRun,
+  makeFleetOverviewTodayHours,
 } from '../../fixtures/fleetMetrics';
 import { FleetWidgets } from '../../../components/fleet/FleetWidgets';
+import { isolatedDot } from '../../../components/fleet/widgets/chartMarks';
 import { CoolingAndEjectWidget } from '../../../components/fleet/widgets/CoolingAndEjectWidget';
 import { DowntimeByCauseWidget } from '../../../components/fleet/widgets/DowntimeByCauseWidget';
 import { PrintsPerDayWidget } from '../../../components/fleet/widgets/PrintsPerDayWidget';
@@ -57,8 +60,28 @@ const SECTION_KEYS = [
   'fleetMetrics.sections.partsBySku',
 ];
 
-const showData = () => i18n.t('fleetMetrics.widgets.showData');
-const showChart = () => i18n.t('fleetMetrics.widgets.showChart');
+/**
+ * The switch's ACCESSIBLE name now carries the chart's own title, because six
+ * controls called "Show data" in one grid are six identical entries in a
+ * screen reader's control list. Tests that render ONE widget match any of
+ * them; the distinctness of the six is pinned on its own below.
+ *
+ * Built from the leaf, so a copy edit moves the matcher with it.
+ */
+function switchPattern(key: string): RegExp {
+  const MARK = '\u0000';
+  const escaped = (i18n.t(key, { chart: MARK }) as string)
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(MARK, '.+');
+  return new RegExp(`^${escaped}$`);
+}
+
+const showData = (): RegExp => switchPattern('fleetMetrics.widgets.showDataFor');
+const showChart = (): RegExp => switchPattern('fleetMetrics.widgets.showChartFor');
+
+/** The switch of one NAMED chart. */
+const showDataFor = (sectionKey: string): string =>
+  i18n.t('fleetMetrics.widgets.showDataFor', { chart: i18n.t(sectionKey) }) as string;
 
 describe('FleetWidgets — the grid', () => {
   it('mounts all six widgets, in the laid-out order', () => {
@@ -92,6 +115,42 @@ describe('FleetWidgets — the grid', () => {
 
     const switches = screen.getAllByRole('button', { name: showData() });
     expect(switches).toHaveLength(SECTION_KEYS.length);
+  });
+
+  it('gives each of the six switches a name that tells it from the other five', () => {
+    // They were six controls called "Show data", in a list with nothing to tell
+    // them apart and no heading between them.
+    render(<FleetWidgets overview={overview} />);
+
+    const names = screen
+      .getAllByRole('button', { name: showData() })
+      .map((control) => control.getAttribute('aria-label') ?? '');
+    expect(new Set(names).size).toBe(SECTION_KEYS.length);
+    // …and each one names its OWN chart, not just any distinct string.
+    for (const key of SECTION_KEYS) {
+      expect(
+        screen.getByRole('button', { name: showDataFor(key) }),
+        `${key} has its own switch`,
+      ).toBeInTheDocument();
+    }
+    // The visible text stays short — the card's title is right above it.
+    for (const control of screen.getAllByRole('button', { name: showData() })) {
+      expect(control.textContent).toBe(i18n.t('fleetMetrics.widgets.showData'));
+    }
+  });
+
+  it('renames the switch for its own chart once the table is up', async () => {
+    const user = userEvent.setup();
+    render(<FleetWidgets overview={overview} />);
+
+    const key = 'fleetMetrics.sections.printsPerDay';
+    await user.click(screen.getByRole('button', { name: showDataFor(key) }));
+
+    expect(
+      screen.getByRole('button', {
+        name: i18n.t('fleetMetrics.widgets.showChartFor', { chart: i18n.t(key) }),
+      }),
+    ).toBeInTheDocument();
   });
 
   it('signals the switch state through its LABEL alone, never a second time', () => {
@@ -358,5 +417,72 @@ describe('empty states', () => {
       .filter((node) => node.textContent === i18n.t('fleetMetrics.states.empty'));
     expect(empties).toHaveLength(3);
     expect(screen.getAllByRole('button', { name: showData() })).toHaveLength(3);
+  });
+});
+
+/**
+ * The MARK for a point a line cannot reach.
+ *
+ * Pinned on the renderer itself rather than on painted SVG: recharts lays out
+ * through a `ResponsiveContainer`, which measures zero in jsdom and draws no
+ * geometry at all, so no assertion about a rendered `<circle>` could ever be
+ * honest here. The rule that decides WHICH points (`isolatedPointFlags`) is
+ * pinned in the util, the data that produces exactly one of them in
+ * `fleetWidgetRows`, and the painted result in the browser.
+ */
+describe('isolatedDot', () => {
+  const LONE = '2026-09-21T00:00:00';
+  const dot = isolatedDot(new Set([LONE]), '#abcdef');
+
+  it('draws a filled point where the line has no neighbour to join', () => {
+    const drawn = dot({ payload: { bucketStart: LONE }, cx: 12, cy: 34 });
+    expect(drawn.type).toBe('circle');
+    expect(drawn.props).toMatchObject({ cx: 12, cy: 34, fill: '#abcdef' });
+  });
+
+  it('draws nothing where the line can join its neighbours', () => {
+    expect(dot({ payload: { bucketStart: '2026-09-20T00:00:00' }, cx: 12, cy: 34 }).type).toBe('g');
+  });
+
+  it('reads the BUCKET, never the index recharts happens to give it', () => {
+    // recharts drops the null points before rendering marks, so the `index` it
+    // hands a dot renderer counts only the survivors: index 0 of a thirty-day
+    // series with one point IS that point, not the first day. Keying on the
+    // index asked about the wrong bucket and the mark never appeared — and
+    // nothing but a browser could catch it, since jsdom lays out no chart.
+    expect(dot({ payload: {}, cx: 1, cy: 2 }).type).toBe('g');
+    expect(dot({ cx: 1, cy: 2 }).type).toBe('g');
+  });
+
+  it('draws nothing for a point recharts gave no position', () => {
+    expect(dot({ payload: { bucketStart: LONE } }).type).toBe('g');
+  });
+});
+
+describe('the hours still to come', () => {
+  it('prints a dash, never a zero, in the data table', async () => {
+    // A `0` in a future hour's row is a claim about an hour that has not
+    // arrived; the print log is complete for its own PAST, not for its future.
+    const user = userEvent.setup();
+    render(<PrintsPerDayWidget overview={makeFleetOverviewTodayHours()} size={4} />);
+
+    await user.click(screen.getByRole('button', { name: showData() }));
+    // The last row is the window's totals, so the future hours sit above it.
+    const rows = screen.getAllByRole('row');
+    const future = rows.slice(-(TODAY_FUTURE_HOURS + 1), -1);
+    expect(future).toHaveLength(TODAY_FUTURE_HOURS);
+
+    for (const row of future) {
+      for (const cellNode of within(row).getAllByRole('cell')) {
+        expect((cellNode.textContent ?? '').trim()).toBe('–');
+      }
+    }
+    // Non-vacuous: an hour that HAS happened still prints its figures.
+    const past = rows[1];
+    expect(
+      within(past as HTMLElement)
+        .getAllByRole('cell')
+        .some((cellNode) => /\d/.test(cellNode.textContent ?? '')),
+    ).toBe(true);
   });
 });

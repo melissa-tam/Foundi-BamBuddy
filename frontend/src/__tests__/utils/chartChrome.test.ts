@@ -20,7 +20,10 @@ import {
   CHART_TOOLTIP_CONTENT_STYLE,
   CHART_TOOLTIP_ITEM_STYLE,
   CHART_TOOLTIP_LABEL_STYLE,
+  CHART_AXIS_TICK_GUTTER_PX,
+  CHART_TICK_GLYPH_RATIO,
   chartAxisTick,
+  chartYAxisWidth,
 } from '../../utils/chartChrome';
 
 const SRC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -131,5 +134,46 @@ describe('chart chrome source pins', () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('chartYAxisWidth', () => {
+  it('grows with the widest tick it has to carry', () => {
+    // The axis shipped at a flat 34 px: room for `900`, not for `10,000`, so a
+    // farm with one huge day lost a digit off the figure the chart is scaled to.
+    const narrow = chartYAxisWidth('12', 11);
+    const wide = chartYAxisWidth('10,000', 11);
+    expect(wide).toBeGreaterThan(narrow);
+    expect(wide).toBeGreaterThan(34);
+  });
+
+  it('is sized from the tick itself, never a fixed reserve', () => {
+    const glyphs = (tick: string, fontSize: number): number =>
+      Math.ceil(tick.length * fontSize * CHART_TICK_GLYPH_RATIO) + CHART_AXIS_TICK_GUTTER_PX;
+    for (const tick of ['9', '12', '900', '9,999', '12.5K']) {
+      const width = chartYAxisWidth(tick, 11);
+      expect(width, `${tick} fits`).toBeGreaterThanOrEqual(glyphs(tick, 11));
+      // A couple of glyphs of headroom, not a column reserved for a farm
+      // nobody has: a magic 60 would clear this bound at every tick width.
+      expect(width, `${tick} reserves no more`).toBeLessThan(glyphs(tick, 11) + 4 * 11 * CHART_TICK_GLYPH_RATIO);
+    }
+  });
+
+  it('grows with the tick FONT, so a quarter-width card is not sized for a full one', () => {
+    expect(chartYAxisWidth('1,000', 11)).toBeGreaterThan(chartYAxisWidth('1,000', 9));
+  });
+
+  it('leaves room for the round tick recharts will add above the data', () => {
+    // A domain peaking at 900 is labelled up to 1,000 — one more digit AND the
+    // group separator that arrives with it. Measured against the glyphs that
+    // label actually needs, not against another headroom-bearing answer.
+    const needed = (tick: string, fontSize: number): number =>
+      Math.ceil(tick.length * fontSize * CHART_TICK_GLYPH_RATIO) + CHART_AXIS_TICK_GUTTER_PX;
+    expect(chartYAxisWidth('900', 11)).toBeGreaterThanOrEqual(needed('1,000', 11));
+    expect(chartYAxisWidth('9', 10)).toBeGreaterThanOrEqual(needed('10', 10));
+  });
+
+  it('is a whole number of px', () => {
+    expect(Number.isInteger(chartYAxisWidth('9,999', 10))).toBe(true);
   });
 });

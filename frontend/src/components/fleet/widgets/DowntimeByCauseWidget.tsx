@@ -45,7 +45,14 @@ import {
 } from './ChartFrame';
 import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
-import { downtimeCauses, downtimeRows, downtimeTotals, type DowntimeRowValues } from './rows';
+import {
+  NO_VALUE,
+  downtimeCauses,
+  downtimeRows,
+  downtimeTotals,
+  type DowntimeRowValues,
+  type Nullable,
+} from './rows';
 import type { FleetOverview } from '../../../types/fleetMetrics';
 import {
   CHART_AXIS_STROKE,
@@ -86,18 +93,22 @@ export function DowntimeByCauseWidget({ overview, size }: DowntimeByCauseWidgetP
     textColor: downCauseTextColor(cause),
   }));
 
-  const columns: ChartDataColumn<DowntimeRowValues>[] = [
+  /** Hours, or a dash where the bucket has not happened. */
+  const hours = (value: number | null | undefined): string =>
+    value === null || value === undefined ? NO_VALUE : formatHours(value, locale);
+
+  const columns: ChartDataColumn<Nullable<DowntimeRowValues>>[] = [
     ...causes.map((cause) => ({
       key: cause,
       header: t(causeLabelKey(cause)),
       unit: t('fleetMetrics.units.hours'),
-      format: (values: DowntimeRowValues) => formatHours(values[cause] ?? 0, locale),
+      format: (values: Nullable<DowntimeRowValues>) => hours(values[cause]),
     })),
     {
       key: 'total_hours',
       header: t('fleetMetrics.matrix.lens.hoursDown'),
       unit: t('fleetMetrics.units.hours'),
-      format: (values: DowntimeRowValues) => formatHours(values.total_hours, locale),
+      format: (values: Nullable<DowntimeRowValues>) => hours(values.total_hours),
     },
   ];
 
@@ -158,7 +169,7 @@ export function DowntimeByCauseWidget({ overview, size }: DowntimeByCauseWidgetP
         </ResponsiveContainer>
       }
       table={
-        <ChartDataTable<DowntimeRowValues>
+        <ChartDataTable<Nullable<DowntimeRowValues>>
           caption={t('fleetMetrics.sections.downtimeByCause')}
           rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}
