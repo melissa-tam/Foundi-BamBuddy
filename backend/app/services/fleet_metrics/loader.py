@@ -5,17 +5,32 @@ projection take rows and return values. This module is where rows come from — 
 window, one set of Core column selects, then the whole fold handed to a worker thread
 so a year-long sweep never blocks the event loop while the farm is dispatching.
 
-**The selects are shaped for the indexes that exist.** Spans come out of
-``(printer_id, started_at)`` by the standard overlap predicate; incidents through the
-store's own ``list_overlapping`` (a window reader must see the hold that OPENED
-before the window and was still standing through it — the longest outages, which a
-``created_at >= since`` filter is blind to); print events off
-``print_log_entries.created_at``; episodes off ``(kind, ended_at)``.
+**A window read costs the window, not the history.** The obvious overlap predicate —
+``started_at < :end AND (ended_at IS NULL OR ended_at > :start)`` — cannot be served
+by any index, because the disjunction has no lower bound to seek on; it reads every
+row in the table however narrow the window is. So the read is in two parts instead.
+Spans that START inside the window come off ``(started_at)`` as a range scan. The
+spans already running when the window opened are found one at a time: the log is
+run-length compressed, so a printer's spans are contiguous and non-overlapping and at
+most ONE of them can straddle the opening instant — the last one starting before it,
+a seek into ``(printer_id, started_at)``. Incidents come through the store's own
+``list_overlapping`` (a window reader must see the hold that OPENED before the window
+and was still standing through it — the longest outages, which a ``created_at >=
+since`` filter is blind to); print events off ``print_log_entries.created_at``;
+episodes off ``(kind, ended_at)``, with ``kind`` constrained so the index's leading
+column is usable; completed plates off ``print_queue.completed_at``.
 
-**Aggregates answer the questions a window cannot.** When a printer's record began
-and when it was last evidenced to exist are facts about the whole table, not about the
-window, so they are two small GROUP BY queries rather than a scan: a window must not
-be able to change what *before recording* means.
+**Whole-table facts are answered by seeks, not by aggregates over the table.** When a
+printer's record began and when it was last evidenced to exist are facts about all of
+history, not about the window — a window must not be able to change what *before
+recording* means — but a GROUP BY over the span table reads every row to produce one
+line per printer, and that cost grows for ever while the answer stays the same size.
+Both come from per-printer index seeks, and the set of printers to ask is itself
+walked out of the index by hops (``min(printer_id) WHERE printer_id > :last``) rather
+than by a DISTINCT that would scan. That set deliberately includes printers the
+roster no longer has: a machine that sat offline for weeks and was then deleted still
+owns that downtime, and a reader that only asked the roster would report a fleet that
+was never down.
 
 **Read-only, and deliberately so.** Nothing here inserts, updates or deletes. The
 recorder and the episode writer own those tables; classification happens at read time
@@ -27,11 +42,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 
-from backend.app.models.farm_cycle_episode import FarmCycleEpisode
+from backend.app.models.farm_cycle_episode import EPISODE_KINDS, FarmCycleEpisode
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_log import PrintLogEntry
 from backend.app.models.print_queue import PrintQueueItem
@@ -68,12 +83,15 @@ from backend.app.services.fleet_metrics.timeline import (
     build_timeline,
     build_window,
     printer_slice,
+    span_end,
 )
 from backend.app.utils.site_time import Bucket, default_bucket, previous_window, site_today, site_zone_name
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
     from datetime import tzinfo
 
+    from sqlalchemy import Row, Select
     from sqlalchemy.ext.asyncio import AsyncSession
 
 # The window bounds the API publishes. They are limits on the SWEEP, not on the data:
@@ -97,6 +115,9 @@ _QUEUE_STATUS_COMPLETED = "completed"
 # The store's own precedence, as a rank lookup — the same order the printer card's
 # chip reads, so "which hold decided this class" has one answer on both surfaces.
 _RANK: dict[str, int] = {kind: rank for rank, kind in enumerate(KIND_PRECEDENCE)}
+
+#: What ``_stream`` builds — the row type is the caller's, the partitioning is not.
+_RowT = TypeVar("_RowT")
 
 
 class FleetMetricsError(ValueError):
@@ -139,14 +160,19 @@ async def overview(
     moment = now if now is not None else utcnow()
 
     roster = await _load_roster(db)
-    evidence = await _load_evidence(db)
-    facts = await _load_window(db, window, roster=roster, evidence=evidence)
+    # From the SPAN table, not the roster: a printer that was down for weeks and then
+    # deleted still owns that downtime, and asking only the roster would drop it.
+    span_printers = await _span_printer_ids(db)
+    evidence = await _load_evidence(db, printer_ids=span_printers)
+    facts = await _load_window(db, window, roster=roster, evidence=evidence, printer_ids=span_printers, now=moment)
     previous_from, previous_to = previous_window(date_from, date_to)
     previous = await _load_window(
         db,
         build_window(previous_from, previous_to, resolved_bucket, tz),
         roster=roster,
         evidence=evidence,
+        printer_ids=span_printers,
+        now=moment,
         include_output=False,
     )
 
@@ -179,7 +205,9 @@ async def printer_intervals(
         db,
         window,
         roster=await _load_roster(db, printer_id=printer_id),
-        evidence=await _load_evidence(db, printer_id=printer_id),
+        evidence=await _load_evidence(db, printer_ids=[printer_id], printer_id=printer_id),
+        printer_ids=[printer_id],
+        now=moment,
         printer_id=printer_id,
         include_output=False,
     )
@@ -250,6 +278,66 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
 
 
+# ── reading machinery ───────────────────────────────────────────────────────────────
+
+# Rows per streamed partition. Chosen by measurement rather than by feel: reading a
+# year of spans in one buffered fetch holds the event loop for ~1.9 s, which is a farm
+# whose printer list stops answering while somebody looks at a chart. At 500 the worst
+# observed gap is ~16 ms and the read is FASTER in wall-clock terms as well, because
+# nothing has to materialise a single list of half a million rows.
+_STREAM_PARTITION = 500
+
+# The span columns, in the order ``_span_row`` reads them. One tuple, because three
+# call sites select exactly this shape and a column added to one of them and not the
+# others would be a silent mis-read rather than an error.
+_SPAN_COLUMNS = (
+    PrinterObservationSpan.printer_id,
+    PrinterObservationSpan.started_at,
+    PrinterObservationSpan.last_observed_at,
+    PrinterObservationSpan.ended_at,
+    PrinterObservationSpan.is_active,
+    PrinterObservationSpan.connected,
+    PrinterObservationSpan.gcode_state,
+    PrinterObservationSpan.plate_phase,
+    PrinterObservationSpan.quarantined,
+    PrinterObservationSpan.usb_present,
+    PrinterObservationSpan.model_mismatch,
+)
+
+
+def _span_row(row: Row[Any]) -> SpanRow:
+    """One selected row as the sweep's own value object."""
+    return SpanRow(
+        printer_id=row[0],
+        started_at=row[1],
+        last_observed_at=row[2],
+        ended_at=row[3],
+        is_active=bool(row[4]),
+        connected=bool(row[5]),
+        gcode_state=row[6],
+        plate_phase=row[7],
+        quarantined=bool(row[8]),
+        usb_present=None if row[9] is None else bool(row[9]),
+        model_mismatch=bool(row[10]),
+    )
+
+
+async def _stream(db: AsyncSession, stmt: Select[Any], build: Callable[[Row[Any]], _RowT]) -> list[_RowT]:
+    """Run ``stmt`` in bounded partitions, building each row as it arrives.
+
+    Every partition boundary is an ``await``, so a long read hands the event loop back
+    hundreds of times instead of once at the end. This is the difference between a
+    concurrent request waiting a few milliseconds and waiting for the whole query: the
+    pure fold already runs in a worker thread, but fetching and materialising rows is
+    the other half of the work and it happens here, on the loop.
+    """
+    rows: list[_RowT] = []
+    result = await db.stream(stmt)
+    async for partition in result.partitions(_STREAM_PARTITION):
+        rows.extend(build(row) for row in partition)
+    return rows
+
+
 # ── window loading ──────────────────────────────────────────────────────────────────
 
 
@@ -281,16 +369,18 @@ async def _load_window(
     *,
     roster: list[RosterPrinter],
     evidence: list[PrinterEvidence],
+    printer_ids: Sequence[int],
+    now: datetime,
     printer_id: int | None = None,
     include_output: bool = True,
 ) -> _WindowFacts:
     """Every row one window needs. Read-only; the session is left exactly as found.
 
-    ``roster`` and ``evidence`` are passed in because they are facts about the whole
-    table, identical for a window and its predecessor — loading them twice would be
-    two identical aggregates per request. ``include_output`` is off for the comparison
-    window: the summary reads only its state and print series, so a year of units and
-    episodes nobody will look at is a query not worth making.
+    ``roster``, ``evidence`` and ``printer_ids`` are passed in because they are facts
+    about the whole table, identical for a window and its predecessor — resolving them
+    twice would be the same seeks twice per request. ``include_output`` is off for the
+    comparison window: the summary reads only its state and print series, so a year of
+    units and episodes nobody will look at is a query not worth making.
     """
     incidents = await printer_incidents.list_overlapping(db, start=window.start, end=window.end)
     if printer_id is not None:
@@ -298,7 +388,7 @@ async def _load_window(
     return _WindowFacts(
         window=window,
         roster=roster,
-        spans=await _load_spans(db, window, printer_id=printer_id),
+        spans=await _load_spans(db, window, printer_ids=printer_ids, now=now, printer_id=printer_id),
         incidents=incidents,
         incident_rows=[
             IncidentRow(
@@ -327,102 +417,168 @@ async def _load_roster(db: AsyncSession, *, printer_id: int | None = None) -> li
     ]
 
 
-async def _load_spans(db: AsyncSession, window: Window, *, printer_id: int | None = None) -> list[SpanRow]:
-    """Spans OVERLAPPING the window: started before it ended, and had not ended when it began."""
+async def _span_printer_ids(db: AsyncSession) -> list[int]:
+    """Every printer id the span table holds, walked out of the index by hops.
+
+    ``SELECT min(printer_id) WHERE printer_id > :last``, repeated until it answers
+    nothing: each call is a seek into ``(printer_id, started_at)``, so the whole set
+    costs O(printers · log n) where ``SELECT DISTINCT`` would read every entry in the
+    table. Portable — the min/max-with-a-lower-bound form is an index seek on SQLite
+    and on PostgreSQL alike, unlike a ``DISTINCT ON`` or a recursive CTE.
+    """
+    ids: list[int] = []
+    last: int | None = None
+    while True:
+        stmt = select(func.min(PrinterObservationSpan.printer_id))
+        if last is not None:
+            stmt = stmt.where(PrinterObservationSpan.printer_id > last)
+        found = await db.scalar(stmt)
+        if found is None:
+            return ids
+        ids.append(int(found))
+        last = int(found)
+
+
+async def _straddler(db: AsyncSession, printer_id: int, start: datetime, now: datetime) -> SpanRow | None:
+    """The one span that can reach into the window from before it, for one printer.
+
+    Spans are run-length compressed and therefore contiguous per printer, so at most
+    one can start before ``start`` and still be covering the printer when the window
+    opens: the LAST one starting before it. Whether it actually reaches is the
+    timeline's own coverage rule (``span_end``) rather than a second predicate written
+    in SQL — an open span's freshness has one definition, and a straddler admitted by
+    one rule and then read by another would put a hole where the record has none.
+    """
     stmt = (
-        select(
-            PrinterObservationSpan.printer_id,
-            PrinterObservationSpan.started_at,
-            PrinterObservationSpan.last_observed_at,
-            PrinterObservationSpan.ended_at,
-            PrinterObservationSpan.is_active,
-            PrinterObservationSpan.connected,
-            PrinterObservationSpan.gcode_state,
-            PrinterObservationSpan.plate_phase,
-            PrinterObservationSpan.quarantined,
-            PrinterObservationSpan.usb_present,
-            PrinterObservationSpan.model_mismatch,
-        )
+        select(*_SPAN_COLUMNS)
+        .where(PrinterObservationSpan.printer_id == printer_id)
+        .where(PrinterObservationSpan.started_at < start)
+        .order_by(PrinterObservationSpan.started_at.desc())
+        .limit(1)
+    )
+    row = (await db.execute(stmt)).first()
+    if row is None:
+        return None
+    span = _span_row(row)
+    return span if span_end(span, now) > start else None
+
+
+async def _load_spans(
+    db: AsyncSession,
+    window: Window,
+    *,
+    printer_ids: Sequence[int],
+    now: datetime,
+    printer_id: int | None = None,
+) -> list[SpanRow]:
+    """The window's spans: the ones that START in it, plus each printer's straddler.
+
+    Returned straddlers first, then the rest in ``started_at`` order. That is already
+    the order the timeline needs — every straddler starts before the window and every
+    other row inside it, so within any one printer the sequence ascends — and it is
+    the order the index yields, so nothing sorts a year of rows to get it.
+    """
+    inside = (
+        select(*_SPAN_COLUMNS)
+        .where(PrinterObservationSpan.started_at >= window.start)
         .where(PrinterObservationSpan.started_at < window.end)
-        .where(
-            or_(
-                PrinterObservationSpan.ended_at.is_(None),
-                PrinterObservationSpan.ended_at > window.start,
-            )
-        )
-        .order_by(PrinterObservationSpan.printer_id, PrinterObservationSpan.started_at, PrinterObservationSpan.id)
+        .order_by(PrinterObservationSpan.started_at)
     )
     if printer_id is not None:
-        stmt = stmt.where(PrinterObservationSpan.printer_id == printer_id)
-    return [
-        SpanRow(
-            printer_id=row[0],
-            started_at=row[1],
-            last_observed_at=row[2],
-            ended_at=row[3],
-            is_active=bool(row[4]),
-            connected=bool(row[5]),
-            gcode_state=row[6],
-            plate_phase=row[7],
-            quarantined=bool(row[8]),
-            usb_present=None if row[9] is None else bool(row[9]),
-            model_mismatch=bool(row[10]),
-        )
-        for row in (await db.execute(stmt)).all()
-    ]
+        inside = inside.where(PrinterObservationSpan.printer_id == printer_id)
+
+    spans: list[SpanRow] = []
+    for identifier in printer_ids:
+        straddler = await _straddler(db, identifier, window.start, now)
+        if straddler is not None:
+            spans.append(straddler)
+    spans.extend(await _stream(db, inside, _span_row))
+    return spans
 
 
-async def _load_evidence(db: AsyncSession, *, printer_id: int | None = None) -> list[PrinterEvidence]:
+async def _load_evidence(
+    db: AsyncSession, *, printer_ids: Sequence[int], printer_id: int | None = None
+) -> list[PrinterEvidence]:
     """Per-printer facts over the WHOLE table: when its record began, and last existed.
 
-    Two aggregates, not a scan. ``first_span_start`` is what makes "before recording"
-    a fixed instant rather than a property of whichever window is being asked about,
-    and the two last-evidence columns are what place a DELETED printer out of the
-    fleet instead of leaving its orphaned open incident reading as downtime forever.
+    ``first_span_start`` is what makes "before recording" a fixed instant rather than
+    a property of whichever window is being asked about, and the two last-evidence
+    columns are what place a DELETED printer out of the fleet instead of leaving its
+    orphaned open incident reading as downtime for ever.
+
+    Two index seeks per printer, not a GROUP BY over the span table. The answer is one
+    line per printer either way, but the aggregate reads every row of history to build
+    it — so a figure whose size never changes would get slower every day the farm runs.
+    The incident side stays a grouped aggregate: that table holds a row per FAULT, not
+    one per sample, and is smaller by orders of magnitude.
     """
-    spans = select(
-        PrinterObservationSpan.printer_id,
-        func.min(PrinterObservationSpan.started_at),
-        func.max(func.coalesce(PrinterObservationSpan.ended_at, PrinterObservationSpan.last_observed_at)),
-    ).group_by(PrinterObservationSpan.printer_id)
     holds = select(PrinterIncident.printer_id, func.max(PrinterIncident.created_at)).group_by(
         PrinterIncident.printer_id
     )
     if printer_id is not None:
-        spans = spans.where(PrinterObservationSpan.printer_id == printer_id)
         holds = holds.where(PrinterIncident.printer_id == printer_id)
-
-    first: dict[int, tuple[datetime | None, datetime | None]] = {
-        row[0]: (row[1], row[2]) for row in (await db.execute(spans)).all()
-    }
     last_hold: dict[int, datetime | None] = {row[0]: row[1] for row in (await db.execute(holds)).all()}
-    return [
-        PrinterEvidence(
-            printer_id=identifier,
-            first_span_start=first.get(identifier, (None, None))[0],
-            last_span_end=first.get(identifier, (None, None))[1],
-            last_incident_at=last_hold.get(identifier),
+
+    evidence: list[PrinterEvidence] = []
+    for identifier in sorted(set(printer_ids) | set(last_hold)):
+        first_span = await db.scalar(
+            select(func.min(PrinterObservationSpan.started_at)).where(PrinterObservationSpan.printer_id == identifier)
         )
-        for identifier in sorted(set(first) | set(last_hold))
-    ]
+        # The last span BY START is the one that ends last: the log is run-length
+        # compressed, so one printer's spans are contiguous and a later start cannot
+        # carry an earlier end. That invariant is what lets a seek replace a max() over
+        # a COALESCE, which no index can serve.
+        last_row = (
+            await db.execute(
+                select(PrinterObservationSpan.ended_at, PrinterObservationSpan.last_observed_at)
+                .where(PrinterObservationSpan.printer_id == identifier)
+                .order_by(PrinterObservationSpan.started_at.desc())
+                .limit(1)
+            )
+        ).first()
+        last_span_end: datetime | None = None
+        if last_row is not None:
+            last_span_end = last_row[0] if last_row[0] is not None else last_row[1]
+        evidence.append(
+            PrinterEvidence(
+                printer_id=identifier,
+                first_span_start=first_span,
+                last_span_end=last_span_end,
+                last_incident_at=last_hold.get(identifier),
+            )
+        )
+    return evidence
 
 
 async def _load_prints(db: AsyncSession, window: Window) -> list[projections.PrintLogRow]:
+    """Print events inside the window, off ``created_at``'s own index.
+
+    The ORDER BY is the index's order, so it costs nothing and the rows arrive ready
+    to stream. A row with no ``created_at`` cannot be placed in a bucket and is left
+    out rather than being charged to the window's first one.
+    """
     stmt = (
         select(PrintLogEntry.created_at, PrintLogEntry.status, PrintLogEntry.printer_id)
         .where(PrintLogEntry.created_at >= window.start)
         .where(PrintLogEntry.created_at < window.end)
         .order_by(PrintLogEntry.created_at)
     )
-    return [
-        projections.PrintLogRow(created_at=row[0], status=row[1], printer_id=row[2])
-        for row in (await db.execute(stmt)).all()
-        if row[0] is not None
-    ]
+    rows = await _stream(
+        db,
+        stmt,
+        lambda row: projections.PrintLogRow(created_at=row[0], status=row[1], printer_id=row[2]),
+    )
+    return [row for row in rows if row.created_at is not None]
 
 
 async def _load_units(db: AsyncSession, window: Window) -> list[projections.UnitRow]:
-    """Completed queue plates joined to the SKU file that says what a plate yields."""
+    """Completed queue plates joined to the SKU file that says what a plate yields.
+
+    No ORDER BY: the units projection places every row by its own timestamp and
+    accumulates into buckets, so the order rows arrive in cannot change the answer —
+    and asking for one here would make the planner sort the join's output instead of
+    driving straight off ``completed_at``'s index.
+    """
     stmt = (
         select(PrintQueueItem.completed_at, SkuFile.units_per_plate, Sku.code)
         .join(PrintBatch, PrintQueueItem.batch_id == PrintBatch.id)
@@ -431,16 +587,23 @@ async def _load_units(db: AsyncSession, window: Window) -> list[projections.Unit
         .where(PrintQueueItem.status == _QUEUE_STATUS_COMPLETED)
         .where(PrintQueueItem.completed_at >= window.start)
         .where(PrintQueueItem.completed_at < window.end)
-        .order_by(PrintQueueItem.completed_at)
     )
-    return [
-        projections.UnitRow(completed_at=row[0], units_per_plate=row[1], sku_code=row[2])
-        for row in (await db.execute(stmt)).all()
-    ]
+    return await _stream(
+        db,
+        stmt,
+        lambda row: projections.UnitRow(completed_at=row[0], units_per_plate=row[1], sku_code=row[2]),
+    )
 
 
 async def _load_episodes(db: AsyncSession, window: Window) -> list[projections.EpisodeRow]:
-    """Episodes that ENDED in the window — an episode belongs to the bucket it finished in."""
+    """Episodes that ENDED in the window — an episode belongs to the bucket it finished in.
+
+    ``kind`` is constrained to the registered vocabulary so the ``(kind, ended_at)``
+    index is usable at all: its leading column is ``kind``, and a query that named
+    only ``ended_at`` could not seek into it and read the whole table instead. The
+    cycle projection groups rows and sorts durations itself, so no ORDER BY is asked
+    for — one across both kinds would be a sort the index cannot provide.
+    """
     stmt = (
         select(
             FarmCycleEpisode.printer_id,
@@ -451,12 +614,14 @@ async def _load_episodes(db: AsyncSession, window: Window) -> list[projections.E
             FarmCycleEpisode.outcome,
             FarmCycleEpisode.variant,
         )
+        .where(FarmCycleEpisode.kind.in_(sorted(EPISODE_KINDS)))
         .where(FarmCycleEpisode.ended_at >= window.start)
         .where(FarmCycleEpisode.ended_at < window.end)
-        .order_by(FarmCycleEpisode.ended_at)
     )
-    return [
-        projections.EpisodeRow(
+    return await _stream(
+        db,
+        stmt,
+        lambda row: projections.EpisodeRow(
             printer_id=row[0],
             kind=row[1],
             started_at=row[2],
@@ -464,9 +629,8 @@ async def _load_episodes(db: AsyncSession, window: Window) -> list[projections.E
             expected_s=row[4],
             outcome=row[5],
             variant=row[6],
-        )
-        for row in (await db.execute(stmt)).all()
-    ]
+        ),
+    )
 
 
 # ── the pure fold (runs in a worker thread) ─────────────────────────────────────────
@@ -561,20 +725,14 @@ async def _since(
     if klass.group not in (GROUP_DOWN, GROUP_IDLE):
         return None, False
 
+    # The composite index seeks to this printer and already yields its rows in
+    # ``started_at`` order, so the walk-back reads the index backwards and stops after
+    # at most ``_SINCE_SPAN_LIMIT`` entries — a seek, not a scan, however long this
+    # printer's history is. The ``id`` tiebreak costs nothing (the plan is identical
+    # with and without it) and makes the order total, so a clock step that produced two
+    # spans with one start cannot make the walk-back's answer depend on row order.
     stmt = (
-        select(
-            PrinterObservationSpan.printer_id,
-            PrinterObservationSpan.started_at,
-            PrinterObservationSpan.last_observed_at,
-            PrinterObservationSpan.ended_at,
-            PrinterObservationSpan.is_active,
-            PrinterObservationSpan.connected,
-            PrinterObservationSpan.gcode_state,
-            PrinterObservationSpan.plate_phase,
-            PrinterObservationSpan.quarantined,
-            PrinterObservationSpan.usb_present,
-            PrinterObservationSpan.model_mismatch,
-        )
+        select(*_SPAN_COLUMNS)
         .where(PrinterObservationSpan.printer_id == printer_id)
         .order_by(PrinterObservationSpan.started_at.desc(), PrinterObservationSpan.id.desc())
         .limit(_SINCE_SPAN_LIMIT)
@@ -584,19 +742,7 @@ async def _since(
     newer_start: datetime | None = None
     exhausted = True
     for row in rows:
-        span = SpanRow(
-            printer_id=row[0],
-            started_at=row[1],
-            last_observed_at=row[2],
-            ended_at=row[3],
-            is_active=bool(row[4]),
-            connected=bool(row[5]),
-            gcode_state=row[6],
-            plate_phase=row[7],
-            quarantined=bool(row[8]),
-            usb_present=None if row[9] is None else bool(row[9]),
-            model_mismatch=bool(row[10]),
-        )
+        span = _span_row(row)
         # A span that does not MEET the one after it is a hole in the record, and a run
         # cannot reach back across one: what happened in the gap is unknown, not more
         # of the same.

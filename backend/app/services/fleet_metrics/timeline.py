@@ -289,10 +289,12 @@ def build_timeline(
 ) -> FleetTimeline:
     """Fold the window's rows into one classified timeline. Pure; O(n log n).
 
-    ``spans`` must be ordered by ``(printer_id, started_at)`` — the read index's own
-    order — and may overlap only pathologically (a clock step): a span's start is
-    clipped to the furthest end already covered, so the result is strictly
-    non-overlapping whatever the table holds.
+    ``spans`` must be ordered by ``started_at`` WITHIN each printer (the grouping below
+    preserves the caller's order and nothing re-sorts it); the printers themselves may
+    arrive interleaved, which is what lets the loader read the window in index order
+    instead of paying for a sort. Spans may overlap only pathologically (a clock step):
+    a span's start is clipped to the furthest end already covered, so the result is
+    strictly non-overlapping whatever the table holds.
     """
     horizon = min(window.end, now)
     by_span = _group(spans)
@@ -394,16 +396,23 @@ def _coverage(spans: Iterable[SpanRow], now: datetime, start: datetime, horizon:
     covered_to: datetime | None = None
     for span in spans:
         span_start = span.started_at if covered_to is None else max(span.started_at, covered_to)
-        span_end = _span_end(span, now)
-        covered_to = span_end if covered_to is None else max(covered_to, span_end)
+        end = span_end(span, now)
+        covered_to = end if covered_to is None else max(covered_to, end)
         low = max(span_start, start)
-        high = min(span_end, horizon)
+        high = min(end, horizon)
         if high > low:
             pieces.append(_Coverage(start=low, end=high, observation=span.observation()))
     return pieces
 
 
-def _span_end(span: SpanRow, now: datetime) -> datetime:
+def span_end(span: SpanRow, now: datetime) -> datetime:
+    """The instant a span stops being evidence. THE definition, shared by both readers.
+
+    Public because the loader asks it too: deciding whether the one span that starts
+    before a window still reaches into it is the same question as deciding how far
+    that span covers, and answering it twice would let a straddler be admitted by one
+    rule and then read by another.
+    """
     if span.ended_at is not None:
         return span.ended_at
     if (now - span.last_observed_at).total_seconds() <= STALE_AFTER_S:

@@ -49,6 +49,11 @@ HOUR = timedelta(hours=1)
 SEP1 = datetime(2026, 9, 1, 4, 0, 0)
 NOW = SEP1 + timedelta(days=2)
 
+# 2 Sep as a site day — the one-bucket window the straddler pins read. September holds
+# no transition, so its two midnights really are 24 h apart.
+W_START = SEP1 + timedelta(days=1)
+W_END = SEP1 + timedelta(days=2)
+
 
 @pytest.fixture(autouse=True)
 def _clean_incident_cache():
@@ -238,6 +243,105 @@ class TestOverview:
         assert result.fleet_series.totals.uptime is None
         state_row = next(row for row in result.summary.rows if row.key == loader.projections.ROW_AVG_DOWN)
         assert state_row.figure is None
+
+
+class TestStraddlingSpans:
+    """The window read finds spans that START in it, plus one straddler per printer.
+
+    A run-length-compressed log records long stretches as ONE row, so the span that
+    matters most to a window — the outage already running when it opened — is usually
+    the one that starts outside it. These pin that the two-part read finds it, and
+    that it stops finding it exactly where the coverage rule says the evidence ends.
+    """
+
+    async def _day(self, db, **overrides):
+        """``overview`` over 2 Sep alone, as one bucket."""
+        return await loader.overview(
+            db, date_from=date(2026, 9, 2), date_to=date(2026, 9, 2), bucket="day", now=NOW, tz=NY, **overrides
+        )
+
+    @staticmethod
+    def _seconds(result, printer_id: int) -> dict[str, float]:
+        cell = result.matrix.series.buckets[0].values.printers.get(printer_id)
+        return dict(cell.class_seconds) if cell is not None else {}
+
+    async def test_a_span_that_starts_before_the_window_and_ends_inside_it(self, db_session):
+        printer = await _printer(db_session, "001-H2S")
+        # Starts 4 h before the window opens, ends 6 h into it.
+        await _span(db_session, printer.id, W_START - 4 * HOUR, W_START + 6 * HOUR)
+        await db_session.commit()
+
+        seconds = self._seconds(await self._day(db_session), printer.id)
+
+        assert seconds["printing"] == 6 * 3600
+        # Nothing observed it after that, and recording had begun: an honest hole.
+        assert seconds["unobserved"] == 18 * 3600
+
+    async def test_a_span_that_covers_the_whole_window(self, db_session):
+        printer = await _printer(db_session, "001-H2S")
+        await _span(db_session, printer.id, W_START - 4 * HOUR, W_END + 4 * HOUR)
+        await db_session.commit()
+
+        seconds = self._seconds(await self._day(db_session), printer.id)
+
+        # One row, no start and no end inside the window — invisible to a read that
+        # only looked for spans starting in it.
+        assert seconds == {"printing": 24 * 3600}
+
+    async def test_an_open_span_started_before_the_window_and_still_fresh(self, db_session):
+        printer = await _printer(db_session, "001-H2S")
+        # Open (ended_at NULL) and last sampled at ``now``: the recorder still reads
+        # this printer this way, so the span covers right through the window.
+        await _span(db_session, printer.id, W_START - 4 * HOUR, None, last=NOW)
+        await db_session.commit()
+
+        seconds = self._seconds(await self._day(db_session), printer.id)
+
+        assert seconds == {"printing": 24 * 3600}
+
+    async def test_a_stale_open_span_does_not_reach_the_window(self, db_session):
+        printer = await _printer(db_session, "001-H2S")
+        # Open, but last sampled BEFORE the window opened — the controller stopped
+        # recording and the span's evidence ends at its own last sample. Extending it
+        # would claim a reading through a stretch nothing observed.
+        await _span(db_session, printer.id, W_START - 10 * HOUR, None, last=W_START - 5 * HOUR)
+        await db_session.commit()
+
+        seconds = self._seconds(await self._day(db_session), printer.id)
+
+        assert "printing" not in seconds
+        assert seconds == {"unobserved": 24 * 3600}
+
+    async def test_a_deleted_printer_keeps_the_downtime_it_owns(self, db_session):
+        """The case a roster-driven read loses: offline for weeks, then deleted.
+
+        Its last span starts long before the window and it has no incident inside it,
+        so nothing about the window names it — yet it was down for the whole of it.
+        The printer id set comes from the SPAN table for exactly this reason.
+        """
+        present = await _printer(db_session, "001-H2S")
+        await _span(db_session, present.id, W_START, W_END)
+        # No Printer row for 4242: the machine was removed. Its history was not.
+        await _span(
+            db_session,
+            4242,
+            W_START - 40 * 24 * HOUR,
+            W_START + 12 * HOUR,
+            connected=False,
+            gcode_state=None,
+        )
+        await db_session.commit()
+
+        result = await self._day(db_session)
+
+        rows = {row.printer_id: row for row in result.matrix.printers}
+        assert 4242 in rows, "a deleted printer's downtime vanished from the window"
+        assert rows[4242].deleted is True
+        seconds = self._seconds(result, 4242)
+        assert seconds["down:offline"] == 12 * 3600
+        # After its last evidence it is out of the fleet, not silently still down.
+        assert seconds["out_of_fleet"] == 12 * 3600
+        assert result.fleet_series.buckets[0].values.avg_down_by_cause["offline"] == pytest.approx(0.5)
 
 
 class TestValidation:

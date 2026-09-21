@@ -5,11 +5,14 @@ Neither table is created by ``run_migrations``. ``init_db`` runs ``create_all`` 
 missing whether the database is minutes or months old — so a hand-written CREATE TABLE
 would be a second, drifting spelling of the same schema. That claim is exactly what this
 file checks: the pre-existing arm below builds a database WITHOUT the two tables and
-without the print-log index, brings it up the way a real boot does, and then demands the
-same schema the fresh arm gets.
+without the two window indexes, brings it up the way a real boot does, and then demands
+the same schema the fresh arm gets.
 
-The one statement the migration does carry is the ``print_log_entries.created_at``
-index, which every window reader of that append-only table needs.
+The statements the migration does carry are two window indexes on tables that already
+existed — ``print_log_entries.created_at`` and ``print_queue.completed_at``. Both tables
+are append-only and never pruned, both are read by window, and ``create_all`` never
+revisits a table it did not create, so each needs its own idempotent CREATE INDEX for
+an install that predates the declaration.
 
 The open-span exclusivity index gets its own cases: it is the invariant the whole
 run-length encoding rests on (one open span per printer, or no reader can tell which row
@@ -45,6 +48,7 @@ _SPAN_TABLE = "printer_observation_span"
 _EPISODE_TABLE = "farm_cycle_episode"
 _NEW_TABLES = (_SPAN_TABLE, _EPISODE_TABLE)
 _PRINT_LOG_INDEX = "ix_print_log_entries_created_at"
+_PRINT_QUEUE_INDEX = "ix_print_queue_completed_at"
 
 # Spelled out rather than derived from the model: a column silently dropped from the
 # model would take a derived expectation with it and this file would still pass.
@@ -76,7 +80,11 @@ _EPISODE_COLUMNS = {
 _SPAN_INDEXES = {
     "ux_printer_observation_span_open",
     "ix_printer_observation_span_printer_started",
-    "ix_printer_observation_span_ended",
+    # Leads with ``started_at`` because the fleet-wide window read constrains that and
+    # nothing else. There is deliberately NO index on ``ended_at``: no query filters on
+    # it — a window read finds the spans that STARTED inside it plus one straddler per
+    # printer, which is a seek on the composite above.
+    "ix_printer_observation_span_started",
 }
 _OPEN_SPAN_INDEX = "ux_printer_observation_span_open"
 _EPISODE_INDEX = "ix_farm_cycle_episode_kind_ended"
@@ -102,14 +110,16 @@ async def fresh():
 
 @pytest.fixture
 async def legacy():
-    """An install that predates both tables and the print-log index."""
+    """An install that predates both tables and the two window indexes."""
     import_all_models()
     engine = create_async_engine(MEMORY_DATABASE_URL)
     async with engine.begin() as conn:
         await conn.run_sync(_create_all_except_the_new_tables)
-        # The model declares the index, so create_all just built it; an old install's
-        # table predates the declaration, and create_all never revisits an existing table.
+        # The models declare these, so create_all just built them; an old install's
+        # tables predate the declaration, and create_all never revisits an existing
+        # table — which is exactly why each one also has a migration statement.
         await conn.execute(text(f"DROP INDEX IF EXISTS {_PRINT_LOG_INDEX}"))
+        await conn.execute(text(f"DROP INDEX IF EXISTS {_PRINT_QUEUE_INDEX}"))
     yield engine
     await engine.dispose()
 
@@ -208,12 +218,22 @@ class TestFreshDatabase:
     async def test_the_print_log_gains_its_created_at_index(self, fresh):
         assert _PRINT_LOG_INDEX in await _indexes(fresh, "print_log_entries")
 
+    async def test_the_print_queue_gains_its_completed_at_index(self, fresh):
+        assert _PRINT_QUEUE_INDEX in await _indexes(fresh, "print_queue")
+
+    async def test_the_span_window_index_leads_with_started_at(self, fresh):
+        """The fleet-wide read constrains ``started_at`` alone, so it must lead."""
+        sql = (await _indexes(fresh, _SPAN_TABLE))["ix_printer_observation_span_started"]
+        assert "started_at" in sql
+        assert "printer_id" not in sql, "a leading printer_id would make the window read a full scan"
+
 
 class TestPreExistingDatabase:
     async def test_the_fixture_really_builds_the_old_shape(self, legacy):
         """Sanity: without this the convergence cases would pass against ``create_all`` alone."""
         assert not set(_NEW_TABLES) & await _tables(legacy)
         assert _PRINT_LOG_INDEX not in await _indexes(legacy, "print_log_entries")
+        assert _PRINT_QUEUE_INDEX not in await _indexes(legacy, "print_queue")
 
     async def test_it_converges_on_the_same_tables_and_columns(self, upgraded, fresh):
         assert set(_NEW_TABLES) <= await _tables(upgraded)
@@ -227,12 +247,15 @@ class TestPreExistingDatabase:
     async def test_the_print_log_index_is_created_on_an_old_database(self, upgraded):
         assert _PRINT_LOG_INDEX in await _indexes(upgraded, "print_log_entries")
 
+    async def test_the_print_queue_index_is_created_on_an_old_database(self, upgraded):
+        assert _PRINT_QUEUE_INDEX in await _indexes(upgraded, "print_queue")
+
     async def test_a_second_pass_is_a_no_op(self, upgraded):
-        """Every boot re-runs the whole list; the index statement must not fail the second time."""
-        before = await _indexes(upgraded, "print_log_entries")
+        """Every boot re-runs the whole list; the index statements must not fail the second time."""
+        before = {table: await _indexes(upgraded, table) for table in ("print_log_entries", "print_queue", _SPAN_TABLE)}
         async with upgraded.begin() as conn:
             await run_migrations(conn)
-        assert await _indexes(upgraded, "print_log_entries") == before
+        assert {table: await _indexes(upgraded, table) for table in before} == before
         assert set(await _indexes(upgraded, _SPAN_TABLE)) == _SPAN_INDEXES
 
 

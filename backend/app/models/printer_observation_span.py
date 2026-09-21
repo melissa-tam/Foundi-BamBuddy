@@ -97,7 +97,10 @@ class PrinterObservationSpan(Base):
         # a slow tick can re-enter, and two open spans would make the whole run-length
         # encoding ambiguous for every reader afterwards. PARTIAL (SQLite >= 3.8 and
         # PostgreSQL both support the WHERE clause), so closed spans accumulate freely
-        # as history while a second concurrent open row dies with IntegrityError.
+        # as history while a second concurrent open row dies with IntegrityError. It is
+        # also the recorder's own lookup: "this printer's open span" is a seek into the
+        # partial index, whose entries are exactly the open rows — one per printer,
+        # however long the history behind them grows.
         Index(
             "ux_printer_observation_span_open",
             "printer_id",
@@ -105,14 +108,20 @@ class PrinterObservationSpan(Base):
             sqlite_where=text(OPEN_SPAN_PREDICATE),
             postgresql_where=text(OPEN_SPAN_PREDICATE),
         ),
-        # THE read path: every window query is "this printer's spans overlapping
-        # [from, to)". printer_id is the leftmost column here and in the partial index
-        # above, so a separate single-column index on it would be pure duplication on a
-        # table that is written every sampling tick.
+        # THE fleet-wide read path: "every span that STARTED inside [from, to)". The
+        # window constrains ``started_at`` and nothing else, so ``started_at`` has to be
+        # the LEADING column — under the composite below it is the second, and a reader
+        # that never pins a printer would have to walk every entry in the table to find
+        # a month of them. This index is what makes a window read cost the rows in the
+        # window rather than the rows in the history.
+        Index("ix_printer_observation_span_started", "started_at"),
+        # The per-printer seek path, and the reason the index above is not enough on its
+        # own: spans are contiguous and non-overlapping per printer, so at most ONE span
+        # per printer starts before a window and runs into it. That straddler is found
+        # here (the last row with ``started_at`` below the window, per printer), and so
+        # are the three other per-printer questions — when this printer's record began,
+        # where its last span ended, and the live walk-back over adjacent spans.
         Index("ix_printer_observation_span_printer_started", "printer_id", "started_at"),
-        # The window query's other half: "ended after the window opened". The recorder's
-        # open-span lookup needs no help from it — the partial index above IS that set.
-        Index("ix_printer_observation_span_ended", "ended_at"),
         # NEVER index ``last_observed_at``. It is rewritten on every sample of every
         # printer — the single hottest write in this table — and no reader searches by
         # it: staleness is judged on a row the reader already has in hand.
