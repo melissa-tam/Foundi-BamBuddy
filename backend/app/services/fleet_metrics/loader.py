@@ -164,7 +164,10 @@ async def overview(
     # deleted still owns that downtime, and asking only the roster would drop it.
     span_printers = await _span_printer_ids(db)
     evidence = await _load_evidence(db, printer_ids=span_printers)
-    facts = await _load_window(db, window, roster=roster, evidence=evidence, printer_ids=span_printers, now=moment)
+    since = await _history_since(db)
+    facts = await _load_window(
+        db, window, roster=roster, evidence=evidence, printer_ids=span_printers, now=moment, history_since=since
+    )
     previous_from, previous_to = previous_window(date_from, date_to)
     previous = await _load_window(
         db,
@@ -173,6 +176,7 @@ async def overview(
         evidence=evidence,
         printer_ids=span_printers,
         now=moment,
+        history_since=since,
         include_output=False,
     )
 
@@ -208,6 +212,9 @@ async def printer_intervals(
         evidence=await _load_evidence(db, printer_ids=[printer_id], printer_id=printer_id),
         printer_ids=[printer_id],
         now=moment,
+        # The drill-down lists intervals and computes no rate, so nothing reads it
+        # here; it is passed for one timeline shape rather than two.
+        history_since=None,
         printer_id=printer_id,
         include_output=False,
     )
@@ -259,20 +266,38 @@ async def status_now(db: AsyncSession, *, now: datetime | None = None, tz: tzinf
         by_class[klass.key] = by_class.get(klass.key, 0) + 1
 
     recording_since = await db.scalar(select(func.min(PrinterObservationSpan.started_at)))
-    first_incident = await db.scalar(select(func.min(PrinterIncident.created_at)))
     return FleetStatus(
         generated_at=moment,
         site_today=site_today(moment, tz),
         tz_name=zone_name(moment, tz),
         recording_since=recording_since,
-        # What "all time" resolves to: the ledger reaches further back than the
-        # recorder, and a range that stopped at the first span would silently drop
-        # every fault the farm has a durable record of.
-        history_since=min([value for value in (recording_since, first_incident) if value is not None], default=None),
+        history_since=await _history_since(db, recording_since=recording_since),
         printers=printers,
         counts_by_group=by_group,
         counts_by_class=by_class,
     )
+
+
+async def _history_since(db: AsyncSession, *, recording_since: datetime | None = None) -> datetime | None:
+    """The earliest instant the farm has ANY evidence for. ``None`` before either exists.
+
+    THE one origin of that instant, because two consumers would otherwise define it
+    twice: it is what "all time" resolves to on the live tile, and it is what tells a
+    downtime rate which buckets could have been known about. The ledger reaches
+    further back than the recorder — fault history predates the first span by weeks on
+    this farm — so a reader that stopped at the first span would silently drop every
+    fault the farm has a durable record of.
+
+    ``recording_since`` is passed in by a caller that already has it, so the live tile
+    costs one scalar rather than two.
+    """
+    first_span = (
+        recording_since
+        if recording_since is not None
+        else await db.scalar(select(func.min(PrinterObservationSpan.started_at)))
+    )
+    first_incident = await db.scalar(select(func.min(PrinterIncident.created_at)))
+    return min([value for value in (first_span, first_incident) if value is not None], default=None)
 
 
 def utcnow() -> datetime:
@@ -376,6 +401,9 @@ class _WindowFacts:
     prints: list[projections.PrintLogRow]
     units: list[projections.UnitRow]
     episodes: list[projections.EpisodeRow]
+    #: Whole-table, window-independent: the earliest evidence of any kind. A rate that
+    #: divides by "days the farm could have known about" reads it.
+    history_since: datetime | None
 
 
 async def _load_window(
@@ -386,6 +414,7 @@ async def _load_window(
     evidence: list[PrinterEvidence],
     printer_ids: Sequence[int],
     now: datetime,
+    history_since: datetime | None,
     printer_id: int | None = None,
     include_output: bool = True,
 ) -> _WindowFacts:
@@ -402,6 +431,7 @@ async def _load_window(
         incidents = [row for row in incidents if row.printer_id == printer_id]
     return _WindowFacts(
         window=window,
+        history_since=history_since,
         roster=roster,
         spans=await _load_spans(db, window, printer_ids=printer_ids, now=now, printer_id=printer_id),
         incidents=incidents,
@@ -659,6 +689,7 @@ def _build(facts: _WindowFacts, now: datetime) -> FleetTimeline:
         spans=facts.spans,
         incidents=facts.incident_rows,
         evidence=facts.evidence,
+        history_since=facts.history_since,
     )
 
 

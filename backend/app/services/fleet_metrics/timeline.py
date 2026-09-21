@@ -210,14 +210,21 @@ def _base_to_bucket(base: tuple[BucketEdge, ...], buckets: tuple[BucketEdge, ...
 
 @dataclass(frozen=True, slots=True)
 class BucketHeader:
-    """The arithmetic every series divides by, computed once and shared.
+    """The three widths every series divides by, computed once and shared.
 
     ``seconds`` is the bucket's full wall-clock width; ``elapsed_seconds`` is that
-    width clamped to ``now`` (0 for a bucket entirely in the future). **Averages and
-    rates divide by ELAPSED**, never by the width and never by ``observed_seconds``,
-    so a half-finished current day compares fairly with a complete previous one and a
-    recorder outage shows up as unobserved time rather than silently inflating every
-    other class.
+    width clamped to ``now`` (0 for a bucket entirely in the future);
+    ``observed_seconds`` is the length of the OBSERVED MASK inside it — how long the
+    farm was being watched at all.
+
+    **Which one a figure divides by is the figure's own question, and the two are not
+    interchangeable.** A fleet STATE average ("how many printers were printing")
+    divides by ``observed_seconds``, because it can only be measured where something
+    was measuring: dividing it by elapsed time would dilute it by however long nobody
+    was watching, which on a farm whose recorder is an hour old reports a fleet of
+    twelve as a fleet of one. A rate over COMPLETE data (prints per day) divides by
+    ``elapsed_seconds``, because the print log knows the whole window and the recorder
+    has no say in it. The matrix divides by neither — it reports seconds.
     """
 
     start: datetime
@@ -277,6 +284,17 @@ class FleetTimeline:
     headers: tuple[BucketHeader, ...]
     #: The whole window as one cell, by the same re-aggregation.
     total: BucketHeader
+    #: THE OBSERVED MASK: the merged, disjoint, ascending stretches in which the farm
+    #: was being watched at all — the union of every printer's span coverage, clipped
+    #: to the window. Its LENGTH per bucket is ``observed_seconds``; the intervals
+    #: themselves are kept because the fleet's state figures are measured inside it
+    #: (see the projections' rule A), and a length cannot clip anything.
+    observed_mask: tuple[tuple[datetime, datetime], ...]
+    #: The earliest instant the farm has ANY evidence for, fleet-wide and over the
+    #: whole table — the earlier of the first span and the first incident. ``None``
+    #: before either exists. It is what tells a rate which buckets COULD have been
+    #: known about, as opposed to those that predate the record entirely.
+    history_since: datetime | None
 
     @property
     def printers_known(self) -> int:
@@ -292,6 +310,7 @@ def build_timeline(
     spans: Sequence[SpanRow],
     incidents: Sequence[IncidentRow],
     evidence: Sequence[PrinterEvidence],
+    history_since: datetime | None = None,
 ) -> FleetTimeline:
     """Fold the window's rows into one classified timeline. Pure; O(n log n).
 
@@ -347,8 +366,9 @@ def build_timeline(
             )
         )
 
+    mask = _union(union_input)
     union = [0.0] * len(base)
-    _add_seconds(_union(union_input), base_starts, base_ends, union)
+    _add_seconds(mask, base_starts, base_ends, union)
     base_headers = tuple(
         BucketHeader(
             start=edge.start,
@@ -368,6 +388,8 @@ def build_timeline(
         base_headers=base_headers,
         headers=headers,
         total=_sum_headers(headers, window.start, window.end, window.grid.buckets[0].utc_offset_minutes),
+        observed_mask=tuple(mask),
+        history_since=history_since,
     )
 
 

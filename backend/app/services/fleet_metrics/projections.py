@@ -1,26 +1,51 @@
 """Every fleet figure, as a pure projection of ONE timeline.
 
 Nothing here re-reads a row set or re-derives a number that another function already
-owns: the class seconds are summed once (:func:`class_totals`), every average and
-rate divides them by the bucket's ELAPSED seconds, the window totals re-aggregate the
-same seconds rather than averaging the buckets' averages, and the summary card reads
-the series' own numbers instead of computing a second version of them.
+owns: the class seconds are summed once (:func:`class_totals`), each figure divides
+them by the ONE coverage its own question is answerable over, the window totals
+re-aggregate the same seconds rather than averaging the buckets' averages, and the
+summary card reads the series' own numbers instead of computing a second version of
+them.
 
-**The identities this module is built to keep exact** — each is stated again beside
-the code that produces it, and pinned in ``test_fleet_metrics_series.py``:
+**Two coverages, on purpose, and which one a figure uses is the whole design.**
 
-a. per bucket, the class seconds of all printers sum to ``printers_known ×
-   elapsed_seconds``, so the per-class average concurrent printers sum to
-   ``printers_known``;
-b. ``printers_in_fleet = printers_known − avg(out_of_fleet) − avg(not_recorded)``;
+A fleet STATE figure is a measurement, and it is measured INSIDE THE OBSERVED MASK:
+per bucket, every printer's class seconds are clipped to the mask ``M`` (the union of
+all span coverage in that bucket) and divided by ``|M|``. Production made the case:
+with the recorder 45 minutes old and 44 days of ledger behind it, dividing by elapsed
+time reported a twelve-printer farm as ``printers_in_fleet = 1.29`` and
+``avg_printing = 0.04`` while eight machines were visibly printing. Every one of those
+figures satisfied the old identity exactly — the identity held and the headline lied,
+because the denominator counted time nobody was watching.
+
+The MATRIX keeps the other coverage: per printer × bucket seconds over the FULL
+elapsed bucket, ledger evidence included, because a fault that stood through a
+recorder gap really was that printer's downtime and an operator asking "why was 009
+down on the 3rd" must be shown it. So the matrix and the fleet averages deliberately
+disagree about a recorder gap, and each is right about its own question.
+
+**The identities, under that rule** — each stated again beside the code that produces
+it, and pinned in ``test_fleet_metrics_series.py``:
+
+a. in an OBSERVED bucket, every known printer contributes exactly ``|M|`` clipped
+   seconds across all classes (a printer with no span of its own reads *unobserved*
+   there), so the per-group average concurrent printers sum to ``printers_known``;
+b. ``printers_in_fleet = printers_known − avg(out_of_fleet) − avg(not_recorded)``,
+   over the same mask;
 c. the down causes sum to down;
-d. the printers' down seconds ÷ elapsed is the fleet's ``avg_down``;
-e. day cells re-aggregate EXACTLY into week cells and into the window totals;
-f. ``avg_down ≤ peak_down ≤ printers_known``;
+d. the printers' clipped down seconds ÷ ``|M|`` is the fleet's ``avg_down``;
+e. day cells re-aggregate EXACTLY into week cells and into the window totals — sums
+   of clipped seconds over sums of ``|M|``, never an average of averages;
+f. ``avg_down ≤ peak_down ≤ printers_known`` (the peak stays a maximum over
+   everything KNOWN in the bucket, ledger included, so it can only be larger);
 g. the ``down:fault`` seconds are at most the incident-held seconds clipped to the
    window (equal only when nothing was observed running through the hold);
-h. one printer's intervals sum, per class, to its matrix cell;
-i. the ratios share one denominator, ``scheduled``, and are null without it.
+h. one printer's intervals sum, per class, to its MATRIX cell — the unclipped one;
+i. the ratios share one denominator, ``scheduled``, itself inside the mask, and are
+   null without it.
+
+An ``incidents_only`` bucket measures nothing, so it reports only what the ledger
+knows — fault and planned averages over elapsed time — and withholds the rest.
 
 They are not decoration. They are what lets an operator check any number on the page
 against the matrix beside it, which is the difference between a dashboard that is
@@ -185,19 +210,36 @@ class ClassTotals:
     """
 
     timeline: FleetTimeline
-    #: printer id -> per requested bucket -> class -> seconds.
+    #: printer id -> per requested bucket -> class -> seconds. FULL elapsed bucket,
+    #: ledger evidence included — the MATRIX's coverage (rule C).
     per_printer: dict[int, list[dict[AvailabilityClass, float]]]
-    #: per requested bucket -> class -> seconds, over the whole fleet.
+    #: per requested bucket -> class -> seconds, over the whole fleet. Same coverage.
     fleet: list[dict[AvailabilityClass, float]]
+    #: The same two CLIPPED TO THE OBSERVED MASK — the fleet STATE figures' coverage
+    #: (rule A). Kept beside the unclipped pair rather than replacing it, because the
+    #: matrix and the averages answer different questions about the same intervals.
+    per_printer_masked: dict[int, list[dict[AvailabilityClass, float]]]
+    fleet_masked: list[dict[AvailabilityClass, float]]
     #: printer id -> per requested bucket -> that printer's own observed seconds.
     per_printer_observed: dict[int, list[float]]
     #: per requested bucket -> the most printers down at once inside it.
     peak_down: list[int]
-    #: The same four, re-aggregated over the whole window.
+    #: per requested bucket -> ``printers_known − avg(out_of_fleet) − avg(not_recorded)``
+    #: inside the mask. Computed HERE and read by both the fleet series and the
+    #: per-printer print rate, so the two cannot disagree about how many printers the
+    #: farm had (rule B's denominator is rule A's figure).
+    printers_in_fleet: list[float]
+    #: Elapsed seconds of the buckets that COULD have been known about: observed, or
+    #: ending after the fleet's ``history_since``. The denominator of hours-down-per-day
+    #: — days before any record at all must not dilute a downtime rate.
+    history_elapsed_seconds: float
+    #: The same, re-aggregated over the whole window.
     per_printer_window: dict[int, dict[AvailabilityClass, float]]
     fleet_window: dict[AvailabilityClass, float]
+    fleet_masked_window: dict[AvailabilityClass, float]
     per_printer_observed_window: dict[int, float]
     peak_down_window: int
+    printers_in_fleet_window: float
 
 
 def class_totals(timeline: FleetTimeline) -> ClassTotals:
@@ -214,26 +256,41 @@ def class_totals(timeline: FleetTimeline) -> ClassTotals:
     grid = timeline.window.grid
     base_starts = [header.start for header in timeline.base_headers]
     count = len(timeline.headers)
+    mask = timeline.observed_mask
 
     per_printer: dict[int, list[dict[AvailabilityClass, float]]] = {}
+    per_printer_masked: dict[int, list[dict[AvailabilityClass, float]]] = {}
     per_printer_observed: dict[int, list[float]] = {}
     fleet: list[dict[AvailabilityClass, float]] = [{} for _ in range(count)]
+    fleet_masked: list[dict[AvailabilityClass, float]] = [{} for _ in range(count)]
     down_by_base: list[list[tuple[datetime, datetime]]] = [[] for _ in timeline.base_headers]
 
     for printer in timeline.printers:
         cells: list[dict[AvailabilityClass, float]] = [{} for _ in range(count)]
+        masked_cells: list[dict[AvailabilityClass, float]] = [{} for _ in range(count)]
         observed = [0.0] * count
         for position, seconds in enumerate(printer.observed_seconds):
             observed[grid.base_to_bucket[position]] += seconds
+        # One forward pointer per printer: this printer's intervals ascend and the mask
+        # ascends, so the clip never rescans.
+        cursor = 0
         for interval in printer.intervals:
             base_position = bucket_index(base_starts, interval.start)
             index = grid.base_to_bucket[base_position]
             seconds = interval.seconds
             cells[index][interval.klass] = cells[index].get(interval.klass, 0.0) + seconds
             fleet[index][interval.klass] = fleet[index].get(interval.klass, 0.0) + seconds
+            # ...and the same interval again, inside the mask. An interval lies wholly
+            # within one base cell (the sweep's merge stops at grid cuts), so whatever
+            # survives the clip belongs to that same cell.
+            cursor, clipped = _clip_seconds(interval.start, interval.end, mask, cursor)
+            if clipped:
+                masked_cells[index][interval.klass] = masked_cells[index].get(interval.klass, 0.0) + clipped
+                fleet_masked[index][interval.klass] = fleet_masked[index].get(interval.klass, 0.0) + clipped
             if interval.klass.is_down:
                 down_by_base[base_position].append((interval.start, interval.end))
         per_printer[printer.printer_id] = cells
+        per_printer_masked[printer.printer_id] = masked_cells
         per_printer_observed[printer.printer_id] = observed
 
     peak_down = [0] * count
@@ -241,16 +298,81 @@ def class_totals(timeline: FleetTimeline) -> ClassTotals:
         index = grid.base_to_bucket[base_position]
         peak_down[index] = max(peak_down[index], _peak(intervals))
 
+    known = timeline.printers_known
+    fleet_masked_window = _merge(fleet_masked)
     return ClassTotals(
         timeline=timeline,
         per_printer=per_printer,
         fleet=fleet,
+        per_printer_masked=per_printer_masked,
+        fleet_masked=fleet_masked,
         per_printer_observed=per_printer_observed,
         peak_down=peak_down,
+        printers_in_fleet=[
+            _printers_in_fleet(fleet_masked[index], header.observed_seconds, known)
+            for index, header in enumerate(timeline.headers)
+        ],
+        history_elapsed_seconds=_history_elapsed(timeline),
         per_printer_window={printer_id: _merge(cells) for printer_id, cells in per_printer.items()},
         fleet_window=_merge(fleet),
+        fleet_masked_window=fleet_masked_window,
         per_printer_observed_window={printer_id: sum(values) for printer_id, values in per_printer_observed.items()},
         peak_down_window=max(peak_down, default=0),
+        printers_in_fleet_window=_printers_in_fleet(fleet_masked_window, timeline.total.observed_seconds, known),
+    )
+
+
+def _clip_seconds(
+    start: datetime, end: datetime, mask: tuple[tuple[datetime, datetime], ...], cursor: int
+) -> tuple[int, float]:
+    """Seconds of ``[start, end)`` that fall inside the observed mask, and the cursor.
+
+    The mask is disjoint and ascending, so this is a merge step rather than a search:
+    the cursor is only ever advanced past stretches that end before ``start``, which is
+    safe because the caller feeds intervals in ascending order.
+    """
+    while cursor < len(mask) and mask[cursor][1] <= start:
+        cursor += 1
+    total = 0.0
+    index = cursor
+    while index < len(mask) and mask[index][0] < end:
+        low = max(start, mask[index][0])
+        high = min(end, mask[index][1])
+        if high > low:
+            total += (high - low).total_seconds()
+        if mask[index][1] >= end:
+            break
+        index += 1
+    return cursor, total
+
+
+def _printers_in_fleet(masked: dict[AvailabilityClass, float], observed: float, known: int) -> float:
+    """Identity (b), inside the mask: the roster less what was measured as not in it.
+
+    0.0 where nothing was observed. The schema's field is not nullable, so a bucket
+    that measured nothing reports the one value that cannot be mistaken for a
+    measurement — and the summary row that an operator actually reads is withheld
+    outright there (see :func:`compose_summary`).
+    """
+    if observed <= 0:
+        return 0.0
+    groups = _by_group(masked)
+    return known - groups.get(GROUP_OUT_OF_FLEET, 0.0) / observed - groups.get(GROUP_NOT_RECORDED, 0.0) / observed
+
+
+def _history_elapsed(timeline: FleetTimeline) -> float:
+    """Elapsed seconds of the buckets the farm could have known anything about.
+
+    A bucket counts when it was observed, or when it ends after the first evidence of
+    any kind exists — the ledger could have carried a fault there. Buckets that predate
+    the record entirely are excluded, because dividing a printer's downtime by days on
+    which nothing could have been recorded reports a broken machine as a healthy one.
+    """
+    since = timeline.history_since
+    return sum(
+        header.elapsed_seconds
+        for header in timeline.headers
+        if header.observed_seconds > 0 or (since is not None and header.end > since)
     )
 
 
@@ -310,33 +432,24 @@ def _down_seconds(cell: dict[AvailabilityClass, float]) -> float:
     return sum(seconds for klass, seconds in cell.items() if klass.is_down)
 
 
-def _in_service_seconds(cell: dict[AvailabilityClass, float], elapsed: float, printers_known: int) -> float:
-    """Printer-seconds this bucket had machines to print with.
-
-    Elapsed printer-seconds less the time printers were out of the fleet or had no
-    record at all. It is the denominator of every PER-PRINTER rate, so a fleet that
-    doubled halfway through a window is not charged with the second half's printers
-    for the first half.
-    """
-    groups = _by_group(cell)
-    return max(
-        0.0,
-        printers_known * elapsed - groups.get(GROUP_OUT_OF_FLEET, 0.0) - groups.get(GROUP_NOT_RECORDED, 0.0),
-    )
-
-
-def _scheduled_seconds(cell: dict[AvailabilityClass, float], elapsed: float, printers_known: int) -> float:
+def _scheduled_seconds(masked: dict[AvailabilityClass, float], observed: float, printers_known: int) -> float:
     """Printer-seconds the farm was actually expected to be producing in.
 
-    Identity (i)'s single denominator: elapsed printer-seconds less the time nobody
-    could have printed in anyway — out of fleet, before recording, unobserved, and
-    planned maintenance. Uptime and time-printing share it, so the two ratios are
-    always comparable and neither can be improved by changing what it divides by.
+    Identity (i)'s single denominator, INSIDE THE MASK: observed printer-seconds less
+    the time nobody could have printed in anyway — out of fleet, before recording,
+    unobserved, and planned maintenance. Uptime and time-printing share it, so the two
+    ratios are always comparable and neither can be improved by changing what it
+    divides by.
+
+    Measuring it inside the mask is what stops the two halves of the ratio coming from
+    different coverages: the ledger knows a printer's fault for the whole elapsed day
+    while the recorder knows its printing for one observed hour, and a ratio built from
+    both reads as an availability collapse that never happened.
     """
-    groups = _by_group(cell)
+    groups = _by_group(masked)
     return max(
         0.0,
-        printers_known * elapsed
+        printers_known * observed
         - groups.get(GROUP_OUT_OF_FLEET, 0.0)
         - groups.get(GROUP_NOT_RECORDED, 0.0)
         - groups.get(GROUP_UNOBSERVED, 0.0)
@@ -345,7 +458,7 @@ def _scheduled_seconds(cell: dict[AvailabilityClass, float], elapsed: float, pri
 
 
 def _ratios(
-    cell: dict[AvailabilityClass, float], header: BucketHeader, printers_known: int
+    masked: dict[AvailabilityClass, float], header: BucketHeader, printers_known: int
 ) -> tuple[float | None, float | None]:
     """``(uptime, time_printing)``, or ``(None, None)`` where neither has a meaning.
 
@@ -355,10 +468,10 @@ def _ratios(
     """
     if header.elapsed_seconds <= 0 or header.observed_seconds <= 0:
         return None, None
-    scheduled = _scheduled_seconds(cell, header.elapsed_seconds, printers_known)
+    scheduled = _scheduled_seconds(masked, header.observed_seconds, printers_known)
     if scheduled <= 0:
         return None, None
-    groups = _by_group(cell)
+    groups = _by_group(masked)
     uptime = (scheduled - groups.get(GROUP_DOWN, 0.0)) / scheduled
     return uptime, groups.get(GROUP_PRINTING, 0.0) / scheduled
 
@@ -384,10 +497,14 @@ def _sparse_counts(values: dict[str, int]) -> dict[str, int]:
 def fleet_series(totals: ClassTotals) -> SeriesEnvelope[FleetSeriesValues]:
     """The fleet over time, in AVERAGE CONCURRENT PRINTERS per class.
 
-    Identity (a) lives here: every class second of every printer is divided by the
-    same elapsed seconds, so the per-group averages sum to ``printers_known`` for any
-    bucket that has elapsed at all. Identity (b) then follows by subtraction rather
-    than by a second count of the roster.
+    Identity (a) lives here: inside the observed mask every known printer accounts for
+    exactly ``|M|`` seconds across all classes, so dividing the clipped class seconds
+    by ``|M|`` makes the per-group averages sum to ``printers_known``. Identity (b)
+    then follows by subtraction rather than by a second count of the roster.
+
+    Window totals re-aggregate the same way — Σ clipped seconds ÷ Σ ``|M|``, both taken
+    over the observed buckets, since an unobserved bucket contributes nothing to
+    either. Identity (e) is that sum, never an average of averages.
     """
     timeline = totals.timeline
     known = timeline.printers_known
@@ -399,38 +516,78 @@ def fleet_series(totals: ClassTotals) -> SeriesEnvelope[FleetSeriesValues]:
             observed_seconds=header.observed_seconds,
             utc_offset_minutes=header.utc_offset_minutes,
             basis=header.basis,
-            values=_fleet_values(totals.fleet[index], header, known, totals.peak_down[index]),
+            values=_fleet_values(
+                totals.fleet_masked[index],
+                totals.fleet[index],
+                header,
+                known,
+                totals.peak_down[index],
+                totals.printers_in_fleet[index],
+            ),
         )
         for index, header in enumerate(timeline.headers)
     ]
     return SeriesEnvelope[FleetSeriesValues](
         buckets=buckets,
-        totals=_fleet_values(totals.fleet_window, timeline.total, known, totals.peak_down_window),
+        totals=_fleet_values(
+            totals.fleet_masked_window,
+            totals.fleet_window,
+            timeline.total,
+            known,
+            totals.peak_down_window,
+            totals.printers_in_fleet_window,
+        ),
     )
 
 
 def _fleet_values(
-    cell: dict[AvailabilityClass, float], header: BucketHeader, known: int, peak: int
+    masked: dict[AvailabilityClass, float],
+    ledger: dict[AvailabilityClass, float],
+    header: BucketHeader,
+    known: int,
+    peak: int,
+    in_fleet: float,
 ) -> FleetSeriesValues:
-    elapsed = header.elapsed_seconds
-    # A bucket entirely in the future has elapsed no time, so every average over it is
-    # 0/0. It answers with empty maps rather than zeros: nothing happened in it because
-    # it has not happened yet, which is not the same statement as "nothing happened".
+    """One bucket's state figures, from whichever evidence the bucket actually has.
+
+    Three cases, and they are three different statements:
+
+    * OBSERVED — the mask has length, so every figure is a measurement inside it;
+    * ``incidents_only`` — nothing was watched, so only what the LEDGER knows is
+      reported (fault and planned averages, over elapsed time) and the rest is
+      withheld. Reporting a printing average of zero there would be indistinguishable
+      from a farm that genuinely printed nothing;
+    * not yet elapsed — a future bucket answers with empty maps rather than zeros:
+      nothing happened in it because it has not happened yet.
+    """
     averages: dict[str, float] = {}
     causes: dict[str, float] = {}
-    in_fleet = 0.0
-    if elapsed > 0:
-        averages = {group: seconds / elapsed for group, seconds in _by_group(cell).items()}
-        causes = {cause: seconds / elapsed for cause, seconds in _down_by_cause(cell).items()}
-        # Identity (b), by subtraction from the roster rather than by a second count.
-        in_fleet = known - averages.get(GROUP_OUT_OF_FLEET, 0.0) - averages.get(GROUP_NOT_RECORDED, 0.0)
-    uptime, time_printing = _ratios(cell, header, known)
+    if header.observed_seconds > 0:
+        observed = header.observed_seconds
+        averages = {group: seconds / observed for group, seconds in _by_group(masked).items()}
+        causes = {cause: seconds / observed for cause, seconds in _down_by_cause(masked).items()}
+    elif header.elapsed_seconds > 0:
+        elapsed = header.elapsed_seconds
+        # The ledger's own two groups and nothing else. A fault or a declared hold is
+        # durable evidence the recorder's absence cannot erase, and it is the only
+        # thing an unwatched bucket can honestly report.
+        averages = {
+            group: seconds / elapsed
+            for group, seconds in _by_group(ledger).items()
+            if group in (GROUP_DOWN, GROUP_PLANNED)
+        }
+        causes = {cause: seconds / elapsed for cause, seconds in _down_by_cause(ledger).items()}
+    uptime, time_printing = _ratios(masked, header, known)
     return FleetSeriesValues(
         printers_known=known,
         printers_in_fleet=in_fleet,
         avg_by_group=_sparse(averages),
         avg_down_by_cause=_sparse(causes),
         avg_down=averages.get(GROUP_DOWN, 0.0),
+        # Deliberately NOT clipped: the peak answers "how bad did it get", and a fault
+        # the ledger proves stood through a recorder gap was as bad as it looked. It is
+        # therefore an upper bound on ``avg_down`` from a strictly larger evidence set,
+        # which is what keeps identity (f) true rather than accidental.
         peak_down=peak,
         uptime=uptime,
         time_printing=time_printing,
@@ -443,9 +600,19 @@ def _fleet_values(
 def matrix(totals: ClassTotals, prints: PrintTally) -> MatrixProjection:
     """Printer × bucket: where the time went, and what came out.
 
+    **The matrix keeps the FULL elapsed bucket, ledger evidence included** — the other
+    coverage from the fleet averages above, deliberately. The two answer different
+    questions: an average asks "how many printers were printing", which can only be
+    measured where something was measuring, while a cell asks "what was THIS printer
+    doing on the 3rd", and a fault the incident ledger proves stood through a recorder
+    gap is that printer's downtime whether or not anyone was watching. Clipping the
+    matrix to the observed mask would erase exactly the evidence an operator opens it
+    to find.
+
     Identity (h): a cell's ``class_seconds`` are exactly the intervals
     :func:`printer_intervals` lists for the same printer and bucket, because both read
-    the one timeline and neither re-classifies anything.
+    the one timeline and neither re-classifies anything — which is only true because
+    the cell is the unclipped fold.
     """
     timeline = totals.timeline
     per_printer_prints, fleet_prints = prints.per_printer, prints.fleet
@@ -506,14 +673,23 @@ def _cell(cell: dict[AvailabilityClass, float], prints: dict[str, int], observed
 def _matrix_printer(
     totals: ClassTotals, printer: PrinterTimeline, per_printer_prints: dict[int, dict[int, dict[str, int]]]
 ) -> MatrixPrinter:
-    """One row's identity plus its two per-day figures, over its IN-SERVICE time.
+    """One row's identity plus its two per-day figures — ONE COVERAGE PER RATE.
 
-    Both rates share the in-service denominator, so a printer deactivated for half the
-    window is not reported as half as busy as it was — and a printer with no service
-    time at all answers null rather than zero, which is a different statement.
+    The two rates deliberately divide by different denominators, because their
+    numerators come from different records and mixing them is what produced "48 prints
+    a day" for a printer that made twenty in a week:
+
+    * ``prints_per_day`` counts COMPLETED prints, and the print log is complete for the
+      whole window, so it divides by the window's elapsed days. The recorder has no say
+      in this number at all;
+    * ``hours_down_per_day`` counts observed and ledger-known downtime, so it divides
+      by the elapsed days of the buckets that could have known anything — days before
+      the farm kept any record must not dilute a downtime rate toward zero.
+
+    Null, not zero, where a denominator does not exist: "we cannot say" and "none" are
+    different answers.
     """
     cell = totals.per_printer_window[printer.printer_id]
-    in_service = _in_service_seconds(cell, totals.timeline.total.elapsed_seconds, printers_known=1)
     completed = _fold_counts(per_printer_prints.get(printer.printer_id, {}).values()).get(OUTCOME_COMPLETED, 0)
     down_hours = _down_seconds(cell) / _SECONDS_PER_HOUR
     return MatrixPrinter(
@@ -522,8 +698,8 @@ def _matrix_printer(
         model=printer.model,
         is_active=printer.is_active,
         deleted=printer.deleted,
-        hours_down_per_day=_rate(down_hours, in_service),
-        prints_per_day=_rate(completed, in_service),
+        hours_down_per_day=_rate(down_hours, totals.history_elapsed_seconds),
+        prints_per_day=_rate(completed, totals.timeline.total.elapsed_seconds),
     )
 
 
@@ -582,41 +758,69 @@ def throughput(totals: ClassTotals, prints: PrintTally) -> SeriesEnvelope[Throug
     """
     timeline = totals.timeline
     per_printer, fleet = prints.per_printer, prints.fleet
-    buckets = [
-        SeriesBucket[ThroughputValues](
-            start=header.start,
-            seconds=header.seconds,
-            elapsed_seconds=header.elapsed_seconds,
-            observed_seconds=header.observed_seconds,
-            utc_offset_minutes=header.utc_offset_minutes,
-            values=_throughput_values(
-                fleet.get(index, {}),
-                {printer_id: cells[index] for printer_id, cells in per_printer.items() if index in cells},
-                totals.fleet[index],
-                header,
-                timeline.printers_known,
-            ),
+    # The per-printer rate's denominator, accumulated as PRINTER-DAYS over the observed
+    # buckets only, so the window figure is the sum of the same products the buckets
+    # divided by — never an average of per-bucket rates.
+    printer_days = 0.0
+    completed_observed = 0
+    buckets: list[SeriesBucket[ThroughputValues]] = []
+    for index, header in enumerate(timeline.headers):
+        bucket_counts = fleet.get(index, {})
+        bucket_days = _bucket_printer_days(header, totals.printers_in_fleet[index])
+        if bucket_days is not None:
+            printer_days += bucket_days
+            completed_observed += bucket_counts.get(OUTCOME_COMPLETED, 0)
+        buckets.append(
+            SeriesBucket[ThroughputValues](
+                start=header.start,
+                seconds=header.seconds,
+                elapsed_seconds=header.elapsed_seconds,
+                observed_seconds=header.observed_seconds,
+                utc_offset_minutes=header.utc_offset_minutes,
+                values=_throughput_values(
+                    bucket_counts,
+                    {printer_id: cells[index] for printer_id, cells in per_printer.items() if index in cells},
+                    header.elapsed_seconds,
+                    bucket_days,
+                    bucket_counts.get(OUTCOME_COMPLETED, 0),
+                ),
+            )
         )
-        for index, header in enumerate(timeline.headers)
-    ]
     return SeriesEnvelope[ThroughputValues](
         buckets=buckets,
         totals=_throughput_values(
             _fold_counts(fleet.values()),
             {printer_id: _fold_counts(cells.values()) for printer_id, cells in per_printer.items()},
-            totals.fleet_window,
-            timeline.total,
-            timeline.printers_known,
+            timeline.total.elapsed_seconds,
+            printer_days if printer_days > 0 else None,
+            completed_observed,
         ),
     )
+
+
+def _bucket_printer_days(header: BucketHeader, printers_in_fleet: float) -> float | None:
+    """Printer-days this bucket can charge a per-printer rate to, or ``None``.
+
+    ``printers_in_fleet`` × the bucket's ELAPSED days: the count of machines is a
+    measurement (rule A, inside the mask) while the days are the whole bucket, because
+    the numerator — completed prints — is known for the whole bucket too. One coverage
+    per ratio, and this ratio's is the bucket.
+
+    ``None`` on a bucket that measured nothing: the print count is still real, but
+    there is no measured fleet size to divide it among, and dividing by the roster
+    instead would quietly turn an unmeasured period into a per-printer figure.
+    """
+    if header.observed_seconds <= 0 or header.elapsed_seconds <= 0 or printers_in_fleet <= 0:
+        return None
+    return printers_in_fleet * header.elapsed_seconds / _SECONDS_PER_DAY
 
 
 def _throughput_values(
     by_outcome: dict[str, int],
     by_printer: dict[int, dict[str, int]],
-    cell: dict[AvailabilityClass, float],
-    header: BucketHeader,
-    printers_known: int,
+    elapsed_seconds: float,
+    printer_days: float | None,
+    completed_for_rate: int,
 ) -> ThroughputValues:
     completed = by_outcome.get(OUTCOME_COMPLETED, 0)
     failed = by_outcome.get(OUTCOME_FAILED, 0)
@@ -625,8 +829,15 @@ def _throughput_values(
         by_outcome=_sparse_counts(by_outcome),
         total=sum(by_outcome.values()),
         by_printer={printer_id: _sparse_counts(counts) for printer_id, counts in by_printer.items() if counts},
-        prints_per_day=_rate(completed, header.elapsed_seconds),
-        prints_per_printer_per_day=_rate(completed, _in_service_seconds(cell, header.elapsed_seconds, printers_known)),
+        # The print log is complete for its own history, so this divides by elapsed time
+        # and answers for every bucket, observed or not.
+        prints_per_day=_rate(completed, elapsed_seconds),
+        # ...whereas the per-printer rate needs a measured fleet size, so it answers
+        # only where one exists. ``completed_for_rate`` is the count over the same
+        # buckets the denominator was accumulated from.
+        prints_per_printer_per_day=(
+            completed_for_rate / printer_days if printer_days is not None and printer_days > 0 else None
+        ),
         # Cancelled prints are outside the ratio on purpose: an operator stopping a
         # print is not the printer failing to deliver one.
         success_pct=completed / judged if judged else None,
