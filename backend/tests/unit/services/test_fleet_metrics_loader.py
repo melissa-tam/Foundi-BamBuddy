@@ -15,7 +15,7 @@ idle while its own card says offline is worse than no page.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -34,6 +34,7 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.models.printer_observation_span import PLATE_PHASE_CLEAR, PLATE_PHASE_HELD, PrinterObservationSpan
 from backend.app.models.sku import Sku, SkuFile
+from backend.app.schemas.fleet_metrics import FleetOverview
 from backend.app.services import printer_incidents
 from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.fleet_metrics import loader
@@ -48,6 +49,31 @@ HOUR = timedelta(hours=1)
 # 2026-09-01 00:00 in New York (EDT), as the naive UTC every table stores.
 SEP1 = datetime(2026, 9, 1, 4, 0, 0)
 NOW = SEP1 + timedelta(days=2)
+
+
+class _SeasonalZone(tzinfo):
+    """A zone whose display NAME changes with the season while its offset does not.
+
+    The defect this pins cannot be caught with a ``ZoneInfo``: that answers its KEY
+    ("America/New_York") whatever instant it is asked about, so a name read at the
+    wrong moment looks identical to one read at the right moment. A real OS zone on
+    the farm PC does not behave that way — it answers "...Standard Time" for half the
+    year — and this stands in for one. The offset is deliberately fixed, so the grid
+    arithmetic stays boring and the only variable under test is the NAME.
+    """
+
+    WINTER = "TEST-WINTER"
+    SUMMER = "TEST-SUMMER"
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return timedelta(hours=-5)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return self.WINTER if dt is not None and dt.month <= 3 else self.SUMMER
+
 
 # 2 Sep as a site day — the one-bucket window the straddler pins read. September holds
 # no transition, so its two midnights really are 24 h apart.
@@ -497,6 +523,133 @@ class TestStatusNow:
 
         assert result.recording_since == SEP1
         assert result.history_since == older
+
+
+class TestEveryEnvelopeIsDense:
+    """One response, one grid: every series has a cell for every bucket, in order.
+
+    A bucket with nothing in it is a ZERO, not an absence. Absence is what ``basis``
+    and ``observed_seconds`` say, and the client aligns the series by bucket INDEX —
+    so a series that omitted its empty cells would silently shift a chart's whole tail
+    against the axis it is drawn under.
+
+    Note the two nesting levels: ``fleet_series``, ``throughput`` and ``units`` ARE
+    envelopes, while ``matrix`` and ``recovery`` wrap theirs beside a dimension that is
+    not per-bucket (the roster; the incident ledger). ``cycle`` has no bucket dimension
+    at all — medians do not re-aggregate, so it is deliberately not a series.
+    """
+
+    @staticmethod
+    def _envelopes(result) -> dict[str, object]:
+        return {
+            "fleet_series": result.fleet_series,
+            "throughput": result.throughput,
+            "units": result.units,
+            "matrix.series": result.matrix.series,
+            "recovery.series": result.recovery.series,
+        }
+
+    def _assert_dense(self, result) -> None:
+        grid = [bucket.start for bucket in result.fleet_series.buckets]
+        assert grid, "a valid window always has at least one bucket"
+        for name, envelope in self._envelopes(result).items():
+            assert [bucket.start for bucket in envelope.buckets] == grid, name
+        for row in result.summary.rows:
+            assert len(row.series) == len(grid), row.key
+
+    @pytest.mark.parametrize(
+        ("label", "date_from", "date_to", "bucket"),
+        [
+            ("populated day grid", date(2026, 9, 1), date(2026, 9, 2), "day"),
+            ("populated hour grid", date(2026, 9, 1), date(2026, 9, 1), "hour"),
+            ("empty window, before any row", date(2026, 7, 1), date(2026, 7, 31), None),
+            ("window running into the future", date(2026, 9, 1), date(2026, 9, 6), "day"),
+            ("week grid", date(2026, 6, 1), date(2026, 8, 31), "week"),
+        ],
+    )
+    async def test_every_series_covers_the_whole_grid(self, db_session, label, date_from, date_to, bucket):
+        await _seed(db_session)
+        result = await loader.overview(db_session, date_from=date_from, date_to=date_to, bucket=bucket, now=NOW, tz=NY)
+        self._assert_dense(result)
+
+    async def test_a_window_with_no_incidents_still_has_a_recovery_cell_per_bucket(self, db_session):
+        # The case the live probe raised: no incident OPENED in the window. The series
+        # must read as a run of zeros, not as an empty list.
+        await _seed(db_session)
+        result = await loader.overview(
+            db_session, date_from=date(2026, 7, 1), date_to=date(2026, 7, 31), bucket="day", now=NOW, tz=NY
+        )
+        buckets = result.recovery.series.buckets
+        assert len(buckets) == 31
+        assert all(bucket.values.opened == 0 for bucket in buckets)
+        assert all(bucket.values.opened_by_kind == {} for bucket in buckets)
+        assert result.recovery.series.totals.opened == 0
+
+    async def test_the_grid_survives_the_response_model_round_trip(self, db_session):
+        # What the route actually returns: FastAPI validates and dumps through
+        # ``FleetOverview``, and these envelopes are pydantic GENERICS — the one place
+        # a shape could be lost between the service and the wire.
+        await _seed(db_session)
+        result = await loader.overview(
+            db_session, date_from=date(2026, 9, 1), date_to=date(2026, 9, 2), bucket="day", now=NOW, tz=NY
+        )
+        wire = result.model_dump(mode="json")
+        for name in ("fleet_series", "throughput", "units"):
+            assert len(wire[name]["buckets"]) == 2, name
+        assert len(wire["matrix"]["series"]["buckets"]) == 2
+        assert len(wire["recovery"]["series"]["buckets"]) == 2
+        self._assert_dense(FleetOverview.model_validate(wire))
+
+
+class TestTheZoneLabel:
+    """The zone's NAME is a fact about now, never about the window being asked about."""
+
+    async def test_a_january_window_is_labelled_with_the_zone_name_of_now(self, db_session):
+        # The defect: the label was read at the window's FIRST INSTANT, so "This year"
+        # said Standard Time in September while every other preset on the page said
+        # Daylight Time.
+        await _seed(db_session)
+        zone = _SeasonalZone()
+        result = await loader.overview(
+            db_session, date_from=date(2026, 1, 1), date_to=date(2026, 1, 31), now=NOW, tz=zone
+        )
+        assert result.window_start.month == 1, "the window really does open in winter"
+        assert result.tz_name == _SeasonalZone.SUMMER
+
+    async def test_every_response_names_the_same_zone_for_the_same_moment(self, db_session, status_map):
+        await _seed(db_session)
+        zone = _SeasonalZone()
+        overview = await loader.overview(
+            db_session, date_from=date(2026, 1, 1), date_to=date(2026, 1, 31), now=NOW, tz=zone
+        )
+        detail = await loader.printer_intervals(
+            db_session, 1, date_from=date(2026, 1, 1), date_to=date(2026, 1, 2), now=NOW, tz=zone
+        )
+        live = await loader.status_now(db_session, now=NOW, tz=zone)
+        assert overview.tz_name == detail.tz_name == live.tz_name == _SeasonalZone.SUMMER
+
+    async def test_the_same_window_read_in_winter_names_winter(self, db_session):
+        # The label follows the CLOCK, so it does move — just with now, not with the
+        # range. Same window, a different request moment, a different name.
+        await _seed(db_session)
+        zone = _SeasonalZone()
+        winter = await loader.overview(
+            db_session,
+            date_from=date(2026, 1, 1),
+            date_to=date(2026, 1, 31),
+            now=datetime(2026, 2, 10, 12, 0, 0),
+            tz=zone,
+        )
+        assert winter.tz_name == _SeasonalZone.WINTER
+
+    async def test_per_bucket_offsets_are_still_per_instant(self, db_session):
+        # The per-instant fact stays per-instant: it is what a client renders a label
+        # from, and it is untouched by the name being pinned to now.
+        await _seed(db_session)
+        result = await loader.overview(
+            db_session, date_from=date(2026, 1, 1), date_to=date(2026, 1, 31), now=NOW, tz=_SeasonalZone()
+        )
+        assert {bucket.utc_offset_minutes for bucket in result.fleet_series.buckets} == {-300}
 
 
 class TestStatusCardParity:
