@@ -9,19 +9,26 @@
  * the grid, so the four absence treatments and the heat tile cannot be applied
  * to one element while `tabIndex` and the width are applied to another.
  *
- * ## The four absences, never conflated
+ * ## The five verdicts, never conflated
  *
- * `utils/fleetMetrics.cellAbsence` is the single verdict — this file never
- * re-derives one. The treatments:
+ * `utils/fleetMetrics.cellAbsence` is the single verdict and
+ * `CELL_ABSENCE_LABEL_KEY` its single name — this file re-derives neither. The
+ * treatments:
  *
- *   - `zero` — a dim `0`. The farm earned it.
- *   - `before_recording` — an em dash, with the reason as sr-only text. There
- *     was no recorder yet, so there is no number to be zero.
- *   - `partial` — the sparse hatch over whatever IS known, with the reason as
- *     sr-only text (`No data`, or `Faults and holds only` when the fault
- *     ledger is the bucket's only evidence). A hatched cell may still carry a
- *     real figure: the incident ledger proves fault hours the recorder missed.
+ *   - `zero` — a dim `0`. The farm earned it, and it needs no explaining.
+ *   - `before_recording` — an em dash, named `Before recording`. There was no
+ *     recorder yet, so there is no number to be zero.
+ *   - `incidents_only` — the recorder covered NONE of the bucket, named
+ *     `Faults and holds only`. Whatever figure the cell shows is the ledger's,
+ *     and it is real.
+ *   - `partly_observed` — the recorder fell short of the bucket, named
+ *     `Partly observed`.
  *   - `out_of_fleet` — flat ground, no number. The printer was deactivated.
+ *
+ * Three of the five sit beside a real figure, which is why the name is read
+ * from the VERDICT and not from the bucket's `basis`: `basis: observed` on a
+ * short bucket used to resolve to the `unobserved` leaf, so a hatched cell
+ * showing `12` hours down announced "No data" next to its own number.
  *
  * On a lights-out farm the difference between "zero prints because nothing was
  * queued" and "zero prints because nobody was recording" is the whole point,
@@ -29,6 +36,13 @@
  * hatched and never dashed — the print log is complete for its own history —
  * and `cellAbsence` enforces that from the lens argument, so this file simply
  * renders whatever verdict comes back.
+ *
+ * ## Where the partly-observed texture goes
+ *
+ * On a cell with a FIGURE it is a 4 px band along the bottom edge, never the
+ * full face: the hatch strokes in `currentColor`, which on a heat tile is the
+ * digits' own colour, so a full-face hatch ran stripes through the number the
+ * cell exists to show. `partialMarkerCss` owns that choice.
  *
  * ## No per-cell `aria-label`
  *
@@ -42,7 +56,7 @@ import type { CSSProperties, KeyboardEvent, Ref } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { FleetBucket, MatrixCell } from '../../types/fleetMetrics';
 import {
-  BASIS_LABEL_KEY,
+  CELL_ABSENCE_LABEL_KEY,
   FLEET_ABSENCE_COLOR,
   FLEET_PATTERN_CSS,
   SECONDARY_TEXT_CLASS,
@@ -53,10 +67,13 @@ import {
   formatHours,
   formatPercent,
   hoursDownBand,
+  isPartlyObserved,
   lensRamp,
+  partialMarkerCss,
   printsBand,
   lensValue,
   type AbsenceHeader,
+  type CellAbsence,
   type FleetLens,
   type ResolvedThemeMode,
   type TimeSplit,
@@ -166,28 +183,23 @@ export function FleetMatrixCell({
   const style: CSSProperties = {};
   /** The visible figure, if the cell has one. */
   let text: string | null = null;
-  /** Why this cell has no ordinary number, spoken but not shown. */
-  let reason: string | null = null;
   let bar: TimeSplit | null = null;
   /** An opaque heat tile brings its own proven text colour. */
   let painted = false;
   let dim = false;
 
-  const absence = cell === undefined ? 'before_recording' : cellAbsence(cell, header, { lens });
+  // A cell the payload has no row for is a cell from before this printer was
+  // recorded — the same verdict, reached without a cell to judge.
+  const absence: CellAbsence =
+    cell === undefined ? 'before_recording' : cellAbsence(cell, header, { lens });
 
   if (cell === undefined || absence === 'before_recording') {
     text = '–';
     dim = true;
-    reason = t('fleetMetrics.class.not_recorded');
   } else if (absence === 'out_of_fleet') {
     // Flat ground: not a value and not a zero — the printer was not in the fleet.
     style.backgroundColor = 'var(--bg-primary)';
-    reason = t('fleetMetrics.class.out_of_fleet');
   } else {
-    if (absence === 'partial') {
-      Object.assign(style, FLEET_PATTERN_CSS.sparse);
-      reason = t(BASIS_LABEL_KEY[cell.basis]);
-    }
     dim = absence === 'zero';
 
     if (lens === 'time_split') {
@@ -215,6 +227,16 @@ export function FleetMatrixCell({
     }
   }
 
+  // The partly-observed texture goes on LAST, once it is known whether a figure
+  // is actually on screen to be protected from it — an hour column hides its
+  // digits (14 px), so its whole face is free to carry the hatch.
+  if (isPartlyObserved(absence)) {
+    Object.assign(style, partialMarkerCss(text !== null && !valueHidden));
+  }
+
+  /** What the cell's figure means, spoken but not shown. Its verdict names it. */
+  const reason =
+    absence === null || absence === 'zero' ? null : t(CELL_ABSENCE_LABEL_KEY[absence]);
   const spoken = [valueHidden && text !== null ? text : null, reason].filter(Boolean).join(' ');
 
   return (

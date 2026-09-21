@@ -80,8 +80,23 @@ export function ChartFrame({
               `aria-pressed` on top of that says the same thing a second time,
               in a second vocabulary — "Show chart, pressed" is heard as two
               facts about one control and reads as a contradiction. One signal,
-              and it is the one sighted and screen-reader users share. */}
-          <Button variant="secondary" size="sm" onClick={() => setShowData((shown) => !shown)}>
+              and it is the one sighted and screen-reader users share.
+
+              The ACCESSIBLE name names the chart as well. Six widgets on one
+              grid gave a screen-reader user six controls called "Show data",
+              in a list with nothing to tell them apart and no heading between
+              them; the visible text stays short because a sighted reader has
+              the card's own title right above it. */}
+          <Button
+            variant="secondary"
+            size="sm"
+            aria-label={
+              showData
+                ? t('fleetMetrics.widgets.showChartFor', { chart: title })
+                : t('fleetMetrics.widgets.showDataFor', { chart: title })
+            }
+            onClick={() => setShowData((shown) => !shown)}
+          >
             {showData ? t('fleetMetrics.widgets.showChart') : t('fleetMetrics.widgets.showData')}
           </Button>
         </div>

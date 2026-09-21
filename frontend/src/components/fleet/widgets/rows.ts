@@ -129,7 +129,17 @@ export interface StateRowValues {
   down: number | null;
   /** The recorder's own blind spot, drawn as the sparse-hatch band. */
   unobserved: number | null;
-  in_fleet: number;
+  /**
+   * The roster ceiling — NULL where nobody knows it.
+   *
+   * `printers_in_fleet` is a non-nullable float, and the backend's own identity
+   * for it (`printers_known − out_of_fleet − not_recorded`) has two
+   * recorder-derived terms. On a bucket the recorder never reached it therefore
+   * arrives as `0.0` meaning UNKNOWN, not as a roster of nothing — and a
+   * ceiling line drawn along zero for the first forty days of a window is the
+   * chart stating, in its loudest channel, that the farm had no printers.
+   */
+  in_fleet: number | null;
   peak_down: number | null;
 }
 
@@ -144,16 +154,66 @@ function bucketObserved(basis: string | null, observedSeconds: number): boolean 
   return basis !== 'incidents_only' && observedSeconds > 0;
 }
 
+/**
+ * The two groups a bucket the recorder never reached can still state.
+ *
+ * An open equipment fault and a declared service hold are rows in a LEDGER:
+ * durable, timestamped, and true whether or not the sampler was running. Every
+ * other group is a reading the sampler had to take, so on an `incidents_only`
+ * bucket it is unknown — and unknown is a gap, never a zero.
+ */
+const LEDGER_EVIDENCED_GROUPS: ReadonlySet<FleetGroup> = new Set<FleetGroup>(['down', 'planned']);
+
+/**
+ * One group's band for one bucket, keyed on the bucket's BASIS rather than on
+ * whether the payload happened to carry the field.
+ *
+ * Stated as a rule and not read off the response because the two answers differ
+ * exactly where it matters: a zero the recorder watched and a zero it never saw
+ * arrive on the wire looking identical (a sparse map omits both), and drawing
+ * the second as a band says the farm had nothing printing when the truth is
+ * that nobody was counting.
+ */
 function classValue(
   values: FleetSeriesValues,
   group: FleetGroup,
   observed: boolean,
 ): number | null {
+  if (!observed && !LEDGER_EVIDENCED_GROUPS.has(group)) return null;
   const value = values.avg_by_group[group];
   if (value !== undefined) return value;
   // Absent in an observed bucket means none of it happened; absent in one
   // nobody recorded means nobody knows, and a gap says so.
   return observed ? 0 : null;
+}
+
+/**
+ * The no-data band: how much of the bucket is covered by nothing at all.
+ *
+ * On an OBSERVED bucket the backend states it (`avg_by_group.unobserved`) and
+ * nothing here second-guesses it. On an `incidents_only` bucket it does not,
+ * because the whole point is that it measured nothing — so the band is derived
+ * from the two things that ARE known: the roster the bucket was drawn over, and
+ * the ledger bands standing in front of it. Without it an unrecorded bucket
+ * draws a red sliver floating over empty space, and a reader cannot tell a
+ * fleet of one from a fleet of twelve with eleven unaccounted for.
+ */
+function noDataValue(values: FleetSeriesValues, observed: boolean): number | null {
+  const stated = values.avg_by_group.unobserved;
+  if (stated !== undefined) return stated;
+  if (observed) return 0;
+  const ledger = (values.avg_by_group.down ?? 0) + (values.avg_by_group.planned ?? 0);
+  return Math.max(0, values.printers_known - ledger);
+}
+
+/**
+ * The roster ceiling, or null where the bucket cannot state one.
+ *
+ * `printers_in_fleet` is `0.0` for "unknown" on an `incidents_only` bucket (see
+ * `StateRowValues.in_fleet`), so the basis decides, not the value.
+ */
+function inFleetValue(values: FleetSeriesValues, observed: boolean): number | null {
+  return observed ? values.printers_in_fleet : null;
 }
 
 export function stateRows(
@@ -170,9 +230,8 @@ export function stateRows(
         idle: classValue(values, 'idle', observed),
         planned: classValue(values, 'planned', observed),
         down: classValue(values, 'down', observed),
-        unobserved: classValue(values, 'unobserved', observed),
-        // The roster is known whether or not anything was recorded.
-        in_fleet: values.printers_in_fleet,
+        unobserved: noDataValue(values, observed),
+        in_fleet: inFleetValue(values, observed),
         // A peak the incident ledger proves stands even in an unobserved
         // bucket; a zero nobody watched does not.
         peak_down: observed || values.peak_down > 0 ? values.peak_down : null,
@@ -188,6 +247,13 @@ export function stateRows(
  * A window can have a full grid of buckets and still have nothing IN them —
  * every bucket before the recorder shipped is a row of nulls. That is an empty
  * chart, not a flat one, and it gets the empty state rather than a blank axis.
+ *
+ * The no-data band is deliberately NOT evidence. It is the absence itself, and
+ * on a window nobody recorded it would fill every bucket to the roster line —
+ * a chart that is one hundred per cent hatch, which tells a reader strictly
+ * less than the sentence the empty state puts there instead. A window whose
+ * only content is the fault ledger still draws, because a proven fault is a
+ * fact worth a picture.
  */
 export function stateHasData(rows: readonly ChartRow<StateRowValues>[]): boolean {
   return rows.some(
@@ -196,8 +262,7 @@ export function stateHasData(rows: readonly ChartRow<StateRowValues>[]): boolean
       row.cycle_overhead !== null ||
       row.idle !== null ||
       row.planned !== null ||
-      row.down !== null ||
-      row.unobserved !== null,
+      row.down !== null,
   );
 }
 
@@ -213,8 +278,8 @@ export function stateTotals(envelope: SeriesEnvelope<FleetSeriesValues>): StateR
     idle: classValue(values, 'idle', observed),
     planned: classValue(values, 'planned', observed),
     down: classValue(values, 'down', observed),
-    unobserved: classValue(values, 'unobserved', observed),
-    in_fleet: values.printers_in_fleet,
+    unobserved: noDataValue(values, observed),
+    in_fleet: inFleetValue(values, observed),
     peak_down: observed || values.peak_down > 0 ? values.peak_down : null,
   };
 }

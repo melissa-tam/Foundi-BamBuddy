@@ -43,6 +43,7 @@ import {
   CHART_GRID_STROKE,
   CHART_MUTED_TEXT,
   chartAxisTick,
+  chartYAxisWidth,
 } from '../../../utils/chartChrome';
 import {
   OUTCOME_COLOR,
@@ -53,6 +54,7 @@ import {
   formatCount,
   formatPercent,
   formatPrinters,
+  formatTickCount,
   SUM_UNCERTAINTY,
 } from '../../../utils/fleetMetrics';
 
@@ -73,6 +75,19 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
   const rows = printsRows(overview.throughput, options);
   const totals = printsTotals(overview.throughput);
   const successPct = overview.throughput.totals.success_pct;
+
+  /**
+   * The y axis is sized for the data ACTUALLY DRAWN, not for a number typed
+   * into the file: the axis shipped at a flat 34 px, which fits `900` and
+   * clips `10,000` — so a farm having one huge day lost a digit off the very
+   * figure the whole chart is scaled to. The tallest bar is the stack's total
+   * (the line series is prints per PRINTER and always sits under it), and the
+   * ticks are spelled compactly so a five-figure axis costs three glyphs
+   * rather than six.
+   */
+  const tickFormat = (value: number): string => formatTickCount(value, locale);
+  const tallestBar = rows.reduce((max, row) => Math.max(max, row.total), 0);
+  const yAxisWidth = chartYAxisWidth(tickFormat(tallestBar), AXIS_TICK_SIZE[size]);
 
   const legend: ChartLegendEntry[] = [
     ...OUTCOME_ORDER.map((outcome) => ({
@@ -144,7 +159,8 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
             <YAxis
               stroke={CHART_AXIS_STROKE}
               tick={chartAxisTick(AXIS_TICK_SIZE[size])}
-              width={34}
+              tickFormatter={tickFormat}
+              width={yAxisWidth}
               allowDecimals={false}
             />
             <Tooltip

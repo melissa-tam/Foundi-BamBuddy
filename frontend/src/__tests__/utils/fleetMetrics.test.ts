@@ -22,6 +22,7 @@ import type { PrinterIncidentKind } from '../../api/client';
 import type { FleetBucket, MatrixCell, SeriesBucket, SeriesEnvelope } from '../../types/fleetMetrics';
 import {
   allClassKeys,
+  bucketLabel,
   BUCKET_COLUMN_WIDTH_PX,
   causeLabelKey,
   cellAbsence,
@@ -34,6 +35,7 @@ import {
   FLEET_ABSENCE_TEXT,
   FLEET_GROUP_COLOR,
   FLEET_GROUP_TEXT,
+  FLEET_PARTIAL_BAND_PX,
   FLEET_STATUS_TOKEN_HEX,
   foldTimeSplit,
   formatCount,
@@ -45,12 +47,25 @@ import {
   formatPrinters,
   formatSiteDate,
   formatSiteInstant,
+  formatTickCount,
   groupLabelKey,
+  headerRangeKey,
+  hourHeaderLabel,
+  isPartlyObserved,
+  isSingleDayRange,
+  matrixCaptionKey,
+  overlapsBucket,
+  partialMarkerCss,
+  showsHourLabel,
+  siteWallClock,
+  summaryHintKeys,
+  SUMMARY_ROW_UNIT_KEY,
+  windowPrecedesRecording,
   incidentKindCause,
   incidentKindColor,
   incidentKindLabelKey,
   incidentKindTextColor,
-  BASIS_LABEL_KEY,
+  CELL_ABSENCE_LABEL_KEY,
   LENS_LABEL_KEY,
   OUTCOME_LABEL_KEY,
   OUTCOME_COLOR,
@@ -117,6 +132,9 @@ function hue(hex: string): number {
   const degrees = raw * 60;
   return degrees < 0 ? degrees + 360 : degrees;
 }
+
+/** The app's own source root — the scans below walk it. */
+const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 const lookup = (dotted: string): unknown =>
   dotted.split('.').reduce<unknown>((node, part) => {
@@ -235,10 +253,45 @@ describe('label keys', () => {
       ...OUTCOME_ORDER.map((outcome) => OUTCOME_LABEL_KEY[outcome]),
       ...Object.values(SUMMARY_ROW_LABEL_KEY),
       ...Object.values(LENS_LABEL_KEY),
-      ...Object.values(BASIS_LABEL_KEY),
+      ...Object.values(CELL_ABSENCE_LABEL_KEY),
     ];
     const missing = keys.filter((key) => typeof lookup(key) !== 'string');
     expect(missing).toEqual([]);
+  });
+
+  it('lets nobody but the util BUILD a printers.incident key', () => {
+    // The class, not the instance. `printers.incident.service_hold` reached the
+    // Incidents list as visible text because the dialog spelled the key with a
+    // template — and the declared kind has no leaf there, by design. Any file
+    // that assembles one is one `service_hold` away from the same bug, so the
+    // rule is that only `incidentKindLabelKey` and `causeLabelKey` assemble it.
+    const ALLOWED = new Set([
+      // THE owner: `causeLabelKey` builds it and `incidentKindLabelKey` guards
+      // the declared kind away from it.
+      path.join('utils', 'fleetMetrics.ts'),
+      // The printer card's own chip, whose kinds are all faults and which is
+      // pinned by `__tests__/i18n/incidentKinds.test.ts`.
+      path.join('pages', 'PrintersPage.tsx'),
+    ]);
+    const builder = /printers\.incident\.(?:\$\{|['"`]\s*\+)|['"`]printers\.incident\.['"`]\s*\+/;
+
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === '__tests__' || entry.name === 'node_modules') continue;
+          walk(full);
+        } else if (/\.tsx?$/.test(entry.name)) {
+          const relative = path.relative(SRC, full);
+          if (ALLOWED.has(relative)) continue;
+          if (builder.test(fs.readFileSync(full, 'utf8'))) offenders.push(relative);
+        }
+      }
+    };
+    walk(SRC);
+
+    expect(offenders).toEqual([]);
   });
 
   it('names the declared hold as maintenance, never as a fault kind', () => {
@@ -645,16 +698,72 @@ describe('cellAbsence', () => {
     expect(cellAbsence(gone, header(86_400, 86_400), { lens: 'time_split' })).toBe('out_of_fleet');
   });
 
-  it('hatches a ledger-only cell and a partly observed bucket', () => {
+  it('tells a ledger-only cell from a partly observed one, and names each', () => {
+    // They were ONE verdict (`partial`) and the cell named itself from the
+    // bucket's `basis` instead — so `observed` resolved to the "No data" leaf
+    // and a hatched cell showing a real 12 announced "No data" beside its own
+    // figure. Two claims, two verdicts, two names.
     const ledgerOnly = cell({
       class_seconds: { 'down:fault:jam': 14_400, unobserved: 72_000 },
       down_seconds: 14_400,
       basis: 'incidents_only',
     });
-    expect(cellAbsence(ledgerOnly, header(86_400, 86_400), { lens: 'hours_down' })).toBe('partial');
+    expect(cellAbsence(ledgerOnly, header(86_400, 86_400), { lens: 'hours_down' })).toBe(
+      'incidents_only',
+    );
 
     const observedCell = cell({ down_seconds: 600, class_seconds: { 'down:offline': 600, idle: 85_800 } });
-    expect(cellAbsence(observedCell, header(86_400, 43_200), { lens: 'hours_down' })).toBe('partial');
+    expect(cellAbsence(observedCell, header(86_400, 43_200), { lens: 'hours_down' })).toBe(
+      'partly_observed',
+    );
+  });
+
+  it('gives every verdict that needs a name a leaf that exists, and "No data" to none', () => {
+    const verdicts = [
+      'before_recording',
+      'incidents_only',
+      'partly_observed',
+      'out_of_fleet',
+    ] as const;
+    for (const verdict of verdicts) {
+      const leaf = CELL_ABSENCE_LABEL_KEY[verdict];
+      expect(typeof lookup(leaf), `${verdict} names a leaf`).toBe('string');
+      // The `unobserved` class is still "No data" where that IS the answer —
+      // a share of a Time-split bar. It is never a CELL's reason, because
+      // three of the four verdicts here sit beside a figure.
+      expect(leaf, `${verdict} must not reuse the No-data leaf`).not.toBe(
+        'fleetMetrics.class.unobserved',
+      );
+    }
+  });
+
+  it('marks exactly the two partly-observed verdicts as wearing the marker', () => {
+    expect(isPartlyObserved('incidents_only')).toBe(true);
+    expect(isPartlyObserved('partly_observed')).toBe(true);
+    for (const quiet of ['zero', 'before_recording', 'out_of_fleet', null] as const) {
+      expect(isPartlyObserved(quiet), `${String(quiet)} wears no marker`).toBe(false);
+    }
+  });
+
+  it('keeps the texture off the digits on a cell that shows one', () => {
+    // The full-face hatch strokes in `currentColor`, which on a heat tile is
+    // the figure's own colour — so the stripes ran through the number the cell
+    // exists to show. A cell WITH a figure gets a band along the bottom edge
+    // instead; one with nothing to show keeps the whole face.
+    const band = partialMarkerCss(true);
+    const full = partialMarkerCss(false);
+
+    expect(band.backgroundImage).toBe(full.backgroundImage);
+    expect(band.backgroundSize).toBe(`100% ${FLEET_PARTIAL_BAND_PX}px`);
+    expect(band.backgroundPosition).toBe('left bottom');
+    expect(band.backgroundRepeat).toBe('no-repeat');
+    // The full hatch is unbounded in both axes, which is what covered the text.
+    expect(full.backgroundSize).toBe('auto');
+    expect(full.backgroundPosition).toBeUndefined();
+    // Thin enough to sit under a figure in a 24 px cell, thick enough to read
+    // as a texture rather than as a rule.
+    expect(FLEET_PARTIAL_BAND_PX).toBeGreaterThan(1);
+    expect(FLEET_PARTIAL_BAND_PX).toBeLessThan(8);
   });
 
   it('never hatches the Prints lens — the print log is complete for its own history', () => {
@@ -816,6 +925,291 @@ describe('site time', () => {
     expect(formatSiteDate('not-a-date', 'en-GB')).toBe('not-a-date');
     expect(formatSiteInstant('not-a-date', 0, 'en-GB')).toBe('not-a-date');
     expect(formatInstantSiteDay('not-a-date', 'UTC', 'en-GB')).toBe('not-a-date');
+  });
+});
+
+describe('windowPrecedesRecording', () => {
+  // Production, as of this wave: the recorder is an hour old and the window is
+  // six weeks deep — so the tab has to say so on nearly every window an
+  // operator picks, not only on a virgin instance.
+  const TZ = 'Pacific/Auckland';
+
+  it('is true when the window starts days before the recorder did', () => {
+    expect(windowPrecedesRecording('2026-08-08', '2026-09-20T23:00:00', TZ)).toBe(true);
+  });
+
+  it('is false when the window starts after the recorder did', () => {
+    expect(windowPrecedesRecording('2026-09-21', '2026-09-01T03:00:00', TZ)).toBe(false);
+  });
+
+  it('is true on the recorder’s own start DAY, whose first hours it missed', () => {
+    // 2026-09-20T23:00:00 UTC is 11:00 on the 21st at the site, so a window
+    // opening at the site's midnight predates it by eleven hours.
+    expect(windowPrecedesRecording('2026-09-21', '2026-09-20T23:00:00', TZ)).toBe(true);
+  });
+
+  it('is true when nothing has ever been recorded', () => {
+    expect(windowPrecedesRecording('2026-09-21', null, TZ)).toBe(true);
+  });
+
+  it('reads the SITE zone, not the browser’s', () => {
+    // The same instant is the 20th in UTC and the 21st in Auckland, so a window
+    // opening on the 21st precedes it only when the site zone is honoured.
+    expect(windowPrecedesRecording('2026-09-21', '2026-09-20T23:00:00', 'UTC')).toBe(false);
+    expect(windowPrecedesRecording('2026-09-21', '2026-09-20T23:00:00', TZ)).toBe(true);
+  });
+
+  it('makes no claim it cannot check', () => {
+    expect(siteWallClock('not-an-instant', TZ)).toBeNull();
+    expect(windowPrecedesRecording('2026-09-21', 'not-an-instant', TZ)).toBe(false);
+  });
+
+  it('falls back to UTC rather than throwing on a zone the browser lacks', () => {
+    expect(siteWallClock('2026-09-20T23:00:00', 'Mars/Olympus')).toBe('2026-09-20T23:00:00');
+  });
+});
+
+describe('a one-day window names its date once', () => {
+  it('reads a same-day range as a single day', () => {
+    expect(isSingleDayRange('2026-09-21', '2026-09-21')).toBe(true);
+    expect(isSingleDayRange('2026-09-15', '2026-09-21')).toBe(false);
+  });
+
+  it('picks a different header leaf for each shape, loaded and pending', () => {
+    const leaves = [
+      headerRangeKey(true, false),
+      headerRangeKey(false, false),
+      headerRangeKey(true, true),
+      headerRangeKey(false, true),
+    ];
+    expect(new Set(leaves).size).toBe(4);
+    for (const leaf of leaves) expect(typeof lookup(leaf)).toBe('string');
+  });
+
+  it('picks a different matrix caption for each shape', () => {
+    expect(matrixCaptionKey(true)).not.toBe(matrixCaptionKey(false));
+    expect(typeof lookup(matrixCaptionKey(true))).toBe('string');
+    expect(typeof lookup(matrixCaptionKey(false))).toBe('string');
+  });
+
+  it('captions the matrix BY printer, never "per printer"', () => {
+    // "Prints per printer" is a metric on the same tab, and a Prints-lens
+    // caption reading "Prints per printer, Sep 15 to Sep 21" named the rate
+    // rather than the grid underneath it.
+    for (const single of [true, false]) {
+      expect(lookup(matrixCaptionKey(single))).not.toContain('per printer');
+    }
+  });
+});
+
+describe('overlapsBucket', () => {
+  // The drill-down asks its endpoint for whole site DAYS, so an hour bucket's
+  // answer routinely carries rows from the other twenty-three.
+  const start = Date.parse('2026-09-19T16:00:00Z');
+  const end = Date.parse('2026-09-19T17:00:00Z');
+  const now = Date.parse('2026-09-21T00:04:00Z');
+  const within = (span: { start: string; end: string | null }): boolean =>
+    overlapsBucket(span, start, end, now);
+
+  it('keeps a span that runs through the bucket', () => {
+    expect(within({ start: '2026-09-19T16:10:00', end: '2026-09-19T16:40:00' })).toBe(true);
+    expect(within({ start: '2026-09-19T15:00:00', end: '2026-09-19T18:00:00' })).toBe(true);
+  });
+
+  it('drops the incident that was listed under an hour it had nothing to do with', () => {
+    // The production report: a 16:00–17:00 bucket listed an incident that ran
+    // 19:18 the previous day to 00:37.
+    expect(within({ start: '2026-09-18T19:18:00', end: '2026-09-19T00:37:00' })).toBe(false);
+  });
+
+  it('does not count touching as overlapping, at either edge', () => {
+    expect(within({ start: '2026-09-19T15:00:00', end: '2026-09-19T16:00:00' })).toBe(false);
+    expect(within({ start: '2026-09-19T17:00:00', end: '2026-09-19T18:00:00' })).toBe(false);
+  });
+
+  it('runs an open-ended span to the answer’s own now, and no further', () => {
+    expect(within({ start: '2026-09-19T10:00:00', end: null })).toBe(true);
+    // Opened after the bucket closed and still open: it overlaps later buckets,
+    // not this one.
+    expect(within({ start: '2026-09-20T10:00:00', end: null })).toBe(false);
+  });
+
+  it('keeps nothing it cannot place', () => {
+    expect(within({ start: 'nonsense', end: '2026-09-19T16:30:00' })).toBe(false);
+  });
+});
+
+describe('hour headers', () => {
+  const at = (hourOfDay: number | null, hour: string | null) => ({ hourOfDay, hour });
+
+  it('spells every third hour and nothing between', () => {
+    // 14 px columns: labelling all twenty-four ran them into `000102030405…`.
+    expect(showsHourLabel(at(0, '00:00'))).toBe(true);
+    expect(showsHourLabel(at(3, '03:00'))).toBe(true);
+    expect(showsHourLabel(at(21, '21:00'))).toBe(true);
+    for (const hour of [1, 2, 4, 5, 7, 8, 22, 23]) {
+      expect(showsHourLabel(at(hour, '')), `${hour} is unlabelled`).toBe(false);
+    }
+  });
+
+  it('gives the labelled hours their two digits and the rest nothing', () => {
+    expect(hourHeaderLabel(at(6, '06:00'), 'en')).toBe('06');
+    expect(hourHeaderLabel(at(7, '07:00'), 'en')).toBe('');
+  });
+
+  it('labels no column on a lens that has no hour', () => {
+    expect(showsHourLabel(at(null, null))).toBe(false);
+    expect(hourHeaderLabel(at(null, null), 'en')).toBe('');
+  });
+
+  it('reads the hour NUMBER, never the first two characters of a clock', () => {
+    // Slicing `label.hour` assumed the hour comes first AND that the cycle
+    // runs 00–23. Neither is a locale-invariant fact; `hourOfDay` is.
+    expect(hourHeaderLabel({ hourOfDay: 0 }, 'en')).toBe('00');
+    expect(hourHeaderLabel({ hourOfDay: 21 }, 'en')).toBe('21');
+  });
+});
+
+/**
+ * Midnight is `00`, never `24`.
+ *
+ * `hour12: false` does NOT mean "the 00–23 cycle" — it means "this locale's own
+ * 24-hour cycle", and ICU makes that **h24** (01–24) for several locales. A
+ * bucket starting at the site's midnight therefore formatted as `24:00`: an
+ * hour that does not exist, on the header row above the day it opens. Spelling
+ * only every third hour is what made it visible, 00 being one of the three.
+ */
+describe('the site midnight hour', () => {
+  /** `2026-09-20T12:00` naive UTC at +12 is `2026-09-21 00:00` at the site. */
+  const MIDNIGHT: SeriesBucket<unknown> = {
+    start: '2026-09-20T12:00:00',
+    seconds: 3600,
+    elapsed_seconds: 3600,
+    observed_seconds: 3600,
+    utc_offset_minutes: 720,
+    basis: 'observed',
+    values: {},
+  };
+
+  /** Every locale the app ships. */
+  const LOCALES = ['en', 'de', 'es', 'fr', 'it', 'ja', 'ko', 'pt-BR', 'tr', 'zh-CN', 'zh-TW'];
+
+  it('is 00 in every locale the app ships — the header and the full stamp', () => {
+    for (const locale of LOCALES) {
+      const label = bucketLabel(MIDNIGHT, { bucket: 'hour', locale });
+      expect(label.hourOfDay, locale).toBe(0);
+      expect(hourHeaderLabel(label, locale), locale).toBe('00');
+      // `full` is the sr-only stamp on every hour column AND the bucket
+      // detail's own title.
+      expect(label.hour ?? '', locale).not.toMatch(/24/);
+      expect(label.full, locale).not.toMatch(/24/);
+    }
+  });
+
+  it('takes the h23 cycle BY NAME, not whatever the locale calls 24-hour', () => {
+    // Measured against what `hour12: false` actually produces in THIS ICU
+    // build rather than against a guessed locale: wherever that build spells
+    // midnight with a 24, ours must disagree with it — and in every build,
+    // ours must never contain one.
+    for (const locale of LOCALES) {
+      const localeOwn24Hour = new Intl.DateTimeFormat(locale, {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        timeZone: 'UTC',
+      }).format(Date.parse('2026-09-21T00:00:00Z'));
+      const ours = bucketLabel(MIDNIGHT, { bucket: 'hour', locale }).hour ?? '';
+
+      if (localeOwn24Hour.includes('24')) {
+        expect(ours, `${locale} must not follow its own h24 cycle`).not.toBe(localeOwn24Hour);
+      }
+      expect(ours, locale).not.toMatch(/24/);
+    }
+  });
+
+  it('leaves no hour12 option on any Fleet surface that spells a clock', () => {
+    // The rule, not the instance. `utils/date.ts` owns the operator's real
+    // 12/24-hour PREFERENCE and is untouched by this; a Fleet surface has no
+    // such choice to make — it states a 24-hour clock — so an `hour12` here is
+    // the h24 bug waiting to come back.
+    const owner = path.join(SRC, 'utils', 'fleetMetrics.ts');
+    // CODE, not prose: the comments above and in the modules themselves name
+    // the flag in order to explain why it is not used.
+    const stripComments = (source: string): string =>
+      source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+
+    const offenders: string[] = [];
+    const inspect = (entry: string): void => {
+      if (fs.statSync(entry).isDirectory()) {
+        for (const child of fs.readdirSync(entry)) inspect(path.join(entry, child));
+        return;
+      }
+      if (!/\.tsx?$/.test(entry)) return;
+      if (/hour12\s*:/.test(stripComments(fs.readFileSync(entry, 'utf8')))) {
+        offenders.push(path.relative(SRC, entry));
+      }
+    };
+    inspect(owner);
+    inspect(path.join(SRC, 'components', 'fleet'));
+
+    expect(offenders).toEqual([]);
+    expect(fs.readFileSync(owner, 'utf8')).toMatch(/hourCycle: 'h23'/);
+  });
+});
+
+describe('formatTickCount', () => {
+  it('groups a tick a reader can still parse', () => {
+    expect(formatTickCount(900, 'en')).toBe('900');
+    expect(formatTickCount(9999, 'en')).toBe('9,999');
+  });
+
+  it('goes compact where the sixth glyph would arrive', () => {
+    // A five-digit tick is what clipped the axis; three glyphs fit the column
+    // the axis was already sized for.
+    expect(formatTickCount(10_000, 'en')).toBe('10K');
+    expect(formatTickCount(12_500, 'en')).toBe('12.5K');
+  });
+
+  it('follows the active locale', () => {
+    expect(formatTickCount(1234, 'de')).toBe('1.234');
+  });
+});
+
+describe('summary row units and hints', () => {
+  it('units exactly the two rows that are a RATE, and nothing else', () => {
+    // `SUMMARY_ROW_FORMAT` says how a number is spelled, never what it counts
+    // per: "Prints 21" beside a matrix total of 900 was a rate read as a count.
+    expect(Object.keys(SUMMARY_ROW_UNIT_KEY).sort()).toEqual([
+      'prints_per_day',
+      'prints_per_printer_per_day',
+    ]);
+    for (const leaf of Object.values(SUMMARY_ROW_UNIT_KEY)) {
+      expect(typeof lookup(leaf as string)).toBe('string');
+    }
+  });
+
+  it('qualifies a hinted row when the window outruns the recorder, and only then', () => {
+    const settled = summaryHintKeys('uptime', { recordingGap: false });
+    const gapped = summaryHintKeys('uptime', { recordingGap: true });
+    expect(gapped.slice(0, settled.length)).toEqual(settled);
+    expect(gapped.length).toBe(settled.length + 1);
+    for (const leaf of gapped) expect(typeof lookup(leaf)).toBe('string');
+  });
+
+  it('gives no row a tooltip it would not otherwise have had', () => {
+    // Supplementary copy rides a control that already carries some; a row whose
+    // label says it all does not grow a trigger just to hold a qualifier.
+    expect(summaryHintKeys('avg_printing', { recordingGap: true })).toEqual([]);
+    expect(summaryHintKeys('peak_down', { recordingGap: true })).toEqual([]);
+  });
+
+  it('says the two prints rates are not comparable while the window outruns the recorder', () => {
+    // Counted printer-days come from RECORDED buckets only, while prints per
+    // day covers the whole window — during the first days they are two
+    // different denominators and the row has to say so.
+    const hint = lookup('fleetMetrics.hints.prints_per_printer');
+    expect(typeof hint).toBe('string');
+    expect(hint as string).toMatch(/recorded/i);
   });
 });
 

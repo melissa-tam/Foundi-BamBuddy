@@ -334,6 +334,42 @@ export const SUMMARY_ROW_HINT_KEY: Partial<Record<SummaryRowKey, string>> = {
   time_printing: 'fleetMetrics.hints.time_printing',
 };
 
+/**
+ * Every hint leaf one summary row carries, in reading order.
+ *
+ * The second one is CONDITIONAL on the window: where the recorder did not cover
+ * all of it, the period column is an average over the part it DID cover, so a
+ * reader setting that figure beside the live Now column is comparing two
+ * different spans. The qualifier rides the tooltip the row already has — a row
+ * with nothing else to explain does not gain one just to carry it, and none of
+ * it goes inline on the primary surface (react-best-practices §9).
+ *
+ * Every hinted row is state-derived, `prints_per_printer_per_day` included: its
+ * denominator is the days each printer was COUNTED, which the recorder states.
+ */
+export function summaryHintKeys(
+  key: SummaryRowKey,
+  { recordingGap }: { recordingGap: boolean },
+): string[] {
+  const own = SUMMARY_ROW_HINT_KEY[key];
+  if (own === undefined) return [];
+  return recordingGap ? [own, 'fleetMetrics.hints.whileRecorded'] : [own];
+}
+
+/**
+ * The unit a row's figure cannot be read without, or nothing where the row
+ * label already carries it.
+ *
+ * `SUMMARY_ROW_FORMAT` says how a figure is SPELLED — one decimal, a whole
+ * count, a percentage — and deliberately says nothing about what it counts per.
+ * The two rate rows are per DAY, and a bare "Prints 21" beside a matrix total
+ * of 900 is not a figure a reader can place: the unit is what makes it one.
+ */
+export const SUMMARY_ROW_UNIT_KEY: Partial<Record<SummaryRowKey, string>> = {
+  prints_per_day: 'fleetMetrics.units.perDay',
+  prints_per_printer_per_day: 'fleetMetrics.units.perDay',
+};
+
 /** How each row's figure is formatted — the summary card's one switch. */
 export const SUMMARY_ROW_FORMAT: Record<SummaryRowKey, 'printers' | 'count' | 'ratio'> = {
   avg_printing: 'printers',
@@ -371,11 +407,6 @@ export const LENS_LABEL_KEY: Record<FleetLens, string> = {
   time_split: 'fleetMetrics.matrix.lens.timeSplit',
 };
 
-/** `basis` → the label a hatched cell's tooltip names it with. */
-export const BASIS_LABEL_KEY: Record<FleetBasis, string> = {
-  observed: 'fleetMetrics.class.unobserved',
-  incidents_only: 'fleetMetrics.class.incidents_only',
-};
 
 // ── colour ──────────────────────────────────────────────────────────────────
 
@@ -746,10 +777,19 @@ export function patternFill(pattern: FleetPattern): string {
   return `url(#${FLEET_PATTERN_IDS[pattern]})`;
 }
 
-/** A CSS background pair — an HTML table cell needs no SVG to carry a pattern. */
+/**
+ * A CSS background — an HTML table cell needs no SVG to carry a pattern.
+ *
+ * Repeat and position are optional because a full-surface texture needs
+ * neither; a texture confined to one EDGE of a surface needs both, and leaving
+ * them to the call site is how one cell ends up with the band and the next with
+ * the band tiled over its whole face.
+ */
 export interface PatternCss {
   backgroundImage: string;
   backgroundSize: string;
+  backgroundRepeat?: string;
+  backgroundPosition?: string;
 }
 
 /**
@@ -779,6 +819,49 @@ export const FLEET_PATTERN_CSS: Record<FleetPattern, PatternCss> = {
     backgroundSize: 'auto',
   },
 };
+
+/**
+ * How tall the partly-observed BAND is, in px, along a cell's bottom edge.
+ *
+ * Four: two hatch strokes' worth at the sparse pattern's 12 px period, which is
+ * the least that still reads as a texture rather than as a rule, inside a 24 px
+ * cell that has a figure to show.
+ */
+export const FLEET_PARTIAL_BAND_PX = 4;
+
+/**
+ * The sparse hatch confined to a band along the bottom edge.
+ *
+ * The full-face hatch strokes in `currentColor`, which on a heat tile IS the
+ * figure's own colour — so the stripes ran THROUGH the digits, and on the
+ * saturated end of the down ramp a `12` was unreadable behind them. The marker
+ * and the figure want the same square of cell and the figure wins: the texture
+ * moves to the edge, the digits keep a clean tile, and the contrast the ramp
+ * was measured for is the contrast the reader gets.
+ *
+ * `100%` wide and `FLEET_PARTIAL_BAND_PX` tall pins the gradient's box to that
+ * strip (a gradient has no intrinsic size, so `auto` would resolve to the whole
+ * cell), `no-repeat` stops it tiling back up the face, and `left bottom` puts
+ * it where a footnote goes.
+ */
+export const FLEET_PARTIAL_BAND_CSS: PatternCss = {
+  backgroundImage: FLEET_PATTERN_CSS.sparse.backgroundImage,
+  backgroundSize: `100% ${FLEET_PARTIAL_BAND_PX}px`,
+  backgroundRepeat: 'no-repeat',
+  backgroundPosition: 'left bottom',
+};
+
+/**
+ * The partly-observed marker for one cell: the bottom band where the cell shows
+ * a figure, the full hatch where it has none.
+ *
+ * A cell with nothing to show has no digits to protect and the whole face is
+ * the clearest way to say "this square is not evidence"; a cell WITH a figure
+ * is making a claim, and the marker qualifies it rather than obscuring it.
+ */
+export function partialMarkerCss(showsFigure: boolean): PatternCss {
+  return showsFigure ? FLEET_PARTIAL_BAND_CSS : FLEET_PATTERN_CSS.sparse;
+}
 
 /**
  * The marker for a bucket that is still IN PROGRESS — a half-filled swatch,
@@ -1000,11 +1083,54 @@ export function sumMap(map: Partial<Record<string, number>>): number {
 export const OBSERVED_TOLERANCE_S = 90;
 
 /**
- * The four ways a cell can have no ordinary number, plus `null` for one that
- * does. Never conflated — a zero the farm earned and a zero nobody recorded are
+ * The five ways a cell's number is qualified, plus `null` for one that is not.
+ * Never conflated — a zero the farm earned and a zero nobody recorded are
  * different answers, and on a lights-out farm the difference is the whole point.
+ *
+ * The two PARTLY-observed verdicts were one (`partial`) and had to be split.
+ * The cell named itself from the bucket's `basis`, and `observed` mapped to the
+ * "No data" leaf — so a hatched Hours-down cell showing a real `12` announced
+ * "No data" beside its own figure. They are different claims and each carries
+ * its own name now:
+ *
+ *   - `incidents_only` — the recorder covered NONE of the bucket, and the fault
+ *     and hold ledger is the whole of the evidence. The hours are real.
+ *   - `partly_observed` — the recorder covered some of it and fell short.
+ *
+ * A verdict is a statement about the EVIDENCE, never about the value: three of
+ * the five sit happily beside a figure.
  */
-export type CellAbsence = 'zero' | 'before_recording' | 'partial' | 'out_of_fleet' | null;
+export type CellAbsence =
+  | 'zero'
+  | 'before_recording'
+  | 'incidents_only'
+  | 'partly_observed'
+  | 'out_of_fleet'
+  | null;
+
+/**
+ * The i18n leaf that NAMES a verdict — the one place a cell's spoken reason is
+ * decided, so no surface can pair a reason with a figure that contradicts it.
+ *
+ * `zero` and `null` are absent on purpose: a cell whose figure is its own
+ * complete answer says nothing extra, and an empty entry here would invite one.
+ */
+export const CELL_ABSENCE_LABEL_KEY: Record<
+  Exclude<CellAbsence, null | 'zero'>,
+  string
+> = {
+  before_recording: 'fleetMetrics.class.not_recorded',
+  incidents_only: 'fleetMetrics.class.incidents_only',
+  // Reused from the chart data tables, where the same bucket wears the same
+  // word: one fact, one leaf, translated once.
+  partly_observed: 'fleetMetrics.widgets.partlyObserved',
+  out_of_fleet: 'fleetMetrics.class.out_of_fleet',
+};
+
+/** Does this verdict draw the partly-observed marker? */
+export function isPartlyObserved(absence: CellAbsence): boolean {
+  return absence === 'incidents_only' || absence === 'partly_observed';
+}
 
 /** Enough of a bucket header for an absence verdict. */
 export type AbsenceHeader = Pick<
@@ -1046,8 +1172,14 @@ export function cellAbsence(
     return 'before_recording';
   }
   if (stateDerived) {
-    const bucketShort = header.observed_seconds < header.elapsed_seconds - OBSERVED_TOLERANCE_S;
-    if (cell.basis === 'incidents_only' || bucketShort) return 'partial';
+    // Asked in this order because they are not the same claim and the stronger
+    // one wins: a bucket the recorder never reached is `incidents_only`
+    // whatever its observed seconds say, and only a bucket it DID reach can be
+    // short of one.
+    if (cell.basis === 'incidents_only') return 'incidents_only';
+    if (header.observed_seconds < header.elapsed_seconds - OBSERVED_TOLERANCE_S) {
+      return 'partly_observed';
+    }
   }
   return lensValue(cell, lens) > 0 ? null : 'zero';
 }
@@ -1203,6 +1335,129 @@ export function formatInstantSiteDay(naiveUtc: string, tzName: string, locale: s
   }
 }
 
+/**
+ * The site's wall clock for a naive-UTC instant, as a sortable
+ * `YYYY-MM-DDTHH:MM:SS`.
+ *
+ * The fourth shape, and the only one that is not a LABEL: comparing "does this
+ * window start before the recorder did" means putting an instant beside a site
+ * MIDNIGHT, and a formatted date cannot be compared with anything. `en-CA` is
+ * chosen purely for its ISO part order — nothing this returns is ever shown to
+ * a reader, and the operator's locale must not change the answer.
+ *
+ * Null on an unparseable instant; an unknown ZONE falls back to UTC, the same
+ * way `formatInstantSiteDay` does, rather than refusing to answer at all.
+ */
+export function siteWallClock(naiveUtc: string, tzName: string): string | null {
+  const parsed = Date.parse(`${naiveUtc}Z`);
+  if (Number.isNaN(parsed)) return null;
+  const read = (timeZone: string): string => {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(parsed);
+    const at = (type: Intl.DateTimeFormatPartTypes): string =>
+      parts.find((part) => part.type === type)?.value ?? '00';
+    return `${at('year')}-${at('month')}-${at('day')}T${at('hour')}:${at('minute')}:${at('second')}`;
+  };
+  try {
+    return read(tzName);
+  } catch {
+    return read(UTC);
+  }
+}
+
+/**
+ * Does the resolved window begin BEFORE the state recorder did?
+ *
+ * The question the Fleet tab's honesty notice is built on, and it is not "is
+ * this a first run". On a real instance the recorder is hours old while the
+ * print log and the fault ledger go back weeks, so nearly every window an
+ * operator picks is mostly unrecorded — and a tab that only said so when
+ * NOTHING had ever been observed said nothing at all in the case that matters.
+ *
+ * The window starts at midnight of `dateFrom` in the SITE's zone, so a window
+ * beginning on the recorder's own start date still precedes it unless recording
+ * began at exactly midnight. Both sides are the same sortable shape, so the
+ * comparison is a string compare and no second offset table is involved.
+ *
+ * A recorder that has never written (`recording_since` null) precedes nothing —
+ * but every window is then entirely unrecorded, which is the same thing to say.
+ */
+export function windowPrecedesRecording(
+  dateFrom: string,
+  recordingSince: string | null,
+  tzName: string,
+): boolean {
+  if (recordingSince === null) return true;
+  const wall = siteWallClock(recordingSince, tzName);
+  // Unparseable: nothing is known, and a claim nobody can check is worse than
+  // no claim.
+  if (wall === null) return false;
+  return `${dateFrom}T00:00:00` < wall;
+}
+
+/**
+ * A window that starts and ends on the same site date names that date ONCE.
+ * "Sep 21, 2026 – Sep 21, 2026" is a range whose two ends a reader has to
+ * compare character by character to discover it is one day.
+ */
+export function isSingleDayRange(dateFrom: string, dateTo: string): boolean {
+  return dateFrom === dateTo;
+}
+
+/** The summary header's leaf: one date or two, and with the bucket or without. */
+export function headerRangeKey(singleDay: boolean, pending: boolean): string {
+  if (pending) {
+    return singleDay ? 'fleetMetrics.header.dayPending' : 'fleetMetrics.header.rangePending';
+  }
+  return singleDay ? 'fleetMetrics.header.day' : 'fleetMetrics.header.range';
+}
+
+/** The matrix caption's leaf, by the same rule. */
+export function matrixCaptionKey(singleDay: boolean): string {
+  return singleDay ? 'fleetMetrics.matrix.captionDay' : 'fleetMetrics.matrix.caption';
+}
+
+/** A span on the wire: a naive-UTC start and an end that may still be open. */
+export interface OpenEndedSpan {
+  start: string;
+  /** Null while it is still running. */
+  end: string | null;
+}
+
+/**
+ * Does a span overlap a bucket's `[start, end)`?
+ *
+ * HALF-OPEN on both sides: a span that ends exactly when the bucket begins, or
+ * begins exactly when it ends, does not overlap it. Touching is not overlapping,
+ * and a closed-at-16:00 incident listed under the 16:00–17:00 hour is a fact
+ * about the hour before.
+ *
+ * The drill-down asks its endpoint for whole site DAYS (that is the only grain
+ * it has), so an hour bucket's answer routinely carries rows from the other
+ * twenty-three — this is the predicate that keeps them out of the hour's list.
+ * `openEndMs` closes a still-running span at the answer's own "now", so an open
+ * incident overlaps every bucket up to it and none after.
+ */
+export function overlapsBucket(
+  span: OpenEndedSpan,
+  bucketStartMs: number,
+  bucketEndMs: number,
+  openEndMs: number,
+): boolean {
+  const start = Date.parse(`${span.start}Z`);
+  const end = span.end === null ? openEndMs : Date.parse(`${span.end}Z`);
+  if (Number.isNaN(start) || Number.isNaN(end)) return false;
+  return end > bucketStartMs && start < bucketEndMs;
+}
+
 // ── format ──────────────────────────────────────────────────────────────────
 //
 // Every formatter takes the ACTIVE i18n language and formats through `Intl`, so
@@ -1229,6 +1484,28 @@ export function formatPrinters(value: number, locale: string): string {
 /** A whole count. */
 export function formatCount(value: number, locale: string): string {
   return numberFormat(locale, 0, 0).format(value);
+}
+
+/**
+ * Past this many, a chart TICK is spelled compactly.
+ *
+ * An axis column is measured in characters, not in pixels: `10,000` is six
+ * glyphs where `10K` is three, and the axis has to reserve room for the widest
+ * label it will draw. Four digits still read as a number at a glance, so the
+ * threshold sits where the fifth one arrives.
+ */
+export const COMPACT_TICK_FROM = 10_000;
+
+/**
+ * A chart tick's own formatter — grouped below the threshold, compact above it.
+ * Through `Intl`, so the compact suffix is the locale's own (`12 k`, `1.2万`).
+ */
+export function formatTickCount(value: number, locale: string): string {
+  if (Math.abs(value) < COMPACT_TICK_FROM) return formatCount(value, locale);
+  return new Intl.NumberFormat(locale, {
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(value);
 }
 
 /** A 0–1 ratio as an integer percentage. */
@@ -1335,6 +1612,15 @@ export interface BucketLabel {
   month: string | null;
   /** `HH:MM` for an hour bucket; null otherwise. */
   hour: string | null;
+  /**
+   * The hour of the site day, 0–23, for an hour bucket; null otherwise.
+   *
+   * The NUMBER as well as the label, because the every-third-hour header rule
+   * is arithmetic on the hour itself and must not be re-derived by parsing a
+   * locale-formatted string — `hour` is spelled by `Intl` and a locale that
+   * writes midnight as `24:00` would put the rule one column out.
+   */
+  hourOfDay: number | null;
   /** A week bucket's own start date. A CLIPPED first week keeps its real start. */
   weekStart: string | null;
   isWeekend: boolean;
@@ -1447,10 +1733,18 @@ export function bucketLabel(
       ? new Intl.DateTimeFormat(locale, {
           hour: '2-digit',
           minute: '2-digit',
-          hour12: false,
+          // `hourCycle: 'h23'`, never `hour12: false`. The two are not
+          // synonyms: `hour12: false` selects the locale's own 24-hour cycle,
+          // and for several locales ICU makes that **h24**, which spells
+          // midnight `24:00`. So a bucket starting at the site's midnight read
+          // "24:00" — an hour that does not exist, on the row above the day it
+          // opens. `h23` is the 00–23 cycle by name and is locale-invariant;
+          // `SITE_INSTANT_FORMAT` above has always used it.
+          hourCycle: 'h23',
           timeZone: UTC,
         }).format(shifted)
       : null,
+    hourOfDay: isHour ? shifted.getUTCHours() : null,
     weekStart: width === 'week' ? date : null,
     isWeekend: weekday === 0 || weekday === 6,
     isCurrent: bucket.elapsed_seconds > 0 && bucket.elapsed_seconds < bucket.seconds,
@@ -1458,10 +1752,50 @@ export function bucketLabel(
       year: 'numeric',
       month: 'short',
       day: 'numeric',
-      ...(isHour ? { hour: '2-digit', minute: '2-digit', hour12: false } : {}),
+      // Same cycle as `hour` above: the sr-only stamp on every hour column and
+      // the bucket detail's own title are both built from this.
+      ...(isHour ? { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' as const } : {}),
       timeZone: UTC,
     }).format(shifted),
   };
+}
+
+/**
+ * How often an hour column gets a VISIBLE header.
+ *
+ * Every third, so the labels read 00 · 03 · 06. An hour column is 14 px wide
+ * and a two-digit label is about 13 px, so labelling every one ran the hours
+ * together into `000102030405…` — a band of digits that says nothing and hides
+ * the day boundaries underneath it. Three is the least that separates them.
+ */
+export const HOUR_HEADER_LABEL_EVERY = 3;
+
+/** Does this hour column carry a visible header? */
+export function showsHourLabel(label: Pick<BucketLabel, 'hourOfDay'>): boolean {
+  return label.hourOfDay !== null && label.hourOfDay % HOUR_HEADER_LABEL_EVERY === 0;
+}
+
+/**
+ * The visible text of an hour column's header, or `''` where the grid is too
+ * tight to carry one.
+ *
+ * Built from the hour NUMBER, never sliced off `label.hour`. Slicing took the
+ * first two characters of a locale-formatted clock, which is two assumptions at
+ * once: that the hour comes first (it does not in every locale) and that the
+ * cycle runs 00–23 (it did not — see `bucketLabel`, where midnight could format
+ * as `24:00`). `hourOfDay` is `getUTCHours()` on the site-shifted instant, so it
+ * is 0–23 by construction and no formatter can move it.
+ *
+ * The DIGITS still go through the locale (`pad`), the way every other figure on
+ * this tab does; only the value is ours.
+ *
+ * Only the VISIBLE label thins out: every header still spells its full
+ * site-local date and time as sr-only text, so a screen-reader user hears all
+ * twenty-four and nothing is disclosed behind a control.
+ */
+export function hourHeaderLabel(label: Pick<BucketLabel, 'hourOfDay'>, locale: string): string {
+  if (!showsHourLabel(label) || label.hourOfDay === null) return '';
+  return pad(label.hourOfDay, locale);
 }
 
 /**

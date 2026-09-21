@@ -57,8 +57,28 @@ const SECTION_KEYS = [
   'fleetMetrics.sections.partsBySku',
 ];
 
-const showData = () => i18n.t('fleetMetrics.widgets.showData');
-const showChart = () => i18n.t('fleetMetrics.widgets.showChart');
+/**
+ * The switch's ACCESSIBLE name now carries the chart's own title, because six
+ * controls called "Show data" in one grid are six identical entries in a
+ * screen reader's control list. Tests that render ONE widget match any of
+ * them; the distinctness of the six is pinned on its own below.
+ *
+ * Built from the leaf, so a copy edit moves the matcher with it.
+ */
+function switchPattern(key: string): RegExp {
+  const MARK = '\u0000';
+  const escaped = (i18n.t(key, { chart: MARK }) as string)
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(MARK, '.+');
+  return new RegExp(`^${escaped}$`);
+}
+
+const showData = (): RegExp => switchPattern('fleetMetrics.widgets.showDataFor');
+const showChart = (): RegExp => switchPattern('fleetMetrics.widgets.showChartFor');
+
+/** The switch of one NAMED chart. */
+const showDataFor = (sectionKey: string): string =>
+  i18n.t('fleetMetrics.widgets.showDataFor', { chart: i18n.t(sectionKey) }) as string;
 
 describe('FleetWidgets — the grid', () => {
   it('mounts all six widgets, in the laid-out order', () => {
@@ -92,6 +112,42 @@ describe('FleetWidgets — the grid', () => {
 
     const switches = screen.getAllByRole('button', { name: showData() });
     expect(switches).toHaveLength(SECTION_KEYS.length);
+  });
+
+  it('gives each of the six switches a name that tells it from the other five', () => {
+    // They were six controls called "Show data", in a list with nothing to tell
+    // them apart and no heading between them.
+    render(<FleetWidgets overview={overview} />);
+
+    const names = screen
+      .getAllByRole('button', { name: showData() })
+      .map((control) => control.getAttribute('aria-label') ?? '');
+    expect(new Set(names).size).toBe(SECTION_KEYS.length);
+    // …and each one names its OWN chart, not just any distinct string.
+    for (const key of SECTION_KEYS) {
+      expect(
+        screen.getByRole('button', { name: showDataFor(key) }),
+        `${key} has its own switch`,
+      ).toBeInTheDocument();
+    }
+    // The visible text stays short — the card's title is right above it.
+    for (const control of screen.getAllByRole('button', { name: showData() })) {
+      expect(control.textContent).toBe(i18n.t('fleetMetrics.widgets.showData'));
+    }
+  });
+
+  it('renames the switch for its own chart once the table is up', async () => {
+    const user = userEvent.setup();
+    render(<FleetWidgets overview={overview} />);
+
+    const key = 'fleetMetrics.sections.printsPerDay';
+    await user.click(screen.getByRole('button', { name: showDataFor(key) }));
+
+    expect(
+      screen.getByRole('button', {
+        name: i18n.t('fleetMetrics.widgets.showChartFor', { chart: i18n.t(key) }),
+      }),
+    ).toBeInTheDocument();
   });
 
   it('signals the switch state through its LABEL alone, never a second time', () => {

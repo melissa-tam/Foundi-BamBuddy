@@ -81,7 +81,10 @@ import {
   formatPercent,
   formatPrinters,
   formatSiteDate,
+  hourHeaderLabel,
   isRowHidden,
+  isSingleDayRange,
+  matrixCaptionKey,
   type BucketLabel,
   type FleetLens,
   type MatrixFrozenColumn,
@@ -468,11 +471,19 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
             role="grid"
             className="table-fixed w-max border-separate border-spacing-0 text-xs"
           >
+            {/*
+              "by printer", not "per printer": the tab already has a metric
+              called "Prints per printer", and a Prints-lens caption reading
+              "Prints per printer, Sep 15 to Sep 21" named that rate rather
+              than the grid underneath it. A one-day window names its date
+              once — the leaf choice is the util's, not this component's.
+            */}
             <caption className="sr-only">
-              {t('fleetMetrics.matrix.caption', {
+              {t(matrixCaptionKey(isSingleDayRange(overview.date_from, overview.date_to)), {
                 lens: t(LENS_LABEL_KEY[activeLens]),
                 from: formatSiteDate(overview.date_from, locale),
                 to: formatSiteDate(overview.date_to, locale),
+                date: formatSiteDate(overview.date_from, locale),
               })}
             </caption>
             <colgroup>
@@ -546,7 +557,7 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                         aria-hidden="true"
                         className={`block leading-tight ${label.isWeekend ? 'opacity-50' : ''}`}
                       >
-                        {topLine(bucketWidth, label)}
+                        {topLine(bucketWidth, label, locale)}
                       </span>
                       <span aria-hidden="true" className="block leading-tight">
                         {bottomLine(bucketWidth, label, newDay)}
@@ -795,8 +806,14 @@ function FrozenFigure({ column, value, lens, kind, plumbing, cellRef, onKeyDown 
 }
 
 /** The top header line: weekday initial by day, the hour by hour, blank by week. */
-function topLine(bucketWidth: string, label: BucketLabel): string {
-  if (bucketWidth === 'hour') return label.hour?.slice(0, 2) ?? '';
+function topLine(bucketWidth: string, label: BucketLabel, locale: string): string {
+  // Only every third hour is SPELLED (`hourHeaderLabel` owns that rule): at
+  // 14 px a two-digit label fills its column, so labelling all twenty-four ran
+  // them into one band of digits. An unlabelled column keeps the same
+  // non-breaking space the week lens uses, so the header row's height is the
+  // same across all of them — and all twenty-four still carry their full
+  // site-local stamp as sr-only text below.
+  if (bucketWidth === 'hour') return hourHeaderLabel(label, locale) || ' ';
   if (bucketWidth === 'week') return ' ';
   return label.weekdayInitial;
 }

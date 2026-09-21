@@ -57,10 +57,10 @@ import {
   DOWN_CAUSE_ORDER,
   SECONDARY_TEXT_CLASS,
   SUMMARY_ROW_FORMAT,
-  SUMMARY_ROW_HINT_KEY,
   SUMMARY_ROW_LABEL_KEY,
   SUMMARY_ROW_NOW_GROUP,
   SUMMARY_ROW_ORDER,
+  SUMMARY_ROW_UNIT_KEY,
   classLabelKey,
   formatCount,
   formatDuration,
@@ -68,7 +68,10 @@ import {
   formatPoints,
   formatPrinters,
   formatSiteDate,
+  headerRangeKey,
+  isSingleDayRange,
   readChange,
+  summaryHintKeys,
   type ChangeReading,
 } from '../../utils/fleetMetrics';
 import type {
@@ -158,12 +161,20 @@ function formatMagnitude(
   }
 }
 
-/** `HH:MM` on the READER's clock — the footer states when their page last updated. */
+/**
+ * `HH:MM` on the READER's clock — the footer states when their page last
+ * updated.
+ *
+ * `hourCycle: 'h23'`, never `hour12: false`: the latter selects the locale's
+ * OWN 24-hour cycle, which ICU makes **h24** for several of them, so a page
+ * that last refreshed at midnight reported "Updated 24:00". Same fix and same
+ * reason as the hour buckets in `utils/fleetMetrics.bucketLabel`.
+ */
 function formatClock(epochMs: number, locale: string): string {
   return new Intl.DateTimeFormat(locale, {
     hour: '2-digit',
     minute: '2-digit',
-    hour12: false,
+    hourCycle: 'h23',
   }).format(new Date(epochMs));
 }
 
@@ -314,6 +325,12 @@ export interface FleetSummaryCardProps {
   range: FleetRange | undefined;
   /** Nothing observed yet: rows with no figure are dropped rather than dashed. */
   firstRun: boolean;
+  /**
+   * The window reaches back before the recorder did, so every period figure in
+   * this card covers only the recorded part of it. Qualifies the tooltips the
+   * hinted rows already carry; the tab states the fact itself, once, above.
+   */
+  recordingGap: boolean;
 }
 
 export function FleetSummaryCard({
@@ -324,6 +341,7 @@ export function FleetSummaryCard({
   preset,
   range,
   firstRun,
+  recordingGap,
 }: FleetSummaryCardProps) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language;
@@ -336,18 +354,23 @@ export function FleetSummaryCard({
    * not. Null only before `/status` has answered, when there is no window to
    * name at all.
    */
+  // A ONE-DAY window names its date once. "Sep 21, 2026 – Sep 21, 2026" is a
+  // range whose two ends a reader has to compare character by character to
+  // discover it is a single day; which leaf says so is the util's rule.
   const headerLine: string | null =
     overview !== undefined
-      ? t('fleetMetrics.header.range', {
+      ? t(headerRangeKey(isSingleDayRange(overview.date_from, overview.date_to), false), {
           from: formatSiteDate(overview.date_from, locale),
           to: formatSiteDate(overview.date_to, locale),
+          date: formatSiteDate(overview.date_from, locale),
           bucket: t(`fleetMetrics.header.bucket.${overview.bucket}`),
           tz: overview.tz_name,
         })
       : range !== undefined && status !== undefined
-        ? t('fleetMetrics.header.rangePending', {
+        ? t(headerRangeKey(isSingleDayRange(range.dateFrom, range.dateTo), true), {
             from: formatSiteDate(range.dateFrom, locale),
             to: formatSiteDate(range.dateTo, locale),
+            date: formatSiteDate(range.dateFrom, locale),
             tz: status.tz_name,
           })
         : null;
@@ -439,7 +462,8 @@ export function FleetSummaryCard({
               <tbody>
                 {rows.map((row, index) => {
                   const format = SUMMARY_ROW_FORMAT[row.key];
-                  const hintKey = SUMMARY_ROW_HINT_KEY[row.key];
+                  const hintKeys = summaryHintKeys(row.key, { recordingGap });
+                  const unitKey = SUMMARY_ROW_UNIT_KEY[row.key];
                   const now = nowValue(row.key, status);
                   const change = readChange(row.figure, row.previous, {
                     precision: CHANGE_PRECISION[format],
@@ -458,7 +482,13 @@ export function FleetSummaryCard({
                       >
                         <span className="inline-flex items-center gap-1">
                           {t(SUMMARY_ROW_LABEL_KEY[row.key])}
-                          {hintKey !== undefined && <InfoHint text={t(hintKey)} />}
+                          {/* One hint per row, whatever it has to say: the
+                              window qualifier joins the row's own sentence
+                              rather than arriving as a second trigger beside
+                              it (react-best-practices §9). */}
+                          {hintKeys.length > 0 && (
+                            <InfoHint text={hintKeys.map((key) => t(key)).join(' ')} />
+                          )}
                         </span>
                       </th>
                       <td
@@ -472,7 +502,20 @@ export function FleetSummaryCard({
                         {row.figure === null ? (
                           <span className={SECONDARY_TEXT_CLASS}>—</span>
                         ) : (
-                          formatFigure(row.figure, format, locale)
+                          <>
+                            {formatFigure(row.figure, format, locale)}
+                            {/* The unit, where the figure is not a figure
+                                without one: a bare "Prints 21" beside a matrix
+                                total of 900 reads as a count of prints rather
+                                than as a daily rate. `SUMMARY_ROW_FORMAT` says
+                                how a number is spelled and deliberately not
+                                what it counts per — that is its own map. */}
+                            {unitKey !== undefined && (
+                              <span className={`ml-1 text-xs font-normal ${SECONDARY_TEXT_CLASS}`}>
+                                {t(unitKey)}
+                              </span>
+                            )}
+                          </>
                         )}
                         {/* The sub-line is RESERVED, not conditional: it is
                             the Down row's second line whether or not a peak is

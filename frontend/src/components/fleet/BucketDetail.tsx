@@ -21,10 +21,17 @@
  *
  * `/printers/{id}/intervals` takes inclusive SITE dates and 422s above seven
  * days, so: a DAY bucket asks for its own day; a WEEK bucket asks for its
- * seven; an HOUR bucket asks for the site day it falls in and shows only the
- * intervals that intersect the hour — the endpoint has no finer grain, and
- * asking for a day and filtering is cheaper than a narrower contract nobody
- * else needs.
+ * seven; an HOUR bucket asks for the site day it falls in — the endpoint has
+ * no finer grain, and asking for a day and filtering is cheaper than a
+ * narrower contract nobody else needs.
+ *
+ * Which makes the BUCKET FILTER the thing this dialog cannot skip, and it
+ * applies to BOTH lists. The intervals were filtered and the incidents were
+ * not, so a 16:00–17:00 hour listed an incident that ran 19:18 the previous
+ * day to 00:37 — an hour of the day the reader had not asked about. One
+ * predicate (`overlapsBucket`), both lists, every bucket width: for a day or
+ * a week the request already IS the bucket, so filtering changes nothing
+ * there and there is no second rule to keep in step.
  */
 import { useId, useRef } from 'react';
 import { Loader2, X } from 'lucide-react';
@@ -36,7 +43,6 @@ import { Modal } from '../ui/Modal';
 import { FleetSplitBar } from './FleetMatrixCell';
 import { useFleetPrinterIntervals, type FleetRange } from '../../hooks/useFleetMetrics';
 import type {
-  ClassifiedInterval,
   FleetBucket,
   FleetGroup,
   MatrixCell,
@@ -55,8 +61,11 @@ import {
   formatHours,
   formatPercent,
   formatSiteInstant,
+  incidentKindLabelKey,
+  overlapsBucket,
   parseClassKey,
   sumMap,
+  type OpenEndedSpan,
 } from '../../utils/fleetMetrics';
 import { addCalendarDays } from '../../utils/timeframe';
 
@@ -122,19 +131,24 @@ export function BucketDetail({
   };
   const query = useFleetPrinterIntervals(printer.printer_id, range, { enabled: true });
 
+  const response = query.data;
+
   const bucketStartMs = Date.parse(`${seriesBucket.start}Z`);
   const bucketEndMs = bucketStartMs + seriesBucket.seconds * 1000;
-  const intersectsBucket = (interval: ClassifiedInterval): boolean =>
-    Date.parse(`${interval.end}Z`) > bucketStartMs && Date.parse(`${interval.start}Z`) < bucketEndMs;
+  // An open-ended span runs to the answer's own "now", never the browser's, so
+  // the same response filters the same way however long this page stays open.
+  const openEndMs =
+    response === undefined ? bucketEndMs : Date.parse(`${response.generated_at}Z`);
+  const inBucket = (span: OpenEndedSpan): boolean =>
+    overlapsBucket(span, bucketStartMs, bucketEndMs, openEndMs);
 
-  const response = query.data;
-  const intervals =
+  const intervals = response === undefined ? [] : response.intervals.filter(inBucket);
+  const incidents =
     response === undefined
       ? []
-      : bucketWidth === 'hour'
-        ? response.intervals.filter(intersectsBucket)
-        : response.intervals;
-  const incidents = response?.incidents ?? [];
+      : response.incidents.filter((incident) =>
+          inBucket({ start: incident.created_at, end: incident.resolved_at }),
+        );
 
   const values = cell ?? EMPTY_CELL;
   const split = foldTimeSplit(values.class_seconds);
@@ -150,7 +164,7 @@ export function BucketDetail({
   const at = (naiveUtc: string): string => formatSiteInstant(naiveUtc, offset, locale);
   /** An interval running up to the moment the answer was built is still open. */
   const ongoing = (end: string): boolean =>
-    response !== undefined && Date.parse(`${end}Z`) >= Date.parse(`${response.generated_at}Z`);
+    response !== undefined && Date.parse(`${end}Z`) >= openEndMs;
 
   return (
     <Modal onClose={onClose} labelledBy={titleId} size="lg" initialFocusRef={closeRef}>
@@ -311,7 +325,15 @@ export function BucketDetail({
                           ? t('fleetMetrics.detail.ongoing')
                           : at(incident.resolved_at)}
                       </span>
-                      <span>{t(`printers.incident.${incident.kind}`)}</span>
+                      {/*
+                        Through the owner, never a template: the declared
+                        `service_hold` is not a fault kind and has no
+                        `printers.incident.*` leaf, so building the key here
+                        printed the raw `printers.incident.service_hold` on
+                        screen. `incidentKindLabelKey` makes that distinction
+                        once, for every surface.
+                      */}
+                      <span>{t(incidentKindLabelKey(incident.kind))}</span>
                     </li>
                   ))}
                 </ul>

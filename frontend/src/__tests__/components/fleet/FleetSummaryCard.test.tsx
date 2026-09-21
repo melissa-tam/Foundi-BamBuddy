@@ -18,7 +18,9 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { act, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { ReactElement } from 'react';
+import i18n from '../../../i18n';
 import { FleetSummaryCard } from '../../../components/fleet/FleetSummaryCard';
+import type { FleetRange } from '../../../hooks/useFleetMetrics';
 import {
   FIXTURE_TZ_NAME,
   makeFleetOverview,
@@ -42,6 +44,8 @@ interface CardOptions {
   overview?: FleetOverview | undefined;
   preset?: TimeframeState['preset'];
   firstRun?: boolean;
+  recordingGap?: boolean;
+  range?: FleetRange | undefined;
 }
 
 function renderCard(options: CardOptions = {}) {
@@ -52,7 +56,9 @@ function renderCard(options: CardOptions = {}) {
       statusError={options.statusError ?? false}
       overview={'overview' in options ? options.overview : makeFleetOverview()}
       preset={options.preset ?? 'last-30'}
+      range={'range' in options ? options.range : undefined}
       firstRun={options.firstRun ?? false}
+      recordingGap={options.recordingGap ?? false}
     />
   );
   return render(element, { wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter> });
@@ -273,13 +279,81 @@ describe('FleetSummaryCard', () => {
   it('drops the rows it has nothing to say about on a first run', () => {
     renderCard({ overview: makeFleetOverviewFirstRun(), firstRun: true });
 
-    // Only the print-derived rows survive: print history is complete for its
-    // own past, state history does not exist yet, and every state row the
-    // server returned carries a null figure.
+    // Only the print-log rate survives. Print history is complete for its own
+    // past, so "Prints / day" is a real figure; "Prints per printer / day"
+    // divides by COUNTED printer-days, which only a recorded bucket produces,
+    // so on a first run it has no denominator at all.
     const headers = screen.getAllByRole('rowheader');
-    expect(headers.map((header) => header.textContent)).toEqual([
-      'Prints',
-      'Prints per printer',
-    ]);
+    expect(headers.map((header) => header.textContent)).toEqual(['Prints']);
+  });
+
+  describe('the rate rows carry their unit', () => {
+    it('reads "/ day" beside both rates, and beside nothing else', () => {
+      // Production read "Prints 21" next to a matrix total of 900 — a per-day
+      // average with no unit on it.
+      renderCard();
+
+      const perDay = i18n.t('fleetMetrics.units.perDay');
+      expect(rowCells('Prints')[1].textContent).toContain(perDay);
+      expect(rowCells('Prints per printer')[1].textContent).toContain(perDay);
+      expect(rowCells(/^Down/)[1].textContent).not.toContain(perDay);
+      expect(rowCells('Uptime')[1].textContent).not.toContain(perDay);
+    });
+
+    it('states no unit where there is no figure to qualify', () => {
+      renderCard({ overview: undefined });
+
+      expect(rowCells('Prints')[1].textContent).not.toContain(
+        i18n.t('fleetMetrics.units.perDay'),
+      );
+    });
+  });
+
+  describe('the window qualifier on the hints', () => {
+    const hintNames = (): string[] =>
+      screen.getAllByRole('button').map((node) => node.getAttribute('aria-label') ?? '');
+
+    it('says the period figures cover recorded time only when the window outruns the recorder', () => {
+      renderCard({ recordingGap: true });
+
+      const qualifier = i18n.t('fleetMetrics.hints.whileRecorded');
+      expect(hintNames().some((name) => name.includes(qualifier))).toBe(true);
+      // It joins the row's OWN sentence rather than arriving as a second
+      // trigger beside it.
+      const uptime = i18n.t('fleetMetrics.hints.uptime');
+      expect(hintNames().some((name) => name.includes(uptime) && name.includes(qualifier))).toBe(
+        true,
+      );
+    });
+
+    it('leaves the hints alone when the recorder covered the whole window', () => {
+      renderCard({ recordingGap: false });
+
+      expect(
+        hintNames().some((name) => name.includes(i18n.t('fleetMetrics.hints.whileRecorded'))),
+      ).toBe(false);
+    });
+  });
+
+  describe('a one-day window', () => {
+    it('names the single date once rather than either side of a dash', () => {
+      const overview = makeFleetOverview();
+      overview.date_from = overview.date_to;
+      renderCard({ overview });
+
+      const header = screen.getByTitle(new RegExp(FIXTURE_TZ_NAME));
+      expect(header.textContent).toContain('Sep 21, 2026');
+      expect(header.textContent?.match(/Sep 21, 2026/g)).toHaveLength(1);
+    });
+
+    it('does the same before history has landed', () => {
+      renderCard({
+        overview: undefined,
+        range: { dateFrom: '2026-09-21', dateTo: '2026-09-21' },
+      });
+
+      const header = screen.getByTitle(new RegExp(FIXTURE_TZ_NAME));
+      expect(header.textContent?.match(/Sep 21, 2026/g)).toHaveLength(1);
+    });
   });
 });

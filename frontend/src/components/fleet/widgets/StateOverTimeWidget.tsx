@@ -231,7 +231,12 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
             })}
 
             {/* The roster ceiling. It moves with activations and deletions, so
-                it is a series and not a fixed reference line. */}
+                it is a series and not a fixed reference line — and it BREAKS
+                over a bucket the recorder never reached, where the roster is
+                unknown rather than empty. `connectNulls={false}` is stated
+                rather than left to the default: a line drawn straight across
+                that gap would be the chart asserting the ceiling it does not
+                have. */}
             <Line
               type="stepAfter"
               dataKey="in_fleet"
@@ -241,6 +246,7 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
               strokeWidth={1.5}
               dot={false}
               activeDot={false}
+              connectNulls={false}
               isAnimationActive={false}
             />
             <Line

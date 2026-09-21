@@ -114,6 +114,9 @@ describe('FleetMatrix', () => {
           to: 'Sep 21, 2026',
         }),
       );
+      // "by printer", never "per printer": the tab has a metric called "Prints
+      // per printer", and the Prints-lens caption used to name that rate.
+      expect(grid.querySelector('caption')?.textContent).not.toContain('per printer');
       // The three frozen columns plus seven day buckets.
       expect(within(grid).getAllByRole('columnheader')).toHaveLength(FIRST_BUCKET_COL + 7);
       // Three printers (the deleted one is hidden) plus the fleet row.
@@ -322,6 +325,54 @@ describe('FleetMatrix', () => {
       ).toBeGreaterThan(0);
     });
 
+    it('captions the grid for whichever lens is up', async () => {
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      const caption = (): string => theGrid().querySelector('caption')?.textContent ?? '';
+
+      expect(caption()).toContain(LENS_PRINTS());
+      await switchLens(user, LENS_HOURS());
+      expect(caption()).toContain(LENS_HOURS());
+      expect(caption()).not.toContain(LENS_PRINTS());
+      await switchLens(user, LENS_SPLIT());
+      expect(caption()).toContain(LENS_SPLIT());
+      // Whichever lens it names, it names the GRID, never the rate metric.
+      expect(caption()).not.toContain('per printer');
+    });
+
+    it('captions a ONE-DAY window with its single date', () => {
+      const overview = makeFleetOverview({ bucket: 'hour', count: 12 });
+      overview.date_from = overview.date_to;
+      render(<FleetMatrix overview={overview} />);
+
+      const caption = theGrid().querySelector('caption')?.textContent ?? '';
+      expect(caption).toContain('Sep 21, 2026');
+      // Not "Sep 21, 2026 to Sep 21, 2026" — one date, said once.
+      expect(caption.match(/Sep 21, 2026/g)).toHaveLength(1);
+    });
+
+    it('spells only every third hour header, and all of them for a screen reader', () => {
+      // 14 px columns: labelling all twenty-four ran them into `000102030405…`.
+      render(<FleetMatrix overview={makeFleetOverview({ bucket: 'hour', count: 24 })} />);
+      const grid = theGrid();
+      const headers = [...grid.querySelectorAll('thead th')].slice(FIRST_BUCKET_COL);
+      expect(headers).toHaveLength(24);
+
+      // A header's aria-hidden spans are [optional month-or-Today overlay,
+      // top line, bottom line] — the hour is the top line, second from last.
+      const visible = headers.map((header) => {
+        const spans = header.querySelectorAll('[aria-hidden="true"]');
+        return spans[spans.length - 2]?.textContent?.trim() ?? '';
+      });
+      const labelled = visible.filter((text) => text !== '');
+      // The window ends at 09:00, so it opens at 10:00 the day before.
+      expect(labelled).toEqual(['12', '15', '18', '21', '00', '03', '06', '09']);
+
+      // Every one of the twenty-four still carries its full site stamp.
+      for (const header of headers) {
+        expect(header.querySelector('.sr-only')?.textContent ?? '').toMatch(/\d{2}:\d{2}/);
+      }
+    });
+
     it('renders 14 px hour columns and opens the detail from the row control', async () => {
       render(<FleetMatrix overview={makeFleetOverviewHour()} />);
       const grid = theGrid();
@@ -360,7 +411,7 @@ describe('FleetMatrix', () => {
       expect(cell.textContent).toContain('–');
     });
 
-    it('hatches and names a bucket the recorder only partly covered', async () => {
+    it('names each partly-observed bucket for what it actually is', async () => {
       render(<FleetMatrix overview={makeFleetOverviewDay()} />);
       await switchLens(user, LENS_HOURS());
       const grid = theGrid();
@@ -372,10 +423,43 @@ describe('FleetMatrix', () => {
           t('fleetMetrics.class.incidents_only'),
         ),
       ).toBeInTheDocument();
-      // Bucket 3 is half observed.
+      // Bucket 3 is half observed — a DIFFERENT claim, and it used to borrow
+      // the "No data" leaf from the bucket's `basis` instead of naming itself.
       expect(
-        within(cellAt(grid, row, FIRST_BUCKET_COL + 3)).getByText(t('fleetMetrics.class.unobserved')),
+        within(cellAt(grid, row, FIRST_BUCKET_COL + 3)).getByText(
+          t('fleetMetrics.widgets.partlyObserved'),
+        ),
       ).toBeInTheDocument();
+    });
+
+    it('never says "No data" beside a figure', async () => {
+      // Production: a hatched Hours-down cell showing 12 announced "No data".
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      await switchLens(user, LENS_HOURS());
+      const grid = theGrid();
+
+      const offenders = gridRows(grid)
+        .flatMap((gridRow) => [...gridRow.children].slice(FIRST_BUCKET_COL))
+        .filter((cell) => {
+          const text = cell.textContent ?? '';
+          return text.includes(t('fleetMetrics.class.unobserved')) && /\d/.test(text);
+        });
+      expect(offenders).toHaveLength(0);
+    });
+
+    it('keeps the texture off the digits of a cell that has some', async () => {
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      await switchLens(user, LENS_HOURS());
+      const grid = theGrid();
+      const row = rowOf(grid, '001-H2S');
+
+      // Bucket 3 is half observed and still shows its hours: the marker is a
+      // band along the bottom edge, not a hatch across the number.
+      const withFigure = cellAt(grid, row, FIRST_BUCKET_COL + 3) as HTMLTableCellElement;
+      expect(withFigure.textContent).toMatch(/\d/);
+      expect(withFigure.style.backgroundPosition).toBe('left bottom');
+      expect(withFigure.style.backgroundRepeat).toBe('no-repeat');
+      expect(withFigure.style.backgroundSize).not.toBe('auto');
     });
 
     it('renders flat ground and names a printer that was out of the fleet', async () => {
