@@ -7616,6 +7616,7 @@ export default {
       deactivated: 'Deaktiviert',
       fleetRow: 'Flotte',
       timeSplitDisabled: 'Benötigt aufgezeichnete Druckerzustände. Aufzeichnung seit {{date}}.',
+      timeSplitDisabledNoData: 'Benötigt aufgezeichnete Druckerzustände. Bisher nichts aufgezeichnet.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7655,6 +7656,11 @@ export default {
         hold: 'Anheben und Lüfter',
         fan_only: 'Nur Lüfter',
       },
+      ejectPurpose: {
+        production: 'Produktion',
+        fa: 'Erstmuster',
+        manual: 'Manuell',
+      },
       perPrinter: 'Je Drucker',
       faultHoursOpen: 'Offene Störstunden',
       timeToRecover: 'Dauer bis zur Behebung',
@@ -7666,6 +7672,11 @@ export default {
       plates: 'Platten',
       successRate: 'Erfolg',
       opened: 'Eröffnet',
+      notCompleted: 'Nicht abgeschlossen',
+      partlyObserved: 'Teilweise aufgezeichnet',
+      inProgress: 'Laufend',
+      otherSku: 'Sonstiges',
+      bucketColumn: 'Zeitraum',
     },
     states: {
       loading: 'Wird geladen…',
@@ -7686,6 +7697,7 @@ export default {
       up: '{{value}} mehr als im vorherigen Zeitraum {{period}}',
       down: '{{value}} weniger als im vorherigen Zeitraum {{period}}',
       none: 'Keine Änderung gegenüber dem vorherigen Zeitraum {{period}}',
+      noPrevious: 'Kein vorheriger Zeitraum {{period}} zum Vergleich',
     },
     hints: {
       down: 'Ungeplant: Der Drucker kann keine Aufträge annehmen — offline, pausiert, in Quarantäne, offene Störung, nicht geräumte Platte, kein USB-Stick oder falsches Modell.',

@@ -7603,6 +7603,7 @@ export default {
       deactivated: 'Desativada',
       fleetRow: 'Frota',
       timeSplitDisabled: 'Requer estado de impressora registrado. Registro desde {{date}}.',
+      timeSplitDisabledNoData: 'Requer estado de impressora registrado. Ainda não há nada registrado.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7642,6 +7643,11 @@ export default {
         hold: 'Mesa elevada e ventilação',
         fan_only: 'Somente ventilação',
       },
+      ejectPurpose: {
+        production: 'Produção',
+        fa: 'Primeira peça',
+        manual: 'Manual',
+      },
       perPrinter: 'Por impressora',
       faultHoursOpen: 'Horas de falha abertas',
       timeToRecover: 'Tempo até a recuperação',
@@ -7653,6 +7659,11 @@ export default {
       plates: 'Mesas',
       successRate: 'Sucesso',
       opened: 'Abertas',
+      notCompleted: 'Não concluídos',
+      partlyObserved: 'Registro parcial',
+      inProgress: 'Em andamento',
+      otherSku: 'Outro',
+      bucketColumn: 'Período',
     },
     states: {
       loading: 'Carregando…',
@@ -7673,6 +7684,7 @@ export default {
       up: '{{value}} a mais que no período anterior {{period}}',
       down: '{{value}} a menos que no período anterior {{period}}',
       none: 'Sem alteração em relação ao período anterior {{period}}',
+      noPrevious: 'Sem período anterior {{period}} para comparar',
     },
     hints: {
       down: 'Não planejado: a impressora não pode receber trabalho — offline, pausada, em quarentena, falha aberta, mesa não liberada, sem pendrive USB ou modelo divergente.',

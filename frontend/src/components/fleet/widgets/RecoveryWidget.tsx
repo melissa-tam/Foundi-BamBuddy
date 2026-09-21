@@ -44,8 +44,7 @@ import {
   recoveryTotals,
   type RecoveryRowValues,
 } from './rows';
-import type { PrinterIncidentKind } from '../../../api/client';
-import type { FleetCause, FleetOverview } from '../../../types/fleetMetrics';
+import type { FleetOverview } from '../../../types/fleetMetrics';
 import {
   CHART_AXIS_STROKE,
   CHART_GRID_DASH,
@@ -55,27 +54,16 @@ import {
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
-  FLEET_GROUP_COLOR,
-  FLEET_GROUP_TEXT,
   causeLabelKey,
-  downCauseColor,
-  downCauseTextColor,
   formatCount,
   formatDuration,
   formatHours,
   formatPercent,
+  incidentKindCause,
+  incidentKindColor,
+  incidentKindTextColor,
+  SUM_UNCERTAINTY,
 } from '../../../utils/fleetMetrics';
-
-/** A declared hold is planned work, so it takes the maintenance hue, not a fault shade. */
-const SERVICE_HOLD: PrinterIncidentKind = 'service_hold';
-
-const kindCause = (kind: PrinterIncidentKind): FleetCause => `fault:${kind}` as FleetCause;
-
-const kindColor = (kind: PrinterIncidentKind): string =>
-  kind === SERVICE_HOLD ? FLEET_GROUP_COLOR.planned : downCauseColor(kindCause(kind));
-
-const kindText = (kind: PrinterIncidentKind): string =>
-  kind === SERVICE_HOLD ? FLEET_GROUP_TEXT.planned : downCauseTextColor(kindCause(kind));
 
 export interface RecoveryWidgetProps {
   overview: FleetOverview;
@@ -102,21 +90,21 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
     .filter((entry) => entry.median_recover_s !== null)
     .map(
       (entry) =>
-        `${t(causeLabelKey(kindCause(entry.kind)))}: ${formatDuration(entry.median_recover_s ?? 0, locale)}`,
+        `${t(causeLabelKey(incidentKindCause(entry.kind)))}: ${formatDuration(entry.median_recover_s ?? 0, locale)}`,
     )
     .join(' · ');
 
   const legend: ChartLegendEntry[] = kinds.map((kind) => ({
     key: kind,
-    label: t(causeLabelKey(kindCause(kind))),
-    color: kindColor(kind),
-    textColor: kindText(kind),
+    label: t(causeLabelKey(incidentKindCause(kind))),
+    color: incidentKindColor(kind),
+    textColor: incidentKindTextColor(kind),
   }));
 
   const columns: ChartDataColumn<RecoveryRowValues>[] = [
     ...kinds.map((kind) => ({
       key: kind,
-      header: t(causeLabelKey(kindCause(kind))),
+      header: t(causeLabelKey(incidentKindCause(kind))),
       format: (values: RecoveryRowValues) => formatCount(values[kind] ?? 0, locale),
     })),
     {
@@ -144,7 +132,7 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
               detail:
                 headline.leadRecovery === null
                   ? undefined
-                  : t(causeLabelKey(kindCause(headline.leadRecovery.kind))),
+                  : t(causeLabelKey(incidentKindCause(headline.leadRecovery.kind))),
               hint: recoveryByKind === '' ? undefined : recoveryByKind,
             },
             {
@@ -189,10 +177,19 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
               <Bar
                 key={kind}
                 dataKey={kind}
-                name={t(causeLabelKey(kindCause(kind)))}
+                name={t(causeLabelKey(incidentKindCause(kind)))}
                 stackId="kind"
-                fill={kindColor(kind)}
-                shape={(props) => <PartialAwareBar {...props} fill={kindColor(kind)} />}
+                fill={incidentKindColor(kind)}
+                // The incident ledger is complete for its own history — a
+                // recorder gap never hid a fault row — so only a RUNNING
+                // bucket makes this arrival count short.
+                shape={(props) => (
+                  <PartialAwareBar
+                    {...props}
+                    fill={incidentKindColor(kind)}
+                    uncertain={SUM_UNCERTAINTY}
+                  />
+                )}
                 isAnimationActive={false}
               />
             ))}
@@ -202,12 +199,12 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
       table={
         <ChartDataTable<RecoveryRowValues>
           caption={t('fleetMetrics.sections.recovery')}
-          rowHeader={t('common.date')}
+          rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}
           rows={rows.map((row) => ({
             key: row.bucketStart,
             header: row.fullLabel,
-            partial: row.bucketPartial,
+            inProgress: row.bucketInProgress,
             values: row,
           }))}
           totals={{ key: 'window', header: t('fleetMetrics.matrix.columns.total'), values: totals }}

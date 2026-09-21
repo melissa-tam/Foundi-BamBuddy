@@ -59,6 +59,7 @@ import {
   downCauseColor,
   downCauseTextColor,
   formatHours,
+  STATE_SUM_UNCERTAINTY,
 } from '../../../utils/fleetMetrics';
 
 export interface DowntimeByCauseWidgetProps {
@@ -139,7 +140,16 @@ export function DowntimeByCauseWidget({ overview, size }: DowntimeByCauseWidgetP
                 name={t(causeLabelKey(cause))}
                 stackId="cause"
                 fill={downCauseColor(cause)}
-                shape={(props) => <PartialAwareBar {...props} fill={downCauseColor(cause)} />}
+                // THE state-derived chart on this tab: its hours come from the
+                // classified timeline, so a running bucket AND a recorder gap
+                // both make the bar short of what the finished bucket will say.
+                shape={(props) => (
+                  <PartialAwareBar
+                    {...props}
+                    fill={downCauseColor(cause)}
+                    uncertain={STATE_SUM_UNCERTAINTY}
+                  />
+                )}
                 isAnimationActive={false}
               />
             ))}
@@ -149,12 +159,13 @@ export function DowntimeByCauseWidget({ overview, size }: DowntimeByCauseWidgetP
       table={
         <ChartDataTable<DowntimeRowValues>
           caption={t('fleetMetrics.sections.downtimeByCause')}
-          rowHeader={t('common.date')}
+          rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}
           rows={rows.map((row) => ({
             key: row.bucketStart,
             header: row.fullLabel,
-            partial: row.bucketPartial,
+            inProgress: row.bucketInProgress,
+            partlyObserved: row.bucketPartlyObserved,
             values: row,
           }))}
           totals={{ key: 'window', header: t('fleetMetrics.matrix.columns.total'), values: totals }}

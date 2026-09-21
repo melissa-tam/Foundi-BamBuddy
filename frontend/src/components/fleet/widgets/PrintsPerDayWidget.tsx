@@ -35,7 +35,7 @@ import {
 } from './ChartFrame';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
 import { NO_VALUE, printsRows, printsTotals, type PrintsRowValues } from './rows';
-import type { FleetOverview, PrintOutcome } from '../../../types/fleetMetrics';
+import type { FleetOverview } from '../../../types/fleetMetrics';
 import {
   CHART_AXIS_STROKE,
   CHART_GRID_DASH,
@@ -46,35 +46,15 @@ import {
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
-  FLEET_GROUP_COLOR,
-  FLEET_GROUP_TEXT,
+  OUTCOME_COLOR,
   OUTCOME_LABEL_KEY,
   OUTCOME_ORDER,
+  OUTCOME_TEXT,
   formatCount,
   formatPercent,
   formatPrinters,
+  SUM_UNCERTAINTY,
 } from '../../../utils/fleetMetrics';
-
-/**
- * Outcome → band colour, composed from the class palette rather than typed as
- * new hexes: a completed print is the green that already means printing, a
- * failure is the red that already means down, a stop is the amber that already
- * means a person intervened, and "other" is the neutral. Nothing new to
- * validate for contrast, and nothing to drift.
- */
-const OUTCOME_COLOR: Record<PrintOutcome, string> = {
-  completed: FLEET_GROUP_COLOR.printing,
-  failed: FLEET_GROUP_COLOR.down,
-  cancelled: FLEET_GROUP_COLOR.planned,
-  other: FLEET_GROUP_COLOR.idle,
-};
-
-const OUTCOME_TEXT: Record<PrintOutcome, string> = {
-  completed: FLEET_GROUP_TEXT.printing,
-  failed: FLEET_GROUP_TEXT.down,
-  cancelled: FLEET_GROUP_TEXT.planned,
-  other: FLEET_GROUP_TEXT.idle,
-};
 
 export interface PrintsPerDayWidgetProps {
   overview: FleetOverview;
@@ -178,7 +158,16 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
                 name={t(OUTCOME_LABEL_KEY[outcome])}
                 stackId="outcome"
                 fill={OUTCOME_COLOR[outcome]}
-                shape={(props) => <PartialAwareBar {...props} fill={OUTCOME_COLOR[outcome]} />}
+                // The print log is complete for its own history, so only a
+                // RUNNING bucket makes this bar short. A recorder gap says
+                // nothing about whether a print finished.
+                shape={(props) => (
+                  <PartialAwareBar
+                    {...props}
+                    fill={OUTCOME_COLOR[outcome]}
+                    uncertain={SUM_UNCERTAINTY}
+                  />
+                )}
                 isAnimationActive={false}
               />
             ))}
@@ -199,12 +188,12 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
       table={
         <ChartDataTable<PrintsRowValues>
           caption={t('fleetMetrics.sections.printsPerDay')}
-          rowHeader={t('common.date')}
+          rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}
           rows={rows.map((row) => ({
             key: row.bucketStart,
             header: row.fullLabel,
-            partial: row.bucketPartial,
+            inProgress: row.bucketInProgress,
             values: row,
           }))}
           totals={{ key: 'window', header: t('fleetMetrics.matrix.columns.total'), values: totals }}

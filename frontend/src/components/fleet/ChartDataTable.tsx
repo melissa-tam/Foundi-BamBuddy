@@ -14,18 +14,26 @@
  * focusable and named, because a region that scrolls has to be reachable
  * without a pointer (WCAG 2.1.1).
  *
- * **A partly observed bucket is marked, not hidden.** The marker is the same
+ * **A bucket that understates is marked, not hidden — and the table says WHICH
+ * way it understates.** The chart can only hatch (one texture, one meaning:
+ * "this bar is short"), but a table has room for the distinction, and the two
+ * are genuinely different: a bucket still RUNNING is short because the day is
+ * not over, and one the recorder only partly OBSERVED is short because nobody
+ * was watching. A row can carry both. The partly-observed marker is the same
  * sparse hatch the charts paint, drawn from `FLEET_PATTERN_CSS` so the table
- * and the plot cannot drift into two different textures, and it carries a real
- * accessible name rather than being colour and texture alone.
+ * and the plot cannot drift into two textures; the in-progress marker is a
+ * half-filled swatch, which is what "half a bucket" looks like. Both carry a
+ * real accessible name rather than being colour and texture alone.
  */
 import { useTranslation } from 'react-i18next';
 import { InfoHint } from '../ui/InfoHint';
 import {
   FLEET_ABSENCE_COLOR,
   FLEET_ABSENCE_TEXT,
+  FLEET_IN_PROGRESS_CSS,
   FLEET_PATTERN_CSS,
   SECONDARY_TEXT_CLASS,
+  type PatternCss,
 } from '../../utils/fleetMetrics';
 
 /** One column: its heading, its unit, and how it reads a value out of a row. */
@@ -38,12 +46,18 @@ export interface ChartDataColumn<Values> {
   format: (values: Values) => string;
 }
 
-/** One row: its own heading, the values the columns read, and its honesty flag. */
+/** One row: its own heading, the values the columns read, and its honesty flags. */
 export interface ChartDataRow<Values> {
   key: string;
   header: string;
-  /** The state recorder covered less of this bucket than elapsed. */
-  partial?: boolean;
+  /** The bucket has not finished, so every sum over it is short of a full one. */
+  inProgress?: boolean;
+  /**
+   * The state recorder covered less of this bucket than elapsed. Set ONLY by a
+   * table whose figures are state-derived — a print or incident count is
+   * complete for its own history and must never carry this.
+   */
+  partlyObserved?: boolean;
   values: Values;
 }
 
@@ -59,13 +73,13 @@ export interface ChartDataTableProps<Values> {
 }
 
 /**
- * The partly-observed marker: the sparse hatch, named.
+ * One honesty marker: a named swatch carrying a texture.
  *
- * `color` is set to the swatch's paired text colour because `FLEET_PATTERN_CSS`
- * strokes with `currentColor` — the pattern then inherits a stroke already
- * proven legible on that exact tile.
+ * `color` is set to the swatch's paired text colour because both
+ * `FLEET_PATTERN_CSS` and `FLEET_IN_PROGRESS_CSS` stroke with `currentColor` —
+ * the texture then inherits a stroke already proven legible on that exact tile.
  */
-function PartialMarker({ label }: { label: string }) {
+function RowMarker({ label, texture }: { label: string; texture: PatternCss }) {
   return (
     <span
       role="img"
@@ -74,7 +88,7 @@ function PartialMarker({ label }: { label: string }) {
       style={{
         backgroundColor: FLEET_ABSENCE_COLOR.unobserved,
         color: FLEET_ABSENCE_TEXT.unobserved,
-        ...FLEET_PATTERN_CSS.sparse,
+        ...texture,
       }}
     />
   );
@@ -88,8 +102,12 @@ export function ChartDataTable<Values>({
   totals,
 }: ChartDataTableProps<Values>) {
   const { t } = useTranslation();
-  const partialLabel = t('fleetMetrics.class.unobserved');
-  const anyPartial = rows.some((row) => row.partial === true);
+  const inProgressLabel = t('fleetMetrics.widgets.inProgress');
+  const partlyObservedLabel = t('fleetMetrics.widgets.partlyObserved');
+  // The caption's hint explains the RECORDER's blind spot, so it appears only
+  // where that is what happened. A running bucket needs no explanation beyond
+  // its own marker name.
+  const anyPartlyObserved = rows.some((row) => row.partlyObserved === true);
 
   return (
     <div
@@ -103,7 +121,7 @@ export function ChartDataTable<Values>({
         <caption className={`mb-2 text-left text-xs ${SECONDARY_TEXT_CLASS}`}>
           <span className="inline-flex items-center gap-1">
             {caption}
-            {anyPartial && <InfoHint text={t('fleetMetrics.hints.unobserved')} />}
+            {anyPartlyObserved && <InfoHint text={t('fleetMetrics.hints.unobserved')} />}
           </span>
         </caption>
         <thead>
@@ -130,7 +148,12 @@ export function ChartDataTable<Values>({
                 className="whitespace-nowrap py-1.5 pr-3 text-left font-normal text-white"
               >
                 {row.header}
-                {row.partial === true && <PartialMarker label={partialLabel} />}
+                {row.inProgress === true && (
+                  <RowMarker label={inProgressLabel} texture={FLEET_IN_PROGRESS_CSS} />
+                )}
+                {row.partlyObserved === true && (
+                  <RowMarker label={partlyObservedLabel} texture={FLEET_PATTERN_CSS.sparse} />
+                )}
               </th>
               {columns.map((column) => (
                 <td key={column.key} className="py-1.5 pl-3 text-right text-white">

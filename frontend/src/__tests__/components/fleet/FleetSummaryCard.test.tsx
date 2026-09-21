@@ -161,7 +161,12 @@ describe('FleetSummaryCard', () => {
         overview: overviewWithRows([{ ...upRow, figure: 2.1, previous: null }]),
       });
 
-      expect(screen.getByRole('img', { name: 'No data available' })).toBeInTheDocument();
+      // It names the MISSING COMPARISON, and names the period it would have
+      // been against. A bare "No data" was ambiguous with the row's own figure
+      // being absent, which is a different fact.
+      expect(
+        screen.getByRole('img', { name: 'No previous Last 30 days to compare with' }),
+      ).toBeInTheDocument();
       expect(
         screen.queryByRole('img', { name: /No change from the previous/ }),
       ).not.toBeInTheDocument();

@@ -7603,6 +7603,7 @@ export default {
       deactivated: 'Disattivata',
       fleetRow: 'Parco',
       timeSplitDisabled: 'Richiede lo stato registrato delle stampanti. Registrazione dal {{date}}.',
+      timeSplitDisabledNoData: 'Richiede lo stato registrato delle stampanti. Non è stato ancora registrato nulla.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7642,6 +7643,11 @@ export default {
         hold: 'Piano sollevato e ventole',
         fan_only: 'Solo ventole',
       },
+      ejectPurpose: {
+        production: 'Produzione',
+        fa: 'Primo pezzo',
+        manual: 'Manuale',
+      },
       perPrinter: 'Per stampante',
       faultHoursOpen: 'Ore di guasto aperte',
       timeToRecover: 'Tempo di ripristino',
@@ -7653,6 +7659,11 @@ export default {
       plates: 'Piani',
       successRate: 'Riuscita',
       opened: 'Aperti',
+      notCompleted: 'Non completati',
+      partlyObserved: 'Registrazione parziale',
+      inProgress: 'In corso',
+      otherSku: 'Altro',
+      bucketColumn: 'Periodo',
     },
     states: {
       loading: 'Caricamento…',
@@ -7673,6 +7684,7 @@ export default {
       up: '{{value}} in più rispetto al periodo precedente {{period}}',
       down: '{{value}} in meno rispetto al periodo precedente {{period}}',
       none: 'Nessuna variazione rispetto al periodo precedente {{period}}',
+      noPrevious: 'Nessun periodo precedente {{period}} con cui confrontare',
     },
     hints: {
       down: 'Non pianificato: la stampante non può accettare lavoro — offline, in pausa, in quarantena, guasto aperto, piano non liberato, chiavetta USB assente o modello non corrispondente.',

@@ -54,13 +54,13 @@ import {
   formatDuration,
   formatHours,
   formatPercent,
+  formatSiteInstant,
   parseClassKey,
   sumMap,
 } from '../../utils/fleetMetrics';
 import { addCalendarDays } from '../../utils/timeframe';
 
 const SECONDS_PER_HOUR = 3600;
-const MS_PER_MINUTE = 60_000;
 
 /** Class rows read top-down in the order an operator cares about them. */
 const GROUP_RANK: Record<FleetGroup, number> = {
@@ -308,22 +308,4 @@ export function BucketDetail({
       </CardContent>
     </Modal>
   );
-}
-
-/**
- * A naive-UTC instant as the SITE's wall clock. The date is always shown, not
- * only on a week bucket: an interval that starts before its bucket reads as a
- * mistake without one, and the whole point of this dialog is that the
- * timestamps can be checked against the printer's own history.
- */
-function formatSiteInstant(naiveUtc: string, offsetMinutes: number, locale: string): string {
-  const shifted = new Date(Date.parse(`${naiveUtc}Z`) + offsetMinutes * MS_PER_MINUTE);
-  return new Intl.DateTimeFormat(locale, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-    timeZone: 'UTC',
-  }).format(shifted);
 }

@@ -7615,6 +7615,7 @@ export default {
       deactivated: '無効',
       fleetRow: 'フリート',
       timeSplitDisabled: '記録されたプリンター状態が必要です。記録開始は{{date}}です。',
+      timeSplitDisabledNoData: '記録されたプリンター状態が必要です。まだ何も記録されていません。',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7654,6 +7655,11 @@ export default {
         hold: 'プレート上昇とファン',
         fan_only: 'ファンのみ',
       },
+      ejectPurpose: {
+        production: '生産',
+        fa: '初品',
+        manual: '手動',
+      },
       perPrinter: 'プリンター別',
       faultHoursOpen: '障害の継続時間',
       timeToRecover: '復旧までの時間',
@@ -7665,6 +7671,11 @@ export default {
       plates: 'プレート',
       successRate: '成功',
       opened: '発生',
+      notCompleted: '未完了',
+      partlyObserved: '一部のみ記録',
+      inProgress: '進行中',
+      otherSku: 'その他',
+      bucketColumn: '期間',
     },
     states: {
       loading: '読み込み中…',
@@ -7685,6 +7696,7 @@ export default {
       up: '前の{{period}}より{{value}}多い',
       down: '前の{{period}}より{{value}}少ない',
       none: '前の{{period}}から変化なし',
+      noPrevious: '比較できる前の{{period}}がありません',
     },
     hints: {
       down: '計画外の停止です。オフライン、一時停止、隔離、未解決の障害、片付いていないプレート、USBメモリ未挿入、機種不一致のいずれかで作業を受けられません。',

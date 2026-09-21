@@ -7602,6 +7602,7 @@ export default {
       deactivated: '已停用',
       fleetRow: '机群',
       timeSplitDisabled: '需要已记录的打印机状态。记录自 {{date}} 开始。',
+      timeSplitDisabledNoData: '需要已记录的打印机状态。目前还没有任何记录。',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7641,6 +7642,11 @@ export default {
         hold: '抬升热床加风扇',
         fan_only: '仅风扇',
       },
+      ejectPurpose: {
+        production: '生产',
+        fa: '首件',
+        manual: '手动',
+      },
       perPrinter: '按打印机',
       faultHoursOpen: '故障未解小时',
       timeToRecover: '恢复用时',
@@ -7652,6 +7658,11 @@ export default {
       plates: '盘数',
       successRate: '成功率',
       opened: '新增',
+      notCompleted: '未完成',
+      partlyObserved: '部分记录',
+      inProgress: '进行中',
+      otherSku: '其他',
+      bucketColumn: '期间',
     },
     states: {
       loading: '加载中…',
@@ -7672,6 +7683,7 @@ export default {
       up: '比上一个{{period}}多 {{value}}',
       down: '比上一个{{period}}少 {{value}}',
       none: '与上一个{{period}}持平',
+      noPrevious: '没有可比较的上一个{{period}}',
     },
     hints: {
       down: '非计划停机：打印机无法接活——离线、暂停、隔离、存在未解故障、热床未清理、没有 U 盘或机型不匹配。',

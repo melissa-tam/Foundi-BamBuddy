@@ -19,7 +19,10 @@ import {
   FLEET_PATTERN_CSS,
   SECONDARY_TEXT_CLASS,
   patternFill,
+  rowIsUncertain,
+  type BucketUncertainty,
   type FleetPattern,
+  type SeriesRowMeta,
 } from '../../../utils/fleetMetrics';
 
 export interface ChartFrameProps {
@@ -68,12 +71,13 @@ export function ChartFrame({
       {!isEmpty && (
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">{controls}</div>
-          <Button
-            variant="secondary"
-            size="sm"
-            aria-pressed={showData}
-            onClick={() => setShowData((shown) => !shown)}
-          >
+          {/* The LABEL is the state signal: it names what pressing the button
+              will do next, and it changes every time the view does. An
+              `aria-pressed` on top of that says the same thing a second time,
+              in a second vocabulary — "Show chart, pressed" is heard as two
+              facts about one control and reads as a contradiction. One signal,
+              and it is the one sighted and screen-reader users share. */}
+          <Button variant="secondary" size="sm" onClick={() => setShowData((shown) => !shown)}>
             {showData ? t('fleetMetrics.widgets.showChart') : t('fleetMetrics.widgets.showData')}
           </Button>
         </div>
@@ -193,35 +197,65 @@ export function HeadlineFigures({ figures }: { figures: readonly HeadlineFigure[
   );
 }
 
-/** Does this row say the recorder fell short of the bucket's elapsed time? */
-function isPartialRow(payload: unknown): boolean {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    'bucketPartial' in payload &&
-    (payload as { bucketPartial?: unknown }).bucketPartial === true
-  );
+/** The two meta flags a bar shape reads, as they arrive from recharts: loosely. */
+type UncertaintyMeta = Pick<SeriesRowMeta, 'bucketInProgress' | 'bucketPartlyObserved'>;
+
+/**
+ * Read the uncertainty flags off a recharts payload.
+ *
+ * recharts hands the shape an untyped row, so the flags are checked rather than
+ * asserted; a row that carries neither is simply certain, which is the right
+ * answer for a chart whose rows are not bucket rows at all.
+ */
+function uncertaintyOf(payload: unknown): UncertaintyMeta {
+  const row = typeof payload === 'object' && payload !== null ? (payload as UncertaintyMeta) : null;
+  return {
+    bucketInProgress: row?.bucketInProgress === true,
+    bucketPartlyObserved: row?.bucketPartlyObserved === true,
+  };
 }
 
 export interface PartialAwareBarProps extends BarShapeProps {
   /** The band's own colour. Passed explicitly: the computed props do not type it. */
   fill: string;
+  /**
+   * Which of the two bucket uncertainties make THIS chart's bars understate.
+   *
+   * Always includes `inProgress` — a sum over a running bucket is short of a
+   * full one whatever it sums. `partlyObserved` is added only by a chart whose
+   * source IS the state recorder; a print or incident count is complete for its
+   * own history, and hatching it would report a working ledger as a doubtful
+   * one. Both hatch the same way, because both say one thing to the reader:
+   * this bar is lower than the finished bucket's will be.
+   */
+  uncertain: readonly BucketUncertainty[];
 }
 
 /**
- * A stacked-bar segment that hatches itself when its bucket is partly observed.
+ * A stacked-bar segment that hatches itself when its bucket understates.
  *
  * One rectangle for the colour and, over it, the same rectangle filled with the
  * shared sparse `<pattern>` — so the texture is composed at PAINT time rather
  * than by defining a second, colour-bearing pattern that would have to repeat
  * the geometry `FleetPatternDefs` already owns and would then drift from it.
  */
-export function PartialAwareBar({ payload, x, y, width, height, radius, fill }: PartialAwareBarProps) {
+export function PartialAwareBar({
+  payload,
+  x,
+  y,
+  width,
+  height,
+  radius,
+  fill,
+  uncertain,
+}: PartialAwareBarProps) {
   const rect = { x, y, width, height, radius };
   return (
     <>
       <Rectangle {...rect} fill={fill} />
-      {isPartialRow(payload) && <Rectangle {...rect} fill={patternFill('sparse')} />}
+      {rowIsUncertain(uncertaintyOf(payload), uncertain) && (
+        <Rectangle {...rect} fill={patternFill('sparse')} />
+      )}
     </>
   );
 }

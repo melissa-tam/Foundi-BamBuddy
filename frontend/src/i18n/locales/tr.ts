@@ -7544,6 +7544,7 @@ export default {
       deactivated: 'Devre dışı',
       fleetRow: 'Filo',
       timeSplitDisabled: 'Kayıtlı yazıcı durumu gerekir. Kayıt {{date}} tarihinde başladı.',
+      timeSplitDisabledNoData: 'Kayıtlı yazıcı durumu gerekir. Henüz hiçbir şey kaydedilmedi.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7583,6 +7584,11 @@ export default {
         hold: 'Tabla kaldırma ve fan',
         fan_only: 'Yalnızca fan',
       },
+      ejectPurpose: {
+        production: 'Üretim',
+        fa: 'İlk parça',
+        manual: 'Manuel',
+      },
       perPrinter: 'Yazıcı başına',
       faultHoursOpen: 'Açık arıza saati',
       timeToRecover: 'Toparlanma süresi',
@@ -7594,6 +7600,11 @@ export default {
       plates: 'Tablalar',
       successRate: 'Başarı',
       opened: 'Açılan',
+      notCompleted: 'Tamamlanmadı',
+      partlyObserved: 'Kısmi kayıt',
+      inProgress: 'Sürüyor',
+      otherSku: 'Diğer',
+      bucketColumn: 'Dönem',
     },
     states: {
       loading: 'Yükleniyor…',
@@ -7614,6 +7625,7 @@ export default {
       up: 'Önceki {{period}} dönemine göre {{value}} daha fazla',
       down: 'Önceki {{period}} dönemine göre {{value}} daha az',
       none: 'Önceki {{period}} dönemine göre değişiklik yok',
+      noPrevious: 'Karşılaştırılacak önceki {{period}} yok',
     },
     hints: {
       down: 'Plansız: yazıcı iş alamıyor — çevrimdışı, duraklatılmış, karantinada, açık arıza, temizlenmemiş tabla, USB bellek yok veya model uyuşmuyor.',

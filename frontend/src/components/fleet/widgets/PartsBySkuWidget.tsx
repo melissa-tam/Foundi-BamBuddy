@@ -42,45 +42,11 @@ import {
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
-  FLEET_ABSENCE_COLOR,
-  FLEET_ABSENCE_TEXT,
-  FLEET_GROUP_COLOR,
-  FLEET_GROUP_TEXT,
+  SUM_UNCERTAINTY,
   formatCount,
+  skuBandColor,
+  skuBandText,
 } from '../../../utils/fleetMetrics';
-
-/**
- * The SKU bands, composed from the class palette rather than typed as new
- * hexes. Red is last of the five so it only appears on a farm running five or
- * more SKUs at once, where the legend is doing the identifying anyway; nothing
- * in this widget draws a printer state, so the hues carry no second meaning
- * here. "Other" takes the neutral absence swatch.
- */
-const SKU_BAND_COLORS: readonly string[] = [
-  FLEET_GROUP_COLOR.printing,
-  FLEET_GROUP_COLOR.cycle_overhead,
-  FLEET_GROUP_COLOR.planned,
-  FLEET_GROUP_COLOR.idle,
-  FLEET_GROUP_COLOR.down,
-];
-
-const SKU_BAND_TEXT: readonly string[] = [
-  FLEET_GROUP_TEXT.printing,
-  FLEET_GROUP_TEXT.cycle_overhead,
-  FLEET_GROUP_TEXT.planned,
-  FLEET_GROUP_TEXT.idle,
-  FLEET_GROUP_TEXT.down,
-];
-
-const bandColor = (index: number, isOther: boolean): string =>
-  isOther
-    ? FLEET_ABSENCE_COLOR.unobserved
-    : (SKU_BAND_COLORS[index % SKU_BAND_COLORS.length] ?? FLEET_ABSENCE_COLOR.unobserved);
-
-const bandText = (index: number, isOther: boolean): string =>
-  isOther
-    ? FLEET_ABSENCE_TEXT.unobserved
-    : (SKU_BAND_TEXT[index % SKU_BAND_TEXT.length] ?? FLEET_ABSENCE_TEXT.unobserved);
 
 export interface PartsBySkuWidgetProps {
   overview: FleetOverview;
@@ -101,13 +67,13 @@ export function PartsBySkuWidget({ overview, size }: PartsBySkuWidgetProps) {
   const totals = partsTotals(overview.units, series);
 
   const seriesLabel = (entry: SkuSeries): string =>
-    entry.sku ?? t('fleetMetrics.detail.outcome.other');
+    entry.sku ?? t('fleetMetrics.widgets.otherSku');
 
   const legend: ChartLegendEntry[] = series.map((entry, index) => ({
     key: entry.key,
     label: seriesLabel(entry),
-    color: bandColor(index, entry.sku === null),
-    textColor: bandText(index, entry.sku === null),
+    color: skuBandColor(index, entry.sku === null),
+    textColor: skuBandText(index, entry.sku === null),
   }));
 
   const columns: ChartDataColumn<PartsRowValues>[] = [
@@ -151,7 +117,7 @@ export function PartsBySkuWidget({ overview, size }: PartsBySkuWidgetProps) {
               formatter={(value) => (typeof value === 'number' ? formatCount(value, locale) : '')}
             />
             {series.map((entry, index) => {
-              const color = bandColor(index, entry.sku === null);
+              const color = skuBandColor(index, entry.sku === null);
               return (
                 <Bar
                   key={entry.key}
@@ -159,7 +125,11 @@ export function PartsBySkuWidget({ overview, size }: PartsBySkuWidgetProps) {
                   name={seriesLabel(entry)}
                   stackId="sku"
                   fill={color}
-                  shape={(props) => <PartialAwareBar {...props} fill={color} />}
+                  // Units come from completed queue plates — a complete ledger.
+                  // Only a running bucket understates them.
+                  shape={(props) => (
+                    <PartialAwareBar {...props} fill={color} uncertain={SUM_UNCERTAINTY} />
+                  )}
                   isAnimationActive={false}
                 />
               );
@@ -170,12 +140,12 @@ export function PartsBySkuWidget({ overview, size }: PartsBySkuWidgetProps) {
       table={
         <ChartDataTable<PartsRowValues>
           caption={t('fleetMetrics.sections.partsBySku')}
-          rowHeader={t('common.date')}
+          rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}
           rows={rows.map((row) => ({
             key: row.bucketStart,
             header: row.fullLabel,
-            partial: row.bucketPartial,
+            inProgress: row.bucketInProgress,
             values: row,
           }))}
           totals={{ key: 'window', header: t('fleetMetrics.matrix.columns.total'), values: totals }}

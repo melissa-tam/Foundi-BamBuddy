@@ -44,6 +44,12 @@ import {
   formatPercent,
 } from '../../../utils/fleetMetrics';
 
+/**
+ * The eject purposes the backend mints, each with its own leaf. Any other
+ * string falls through to itself — see `variantLabel`.
+ */
+const EJECT_PURPOSES: readonly string[] = ['production', 'fa', 'manual'];
+
 /** The median bar takes the between-prints hue: this IS the between-prints work. */
 const MEDIAN_COLOR = FLEET_GROUP_COLOR.cycle_overhead;
 /** The slow tail is the same measure at a lower emphasis, so it takes the neutral. */
@@ -66,16 +72,24 @@ export function CoolingAndEjectWidget({ overview }: CoolingAndEjectWidgetProps) 
     t('fleetMetrics.matrix.deletedPrinter', { id: printerId });
 
   /**
-   * A cooldown's variant is one of two measured modes and has its own copy; an
-   * eject's variant is its purpose, which the backend carries verbatim and no
-   * locale has a leaf for.
+   * A cooldown's variant is one of two measured modes; an eject's variant is
+   * its PURPOSE, and the backend spells three (`production`, `fa`, `manual` —
+   * `services/eject/remote.py` parses the job name into exactly those).
+   *
+   * Both vocabularies get real copy. The fall-back to the raw string stays for
+   * a purpose a later build invents: printing `dry_run` is ugly but true, and
+   * silently dropping a row the operator's episodes went into is not.
    */
   const variantLabel = (row: CycleRow): string | null => {
     if (row.variant === null) return null;
-    if (row.variant === 'hold' || row.variant === 'fan_only') {
-      return t(`fleetMetrics.widgets.variant.${row.variant}`);
+    if (row.kind === 'cooldown') {
+      return row.variant === 'hold' || row.variant === 'fan_only'
+        ? t(`fleetMetrics.widgets.variant.${row.variant}`)
+        : row.variant;
     }
-    return row.variant;
+    return EJECT_PURPOSES.includes(row.variant)
+      ? t(`fleetMetrics.widgets.ejectPurpose.${row.variant}`)
+      : row.variant;
   };
 
   const rowLabel = (row: CycleRow): string => {
@@ -127,8 +141,7 @@ export function CoolingAndEjectWidget({ overview }: CoolingAndEjectWidgetProps) 
     },
     {
       key: 'not_completed',
-      // TODO(i18n): wants its own leaf, `fleetMetrics.widgets.notCompleted`.
-      header: t('fleetMetrics.detail.outcome.cancelled'),
+      header: t('fleetMetrics.widgets.notCompleted'),
       format: (row) => formatCount(row.notCompleted, locale),
     },
   ];
@@ -152,7 +165,7 @@ export function CoolingAndEjectWidget({ overview }: CoolingAndEjectWidgetProps) 
       footer={
         notCompleted > 0 ? (
           <p className={`text-xs ${SECONDARY_TEXT_CLASS}`}>
-            {t('fleetMetrics.detail.outcome.cancelled')} {formatCount(notCompleted, locale)}
+            {t('fleetMetrics.widgets.notCompleted')} {formatCount(notCompleted, locale)}
           </p>
         ) : undefined
       }

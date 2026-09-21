@@ -49,7 +49,7 @@ import { useEffect, useId, useState } from 'react';
 import { AlertTriangle, ArrowDown, ArrowUp, Minus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
-import { Card, CardContent } from '../Card';
+import { Card, CardContent, CardHeader } from '../Card';
 import { InfoHint } from '../ui/InfoHint';
 import { Sparkline } from './Sparkline';
 import { TIMEFRAME_PERIOD_LABEL_KEY } from '../../hooks/useFleetMetrics';
@@ -59,17 +59,18 @@ import {
   SUMMARY_ROW_FORMAT,
   SUMMARY_ROW_HINT_KEY,
   SUMMARY_ROW_LABEL_KEY,
+  SUMMARY_ROW_NOW_GROUP,
   classLabelKey,
   formatCount,
   formatDuration,
   formatPercent,
   formatPoints,
   formatPrinters,
+  formatSiteDate,
   readChange,
   type ChangeReading,
 } from '../../utils/fleetMetrics';
 import type {
-  FleetGroup,
   FleetOverview,
   FleetStatus,
   PrinterStatus,
@@ -82,26 +83,6 @@ import type { TimeframeState } from '../../utils/timeframe';
 type RowFormat = (typeof SUMMARY_ROW_FORMAT)[SummaryRowKey];
 
 /**
- * Summary row → the live class GROUP whose printer count is that row's "Now".
- *
- * The pairing is what makes the two figure columns comparable: `avg_down` is
- * average concurrent printers down, and `counts_by_group.down` is printers down
- * at this instant. A row absent from this map has no instantaneous twin (a rate
- * per day, a percentage) and leaves Now blank.
- *
- * Lives here rather than in `utils/fleetMetrics` only because nothing else
- * needs it yet — it is a candidate to move the moment a second surface pairs a
- * summary row with a live count.
- */
-const NOW_GROUP: Partial<Record<SummaryRowKey, FleetGroup>> = {
-  avg_printing: 'printing',
-  avg_cycle_overhead: 'cycle_overhead',
-  avg_idle: 'idle',
-  avg_down: 'down',
-  avg_planned: 'planned',
-};
-
-/**
  * The rows the card can render from `/status` ALONE, in the order the wireframe
  * reads them.
  *
@@ -111,11 +92,11 @@ const NOW_GROUP: Partial<Record<SummaryRowKey, FleetGroup>> = {
  * two-query split exists to prevent. Once `/overview` lands, the server's own
  * row list takes over completely; this is a floor, never a merge.
  *
- * Derived from `NOW_GROUP` rather than re-typed, so a row can never appear here
- * without the live count that gives it a Now column.
+ * Derived from `SUMMARY_ROW_NOW_GROUP` rather than re-typed, so a row can never
+ * appear here without the live count that gives it a Now column.
  */
 const LIVE_ROW_ORDER: SummaryRowKey[] = [
-  ...(Object.keys(NOW_GROUP) as SummaryRowKey[]),
+  ...(Object.keys(SUMMARY_ROW_NOW_GROUP) as SummaryRowKey[]),
   'printers_in_fleet',
 ];
 
@@ -143,7 +124,7 @@ const MAX_DOWN_ROWS = 3;
 
 /** Does this row have an instantaneous twin at all? Independent of any data. */
 function hasNowColumn(key: SummaryRowKey): boolean {
-  return key === 'printers_in_fleet' || NOW_GROUP[key] !== undefined;
+  return key === 'printers_in_fleet' || SUMMARY_ROW_NOW_GROUP[key] !== undefined;
 }
 
 /** The live printer count that pairs with a row, or null when it has none. */
@@ -157,7 +138,7 @@ function nowValue(key: SummaryRowKey, status: FleetStatus | undefined): number |
     const counts = status.counts_by_group;
     return status.printers.length - (counts.out_of_fleet ?? 0) - (counts.not_recorded ?? 0);
   }
-  const group = NOW_GROUP[key];
+  const group = SUMMARY_ROW_NOW_GROUP[key];
   if (group === undefined) return null;
   return status.counts_by_group[group] ?? 0;
 }
@@ -192,22 +173,6 @@ function formatMagnitude(
     default:
       return formatPrinters(magnitude, locale);
   }
-}
-
-/**
- * A site CALENDAR DATE (`YYYY-MM-DD`, already resolved by the server) spelled
- * the way the operator's locale spells one. Parsed AND formatted in UTC, so the
- * browser's own zone can never shift the server's date by a day.
- */
-function formatSiteDate(date: string, locale: string): string {
-  const parsed = Date.parse(`${date}T00:00:00Z`);
-  if (Number.isNaN(parsed)) return date;
-  return new Intl.DateTimeFormat(locale, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'UTC',
-  }).format(new Date(parsed));
 }
 
 /** `HH:MM` on the READER's clock — the footer states when their page last updated. */
@@ -275,9 +240,15 @@ function ChangeCell({ change, format, periodLabel }: ChangeCellProps) {
 
   if (change === null) {
     // No previous window to compare against — a different claim from "no
-    // change", so it is never rendered as a zero.
+    // change", so it is never rendered as a zero, and the accessible name says
+    // WHICH claim it is. A bare "No data" here was ambiguous with the row's own
+    // figure being missing, which is a different fact entirely.
     return (
-      <span role="img" aria-label={t('common.noData')} className={SECONDARY_TEXT_CLASS}>
+      <span
+        role="img"
+        aria-label={t('fleetMetrics.change.noPrevious', { period: periodLabel })}
+        className={SECONDARY_TEXT_CLASS}
+      >
         <span aria-hidden="true">—</span>
       </span>
     );
@@ -394,7 +365,7 @@ export function FleetSummaryCard({
     // the persisted sidebar toggle, so the card has to size against ITSELF.
     <section aria-labelledby={headingId} className="@container">
       <Card>
-        <div className="px-6 py-4 border-b border-bambu-dark-tertiary flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <CardHeader className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <h2 id={headingId} className="text-lg font-semibold text-white">
             {t('fleetMetrics.sections.fleet')}
           </h2>
@@ -408,7 +379,7 @@ export function FleetSummaryCard({
               })}
             </p>
           )}
-        </div>
+        </CardHeader>
 
         <CardContent>
           {/* Fixed min-height: the period columns fill in after the Now column,

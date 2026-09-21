@@ -72,8 +72,10 @@ import {
   foldTimeSplit,
   formatCount,
   formatHours,
+  formatInstantSiteDay,
   formatPercent,
   formatPrinters,
+  formatSiteDate,
   isRowHidden,
   sumMap,
   type AbsenceHeader,
@@ -347,7 +349,26 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
   }));
   const tabs = useTabs<FleetLens>({ value: activeLens, onChange: setLens, items: lensItems });
 
-  const recordingDate = formatDay(status?.recording_since?.slice(0, 10) ?? overview.date_to, locale);
+  /**
+   * Why Time split is unavailable — two different reasons, never conflated.
+   *
+   * The lens needs recorded printer state, and there are two ways not to have
+   * it: nothing has EVER been recorded (`recording_since` is null), or
+   * recording started after this window ended. Only the second has a date, and
+   * the date is the recorder's FIRST instant read in the SITE's zone — the old
+   * fallback here named the window's own end date, which is not when recording
+   * started and told the reader something untrue.
+   *
+   * `status` is optional on this component but is in practice always present:
+   * the history query does not run until `/status` has answered with the site's
+   * today. Absent, the weaker claim is the honest one.
+   */
+  const timeSplitReason =
+    status?.recording_since == null
+      ? t('fleetMetrics.matrix.timeSplitDisabledNoData')
+      : t('fleetMetrics.matrix.timeSplitDisabled', {
+          date: formatInstantSiteDay(status.recording_since, overview.tz_name, locale),
+        });
 
   const detailPrinter = detail
     ? overview.matrix.printers.find((printer) => printer.printer_id === detail.printerId)
@@ -362,7 +383,7 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
           // The reason rides an adjacent InfoHint rather than the tab itself: a
           // focusable tooltip trigger nested inside a `role="tab"` button is
           // invalid, and `TabDefinition` carries no description slot.
-          <InfoHint text={t('fleetMetrics.matrix.timeSplitDisabled', { date: recordingDate })} />
+          <InfoHint text={timeSplitReason} />
         ) : null}
         <button
           type="button"
@@ -387,8 +408,8 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
             <caption className="sr-only">
               {t('fleetMetrics.matrix.caption', {
                 lens: t(LENS_LABEL_KEY[activeLens]),
-                from: formatDay(overview.date_from, locale),
-                to: formatDay(overview.date_to, locale),
+                from: formatSiteDate(overview.date_from, locale),
+                to: formatSiteDate(overview.date_to, locale),
               })}
             </caption>
             <thead>
@@ -731,12 +752,3 @@ function bottomLine(bucketWidth: string, label: BucketLabel, newDay: boolean): s
   return label.dayOfMonth;
 }
 
-/** A `YYYY-MM-DD` site date, read as a calendar date and never as an instant. */
-function formatDay(date: string, locale: string): string {
-  return new Intl.DateTimeFormat(locale, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'UTC',
-  }).format(new Date(`${date}T00:00:00Z`));
-}

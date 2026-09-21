@@ -23,6 +23,7 @@ import {
   makeFleetOverviewFirstRun,
   makeFleetOverviewHour,
   makeFleetOverviewWeek,
+  makeFleetStatus,
   makeFleetStatusFirstRun,
 } from '../../fixtures/fleetMetrics';
 import type { FleetOverview } from '../../../types/fleetMetrics';
@@ -426,6 +427,36 @@ describe('FleetMatrix', () => {
       expect(screen.getByRole('tab', { selected: true })).toHaveAccessibleName(LENS_PRINTS());
       expect(screen.getByRole('tab', { name: LENS_SPLIT() })).toHaveAttribute('aria-disabled', 'true');
       expect(screen.getByRole('button', { name: /Needs recorded printer state/i })).toBeInTheDocument();
+    });
+
+    it('says nothing has EVER been recorded rather than naming a date', () => {
+      // `recording_since` is null on a first run, and the reason used to fall
+      // back to the window's own end date — which is not when recording
+      // started, and on a fresh instance is a date nothing was recorded on.
+      render(
+        <FleetMatrix overview={makeFleetOverviewFirstRun()} status={makeFleetStatusFirstRun()} />,
+      );
+
+      expect(
+        screen.getByRole('button', { name: t('fleetMetrics.matrix.timeSplitDisabledNoData') }),
+      ).toBeInTheDocument();
+    });
+
+    it('names the recorder start date, in the SITE zone, once there is one', () => {
+      // A window that predates the recorder: nothing observed in it, but
+      // recording HAS started, so the reason can say when.
+      const overview = makeFleetOverviewFirstRun();
+      const status = makeFleetStatus();
+
+      render(<FleetMatrix overview={overview} status={status} />);
+
+      // `recording_since` is 2026-09-01T03:00:00 naive UTC; the fixture site is
+      // Pacific/Auckland, where that instant is already 2026-09-01 15:00.
+      expect(
+        screen.getByRole('button', {
+          name: t('fleetMetrics.matrix.timeSplitDisabled', { date: 'Sep 1, 2026' }),
+        }),
+      ).toBeInTheDocument();
     });
   });
 

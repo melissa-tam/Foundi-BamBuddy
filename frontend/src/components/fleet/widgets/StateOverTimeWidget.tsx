@@ -255,12 +255,16 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
       table={
         <ChartDataTable<StateRowValues>
           caption={t('fleetMetrics.sections.stateOverTime')}
-          rowHeader={t('common.date')}
+          rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}
           rows={rows.map((row) => ({
             key: row.bucketStart,
             header: row.fullLabel,
-            partial: row.bucketPartial,
+            // AVERAGES, not sums: every figure here already divides by the
+            // bucket's ELAPSED seconds, so a bucket that is still running is
+            // not understated and carries no in-progress marker. A recorder
+            // gap is a different matter — these figures are state-derived.
+            partlyObserved: row.bucketPartlyObserved,
             values: row,
           }))}
           totals={{

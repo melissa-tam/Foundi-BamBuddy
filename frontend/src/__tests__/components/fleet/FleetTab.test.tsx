@@ -29,9 +29,18 @@ const preset = (value: TimeframeState['preset']): TimeframeState => ({
   dateTo: undefined,
 });
 
-/** The cells of the row whose row header matches, in column order. */
+/**
+ * The summary card's own table.
+ *
+ * Scoped by name, because the tab now mounts the matrix under the card and the
+ * matrix is a grid of row headers too — an unscoped `rowheader` query would
+ * answer with every printer on the farm.
+ */
+const summaryTable = (): HTMLElement => screen.getByRole('table', { name: 'Fleet' });
+
+/** The cells of the SUMMARY row whose row header matches, in column order. */
 function rowCells(headerName: string | RegExp): HTMLElement[] {
-  const header = screen.getByRole('rowheader', { name: headerName });
+  const header = within(summaryTable()).getByRole('rowheader', { name: headerName });
   const row = header.closest('tr');
   if (row === null) throw new Error('row header is not inside a row');
   return within(row).getAllByRole('cell');
@@ -106,10 +115,11 @@ describe('FleetTab', () => {
 
     expect(await screen.findByRole('alert')).toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getAllByRole('rowheader').map((header) => header.textContent)).toEqual([
-        'Prints',
-        'Prints per printer',
-      ]);
+      expect(
+        within(summaryTable())
+          .getAllByRole('rowheader')
+          .map((header) => header.textContent),
+      ).toEqual(['Prints', 'Prints per printer']);
     });
   });
 

@@ -48,6 +48,7 @@
  * (down = 45° hatch, maintenance = dots, no data = sparse hatch).
  */
 
+import type { PrinterIncidentKind } from '../api/client';
 import type { ResolvedThemeMode } from '../contexts/ThemeContext';
 // Re-exported so a consumer's signature can name the mode without importing
 // React context types; ThemeContext remains the one place it is RESOLVED.
@@ -269,6 +270,22 @@ export function groupHintKey(group: FleetGroup): string | null {
   }
 }
 
+/**
+ * Summary row → the live class GROUP whose printer count is that row's "Now".
+ *
+ * The pairing is what makes the two figure columns comparable: `avg_down` is
+ * average concurrent printers down, and `counts_by_group.down` is printers down
+ * at this instant. A row absent from this map has no instantaneous twin (a rate
+ * per day, a percentage) and leaves Now blank.
+ */
+export const SUMMARY_ROW_NOW_GROUP: Partial<Record<SummaryRowKey, FleetGroup>> = {
+  avg_printing: 'printing',
+  avg_cycle_overhead: 'cycle_overhead',
+  avg_idle: 'idle',
+  avg_down: 'down',
+  avg_planned: 'planned',
+};
+
 /** Summary row key → its label leaf. The backend composes the rows; this names them. */
 export const SUMMARY_ROW_LABEL_KEY: Record<SummaryRowKey, string> = {
   avg_printing: 'fleetMetrics.summary.rows.avg_printing',
@@ -417,6 +434,63 @@ export const FLEET_ABSENCE_TEXT: Record<'unobserved', string> = {
 };
 
 /**
+ * Print outcome → band colour, COMPOSED from the class palette rather than
+ * typed as new hexes: a completed print is the green that already means
+ * printing, a failure is the red that already means down, an operator stop is
+ * the amber that already means a person intervened, and "other" is the
+ * neutral. Nothing new to validate for contrast, and nothing to drift.
+ */
+export const OUTCOME_COLOR: Record<PrintOutcome, string> = {
+  completed: FLEET_GROUP_COLOR.printing,
+  failed: FLEET_GROUP_COLOR.down,
+  cancelled: FLEET_GROUP_COLOR.planned,
+  other: FLEET_GROUP_COLOR.idle,
+};
+
+/** The text colour proven legible on each outcome band, inherited with it. */
+export const OUTCOME_TEXT: Record<PrintOutcome, string> = {
+  completed: FLEET_GROUP_TEXT.printing,
+  failed: FLEET_GROUP_TEXT.down,
+  cancelled: FLEET_GROUP_TEXT.planned,
+  other: FLEET_GROUP_TEXT.idle,
+};
+
+/**
+ * The SKU bands, composed from the same class palette. Red is LAST of the five
+ * so it only appears on a farm running five or more SKUs at once, where the
+ * legend is doing the identifying anyway; nothing in that widget draws a
+ * printer state, so the hues carry no second meaning there.
+ */
+export const SKU_BAND_COLORS: readonly string[] = [
+  FLEET_GROUP_COLOR.printing,
+  FLEET_GROUP_COLOR.cycle_overhead,
+  FLEET_GROUP_COLOR.planned,
+  FLEET_GROUP_COLOR.idle,
+  FLEET_GROUP_COLOR.down,
+];
+
+/** The text colour proven legible on each SKU band, in the same order. */
+export const SKU_BAND_TEXT: readonly string[] = [
+  FLEET_GROUP_TEXT.printing,
+  FLEET_GROUP_TEXT.cycle_overhead,
+  FLEET_GROUP_TEXT.planned,
+  FLEET_GROUP_TEXT.idle,
+  FLEET_GROUP_TEXT.down,
+];
+
+/** One SKU band's colour. The "other" remainder takes the neutral absence swatch. */
+export function skuBandColor(index: number, isOther: boolean): string {
+  if (isOther) return FLEET_ABSENCE_COLOR.unobserved;
+  return SKU_BAND_COLORS[index % SKU_BAND_COLORS.length] ?? FLEET_ABSENCE_COLOR.unobserved;
+}
+
+/** The text colour proven legible on that SKU band. */
+export function skuBandText(index: number, isOther: boolean): string {
+  if (isOther) return FLEET_ABSENCE_TEXT.unobserved;
+  return SKU_BAND_TEXT[index % SKU_BAND_TEXT.length] ?? FLEET_ABSENCE_TEXT.unobserved;
+}
+
+/**
  * The Time-split lens's three bands. Categorical, not a magnitude scale — the
  * bar is always printing | other | down in that order with a legend — so
  * emphasis does not need to track a value and one set serves both modes. Every
@@ -481,6 +555,41 @@ export function downCauseColor(cause: FleetCause): string {
 export function downCauseTextColor(cause: FleetCause): string {
   const index = DOWN_CAUSE_ORDER.indexOf(cause);
   return index === -1 || index >= DOWN_CAUSE_WHITE_TEXT_FROM ? HEAT_TEXT_LIGHT : HEAT_TEXT_DARK;
+}
+
+/** The one DECLARED incident kind: planned work, never an equipment fault. */
+const SERVICE_HOLD_KIND: PrinterIncidentKind = 'service_hold';
+
+/**
+ * The down cause an incident kind classifies to.
+ *
+ * The classifier spells a fault as `fault:<kind>`, so this is the one place the
+ * prefix is applied to a ledger kind — an incident-derived surface can then
+ * reach the cause's label, colour and shade through the ordinary lookups
+ * instead of inventing a parallel vocabulary for the same twelve facts.
+ */
+export function incidentKindCause(kind: PrinterIncidentKind): FleetCause {
+  return `${FAULT_PREFIX}${kind}` as FleetCause;
+}
+
+/**
+ * An incident kind's band colour.
+ *
+ * A declared `service_hold` takes the MAINTENANCE hue rather than a fault
+ * shade: it is planned work, and colouring it red would make a deliberate
+ * service window read as a breakdown in every chart that stacks the two.
+ */
+export function incidentKindColor(kind: PrinterIncidentKind): string {
+  return kind === SERVICE_HOLD_KIND
+    ? FLEET_GROUP_COLOR.planned
+    : downCauseColor(incidentKindCause(kind));
+}
+
+/** The text colour proven legible on that kind's band. */
+export function incidentKindTextColor(kind: PrinterIncidentKind): string {
+  return kind === SERVICE_HOLD_KIND
+    ? FLEET_GROUP_TEXT.planned
+    : downCauseTextColor(incidentKindCause(kind));
 }
 
 /** One heat step: an opaque tile and the text colour proven legible on it. */
@@ -629,6 +738,22 @@ export const FLEET_PATTERN_CSS: Record<FleetPattern, PatternCss> = {
       'repeating-linear-gradient(45deg, currentColor 0, currentColor 2px, transparent 2px, transparent 12px)',
     backgroundSize: 'auto',
   },
+};
+
+/**
+ * The marker for a bucket that is still IN PROGRESS — a half-filled swatch,
+ * not a pattern.
+ *
+ * Deliberately not one of the three patterns: "today so far" and "the recorder
+ * was not watching" are different claims (see `SeriesRowMeta`), and a table row
+ * can carry both at once. A pattern would say the second thing about a bucket
+ * where only the first is true. Half filled reads as "half a bucket", which is
+ * exactly what it is, and `currentColor` keeps its stroke on whatever text
+ * colour the surface already proved legible.
+ */
+export const FLEET_IN_PROGRESS_CSS: PatternCss = {
+  backgroundImage: 'linear-gradient(90deg, currentColor 0 50%, transparent 50%)',
+  backgroundSize: 'auto',
 };
 
 /** The pattern a group carries wherever it is drawn. Groups not listed carry none. */
@@ -852,6 +977,104 @@ export function isRowHidden(
   });
 }
 
+// ── site time ───────────────────────────────────────────────────────────────
+//
+// THE Fleet tab's timezone story, in one place. Three shapes, because three
+// different things arrive on the wire and each needs a different conversion —
+// but all three obey one rule: **a label never depends on the browser's zone.**
+// A page rendered in Kiritimati and one rendered in Los Angeles read the same.
+//
+// Every component that spelled one of these privately now imports it; a second
+// conversion is a second answer, and the two disagree on exactly the days that
+// matter (a DST change, a site ahead of UTC, the bucket that spans midnight).
+
+const MS_PER_MINUTE = 60_000;
+
+const UTC = 'UTC';
+
+/**
+ * Shift a naive-UTC instant by the site's offset AT that instant, so reading it
+ * with UTC getters yields the SITE's wall clock.
+ *
+ * Deliberately bucket-independent: the server stamps each bucket with the
+ * offset that was in force when it started, so a DST transition inside a window
+ * is correct on both sides of the change.
+ */
+function siteInstant(start: string, utcOffsetMinutes: number): Date {
+  return new Date(Date.parse(`${start}Z`) + utcOffsetMinutes * MS_PER_MINUTE);
+}
+
+/**
+ * How an instant is spelled when the surface has the site's OFFSET in hand
+ * (every series bucket carries one).
+ *
+ * The date is always part of it, never only the clock: an interval that starts
+ * before its bucket reads as a mistake without one, and the whole point of the
+ * drill-down is that its timestamps can be checked against the printer's own
+ * history.
+ */
+const SITE_INSTANT_FORMAT: Intl.DateTimeFormatOptions = {
+  month: 'short',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+};
+
+/** A naive-UTC instant as the SITE's wall clock, from the site's own offset. */
+export function formatSiteInstant(
+  naiveUtc: string,
+  utcOffsetMinutes: number,
+  locale: string,
+  options: Intl.DateTimeFormatOptions = SITE_INSTANT_FORMAT,
+): string {
+  const shifted = siteInstant(naiveUtc, utcOffsetMinutes);
+  if (Number.isNaN(shifted.getTime())) return naiveUtc;
+  return new Intl.DateTimeFormat(locale, { ...options, timeZone: UTC }).format(shifted);
+}
+
+/** How a calendar DATE is spelled once the server has already resolved it. */
+const SITE_DATE_FORMAT: Intl.DateTimeFormatOptions = {
+  year: 'numeric',
+  month: 'short',
+  day: 'numeric',
+};
+
+/**
+ * A site CALENDAR DATE (`YYYY-MM-DD`, already resolved by the server) spelled
+ * the way the operator's locale spells one. Parsed AND formatted in UTC, so the
+ * browser's own zone can never shift the server's date by a day.
+ */
+export function formatSiteDate(
+  date: string,
+  locale: string,
+  options: Intl.DateTimeFormatOptions = SITE_DATE_FORMAT,
+): string {
+  const parsed = Date.parse(`${date}T00:00:00Z`);
+  if (Number.isNaN(parsed)) return date;
+  return new Intl.DateTimeFormat(locale, { ...options, timeZone: UTC }).format(new Date(parsed));
+}
+
+/**
+ * The site calendar DAY an instant fell on, named by the site's ZONE.
+ *
+ * The third shape, and the reason there are three: the live `/status` response
+ * carries `tz_name` but no offset, so an instant from it (`recording_since`)
+ * cannot go through `formatSiteInstant`. The browser carries the IANA database,
+ * so the zone name resolves the day exactly, with no second offset table. An
+ * unrecognised zone makes `Intl` throw, so this falls back to UTC rather than
+ * leaving a hole in the sentence.
+ */
+export function formatInstantSiteDay(naiveUtc: string, tzName: string, locale: string): string {
+  const parsed = Date.parse(`${naiveUtc}Z`);
+  if (Number.isNaN(parsed)) return naiveUtc;
+  try {
+    return new Intl.DateTimeFormat(locale, { ...SITE_DATE_FORMAT, timeZone: tzName }).format(parsed);
+  } catch {
+    return new Intl.DateTimeFormat(locale, { ...SITE_DATE_FORMAT, timeZone: UTC }).format(parsed);
+  }
+}
+
 // ── format ──────────────────────────────────────────────────────────────────
 //
 // Every formatter takes the ACTIVE i18n language and formats through `Intl`, so
@@ -993,6 +1216,43 @@ export interface BucketLabel {
   full: string;
 }
 
+/**
+ * TWO partialities, never one flag — they are different claims about different
+ * things, and conflating them is how a chart ends up marking a complete print
+ * count as unreliable, or a half-finished day as fully observed.
+ *
+ * - `inProgress` — the bucket has not FINISHED (`elapsed < seconds`, i.e.
+ *   "today so far"). Every SUM over it is smaller than a full bucket's would
+ *   be, whatever the sum is of: prints, incidents, SKU units, hours down. It
+ *   says nothing about whether the data is trustworthy.
+ * - `partlyObserved` — the state RECORDER covered less of the bucket than
+ *   elapsed (beyond the sampler's tolerance), or covered none of it at all
+ *   (`basis === 'incidents_only'`). Only STATE-derived figures are uncertain;
+ *   prints, incidents and units come from ledgers that are complete for their
+ *   own history, and marking those would be a lie in the safe direction.
+ *
+ * Which widget reads which is the widget's own decision, stated at its call
+ * site — this module states the facts, not the policy.
+ */
+export type BucketUncertainty = 'inProgress' | 'partlyObserved';
+
+/**
+ * A chart whose figures come from a COMPLETE ledger — the print log, the
+ * incident ledger, the queue's finished plates. Only a bucket that has not
+ * finished makes its bars short; a recorder gap never hid a print.
+ */
+export const SUM_UNCERTAINTY: readonly BucketUncertainty[] = ['inProgress'];
+
+/**
+ * A chart whose figures are derived from the STATE recorder. Both partialities
+ * apply: an unfinished bucket is short because the day is not over, and a
+ * partly observed one is short because nobody was watching.
+ */
+export const STATE_SUM_UNCERTAINTY: readonly BucketUncertainty[] = [
+  'inProgress',
+  'partlyObserved',
+];
+
 /** Everything a chart row carries besides its own values. */
 export interface SeriesRowMeta {
   /** The bucket's `start`, verbatim — a stable React key and the detail's argument. */
@@ -1003,8 +1263,20 @@ export interface SeriesRowMeta {
   bucketElapsedSeconds: number;
   bucketObservedSeconds: number;
   bucketBasis: FleetBasis | null;
-  /** The recorder covered less of this bucket than elapsed: sum charts hatch it. */
-  bucketPartial: boolean;
+  /** The bucket is still running: any SUM over it is short of a full one. */
+  bucketInProgress: boolean;
+  /** The recorder fell short of the bucket: STATE-derived sums are uncertain. */
+  bucketPartlyObserved: boolean;
+}
+
+/** Does this row carry any of the uncertainties a given surface cares about? */
+export function rowIsUncertain(
+  row: Pick<SeriesRowMeta, 'bucketInProgress' | 'bucketPartlyObserved'>,
+  kinds: readonly BucketUncertainty[],
+): boolean {
+  return kinds.some((kind) =>
+    kind === 'inProgress' ? row.bucketInProgress : row.bucketPartlyObserved,
+  );
 }
 
 export type SeriesRow<Values extends object> = SeriesRowMeta & Values;
@@ -1015,23 +1287,6 @@ export interface SeriesRowsOptions {
   /** The active i18n language, for the weekday and month names. */
   locale: string;
 }
-
-/**
- * Shift a naive-UTC instant by the site's offset AT that instant, so reading it
- * with UTC getters yields the SITE's wall clock.
- *
- * This is the whole timezone story of the Fleet tab, and it is deliberately
- * bucket-independent: the server stamps each bucket with the offset that was in
- * force when it started, so a DST transition inside a window is correct on both
- * sides of the change and the browser's own zone never enters the calculation.
- * A label rendered in Kiritimati and one rendered in Los Angeles are identical.
- */
-function siteInstant(start: string, utcOffsetMinutes: number): Date {
-  const utcMs = Date.parse(`${start}Z`);
-  return new Date(utcMs + utcOffsetMinutes * 60_000);
-}
-
-const UTC = 'UTC';
 
 function siteDateKey(shifted: Date): string {
   return shifted.toISOString().slice(0, 10);
@@ -1105,7 +1360,15 @@ export function seriesRows<Values, Picked extends object>(
     bucketElapsedSeconds: bucket.elapsed_seconds,
     bucketObservedSeconds: bucket.observed_seconds,
     bucketBasis: bucket.basis,
-    bucketPartial: bucket.observed_seconds < bucket.elapsed_seconds - OBSERVED_TOLERANCE_S,
+    // "Still running", read from the bucket's own geometry — a bucket with no
+    // elapsed time at all has not started, which is not the same as running.
+    bucketInProgress: bucket.elapsed_seconds > 0 && bucket.elapsed_seconds < bucket.seconds,
+    // "The recorder fell short", read from the recorder's own coverage.
+    // `incidents_only` is the backend's word for covering none of it, and both
+    // are read so a response stating only one still answers correctly.
+    bucketPartlyObserved:
+      bucket.basis === 'incidents_only' ||
+      bucket.observed_seconds < bucket.elapsed_seconds - OBSERVED_TOLERANCE_S,
     ...pick(bucket.values, bucket),
   }));
 }

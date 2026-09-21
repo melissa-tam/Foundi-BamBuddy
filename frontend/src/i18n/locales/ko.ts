@@ -7241,6 +7241,7 @@ export default {
       deactivated: '비활성',
       fleetRow: '전체',
       timeSplitDisabled: '기록된 프린터 상태가 필요합니다. 기록은 {{date}}에 시작되었습니다.',
+      timeSplitDisabledNoData: '기록된 프린터 상태가 필요합니다. 아직 기록된 내용이 없습니다.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7280,6 +7281,11 @@ export default {
         hold: '베드 상승 및 팬',
         fan_only: '팬만',
       },
+      ejectPurpose: {
+        production: '생산',
+        fa: '초도품',
+        manual: '수동',
+      },
       perPrinter: '프린터별',
       faultHoursOpen: '고장 지속 시간',
       timeToRecover: '복구까지 걸린 시간',
@@ -7291,6 +7297,11 @@ export default {
       plates: '플레이트',
       successRate: '성공',
       opened: '발생',
+      notCompleted: '미완료',
+      partlyObserved: '부분 기록',
+      inProgress: '진행 중',
+      otherSku: '기타',
+      bucketColumn: '기간',
     },
     states: {
       loading: '불러오는 중…',
@@ -7311,6 +7322,7 @@ export default {
       up: '이전 {{period}}보다 {{value}} 많음',
       down: '이전 {{period}}보다 {{value}} 적음',
       none: '이전 {{period}}와 변화 없음',
+      noPrevious: '비교할 이전 {{period}} 없음',
     },
     hints: {
       down: '계획에 없던 중단입니다. 오프라인, 일시정지, 격리, 미해결 고장, 치우지 않은 플레이트, USB 미삽입, 모델 불일치 중 하나로 작업을 받을 수 없습니다.',

@@ -124,8 +124,29 @@ describe('printers by state over time', () => {
   });
 
   it('marks the partly observed bucket for the hatch', () => {
-    expect(rows[PARTIAL_BUCKET].bucketPartial).toBe(true);
-    expect(rows[2].bucketPartial).toBe(false);
+    expect(rows[PARTIAL_BUCKET].bucketPartlyObserved).toBe(true);
+    expect(rows[2].bucketPartlyObserved).toBe(false);
+  });
+
+  it('keeps the two partialities apart on every row', () => {
+    // A bucket the recorder only half covered is NOT the bucket that is still
+    // running, and the fixture has one of each: bucket 3 is half observed and
+    // long finished, the last bucket is fully observed and still going. One
+    // overloaded boolean answered the same for both, which is how a complete
+    // print count ends up hatched and a half-finished day ends up trusted.
+    expect(rows[PARTIAL_BUCKET].bucketInProgress).toBe(false);
+
+    const last = rows[rows.length - 1];
+    expect(last.bucketInProgress).toBe(true);
+    expect(last.bucketPartlyObserved).toBe(false);
+  });
+
+  it('calls a bucket the recorder never touched partly observed, not merely unfinished', () => {
+    // `incidents_only` is the backend's word for covering NONE of it, and it
+    // has to read as a recorder gap even though the bucket itself is complete.
+    const unobserved = rows[UNOBSERVED_BUCKETS[0]];
+    expect(unobserved.bucketPartlyObserved).toBe(true);
+    expect(unobserved.bucketInProgress).toBe(false);
   });
 
   it('summarises the window as averages, not sums', () => {

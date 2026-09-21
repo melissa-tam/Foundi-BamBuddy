@@ -7652,6 +7652,7 @@ export default {
       deactivated: 'Deactivated',
       fleetRow: 'Fleet',
       timeSplitDisabled: 'Needs recorded printer state. Recording started {{date}}.',
+      timeSplitDisabledNoData: 'Needs recorded printer state. Nothing recorded yet.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7691,6 +7692,11 @@ export default {
         hold: 'Hold and fan',
         fan_only: 'Fan only',
       },
+      ejectPurpose: {
+        production: 'Production',
+        fa: 'First article',
+        manual: 'Manual',
+      },
       perPrinter: 'Per printer',
       faultHoursOpen: 'Fault hours open',
       timeToRecover: 'Time to recover',
@@ -7702,6 +7708,11 @@ export default {
       plates: 'Plates',
       successRate: 'Success',
       opened: 'Opened',
+      notCompleted: 'Not completed',
+      partlyObserved: 'Partly observed',
+      inProgress: 'In progress',
+      otherSku: 'Other',
+      bucketColumn: 'Period',
     },
     states: {
       loading: 'Loading…',
@@ -7722,6 +7733,7 @@ export default {
       up: '{{value}} more than the previous {{period}}',
       down: '{{value}} less than the previous {{period}}',
       none: 'No change from the previous {{period}}',
+      noPrevious: 'No previous {{period}} to compare with',
     },
     hints: {
       down: 'Unplanned: the printer cannot take work — offline, paused, quarantined, an open fault, a plate nobody cleared, no USB drive, or a model mismatch.',

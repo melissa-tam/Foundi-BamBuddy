@@ -30,38 +30,36 @@
  * it has nothing to say about — rather than printing a column of dashes that
  * reads like a fault.
  */
+import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2 } from 'lucide-react';
 import { Button } from '../Button';
+import { Card, CardContent, CardHeader } from '../Card';
 import { InfoHint } from '../ui/InfoHint';
 import { InlineAlert } from '../ui/InlineAlert';
+import { FleetMatrix } from './FleetMatrix';
 import { FleetSummaryCard } from './FleetSummaryCard';
+import { FleetWidgets } from './FleetWidgets';
 import { resolveFleetRange, useFleetOverview, useFleetStatus } from '../../hooks/useFleetMetrics';
-import { SECONDARY_TEXT_CLASS } from '../../utils/fleetMetrics';
+import {
+  SECONDARY_TEXT_CLASS,
+  formatInstantSiteDay,
+  formatSiteDate,
+} from '../../utils/fleetMetrics';
 import type { FleetOverview, FleetStatus } from '../../types/fleetMetrics';
 import type { TimeframeState } from '../../utils/timeframe';
 
 /**
- * A naive-UTC instant as a calendar day in the SITE's zone.
+ * The vertical space the matrix and the widget grid stand in for while history
+ * is loading or after it failed.
  *
- * The browser carries the IANA database and `/status` states the site's zone
- * name, so the day the recorder started can be named exactly without a second
- * offset table. An unrecognised zone name makes `Intl` throw, so the format
- * falls back to UTC rather than leaving a hole in the sentence.
- *
- * Distinct from the summary card's `formatSiteDate`, which converts a site
- * calendar DATE the server already resolved; this one converts an INSTANT.
+ * A reserve, not a guess at the final height: the point is that the state row
+ * above it and the page furniture around it do not sit on a collapsed page and
+ * then get shoved when a 30-day sweep lands. It is deliberately about one
+ * viewport of content — enough that the transition reads as filling in rather
+ * than as the page jumping.
  */
-function formatInstantDay(instant: string, tzName: string, locale: string): string {
-  const parsed = Date.parse(`${instant}Z`);
-  if (Number.isNaN(parsed)) return instant;
-  const options: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'short', day: 'numeric' };
-  try {
-    return new Intl.DateTimeFormat(locale, { ...options, timeZone: tzName }).format(parsed);
-  } catch {
-    return new Intl.DateTimeFormat(locale, { ...options, timeZone: 'UTC' }).format(parsed);
-  }
-}
+const SECTION_RESERVE_CLASS = 'min-h-[32rem]';
 
 /**
  * Nothing has been observed yet.
@@ -106,9 +104,10 @@ export interface FleetTabProps {
   gridKey?: number;
 }
 
-export function FleetTab({ timeframe }: FleetTabProps) {
+export function FleetTab({ timeframe, gridKey }: FleetTabProps) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language;
+  const matrixHeadingId = useId();
 
   const statusQuery = useFleetStatus();
   const status = statusQuery.data;
@@ -134,13 +133,14 @@ export function FleetTab({ timeframe }: FleetTabProps) {
             date:
               status.recording_since === null
                 ? // Recording begins with this build, so the site's today IS
-                  // the day it started.
-                  formatInstantDay(`${status.site_today}T00:00:00`, 'UTC', locale)
-                : formatInstantDay(status.recording_since, status.tz_name, locale),
+                  // the day it started — and `site_today` is already a site
+                  // calendar DATE, not an instant to be converted.
+                  formatSiteDate(status.site_today, locale)
+                : formatInstantSiteDay(status.recording_since, status.tz_name, locale),
             earliest:
               status.history_since === null
-                ? formatInstantDay(`${status.site_today}T00:00:00`, 'UTC', locale)
-                : formatInstantDay(status.history_since, status.tz_name, locale),
+                ? formatSiteDate(status.site_today, locale)
+                : formatInstantSiteDay(status.history_since, status.tz_name, locale),
           })}
         </InlineAlert>
       )}
@@ -183,11 +183,39 @@ export function FleetTab({ timeframe }: FleetTabProps) {
       </div>
 
       {/*
-        INTEGRATION SEAM — the fleet matrix and the widget grid mount here.
-        In scope at this point: `overview` (FleetOverview | undefined),
-        `status` (FleetStatus | undefined), `range` (FleetRange | undefined)
-        and the `gridKey` prop above.
+        The matrix and the grid render only from a LOADED window. Neither has a
+        loading or error surface of its own — the state row above owns both for
+        the whole tab, which is what keeps one failed sweep from producing three
+        error messages. A refetch keeps the previous window on screen
+        (`placeholderData: keepPreviousData`), so changing the timeframe redraws
+        the old numbers rather than blanking the page.
       */}
+      {overview === undefined ? (
+        <div className={SECTION_RESERVE_CLASS} />
+      ) : (
+        <>
+          <section aria-labelledby={matrixHeadingId} className={SECTION_RESERVE_CLASS}>
+            <Card>
+              <CardHeader>
+                <h2 id={matrixHeadingId} className="text-lg font-semibold text-white">
+                  {t('fleetMetrics.sections.matrix')}
+                </h2>
+              </CardHeader>
+              <CardContent>
+                <FleetMatrix overview={overview} status={status} />
+              </CardContent>
+            </Card>
+          </section>
+
+          {/*
+            `gridKey` is the header's Reset-layout remount key: clearing the
+            stored layout does not itself re-render the grid, which reads
+            localStorage once at mount, so the page bumps the key and the grid
+            comes back on its defaults. Same mechanism the Prints grid uses.
+          */}
+          <FleetWidgets key={gridKey} overview={overview} />
+        </>
+      )}
     </div>
   );
 }

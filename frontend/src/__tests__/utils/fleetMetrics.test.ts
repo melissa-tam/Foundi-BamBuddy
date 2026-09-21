@@ -18,6 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import en from '../../i18n/locales/en';
+import type { PrinterIncidentKind } from '../../api/client';
 import type { FleetBucket, MatrixCell, SeriesBucket, SeriesEnvelope } from '../../types/fleetMetrics';
 import {
   allClassKeys,
@@ -27,6 +28,7 @@ import {
   classLabelKey,
   CHART_STACK_GROUPS,
   DOWN_CAUSE_ORDER,
+  FAULT_KIND_ORDER,
   FLEET_ABSENCE_COLOR,
   FLEET_ABSENCE_TEXT,
   FLEET_GROUP_COLOR,
@@ -36,10 +38,23 @@ import {
   formatCount,
   formatDuration,
   formatHours,
+  formatInstantSiteDay,
   formatPercent,
   formatPoints,
   formatPrinters,
+  formatSiteDate,
+  formatSiteInstant,
   groupLabelKey,
+  incidentKindCause,
+  incidentKindColor,
+  incidentKindTextColor,
+  OUTCOME_COLOR,
+  OUTCOME_ORDER,
+  OUTCOME_TEXT,
+  SKU_BAND_COLORS,
+  skuBandColor,
+  skuBandText,
+  SUMMARY_ROW_NOW_GROUP,
   HEAT_RAMP_HOURS_DOWN_DARK,
   HEAT_RAMP_HOURS_DOWN_LIGHT,
   HEAT_RAMP_PRINTS_DARK,
@@ -314,6 +329,49 @@ describe('palette', () => {
     for (const band of ['printing', 'other', 'down'] as const) {
       expect(contrast(TIME_SPLIT_BAND_COLOR[band], TIME_SPLIT_BAND_TEXT[band])).toBeGreaterThanOrEqual(4.5);
     }
+  });
+
+  it('pairs every OUTCOME band with a text colour that measures AA', () => {
+    // Moved here out of `widgets/PrintsPerDayWidget`, where no test could
+    // measure it. A text-bearing pairing that lives outside this module is a
+    // pairing nobody checks.
+    for (const outcome of OUTCOME_ORDER) {
+      expect(contrast(OUTCOME_COLOR[outcome], OUTCOME_TEXT[outcome])).toBeGreaterThanOrEqual(4.5);
+    }
+    // Composed from the class palette, not re-typed as fresh hexes — so a hue
+    // change lands in both places at once or in neither.
+    expect(OUTCOME_COLOR.completed).toBe(FLEET_GROUP_COLOR.printing);
+    expect(OUTCOME_COLOR.failed).toBe(FLEET_GROUP_COLOR.down);
+  });
+
+  it('pairs every SKU band with a text colour that measures AA, remainder included', () => {
+    // Moved here out of `widgets/PartsBySkuWidget`.
+    for (let index = 0; index < SKU_BAND_COLORS.length; index += 1) {
+      expect(
+        contrast(skuBandColor(index, false), skuBandText(index, false)),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(contrast(skuBandColor(0, true), skuBandText(0, true))).toBeGreaterThanOrEqual(4.5);
+    // A sixth SKU wraps rather than falling off the palette.
+    expect(skuBandColor(SKU_BAND_COLORS.length, false)).toBe(skuBandColor(0, false));
+  });
+
+  it('pairs every INCIDENT KIND band with a text colour that measures AA', () => {
+    // Moved here out of `widgets/RecoveryWidget`.
+    const kinds: PrinterIncidentKind[] = [...FAULT_KIND_ORDER, 'service_hold'];
+    for (const kind of kinds) {
+      expect(
+        contrast(incidentKindColor(kind), incidentKindTextColor(kind)),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it('gives a declared hold the maintenance hue, never a fault shade', () => {
+    // A service window is planned work. Painting it red would report every
+    // deliberate maintenance hour as a breakdown in the stacked chart.
+    expect(incidentKindColor('service_hold')).toBe(FLEET_GROUP_COLOR.planned);
+    expect(incidentKindColor('jam')).toBe(downCauseColor('fault:jam'));
+    expect(incidentKindCause('jam')).toBe('fault:jam');
   });
 
   it('keeps every Time-split band and the no-data swatch off every ground', () => {
@@ -615,6 +673,87 @@ describe('formatters', () => {
   });
 });
 
+/**
+ * The three site-time shapes, consolidated here out of four private copies
+ * (`BucketDetail`, `FleetSummaryCard`, `FleetTab`, `FleetMatrix`). The rule
+ * every one of them has to keep is the same: the browser's zone never enters
+ * the answer.
+ */
+describe('site time', () => {
+  const original = process.env.TZ;
+  afterEach(() => {
+    process.env.TZ = original;
+  });
+
+  const under = <T,>(tz: string, read: () => T): T => {
+    process.env.TZ = tz;
+    return read();
+  };
+
+  it('reads an instant on the SITE wall clock from the site offset', () => {
+    // 2026-09-18T19:03:25 UTC at UTC+12 is 2026-09-19 07:03 site-local.
+    expect(formatSiteInstant('2026-09-18T19:03:25', 720, 'en-GB')).toMatch(/19 Sept.*07:03/);
+  });
+
+  it('gives the same instant the same label fourteen hours either side of UTC', () => {
+    const read = () => formatSiteInstant('2026-09-18T19:03:25', 720, 'en-GB');
+    expect(under('Pacific/Kiritimati', read)).toBe(under('America/Los_Angeles', read));
+  });
+
+  it('never shifts a server-resolved calendar date by a day', () => {
+    const read = () => formatSiteDate('2026-09-21', 'en-GB');
+    expect(under('America/Los_Angeles', read)).toMatch(/21 Sept 2026/);
+    expect(under('Pacific/Kiritimati', read)).toBe(under('America/Los_Angeles', read));
+  });
+
+  it('names the site DAY of an instant from the zone name alone', () => {
+    // 2026-09-01T03:00 UTC is already 2026-09-01 15:00 in Auckland, and still
+    // 2026-08-31 in Los Angeles — the zone decides, never the browser.
+    const read = () => formatInstantSiteDay('2026-09-01T03:00:00', 'Pacific/Auckland', 'en-GB');
+    expect(under('America/Los_Angeles', read)).toMatch(/1 Sept 2026/);
+    expect(
+      formatInstantSiteDay('2026-09-01T03:00:00', 'America/Los_Angeles', 'en-GB'),
+    ).toMatch(/31 Aug 2026/);
+  });
+
+  it('falls back to UTC rather than leaving a hole when the zone is unknown', () => {
+    expect(formatInstantSiteDay('2026-09-01T03:00:00', 'Mars/Olympus', 'en-GB')).toMatch(
+      /1 Sept 2026/,
+    );
+  });
+
+  it('hands back the raw value rather than "Invalid Date" on unparseable input', () => {
+    expect(formatSiteDate('not-a-date', 'en-GB')).toBe('not-a-date');
+    expect(formatSiteInstant('not-a-date', 0, 'en-GB')).toBe('not-a-date');
+    expect(formatInstantSiteDay('not-a-date', 'UTC', 'en-GB')).toBe('not-a-date');
+  });
+});
+
+describe('SUMMARY_ROW_NOW_GROUP', () => {
+  it('pairs exactly the state rows with a live group, and no rate row', () => {
+    expect(Object.keys(SUMMARY_ROW_NOW_GROUP).sort()).toEqual([
+      'avg_cycle_overhead',
+      'avg_down',
+      'avg_idle',
+      'avg_planned',
+      'avg_printing',
+    ]);
+    // A rate has no instantaneous twin — "148 prints per day" is not a number
+    // of printers, and pairing it with one would put two different units in
+    // the same row.
+    expect(SUMMARY_ROW_NOW_GROUP.prints_per_day).toBeUndefined();
+    expect(SUMMARY_ROW_NOW_GROUP.uptime).toBeUndefined();
+  });
+
+  it('names a group the summary row label agrees with', () => {
+    for (const key of Object.keys(SUMMARY_ROW_NOW_GROUP)) {
+      expect(lookup(SUMMARY_ROW_LABEL_KEY[key as keyof typeof SUMMARY_ROW_LABEL_KEY])).toBeTypeOf(
+        'string',
+      );
+    }
+  });
+});
+
 describe('readChange', () => {
   it('reads direction from the DISPLAYED precision, not the raw float', async () => {
     const { readChange } = await import('../../utils/fleetMetrics');
@@ -753,7 +892,51 @@ describe('seriesRows', () => {
       { bucket: 'day', locale: 'en-GB' },
     );
     expect(rows[0]!.bucketLabel.isWeekend).toBe(true);
-    expect(rows[0]!.bucketPartial).toBe(true);
+    expect(rows[0]!.bucketPartlyObserved).toBe(true);
+    // Finished, and short only because nobody was watching. The two flags are
+    // separate precisely so this bucket is not also called "in progress".
+    expect(rows[0]!.bucketInProgress).toBe(false);
+  });
+
+  it('separates a bucket that is still RUNNING from one that is under-observed', () => {
+    const rows = seriesRows(
+      envelope([
+        // Finished and fully observed.
+        bucket('2026-09-18T12:00:00'),
+        // Finished, half observed: a recorder gap.
+        bucket('2026-09-19T12:00:00', { observed_seconds: 40_000 }),
+        // Half elapsed and observed all of it: today so far.
+        bucket('2026-09-20T12:00:00', { elapsed_seconds: 43_200, observed_seconds: 43_200 }),
+        // Elapsed but covered only by the incident ledger.
+        bucket('2026-09-21T12:00:00', { observed_seconds: 0, basis: 'incidents_only' }),
+      ]),
+      (values) => values,
+      { bucket: 'day', locale: 'en-GB' },
+    );
+
+    expect(rows.map((row) => row.bucketInProgress)).toEqual([false, false, true, false]);
+    expect(rows.map((row) => row.bucketPartlyObserved)).toEqual([false, true, false, true]);
+  });
+
+  it('tolerates a recorder a couple of samples short of a finished bucket', () => {
+    const rows = seriesRows(
+      envelope([bucket('2026-09-18T12:00:00', { observed_seconds: 86_400 - 60 })]),
+      (values) => values,
+      { bucket: 'day', locale: 'en-GB' },
+    );
+    expect(rows[0]!.bucketPartlyObserved).toBe(false);
+  });
+
+  it('calls a bucket with no elapsed time neither running nor short', () => {
+    // A bucket that has not STARTED is a different thing from one part way
+    // through: nothing is accumulating in it, so nothing about it understates.
+    const rows = seriesRows(
+      envelope([bucket('2026-09-22T12:00:00', { elapsed_seconds: 0, observed_seconds: 0 })]),
+      (values) => values,
+      { bucket: 'day', locale: 'en-GB' },
+    );
+    expect(rows[0]!.bucketInProgress).toBe(false);
+    expect(rows[0]!.bucketPartlyObserved).toBe(false);
   });
 
   it('spreads the picked values into a flat recharts row and keeps the header', () => {

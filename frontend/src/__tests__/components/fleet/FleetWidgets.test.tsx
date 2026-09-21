@@ -24,10 +24,12 @@ import {
 import { FleetWidgets } from '../../../components/fleet/FleetWidgets';
 import { CoolingAndEjectWidget } from '../../../components/fleet/widgets/CoolingAndEjectWidget';
 import { DowntimeByCauseWidget } from '../../../components/fleet/widgets/DowntimeByCauseWidget';
+import { PrintsPerDayWidget } from '../../../components/fleet/widgets/PrintsPerDayWidget';
 import { StateOverTimeWidget } from '../../../components/fleet/widgets/StateOverTimeWidget';
 import {
   downtimeCauses,
   downtimeRows,
+  printsRows,
   type RowOptions,
 } from '../../../components/fleet/widgets/rows';
 import {
@@ -90,8 +92,17 @@ describe('FleetWidgets — the grid', () => {
 
     const switches = screen.getAllByRole('button', { name: showData() });
     expect(switches).toHaveLength(SECTION_KEYS.length);
-    for (const control of switches) {
-      expect(control).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('signals the switch state through its LABEL alone, never a second time', () => {
+    render(<FleetWidgets overview={overview} />);
+
+    // The label already names what pressing the button does next, and it
+    // changes every time the view does. An `aria-pressed` beside it states the
+    // same fact in a second vocabulary — "Show chart, pressed" reads as a
+    // contradiction. One signal, shared by every reader.
+    for (const control of screen.getAllByRole('button', { name: showData() })) {
+      expect(control).not.toHaveAttribute('aria-pressed');
     }
   });
 
@@ -120,8 +131,7 @@ describe('the Show data switch', () => {
 
     await user.click(screen.getByRole('button', { name: showData() }));
 
-    const control = screen.getByRole('button', { name: showChart() });
-    expect(control).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: showChart() })).toBeInTheDocument();
     expect(screen.getByRole('table')).toHaveAccessibleName(title);
     expect(screen.queryByRole('img', { name: title })).toBeNull();
   });
@@ -136,10 +146,7 @@ describe('the Show data switch', () => {
     expect(
       screen.getByRole('img', { name: i18n.t('fleetMetrics.sections.downtimeByCause') }),
     ).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: showData() })).toHaveAttribute(
-      'aria-pressed',
-      'false',
-    );
+    expect(screen.getByRole('button', { name: showData() })).toBeInTheDocument();
   });
 
   it('shows the SAME numbers the chart was drawn from', async () => {
@@ -176,20 +183,65 @@ describe('the Show data switch', () => {
     const user = userEvent.setup();
     const causes = downtimeCauses(overview.fleet_series);
     const rows = downtimeRows(overview.fleet_series, causes, rowOptions());
-    const partial = rows.filter((row) => row.bucketPartial);
-    const complete = rows.filter((row) => !row.bucketPartial);
+    const partial = rows.filter((row) => row.bucketPartlyObserved);
+    const complete = rows.filter((row) => !row.bucketPartlyObserved && !row.bucketInProgress);
     expect(partial.length).toBeGreaterThan(0);
     expect(complete.length).toBeGreaterThan(0);
 
     render(<DowntimeByCauseWidget overview={overview} size={2} />);
     await user.click(screen.getByRole('button', { name: showData() }));
 
-    const markerName = i18n.t('fleetMetrics.class.unobserved');
+    const markerName = i18n.t('fleetMetrics.widgets.partlyObserved');
     const rowFor = (label: string): HTMLElement =>
       screen.getByRole('rowheader', { name: new RegExp(label) }).closest('tr') as HTMLElement;
 
     expect(within(rowFor(partial[0].fullLabel)).getByRole('img', { name: markerName })).toBeInTheDocument();
     expect(within(rowFor(complete[0].fullLabel)).queryByRole('img', { name: markerName })).toBeNull();
+  });
+
+  it('marks the RUNNING bucket as in progress in every sum table', async () => {
+    const user = userEvent.setup();
+    const rows = printsRows(overview.throughput, rowOptions());
+    const running = rows.filter((row) => row.bucketInProgress);
+    expect(running).toHaveLength(1);
+
+    render(<PrintsPerDayWidget overview={overview} size={2} />);
+    await user.click(screen.getByRole('button', { name: showData() }));
+
+    const tableRow = screen
+      .getByRole('rowheader', { name: new RegExp(running[0].fullLabel) })
+      .closest('tr') as HTMLElement;
+    expect(
+      within(tableRow).getByRole('img', { name: i18n.t('fleetMetrics.widgets.inProgress') }),
+    ).toBeInTheDocument();
+  });
+
+  it('never marks a PRINT count partly observed — the print log is complete', async () => {
+    const user = userEvent.setup();
+    // The fixture window has buckets the recorder never covered at all, so if
+    // the two partialities were one flag this table would be covered in
+    // recorder markers for prints the log has in full.
+    const rows = printsRows(overview.throughput, rowOptions());
+    expect(rows.some((row) => row.bucketPartlyObserved)).toBe(true);
+
+    render(<PrintsPerDayWidget overview={overview} size={2} />);
+    await user.click(screen.getByRole('button', { name: showData() }));
+
+    expect(
+      screen.queryAllByRole('img', { name: i18n.t('fleetMetrics.widgets.partlyObserved') }),
+    ).toHaveLength(0);
+  });
+
+  it('heads a bucket table by the PERIOD, not by a date it may not be', async () => {
+    const user = userEvent.setup();
+    // A bucket is an hour, a day or a week depending on the window — the one
+    // thing it is never guaranteed to be is a date.
+    render(<PrintsPerDayWidget overview={overview} size={2} />);
+    await user.click(screen.getByRole('button', { name: showData() }));
+
+    expect(
+      screen.getByRole('columnheader', { name: i18n.t('fleetMetrics.widgets.bucketColumn') }),
+    ).toBeInTheDocument();
   });
 });
 
@@ -234,6 +286,38 @@ describe('Cooling and eject — the per-printer switch', () => {
     expect(
       screen.getByRole('columnheader', { name: i18n.t('common.printer') }),
     ).toBeInTheDocument();
+  });
+
+  it('names an eject by its PURPOSE rather than printing the backend token', () => {
+    render(<CoolingAndEjectWidget overview={overview} />);
+
+    // The fixture's eject groups carry `variant: 'production'`, which the
+    // widget used to render verbatim beside a translated cooldown mode.
+    const figure = screen.getByRole('figure', {
+      name: i18n.t('fleetMetrics.sections.coolingAndEject'),
+    });
+    expect(
+      within(figure).getAllByText(
+        new RegExp(i18n.t('fleetMetrics.widgets.ejectPurpose.production')),
+      ).length,
+    ).toBeGreaterThan(0);
+    expect(within(figure).queryByText(/·\s*production\s*$/)).toBeNull();
+  });
+
+  it('calls a stopped episode NOT COMPLETED, never cancelled', async () => {
+    const user = userEvent.setup();
+    render(<CoolingAndEjectWidget overview={overview} />);
+
+    await user.click(screen.getByRole('button', { name: showData() }));
+
+    // "Cancelled" is the operator-stop vocabulary and means something else on
+    // this farm; an eject the watchdog stopped was nobody's decision.
+    expect(
+      screen.getByRole('columnheader', { name: i18n.t('fleetMetrics.widgets.notCompleted') }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('columnheader', { name: i18n.t('fleetMetrics.detail.outcome.cancelled') }),
+    ).toBeNull();
   });
 
   it('keeps a deactivated printer out of the episode rows it never produced', () => {

@@ -7602,6 +7602,7 @@ export default {
       deactivated: '已停用',
       fleetRow: '機群',
       timeSplitDisabled: '需要已記錄的印表機狀態。記錄自 {{date}} 開始。',
+      timeSplitDisabledNoData: '需要已記錄的印表機狀態。目前尚無任何記錄。',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7641,6 +7642,11 @@ export default {
         hold: '抬升熱床加風扇',
         fan_only: '僅風扇',
       },
+      ejectPurpose: {
+        production: '生產',
+        fa: '首件',
+        manual: '手動',
+      },
       perPrinter: '依印表機',
       faultHoursOpen: '故障未解小時',
       timeToRecover: '復原用時',
@@ -7652,6 +7658,11 @@ export default {
       plates: '盤數',
       successRate: '成功率',
       opened: '新增',
+      notCompleted: '未完成',
+      partlyObserved: '部分記錄',
+      inProgress: '進行中',
+      otherSku: '其他',
+      bucketColumn: '期間',
     },
     states: {
       loading: '載入中…',
@@ -7672,6 +7683,7 @@ export default {
       up: '比上一個{{period}}多 {{value}}',
       down: '比上一個{{period}}少 {{value}}',
       none: '與上一個{{period}}持平',
+      noPrevious: '沒有可比較的上一個{{period}}',
     },
     hints: {
       down: '非計畫停機：印表機無法接單——離線、暫停、隔離、存在未解故障、熱床未清理、沒有隨身碟或機型不符。',

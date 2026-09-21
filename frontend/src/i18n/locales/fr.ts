@@ -7604,6 +7604,7 @@ export default {
       deactivated: 'Désactivée',
       fleetRow: 'Parc',
       timeSplitDisabled: 'Nécessite un état d’imprimante enregistré. Enregistrement depuis le {{date}}.',
+      timeSplitDisabledNoData: 'Nécessite un état d’imprimante enregistré. Rien n’a encore été enregistré.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7643,6 +7644,11 @@ export default {
         hold: 'Plateau levé et ventilation',
         fan_only: 'Ventilation seule',
       },
+      ejectPurpose: {
+        production: 'Production',
+        fa: 'Première pièce',
+        manual: 'Manuel',
+      },
       perPrinter: 'Par imprimante',
       faultHoursOpen: 'Heures de panne ouvertes',
       timeToRecover: 'Délai de rétablissement',
@@ -7654,6 +7660,11 @@ export default {
       plates: 'Plateaux',
       successRate: 'Réussite',
       opened: 'Ouverts',
+      notCompleted: 'Non terminés',
+      partlyObserved: 'Enregistrement partiel',
+      inProgress: 'En cours',
+      otherSku: 'Autre',
+      bucketColumn: 'Période',
     },
     states: {
       loading: 'Chargement…',
@@ -7674,6 +7685,7 @@ export default {
       up: '{{value}} de plus que la période précédente {{period}}',
       down: '{{value}} de moins que la période précédente {{period}}',
       none: 'Aucun changement par rapport à la période précédente {{period}}',
+      noPrevious: 'Aucune période précédente {{period}} à comparer',
     },
     hints: {
       down: 'Non planifié : l’imprimante ne peut pas prendre de travail — hors ligne, en pause, en quarantaine, panne ouverte, plateau non dégagé, clé USB absente ou modèle incompatible.',

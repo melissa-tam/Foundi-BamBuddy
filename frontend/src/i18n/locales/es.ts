@@ -7625,6 +7625,7 @@ export default {
       deactivated: 'Desactivada',
       fleetRow: 'Flota',
       timeSplitDisabled: 'Requiere estado de impresora registrado. Registro desde el {{date}}.',
+      timeSplitDisabledNoData: 'Requiere estado de impresora registrado. Aún no se ha registrado nada.',
       legend: {
         none: '0',
         over: '{{hours}} h+',
@@ -7664,6 +7665,11 @@ export default {
         hold: 'Cama elevada y ventilación',
         fan_only: 'Solo ventilación',
       },
+      ejectPurpose: {
+        production: 'Producción',
+        fa: 'Primera pieza',
+        manual: 'Manual',
+      },
       perPrinter: 'Por impresora',
       faultHoursOpen: 'Horas de avería abiertas',
       timeToRecover: 'Tiempo hasta la recuperación',
@@ -7675,6 +7681,11 @@ export default {
       plates: 'Bandejas',
       successRate: 'Éxito',
       opened: 'Abiertas',
+      notCompleted: 'No completados',
+      partlyObserved: 'Registro parcial',
+      inProgress: 'En curso',
+      otherSku: 'Otro',
+      bucketColumn: 'Periodo',
     },
     states: {
       loading: 'Cargando…',
@@ -7695,6 +7706,7 @@ export default {
       up: '{{value}} más que en el periodo anterior {{period}}',
       down: '{{value}} menos que en el periodo anterior {{period}}',
       none: 'Sin cambios respecto al periodo anterior {{period}}',
+      noPrevious: 'No hay {{period}} anterior con el que comparar',
     },
     hints: {
       down: 'No planificado: la impresora no puede aceptar trabajo — sin conexión, en pausa, en cuarentena, avería abierta, bandeja sin despejar, sin unidad USB o modelo que no coincide.',
