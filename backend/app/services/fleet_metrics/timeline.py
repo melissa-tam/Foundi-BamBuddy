@@ -45,7 +45,7 @@ from backend.app.services.fleet_metrics.classifier import (
     Seen,
     availability_class,
 )
-from backend.app.utils.site_time import Bucket, BucketEdge, bucket_edges, site_zone_name
+from backend.app.utils.site_time import Bucket, BucketEdge, bucket_edges
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -158,11 +158,18 @@ class Grid:
 
 @dataclass(frozen=True, slots=True)
 class Window:
-    """An inclusive SITE-date window, resolved to a half-open naive-UTC interval."""
+    """An inclusive SITE-date window, resolved to a half-open naive-UTC interval.
+
+    Bounds and a grid, and deliberately NO zone display name. The zone's name is a
+    fact about the clock now ("Eastern Daylight Time"), not about the stretch of time
+    being asked about: a window opening in January would otherwise be labelled with
+    January's name while every other range on the same page — and the live tile —
+    named the current one. Per-bucket ``utc_offset_minutes`` is the per-instant fact,
+    and it stays on :class:`BucketEdge` where a label is actually rendered from it.
+    """
 
     date_from: date
     date_to: date
-    tz_name: str
     start: datetime
     end: datetime
     grid: Grid
@@ -181,7 +188,6 @@ def build_window(date_from: date, date_to: date, bucket: Bucket, tz: tzinfo | No
     return Window(
         date_from=date_from,
         date_to=date_to,
-        tz_name=site_zone_name(buckets[0].start, tz),
         start=buckets[0].start,
         end=buckets[-1].end,
         grid=grid,

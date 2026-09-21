@@ -30,10 +30,17 @@ router = APIRouter(prefix="/printers", tags=["printers"])
 
 #: One sentence per refusal reason. The service returns tokens; the English lives HERE
 #: and nowhere else, so a reason can never reach an operator as two different sentences.
+#: TOTAL over :data:`~backend.app.schemas.printer.EjectRefusalReason` — a reason with no
+#: entry here reaches the operator as a bodyless 500 instead of its 409, so the table is
+#: pinned against the literal in ``test_printer_eject_api.TestRefusalMessageTotality``.
 _REFUSAL_MESSAGES: dict[EjectRefusalReason, str] = {
     "job_active": "Printer is running a job; wait for it to finish or stop it, then eject",
     "dispatch_in_flight": "A queued unit is being sent to this printer; retry in a few seconds",
     "eject_in_flight": "An eject is already in flight on this printer",
+    "z_unreferenced": (
+        "Printer restarted with a part on the plate and its Z reference is lost — remove the part by hand "
+        "and Mark plate cleared"
+    ),
     "not_connected": "Printer is not connected; cannot eject",
     "no_plate_gate": "Printer is not awaiting plate clear; nothing to eject",
     "bed_unreadable": "Live bed temperature is unavailable; wait a few seconds for printer telemetry and retry",

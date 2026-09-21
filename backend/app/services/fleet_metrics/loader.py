@@ -176,7 +176,7 @@ async def overview(
         include_output=False,
     )
 
-    return await asyncio.to_thread(_compose_overview, facts, previous, moment)
+    return await asyncio.to_thread(_compose_overview, facts, previous, moment, zone_name(moment, tz))
 
 
 async def printer_intervals(
@@ -215,7 +215,9 @@ async def printer_intervals(
     entry = printer_slice(timeline, printer_id)
     if entry is None:
         raise PrinterUnknown(f"no printer, span or incident in this window names printer {printer_id}")
-    return projections.printer_intervals(timeline, entry, facts.incident_rows, generated_at=moment)
+    return projections.printer_intervals(
+        timeline, entry, facts.incident_rows, generated_at=moment, tz_name=zone_name(moment, tz)
+    )
 
 
 async def status_now(db: AsyncSession, *, now: datetime | None = None, tz: tzinfo | None = None) -> FleetStatus:
@@ -261,7 +263,7 @@ async def status_now(db: AsyncSession, *, now: datetime | None = None, tz: tzinf
     return FleetStatus(
         generated_at=moment,
         site_today=site_today(moment, tz),
-        tz_name=site_zone_name(moment, tz),
+        tz_name=zone_name(moment, tz),
         recording_since=recording_since,
         # What "all time" resolves to: the ledger reaches further back than the
         # recorder, and a range that stopped at the first span would silently drop
@@ -276,6 +278,19 @@ async def status_now(db: AsyncSession, *, now: datetime | None = None, tz: tzinf
 def utcnow() -> datetime:
     """The reader's clock: naive UTC at whole seconds, the tables' own convention."""
     return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+
+def zone_name(moment: datetime, tz: tzinfo | None = None) -> str:
+    """The site zone's display name AT ``moment`` — THE resolver for every response.
+
+    A name, not an offset, and therefore a fact about the clock rather than about the
+    range being asked about. It has to be resolved from the REQUEST's instant and not
+    from a window's first bucket: on a host with no ``TZ`` the OS zone renders
+    "…Standard Time" for half the year, so a window opening in January would label
+    itself with January's name while the live tile beside it and every other preset on
+    the page named the current one. One function, one instant, three responses.
+    """
+    return site_zone_name(moment, tz)
 
 
 # ── reading machinery ───────────────────────────────────────────────────────────────
@@ -647,7 +662,7 @@ def _build(facts: _WindowFacts, now: datetime) -> FleetTimeline:
     )
 
 
-def _compose_overview(facts: _WindowFacts, previous: _WindowFacts, now: datetime) -> FleetOverview:
+def _compose_overview(facts: _WindowFacts, previous: _WindowFacts, now: datetime, tz_name: str) -> FleetOverview:
     """Build both timelines and every projection. Pure; the whole cost of a request."""
     timeline = _build(facts, now)
     totals = projections.class_totals(timeline)
@@ -667,7 +682,7 @@ def _compose_overview(facts: _WindowFacts, previous: _WindowFacts, now: datetime
         date_from=window.date_from,
         date_to=window.date_to,
         bucket=window.grid.bucket,
-        tz_name=window.tz_name,
+        tz_name=tz_name,
         generated_at=now,
         window_start=window.start,
         window_end=window.end,

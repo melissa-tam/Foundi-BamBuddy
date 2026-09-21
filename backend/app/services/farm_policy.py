@@ -51,7 +51,7 @@ from backend.app.models.printer_incident import (
 from backend.app.models.sku import SkuFile
 from backend.app.schemas.settings import AppSettings
 from backend.app.services import farm_correlation, pause_recovery, printer_incidents
-from backend.app.services.cycle_episodes import note_episode
+from backend.app.services.cycle_episodes import record_episode
 from backend.app.services.dispatch_target import DispatchTarget, target_of
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
 from backend.app.services.hms_errors import format_hms_error_summary
@@ -374,7 +374,13 @@ async def on_terminal(
                     # watchdog stopped is still a measured episode, and its ``outcome``
                     # — the printer's own terminal word — is what says it did not
                     # complete.
-                    note_episode(
+                    #
+                    # It rides THIS session, inside its own savepoint: the row is then
+                    # atomic with the terminal's own writes, opens no second connection
+                    # (which on SQLite would queue behind this very transaction on every
+                    # eject) and leaves nothing running after the handler returns.
+                    await record_episode(
+                        db,
                         printer_id,
                         KIND_EJECT,
                         started_at=pending.started_at,
@@ -383,6 +389,18 @@ async def on_terminal(
                         outcome=final_status,
                         variant=pending.purpose,
                     )
+                    # This branch had no DB write of its own until the episode, and so
+                    # no commit: every one of its four callers (main's two notification
+                    # lanes, the monitor's two downtime reconciles) hands over a session
+                    # inside `async with async_session() as db:` and closes it without
+                    # committing, and the plate authority persists through its own
+                    # injected writer. The first writer on a path owns establishing the
+                    # commit — the same thing this handler already does for
+                    # ``waiting_reason`` further down. Nothing else is pending here: the
+                    # eject branch is the handler's first act and the notification pass
+                    # ahead of it never touches this session, so this publishes exactly
+                    # the row above.
+                    await db.commit()
                 if pending.runtime_exceeded_at is not None:
                     # The in-flight watchdog already stopped this job and paged the
                     # operator. Whatever status the printer echoed — cancelled/failed

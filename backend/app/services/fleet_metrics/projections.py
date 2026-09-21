@@ -832,12 +832,17 @@ def printer_intervals(
     incidents: Sequence[IncidentRow],
     *,
     generated_at: datetime,
+    tz_name: str,
 ) -> PrinterIntervalsResponse:
     """One printer's classified intervals and the incidents overlapping its range.
 
     The drill-down behind a matrix cell: these intervals are the very ones the cell was
     summed from (identity h), so "why was 009 down 4 h" is answered by the same objects
     that produced the 4, never by a re-derivation that could disagree with it.
+
+    ``tz_name`` is passed in rather than read off the window: the zone's display name
+    is a fact about now, resolved once by the loader for every response, so this
+    drill-down cannot name a different zone from the page it opened out of.
     """
     horizon = min(timeline.window.end, timeline.now)
     return PrinterIntervalsResponse(
@@ -850,7 +855,7 @@ def printer_intervals(
         ),
         date_from=timeline.window.date_from,
         date_to=timeline.window.date_to,
-        tz_name=timeline.window.tz_name,
+        tz_name=tz_name,
         generated_at=generated_at,
         intervals=[
             ClassifiedInterval(

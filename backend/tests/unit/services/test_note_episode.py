@@ -1,15 +1,22 @@
 """Tests for the cycle-episode ledger (services.cycle_episodes) and its two hooks.
 
-``note_episode`` is called from inside a cooldown's retirement and an eject's terminal
-— two places whose whole contract is that they never raise — so half of this suite is
-about what it does with bad input, a dead database and a missing event loop: log, drop,
-and return. The other half drives the two REAL measuring owners and asserts the row
-they produce carries the same figures their log lines do, because a ledger that
-disagrees with the log is worse than no ledger.
+The ledger has TWO entry points, chosen by whether the caller holds a session, and the
+split is what most of this file is about:
 
-The write is awaited deterministically: the spawn is captured and then handed to the
-REAL ``spawn_background_task`` at a moment the test chooses, so every assertion waits
-for the task rather than sleeping and hoping.
+* ``record_episode`` — awaited, rides the caller's session in a SAVEPOINT. The eject
+  terminal uses it. The properties that matter are that it opens no second connection,
+  leaves no task behind, and that a measurement which cannot be written rolls back only
+  ITSELF — the caller's transaction must still commit afterwards.
+* ``note_episode`` — sync, fire-and-forget, own session. Only ``CooldownPrep.end()``
+  uses it, because that method is sync by contract and holds no session. Its whole
+  contract is what it does with bad input, a dead database and a missing event loop:
+  log, drop, and return.
+
+Both are driven against the REAL measuring owners, and the row is asserted to carry the
+same figures their log lines do — a ledger that disagrees with the log is worse than no
+ledger. ``note_episode``'s write is awaited deterministically: the spawn is captured and
+then handed to the REAL ``spawn_background_task`` at a moment the test chooses, so every
+assertion waits for the task rather than sleeping and hoping.
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ from backend.app.models.farm_cycle_episode import (
 )
 from backend.app.models.printer import Printer
 from backend.app.services import cycle_episodes, farm_policy
-from backend.app.services.cycle_episodes import note_episode
+from backend.app.services.cycle_episodes import note_episode, record_episode
 from backend.app.services.eject.cooldown_prep import CooldownPrep
 from backend.app.services.plate_occupancy import EscalationOnly, Evidence, PendingEject, plate_occupancy
 
@@ -305,7 +312,12 @@ class TestCooldownHook:
 
 
 class TestEjectTerminalHook:
-    """``farm_policy.on_terminal`` — the sweep's own measurement, kept."""
+    """``farm_policy.on_terminal`` — the sweep's own measurement, on the caller's session.
+
+    No ``ledger`` fixture here, and that is the point of the wave: the terminal awaits
+    the write on the session it already holds, so there is nothing to schedule, nothing
+    to settle and no second connection to queue behind its own transaction.
+    """
 
     @staticmethod
     async def _mk_printer(db, name: str) -> Printer:
@@ -323,7 +335,7 @@ class TestEjectTerminalHook:
     def _fake_client(subtask: str | None) -> SimpleNamespace:
         return SimpleNamespace(last_dispatch_subtask_id=subtask)
 
-    async def test_a_completed_sweep_records_the_pendings_own_figures(self, db_session, ledger, caplog):
+    async def test_a_completed_sweep_records_the_pendings_own_figures(self, db_session, caplog):
         printer = await self._mk_printer(db_session, "EPej")
         started_at = datetime.now(timezone.utc) - timedelta(seconds=81)
         self._arm(
@@ -343,10 +355,6 @@ class TestEjectTerminalHook:
                 completed_subtask_id=None,
                 completed_subtask_name=f"eject_manual_p{printer.id}",
             )
-        # Release the caller's transaction first: the ledger writes on its OWN
-        # connection, and one SQLite file cannot be written from two at once.
-        await db_session.commit()
-        await _settle(ledger)
 
         (row,) = await _episodes(db_session)
         assert (row.printer_id, row.kind, row.variant, row.outcome) == (printer.id, KIND_EJECT, "manual", "completed")
@@ -357,7 +365,7 @@ class TestEjectTerminalHook:
         logged_s = float(runtime_line.split(" ran ")[1].split("s (")[0])
         assert abs((row.ended_at - row.started_at).total_seconds() - logged_s) <= 1
 
-    async def test_a_watchdog_stopped_sweep_is_still_a_measured_episode(self, db_session, ledger):
+    async def test_a_watchdog_stopped_sweep_is_still_a_measured_episode(self, db_session):
         """Sweep motion complete is not the same as a verified sweep — but it IS a duration,
         and the outcome is what says the job did not finish cleanly."""
         printer = await self._mk_printer(db_session, "EPwd")
@@ -383,17 +391,13 @@ class TestEjectTerminalHook:
                 completed_subtask_id=None,
                 completed_subtask_name=f"eject_manual_p{printer.id}",
             )
-        # Release the caller's transaction first: the ledger writes on its OWN
-        # connection, and one SQLite file cannot be written from two at once.
-        await db_session.commit()
-        await _settle(ledger)
 
         (row,) = await _episodes(db_session)
         assert row.outcome == "failed"
         assert 178 <= (row.ended_at - row.started_at).total_seconds() <= 181
         assert plate_occupancy.is_plate_occupied(printer.id) is True, "the plate still stays gated"
 
-    async def test_a_sweep_the_printer_never_started_records_nothing(self, db_session, ledger):
+    async def test_a_sweep_the_printer_never_started_records_nothing(self, db_session):
         """No start echo, no duration — there is nothing to measure and nothing is invented."""
         printer = await self._mk_printer(db_session, "EPns")
         self._arm(printer.id, PendingEject("manual", None, None, expected_runtime_s=83.0))
@@ -407,9 +411,112 @@ class TestEjectTerminalHook:
                 completed_subtask_id=None,
                 completed_subtask_name=f"eject_manual_p{printer.id}",
             )
-        # Release the caller's transaction first: the ledger writes on its OWN
-        # connection, and one SQLite file cannot be written from two at once.
-        await db_session.commit()
-        await _settle(ledger)
 
+        assert await _episodes(db_session) == []
+
+    async def test_the_terminal_neither_spawns_a_task_nor_opens_a_session(self, db_session, monkeypatch):
+        """THE regression this wave fixes, pinned from the outside.
+
+        A fire-and-forget write here meant a SECOND connection to the same database
+        while this very handler's transaction was open — which on SQLite queues on the
+        busy timeout in production, and in the suite left a task running into the next
+        test's setup (``test_reconcile`` died on ``database is locked`` and on a session
+        closing mid-flush). Both lanes are made to explode so the terminal cannot
+        quietly take either.
+        """
+
+        def no_tasks(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the eject terminal must not schedule a background write")
+
+        def no_sessions(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the eject terminal must not open a second session")
+
+        monkeypatch.setattr(cycle_episodes, "spawn_background_task", no_tasks)
+        monkeypatch.setattr("backend.app.core.database.async_session", no_sessions, raising=False)
+
+        printer = await self._mk_printer(db_session, "EPsolo")
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=81)
+        self._arm(printer.id, PendingEject("manual", None, None, expected_runtime_s=83.0, started_at=started_at))
+
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client(None)):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                None,
+                "completed",
+                completed_subtask_id=None,
+                completed_subtask_name=f"eject_manual_p{printer.id}",
+            )
+
+        (row,) = await _episodes(db_session)
+        assert row.kind == KIND_EJECT
+
+    async def test_the_row_survives_the_caller_closing_its_session(self, db_session, own_session_factory):
+        """The terminal is the first writer on a path whose callers never commit.
+
+        All four of them (main's two notification lanes, the monitor's two downtime
+        reconciles) hand over a session inside ``async with async_session() as db:`` and
+        close it without committing, so a row that only reached a SAVEPOINT would be
+        rolled back on PostgreSQL — and survive on SQLite only through a pysqlite
+        defect. Read it back on a SEPARATE session, which is the honest question.
+        """
+        printer = await self._mk_printer(db_session, "EPcommit")
+        await db_session.commit()
+        started_at = datetime.now(timezone.utc) - timedelta(seconds=81)
+        self._arm(printer.id, PendingEject("manual", None, None, expected_runtime_s=83.0, started_at=started_at))
+
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client(None)):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                None,
+                "completed",
+                completed_subtask_id=None,
+                completed_subtask_name=f"eject_manual_p{printer.id}",
+            )
+
+        async with own_session_factory() as reader:
+            assert len(await _episodes(reader)) == 1
+
+
+class TestRecordEpisodeIsolation:
+    """A measurement that cannot be written costs the caller nothing but the row."""
+
+    @staticmethod
+    def _break_the_row(monkeypatch) -> None:
+        """Make the INSERT fail at the database, not at the validation.
+
+        ``kind`` is NOT NULL, so this is a genuine engine-level IntegrityError raised by
+        the flush INSIDE the savepoint — the shape a future column or a widened
+        vocabulary would take, and the one the savepoint exists to contain.
+        """
+        monkeypatch.setattr(
+            cycle_episodes,
+            "_episode_row",
+            lambda *args, **kwargs: FarmCycleEpisode(
+                printer_id=PRINTER_ID, kind=None, started_at=START, ended_at=START
+            ),
+        )
+
+    async def test_a_failed_measurement_never_reaches_the_caller(self, db_session, caplog, monkeypatch):
+        self._break_the_row(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            await record_episode(db_session, PRINTER_ID, KIND_EJECT, started_at=START, ended_at=START)
+
+        assert any("not recorded" in line for line in _warnings(caplog))
+
+    async def test_the_callers_later_writes_still_commit(self, db_session, own_session_factory, monkeypatch):
+        """The whole point of the savepoint: the rollback is scoped to the measurement."""
+        self._break_the_row(monkeypatch)
+
+        await record_episode(db_session, PRINTER_ID, KIND_EJECT, started_at=START, ended_at=START)
+        db_session.add(
+            Printer(name="AfterFail", serial_number="SAfterFail", ip_address="1.2.3.4", access_code="x", model="H2S")
+        )
+        await db_session.commit()
+
+        async with own_session_factory() as reader:
+            names = (await reader.execute(select(Printer.name))).scalars().all()
+        assert "AfterFail" in names
         assert await _episodes(db_session) == []

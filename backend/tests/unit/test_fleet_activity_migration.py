@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from backend.app.core.database import Base, run_migrations
 from backend.app.models.farm_cycle_episode import (
@@ -40,7 +40,7 @@ from backend.app.models.printer_observation_span import (
     PLATE_PHASES,
     PrinterObservationSpan,
 )
-from backend.tests._fixtures.db import MEMORY_DATABASE_URL, create_memory_engine, import_all_models
+from backend.tests._fixtures.db import boot_schema, create_memory_engine, import_all_models
 
 pytestmark = pytest.mark.usefixtures("force_sqlite_dialect")
 
@@ -92,29 +92,29 @@ _EPISODE_INDEX = "ix_farm_cycle_episode_kind_ended"
 BASE_TIME = datetime(2026, 9, 21, 8, 0, 0)
 
 
-def _create_all_except_the_new_tables(sync_conn) -> None:
-    """``create_all`` for every table the fork had BEFORE this wave — the legacy shape."""
-    tables = [table for name, table in Base.metadata.tables.items() if name not in _NEW_TABLES]
-    Base.metadata.create_all(sync_conn, tables=tables)
-
-
 @pytest.fixture
 async def fresh():
-    """A brand-new install: full ``create_all``, then the migrations."""
+    """A brand-new install: the app's own boot sequence on an empty database."""
     engine = await create_memory_engine()
-    async with engine.begin() as conn:
-        await run_migrations(conn)
+    await boot_schema(engine)
     yield engine
     await engine.dispose()
 
 
 @pytest.fixture
 async def legacy():
-    """An install that predates both tables and the two window indexes."""
-    import_all_models()
-    engine = create_async_engine(MEMORY_DATABASE_URL)
+    """An install that predates both tables and the two window indexes.
+
+    Built by SUBTRACTION from the owner's full-schema engine rather than by a
+    hand-picked ``create_all``: the old shape is "today's schema minus this wave", and
+    subtracting the four things the wave adds says that in four lines that cannot
+    silently fall behind the model. Dropping a table takes its indexes with it, so the
+    span and episode indexes need no separate statement.
+    """
+    engine = await create_memory_engine()
     async with engine.begin() as conn:
-        await conn.run_sync(_create_all_except_the_new_tables)
+        for table in _NEW_TABLES:
+            await conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
         # The models declare these, so create_all just built them; an old install's
         # tables predate the declaration, and create_all never revisits an existing
         # table — which is exactly why each one also has a migration statement.
@@ -127,9 +127,7 @@ async def legacy():
 @pytest.fixture
 async def upgraded(legacy: AsyncEngine) -> AsyncEngine:
     """The legacy install after a boot — ``create_all`` + ``run_migrations``, one transaction."""
-    async with legacy.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await run_migrations(conn)
+    await boot_schema(legacy)
     return legacy
 
 

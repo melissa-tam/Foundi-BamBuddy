@@ -648,7 +648,7 @@ class TestDispatchFileOwnership:
 _SPAN_WRITER = ("services", "fleet_activity.py")
 _EPISODE_WRITER = ("services", "cycle_episodes.py")
 
-# WHO may hand a measurement to the ledger. The writer itself (it defines the verb)
+# WHO may hand a measurement to the ledger. The writer itself (it defines both verbs)
 # plus the two owners that actually TIME an episode: the eject terminal, which reads
 # the sweep's own start echo, and the cooldown prep's retirement, which is the end of
 # the cooling episode. A third caller is a duration nobody measured.
@@ -657,6 +657,12 @@ _EPISODE_CALLERS = {
     ("services", "farm_policy.py"),
     ("services", "eject", "cooldown_prep.py"),
 }
+
+# The ledger's two entry points, scanned together. Which one a caller takes is decided
+# by whether it holds a session — the terminal rides its own (``record_episode``), the
+# sync cooldown retirement cannot (``note_episode``) — but BOTH write the same table,
+# so the ownership question is about the pair, never about one spelling.
+_EPISODE_ENTRY_POINTS = {"record_episode", "note_episode"}
 
 _FLEET_MODELS = {"PrinterObservationSpan": _SPAN_WRITER, "FarmCycleEpisode": _EPISODE_WRITER}
 
@@ -702,14 +708,15 @@ def _scan_fleet_history_writes(py_file: Path) -> list[tuple[str, str, int]]:
 
 
 def _scan_episode_notes(py_file: Path) -> list[tuple[str, int]]:
-    """Every CALL of ``note_episode``, however the module was imported."""
+    """Every CALL of either ledger entry point, however the module was imported."""
     tree = ast.parse(py_file.read_text(encoding="utf-8"))
     hits: list[tuple[str, int]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if _called_name(node.func) == "note_episode":
-            hits.append(("note_episode()", node.lineno))
+        name = _called_name(node.func)
+        if name in _EPISODE_ENTRY_POINTS:
+            hits.append((f"{name}()", node.lineno))
     return hits
 
 
@@ -854,8 +861,9 @@ class TestFleetActivityOwnership:
                 + "\n\nObservation spans are written ONLY by services/fleet_activity.py (the sampler "
                 "owns the run-length encoding, and a row written anywhere else breaks the one-open-span "
                 "invariant the partial unique index exists to hold); cycle episodes are written ONLY by "
-                "services/cycle_episodes.note_episode, which the two measuring owners call. Reading "
-                "either table is unrestricted — recording raw and classifying at read time is the point."
+                "services/cycle_episodes, through record_episode (the caller's session) or note_episode "
+                "(its own), which the two measuring owners call. Reading either table is unrestricted — "
+                "recording raw and classifying at read time is the point."
             )
 
     def test_only_the_measuring_owners_note_an_episode(self):
@@ -873,7 +881,8 @@ class TestFleetActivityOwnership:
                 + "\n".join(strays)
                 + "\n\nAn episode row is a DURATION somebody measured — the eject terminal reads the "
                 "sweep's own start echo, and cooldown_prep.end() is the end of the cooling episode. A "
-                "caller that did not time the episode is recording a guess."
+                "caller that did not time the episode is recording a guess. Whichever entry point it "
+                "would reach for, the answer is the same: measure it, or do not record it."
             )
 
     def test_the_declared_writers_are_still_there(self):
@@ -885,11 +894,23 @@ class TestFleetActivityOwnership:
             found = {symbol for _, symbol, _ in _scan_fleet_history_writes(path)}
             assert f"{model}()" in found, f"{'/'.join(owner)} no longer constructs {model}"
 
-        # ``cycle_episodes`` DEFINES the verb rather than calling it, so it is
+        # ``cycle_episodes`` DEFINES both verbs rather than calling them, so it is
         # allowlisted but never a hit — both hook modules must be.
         hooks = _EPISODE_CALLERS - {_EPISODE_WRITER}
         callers = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_episode_notes(f)}
         assert callers == hooks
+
+        # And each hook takes the entry point its own shape allows: the async terminal
+        # rides the session it holds, the sync cooldown retirement opens its own. A hook
+        # that swapped them would be the regression this pin exists for — a second
+        # connection queueing behind the terminal's transaction on every eject.
+        by_module = {
+            _relative_parts(f): {symbol for symbol, _ in _scan_episode_notes(f)}
+            for f in get_python_files(BACKEND_DIR)
+            if _scan_episode_notes(f)
+        }
+        assert by_module[("services", "farm_policy.py")] == {"record_episode()"}
+        assert by_module[("services", "eject", "cooldown_prep.py")] == {"note_episode()"}
 
     def test_fleet_metrics_makes_no_calendar_cut_of_its_own(self):
         """The metrics reader takes its day, week and hour grid from ONE resolver.
