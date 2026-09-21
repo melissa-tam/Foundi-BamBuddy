@@ -22,8 +22,11 @@ import type { PrinterIncidentKind } from '../../api/client';
 import type { FleetBucket, MatrixCell, SeriesBucket, SeriesEnvelope } from '../../types/fleetMetrics';
 import {
   allClassKeys,
+  bucketHasElapsed,
   bucketLabel,
   BUCKET_COLUMN_WIDTH_PX,
+  BUCKET_HOURS,
+  currentBucketIndex,
   causeLabelKey,
   cellAbsence,
   classLabelKey,
@@ -33,6 +36,8 @@ import {
   FAULT_KIND_ORDER,
   FLEET_ABSENCE_COLOR,
   FLEET_ABSENCE_TEXT,
+  FLEET_AVG_DESCRIPTION_KEY,
+  fleetAverage,
   FLEET_GROUP_COLOR,
   FLEET_GROUP_TEXT,
   FLEET_PARTIAL_BAND_PX,
@@ -51,6 +56,7 @@ import {
   groupLabelKey,
   headerRangeKey,
   hourHeaderLabel,
+  isolatedPointFlags,
   isPartlyObserved,
   isSingleDayRange,
   matrixCaptionKey,
@@ -66,6 +72,7 @@ import {
   incidentKindLabelKey,
   incidentKindTextColor,
   CELL_ABSENCE_LABEL_KEY,
+  LENS_FLEET_AVG_MODE,
   LENS_LABEL_KEY,
   OUTCOME_LABEL_KEY,
   OUTCOME_COLOR,
@@ -1154,6 +1161,174 @@ describe('the site midnight hour', () => {
 
     expect(offenders).toEqual([]);
     expect(fs.readFileSync(owner, 'utf8')).toMatch(/hourCycle: 'h23'/);
+  });
+});
+
+describe('a bucket that has not happened', () => {
+  const at = (elapsed: number, observed: number) => ({
+    elapsed_seconds: elapsed,
+    observed_seconds: observed,
+  });
+
+  it('is told from one that happened and recorded nothing', () => {
+    expect(bucketHasElapsed(at(0, 0))).toBe(false);
+    expect(bucketHasElapsed(at(3600, 0))).toBe(true);
+  });
+
+  it('takes the upcoming verdict BEFORE any question about data', () => {
+    // On Today at 17:00 seven of the twenty-four hours have not started. They
+    // read as ledger-only zeros — a full hatch and an sr-only "0 Faults and
+    // holds only" — over a drill-down that correctly said there was no data.
+    const future = cell({ class_seconds: {}, basis: 'incidents_only' });
+    for (const lens of ['prints', 'hours_down', 'time_split'] as const) {
+      expect(cellAbsence(future, at(0, 0), { lens }), lens).toBe('upcoming');
+    }
+  });
+
+  it('is never mistaken for a zero, a recorder gap or a deactivation', () => {
+    const future = cell({ class_seconds: {}, basis: 'incidents_only' });
+    const verdict = cellAbsence(future, at(0, 0), { lens: 'hours_down' });
+    expect(verdict).not.toBe('zero');
+    expect(verdict).not.toBe('incidents_only');
+    expect(verdict).not.toBe('out_of_fleet');
+    // …and it wears no partly-observed marker: there was nothing to miss.
+    expect(isPartlyObserved(verdict)).toBe(false);
+  });
+
+  it('names itself with a leaf that exists', () => {
+    expect(CELL_ABSENCE_LABEL_KEY.upcoming).toBe('fleetMetrics.class.upcoming');
+    expect(typeof lookup(CELL_ABSENCE_LABEL_KEY.upcoming)).toBe('string');
+  });
+});
+
+describe('currentBucketIndex', () => {
+  const grid = (...elapsed: number[]) => elapsed.map((value) => ({ elapsed_seconds: value }));
+
+  it('is the last bucket that has ELAPSED, not the last bucket', () => {
+    // Today's hour grid: the per-row Details control opened
+    // `buckets.length - 1`, which is 23:00 — so a printer with seventeen hours
+    // down today opened an empty dialog for an hour that has not arrived.
+    expect(currentBucketIndex(grid(3600, 3600, 1800, 0, 0))).toBe(2);
+  });
+
+  it('is the last bucket for a window wholly in the past', () => {
+    expect(currentBucketIndex(grid(3600, 3600, 3600))).toBe(2);
+  });
+
+  it('answers a usable index for a grid with nothing elapsed at all', () => {
+    expect(currentBucketIndex(grid(0, 0, 0))).toBe(2);
+    expect(currentBucketIndex([])).toBe(0);
+  });
+});
+
+describe('isolatedPointFlags', () => {
+  it('marks the point that has no neighbour to join', () => {
+    // "Prints per printer" exists for observed buckets alone, so in the first
+    // days there is exactly one — and a one-point line is a zero-length path
+    // that paints nothing while the legend promises a line.
+    expect(isolatedPointFlags([null, null, 4.2, null])).toEqual([false, false, true, false]);
+  });
+
+  it('leaves a run of two or more as a plain line', () => {
+    expect(isolatedPointFlags([null, 1, 2, null])).toEqual([false, false, false, false]);
+    expect(isolatedPointFlags([1, 2, 3])).toEqual([false, false, false]);
+  });
+
+  it('counts the ends as absent, so a lone first or last point is isolated', () => {
+    expect(isolatedPointFlags([7, null, null])).toEqual([true, false, false]);
+    expect(isolatedPointFlags([null, null, 7])).toEqual([false, false, true]);
+    expect(isolatedPointFlags([7])).toEqual([true]);
+  });
+
+  it('marks each island of one separately', () => {
+    expect(isolatedPointFlags([1, null, 2, null, 3])).toEqual([true, false, true, false, true]);
+  });
+
+  it('never marks an absent point', () => {
+    expect(isolatedPointFlags([null, undefined, null])).toEqual([false, false, false]);
+  });
+});
+
+describe('the Fleet row’s Avg', () => {
+  it('sums under Prints and means under the two hours lenses', () => {
+    expect(LENS_FLEET_AVG_MODE.prints).toBe('sum');
+    expect(LENS_FLEET_AVG_MODE.hours_down).toBe('mean');
+    // Time split's Avg column carries hours down per day too.
+    expect(LENS_FLEET_AVG_MODE.time_split).toBe('mean');
+  });
+
+  it('never exceeds a day when every printer is down all day', () => {
+    // The defect: twelve printers at roughly 20 h down per day summed to a
+    // Fleet "Avg" of 86 h/day, beside rows reading 22 and 18.
+    const allDown = Array.from({ length: 12 }, () => 24);
+    expect(fleetAverage(allDown, 'mean')).toBe(24);
+    expect(fleetAverage(allDown, 'sum')).toBe(288);
+  });
+
+  it('is directly comparable with the rows above it', () => {
+    expect(fleetAverage([22, 21, 20, 18], 'mean')).toBeCloseTo(20.25, 6);
+  });
+
+  it('leaves a printer with no denominator out of the mean, never in as a zero', () => {
+    // A printer the recorder never counted prints "–" in its own Avg cell, and
+    // averaging it in as a zero is the unknown-read-as-zero conflation the rest
+    // of this module exists to prevent.
+    expect(fleetAverage([24, 24, null, null], 'mean')).toBe(24);
+    expect(fleetAverage([24, 24, null, null], 'sum')).toBe(48);
+  });
+
+  it('is null when no printer has a rate — a mean of nothing is not zero', () => {
+    expect(fleetAverage([null, null], 'mean')).toBeNull();
+    expect(fleetAverage([], 'sum')).toBeNull();
+  });
+
+  it('describes each mode with a leaf that exists, and the two differ', () => {
+    const mean = FLEET_AVG_DESCRIPTION_KEY.mean;
+    const sum = FLEET_AVG_DESCRIPTION_KEY.sum;
+    expect(mean).not.toBe(sum);
+    for (const leaf of [mean, sum]) expect(typeof lookup(leaf)).toBe('string');
+  });
+});
+
+describe('the Today chip', () => {
+  const bucketAt = (seconds: number, elapsed: number): SeriesBucket<unknown> => ({
+    start: '2026-09-20T12:00:00',
+    seconds,
+    elapsed_seconds: elapsed,
+    observed_seconds: elapsed,
+    utc_offset_minutes: 720,
+    basis: 'observed',
+    values: {},
+  });
+
+  it('rides the current DAY bucket, and only that', () => {
+    const day = bucketLabel(bucketAt(86_400, 43_200), { bucket: 'day', locale: 'en' });
+    expect(day.isCurrent).toBe(true);
+    expect(day.showsTodayChip).toBe(true);
+  });
+
+  it('never rides an hour column', () => {
+    // It sat on ONE hour column of an all-today hour grid — calling one hour of
+    // today "Today" while the twenty-three beside it are the same day, and
+    // breaking the every-third-hour cadence where it sat.
+    const hour = bucketLabel(bucketAt(3600, 1800), { bucket: 'hour', locale: 'en' });
+    expect(hour.isCurrent).toBe(true);
+    expect(hour.showsTodayChip).toBe(false);
+  });
+
+  it('never rides a week column — the current week is named by its own start', () => {
+    const week = bucketLabel(bucketAt(604_800, 302_400), { bucket: 'week', locale: 'en' });
+    expect(week.isCurrent).toBe(true);
+    expect(week.showsTodayChip).toBe(false);
+    expect(week.weekStart).not.toBeNull();
+  });
+
+  it('rides no FINISHED bucket, at any width', () => {
+    for (const width of ['hour', 'day', 'week'] as const) {
+      const seconds = BUCKET_HOURS[width] * 3600;
+      const finished = bucketLabel(bucketAt(seconds, seconds), { bucket: width, locale: 'en' });
+      expect(finished.showsTodayChip, width).toBe(false);
+    }
   });
 });
 

@@ -57,6 +57,7 @@ import { useTranslation } from 'react-i18next';
 import type { FleetBucket, MatrixCell } from '../../types/fleetMetrics';
 import {
   CELL_ABSENCE_LABEL_KEY,
+  bucketHasElapsed,
   FLEET_ABSENCE_COLOR,
   FLEET_PATTERN_CSS,
   SECONDARY_TEXT_CLASS,
@@ -190,15 +191,27 @@ export function FleetMatrixCell({
 
   // A cell the payload has no row for is a cell from before this printer was
   // recorded — the same verdict, reached without a cell to judge.
+  // `cellAbsence` is THE verdict wherever there is a cell to judge — including
+  // the `upcoming` one, which it answers first. The only case it cannot take
+  // is a bucket the payload carries no row for at all, and even that splits
+  // two ways: a missing row is "before recording" only if the bucket is in
+  // the PAST.
   const absence: CellAbsence =
-    cell === undefined ? 'before_recording' : cellAbsence(cell, header, { lens });
+    cell !== undefined
+      ? cellAbsence(cell, header, { lens })
+      : bucketHasElapsed(header)
+        ? 'before_recording'
+        : 'upcoming';
 
-  if (cell === undefined || absence === 'before_recording') {
+  if (absence === 'upcoming' || absence === 'out_of_fleet') {
+    // Flat ground: no figure and no marker. One says the printer was not in
+    // the fleet, the other that the bucket has not happened; neither is a
+    // reading, and a hatch over either would claim the recorder missed
+    // something there was nothing to miss.
+    style.backgroundColor = 'var(--bg-primary)';
+  } else if (cell === undefined || absence === 'before_recording') {
     text = '–';
     dim = true;
-  } else if (absence === 'out_of_fleet') {
-    // Flat ground: not a value and not a zero — the printer was not in the fleet.
-    style.backgroundColor = 'var(--bg-primary)';
   } else {
     dim = absence === 'zero';
 

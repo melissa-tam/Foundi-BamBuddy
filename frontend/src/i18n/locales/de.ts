@@ -7590,6 +7590,7 @@ export default {
       not_recorded: 'Vor Aufzeichnungsbeginn',
       unobserved: 'Keine Daten',
       incidents_only: 'Nur Störungen und Haltezustände',
+      upcoming: 'Noch nicht vergangen',
     },
     units: {
       perDay: '/ Tag',
@@ -7623,6 +7624,8 @@ export default {
       deletedPrinter: 'Drucker {{id}}',
       deactivated: 'Deaktiviert',
       fleetRow: 'Flotte',
+      fleetAvgMean: 'Mittelwert je Drucker, über die aufgeführten Drucker.',
+      fleetAvgSum: 'Die gesamte Flotte zusammengerechnet.',
       timeSplitDisabled: 'Benötigt aufgezeichnete Druckerzustände. Aufzeichnung seit {{date}}.',
       timeSplitDisabledNoData: 'Benötigt aufgezeichnete Druckerzustände. Bisher nichts aufgezeichnet.',
       legend: {

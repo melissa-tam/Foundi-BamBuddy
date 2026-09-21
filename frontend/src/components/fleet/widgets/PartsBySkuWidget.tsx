@@ -32,7 +32,15 @@ import {
 } from './ChartFrame';
 import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
-import { partsRows, partsTotals, skuSeries, type PartsRowValues, type SkuSeries } from './rows';
+import {
+  NO_VALUE,
+  partsRows,
+  partsTotals,
+  skuSeries,
+  type Nullable,
+  type PartsRowValues,
+  type SkuSeries,
+} from './rows';
 import type { FleetOverview } from '../../../types/fleetMetrics';
 import {
   CHART_AXIS_STROKE,
@@ -75,16 +83,20 @@ export function PartsBySkuWidget({ overview, size }: PartsBySkuWidgetProps) {
     textColor: skuBandText(index, entry.sku === null),
   }));
 
-  const columns: ChartDataColumn<PartsRowValues>[] = [
+  /** Units, or a dash where the bucket has not happened. */
+  const units = (value: number | null | undefined): string =>
+    value === null || value === undefined ? NO_VALUE : formatCount(value, locale);
+
+  const columns: ChartDataColumn<Nullable<PartsRowValues>>[] = [
     ...series.map((entry) => ({
       key: entry.key,
       header: seriesLabel(entry),
-      format: (values: PartsRowValues) => formatCount(values[entry.key] ?? 0, locale),
+      format: (values: Nullable<PartsRowValues>) => units(values[entry.key]),
     })),
     {
       key: 'units',
       header: t('fleetMetrics.widgets.units'),
-      format: (values: PartsRowValues) => formatCount(values.units, locale),
+      format: (values: Nullable<PartsRowValues>) => units(values.units),
     },
   ];
 
@@ -141,7 +153,7 @@ export function PartsBySkuWidget({ overview, size }: PartsBySkuWidgetProps) {
         </ResponsiveContainer>
       }
       table={
-        <ChartDataTable<PartsRowValues>
+        <ChartDataTable<Nullable<PartsRowValues>>
           caption={t('fleetMetrics.sections.partsBySku')}
           rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}

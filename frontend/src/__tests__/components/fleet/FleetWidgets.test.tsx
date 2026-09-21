@@ -18,10 +18,13 @@ import i18n from '../../../i18n';
 import {
   DEACTIVATED_PRINTER_ID,
   HEALTHY_PRINTER_ID,
+  TODAY_FUTURE_HOURS,
   makeFleetOverview,
   makeFleetOverviewFirstRun,
+  makeFleetOverviewTodayHours,
 } from '../../fixtures/fleetMetrics';
 import { FleetWidgets } from '../../../components/fleet/FleetWidgets';
+import { isolatedDot } from '../../../components/fleet/widgets/chartMarks';
 import { CoolingAndEjectWidget } from '../../../components/fleet/widgets/CoolingAndEjectWidget';
 import { DowntimeByCauseWidget } from '../../../components/fleet/widgets/DowntimeByCauseWidget';
 import { PrintsPerDayWidget } from '../../../components/fleet/widgets/PrintsPerDayWidget';
@@ -414,5 +417,72 @@ describe('empty states', () => {
       .filter((node) => node.textContent === i18n.t('fleetMetrics.states.empty'));
     expect(empties).toHaveLength(3);
     expect(screen.getAllByRole('button', { name: showData() })).toHaveLength(3);
+  });
+});
+
+/**
+ * The MARK for a point a line cannot reach.
+ *
+ * Pinned on the renderer itself rather than on painted SVG: recharts lays out
+ * through a `ResponsiveContainer`, which measures zero in jsdom and draws no
+ * geometry at all, so no assertion about a rendered `<circle>` could ever be
+ * honest here. The rule that decides WHICH points (`isolatedPointFlags`) is
+ * pinned in the util, the data that produces exactly one of them in
+ * `fleetWidgetRows`, and the painted result in the browser.
+ */
+describe('isolatedDot', () => {
+  const LONE = '2026-09-21T00:00:00';
+  const dot = isolatedDot(new Set([LONE]), '#abcdef');
+
+  it('draws a filled point where the line has no neighbour to join', () => {
+    const drawn = dot({ payload: { bucketStart: LONE }, cx: 12, cy: 34 });
+    expect(drawn.type).toBe('circle');
+    expect(drawn.props).toMatchObject({ cx: 12, cy: 34, fill: '#abcdef' });
+  });
+
+  it('draws nothing where the line can join its neighbours', () => {
+    expect(dot({ payload: { bucketStart: '2026-09-20T00:00:00' }, cx: 12, cy: 34 }).type).toBe('g');
+  });
+
+  it('reads the BUCKET, never the index recharts happens to give it', () => {
+    // recharts drops the null points before rendering marks, so the `index` it
+    // hands a dot renderer counts only the survivors: index 0 of a thirty-day
+    // series with one point IS that point, not the first day. Keying on the
+    // index asked about the wrong bucket and the mark never appeared — and
+    // nothing but a browser could catch it, since jsdom lays out no chart.
+    expect(dot({ payload: {}, cx: 1, cy: 2 }).type).toBe('g');
+    expect(dot({ cx: 1, cy: 2 }).type).toBe('g');
+  });
+
+  it('draws nothing for a point recharts gave no position', () => {
+    expect(dot({ payload: { bucketStart: LONE } }).type).toBe('g');
+  });
+});
+
+describe('the hours still to come', () => {
+  it('prints a dash, never a zero, in the data table', async () => {
+    // A `0` in a future hour's row is a claim about an hour that has not
+    // arrived; the print log is complete for its own PAST, not for its future.
+    const user = userEvent.setup();
+    render(<PrintsPerDayWidget overview={makeFleetOverviewTodayHours()} size={4} />);
+
+    await user.click(screen.getByRole('button', { name: showData() }));
+    // The last row is the window's totals, so the future hours sit above it.
+    const rows = screen.getAllByRole('row');
+    const future = rows.slice(-(TODAY_FUTURE_HOURS + 1), -1);
+    expect(future).toHaveLength(TODAY_FUTURE_HOURS);
+
+    for (const row of future) {
+      for (const cellNode of within(row).getAllByRole('cell')) {
+        expect((cellNode.textContent ?? '').trim()).toBe('–');
+      }
+    }
+    // Non-vacuous: an hour that HAS happened still prints its figures.
+    const past = rows[1];
+    expect(
+      within(past as HTMLElement)
+        .getAllByRole('cell')
+        .some((cellNode) => /\d/.test(cellNode.textContent ?? '')),
+    ).toBe(true);
   });
 });

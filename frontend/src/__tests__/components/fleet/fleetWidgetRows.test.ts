@@ -16,12 +16,18 @@ import {
   FIXTURE_UTC_OFFSET_MINUTES,
   HEALTHY_PRINTER_ID,
   PRODUCTION_WINDOW_DAYS,
+  TODAY_FUTURE_HOURS,
   makeFleetOverview,
   makeFleetOverviewFirstRun,
   makeFleetOverviewProduction,
+  makeFleetOverviewTodayHours,
 } from '../../fixtures/fleetMetrics';
 import type { SeriesEnvelope, UnitsValues } from '../../../types/fleetMetrics';
-import { CHART_STACK_GROUPS, DOWN_CAUSE_ORDER } from '../../../utils/fleetMetrics';
+import {
+  CHART_STACK_GROUPS,
+  DOWN_CAUSE_ORDER,
+  isolatedPointKeys,
+} from '../../../utils/fleetMetrics';
 import {
   SECONDS_PER_HOUR,
   SKU_OTHER_KEY,
@@ -223,6 +229,69 @@ describe('printers by state over time', () => {
       0,
     );
     expect(summed).toBeCloseTo(bucket.values.printers_known, 3);
+  });
+
+  it('draws a bucket that has NOT HAPPENED as a gap, never as a zero', () => {
+    // Today's hour grid carries the hours still to come. Every `pick` reads a
+    // sparse map with `?? 0`, which is right for a bucket that happened and
+    // produced nothing and wrong for one that has not started — it drew a
+    // future hour as an observed zero: a full-height no-data band.
+    const today = makeFleetOverviewTodayHours();
+    const todayRows = stateRows(today.fleet_series, options());
+    const future = todayRows.slice(-TODAY_FUTURE_HOURS);
+    const past = todayRows.slice(0, -TODAY_FUTURE_HOURS);
+
+    expect(future).toHaveLength(TODAY_FUTURE_HOURS);
+    for (const row of future) {
+      expect(row.bucketElapsedSeconds).toBe(0);
+      for (const key of ['printing', 'idle', 'cycle_overhead', 'down', 'planned'] as const) {
+        expect(row[key], `${key} at ${row.bucketStart}`).toBeNull();
+      }
+      // Not a roster line along zero, and not a full-height hatch either:
+      // nothing was missed, because there was nothing to miss.
+      expect(row.in_fleet).toBeNull();
+      expect(row.unobserved).toBeNull();
+      expect(row.peak_down).toBeNull();
+    }
+    // Non-vacuous: the hours that HAVE happened still carry their figures.
+    expect(past.some((row) => row.printing !== null)).toBe(true);
+  });
+
+  it('gaps the prints builder over the hours still to come', () => {
+    // The print log is complete for its own history, so a past bucket's
+    // missing outcome is a real zero — but a future bucket has no history to
+    // be complete about, and a `0` in the table is a claim about an hour that
+    // has not arrived.
+    const today = makeFleetOverviewTodayHours();
+    const todayRows = printsRows(today.throughput, options());
+    const future = todayRows.slice(-TODAY_FUTURE_HOURS);
+
+    for (const row of future) {
+      expect(row.completed).toBeNull();
+      expect(row.failed).toBeNull();
+      expect(row.total).toBeNull();
+      expect(row.per_printer).toBeNull();
+    }
+    expect(todayRows.slice(0, -TODAY_FUTURE_HOURS).some((row) => row.total !== null)).toBe(true);
+  });
+
+  it('marks the lone observed point isolated on the production shape', () => {
+    // One observed bucket means one non-null point, and a one-point line is a
+    // zero-length path: with `dot={false}` the chart draws nothing at all
+    // while the legend beside it promises a line.
+    const production = makeFleetOverviewProduction();
+    const productionRows = stateRows(production.fleet_series, options());
+    // Keyed by BUCKET, not by index: recharts renumbers its points once the
+    // nulls are filtered out, so an index-based lookup asks about the wrong
+    // bucket on exactly the series this rule exists for.
+    const keys = isolatedPointKeys(productionRows, (row) => row.in_fleet);
+
+    expect(keys.size).toBe(1);
+    expect(keys.has(productionRows[productionRows.length - 1]!.bucketStart)).toBe(true);
+
+    const printRows = printsRows(production.throughput, options());
+    expect(printRows.filter((row) => row.per_printer !== null)).toHaveLength(1);
+    expect(isolatedPointKeys(printRows, (row) => row.per_printer).size).toBe(1);
   });
 
   it('has nothing to draw before the recorder ever ran', () => {

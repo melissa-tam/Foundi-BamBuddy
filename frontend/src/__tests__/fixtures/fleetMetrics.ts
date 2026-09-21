@@ -613,6 +613,14 @@ export interface FleetOverviewOptions {
   lastObservedSeconds?: number;
   /** The unrecorded stretch carries prints and holds — see `CellOptions`. */
   production?: boolean;
+  /**
+   * Trailing buckets that have NOT HAPPENED: `elapsed_seconds: 0`.
+   *
+   * A window is a grid, so a window ending today carries the hours (or the
+   * day) still to come. They are not an edge case — every `Today` view has
+   * them from midnight until 23:00.
+   */
+  futureTail?: number;
   dateFrom?: string;
   dateTo?: string;
 }
@@ -634,13 +642,22 @@ export function makeFleetOverview(options: FleetOverviewOptions = {}): FleetOver
 
   const production = options.production ?? false;
 
+  const futureTail = options.futureTail ?? 0;
+  /** The bucket NOW falls in: the last one before the buckets still to come. */
+  const currentIndex = count - 1 - futureTail;
+
   const shapes: BucketShape[] = starts.map((start, index) => {
-    const isLast = index === count - 1;
-    const elapsed = isLast && currentLast ? Math.round(width / 2) : width;
+    // Past the current bucket is the future: no elapsed time, so nothing to
+    // observe and nothing to be zero.
+    if (index > currentIndex) {
+      return { start, seconds: width, elapsed_seconds: 0, observed_seconds: 0 };
+    }
+    const isCurrent = index === currentIndex;
+    const elapsed = isCurrent && currentLast ? Math.round(width / 2) : width;
     let observed = elapsed;
     if (index < incidentsOnlyLead) observed = 0;
     else if (index === partialIndex) observed = Math.round(elapsed / 2);
-    if (isLast && options.lastObservedSeconds !== undefined) {
+    if (isCurrent && options.lastObservedSeconds !== undefined) {
       observed = Math.min(elapsed, options.lastObservedSeconds);
     }
     return { start, seconds: width, elapsed_seconds: elapsed, observed_seconds: observed };
@@ -756,6 +773,28 @@ export const makeFleetOverviewWeek = (): FleetOverview => makeFleetOverview({ bu
 export const makeFleetOverviewHour = (): FleetOverview => makeFleetOverview({ bucket: 'hour' });
 /** Nothing observed yet: every bucket is `not_recorded`, every state row null. */
 export const makeFleetOverviewFirstRun = (): FleetOverview => makeFleetOverview({ firstRun: true });
+
+/** How many of the today-shaped hour grid's twenty-four hours are still to come. */
+export const TODAY_FUTURE_HOURS = 6;
+
+/**
+ * TODAY, as an hour grid: eighteen hours that have happened and six that have
+ * not.
+ *
+ * The shape the matrix is read in every morning, and the one that exposed three
+ * lies at once — future hours claiming an observed zero under a full hatch, the
+ * per-row Details control opening 23:00, and the "Today" chip landing on a
+ * single hour column.
+ */
+export const makeFleetOverviewTodayHours = (): FleetOverview =>
+  makeFleetOverview({
+    bucket: 'hour',
+    count: 24,
+    incidentsOnlyLead: 0,
+    partialIndex: null,
+    currentLast: true,
+    futureTail: TODAY_FUTURE_HOURS,
+  });
 
 /** How many days the production-shaped window spans. */
 export const PRODUCTION_WINDOW_DAYS = 44;

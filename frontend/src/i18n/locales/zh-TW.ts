@@ -7576,6 +7576,7 @@ export default {
       not_recorded: '記錄之前',
       unobserved: '無資料',
       incidents_only: '僅故障與暫停',
+      upcoming: '尚未到來',
     },
     units: {
       perDay: '/ 天',
@@ -7609,6 +7610,8 @@ export default {
       deletedPrinter: '印表機 {{id}}',
       deactivated: '已停用',
       fleetRow: '機群',
+      fleetAvgMean: '按列出的印表機計算的每臺平均值。',
+      fleetAvgSum: '整個機隊的合計。',
       timeSplitDisabled: '需要已記錄的印表機狀態。記錄自 {{date}} 開始。',
       timeSplitDisabledNoData: '需要已記錄的印表機狀態。目前尚無任何記錄。',
       legend: {

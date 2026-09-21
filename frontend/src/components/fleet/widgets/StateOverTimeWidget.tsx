@@ -48,9 +48,17 @@ import {
 } from 'recharts';
 import { ChartDataTable, type ChartDataColumn } from '../ChartDataTable';
 import { ChartFrame, ChartLegend, type ChartLegendEntry } from './ChartFrame';
+import { isolatedDot } from './chartMarks';
 import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
-import { NO_VALUE, stateHasData, stateRows, stateTotals, type StateRowValues } from './rows';
+import {
+  NO_VALUE,
+  stateHasData,
+  stateRows,
+  stateTotals,
+  type Nullable,
+  type StateRowValues,
+} from './rows';
 import type { FleetOverview } from '../../../types/fleetMetrics';
 import {
   CHART_AXIS_STROKE,
@@ -68,6 +76,7 @@ import {
   FLEET_GROUP_TEXT,
   GROUP_PATTERN,
   formatPrinters,
+  isolatedPointKeys,
   groupLabelKey,
   patternFill,
 } from '../../../utils/fleetMetrics';
@@ -90,6 +99,21 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
   const totals = stateTotals(overview.fleet_series);
   const printers = (value: number | null): string =>
     value === null ? NO_VALUE : formatPrinters(value, locale);
+
+  /**
+   * Both lines exist for OBSERVED buckets only, so on a young instance each has
+   * exactly one point — and a one-point line is a zero-length path that paints
+   * nothing while the legend promises a line. `isolatedPointKeys` owns which
+   * points cannot reach a neighbour; these turn that verdict into a mark.
+   */
+  const inFleetDot = isolatedDot(
+    isolatedPointKeys(rows, (row) => row.in_fleet),
+    CHART_MUTED_TEXT,
+  );
+  const peakDownDot = isolatedDot(
+    isolatedPointKeys(rows, (row) => row.peak_down),
+    FLEET_GROUP_COLOR.down,
+  );
 
   const legend: ChartLegendEntry[] = [
     ...CHART_STACK_GROUPS.map((group) => ({
@@ -120,26 +144,26 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
     },
   ];
 
-  const columns: ChartDataColumn<StateRowValues>[] = [
+  const columns: ChartDataColumn<Nullable<StateRowValues>>[] = [
     ...CHART_STACK_GROUPS.map((group) => ({
       key: group,
       header: t(groupLabelKey(group)),
-      format: (values: StateRowValues) => printers(values[group]),
+      format: (values: Nullable<StateRowValues>) => printers(values[group]),
     })),
     {
       key: 'unobserved',
       header: t('fleetMetrics.class.unobserved'),
-      format: (values: StateRowValues) => printers(values.unobserved),
+      format: (values: Nullable<StateRowValues>) => printers(values.unobserved),
     },
     {
       key: 'peak_down',
       header: t('fleetMetrics.widgets.peakDownLine'),
-      format: (values: StateRowValues) => printers(values.peak_down),
+      format: (values: Nullable<StateRowValues>) => printers(values.peak_down),
     },
     {
       key: 'in_fleet',
       header: t('fleetMetrics.widgets.inFleetLine'),
-      format: (values: StateRowValues) => printers(values.in_fleet),
+      format: (values: Nullable<StateRowValues>) => printers(values.in_fleet),
     },
   ];
 
@@ -244,7 +268,7 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
               stroke={CHART_MUTED_TEXT}
               strokeDasharray="4 3"
               strokeWidth={1.5}
-              dot={false}
+              dot={inFleetDot}
               activeDot={false}
               connectNulls={false}
               isAnimationActive={false}
@@ -255,7 +279,7 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
               name={t('fleetMetrics.widgets.peakDownLine')}
               stroke={FLEET_GROUP_COLOR.down}
               strokeWidth={2}
-              dot={false}
+              dot={peakDownDot}
               activeDot={false}
               connectNulls={false}
               isAnimationActive={false}
@@ -264,7 +288,7 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
         </ResponsiveContainer>
       }
       table={
-        <ChartDataTable<StateRowValues>
+        <ChartDataTable<Nullable<StateRowValues>>
           caption={t('fleetMetrics.sections.stateOverTime')}
           rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}

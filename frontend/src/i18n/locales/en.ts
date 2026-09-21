@@ -7626,6 +7626,7 @@ export default {
       not_recorded: 'Before recording',
       unobserved: 'No data',
       incidents_only: 'Faults and holds only',
+      upcoming: 'Not yet elapsed',
     },
     units: {
       perDay: '/ day',
@@ -7659,6 +7660,8 @@ export default {
       deletedPrinter: 'Printer {{id}}',
       deactivated: 'Deactivated',
       fleetRow: 'Fleet',
+      fleetAvgMean: 'Mean per printer, over the printers listed.',
+      fleetAvgSum: 'The whole fleet added up.',
       timeSplitDisabled: 'Needs recorded printer state. Recording started {{date}}.',
       timeSplitDisabledNoData: 'Needs recorded printer state. Nothing recorded yet.',
       legend: {

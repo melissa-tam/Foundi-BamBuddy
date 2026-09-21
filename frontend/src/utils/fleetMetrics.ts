@@ -407,6 +407,62 @@ export const LENS_LABEL_KEY: Record<FleetLens, string> = {
   time_split: 'fleetMetrics.matrix.lens.timeSplit',
 };
 
+/**
+ * How the FLEET row's Avg cell combines the printers' own per-day rates.
+ *
+ * Not one answer, because the lenses ask different questions of that column.
+ * Under **Prints** the fleet's output IS the sum — twelve printers making six
+ * prints a day each is a farm making seventy-two a day, which is the figure an
+ * operator plans against. Under **Hours down** the sum is not a rate anybody
+ * can read: it printed 86 "h/day" on a twelve-printer farm, and a day has
+ * twenty-four hours, so the one column meant to be comparable with the rows
+ * above it was the one column that could not be. The mean per printer can be,
+ * and by construction never exceeds a day.
+ *
+ * Time split's Avg carries hours down per day too (a share has no per-day twin
+ * in the payload), so it follows Hours down.
+ */
+export type FleetAvgMode = 'sum' | 'mean';
+
+export const LENS_FLEET_AVG_MODE: Record<FleetLens, FleetAvgMode> = {
+  prints: 'sum',
+  hours_down: 'mean',
+  time_split: 'mean',
+};
+
+/** The leaf that says WHICH of the two the Fleet row's Avg cell is. */
+export const FLEET_AVG_DESCRIPTION_KEY: Record<FleetAvgMode, string> = {
+  sum: 'fleetMetrics.matrix.fleetAvgSum',
+  mean: 'fleetMetrics.matrix.fleetAvgMean',
+};
+
+/**
+ * The Fleet row's Avg, from the printers' own per-day rates.
+ *
+ * The mean divides by the rows that HAVE a rate, not by every row shown: a
+ * printer the recorder never counted has no denominator and prints "–" in its
+ * own Avg cell, and averaging it in as a zero is exactly the unknown-read-as-
+ * zero conflation the rest of this module exists to prevent. Where every
+ * printer has a figure — the case the ≤ 24 bound is argued from — the two
+ * denominators are the same number.
+ *
+ * Null when no printer has a rate yet: a mean of nothing is not zero.
+ */
+export function fleetAverage(
+  rates: readonly (number | null)[],
+  mode: FleetAvgMode,
+): number | null {
+  let total = 0;
+  let counted = 0;
+  for (const rate of rates) {
+    if (rate === null) continue;
+    total += rate;
+    counted += 1;
+  }
+  if (counted === 0) return null;
+  return mode === 'sum' ? total : total / counted;
+}
+
 
 // ── colour ──────────────────────────────────────────────────────────────────
 
@@ -1097,11 +1153,18 @@ export const OBSERVED_TOLERANCE_S = 90;
  *     and hold ledger is the whole of the evidence. The hours are real.
  *   - `partly_observed` — the recorder covered some of it and fell short.
  *
+ * `upcoming` is the sixth and is not an absence of DATA at all — it is the
+ * absence of the hour. On "Today" at 17:00, seven of the twenty-four buckets
+ * have not started, and the server says so with `elapsed_seconds: 0`. They read
+ * as ledger-only zeros: a full hatch and an sr-only "0 Faults and holds only",
+ * over a drill-down that correctly reported no data for the range.
+ *
  * A verdict is a statement about the EVIDENCE, never about the value: three of
- * the five sit happily beside a figure.
+ * the six sit happily beside a figure.
  */
 export type CellAbsence =
   | 'zero'
+  | 'upcoming'
   | 'before_recording'
   | 'incidents_only'
   | 'partly_observed'
@@ -1125,6 +1188,7 @@ export const CELL_ABSENCE_LABEL_KEY: Record<
   // word: one fact, one leaf, translated once.
   partly_observed: 'fleetMetrics.widgets.partlyObserved',
   out_of_fleet: 'fleetMetrics.class.out_of_fleet',
+  upcoming: 'fleetMetrics.class.upcoming',
 };
 
 /** Does this verdict draw the partly-observed marker? */
@@ -1137,6 +1201,37 @@ export type AbsenceHeader = Pick<
   SeriesBucket<unknown>,
   'elapsed_seconds' | 'observed_seconds'
 >;
+
+/**
+ * Has this bucket happened at all?
+ *
+ * THE predicate for it, so the threshold is stated once and the cell, the
+ * verdict, the row builders and the drill-down can never disagree about which
+ * buckets are real. A window is a grid, and a grid over "Today" carries the
+ * hours that have not arrived yet.
+ */
+export function bucketHasElapsed(header: Pick<AbsenceHeader, 'elapsed_seconds'>): boolean {
+  return header.elapsed_seconds > 0;
+}
+
+/**
+ * The index of the bucket "now" falls in — the last one with elapsed time.
+ *
+ * A window wholly in the past has no future buckets, so this is simply its last
+ * one; a window ending today stops at the bucket in progress. The hour grid's
+ * per-row Details control is what needs it: it opened `buckets.length - 1`,
+ * which on Today is 23:00, so a printer with seventeen hours down today opened
+ * an empty dialog for an hour that has not happened.
+ */
+export function currentBucketIndex(
+  buckets: readonly Pick<AbsenceHeader, 'elapsed_seconds'>[],
+): number {
+  for (let index = buckets.length - 1; index >= 0; index -= 1) {
+    const bucket = buckets[index];
+    if (bucket !== undefined && bucketHasElapsed(bucket)) return index;
+  }
+  return Math.max(0, buckets.length - 1);
+}
 
 export interface CellAbsenceOptions {
   lens: FleetLens;
@@ -1158,6 +1253,12 @@ export function cellAbsence(
   header: AbsenceHeader,
   { lens }: CellAbsenceOptions,
 ): CellAbsence {
+  // FIRST, before anything reads a class map: a bucket that has not started
+  // cannot be zero, cannot be unobserved and cannot be evidence. Every other
+  // verdict below is an answer about DATA, and there is no data question to
+  // ask about an hour that has not arrived.
+  if (!bucketHasElapsed(header)) return 'upcoming';
+
   const total = sumMap(cell.class_seconds);
   const stateDerived = lens !== 'prints';
 
@@ -1626,6 +1727,18 @@ export interface BucketLabel {
   isWeekend: boolean;
   /** "now" falls inside this bucket: it has elapsed time but is not yet full. */
   isCurrent: boolean;
+  /**
+   * "Today" belongs on this bucket — the DAY bucket that contains now, and
+   * only that.
+   *
+   * Not the same question as `isCurrent`, which is about a bucket's geometry at
+   * every width. On an all-today HOUR grid the current bucket is one hour, so
+   * the chip landed on a single 14 px column — labelling one hour of today
+   * "Today" while the twenty-three beside it are the same day, and breaking the
+   * every-third-hour cadence where it sat. On a WEEK grid the current week is
+   * named by its own start date like every other week.
+   */
+  showsTodayChip: boolean;
   /** The full site-local date (and time, for an hour bucket) for the sr-only header. */
   full: string;
 }
@@ -1684,6 +1797,53 @@ export interface SeriesRowMeta {
 }
 
 /** Does this row carry any of the uncertainties a given surface cares about? */
+/**
+ * Which points in a series have nothing to join to.
+ *
+ * A line is drawn BETWEEN neighbouring points, so a series with one non-null
+ * bucket is a zero-length path: with `dot={false}` it paints nothing at all and
+ * the legend then promises a line the chart never draws. That is the ordinary
+ * state of every observed-only series on a young instance — "Prints per
+ * printer" exists for observed buckets alone, and in the first days there is
+ * exactly one of them.
+ *
+ * A point is isolated when BOTH its neighbours are absent; a run of two or more
+ * has a segment to draw and stays a plain line. Off the ends counts as absent,
+ * so a lone leading or trailing point is isolated too.
+ */
+export function isolatedPointFlags(values: readonly (number | null | undefined)[]): boolean[] {
+  const missing = (value: number | null | undefined): boolean =>
+    value === null || value === undefined;
+  return values.map(
+    (value, index) => !missing(value) && missing(values[index - 1]) && missing(values[index + 1]),
+  );
+}
+
+/**
+ * The isolated points of one series, keyed by the BUCKET they belong to.
+ *
+ * Keyed and not indexed, because a chart library is free to renumber: recharts
+ * drops the null points before it renders marks (`computeLinePoints` ends in
+ * `.filter(Boolean)`), so the index it hands a dot renderer counts only the
+ * points that survived. A flags array indexed by ROW therefore asked the wrong
+ * question of every series with a gap in it — which is every series this rule
+ * exists for — and the mark silently never appeared.
+ *
+ * `bucketStart` is the row's own stable key, and it rides the payload recharts
+ * gives back, so the answer does not depend on how anything is counted.
+ */
+export function isolatedPointKeys<Row extends { bucketStart: string }>(
+  rows: readonly Row[],
+  value: (row: Row) => number | null | undefined,
+): Set<string> {
+  const flags = isolatedPointFlags(rows.map(value));
+  const keys = new Set<string>();
+  rows.forEach((row, index) => {
+    if (flags[index]) keys.add(row.bucketStart);
+  });
+  return keys;
+}
+
 export function rowIsUncertain(
   row: Pick<SeriesRowMeta, 'bucketInProgress' | 'bucketPartlyObserved'>,
   kinds: readonly BucketUncertainty[],
@@ -1724,6 +1884,7 @@ export function bucketLabel(
         );
   const weekday = shifted.getUTCDay();
   const isHour = width === 'hour';
+  const isCurrent = bucket.elapsed_seconds > 0 && bucket.elapsed_seconds < bucket.seconds;
   return {
     date,
     weekdayInitial: new Intl.DateTimeFormat(locale, { weekday: 'narrow', timeZone: UTC }).format(shifted),
@@ -1747,7 +1908,9 @@ export function bucketLabel(
     hourOfDay: isHour ? shifted.getUTCHours() : null,
     weekStart: width === 'week' ? date : null,
     isWeekend: weekday === 0 || weekday === 6,
-    isCurrent: bucket.elapsed_seconds > 0 && bucket.elapsed_seconds < bucket.seconds,
+    isCurrent,
+    // The chip names a DAY, so only the day grid carries one.
+    showsTodayChip: isCurrent && width === 'day',
     full: new Intl.DateTimeFormat(locale, {
       year: 'numeric',
       month: 'short',

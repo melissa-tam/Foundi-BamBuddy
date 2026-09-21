@@ -7518,6 +7518,7 @@ export default {
       not_recorded: 'Kayıt öncesi',
       unobserved: 'Veri yok',
       incidents_only: 'Yalnızca arıza ve beklemeler',
+      upcoming: 'Henüz geçmedi',
     },
     units: {
       perDay: '/ gün',
@@ -7551,6 +7552,8 @@ export default {
       deletedPrinter: 'Yazıcı {{id}}',
       deactivated: 'Devre dışı',
       fleetRow: 'Filo',
+      fleetAvgMean: 'Listelenen yazıcılar üzerinden yazıcı başına ortalama.',
+      fleetAvgSum: 'Tüm filonun toplamı.',
       timeSplitDisabled: 'Kayıtlı yazıcı durumu gerekir. Kayıt {{date}} tarihinde başladı.',
       timeSplitDisabledNoData: 'Kayıtlı yazıcı durumu gerekir. Henüz hiçbir şey kaydedilmedi.',
       legend: {

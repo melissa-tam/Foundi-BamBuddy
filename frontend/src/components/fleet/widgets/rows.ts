@@ -43,6 +43,7 @@ import type {
   UnitsValues,
 } from '../../../types/fleetMetrics';
 import {
+  bucketHasElapsed,
   DOWN_CAUSE_ORDER,
   FAULT_KIND_ORDER,
   seriesRows,
@@ -78,7 +79,13 @@ export interface RowLabels {
   fullLabel: string;
 }
 
-export type ChartRow<Values extends object> = SeriesRow<Values> & RowLabels;
+/**
+ * Every value a bucket row carries may be absent, because the bucket itself may
+ * not have happened. See `buildRows`.
+ */
+export type Nullable<Values> = { [Key in keyof Values]: Values[Key] | null };
+
+export type ChartRow<Values extends object> = SeriesRow<Nullable<Values>> & RowLabels;
 
 /**
  * The axis form of one bucket label.
@@ -92,17 +99,50 @@ export function bucketAxisLabel(
   bucket: FleetBucket,
   todayLabel: string,
 ): string {
-  if (label.isCurrent) return todayLabel;
+  // The chip names a DAY. On an hour axis the current bucket is one hour, so
+  // labelling it "Today" said nothing the twenty-three beside it did not; on a
+  // week axis the current week is named by its own start date like any other.
+  if (label.showsTodayChip) return todayLabel;
   if (bucket === 'hour') return label.hour ?? label.dayOfMonth;
   return label.month === null ? label.dayOfMonth : `${label.month} ${label.dayOfMonth}`;
 }
 
+/** Every key of a picked row, set to null. */
+function nullsOf<Picked extends object>(picked: Picked): Nullable<Picked> {
+  const empty = {} as Nullable<Picked>;
+  for (const key of Object.keys(picked) as (keyof Picked)[]) empty[key] = null;
+  return empty;
+}
+
+/**
+ * THE seam every bucketed builder goes through — and therefore the one place
+ * the "this bucket has not happened" rule is applied.
+ *
+ * A window is a GRID, so a window ending today carries the hours (or the day)
+ * that have not arrived yet, and the server marks them `elapsed_seconds: 0`.
+ * Every `pick` below reads a sparse map with `?? 0`, which is right for a
+ * bucket that happened and produced nothing and wrong for one that has not
+ * started: it drew a future hour as an observed zero — a full-height no-data
+ * band on the state chart, a `0` rather than a dash in every data table, and a
+ * line dragged down to the axis across the rest of the day.
+ *
+ * Nulling the picked row rather than teaching six builders the same check keeps
+ * it a single rule that a seventh builder cannot forget; `null` is already what
+ * every widget renders as a gap.
+ */
 function buildRows<Values, Picked extends object>(
   envelope: SeriesEnvelope<Values>,
   pick: (values: Values, bucket: SeriesEnvelope<Values>['buckets'][number]) => Picked,
   options: RowOptions,
 ): ChartRow<Picked>[] {
-  return seriesRows(envelope, pick, options).map((row) => ({
+  return seriesRows(
+    envelope,
+    (values, bucket) => {
+      const picked = pick(values, bucket);
+      return bucketHasElapsed(bucket) ? (picked as Nullable<Picked>) : nullsOf(picked);
+    },
+    options,
+  ).map((row) => ({
     ...row,
     axisLabel: bucketAxisLabel(row.bucketLabel, options.bucket, options.todayLabel),
     fullLabel: row.bucketLabel.full,

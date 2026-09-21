@@ -7577,6 +7577,7 @@ export default {
       not_recorded: 'Antes do registro',
       unobserved: 'Sem dados',
       incidents_only: 'Somente falhas e retenções',
+      upcoming: 'Ainda não decorrido',
     },
     units: {
       perDay: '/ dia',
@@ -7610,6 +7611,8 @@ export default {
       deletedPrinter: 'Impressora {{id}}',
       deactivated: 'Desativada',
       fleetRow: 'Frota',
+      fleetAvgMean: 'Média por impressora, sobre as impressoras listadas.',
+      fleetAvgSum: 'Toda a frota somada.',
       timeSplitDisabled: 'Requer estado de impressora registrado. Registro desde {{date}}.',
       timeSplitDisabledNoData: 'Requer estado de impressora registrado. Ainda não há nada registrado.',
       legend: {

@@ -7578,6 +7578,7 @@ export default {
       not_recorded: 'Avant l’enregistrement',
       unobserved: 'Aucune donnée',
       incidents_only: 'Pannes et immobilisations seulement',
+      upcoming: 'Pas encore écoulé',
     },
     units: {
       perDay: '/ jour',
@@ -7611,6 +7612,8 @@ export default {
       deletedPrinter: 'Imprimante {{id}}',
       deactivated: 'Désactivée',
       fleetRow: 'Parc',
+      fleetAvgMean: 'Moyenne par imprimante, sur les imprimantes listées.',
+      fleetAvgSum: 'L’ensemble de la flotte additionné.',
       timeSplitDisabled: 'Nécessite un état d’imprimante enregistré. Enregistrement depuis le {{date}}.',
       timeSplitDisabledNoData: 'Nécessite un état d’imprimante enregistré. Rien n’a encore été enregistré.',
       legend: {

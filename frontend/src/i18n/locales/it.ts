@@ -7577,6 +7577,7 @@ export default {
       not_recorded: 'Prima della registrazione',
       unobserved: 'Nessun dato',
       incidents_only: 'Solo guasti e fermi dichiarati',
+      upcoming: 'Non ancora trascorso',
     },
     units: {
       perDay: '/ giorno',
@@ -7610,6 +7611,8 @@ export default {
       deletedPrinter: 'Stampante {{id}}',
       deactivated: 'Disattivata',
       fleetRow: 'Parco',
+      fleetAvgMean: 'Media per stampante, sulle stampanti elencate.',
+      fleetAvgSum: 'L’intera flotta sommata.',
       timeSplitDisabled: 'Richiede lo stato registrato delle stampanti. Registrazione dal {{date}}.',
       timeSplitDisabledNoData: 'Richiede lo stato registrato delle stampanti. Non è stato ancora registrato nulla.',
       legend: {

@@ -7589,6 +7589,7 @@ export default {
       not_recorded: '記録開始前',
       unobserved: 'データなし',
       incidents_only: '障害と保留のみ',
+      upcoming: 'まだ経過していません',
     },
     units: {
       perDay: '/ 日',
@@ -7622,6 +7623,8 @@ export default {
       deletedPrinter: 'プリンター {{id}}',
       deactivated: '無効',
       fleetRow: 'フリート',
+      fleetAvgMean: '一覧のプリンターを対象とした、プリンターあたりの平均です。',
+      fleetAvgSum: 'フリート全体の合計です。',
       timeSplitDisabled: '記録されたプリンター状態が必要です。記録開始は{{date}}です。',
       timeSplitDisabledNoData: '記録されたプリンター状態が必要です。まだ何も記録されていません。',
       legend: {

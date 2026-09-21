@@ -7215,6 +7215,7 @@ export default {
       not_recorded: '기록 이전',
       unobserved: '데이터 없음',
       incidents_only: '고장과 보류만',
+      upcoming: '아직 경과하지 않음',
     },
     units: {
       perDay: '/ 일',
@@ -7248,6 +7249,8 @@ export default {
       deletedPrinter: '프린터 {{id}}',
       deactivated: '비활성',
       fleetRow: '전체',
+      fleetAvgMean: '목록의 프린터를 대상으로 한 프린터당 평균입니다.',
+      fleetAvgSum: '전체 장비를 합산한 값입니다.',
       timeSplitDisabled: '기록된 프린터 상태가 필요합니다. 기록은 {{date}}에 시작되었습니다.',
       timeSplitDisabledNoData: '기록된 프린터 상태가 필요합니다. 아직 기록된 내용이 없습니다.',
       legend: {

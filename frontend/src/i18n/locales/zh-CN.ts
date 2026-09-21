@@ -7576,6 +7576,7 @@ export default {
       not_recorded: '记录之前',
       unobserved: '无数据',
       incidents_only: '仅故障与挂起',
+      upcoming: '尚未到来',
     },
     units: {
       perDay: '/ 天',
@@ -7609,6 +7610,8 @@ export default {
       deletedPrinter: '打印机 {{id}}',
       deactivated: '已停用',
       fleetRow: '机群',
+      fleetAvgMean: '按列出的打印机计算的每台平均值。',
+      fleetAvgSum: '整个机队的合计。',
       timeSplitDisabled: '需要已记录的打印机状态。记录自 {{date}} 开始。',
       timeSplitDisabledNoData: '需要已记录的打印机状态。目前还没有任何记录。',
       legend: {
