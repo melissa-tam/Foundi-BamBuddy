@@ -792,7 +792,13 @@ async def test_transient_close_rearms(db_session, printer_factory, install_setti
 
 
 async def test_extruder_overload_triggers_recovery(db_session, printer_factory, install_settings, monkeypatch):
-    """The H2S main-extruder-overload code (0300_801E) now triggers recovery."""
+    """The H2S main-extruder-overload code (0300_801E) now triggers recovery.
+
+    The SWAP commits — and parks nothing. 006-H2S 2026-09-21 (incident 289): the fault
+    the driver is reacting to says the EXTRUDER overloaded, so the roll that happened to
+    be feeding is not the suspect, and the stamp this test used to assert took a healthy
+    spool out of rotation 12 ms after the fault and paged the operator about it.
+    """
     install_settings()
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
@@ -805,14 +811,15 @@ async def test_extruder_overload_triggers_recovery(db_session, printer_factory, 
     assert task is not None
     await task
 
+    assert ("unload",) in client.calls  # the swap still commits...
     assert ("load", 1) in client.calls
     assert state.state == "RUNNING"
     db_session.expunge_all()
     refreshed = await db_session.get(PrintQueueItem, item.id)
     assert refreshed.waiting_reason is None  # cleared on success
     jammed_after = await db_session.get(Spool, jammed.id)
-    assert jammed_after.feed_fault_at is not None  # original still marked at the swap-commit boundary
-    assert jammed_after.feed_fault_code == "0300_801E"
+    assert jammed_after.feed_fault_at is None  # ...and the extruder-side fault parks no spool
+    assert jammed_after.feed_fault_code is None
 
 
 async def test_extruder_side_rejam_keeps_replacement_in_rotation(
@@ -820,7 +827,8 @@ async def test_extruder_side_rejam_keeps_replacement_in_rotation(
 ):
     """On an extruder-side fault the extruder is the common factor: a re-jam after
     the swap keeps the replacement IN rotation (feed_fault_at NULL) and tries the
-    next candidate. The ORIGINAL jammed tray is still marked."""
+    next candidate. Since 006-H2S 2026-09-21 the ORIGINAL is kept in rotation too —
+    one rule, one home (`_commit_out_of_rotation`), whichever spool was feeding."""
     install_settings()
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
@@ -839,7 +847,7 @@ async def test_extruder_side_rejam_keeps_replacement_in_rotation(
     replacement_after = await db_session.get(Spool, replacement.id)
     assert replacement_after.feed_fault_at is None  # extruder-side → kept in rotation
     original_after = await db_session.get(Spool, original.id)
-    assert original_after.feed_fault_at is not None  # original marked at the swap-commit boundary
+    assert original_after.feed_fault_at is None  # ...and so is the original (incident 289)
     refreshed = await db_session.get(PrintQueueItem, item.id)
     assert json.loads(refreshed.ams_mapping) == [2, -1, -1, -1]  # landed on tray2
 
@@ -1929,7 +1937,14 @@ async def test_unload_stuck_non_idle_never_confirms_and_never_loads(
 
 
 def _incident(
-    printer_id: int, *, step_timeout_s: float, max_attempts: int = 2, incident_id: int = 0, item_id: int | None = 1
+    printer_id: int,
+    *,
+    step_timeout_s: float,
+    max_attempts: int = 2,
+    incident_id: int = 0,
+    item_id: int | None = 1,
+    extruder_side_only: bool = False,
+    retract_failure: bool = False,
 ):
     """A driver context for the step-helper tests.
 
@@ -1951,7 +1966,8 @@ def _incident(
         jammed_global_tray=0,
         kind=spool_recovery.KIND_JAM,
         external=False,
-        extruder_side_only=False,
+        extruder_side_only=extruder_side_only,
+        retract_failure=retract_failure,
         layer_at_fault=50,
         code="0700_8010",
         printer_name="009-H2S",
@@ -2460,8 +2476,10 @@ async def test_incident_pin_engaged_feeder_assist_fault_skips_reset_and_swaps(
     assert refreshed.waiting_reason is None
     assert json.loads(refreshed.ams_mapping) == [1, -1, -1, -1]  # jammed 3 → replacement 1
     jammed_after = await db_session.get(Spool, jammed.id)
-    assert jammed_after.feed_fault_at is not None  # jammed spool taken out of rotation at the swap-commit boundary
-    assert jammed_after.feed_fault_code == "0300_801E"
+    # The swap-commit boundary was crossed, but an extruder-side fault parks no spool
+    # (006-H2S 2026-09-21, incident 289) — the extruder is the common factor here too.
+    assert jammed_after.feed_fault_at is None
+    assert jammed_after.feed_fault_code is None
 
 
 @pytest.mark.parametrize("ams_main", [2, 3, 4])
@@ -2792,11 +2810,21 @@ async def test_pre_commit_abort_leaves_no_stamp(db_session, printer_factory, ins
     assert (await db_session.get(Spool, jammed.id)).feed_fault_at is None  # never stamped
 
 
-async def test_extruder_side_stamps_feeding_spool_at_commit(db_session, printer_factory, install_settings, monkeypatch):
-    """An extruder-side-only fault still commits the swap: the FEEDING spool is taken
-    out of rotation at the commit boundary. A re-jam of the replacement keeps that
-    replacement IN rotation (the extruder is the common factor, not the spool), so no
-    second OOR notify fires."""
+async def test_extruder_side_commits_the_swap_and_parks_nothing(
+    db_session, printer_factory, install_settings, monkeypatch, caplog
+):
+    """006-H2S 2026-09-21, incident 289 — the rule this test used to assert the
+    opposite of.
+
+    An extruder-side-only fault still COMMITS the swap (unload → load → resume, in that
+    order), because fresh filament often clears the immediate overload. What it must not
+    do is blame a spool: neither the one that was feeding when the extruder overloaded
+    nor the replacement that re-jams behind it. The driver had applied that rule to the
+    replacement since WS2 and stamped the feeding roll anyway — one fault, two opposite
+    conclusions about the same evidence. Both now read `_commit_out_of_rotation`.
+
+    No stamp means no page: the out-of-rotation notification fires inside the stamp.
+    """
     install_settings()
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
@@ -2807,16 +2835,80 @@ async def test_extruder_side_stamps_feeding_spool_at_commit(db_session, printer_
     client = FakeClient(state)  # tray1 re-jams both cycles; tray2 succeeds
     _wire(monkeypatch, state, client, on_poll=_repause_after_running(2))
 
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        task = await on_ams_fault(printer.id, state)
+        await task
+
+    assert state.state == "RUNNING"
+    # The swap itself is untouched: unload before the first load, resume after it.
+    published = [c for c in client.calls if c[0] in ("unload", "load", "resume")]
+    assert published.index(("unload",)) < published.index(("load", 1)) < published.index(("resume",))
+    oor.assert_not_awaited()  # nothing parked → nothing announced
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, original.id)).feed_fault_at is None  # the feeding roll is not the suspect
+    assert (await db_session.get(Spool, replacement.id)).feed_fault_at is None  # nor is the replacement
+    refreshed = await db_session.get(PrintQueueItem, item.id)
+    assert json.loads(refreshed.ams_mapping) == [2, -1, -1, -1]  # landed on tray2
+    # One line per spool kept in rotation, in the wording the replacement rule already had.
+    kept = [
+        r.getMessage()
+        for r in caplog.records
+        if "kept IN rotation — extruder-side fault 0300_801E is the common factor, not the spool" in r.getMessage()
+    ]
+    assert any(" jammed tray 0 " in m for m in kept)
+    assert any(" replacement tray 1 " in m for m in kept)
+
+
+async def test_an_ams_side_jam_still_stamps_exactly_once(db_session, printer_factory, install_settings, monkeypatch):
+    """The other half of the partition — the rule narrows nothing for an AMS-side jam.
+
+    The same swap the extruder-side case above runs, driven by ``0700_8010`` instead:
+    here the fault IS about the roll, so the jammed spool is parked at the commit
+    boundary and announced — once, from the one verb, with its code on the row."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    original = await _bind_spool(db_session, printer.id, 0, 0)  # jammed tray0
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1)])  # default hms = 0700_8010
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
     task = await on_ams_fault(printer.id, state)
     await task
 
     assert state.state == "RUNNING"
-    oor.assert_awaited_once()  # only the feeding spool announced — the replacement stays in rotation
+    oor.assert_awaited_once()
     db_session.expunge_all()
-    assert (await db_session.get(Spool, original.id)).feed_fault_at is not None  # feeding spool stamped at commit
-    assert (await db_session.get(Spool, replacement.id)).feed_fault_at is None  # extruder-side → kept in rotation
-    refreshed = await db_session.get(PrintQueueItem, item.id)
-    assert json.loads(refreshed.ams_mapping) == [2, -1, -1, -1]  # landed on tray2
+    stamped = await db_session.get(Spool, original.id)
+    assert stamped.feed_fault_at is not None
+    assert stamped.feed_fault_code == "0700_8010"
+
+
+async def test_selection_excludes_the_jammed_tray_even_unstamped(
+    db_session, printer_factory, install_settings, monkeypatch
+):
+    """The stamp was never what kept the driver off the jammed tray this round.
+
+    Replacement selection excludes the jammed slot by ID (`_select_replacement` passes
+    it as the excluded tray), so dropping the extruder-side stamp cannot make the swap
+    reload the very spool it just unloaded — which is the one thing the stamp might
+    plausibly have been load-bearing for."""
+    install_settings()
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)
+    state = _make_state(trays=[_ams_tray(0), _ams_tray(1)], hms=[_extruder_hms()])
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+
+    task = await on_ams_fault(printer.id, state)
+    await task
+
+    loads = [c for c in client.calls if c[0] == "load"]
+    assert loads and all(c[1] != 0 for c in loads), f"the jammed tray must never be a candidate: {loads}"
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, jammed.id)).feed_fault_at is None
 
 
 async def test_ams_drying_escalation_keeps_commit_stamp(
@@ -6554,7 +6646,7 @@ async def test_the_slot_label_has_one_origin(db_session, printer_factory, monkey
     _spy_ws(monkeypatch)
     incident = _incident(printer.id, step_timeout_s=0.05)
 
-    await spool_recovery._mark_out_of_rotation(incident, 1, notify=True)
+    await spool_recovery._mark_out_of_rotation(incident, 1)
 
     oor.assert_awaited_once()
     assert oor.call_args.kwargs["slot_desc"] == "AMS A slot 2"
@@ -6923,8 +7015,12 @@ async def test_the_clause_never_claims_an_unload_the_driver_did_not_do(
 async def test_the_stamp_lands_after_selection_and_before_the_unload(
     db_session, printer_factory, install_settings, monkeypatch
 ):
-    """Invariant 7's boundary, in order, recorded from the stamp WRITER itself (a spy on
-    the notification would miss a future `notify=False` call).
+    """Invariant 7's boundary, in order, recorded from the stamp WRITER itself.
+
+    Driving the WRITER rather than the page keeps this pin about ORDER: the page is now
+    unconditional inside the stamp (the `notify` switch nobody ever threw is deleted),
+    so a spy on the notification would test the same thing one layer further away and
+    would stop distinguishing "stamped late" from "stamped and not announced".
 
     The swap-commit boundary is now "a replacement is in hand": selection, then the
     out-of-rotation stamp, then the first unload — exactly once."""
@@ -6945,9 +7041,9 @@ async def test_the_stamp_lands_after_selection_and_before_the_unload(
         client.calls.append(("select", picked[0]))
         return picked
 
-    async def _oor(incident, global_tray, *, notify):
+    async def _oor(incident, global_tray):
         client.calls.append(("oor",))
-        await oor_orig(incident, global_tray, notify=notify)
+        await oor_orig(incident, global_tray)
 
     monkeypatch.setattr(spool_recovery, "_select_replacement", _select)
     monkeypatch.setattr(spool_recovery, "_mark_out_of_rotation", _oor)
@@ -7044,3 +7140,426 @@ def test_no_second_slot_rendering_in_the_module():
     ]
 
     assert offenders == [], f"slot names must render through runout_slot_desc: {offenders}"
+
+
+def test_only_the_commit_verb_parks_a_spool():
+    """ONE home for "an extruder-side fault never parks a spool" (006-H2S 2026-09-21,
+    incident 289).
+
+    The rule is not new — the driver has applied it to the REPLACEMENT since WS2 — but
+    it lived at that one call site, so the three OTHER call sites of the stamp writer
+    drew the opposite conclusion from the same fault and parked a healthy roll. A
+    SOURCE pin, because a fourth direct call would be a perfectly well-formed stamp
+    that no behaviour test looks for."""
+    module = _module_ast()
+    verb = _function_node("_commit_out_of_rotation")
+    inside = range(verb.lineno, (verb.end_lineno or verb.lineno) + 1)
+    strays = sorted(
+        n.lineno
+        for n in ast.walk(module)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_mark_out_of_rotation"
+        and n.lineno not in inside
+    )
+
+    assert strays == [], f"only _commit_out_of_rotation may park a spool; direct writer calls at {strays}"
+    # Liveness: a pin that finds no strays is also satisfied by a verb that stopped
+    # calling the writer at all.
+    assert any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_mark_out_of_rotation"
+        for n in ast.walk(verb)
+    )
+
+
+# ===========================================================================
+# 006-H2S 2026-09-21, incident 289 — the extruder overload, the farm's own unload,
+# and the pull-back it latched.
+#
+# 04:57:34 `0300_801E` + `0300_0001@0x09` (extruder overload, the only fault standing)
+# 04:57:35 incident opened kind=jam; the driver committed the swap and unloaded
+# 04:58:30 `0700_8003` "Failed to pull out the filament from the extruder" + the
+#          slot-attributed `0700_0017@0-0` — the failure of that unload, +56 s
+# 04:58:31 row UPGRADED jam->physical, the driver handed over, PAUSED ~11.5 h
+#
+# Three defects, three fixes, all pinned below: a healthy roll was parked by an
+# extruder-side fault; the upgrade dropped the slot the mechanical sibling named; and
+# the page said "then resume" on a screen whose only button repeats the pull-back.
+# ===========================================================================
+
+
+def _tube_stall_hms(ams_id=0, tray_id=0):
+    """0700_0017@0-0 — "AMS A slot 1 assist motor is stalled, due to excessive
+    resistance in the tube between AMS and the printer". MECHANICAL_FEED, and
+    slot-attributed: the only entry in the 006 set that names a tray at all."""
+    attr = 0x07000000 | (ams_id << 16) | ((0x20 + tray_id) << 8)
+    return HMSError(code="0x20017", attr=attr, module=7, severity=2, full_code=f"{attr:08X}00020017")
+
+
+def _006_candidates():
+    """The candidate set standing at 04:58:30, through the real classifier."""
+    from backend.app.services.hms_errors import live_candidates
+
+    return live_candidates(_make_state(hms=[_tube_stall_hms(), _physical_short_hms()]))
+
+
+def _settings_for_factory():
+    return spool_recovery.RecoverySettings(enabled=True, max_attempts=2, step_timeout_s=1.0, protect_layers=7)
+
+
+def _built(candidates, *, kind, code):
+    """`_build_incident` with the caller-resolved half held constant, so a case varies
+    only the thing it is about: the candidate set."""
+    return spool_recovery._build_incident(
+        _make_state(),
+        candidates,
+        incident_id=1,
+        printer_id=7,
+        job_id="task-1",
+        settings=_settings_for_factory(),
+        item_id=None,
+        kind=kind,
+        code=code,
+        fingerprint="fp",
+        tray=0,
+        external=False,
+        printer_name="006-H2S",
+    )
+
+
+class TestTheIncidentFactory:
+    """ONE construction of the recovery context, so the entry gate and the startup
+    re-entry cannot read one fault two ways."""
+
+    def test_the_factory_freezes_both_fault_shape_flags(self):
+        candidates = _006_candidates()
+        assert {c.short_code for c in candidates} == {"0700_0017", "0700_8003"}
+
+        incident = _built(candidates, kind=spool_recovery.KIND_PHYSICAL, code="0700_8003")
+
+        # The physical candidate is a latched pull-back…
+        assert incident.retract_failure is True
+        # …and the mechanical sibling is not extruder-side, so the swap rule is off.
+        assert incident.extruder_side_only is False
+        assert incident.codes == {"0700_0017", "0700_8003"}
+
+    def test_the_retract_flag_reads_the_physical_candidates_only(self):
+        """The flag answers "is the printer holding a failed pull-back", and only that
+        class can be one — so it is a property of the FAULT, not of the routing, and a
+        mechanical-only set can never raise it however the caller labelled the kind."""
+        from backend.app.services.hms_errors import live_candidates
+
+        assert _built(_006_candidates(), kind=spool_recovery.KIND_JAM, code="0700_0017").retract_failure is True
+        mechanical_only = live_candidates(_make_state(hms=[_tube_stall_hms()]))
+        assert _built(mechanical_only, kind=spool_recovery.KIND_JAM, code="0700_0017").retract_failure is False
+
+    async def test_entry_and_startup_re_entry_agree_on_every_fact(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """The behaviour half of the one-factory pin: the same wire, read twice by the
+        two callers that open an incident, must produce the same context — otherwise a
+        restart resolves a fault differently from the push that raised it."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        built: list = []
+
+        async def _record(incident):
+            built.append(incident)
+
+        monkeypatch.setattr(spool_recovery, "_run_recovery", _record)
+        state = _make_state(hms=[_extruder_hms()])
+        _wire(monkeypatch, state, FakeClient(state))
+
+        task = await on_ams_fault(printer.id, state)
+        assert task is not None
+        await task
+
+        row = await _incident_row(db_session, printer.id)
+        assert row.status == "recovering"  # the driver was stubbed out, so the row stands
+        reentry = await spool_recovery._reenter_recovering_incident(row.id, printer.id)
+        assert reentry is not None
+        await reentry
+
+        entry_incident, reentry_incident = built
+        assert entry_incident == reentry_incident
+        assert entry_incident.extruder_side_only is True
+        assert entry_incident.retract_failure is False
+
+
+class TestTheEscalationDetailComposer:
+    """The page's two halves: what the fault IS (the reason copy) and what the one
+    button in front of the operator will DO (the kind-keyed clause)."""
+
+    _RETRACT = (
+        "The printer is holding a failed filament pull-back: Retry on the screen repeats the pull-back. "
+        "Free the filament at the extruder first, then press Retry."
+    )
+
+    async def _escalate_physical(self, db, printer_id, *, retract_failure):
+        from backend.app.models.printer_incident import KIND_PHYSICAL
+
+        incident = await _owned_incident(
+            db, printer_id, kind=KIND_PHYSICAL, step_timeout_s=0.05, retract_failure=retract_failure
+        )
+        await spool_recovery._escalate(incident, "physical_fault")
+
+    async def test_a_latched_pull_back_names_what_retry_does(self, db_session, printer_factory, monkeypatch):
+        """006-H2S incident 289: the printer was latched in the farm's own unload and
+        the page said "then resume" — there was no Resume on that screen, and Retry
+        would have re-run the pull-back against the stuck filament."""
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(hms=[_tube_stall_hms(), _physical_short_hms()])
+        _wire(monkeypatch, state, FakeClient(state))
+
+        await self._escalate_physical(db_session, printer.id, retract_failure=True)
+
+        detail = failed.call_args.kwargs["detail"]
+        assert detail == f"{spool_recovery._ESCALATE_DETAIL['physical_fault']} {self._RETRACT}"
+        assert "then resume" not in detail.lower()
+
+    async def test_a_plain_physical_fault_still_says_resume(self, db_session, printer_factory, monkeypatch):
+        """The otherwise-arm carries the resume instruction the static copy gave up, so
+        exactly one of the two sentences is ever rendered."""
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(hms=[_physical_wire_hms()])
+        _wire(monkeypatch, state, FakeClient(state))
+
+        await self._escalate_physical(db_session, printer.id, retract_failure=False)
+
+        detail = failed.call_args.kwargs["detail"]
+        assert detail == f"{spool_recovery._ESCALATE_DETAIL['physical_fault']} Then resume on the printer."
+        assert self._RETRACT not in detail
+
+    def test_the_static_copy_makes_no_promise_about_the_screen(self):
+        """The reason copy is shared by every physical escalation, so the sentence that
+        depends on the screen's state cannot live in it."""
+        copy = spool_recovery._ESCALATE_DETAIL["physical_fault"]
+        assert copy == (
+            "A physical filament fault (broken filament, a clog, or a failed pull-back) — fresh filament "
+            "cannot clear it, so the farm will not swap. Check the filament path at the printer."
+        )
+        assert "resume" not in copy.lower()
+
+    async def test_recovery_interrupted_on_a_physical_row_says_resume_once(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The physical clause is REASON-gated, and this is the reason it is.
+
+        ``recovery_interrupted`` is minted by the startup re-entry when the wire has no
+        actionable fault left, and its own copy already ends "check the filament path
+        and resume on the printer". Rendering the otherwise-arm on top printed the same
+        instruction twice — the shape a page composed from two independent halves
+        invites, and the reason the halves are now partitioned by reason as well as by
+        kind."""
+        from backend.app.models.printer_incident import KIND_PHYSICAL
+
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(hms=[])
+        _wire(monkeypatch, state, FakeClient(state))
+        incident = await _owned_incident(db_session, printer.id, kind=KIND_PHYSICAL, step_timeout_s=0.05)
+
+        await spool_recovery._escalate(incident, "recovery_interrupted")
+
+        detail = failed.call_args.kwargs["detail"]
+        assert detail == spool_recovery._ESCALATE_DETAIL["recovery_interrupted"]
+        assert detail.lower().count("resume on the printer") == 1
+
+    def test_the_composer_owns_both_clauses_and_nothing_else_composes(self):
+        """The clauses are kind-keyed and mutually exclusive, and `_escalate` no longer
+        assembles a detail of its own."""
+        composer = _function_node("_compose_detail")
+        called = {n.func.id for n in ast.walk(composer) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert {"_feeder_clause", "_retract_clause"} <= called
+
+        escalate = _function_node("_escalate")
+        assert not [
+            n
+            for n in ast.walk(escalate)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id in {"_feeder_clause", "_retract_clause"}
+        ]
+
+
+class TestTheUpgradeKeepsTheSlotTheEventNamed:
+    """`_resolve_fault_tray`'s PHYSICAL branch. 006's `UPGRADED … slot=None` threw away
+    the only attribution the wire offered."""
+
+    def _candidate(self, fault_class, short, slot, *, retract=False):
+        from backend.app.services.hms_errors import FaultCandidate
+
+        return FaultCandidate(
+            fault_class=fault_class, short_code=short, slot=slot, extruder_side=False, retract_failure=retract
+        )
+
+    def _resolve(self, candidates):
+        return spool_recovery._resolve_fault_tray(
+            None,
+            _make_state(),
+            kind=spool_recovery.KIND_PHYSICAL,
+            external=False,
+            candidates=frozenset(candidates),
+            printer_id=1,
+        )
+
+    def test_a_single_co_standing_mechanical_slot_carries(self):
+        """THE 006 REPLAY, at the resolver: `0700_8003` names no slot, `0700_0017@0-0`
+        does, and they are one physical event on one path."""
+        from backend.app.services.hms_errors import AmsFaultClass
+
+        assert self._resolve(
+            {
+                self._candidate(AmsFaultClass.PHYSICAL_FAULT, "0700_8003", None, retract=True),
+                self._candidate(AmsFaultClass.MECHANICAL_FEED, "0700_0017", (0, 0)),
+            }
+        ) == (0, "single")
+
+    def test_two_distinct_mechanical_slots_refuse_to_arbitrate(self):
+        """`_candidate_slot` answers with the LOWEST slot, which would be a confident
+        lie about which tray a human should go and look at."""
+        from backend.app.services.hms_errors import AmsFaultClass
+
+        assert self._resolve(
+            {
+                self._candidate(AmsFaultClass.PHYSICAL_FAULT, "0700_8003", None, retract=True),
+                self._candidate(AmsFaultClass.MECHANICAL_FEED, "0700_0017", (0, 0)),
+                self._candidate(AmsFaultClass.MECHANICAL_FEED, "0700_0018", (0, 2)),
+            }
+        ) == (None, "single")
+
+    def test_two_entries_naming_ONE_slot_still_carry(self):
+        """Distinctness, not entry count: two members of the tube-resistance ladder on
+        one tray are one slot, and refusing there would drop an unambiguous answer."""
+        from backend.app.services.hms_errors import AmsFaultClass
+
+        assert self._resolve(
+            {
+                self._candidate(AmsFaultClass.PHYSICAL_FAULT, "0700_8003", None, retract=True),
+                self._candidate(AmsFaultClass.MECHANICAL_FEED, "0700_0017", (0, 1)),
+                self._candidate(AmsFaultClass.MECHANICAL_FEED, "0700_0018", (0, 1)),
+            }
+        ) == (1, "single")
+
+    def test_the_physical_candidates_own_slot_still_wins(self):
+        """The fallback is a fallback: a physical fault that names its own tray is not
+        overruled by a mechanical sibling naming another."""
+        from backend.app.services.hms_errors import AmsFaultClass
+
+        assert self._resolve(
+            {
+                self._candidate(AmsFaultClass.PHYSICAL_FAULT, "0700_8003", (0, 3)),
+                self._candidate(AmsFaultClass.MECHANICAL_FEED, "0700_0017", (0, 0)),
+            }
+        ) == (3, "single")
+
+    def test_no_mechanical_sibling_still_answers_none(self):
+        from backend.app.services.hms_errors import AmsFaultClass
+
+        assert self._resolve({self._candidate(AmsFaultClass.PHYSICAL_FAULT, "0700_8003", None, retract=True)}) == (
+            None,
+            "single",
+        )
+
+    def test_an_ams_ht_slot_is_encoded_by_the_codec_not_by_hand(self):
+        """Invariant 1: `spool_respool.encode_global_tray` is THE codec, and it knows
+        conventions a bare ``ams_id * 4 + tray_id`` silently drops.
+
+        An AMS-HT unit is a SINGLE-tray device whose unit id IS its global tray id
+        (128 here). The hand-rolled arithmetic answered 512 — not this slot, and on a
+        fleet with enough units a well-formed id belonging to somebody else's tray.
+        A wrong tray is worse than none on every surface this answer reaches."""
+        from backend.app.services.hms_errors import AmsFaultClass
+        from backend.app.services.spool_respool import encode_global_tray
+
+        assert encode_global_tray(128, 0) == 128  # the codec's own statement
+        tray, verdict = self._resolve({self._candidate(AmsFaultClass.PHYSICAL_FAULT, "1800_8003", (128, 0))})
+        assert (tray, verdict) == (128, "single")
+        assert tray != 128 * 4 + 0
+
+    def test_a_slot_the_codec_cannot_name_falls_through(self):
+        """The fail-closed half: AMS-HT carries ONE tray, so unit 128 slot 2 is not a
+        slot at all. It must read exactly as "no slot" — never as an id the arithmetic
+        would happily have produced."""
+        from backend.app.services.hms_errors import AmsFaultClass
+        from backend.app.services.spool_respool import encode_global_tray
+
+        assert encode_global_tray(128, 2) is None
+        assert self._resolve({self._candidate(AmsFaultClass.PHYSICAL_FAULT, "1800_8003", (128, 2))}) == (
+            None,
+            "single",
+        )
+
+    def test_an_unnameable_physical_slot_still_reaches_the_mechanical_fallback(self):
+        """Falling through means falling through to the NEXT TIER, not to None: the 006
+        borrow is still available when the physical candidate's own slot is unusable."""
+        from backend.app.services.hms_errors import AmsFaultClass
+
+        assert self._resolve(
+            {
+                self._candidate(AmsFaultClass.PHYSICAL_FAULT, "1800_8003", (128, 2)),  # unnameable
+                self._candidate(AmsFaultClass.MECHANICAL_FEED, "0700_0017", (0, 0)),
+            }
+        ) == (0, "single")
+
+
+async def test_the_006_replay_end_to_end(db_session, printer_factory, install_settings, monkeypatch, caplog):
+    """THE INCIDENT REPLAY (04:57:34 → 04:58:31).
+
+    An extruder overload opens a jam; the driver commits the swap and publishes ONE
+    unload; 56 s later the failure of that unload appears on the wire as `0700_8003`
+    + `0700_0017@0-0`; the row is UPGRADED to physical in place, keeping the slot the
+    mechanical sibling named; the live driver hands over without a second unload; and
+    the page tells the operator what Retry will do.
+
+    The spool is never parked — on 006 a healthy roll was stamped 12 ms after the
+    fault and the operator was paged about it.
+    """
+    install_settings(step_timeout_s=2.0)
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    feeding = await _bind_spool(db_session, printer.id, 0, 0)
+    await _bind_spool(db_session, printer.id, 0, 1)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _make_state(hms=[_extruder_hms()], trays=[_ams_tray(0), _ams_tray(1)])
+    # The filament physically would not come out: tray_now never reaches 255, so the
+    # driver sits in its unload confirm exactly as it did on 006.
+    client = FakeClient(state, unload_after=99)
+    pushed: list = []
+
+    def _the_second_push(_n, st):
+        """04:58:30 — the wire answers the farm's unload with its failure."""
+        if pushed or ("unload",) not in client.calls:
+            return
+        st.hms_errors = [_tube_stall_hms(), _physical_short_hms()]
+        pushed.append(asyncio.ensure_future(on_ams_fault(printer.id, st)))
+
+    _wire(monkeypatch, state, client, on_poll=_the_second_push)
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        task = await on_ams_fault(printer.id, state)
+        assert task is not None  # a jam, with a driver
+        await task
+        assert pushed, "the second push never landed — the driver never reached its unload"
+        assert await pushed[0] is None  # upgraded + escalated, no second driver
+
+    assert client.calls.count(("unload",)) == 1, "a latched pull-back must not be answered with a second unload"
+    assert not any(c[0] == "load" for c in client.calls)
+
+    db_session.expunge_all()  # the upgrade committed in the store's own session
+    row = await _incident_row(db_session, printer.id)
+    assert (row.kind, row.status) == ("physical", "escalated")
+    assert row.slot_global_tray == 0, "the upgrade must keep the slot 0700_0017@0-0 named"
+    assert row.code == "0700_8003"
+
+    oor.assert_not_awaited()
+    assert (await db_session.get(Spool, feeding.id)).feed_fault_at is None
+
+    failed.assert_awaited_once()
+    assert failed.call_args.kwargs["kind"] == "physical"
+    assert "Retry on the screen repeats the pull-back" in failed.call_args.kwargs["detail"]
+    assert any("UPGRADED jam->physical" in r.getMessage() for r in caplog.records)

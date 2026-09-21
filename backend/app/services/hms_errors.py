@@ -1220,6 +1220,11 @@ class ClassifiedAmsFault:
 
     ``extruder_side`` marks a fault whose common factor is the EXTRUDER rather than
     the spool (a re-fault after a swap must not penalize the replacement).
+    ``retract_failure`` marks the narrower fact that the firmware is LATCHED in a
+    pull-back it could not finish (006-H2S 2026-09-21, incident 289: the farm's own
+    unload met a filament that would not come out, and the screen's Retry repeats
+    that pull-back rather than offering "Resume"). It is orthogonal to the class in
+    principle but every member is PHYSICAL_FAULT today — see the taxonomy rows.
     ``slot`` is the ``(ams_id, tray_id)`` the attr names via :func:`ams_slot_from_attr`,
     and is always ``None`` on the short-code lane — the short form discards the attr
     low byte that carries it.
@@ -1233,6 +1238,7 @@ class ClassifiedAmsFault:
     fault_class: AmsFaultClass
     extruder_side: bool
     slot: tuple[int, int] | None
+    retract_failure: bool = False
     external: bool = False
 
 
@@ -1266,6 +1272,7 @@ class _CodeWordRow:
     attr_bytes: frozenset[int]
     fault_class: AmsFaultClass
     extruder_side: bool = False
+    retract_failure: bool = False
 
 
 _MECHANICAL = AmsFaultClass.MECHANICAL_FEED
@@ -1354,8 +1361,10 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
     # filament may be too thin, causing the extruder to slip."
     0x00020009: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
     # "AMS A slot 1 pulls filament back to AMS timeout." Pull-BACK, the family an
-    # auto-load can grind (see the swap set's exclusion note).
-    0x00020011: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # auto-load can grind (see the swap set's exclusion note). ``retract_failure``:
+    # the firmware is LATCHED in a pull-back it could not finish, so the screen's
+    # Retry repeats that pull-back (006-H2S 2026-09-21, incident 289).
+    0x00020011: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL, retract_failure=True),),
     # "AMS A slot 1 feeder unit motor has no signal, which may be due to poor
     # contact in the motor connector or a motor fault." Wiring/motor hardware —
     # NOT a feed obstruction, so fresh filament cannot clear it.
@@ -1366,8 +1375,10 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
     # "AMS A slot 1 the tube inside the AMS is broken, or feed-out hall sensor is
     # faulty and cannot detect the filament."
     0x00020023: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
-    # "AMS A slot 1 failed to rotate the filament spool when pulling filament back to AMS."
-    0x00020024: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    # "AMS A slot 1 failed to rotate the filament spool when pulling filament back to
+    # AMS." The other half of the pull-BACK family, so it carries ``retract_failure``
+    # for the same reason 0x00020011 does.
+    0x00020024: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL, retract_failure=True),),
     # -- RFID_READ: the tag could not be read ---------------------------------
     # "Failed to read the filament information from AMS A slot 1. …" — one code
     # word per cause: AMS main board malfunction (0081, the code a commanded read
@@ -1459,6 +1470,7 @@ class _ShortRow:
 
     fault_class: AmsFaultClass
     extruder_side: bool = False
+    retract_failure: bool = False
     external: bool = False
 
 
@@ -1540,18 +1552,25 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # so many words, so it is external whatever module reports it.
     (("0300",), "8015", _ShortRow(AmsFaultClass.RUNOUT_EXTERNAL, external=True)),
     # -- PHYSICAL_FAULT: needs physical work — never auto-recovered -----------
+    # The 8003/8004 PULL-BACK pair, AMS and holder alike, carries ``retract_failure``:
+    # the firmware is LATCHED in a retraction it could not finish, so the touchscreen's
+    # Retry/CONTINUE repeats the pull-back rather than offering "Resume (problem
+    # solved)". 006-H2S 2026-09-21 (incident 289) is why the flag exists — the farm's
+    # own unload met filament that would not come out, and the escalation copy told the
+    # operator to "check the filament path, then resume", on a screen where the only
+    # button retries the pull-back against the same stuck filament.
     # "Failed to pull out the filament from the extruder. This might be caused by
     # clogged extruder or filament broken inside the extruder."
-    ((*_AMS_UNITS,), "8003", _ShortRow(_PHYSICAL)),
+    ((*_AMS_UNITS,), "8003", _ShortRow(_PHYSICAL, retract_failure=True)),
     # external: "Please pull out the filament on the spool holder. If this message
     # persists, please check to see if there is filament broken in the extruder."
-    (_EXTERNAL_SPOOL, "8003", _ShortRow(_PHYSICAL, external=True)),
+    (_EXTERNAL_SPOOL, "8003", _ShortRow(_PHYSICAL, retract_failure=True, external=True)),
     # "AMS failed to pull back filament. This could be due to a stuck spool or the
     # end of the filament being stuck in the path."
-    ((*_AMS_UNITS,), "8004", _ShortRow(_PHYSICAL)),
+    ((*_AMS_UNITS,), "8004", _ShortRow(_PHYSICAL, retract_failure=True)),
     # external: "Failed to pull back the filament from the toolhead to AMS. Please
     # check whether the filament or the spool is stuck."
-    (_EXTERNAL_SPOOL, "8004", _ShortRow(_PHYSICAL, external=True)),
+    (_EXTERNAL_SPOOL, "8004", _ShortRow(_PHYSICAL, retract_failure=True, external=True)),
     # "Extruding filament failed. The extruder might be clogged."
     ((*_AMS_UNITS,), "8007", _ShortRow(_PHYSICAL)),
     # "Timeout purging old filament: Please check if the filament is stuck or the
@@ -1570,6 +1589,13 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # The manual-clearing asks the firmware raises for the external spool path:
     # "Please manually and slowly pull out the filament from the extruder…" /
     # "Press the black PTFE tube coupler and unplug the PTFE tube…"
+    #
+    # Deliberately NOT ``retract_failure``, though they name a pull-out: these are the
+    # firmware ASKING THE OPERATOR to pull by hand, not a machine retraction it latched
+    # on having failed. The flag exists to tell the operator that pressing Retry
+    # re-runs the printer's own pull-back — and here Retry is the operator's own
+    # confirmation that they did the pulling. Marking them would attach the 289 clause
+    # to a guided manual step it contradicts.
     (_EXTERNAL_SPOOL, "C011", _ShortRow(_PHYSICAL, external=True)),
     (_EXTERNAL_SPOOL, "C012", _ShortRow(_PHYSICAL, external=True)),
     # -- RFID_READ ------------------------------------------------------------
@@ -1614,6 +1640,13 @@ _RUNOUT_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFau
 _RUNOUT_EXTERNAL_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.RUNOUT_EXTERNAL)
 _MECHANICAL_FEED_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is _MECHANICAL)
 _EXTRUDER_SIDE_SHORTS: frozenset[str] = _shorts_where(lambda r: r.extruder_side)
+
+# ``retract_failure`` deliberately gets NO set of its own here. A short-lane view is
+# blind to the two code-word members (0x00020011 / 0x00020024), so a consumer reading
+# one would answer "no" for a fault the attr-aware lane classified as exactly that —
+# the split-vocabulary shape doctrine invariant 1 exists to prevent. Its one consumer
+# (``spool_recovery``'s escalation copy) reads the flag off the classified CANDIDATE,
+# which both lanes fill.
 
 
 def runout_short_codes() -> frozenset[str]:
@@ -1691,6 +1724,7 @@ def classify_ams_fault(attr: int, code: int) -> ClassifiedAmsFault | None:
                 fault_class=row.fault_class,
                 extruder_side=row.extruder_side,
                 slot=ams_slot_from_attr(attr),
+                retract_failure=row.retract_failure,
                 external=external,
             )
     return None
@@ -1716,6 +1750,7 @@ def classify_short_code(short: str) -> ClassifiedAmsFault | None:
         fault_class=row.fault_class,
         extruder_side=row.extruder_side,
         slot=None,
+        retract_failure=row.retract_failure,
         external=row.external,
     )
 
@@ -1785,15 +1820,18 @@ class FaultCandidate:
     The tuple the entry gate reasons over: WHAT kind of fault (``fault_class``),
     WHICH code names it (``short_code`` — what the notifications say), WHERE it is
     (``slot``, only the attr-aware ``hms[]`` lane can supply one), whether the
-    EXTRUDER is the common factor, and whether the hardware is the EXTERNAL spool
-    holder rather than an AMS (``external``, straight from the taxonomy's verdict —
-    never re-derived from the code string here, doctrine invariant 1).
+    EXTRUDER is the common factor, whether the printer is LATCHED in a pull-back it
+    could not finish (``retract_failure`` — what the operator's Retry would repeat),
+    and whether the hardware is the EXTERNAL spool holder rather than an AMS
+    (``external``, straight from the taxonomy's verdict — never re-derived from the
+    code string here, doctrine invariant 1).
     """
 
     fault_class: AmsFaultClass
     short_code: str
     slot: tuple[int, int] | None
     extruder_side: bool
+    retract_failure: bool = False
     external: bool = False
 
 
@@ -1826,6 +1864,7 @@ def live_candidates(state) -> frozenset[FaultCandidate]:
                 short_code=short,
                 slot=verdict.slot,
                 extruder_side=verdict.extruder_side,
+                retract_failure=verdict.retract_failure,
                 external=verdict.external,
             )
         )

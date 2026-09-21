@@ -661,6 +661,24 @@ _EXPECTED_RFID = _family(_AMS_UNIT_MODULES, "4025")
 _EXPECTED_INFORMATIONAL = _family(_AMS_UNIT_MODULES, "0025")
 _EXPECTED_EXTRUDER_SIDE = {"0300_801E"}
 
+# Every short code whose verdict must carry ``retract_failure=True`` — "the printer is
+# LATCHED in a pull-back it could not finish", which is what makes the touchscreen's
+# Retry repeat that pull-back instead of offering Resume (006-H2S 2026-09-21, incident
+# 289). Written out independently of the module's tables, like every other pin here.
+#
+# The C011/C012 manual-pull asks are deliberately ABSENT even though they name a
+# pull-out: there the firmware is asking the OPERATOR to pull, and Retry confirms they
+# did — the opposite of a latched machine retraction.
+_EXPECTED_RETRACT_FAILURE = (
+    _family(_AMS_UNIT_MODULES, "8003")
+    | _family(_AMS_UNIT_MODULES, "8004")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8003")
+    | _family(_EXTERNAL_HOLDER_MODULES, "8004")
+)
+
+# The code-word lane's half of the same partition: the two pull-BACK words.
+_EXPECTED_RETRACT_FAILURE_CODE_WORDS = {0x00020011, 0x00020024}
+
 # Every short code whose verdict must carry ``external=True`` — the spool HOLDER's
 # hardware, whatever the class. Written out independently of the module's tables so a
 # row that quietly loses (or gains) the flag fails this pin: the flag is what keeps an
@@ -909,6 +927,84 @@ class TestAmsFaultTaxonomyCodeWordLane:
         verdict = classify_ams_fault(_submodule_attr(0x30), 0x00030003)
         assert verdict.fault_class.value == "rfid_read"
         assert verdict.slot is None
+
+
+class TestRetractFailurePartition:
+    """``retract_failure`` over BOTH wire lanes — the 289 fact, pinned by membership.
+
+    The flag says the printer is HOLDING a pull-back it could not finish, which is the
+    one thing an operator must know before pressing Retry on the screen (it repeats the
+    pull-back). A row that quietly gained or lost it would change what the escalation
+    page tells somebody standing at a latched printer, so the membership is written out
+    here rather than derived from the module's own tables.
+    """
+
+    def test_the_short_lane_partition_is_exact(self):
+        from backend.app.services.hms_errors import _SHORT_CODE_TAXONOMY, classify_short_code
+
+        marked = {short for short in _SHORT_CODE_TAXONOMY if classify_short_code(short).retract_failure}
+        assert marked == _EXPECTED_RETRACT_FAILURE
+
+    def test_the_code_word_lane_partition_is_exact(self):
+        from backend.app.services.hms_errors import _CODE_WORD_TAXONOMY, classify_ams_fault
+
+        marked = set()
+        for code_word in _CODE_WORD_TAXONOMY:
+            verdict = classify_ams_fault(_tray_attr(ams_id=0, tray=0), code_word)
+            if verdict is not None and verdict.retract_failure:
+                marked.add(code_word)
+        assert marked == _EXPECTED_RETRACT_FAILURE_CODE_WORDS
+
+    @pytest.mark.parametrize("short", sorted(_EXPECTED_RETRACT_FAILURE))
+    def test_every_short_member_is_physical(self, short):
+        """A retraction the firmware could not finish is never something fresh filament
+        clears — so every member escalates rather than entering the swap loop."""
+        from backend.app.services.hms_errors import classify_short_code
+
+        assert classify_short_code(short).fault_class.value == "physical_fault"
+
+    @pytest.mark.parametrize("code_word", sorted(_EXPECTED_RETRACT_FAILURE_CODE_WORDS))
+    def test_every_code_word_member_is_physical(self, code_word):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        assert classify_ams_fault(_tray_attr(), code_word).fault_class.value == "physical_fault"
+
+    @pytest.mark.parametrize(
+        "short", sorted(_family(_EXTERNAL_HOLDER_MODULES, "C011") | _family(_EXTERNAL_HOLDER_MODULES, "C012"))
+    )
+    def test_the_guided_manual_pull_asks_are_not_retract_failures(self, short):
+        """C011/C012 name a pull-out the OPERATOR performs; Retry there is their own
+        confirmation, not a repeat of a machine retraction. Marking them would attach
+        the 289 clause to a step it contradicts."""
+        from backend.app.services.hms_errors import classify_short_code
+
+        verdict = classify_short_code(short)
+        assert verdict.fault_class.value == "physical_fault"
+        assert verdict.retract_failure is False
+
+    def test_the_candidate_carries_the_flag_from_both_lanes(self):
+        """The one consumer reads it off the classified CANDIDATE, so the flag has to
+        survive the trip through ``live_candidates`` on either wire shape."""
+        from backend.app.services.hms_errors import live_candidates
+
+        # Short lane: 0700_8003, the code 006-H2S stood on.
+        short_entry = _fake_hms_error(code="8003", attr=0x07000000, module=7, full_code="0700000000008003")
+        # Code-word lane: 0x00020011 under a tray attr, which also names its slot.
+        word_entry = _fake_hms_error(
+            code="0x20011", attr=_tray_attr(ams_id=0, tray=0), module=7, full_code="07002000" + "00020011"
+        )
+        for entry in (short_entry, word_entry):
+            candidates = live_candidates(SimpleNamespace(hms_errors=[entry]))
+            assert len(candidates) == 1
+            assert next(iter(candidates)).retract_failure is True
+
+    def test_a_plain_physical_fault_carries_no_flag(self):
+        """The negative half: a clog is physical but nothing is latched, so the clause
+        must not fire on it."""
+        from backend.app.services.hms_errors import classify_short_code
+
+        assert classify_short_code("0300_801C").retract_failure is False
+        assert classify_short_code("0700_8007").retract_failure is False
 
 
 class TestAmsFaultTaxonomyCollisionPins:
