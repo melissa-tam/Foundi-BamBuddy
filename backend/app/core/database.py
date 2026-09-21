@@ -5414,6 +5414,16 @@ async def run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_print_log_entries_created_at ON print_log_entries (created_at)",
     )
 
+    # Completed queue rows are kept for ever and the units series reads them by window
+    # ("plates delivered between these two instants"), so the same reasoning applies:
+    # unindexed, a question about one day scans every plate the farm has ever finished.
+    # Same name the model's ``index=True`` generates, so create_all and this DDL
+    # converge on ONE index.
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_print_queue_completed_at ON print_queue (completed_at)",
+    )
+
     # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds
     # from and the live table agree. A deleted id is never reused (005-H2S 2026-09-17) —
     # rationale, refusals and failure semantics live on the helper.

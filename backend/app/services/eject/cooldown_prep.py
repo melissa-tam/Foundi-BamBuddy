@@ -152,8 +152,15 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Literal
 
+from backend.app.models.farm_cycle_episode import (
+    COOLDOWN_VARIANT_FAN_ONLY,
+    COOLDOWN_VARIANT_HOLD,
+    KIND_COOLDOWN,
+)
+from backend.app.services.cycle_episodes import note_episode
 from backend.app.services.eject import donor, generator, remote as eject_remote
 from backend.app.services.eject.generator import EjectGenerationError
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
@@ -359,6 +366,23 @@ HoldOutcome = Literal[
     "skipped:error",  # any other exception (logged with its traceback)
 ]
 
+# How the COOLING ended, in the watch's own words — ``monitor.watch_bed_and_clear``'s
+# return vocabulary, and the only one: a cooldown cut short by an operator clearing the
+# gate, or abandoned to a stall, is not a cooldown DURATION, and the cycle statistics
+# read ``released`` rows alone.
+#
+# It lives HERE rather than in the monitor that produces it, because the import runs
+# one way only — ``monitor`` imports this module, so this module cannot import it back —
+# and the alternative, parking it in some leaf neither owns, would scatter the eject
+# vocabulary across a third file to satisfy a direction. The prep is what STORES the
+# verdict, so the type it stores travels with it and the monitor annotates its own
+# return with this name.
+WatchVerdict = Literal[
+    "released",  # the bed met its release condition (threshold, near plateau, or the cap)
+    "stalled",  # cooling plateaued while genuinely hot, or the dispatch failed three times
+    "cleared",  # the plate-clear gate dropped mid-watch — an operator, or the eject's own terminal
+]
+
 
 def _mm(value: float | None) -> str:
     """A millimetre figure for the log line, or ``none``."""
@@ -486,6 +510,12 @@ class CooldownPrep:
     # Has this cooling episode ended? Set by :meth:`end`, which is the ONE retirement
     # path; every other entry point refuses on a retired prep (the invariant above).
     retired: bool = False
+    # How the COOLING ended, written by the WATCH — the only party that holds the
+    # verdict — immediately before it retires the prep. None when the cooling ended
+    # without one at all: a cancelled watch, an exception, a session torn down. The
+    # measurement reads it once, in :meth:`end`, so whatever stands here when the FIRST
+    # ``end()`` runs is what the ledger records for this episode.
+    outcome: WatchVerdict | None = None
     # When the chamber first read at or under the threshold (monotonic), or None for a
     # cooldown whose chamber never got there. THE measurement this wave exists to take.
     boost_ended_at: float | None = None
@@ -702,13 +732,14 @@ class CooldownPrep:
                 observed = None
             segments.append(_fan_summary(lane, observed))
         boosted = "never" if self.boost_ended_at is None else f"{self.boost_ended_at - self.started_at:.0f} s"
+        elapsed_s = time.monotonic() - self.started_at
         # THE line the wave is measured by: one per cooldown, greppable as
         # ``[cooldown-prep]``, carrying every decision this module made.
         logger.info(
             "[cooldown-prep] printer %s: cooldown ended after %.0f s "
             "(hold=%s max_z=%s hold_z=%s, chamber_boost_ended_after=%s chamber_at_arm=%s bed_at_arm=%s, %s)",
             self.printer_id,
-            time.monotonic() - self.started_at,
+            elapsed_s,
             self.hold,
             _mm(self.max_z),
             _mm(self.hold_z),
@@ -716,6 +747,24 @@ class CooldownPrep:
             _c(self.chamber_at_arm_c),
             _c(self.bed_at_arm_c),
             ", ".join(segments),
+        )
+        # The same measurement the line just carried, kept as a row — after it, so a
+        # ledger that somehow failed could never cost the operator the record. Reached
+        # only from the FIRST ``end()`` (the retired guard above returns), so a deferred
+        # cooldown records its cooling episode once; the second call retires fans, not a
+        # second episode. ``self.started_at`` is monotonic and says nothing about the
+        # wall clock, so the start is derived by subtracting the elapsed just logged.
+        # The VARIANT is the one thing that separates cooldown durations on either
+        # model: ``sent`` is the only ``HoldOutcome`` where the plate was really held up
+        # toward the nozzle plane — every other value ran fan-only.
+        ended_at = datetime.now(timezone.utc)
+        note_episode(
+            self.printer_id,
+            KIND_COOLDOWN,
+            started_at=ended_at - timedelta(seconds=elapsed_s),
+            ended_at=ended_at,
+            outcome=self.outcome,
+            variant=COOLDOWN_VARIANT_HOLD if self.hold == "sent" else COOLDOWN_VARIANT_FAN_ONLY,
         )
 
     def _retry_fan_off(self, fan_off: bool) -> None:

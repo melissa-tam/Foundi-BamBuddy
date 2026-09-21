@@ -636,6 +636,334 @@ class TestDispatchFileOwnership:
             assert expected in found, f"{'/'.join(_DISPATCH_SEAM)} no longer uses {expected}"
 
 
+# --- Fleet history: who may write it (2026-09-21) ---------------------------------
+
+# The observation log and the episode ledger are APPEND-shaped records of what was
+# observed and what was measured, and every reader downstream — the availability
+# classifier, the timeline, every series on the Fleet tab — trusts that the rows came
+# from the one sampler and the two instruments. A second writer would not fail any
+# behaviour test: it would quietly produce rows that look identical and mean something
+# else (a hand-closed span, a fabricated episode), and nothing later could tell them
+# apart. So the writers are pinned by SOURCE, like the incident closers above.
+_SPAN_WRITER = ("services", "fleet_activity.py")
+_EPISODE_WRITER = ("services", "cycle_episodes.py")
+
+# WHO may hand a measurement to the ledger. The writer itself (it defines the verb)
+# plus the two owners that actually TIME an episode: the eject terminal, which reads
+# the sweep's own start echo, and the cooldown prep's retirement, which is the end of
+# the cooling episode. A third caller is a duration nobody measured.
+_EPISODE_CALLERS = {
+    _EPISODE_WRITER,
+    ("services", "farm_policy.py"),
+    ("services", "eject", "cooldown_prep.py"),
+}
+
+_FLEET_MODELS = {"PrinterObservationSpan": _SPAN_WRITER, "FarmCycleEpisode": _EPISODE_WRITER}
+
+# The Core statements that WRITE a table, as opposed to selecting from it. Reads are
+# deliberately unrestricted — the whole point of recording raw rows is that anything
+# may classify them.
+_TABLE_WRITE_VERBS = {"insert", "update", "delete"}
+
+
+def _called_name(func: ast.expr | None) -> str | None:
+    """The bare name a call or attribute reference ends in, however it was reached.
+
+    ``insert(...)``, ``sa.insert(...)`` and ``db.add(...)`` all answer with their last
+    identifier, which is what every scan below matches on: an import alias must not be
+    able to hide a write or a calendar cut from the pin.
+    """
+    if isinstance(func, ast.Name):
+        return func.id
+    return getattr(func, "attr", None)
+
+
+def _scan_fleet_history_writes(py_file: Path) -> list[tuple[str, str, int]]:
+    """Every ORM construction of a fleet-history row, and every Core write of its table.
+
+    Returns ``(model_name, symbol, lineno)``. AST rather than grep because both model
+    names appear in prose all over these modules' docstrings, which is where the rule
+    is explained.
+    """
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = _called_name(func)
+        if name in _FLEET_MODELS:
+            hits.append((name, f"{name}()", node.lineno))
+        elif name in _TABLE_WRITE_VERBS and node.args:
+            model = _called_name(node.args[0])
+            if model in _FLEET_MODELS:
+                hits.append((model, f"{name}({model})", node.lineno))
+    return hits
+
+
+def _scan_episode_notes(py_file: Path) -> list[tuple[str, int]]:
+    """Every CALL of ``note_episode``, however the module was imported."""
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _called_name(node.func) == "note_episode":
+            hits.append(("note_episode()", node.lineno))
+    return hits
+
+
+# --- Fleet metrics: what the READER may not do -------------------------------------
+
+_FLEET_METRICS_PKG = ("services", "fleet_metrics")
+
+# Keywords that turn ``.replace()`` into a MIDNIGHT (or any other wall-clock instant).
+# ``microsecond`` and ``tzinfo`` are deliberately absent: truncating sub-second noise
+# and dropping a tzinfo are precision, not calendar — the reader's own clock does both.
+_MIDNIGHT_KEYWORDS = frozenset({"hour", "minute", "second"})
+
+# Keywords that turn a ``timedelta`` into a STEP across the calendar. A site day is
+# 23 h or 25 h across a transition and a week is seven of those, so stepping by a
+# fixed-length delta computes a different calendar from the one the buckets are cut
+# on — the two agree for most of the year and disagree twice, which is the hardest
+# kind of wrong to notice in a series. ``seconds`` and ``minutes`` are absent: those
+# are durations, which this package measures all day long.
+_CALENDAR_STEP_KEYWORDS = frozenset({"days", "hours", "weeks"})
+
+# Session methods that can only ever mean a database write. No built-in collection
+# carries any of these names, so they are flagged on ANY receiver.
+_SESSION_MUTATORS = frozenset(
+    {"commit", "flush", "merge", "add_all", "bulk_save_objects", "bulk_insert_mappings", "bulk_update_mappings"}
+)
+
+# ``add`` and ``delete`` are also SET and DICT verbs, so they are flagged only on a
+# receiver that actually holds a session or names a model. The timeline sweep collects
+# its cut points with ``cuts.add(instant)``; a scan that could not tell that from
+# ``db.add(row)`` would have to be switched off for the very module the pin most needs
+# to cover.
+_AMBIGUOUS_MUTATORS = frozenset({"add", "delete"})
+
+# The Core DML constructors, matched as BARE names (``insert(Table)``): a call to a
+# plain function by one of these names is SQLAlchemy's, while ``cuts.update(other)``
+# is an attribute call on a set and is not.
+_DML_CONSTRUCTORS = frozenset({"insert", "update", "delete"})
+
+# How a module spells "this argument is a database handle", for the ambiguous verbs.
+_SESSION_HINTS = ("Session", "Connection")
+_SESSION_NAMES = frozenset({"db", "session", "conn", "connection"})
+
+
+def _fleet_metrics_modules() -> list[Path]:
+    """Every module of the read-only metrics package, in a stable order."""
+    return sorted(get_python_files(BACKEND_DIR.joinpath(*_FLEET_METRICS_PKG)))
+
+
+def _scan_calendar_cuts(py_file: Path) -> list[tuple[str, int]]:
+    """Every midnight this module builds, and every step it takes across the calendar."""
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "min" and _called_name(node.value) == "time":
+            hits.append(("time.min", node.lineno))
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        name = _called_name(node.func)
+        keywords = {keyword.arg for keyword in node.keywords if keyword.arg is not None}
+        if name == "combine":
+            hits.append(("datetime.combine(...)", node.lineno))
+        elif name == "replace" and keywords & _MIDNIGHT_KEYWORDS:
+            hits.append((f".replace({min(keywords & _MIDNIGHT_KEYWORDS)}=...)", node.lineno))
+        elif name == "time" and (node.args or keywords):
+            # ``time(0)`` — a wall clock being constructed. A bare ``time.time()`` has
+            # no arguments and is a clock reading, not a calendar cut.
+            hits.append(("time(...)", node.lineno))
+        elif name == "timedelta" and keywords & _CALENDAR_STEP_KEYWORDS:
+            hits.append((f"timedelta({min(keywords & _CALENDAR_STEP_KEYWORDS)}=...)", node.lineno))
+    return hits
+
+
+def _session_names(tree: ast.Module) -> set[str]:
+    """The names in this module that hold a database handle.
+
+    A parameter annotated ``…Session`` or ``…Connection``, plus the fork's own
+    conventional spellings — enough to tell ``db.add(row)`` from ``cuts.add(instant)``
+    without either allow-listing a module or banning a set.
+    """
+    names = set(_SESSION_NAMES)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = node.args
+        for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs):
+            annotation = ast.unparse(argument.annotation) if argument.annotation is not None else ""
+            if any(hint in annotation for hint in _SESSION_HINTS):
+                names.add(argument.arg)
+    return names
+
+
+def _scan_database_writes(py_file: Path) -> list[tuple[str, int]]:
+    """Every database WRITE this module performs, by session method or DML construct."""
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    sessions = _session_names(tree)
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            if func.id in _DML_CONSTRUCTORS:
+                hits.append((f"{func.id}(...)", node.lineno))
+            continue
+        if not isinstance(func, ast.Attribute):
+            continue
+        receiver = _called_name(func.value)
+        if func.attr in _SESSION_MUTATORS:
+            hits.append((f".{func.attr}()", node.lineno))
+        elif func.attr in _AMBIGUOUS_MUTATORS and receiver is not None:
+            # A session writes rows; a model or table class builds a DML statement.
+            # Anything else named ``add`` or ``delete`` is a collection.
+            if receiver in sessions or (receiver[:1].isupper() and func.attr in _DML_CONSTRUCTORS):
+                hits.append((f"{receiver}.{func.attr}()", node.lineno))
+        elif func.attr in _DML_CONSTRUCTORS and receiver in {"sqlalchemy", "sa"}:
+            hits.append((f"{receiver}.{func.attr}(...)", node.lineno))
+    return hits
+
+
+class TestFleetActivityOwnership:
+    """One sampler writes the observation log; one leaf writes the episode ledger.
+
+    And the reader that folds both into figures writes neither, and keeps no calendar
+    of its own — the two properties that let the definition of *down* change without
+    re-recording a single row.
+    """
+
+    def test_each_fleet_history_table_has_exactly_one_writer(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            for model, symbol, line in _scan_fleet_history_writes(py_file):
+                if parts == _FLEET_MODELS[model]:
+                    continue
+                strays.append(f"  - {'/'.join(parts)}:{line} uses {symbol}")
+
+        if strays:
+            pytest.fail(
+                "Something outside the declared writer writes fleet history:\n"
+                + "\n".join(strays)
+                + "\n\nObservation spans are written ONLY by services/fleet_activity.py (the sampler "
+                "owns the run-length encoding, and a row written anywhere else breaks the one-open-span "
+                "invariant the partial unique index exists to hold); cycle episodes are written ONLY by "
+                "services/cycle_episodes.note_episode, which the two measuring owners call. Reading "
+                "either table is unrestricted — recording raw and classifying at read time is the point."
+            )
+
+    def test_only_the_measuring_owners_note_an_episode(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts in _EPISODE_CALLERS:
+                continue
+            for symbol, line in _scan_episode_notes(py_file):
+                strays.append(f"  - {'/'.join(parts)}:{line} calls {symbol}")
+
+        if strays:
+            pytest.fail(
+                "A new cycle-episode writer appeared outside the two instruments:\n"
+                + "\n".join(strays)
+                + "\n\nAn episode row is a DURATION somebody measured — the eject terminal reads the "
+                "sweep's own start echo, and cooldown_prep.end() is the end of the cooling episode. A "
+                "caller that did not time the episode is recording a guess."
+            )
+
+    def test_the_declared_writers_are_still_there(self):
+        """The liveness half. An allowlist whose entries have all moved away silently
+        stops policing anything, and both scans would then pass on an empty set."""
+        for model, owner in _FLEET_MODELS.items():
+            path = BACKEND_DIR.joinpath(*owner)
+            assert path.exists(), f"{'/'.join(owner)} is gone — the writer moved without this pin"
+            found = {symbol for _, symbol, _ in _scan_fleet_history_writes(path)}
+            assert f"{model}()" in found, f"{'/'.join(owner)} no longer constructs {model}"
+
+        # ``cycle_episodes`` DEFINES the verb rather than calling it, so it is
+        # allowlisted but never a hit — both hook modules must be.
+        hooks = _EPISODE_CALLERS - {_EPISODE_WRITER}
+        callers = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_episode_notes(f)}
+        assert callers == hooks
+
+    def test_fleet_metrics_makes_no_calendar_cut_of_its_own(self):
+        """The metrics reader takes its day, week and hour grid from ONE resolver.
+
+        ``utils/site_time`` owns the site's calendar because a site day is 23 h or 25 h
+        across a transition and an ISO week starts at a local midnight. A sweep that
+        built a midnight itself, or stepped by ``timedelta(days=1)``, would compute a
+        second calendar that agrees with the grid for most of the year and disagrees
+        twice — and the series would still add up, just to the wrong days.
+        """
+        modules = _fleet_metrics_modules()
+        assert modules, "services/fleet_metrics/ has no modules — this pin would scan nothing"
+
+        # The liveness half. A package that stopped bucketing altogether would pass a
+        # scan for cuts it no longer makes, so the grid must still be coming from the
+        # one resolver.
+        sources = "\n".join(path.read_text(encoding="utf-8") for path in modules)
+        assert "bucket_edges" in sources, (
+            "services/fleet_metrics/ no longer uses site_time.bucket_edges — either the grid "
+            "moved or this pin is now watching a package that buckets nothing"
+        )
+
+        strays = [
+            f"  - {'/'.join(_relative_parts(module))}:{line} uses {symbol}"
+            for module in modules
+            for symbol, line in _scan_calendar_cuts(module)
+        ]
+        if strays:
+            pytest.fail(
+                "The metrics reader is cutting its own calendar:\n"
+                + "\n".join(strays)
+                + "\n\nDay, week and hour boundaries come from utils/site_time (bucket_edges, "
+                "day_bounds, site_instant, previous_window) and from nowhere else. A midnight "
+                "built here, or a fixed-length step across days/hours/weeks, is a SECOND "
+                "calendar: it agrees with the bucket grid for most of the year and disagrees "
+                "across every DST transition."
+            )
+
+    def test_fleet_metrics_never_writes_to_the_database(self):
+        """The reader is read-only, which is what makes read-time classification safe.
+
+        Nothing in the package inserts, updates or deletes: the definition of *down*
+        can therefore change — and it will, as the farm grows lanes — without
+        invalidating a stored row or needing a rebuild. A write from inside the reader
+        would make a figure depend on who read it last.
+        """
+        modules = _fleet_metrics_modules()
+        assert modules, "services/fleet_metrics/ has no modules — this pin would scan nothing"
+
+        # The liveness half. Run the same scanner over a module that certainly DOES
+        # write (the observation recorder), so a scanner that silently stopped
+        # detecting writes cannot pass this pin by seeing nothing anywhere.
+        recorder = BACKEND_DIR.joinpath(*_SPAN_WRITER)
+        assert _scan_database_writes(recorder), (
+            f"the write scanner found nothing in {'/'.join(_SPAN_WRITER)}, which writes every "
+            "sampling tick — the scanner is broken, not the package"
+        )
+
+        strays = [
+            f"  - {'/'.join(_relative_parts(module))}:{line} calls {symbol}"
+            for module in modules
+            for symbol, line in _scan_database_writes(module)
+        ]
+        if strays:
+            pytest.fail(
+                "The read-only metrics reader writes to the database:\n"
+                + "\n".join(strays)
+                + "\n\nThis package classifies at READ time so that raw observation rows never "
+                "have to be re-recorded when the definition of a class changes. A rollup, a "
+                "cache table or a 'just this one flag' written from here takes that property "
+                "away: the figures would then depend on when they were last computed."
+            )
+
+
 class TestModuleImports:
     """Tests for module import health."""
 
