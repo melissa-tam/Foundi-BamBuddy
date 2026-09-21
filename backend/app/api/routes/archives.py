@@ -29,6 +29,7 @@ from backend.app.schemas.archive import ArchiveResponse, ArchiveSlim, ArchiveSta
 from backend.app.schemas.print_log import PrintLogResponse
 from backend.app.schemas.slicer import SliceRequest
 from backend.app.services.archive import ArchiveService
+from backend.app.services.print_log import CANCELLED_STATUSES, COMPLETED_STATUS, FAILED_STATUSES
 from backend.app.utils.http import build_content_disposition
 from backend.app.utils.safe_path import safe_join_under
 from backend.app.utils.threemf_tools import (
@@ -237,6 +238,10 @@ async def _load_run_aggregates(db: AsyncSession, archive_ids: list[int]) -> dict
     Returns ``{archive_id: {run_count, last_run_at, total_filament_actual_grams,
     successful_run_count, failed_run_count}}``. Archives with no logged runs are
     absent from the map; callers should treat that as zero/none.
+
+    The success/failure fold is ``services.print_log``'s, so this card and
+    ``/archives/stats`` answer "did it fail" the same way — an ``aborted`` run
+    counts as failed in both.
     """
     from backend.app.models.print_log import PrintLogEntry
 
@@ -248,8 +253,8 @@ async def _load_run_aggregates(db: AsyncSession, archive_ids: list[int]) -> dict
             func.count(PrintLogEntry.id).label("run_count"),
             func.max(PrintLogEntry.started_at).label("last_run_at"),
             func.coalesce(func.sum(PrintLogEntry.filament_used_grams), 0).label("total_filament"),
-            func.sum(case((PrintLogEntry.status == "completed", 1), else_=0)).label("successful"),
-            func.sum(case((PrintLogEntry.status == "failed", 1), else_=0)).label("failed"),
+            func.sum(case((PrintLogEntry.status == COMPLETED_STATUS, 1), else_=0)).label("successful"),
+            func.sum(case((PrintLogEntry.status.in_(FAILED_STATUSES), 1), else_=0)).label("failed"),
         )
         .where(PrintLogEntry.archive_id.in_(archive_ids))
         .group_by(PrintLogEntry.archive_id)
@@ -1037,12 +1042,12 @@ async def get_archive_stats(
     total_prints = total_result.scalar() or 0
 
     successful_result = await db.execute(
-        select(func.count(PrintLogEntry.id)).where(PrintLogEntry.status == "completed", *base_conditions)
+        select(func.count(PrintLogEntry.id)).where(PrintLogEntry.status == COMPLETED_STATUS, *base_conditions)
     )
     successful_prints = successful_result.scalar() or 0
 
     failed_result = await db.execute(
-        select(func.count(PrintLogEntry.id)).where(PrintLogEntry.status.in_(("failed", "aborted")), *base_conditions)
+        select(func.count(PrintLogEntry.id)).where(PrintLogEntry.status.in_(FAILED_STATUSES), *base_conditions)
     )
     failed_prints = failed_result.scalar() or 0
 
@@ -1053,9 +1058,7 @@ async def get_archive_stats(
     # the gauge down), while still being visible in the breakdown so they
     # don't silently vanish from Total Prints (#1390).
     cancelled_result = await db.execute(
-        select(func.count(PrintLogEntry.id)).where(
-            PrintLogEntry.status.in_(("stopped", "cancelled", "skipped")), *base_conditions
-        )
+        select(func.count(PrintLogEntry.id)).where(PrintLogEntry.status.in_(CANCELLED_STATUSES), *base_conditions)
     )
     cancelled_prints = cancelled_result.scalar() or 0
 
@@ -1119,7 +1122,7 @@ async def get_archive_stats(
         )
         .join(PrintArchive, PrintArchive.id == PrintLogEntry.archive_id)
         .where(
-            PrintLogEntry.status == "completed",
+            PrintLogEntry.status == COMPLETED_STATUS,
             PrintArchive.print_time_seconds.isnot(None),
             *base_conditions,
         )

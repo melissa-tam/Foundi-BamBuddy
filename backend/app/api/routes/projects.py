@@ -41,6 +41,7 @@ from backend.app.schemas.project import (
     ProjectUpdate,
     TimelineEvent,
 )
+from backend.app.services.print_log import COMPLETED_STATUS
 from backend.app.utils.http import build_content_disposition
 from backend.app.utils.safe_path import safe_join_under
 
@@ -49,6 +50,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 
+# Deliberately WIDER than ``print_log.FAILED_STATUSES``, and deliberately its own
+# constant: a project asks "did this run fail to deliver a part", which a cancelled
+# or stopped run also answers no to. Folding it onto the outcome buckets would
+# change the number a project page shows.
 _FAILURE_STATUSES = ("failed", "aborted", "cancelled", "stopped")
 
 
@@ -94,7 +99,7 @@ async def compute_project_stats(
         select(
             func.coalesce(func.sum(PrintArchive.quantity), 0).label("total_items"),
             func.coalesce(
-                func.sum(case((PrintLogEntry.status == "completed", PrintArchive.quantity), else_=0)),
+                func.sum(case((PrintLogEntry.status == COMPLETED_STATUS, PrintArchive.quantity), else_=0)),
                 0,
             ).label("completed_items"),
             func.coalesce(
@@ -202,7 +207,7 @@ async def list_projects(
                 func.count(PrintLogEntry.id).label("archive_count"),
                 func.coalesce(func.sum(PrintArchive.quantity), 0).label("total_items"),
                 func.coalesce(
-                    func.sum(case((PrintLogEntry.status == "completed", PrintArchive.quantity), else_=0)),
+                    func.sum(case((PrintLogEntry.status == COMPLETED_STATUS, PrintArchive.quantity), else_=0)),
                     0,
                 ).label("completed_count"),
                 func.coalesce(
