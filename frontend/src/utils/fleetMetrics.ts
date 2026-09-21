@@ -1052,11 +1052,30 @@ export function cellAbsence(
   return lensValue(cell, lens) > 0 ? null : 'zero';
 }
 
+/**
+ * COMPLETED prints in a cell — the Prints lens's one numerator.
+ *
+ * Not `sumMap(cell.prints)`, which is every outcome. The lens answers "what did
+ * this printer make", and a failed or cancelled print made nothing; the tab's
+ * other print figures already agree — `prints_per_day` and
+ * `prints_per_printer_per_day` are both completed-only, and the matrix's Avg
+ * column reads them straight from the payload. Summing all four outcomes in the
+ * cells and the row Total put TWO numerators in one lens: a printer showed
+ * Total 1,079 against an Avg of 6.0, which is not a rate anybody could derive
+ * from the row they were looking at.
+ *
+ * The full outcome split is not lost — it is in a bucket's detail, under
+ * "Prints by outcome", which is the surface that exists to carry it.
+ */
+export function completedPrints(cell: MatrixCell): number {
+  return cell.prints.completed ?? 0;
+}
+
 /** The number a lens reads out of a cell. */
 export function lensValue(cell: MatrixCell, lens: FleetLens): number {
   switch (lens) {
     case 'prints':
-      return sumMap(cell.prints);
+      return completedPrints(cell);
     case 'hours_down':
       return cell.down_seconds;
     default:

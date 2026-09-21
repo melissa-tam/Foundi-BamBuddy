@@ -982,6 +982,8 @@ export default {
         notConnected: '印表機已離線。請連線後再彈出。',
         dispatchFailed: '彈出命令失敗：{{message}}',
         profileNotFound: '彈出設定檔已不存在。請另選一個。',
+        printerNotFound: '印表機已不存在。請重新整理頁面。',
+        zUnreferenced: '印表機重新啟動時列印板上仍有零件，Z 基準已遺失。請手動取下零件，然後使用「將列印板標記為已清理」。',
         noPlateGate: '列印板已標記為已清理。使用「彈出列印板」將其宣告為已佔用。',
       },
     },
@@ -7585,6 +7587,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: '矩陣檢視',
+      lensHint: {
+        prints: '僅限已完成的列印。某個期間的詳情包含完整的結果細分。',
+      },
       lens: {
         prints: '列印數',
         hoursDown: '停機小時',

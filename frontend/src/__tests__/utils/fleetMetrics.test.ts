@@ -26,6 +26,7 @@ import {
   causeLabelKey,
   cellAbsence,
   classLabelKey,
+  completedPrints,
   CHART_STACK_GROUPS,
   DOWN_CAUSE_ORDER,
   FAULT_KIND_ORDER,
@@ -65,12 +66,14 @@ import {
   HEAT_RAMP_PRINTS_LIGHT,
   hoursDownBand,
   isRowHidden,
+  lensValue,
   lensRamp,
   OBSERVED_TOLERANCE_S,
   parseClassKey,
   printsBand,
   SECONDARY_TEXT_CLASS,
   seriesRows,
+  sumMap,
   SUMMARY_ROW_LABEL_KEY,
   TIME_SPLIT_BAND_COLOR,
   TIME_SPLIT_BAND_TEXT,
@@ -670,6 +673,42 @@ describe('cellAbsence', () => {
     expect(
       cellAbsence(fine, header(86_400, 86_400 - OBSERVED_TOLERANCE_S + 1), { lens: 'hours_down' }),
     ).toBeNull();
+  });
+});
+
+describe('the Prints lens has ONE numerator', () => {
+  const cell = (prints: Record<string, number>): MatrixCell => ({
+    class_seconds: { printing: 3600 },
+    down_seconds: 0,
+    prints: prints as MatrixCell['prints'],
+    basis: 'observed',
+  });
+
+  it('reads COMPLETED prints, never every outcome', () => {
+    // The lens answers "what did this printer make", and a failed or cancelled
+    // print made nothing. Summing all four put two numerators in one lens: the
+    // cells and the row Total counted everything while the Avg column read the
+    // payload's completed-only rate, so a row showed Total 1,079 against an Avg
+    // of 6.0 — a rate nobody could derive from the row they were looking at.
+    const mixed = cell({ completed: 9, failed: 2, cancelled: 1, other: 1 });
+    expect(completedPrints(mixed)).toBe(9);
+    expect(lensValue(mixed, 'prints')).toBe(9);
+    // …and it is emphatically not the total of the outcome split.
+    expect(lensValue(mixed, 'prints')).not.toBe(sumMap(mixed.prints));
+  });
+
+  it('answers zero for a bucket that completed nothing, whatever else it did', () => {
+    const noneFinished = cell({ failed: 3, cancelled: 2 });
+    expect(lensValue(noneFinished, 'prints')).toBe(0);
+    // Which makes the cell read as a genuine zero — the four absence
+    // treatments are unchanged, and the outcome split is in the detail.
+    expect(cellAbsence(noneFinished, { elapsed_seconds: 3600, observed_seconds: 3600 }, { lens: 'prints' })).toBe('zero');
+  });
+
+  it('leaves the other two lenses on their own numerators', () => {
+    const busy = { ...cell({ completed: 4, failed: 4 }), down_seconds: 600 };
+    expect(lensValue(busy, 'hours_down')).toBe(600);
+    expect(lensValue(busy, 'time_split')).toBe(3600);
   });
 });
 

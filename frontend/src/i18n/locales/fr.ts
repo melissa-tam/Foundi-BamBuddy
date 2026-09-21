@@ -982,6 +982,8 @@ export default {
         notConnected: 'L\'imprimante est hors ligne. Connectez-la, puis éjectez.',
         dispatchFailed: 'Échec de la commande d\'éjection : {{message}}',
         profileNotFound: 'Le profil d\'éjection n\'existe plus. Choisissez-en un autre.',
+        printerNotFound: 'L’imprimante n’existe plus. Actualisez la page.',
+        zUnreferenced: 'L’imprimante a redémarré avec une pièce sur le plateau et sa référence Z est perdue. Retirez la pièce à la main, puis utilisez Marquer le plateau comme dégagé.',
         noPlateGate: 'Le plateau est marqué comme dégagé. Utilisez Éjecter le plateau pour le déclarer occupé.',
       },
     },
@@ -7587,6 +7589,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'Vue de la matrice',
+      lensHint: {
+        prints: 'Impressions terminées uniquement. Le détail d’une période affiche la répartition complète par résultat.',
+      },
       lens: {
         prints: 'Impressions',
         hoursDown: 'Heures hors service',

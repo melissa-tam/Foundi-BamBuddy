@@ -982,6 +982,8 @@ export default {
         notConnected: 'Yazıcı çevrimdışı. Bağlayın, sonra çıkarın.',
         dispatchFailed: 'Çıkarma komutu başarısız: {{message}}',
         profileNotFound: 'Çıkarma profili artık yok. Başka birini seçin.',
+        printerNotFound: 'Yazıcı artık yok. Sayfayı yenileyin.',
+        zUnreferenced: 'Yazıcı, plakada parça varken yeniden başlatıldı ve Z referansını kaybetti. Parçayı elle çıkarın, ardından Plakayı temizlendi olarak işaretle seçeneğini kullanın.',
         noPlateGate: 'Plaka temiz olarak işaretli. Dolu olarak bildirmek için Plakayı çıkar seçeneğini kullanın.',
       },
     },
@@ -7527,6 +7529,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'Matris görünümü',
+      lensHint: {
+        prints: 'Yalnızca tamamlanan baskılar. Bir dönemin ayrıntılarında sonuca göre tam dağılım bulunur.',
+      },
       lens: {
         prints: 'Baskılar',
         hoursDown: 'Duruş saati',

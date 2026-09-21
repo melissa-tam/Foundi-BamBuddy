@@ -13,11 +13,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { render, screen, waitFor, within } from '../../utils';
+import { formatCount, formatPrinters } from '../../../utils/fleetMetrics';
 import i18n from '../../../i18n';
 import { FleetMatrix } from '../../../components/fleet/FleetMatrix';
 import {
   DELETED_PRINTER_ID,
   HEALTHY_PRINTER_ID,
+  PROBLEM_PRINTER_ID,
   makeFleetOverview,
   makeFleetOverviewDay,
   makeFleetOverviewFirstRun,
@@ -86,6 +88,8 @@ function rowOf(grid: HTMLElement, label: string | RegExp): number {
  * so the phone's split bar lives inside the printer cell instead.
  */
 const FIRST_BUCKET_COL = 3;
+const COL_TOTAL = 1;
+const COL_AVG = 2;
 
 async function switchLens(user: ReturnType<typeof userEvent.setup>, name: string) {
   await user.click(screen.getByRole('tab', { name }));
@@ -431,6 +435,50 @@ describe('FleetMatrix', () => {
         }),
       ).toBeInTheDocument();
       expect(within(grid).queryByText('gone-from-roster')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('the Prints lens, on one numerator', () => {
+    it('agrees on COMPLETED prints across the cell, the Total and the Avg', () => {
+      // `009-H2C` is the fixture's problem printer and really does fail prints,
+      // so summing every outcome gives a different answer from counting the
+      // completed ones — which is exactly the mismatch this pins.
+      const overview = makeFleetOverviewDay();
+      const key = String(PROBLEM_PRINTER_ID);
+      const cells = overview.matrix.series.buckets.map((bucket) => bucket.values.printers[key]);
+      const completed = cells.reduce((sum, cell) => sum + (cell?.prints.completed ?? 0), 0);
+      const everyOutcome = cells.reduce(
+        (sum, cell) => sum + Object.values(cell?.prints ?? {}).reduce((a, b) => a + (b ?? 0), 0),
+        0,
+      );
+      expect(everyOutcome).toBeGreaterThan(completed);
+
+      render(<FleetMatrix overview={overview} />);
+      const grid = theGrid();
+      const row = rowOf(grid, '009-H2C');
+      const printer = overview.matrix.printers.find((p) => p.printer_id === PROBLEM_PRINTER_ID);
+
+      // The row Total counts completed only…
+      expect(cellAt(grid, row, COL_TOTAL).textContent).toBe(
+        formatCount(completed, i18n.language),
+      );
+      // …each bucket cell shows that bucket's completed count…
+      const firstCompleted = cells[0]?.prints.completed ?? 0;
+      expect(cellAt(grid, row, FIRST_BUCKET_COL).textContent).toContain(
+        formatCount(firstCompleted, i18n.language),
+      );
+      // …and Avg is the payload's own per-day rate, which the backend computes
+      // from completed prints. Three surfaces, one numerator.
+      expect(cellAt(grid, row, COL_AVG).textContent).toBe(
+        formatPrinters(printer?.prints_per_day ?? 0, i18n.language),
+      );
+    });
+
+    it('states on the control that it means completed prints', () => {
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      expect(
+        screen.getByRole('button', { name: t('fleetMetrics.matrix.lensHint.prints') }),
+      ).toBeInTheDocument();
     });
   });
 

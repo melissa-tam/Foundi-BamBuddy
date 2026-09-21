@@ -982,6 +982,8 @@ export default {
         notConnected: '打印机已离线。请连接后再弹出。',
         dispatchFailed: '弹出命令失败：{{message}}',
         profileNotFound: '弹出配置已不存在。请另选一个。',
+        printerNotFound: '打印机已不存在。请刷新页面。',
+        zUnreferenced: '打印机重启时打印板上仍有零件，Z 基准已丢失。请手动取下零件，然后使用「将打印板标记为已清理」。',
         noPlateGate: '打印板已标记为已清理。使用「弹出打印板」将其声明为已占用。',
       },
     },
@@ -7585,6 +7587,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: '矩阵视图',
+      lensHint: {
+        prints: '仅限已完成的打印。某个期间的详情包含完整的结果细分。',
+      },
       lens: {
         prints: '打印数',
         hoursDown: '停机小时',

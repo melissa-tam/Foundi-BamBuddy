@@ -982,6 +982,8 @@ export default {
         notConnected: 'La impresora está desconectada. Conéctala y luego expulsa.',
         dispatchFailed: 'Fallo en el comando de expulsión: {{message}}',
         profileNotFound: 'El perfil de expulsión ya no existe. Elige otro.',
+        printerNotFound: 'La impresora ya no existe. Actualiza la página.',
+        zUnreferenced: 'La impresora se reinició con una pieza en la cama y su referencia Z se perdió. Retira la pieza a mano y luego usa Marcar cama como despejada.',
         noPlateGate: 'La cama está marcada como despejada. Usa Expulsar cama para declararla ocupada.',
       },
     },
@@ -7608,6 +7610,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'Vista de la matriz',
+      lensHint: {
+        prints: 'Solo impresiones completadas. Los detalles de un periodo muestran el reparto completo por resultado.',
+      },
       lens: {
         prints: 'Impresiones',
         hoursDown: 'Horas paradas',

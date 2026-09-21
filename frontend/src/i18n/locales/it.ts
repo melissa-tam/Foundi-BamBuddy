@@ -982,6 +982,8 @@ export default {
         notConnected: 'La stampante è offline. Collegala, poi espelli.',
         dispatchFailed: 'Comando di espulsione fallito: {{message}}',
         profileNotFound: 'Il profilo di espulsione non esiste più. Scegline un altro.',
+        printerNotFound: 'La stampante non esiste più. Aggiorna la pagina.',
+        zUnreferenced: 'La stampante si è riavviata con un pezzo sul piatto e ha perso il riferimento Z. Rimuovi il pezzo a mano, poi usa Segna il piatto come liberato.',
         noPlateGate: 'Il piatto è segnato come libero. Usa Espelli piatto per dichiararlo occupato.',
       },
     },
@@ -7586,6 +7588,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'Vista della matrice',
+      lensHint: {
+        prints: 'Solo le stampe completate. Il dettaglio di un periodo mostra la ripartizione completa per esito.',
+      },
       lens: {
         prints: 'Stampe',
         hoursDown: 'Ore di fermo',

@@ -996,6 +996,8 @@ export default {
         notConnected: 'Printer is offline. Connect it, then eject.',
         dispatchFailed: 'Eject command failed: {{message}}',
         profileNotFound: 'Eject profile no longer exists. Pick another.',
+        printerNotFound: 'Printer no longer exists. Refresh the page.',
+        zUnreferenced: 'Printer restarted with a part on the plate and its Z reference is lost. Remove the part by hand, then use Mark plate as cleared.',
         noPlateGate: 'Plate is marked clear. Use Eject plate to declare it occupied.',
       },
     },
@@ -7635,6 +7637,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'Matrix lens',
+      lensHint: {
+        prints: 'Completed prints only. A bucket’s detail has the full outcome split.',
+      },
       lens: {
         prints: 'Prints',
         hoursDown: 'Hours down',

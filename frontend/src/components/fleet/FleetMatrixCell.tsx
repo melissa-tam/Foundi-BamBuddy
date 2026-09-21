@@ -55,7 +55,7 @@ import {
   hoursDownBand,
   lensRamp,
   printsBand,
-  sumMap,
+  lensValue,
   type AbsenceHeader,
   type FleetLens,
   type ResolvedThemeMode,
@@ -193,8 +193,11 @@ export function FleetMatrixCell({
     if (lens === 'time_split') {
       bar = foldTimeSplit(cell.class_seconds);
     } else {
+      // Through the OWNER, never a local sum: `lensValue` decides what a lens
+      // reads out of a cell, and the Prints lens reads COMPLETED prints. The
+      // hours conversion stays here because it is a unit, not a numerator.
       const value =
-        lens === 'hours_down' ? cell.down_seconds / SECONDS_PER_HOUR : sumMap(cell.prints);
+        lens === 'hours_down' ? cell.down_seconds / SECONDS_PER_HOUR : lensValue(cell, lens);
       text =
         lens === 'hours_down' && value > 0 ? formatHours(value, locale) : formatCount(value, locale);
       const step =

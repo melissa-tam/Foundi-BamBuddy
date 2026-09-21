@@ -67,6 +67,7 @@ import type {
 import {
   BUCKET_COLUMN_WIDTH_PX,
   FLEET_LENSES,
+  completedPrints,
   MATRIX_FROZEN_COLUMNS,
   MATRIX_FROZEN_WIDTH_PX,
   matrixFrozenLeft,
@@ -81,7 +82,6 @@ import {
   formatPrinters,
   formatSiteDate,
   isRowHidden,
-  sumMap,
   type BucketLabel,
   type FleetLens,
   type MatrixFrozenColumn,
@@ -175,7 +175,10 @@ function rowFigures(
   perDay: number | null,
 ): RowFigures {
   if (!cell) return { total: null, avg: perDay };
-  if (lens === 'prints') return { total: sumMap(cell.prints), avg: perDay };
+  // Completed only, exactly as the cells and the Avg column read it — the row
+  // Total used to sum every outcome, so Total and Avg answered different
+  // questions in the same row.
+  if (lens === 'prints') return { total: completedPrints(cell), avg: perDay };
   if (lens === 'hours_down') return { total: cell.down_seconds / SECONDS_PER_HOUR, avg: perDay };
   const split = foldTimeSplit(cell.class_seconds);
   return { total: split.total > 0 ? split.printing / split.total : null, avg: perDay };
@@ -254,11 +257,15 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
     return compareFigures(a, b, effectiveSort.direction) || left.printer_id - right.printer_id;
   });
 
-  /** The Prints ramp is relative to the window's busiest PRINTER cell. */
+  /**
+   * The Prints ramp is relative to the window's busiest PRINTER cell — and
+   * busiest means most COMPLETED, the same numerator the cells paint and the
+   * legend's "0 to {{max}}" states.
+   */
   const printsMax = buckets.reduce((max, bucket) => {
     for (const printer of visiblePrinters) {
       const cell = bucket.values.printers[String(printer.printer_id)];
-      if (cell) max = Math.max(max, sumMap(cell.prints));
+      if (cell) max = Math.max(max, completedPrints(cell));
     }
     return max;
   }, 0);
@@ -419,6 +426,13 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
           // focusable tooltip trigger nested inside a `role="tab"` button is
           // invalid, and `TabDefinition` carries no description slot.
           <InfoHint text={timeSplitReason} />
+        ) : null}
+        {activeLens === 'prints' ? (
+          // "Prints" is not ambiguous anywhere else on this tab, but the Prints
+          // per day WIDGET does stack all four outcomes — so the lens says which
+          // of the two it means, on the control, rather than leaving the reader
+          // to reconcile a matrix cell with a chart bar.
+          <InfoHint text={t('fleetMetrics.matrix.lensHint.prints')} />
         ) : null}
         <button
           type="button"

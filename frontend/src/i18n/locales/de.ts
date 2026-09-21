@@ -982,6 +982,8 @@ export default {
         notConnected: 'Drucker ist offline. Verbinden Sie ihn, dann auswerfen.',
         dispatchFailed: 'Auswurfbefehl fehlgeschlagen: {{message}}',
         profileNotFound: 'Auswurfprofil existiert nicht mehr. Wählen Sie ein anderes.',
+        printerNotFound: 'Drucker existiert nicht mehr. Aktualisieren Sie die Seite.',
+        zUnreferenced: 'Der Drucker wurde mit einem Teil auf der Platte neu gestartet, und seine Z-Referenz ist verloren. Entfernen Sie das Teil von Hand, dann verwenden Sie „Platte als freigegeben markieren“.',
         noPlateGate: 'Platte ist als freigegeben markiert. Mit „Platte auswerfen“ als belegt deklarieren.',
       },
     },
@@ -7599,6 +7601,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'Matrixansicht',
+      lensHint: {
+        prints: 'Nur abgeschlossene Drucke. Die Detailansicht eines Zeitraums zeigt die vollständige Aufteilung nach Ergebnis.',
+      },
       lens: {
         prints: 'Drucke',
         hoursDown: 'Ausfallstunden',

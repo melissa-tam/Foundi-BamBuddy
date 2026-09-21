@@ -982,6 +982,8 @@ export default {
         notConnected: 'A impressora está offline. Conecte-a e então ejete.',
         dispatchFailed: 'Falha no comando de ejeção: {{message}}',
         profileNotFound: 'O perfil de ejeção não existe mais. Escolha outro.',
+        printerNotFound: 'A impressora não existe mais. Atualize a página.',
+        zUnreferenced: 'A impressora reiniciou com uma peça na placa e perdeu a referência Z. Remova a peça à mão e, em seguida, use Marcar placa como liberada.',
         noPlateGate: 'A placa está marcada como liberada. Use Ejetar placa para declará-la ocupada.',
       },
     },
@@ -7586,6 +7588,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'Visão da matriz',
+      lensHint: {
+        prints: 'Somente impressões concluídas. O detalhe de um período mostra a divisão completa por resultado.',
+      },
       lens: {
         prints: 'Impressões',
         hoursDown: 'Horas paradas',

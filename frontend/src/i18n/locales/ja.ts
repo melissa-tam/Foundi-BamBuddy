@@ -981,6 +981,8 @@ export default {
         notConnected: 'プリンターがオフラインです。接続してから排出してください。',
         dispatchFailed: '排出コマンドが失敗しました: {{message}}',
         profileNotFound: '排出プロファイルは存在しません。別のものを選択してください。',
+        printerNotFound: 'プリンターは存在しません。ページを更新してください。',
+        zUnreferenced: 'プレートに部品が載ったままプリンターが再起動し、Z基準が失われました。部品を手で取り除いてから、「プレートをクリア済みにする」を使用してください。',
         noPlateGate: 'プレートはクリア済みとして記録されています。「プレートを排出」で占有済みとして宣言してください。',
       },
     },
@@ -7598,6 +7600,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: 'マトリクスの表示',
+      lensHint: {
+        prints: '完了した印刷のみです。期間の詳細には結果別の内訳がすべて表示されます。',
+      },
       lens: {
         prints: '印刷数',
         hoursDown: '停止時間',

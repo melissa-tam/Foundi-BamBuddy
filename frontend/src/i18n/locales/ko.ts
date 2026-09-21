@@ -956,6 +956,8 @@ export default {
         notConnected: '프린터가 오프라인입니다. 연결한 뒤 배출하세요.',
         dispatchFailed: '배출 명령이 실패했습니다: {{message}}',
         profileNotFound: '배출 프로파일이 더 이상 존재하지 않습니다. 다른 프로파일을 선택하세요.',
+        printerNotFound: '프린터가 더 이상 존재하지 않습니다. 페이지를 새로고침하세요.',
+        zUnreferenced: '프린터가 플레이트에 부품이 있는 상태로 재시작되어 Z 기준을 잃었습니다. 부품을 손으로 제거한 뒤, 플레이트 비움으로 표시를 사용하세요.',
         noPlateGate: '플레이트가 비움으로 표시되어 있습니다. 점유 상태로 선언하려면 플레이트 배출을 사용하세요.'
       }
     },
@@ -7224,6 +7226,9 @@ export default {
     },
     matrix: {
       lensAriaLabel: '매트릭스 보기',
+      lensHint: {
+        prints: '완료된 인쇄만 포함합니다. 기간의 상세 정보에 결과별 전체 분류가 있습니다.',
+      },
       lens: {
         prints: '인쇄 수',
         hoursDown: '중단 시간',
