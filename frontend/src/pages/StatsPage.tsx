@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import {
   Package,
   Clock,
@@ -56,9 +57,29 @@ import {
   chartAxisTick,
 } from '../utils/chartChrome';
 import { MetricToggle, type Metric } from '../components/MetricToggle';
+import { TabList, TabPanel } from '../components/ui/Tabs';
+import { useTabs } from '../hooks/useTabs';
+import { InfoHint } from '../components/ui/InfoHint';
+import { FleetTab, FleetTimeframeHint } from '../components/fleet/FleetTab';
+import { FLEET_DASHBOARD_STORAGE_KEY } from '../utils/fleetMetrics';
 
 // Constants
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+/**
+ * The two lenses on this page. `prints` is the default, so it is the ABSENCE
+ * of the search param rather than a value — a URL nobody has touched opens
+ * where it always did.
+ */
+type StatsTab = 'prints' | 'fleet';
+
+/**
+ * The Prints grid's layout key. Its Fleet twin is `FLEET_DASHBOARD_STORAGE_KEY`
+ * (declared beside the fleet encoding, because the header reads it too): the
+ * header's "Reset layout" and hidden-widget count act on whichever tab is open,
+ * so the key is a function of the active tab and not a literal at each site.
+ */
+const PRINTS_DASHBOARD_STORAGE_KEY = 'bambusy-dashboard-layout-v2';
 
 const HOUR_LABELS = [
   '12am', '1am', '2am', '3am', '4am', '5am',
@@ -929,6 +950,11 @@ export function StatsPage() {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const { hasPermission, authEnabled } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // DERIVED from the URL, never mirrored into state: a deep link and a click
+  // land in exactly the same place, and there is no second copy to get out of
+  // step with the address bar.
+  const activeTab: StatsTab = searchParams.get('tab') === 'fleet' ? 'fleet' : 'prints';
   const [isExporting, setIsExporting] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [dashboardKey, setDashboardKey] = useState(0);
@@ -949,6 +975,31 @@ export function StatsPage() {
   });
   const [showTimeframePicker, setShowTimeframePicker] = useState(false);
 
+  const handleTabChange = (tab: StatsTab) => {
+    if (tab === 'fleet') {
+      searchParams.set('tab', 'fleet');
+    } else {
+      searchParams.delete('tab');
+    }
+    // `replace`: arrowing across a two-tab strip is not navigation, and a
+    // history entry per keystroke would make Back mean "the tab I was on a
+    // moment ago" instead of "the page I came from".
+    setSearchParams(searchParams, { replace: true });
+  };
+
+  const tabs = useTabs<StatsTab>({
+    value: activeTab,
+    onChange: handleTabChange,
+    items: [
+      { id: 'prints', label: t('fleetMetrics.tabs.prints') },
+      { id: 'fleet', label: t('fleetMetrics.tabs.fleet') },
+    ],
+  });
+
+  /** The grid the header's layout controls act on: whichever tab is open. */
+  const layoutStorageKey =
+    activeTab === 'fleet' ? FLEET_DASHBOARD_STORAGE_KEY : PRINTS_DASHBOARD_STORAGE_KEY;
+
   // Persist timeframe selection
   useEffect(() => {
     localStorage.setItem('bambusy-stats-timeframe', JSON.stringify(timeframe));
@@ -961,11 +1012,11 @@ export function StatsPage() {
     return computeDateRange(timeframe.preset, utcToday());
   }, [timeframe]);
 
-  // Read hidden count from localStorage
+  // Read hidden count from the ACTIVE tab's layout
   useEffect(() => {
     const updateHiddenCount = () => {
       try {
-        const saved = localStorage.getItem('bambusy-dashboard-layout-v2');
+        const saved = localStorage.getItem(layoutStorageKey);
         if (saved) {
           const layout = JSON.parse(saved);
           setHiddenCount(layout.hidden?.length || 0);
@@ -983,7 +1034,7 @@ export function StatsPage() {
       window.removeEventListener('storage', updateHiddenCount);
       clearInterval(interval);
     };
-  }, [dashboardKey]);
+  }, [dashboardKey, layoutStorageKey]);
 
   // Only pass createdById when a user is actually selected (not "All Users")
   const createdByIdParam = selectedUserId !== null ? selectedUserId : undefined;
@@ -1062,13 +1113,9 @@ export function StatsPage() {
   const printerMap = new Map(printers?.map((p) => [String(p.id), p.name]) || []);
   const printDates = useMemo(() => archives?.map((a) => a.created_at) || [], [archives]);
 
-  if (isLoading) {
-    return (
-      <div className="p-4 md:p-8">
-        <div className="text-center py-12 text-bambu-gray">{t('stats.loadingStats')}</div>
-      </div>
-    );
-  }
+  // The archive queries are the PRINTS tab's, so their loading state belongs
+  // inside that panel. Returning early here would make a `?tab=fleet` deep
+  // link wait on print archives before it could say whether a printer is down.
 
   // Define dashboard widgets
   // Sizes: 1 = quarter (1/4), 2 = half (1/2), 4 = full width
@@ -1155,7 +1202,7 @@ export function StatsPage() {
           <Button
             variant="secondary"
             onClick={() => {
-              localStorage.removeItem('bambusy-dashboard-layout-v2');
+              localStorage.removeItem(layoutStorageKey);
               setDashboardKey(prev => prev + 1);
               showToast(t('stats.layoutReset'));
             }}
@@ -1165,6 +1212,11 @@ export function StatsPage() {
             <RotateCcw className="w-4 h-4" />
             {t('stats.resetLayout')}
           </Button>
+          {/* Recalculate costs, Export and the user filter all act on print
+              ARCHIVES, so they are absent on the Fleet tab rather than present
+              and inert. */}
+          {activeTab === 'prints' && (
+            <>
           {/* Recalculate Costs */}
           <Button
             variant="secondary"
@@ -1269,6 +1321,8 @@ export function StatsPage() {
               )}
             </div>
           )}
+            </>
+          )}
           {/* Timeframe Selector */}
           <div className="relative">
             <Button
@@ -1353,16 +1407,39 @@ export function StatsPage() {
               </>
             )}
           </div>
+          {/* The picker serves both tabs, and the two read a different day.
+              Which one is in force is supplementary detail, so it rides a
+              tooltip on the control rather than a line of the header. */}
+          {activeTab === 'fleet' ? (
+            <FleetTimeframeHint />
+          ) : (
+            <InfoHint text={t('fleetMetrics.hints.timeframePrints')} />
+          )}
         </div>
       </div>
 
-      <Dashboard
-        key={dashboardKey}
-        widgets={widgets}
-        storageKey="bambusy-dashboard-layout-v2"
-        stackBelow={640}
-        hideControls
+      <TabList
+        tabs={tabs}
+        ariaLabel={t('fleetMetrics.tabs.ariaLabel')}
+        variant="underline"
+        className="mb-6 overflow-x-auto"
       />
+
+      <TabPanel tabs={tabs}>
+        {activeTab === 'fleet' ? (
+          <FleetTab timeframe={timeframe} gridKey={dashboardKey} />
+        ) : isLoading ? (
+          <div className="text-center py-12 text-bambu-gray">{t('stats.loadingStats')}</div>
+        ) : (
+          <Dashboard
+            key={dashboardKey}
+            widgets={widgets}
+            storageKey={PRINTS_DASHBOARD_STORAGE_KEY}
+            stackBelow={640}
+            hideControls
+          />
+        )}
+      </TabPanel>
     </div>
   );
 }

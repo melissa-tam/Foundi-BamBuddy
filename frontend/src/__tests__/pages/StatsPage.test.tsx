@@ -2,12 +2,17 @@
  * Tests for the StatsPage component.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { render } from '../utils';
 import { StatsPage } from '../../pages/StatsPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
+import { FLEET_DASHBOARD_STORAGE_KEY } from '../../utils/fleetMetrics';
+
+/** The Prints grid's layout key, spelled here so the reset test can prove it is untouched. */
+const PRINTS_DASHBOARD_STORAGE_KEY = 'bambusy-dashboard-layout-v2';
 
 // Complete mock stats matching ArchiveStats interface
 const mockStats = {
@@ -141,6 +146,9 @@ const mockFailureAnalysis = {
 
 describe('StatsPage', () => {
   beforeEach(() => {
+    // The tab selection lives in the URL, and `BrowserRouter` reads the real
+    // one — so a test that deep-links must not leak its search into the next.
+    window.history.replaceState({}, '', '/');
     server.use(
       http.get('/api/v1/archives/stats', () => {
         return HttpResponse.json(mockStats);
@@ -579,6 +587,95 @@ describe('StatsPage', () => {
       expect(totalPrints?.querySelector('svg[aria-label]')).toBeNull();
       const printTime = screen.getByText('Print Time').closest('div');
       expect(printTime?.querySelector('svg[aria-label]')).toBeNull();
+    });
+  });
+
+  describe('the Prints / Fleet tab bar', () => {
+    it('opens the Fleet tab from a ?tab=fleet deep link', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+
+      render(<StatsPage />);
+
+      expect(
+        await screen.findByRole('tab', { name: 'Fleet', selected: true }),
+      ).toBeInTheDocument();
+    });
+
+    it('defaults to Prints when the URL says nothing', async () => {
+      render(<StatsPage />);
+
+      expect(
+        await screen.findByRole('tab', { name: 'Prints', selected: true }),
+      ).toBeInTheDocument();
+    });
+
+    it('writes the selection into the URL without adding a history entry', async () => {
+      const pushState = vi.spyOn(window.history, 'pushState');
+      render(<StatsPage />);
+
+      await userEvent.click(await screen.findByRole('tab', { name: 'Fleet' }));
+
+      await waitFor(() => expect(window.location.search).toBe('?tab=fleet'));
+      expect(pushState).not.toHaveBeenCalled();
+      pushState.mockRestore();
+    });
+
+    it('drops the param again on the way back to Prints', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+      render(<StatsPage />);
+
+      await userEvent.click(await screen.findByRole('tab', { name: 'Prints' }));
+
+      await waitFor(() => expect(window.location.search).toBe(''));
+    });
+  });
+
+  describe('tab-aware header controls', () => {
+    it('hides the archive controls on the Fleet tab', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+      render(<StatsPage />);
+      await screen.findByRole('tab', { name: 'Fleet', selected: true });
+
+      // All three act on print ARCHIVES, which the Fleet tab does not read.
+      expect(screen.queryByText('Recalculate Costs')).not.toBeInTheDocument();
+      expect(screen.queryByText('Export Stats')).not.toBeInTheDocument();
+      expect(screen.queryByText('All Users')).not.toBeInTheDocument();
+      // The layout and timeframe controls serve both tabs and stay.
+      expect(screen.getByText('Reset Layout')).toBeInTheDocument();
+    });
+
+    it('keeps the archive controls on the Prints tab', async () => {
+      render(<StatsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Recalculate Costs')).toBeInTheDocument();
+      });
+      expect(screen.getByText('Export Stats')).toBeInTheDocument();
+    });
+
+    it('resets only the active tab’s layout', async () => {
+      window.history.replaceState({}, '', '/?tab=fleet');
+      const removeItem = vi.mocked(localStorage.removeItem);
+      removeItem.mockClear();
+
+      render(<StatsPage />);
+      await screen.findByRole('tab', { name: 'Fleet', selected: true });
+      await userEvent.click(screen.getByText('Reset Layout'));
+
+      expect(removeItem).toHaveBeenCalledWith(FLEET_DASHBOARD_STORAGE_KEY);
+      expect(removeItem).not.toHaveBeenCalledWith(PRINTS_DASHBOARD_STORAGE_KEY);
+    });
+
+    it('resets the Prints layout when Prints is the active tab', async () => {
+      const removeItem = vi.mocked(localStorage.removeItem);
+      removeItem.mockClear();
+
+      render(<StatsPage />);
+      await waitFor(() => expect(screen.getByText('Reset Layout')).toBeInTheDocument());
+      await userEvent.click(screen.getByText('Reset Layout'));
+
+      expect(removeItem).toHaveBeenCalledWith(PRINTS_DASHBOARD_STORAGE_KEY);
+      expect(removeItem).not.toHaveBeenCalledWith(FLEET_DASHBOARD_STORAGE_KEY);
     });
   });
 });
