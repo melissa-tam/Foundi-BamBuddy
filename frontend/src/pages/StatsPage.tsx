@@ -42,53 +42,20 @@ import { Dashboard, type DashboardWidget } from '../components/Dashboard';
 import { getCurrencySymbol } from '../utils/currency';
 import { formatWeight } from '../utils/weight';
 import { parseUTCDate, formatDuration } from '../utils/date';
+import {
+  TIMEFRAME_PRESETS,
+  computeDateRange,
+  utcToday,
+  type TimeframeState,
+} from '../utils/timeframe';
+import {
+  CHART_AXIS_STROKE,
+  CHART_GRID_DASH,
+  CHART_GRID_STROKE,
+  CHART_TOOLTIP_CONTENT_STYLE,
+  chartAxisTick,
+} from '../utils/chartChrome';
 import { MetricToggle, type Metric } from '../components/MetricToggle';
-
-// Timeframe types and helpers
-type TimeframePreset = 'today' | 'this-week' | 'this-month' | 'last-7' | 'last-30' | 'last-90' | 'this-year' | 'all-time' | 'custom';
-
-interface TimeframeState {
-  preset: TimeframePreset;
-  dateFrom: string | undefined; // YYYY-MM-DD
-  dateTo: string | undefined;   // YYYY-MM-DD
-}
-
-function computeDateRange(preset: TimeframePreset): { dateFrom?: string; dateTo?: string } {
-  const now = new Date();
-  const y = now.getUTCFullYear(), m = now.getUTCMonth(), d = now.getUTCDate();
-  const fmt = (dt: Date) => dt.toISOString().split('T')[0];
-  const todayStr = fmt(now);
-
-  switch (preset) {
-    case 'today':
-      return { dateFrom: todayStr, dateTo: todayStr };
-    case 'this-week': {
-      const day = now.getUTCDay();
-      const start = new Date(Date.UTC(y, m, d - (day === 0 ? 6 : day - 1)));
-      return { dateFrom: fmt(start), dateTo: todayStr };
-    }
-    case 'this-month':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, 1))), dateTo: todayStr };
-    case 'last-7':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, d - 6))), dateTo: todayStr };
-    case 'last-30':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, d - 29))), dateTo: todayStr };
-    case 'last-90':
-      return { dateFrom: fmt(new Date(Date.UTC(y, m, d - 89))), dateTo: todayStr };
-    case 'this-year':
-      return { dateFrom: fmt(new Date(Date.UTC(y, 0, 1))), dateTo: todayStr };
-    case 'all-time':
-      return { dateFrom: undefined, dateTo: undefined };
-    case 'custom':
-      return {};
-  }
-}
-
-const TIMEFRAME_PRESETS: TimeframePreset[] = [
-  'today', 'this-week', 'this-month',
-  'last-7', 'last-30', 'last-90',
-  'this-year', 'all-time',
-];
 
 // Constants
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -110,12 +77,6 @@ const DURATION_BUCKETS = [
   { key: '12-24h', max: 86400 },
   { key: '24h+', max: Infinity },
 ];
-
-const RECHARTS_TOOLTIP_STYLE = {
-  backgroundColor: '#2d2d2d',
-  border: '1px solid #3d3d3d',
-  borderRadius: '8px',
-};
 
 // Widget Components
 function QuickStatsWidget({
@@ -641,11 +602,11 @@ function PrinterStatsWidget({
         {printerData.length > 0 ? (
           <ResponsiveContainer width="100%" height={Math.max(140, printerData.length * 40)}>
             <BarChart data={printerData} layout="vertical" margin={{ left: 10 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-              <XAxis type="number" stroke="#9ca3af" tick={{ fontSize: 11 }} unit={ps.unit} />
-              <YAxis type="category" dataKey="name" stroke="#9ca3af" tick={{ fontSize: 11 }} width={100} />
+              <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+              <XAxis type="number" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} unit={ps.unit} />
+              <YAxis type="category" dataKey="name" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} width={100} />
               <Tooltip
-                contentStyle={RECHARTS_TOOLTIP_STYLE}
+                contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
                 formatter={(v: number | undefined) => [
                   printerMetric === 'weight' ? formatWeight(Number(v ?? 0)) : `${v ?? 0}${ps.unit}`,
                   pLabel,
@@ -666,10 +627,10 @@ function PrinterStatsWidget({
           {archives.length > 0 ? (
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={durationData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-                <XAxis dataKey="name" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-                <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} allowDecimals={false} />
-                <Tooltip contentStyle={RECHARTS_TOOLTIP_STYLE} />
+                <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+                <XAxis dataKey="name" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} />
+                <YAxis stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} allowDecimals={false} />
+                <Tooltip contentStyle={CHART_TOOLTIP_CONTENT_STYLE} />
                 <Bar dataKey="count" name={t('common.prints')} fill="#00ae42" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -687,10 +648,10 @@ function PrinterStatsWidget({
           {archives.length > 0 ? (
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={habitsData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-                <XAxis dataKey="name" stroke="#9ca3af" tick={{ fontSize: 11 }} />
-                <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} unit={hs.unit} />
-                <Tooltip contentStyle={RECHARTS_TOOLTIP_STYLE} formatter={(v: number | undefined) => [`${v ?? 0}${hs.unit}`, hLabel]} />
+                <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+                <XAxis dataKey="name" stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} />
+                <YAxis stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} unit={hs.unit} />
+                <Tooltip contentStyle={CHART_TOOLTIP_CONTENT_STYLE} formatter={(v: number | undefined) => [`${v ?? 0}${hs.unit}`, hLabel]} />
                 <Bar dataKey="avg" fill={hs.color} radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -705,10 +666,10 @@ function PrinterStatsWidget({
           {archives.length > 0 ? (
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={hourlyData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#3d3d3d" />
-                <XAxis dataKey="label" stroke="#9ca3af" tick={{ fontSize: 10 }} interval={5} />
-                <YAxis stroke="#9ca3af" tick={{ fontSize: 11 }} allowDecimals={false} />
-                <Tooltip contentStyle={RECHARTS_TOOLTIP_STYLE} />
+                <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
+                <XAxis dataKey="label" stroke={CHART_AXIS_STROKE} tick={chartAxisTick(10)} interval={5} />
+                <YAxis stroke={CHART_AXIS_STROKE} tick={chartAxisTick()} allowDecimals={false} />
+                <Tooltip contentStyle={CHART_TOOLTIP_CONTENT_STYLE} />
                 <Bar dataKey="total" name={t('stats.totalPrints')} fill="#00ae42" radius={[2, 2, 0, 0]} />
                 <Bar dataKey="failures" name={t('stats.failed')} fill="#ef4444" radius={[2, 2, 0, 0]} />
               </BarChart>
@@ -997,7 +958,7 @@ export function StatsPage() {
     if (timeframe.preset === 'custom') {
       return { dateFrom: timeframe.dateFrom, dateTo: timeframe.dateTo };
     }
-    return computeDateRange(timeframe.preset);
+    return computeDateRange(timeframe.preset, utcToday());
   }, [timeframe]);
 
   // Read hidden count from localStorage

@@ -14,6 +14,16 @@ import {
 import { api } from '../api/client';
 import type { InventorySpool, SpoolUsageRecord, FilamentSkuSettings, ShoppingListItem } from '../api/client';
 import { getSwatchStyle } from '../utils/colors';
+import {
+  CHART_GRID_DASH,
+  CHART_GRID_STROKE,
+  CHART_LEGEND_TEXT_STYLE,
+  CHART_MUTED_TEXT,
+  CHART_TOOLTIP_CONTENT_STYLE,
+  CHART_TOOLTIP_ITEM_STYLE,
+  CHART_TOOLTIP_LABEL_STYLE,
+  chartAxisTick,
+} from '../utils/chartChrome';
 import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -719,16 +729,16 @@ function UsageChart({ forecasts, days: maxDays, onDaysChange }: {
               </linearGradient>
             ))}
           </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#374151" strokeOpacity={0.5} />
+          <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
           <XAxis
             dataKey="label"
-            tick={{ fill: '#6B7280', fontSize: 10 }}
+            tick={chartAxisTick(10)}
             interval={Math.max(0, Math.ceil(lastNonZeroDay / 8) - 1)}
             axisLine={false}
             tickLine={false}
           />
           <YAxis
-            tick={{ fill: '#6B7280', fontSize: 10 }}
+            tick={chartAxisTick(10)}
             axisLine={false}
             tickLine={false}
             tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}kg` : `${v}g`}
@@ -738,16 +748,16 @@ function UsageChart({ forecasts, days: maxDays, onDaysChange }: {
             content={({ label: dateLabel, payload }) => {
               if (!payload?.length) return null;
               return (
-                <div style={{ background: '#1a1a2e', border: '1px solid #374151', borderRadius: 8, fontSize: 12, padding: '8px 12px' }}>
-                  <div style={{ color: '#9CA3AF', marginBottom: 6 }}>{dateLabel}</div>
+                <div style={{ ...CHART_TOOLTIP_CONTENT_STYLE, fontSize: 12, padding: '8px 12px' }}>
+                  <div style={{ ...CHART_TOOLTIP_LABEL_STYLE, marginBottom: 6 }}>{dateLabel}</div>
                   {payload.map((p) => {
                     const s = series.find((x) => x.key === String(p.dataKey));
                     if (typeof p.value !== 'number') return null;
                     return (
-                      <div key={String(p.dataKey)} style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#E5E7EB', marginBottom: 2 }}>
-                        <span style={{ color: s?.color ?? '#9CA3AF', fontSize: 10 }}>●</span>
+                      <div key={String(p.dataKey)} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                        <span style={{ color: s?.color ?? CHART_MUTED_TEXT, fontSize: 10 }}>●</span>
                         <span>{s?.label ?? String(p.dataKey)}</span>
-                        <span style={{ color: '#9CA3AF', marginLeft: 4 }}>{p.value}g</span>
+                        <span style={{ ...CHART_TOOLTIP_ITEM_STYLE, marginLeft: 4 }}>{p.value}g</span>
                       </div>
                     );
                   })}
@@ -758,7 +768,7 @@ function UsageChart({ forecasts, days: maxDays, onDaysChange }: {
           <Legend
             formatter={(value) => {
               const s = series.find((x) => x.key === value);
-              return <span style={{ color: '#9CA3AF', fontSize: 11 }}>{s?.label ?? value}</span>;
+              return <span style={{ ...CHART_LEGEND_TEXT_STYLE, fontSize: 11 }}>{s?.label ?? value}</span>;
             }}
           />
           {series.map((s) => (
@@ -1689,24 +1699,24 @@ function CartLogisticsRow({
                   <stop offset="95%" stopColor="#1DB954" stopOpacity={0.03} />
                 </linearGradient>
               </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#374151" strokeOpacity={0.4} />
+              <CartesianGrid strokeDasharray={CHART_GRID_DASH} stroke={CHART_GRID_STROKE} />
               <XAxis
                 dataKey="label"
-                tick={{ fill: '#6B7280', fontSize: 9 }}
+                tick={chartAxisTick(9)}
                 interval={Math.max(0, Math.ceil(chartData.maxDays / 6) - 1)}
                 axisLine={false}
                 tickLine={false}
               />
               <YAxis
-                tick={{ fill: '#6B7280', fontSize: 9 }}
+                tick={chartAxisTick(9)}
                 axisLine={false}
                 tickLine={false}
                 tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}kg` : `${v}g`}
                 width={44}
               />
               <Tooltip
-                contentStyle={{ background: '#1a1a2e', border: '1px solid #374151', borderRadius: 8, fontSize: 11 }}
-                labelStyle={{ color: '#9CA3AF' }}
+                contentStyle={{ ...CHART_TOOLTIP_CONTENT_STYLE, fontSize: 11 }}
+                labelStyle={CHART_TOOLTIP_LABEL_STYLE}
                 formatter={(value, name) => {
                   if (typeof value !== 'number') return '';
                   if (name === 'stock') return `${value}g — ${t('forecast.stock')}`;
