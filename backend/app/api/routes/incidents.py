@@ -91,8 +91,6 @@ class IncidentsResponse(BaseModel):
 
 
 def _row(incident: PrinterIncident, printer_name: str | None, *, now: datetime) -> IncidentRow:
-    end = incident.resolved_at or now
-    held_s = max(0.0, (end - incident.created_at).total_seconds()) if incident.created_at else 0.0
     external = printer_incidents.row_external(incident)
     return IncidentRow(
         id=incident.id,
@@ -112,7 +110,7 @@ def _row(incident: PrinterIncident, printer_name: str | None, *, now: datetime) 
         escalated_at=incident.escalated_at,
         resolved_at=incident.resolved_at,
         resolve_source=incident.resolve_source,
-        held_s=held_s,
+        held_s=printer_incidents.held_seconds(incident, now),
     )
 
 
