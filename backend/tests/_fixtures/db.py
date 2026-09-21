@@ -53,7 +53,7 @@ import pytest
 from sqlalchemy import Table, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
-from backend.app.core.database import Base
+from backend.app.core.database import Base, run_migrations
 
 # TWO urls, because the StaticPool hazard is scoped to SHARED ownership.
 #
@@ -136,6 +136,29 @@ async def create_memory_engine(*, echo: bool = False) -> AsyncEngine:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     return engine
+
+
+async def boot_schema(engine: AsyncEngine) -> None:
+    """Bring ``engine`` up the way a real boot does: ``create_all`` + ``run_migrations``.
+
+    What ``init_db`` does to the schema, minus the seeders — and in ONE transaction,
+    because that is how production runs it: a bad migration statement aborts startup
+    with the old schema intact rather than half-applied.
+
+    It exists so a migration test can express "and then the app booted on top of this"
+    without spelling ``Base.metadata.create_all`` itself. That spelling is what the
+    ownership pins in ``unit/test_fixture_ownership.py`` forbid outside this package,
+    and rightly: a test that builds the schema its own way is testing its own
+    reimplementation of the boot rather than the boot.
+
+    Idempotent by construction — ``create_all`` skips tables that exist and every
+    migration statement is written to be re-runnable — so calling it twice is exactly
+    the second boot a test may want to assert on.
+    """
+    import_all_models()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await run_migrations(conn)
 
 
 @dataclass(slots=True)
