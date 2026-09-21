@@ -33,9 +33,16 @@ import {
   PartialAwareBar,
   type ChartLegendEntry,
 } from './ChartFrame';
+import { isolatedDot } from './chartMarks';
 import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
-import { NO_VALUE, printsRows, printsTotals, type PrintsRowValues } from './rows';
+import {
+  NO_VALUE,
+  printsRows,
+  printsTotals,
+  type Nullable,
+  type PrintsRowValues,
+} from './rows';
 import type { FleetOverview, PrintOutcome } from '../../../types/fleetMetrics';
 import {
   CHART_AXIS_STROKE,
@@ -43,6 +50,7 @@ import {
   CHART_GRID_STROKE,
   CHART_MUTED_TEXT,
   chartAxisTick,
+  chartYAxisWidth,
 } from '../../../utils/chartChrome';
 import {
   OUTCOME_COLOR,
@@ -53,6 +61,8 @@ import {
   formatCount,
   formatPercent,
   formatPrinters,
+  formatTickCount,
+  isolatedPointKeys,
   SUM_UNCERTAINTY,
 } from '../../../utils/fleetMetrics';
 
@@ -74,6 +84,34 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
   const totals = printsTotals(overview.throughput);
   const successPct = overview.throughput.totals.success_pct;
 
+  /**
+   * The y axis is sized for the data ACTUALLY DRAWN, not for a number typed
+   * into the file: the axis shipped at a flat 34 px, which fits `900` and
+   * clips `10,000` — so a farm having one huge day lost a digit off the very
+   * figure the whole chart is scaled to. The tallest bar is the stack's total
+   * (the line series is prints per PRINTER and always sits under it), and the
+   * ticks are spelled compactly so a five-figure axis costs three glyphs
+   * rather than six.
+   */
+  const tickFormat = (value: number): string => formatTickCount(value, locale);
+  const tallestBar = rows.reduce((max, row) => Math.max(max, row.total ?? 0), 0);
+  const yAxisWidth = chartYAxisWidth(tickFormat(tallestBar), AXIS_TICK_SIZE[size]);
+
+  /** A count, or a dash where the bucket has not happened. */
+  const count = (value: number | null): string =>
+    value === null ? NO_VALUE : formatCount(value, locale);
+
+  /**
+   * Prints per printer exists for OBSERVED buckets only, so on a young instance
+   * there is exactly one of them — and a one-point line is a zero-length path
+   * that paints nothing while the legend promises a line. Isolated points are
+   * drawn as dots; `isolatedPointKeys` decides which, per the rule in the util.
+   */
+  const perPrinterDot = isolatedDot(
+    isolatedPointKeys(rows, (row) => row.per_printer),
+    CHART_MUTED_TEXT,
+  );
+
   const legend: ChartLegendEntry[] = [
     ...OUTCOME_ORDER.map((outcome) => ({
       key: outcome,
@@ -90,21 +128,21 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
     },
   ];
 
-  const columns: ChartDataColumn<PrintsRowValues>[] = [
+  const columns: ChartDataColumn<Nullable<PrintsRowValues>>[] = [
     ...OUTCOME_ORDER.map((outcome) => ({
       key: outcome,
       header: t(OUTCOME_LABEL_KEY[outcome]),
-      format: (values: PrintsRowValues) => formatCount(values[outcome], locale),
+      format: (values: Nullable<PrintsRowValues>) => count(values[outcome]),
     })),
     {
       key: 'total',
       header: t('fleetMetrics.matrix.columns.total'),
-      format: (values: PrintsRowValues) => formatCount(values.total, locale),
+      format: (values: Nullable<PrintsRowValues>) => count(values.total),
     },
     {
       key: 'per_printer',
       header: t('fleetMetrics.summary.rows.prints_per_printer_per_day'),
-      format: (values: PrintsRowValues) =>
+      format: (values: Nullable<PrintsRowValues>) =>
         values.per_printer === null ? NO_VALUE : formatPrinters(values.per_printer, locale),
     },
   ];
@@ -144,7 +182,8 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
             <YAxis
               stroke={CHART_AXIS_STROKE}
               tick={chartAxisTick(AXIS_TICK_SIZE[size])}
-              width={34}
+              tickFormatter={tickFormat}
+              width={yAxisWidth}
               allowDecimals={false}
             />
             <Tooltip
@@ -184,7 +223,7 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
               name={t('fleetMetrics.summary.rows.prints_per_printer_per_day')}
               stroke={CHART_MUTED_TEXT}
               strokeWidth={2}
-              dot={false}
+              dot={perPrinterDot}
               activeDot={false}
               connectNulls={false}
               isAnimationActive={false}
@@ -193,7 +232,7 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
         </ResponsiveContainer>
       }
       table={
-        <ChartDataTable<PrintsRowValues>
+        <ChartDataTable<Nullable<PrintsRowValues>>
           caption={t('fleetMetrics.sections.printsPerDay')}
           rowHeader={t('fleetMetrics.widgets.bucketColumn')}
           columns={columns}

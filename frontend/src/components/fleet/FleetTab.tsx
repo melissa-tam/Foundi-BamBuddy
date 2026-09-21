@@ -22,13 +22,22 @@
  * No skeletons anywhere: `animate-pulse` already means "live" in this app, and
  * a pulsing placeholder would read as a printer doing something.
  *
- * ## First run
+ * ## The recording notice
  *
  * Observation history starts the day the recorder ships and can never be
- * backfilled, so a fresh instance has a full live column and an empty period
- * column. That is stated once, as an info alert, and the summary drops the rows
- * it has nothing to say about — rather than printing a column of dashes that
- * reads like a fault.
+ * backfilled, while the print log and the fault ledger go back weeks. So on a
+ * real instance nearly every window an operator picks is MOSTLY unrecorded —
+ * that is the normal first month of this tab's life, not an edge case, and the
+ * tab has to read honestly in it.
+ *
+ * The notice therefore fires on the WINDOW (`windowPrecedesRecording`), not on
+ * "has anything ever been observed": the old condition was true only on a
+ * virgin instance, so the one state it was written for — a 44-day window over
+ * an hour-old recorder — said nothing at all.
+ *
+ * `firstRun` is a different and much narrower question, and keeps its own name:
+ * it decides whether the summary DROPS the rows it has nothing to say about,
+ * rather than printing a column of dashes that reads like a fault.
  */
 import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -45,6 +54,7 @@ import {
   SECONDARY_TEXT_CLASS,
   formatInstantSiteDay,
   formatSiteDate,
+  windowPrecedesRecording,
 } from '../../utils/fleetMetrics';
 import type { FleetOverview, FleetStatus } from '../../types/fleetMetrics';
 import type { TimeframeState } from '../../utils/timeframe';
@@ -60,6 +70,23 @@ import type { TimeframeState } from '../../utils/timeframe';
  * than as the page jumping.
  */
 const SECTION_RESERVE_CLASS = 'min-h-[32rem]';
+
+/**
+ * The recording notice's slot, ALWAYS in the flow.
+ *
+ * The notice's own condition is not known until `/status` lands, and an alert
+ * that appears a moment after first paint pushes the summary card — the hero
+ * this tab's whole geometry was already pinned to hold still (its row floor,
+ * its reserved peak sub-line, its fixed list min-heights all exist for exactly
+ * that reason). So the slot is reserved rather than conditional, and only its
+ * CONTENT arrives late.
+ *
+ * `2.875rem` is one `InlineAlert` measured: `p-3` top and bottom (24 px), one
+ * `text-sm` line at 20 px, and the 1 px border either side. The notice wraps to
+ * a second line below roughly 720 px of card width, where the slot grows with
+ * it — the reserve is what keeps the steady desktop case still, not a cap.
+ */
+const NOTICE_SLOT_CLASS = 'min-h-[2.875rem]';
 
 /**
  * Nothing has been observed yet.
@@ -117,6 +144,16 @@ export function FleetTab({ timeframe, gridKey }: FleetTabProps) {
   const overview = overviewQuery.data;
 
   const firstRun = isFirstRun(status, overview);
+  /**
+   * Does this window reach back before the recorder did? Read from `/status`
+   * and the RESOLVED window, so it is answerable the moment status lands and
+   * never waits on the history sweep. An unresolved window (a custom preset
+   * with a missing or reversed date) has nothing to say about.
+   */
+  const recordingGap =
+    status !== undefined &&
+    range !== undefined &&
+    windowPrecedesRecording(range.dateFrom, status.recording_since, status.tz_name);
   // Status answered but the picker resolves to no window at all — a custom
   // preset with a missing or reversed date. Nothing is loading; there is
   // simply nothing to ask for.
@@ -127,23 +164,25 @@ export function FleetTab({ timeframe, gridKey }: FleetTabProps) {
 
   return (
     <div className="space-y-6">
-      {firstRun && status !== undefined && (
-        <InlineAlert severity="info">
-          {t('fleetMetrics.states.firstRun', {
-            date:
-              status.recording_since === null
-                ? // Recording begins with this build, so the site's today IS
-                  // the day it started — and `site_today` is already a site
-                  // calendar DATE, not an instant to be converted.
-                  formatSiteDate(status.site_today, locale)
-                : formatInstantSiteDay(status.recording_since, status.tz_name, locale),
-            earliest:
-              status.history_since === null
-                ? formatSiteDate(status.site_today, locale)
-                : formatInstantSiteDay(status.history_since, status.tz_name, locale),
-          })}
-        </InlineAlert>
-      )}
+      <div className={NOTICE_SLOT_CLASS}>
+        {recordingGap && status !== undefined && (
+          <InlineAlert severity="info">
+            {t('fleetMetrics.states.recordingGap', {
+              date:
+                status.recording_since === null
+                  ? // Recording begins with this build, so the site's today IS
+                    // the day it started — and `site_today` is already a site
+                    // calendar DATE, not an instant to be converted.
+                    formatSiteDate(status.site_today, locale)
+                  : formatInstantSiteDay(status.recording_since, status.tz_name, locale),
+              earliest:
+                status.history_since === null
+                  ? formatSiteDate(status.site_today, locale)
+                  : formatInstantSiteDay(status.history_since, status.tz_name, locale),
+            })}
+          </InlineAlert>
+        )}
+      </div>
 
       <FleetSummaryCard
         status={status}
@@ -153,6 +192,7 @@ export function FleetTab({ timeframe, gridKey }: FleetTabProps) {
         preset={timeframe.preset}
         range={range}
         firstRun={firstRun}
+        recordingGap={recordingGap}
       />
 
       {/*

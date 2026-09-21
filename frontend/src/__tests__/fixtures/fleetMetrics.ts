@@ -236,30 +236,82 @@ function buildMatrix(spec: WindowSpec): {
   };
 }
 
-/** Average concurrent printers per group, straight off the matrix cells. */
-function fleetValuesFrom(cells: Record<string, MatrixCell>, elapsed: number): FleetSeriesValues {
+/**
+ * Average concurrent printers per group, straight off the matrix cells.
+ *
+ * Two shapes, because the backend has two. The divisor is the RECORDED part of
+ * the bucket, not its elapsed span: a bucket the recorder caught the last 45
+ * minutes of still reads `printing 8 · cooling 1 · down 3` and those still sum
+ * to the printers KNOWN, so the chart draws a full stack and the partly
+ * observed marker — not a stack squashed to a sixteenth of the roster. The
+ * `unobserved` group is therefore absent from an observed bucket: there is no
+ * blind spot inside the part that was watched.
+ *
+ * On an `incidents_only` bucket nothing was measured at all, so the response
+ * states only what the fault and hold LEDGER proves — `down` and `planned` —
+ * and `printers_in_fleet` is `0.0` for UNKNOWN, because its identity
+ * (`printers_known − out_of_fleet − not_recorded`) has two recorder-derived
+ * terms and the field is a non-nullable float.
+ */
+function fleetValuesFrom(
+  cells: Record<string, MatrixCell>,
+  elapsed: number,
+  observedSeconds: number,
+): FleetSeriesValues {
+  const observed = observedSeconds > 0;
   const byGroup: Record<string, number> = {};
   const byCause: Record<string, number> = {};
   let down = 0;
   let printing = 0;
   for (const cell of Object.values(cells)) {
+    // Each printer contributes exactly 1.0 of ITSELF, spread over the part of
+    // the bucket that was recorded for it — which is the elapsed span less its
+    // own `unobserved` seconds. That per-cell denominator is what makes the
+    // groups sum to the printers KNOWN however short the recorder fell; a
+    // single bucket-wide divisor cannot, because a deactivated printer's
+    // out-of-fleet stretch is stated over the whole span while a running one's
+    // states are stated over the watched part.
+    // A bucket nobody watched has no per-cell recorded part, so its ledger
+    // hours divide by the whole span — the ledger covered all of it.
+    const gap = observed ? (cell.class_seconds.unobserved ?? 0) : 0;
+    const divisor = Math.max(1, elapsed - gap);
     for (const [key, seconds] of Object.entries(cell.class_seconds)) {
       if (!seconds) continue;
       const separator = key.indexOf(':');
       const group = separator === -1 ? key : key.slice(0, separator);
-      byGroup[group] = (byGroup[group] ?? 0) + seconds / elapsed;
-      if (group === 'printing') printing += seconds / elapsed;
+      // The recorder's gap is not a state it measured, so it is not a band in
+      // an observed bucket's reading of itself.
+      if (group === 'unobserved') continue;
+      byGroup[group] = (byGroup[group] ?? 0) + seconds / divisor;
+      if (group === 'printing') printing += seconds / divisor;
       if (group === 'down') {
         const cause = key.slice(separator + 1);
-        byCause[cause] = (byCause[cause] ?? 0) + seconds / elapsed;
-        down += seconds / elapsed;
+        byCause[cause] = (byCause[cause] ?? 0) + seconds / divisor;
+        down += seconds / divisor;
       }
     }
   }
   const known = FIXTURE_PRINTERS.length;
+
+  if (!observed) {
+    const ledger: Record<string, number> = {};
+    if (byGroup.down !== undefined) ledger.down = round(byGroup.down);
+    if (byGroup.planned !== undefined) ledger.planned = round(byGroup.planned);
+    return {
+      printers_known: known,
+      // The wire's spelling of "unknown" on a non-nullable float.
+      printers_in_fleet: 0,
+      avg_by_group: ledger as FleetSeriesValues['avg_by_group'],
+      avg_down_by_cause: byCause as FleetSeriesValues['avg_down_by_cause'],
+      avg_down: round(down),
+      peak_down: Math.ceil(down),
+      uptime: null,
+      time_printing: null,
+    };
+  }
+
   const inFleet = known - (byGroup.out_of_fleet ?? 0) - (byGroup.not_recorded ?? 0);
-  const counted = inFleet - (byGroup.unobserved ?? 0) - (byGroup.planned ?? 0);
-  const observed = Object.values(cells).some((cell) => cell.basis === 'observed');
+  const counted = inFleet - (byGroup.planned ?? 0);
   return {
     printers_known: known,
     printers_in_fleet: round(inFleet),
@@ -267,17 +319,27 @@ function fleetValuesFrom(cells: Record<string, MatrixCell>, elapsed: number): Fl
     avg_down_by_cause: byCause as FleetSeriesValues['avg_down_by_cause'],
     avg_down: round(down),
     peak_down: Math.ceil(down),
-    uptime: observed && counted > 0 ? round((counted - down) / counted) : null,
-    time_printing: observed && counted > 0 ? round(printing / counted) : null,
+    uptime: counted > 0 ? round((counted - down) / counted) : null,
+    time_printing: counted > 0 ? round(printing / counted) : null,
   };
 }
 
 const round = (value: number): number => Math.round(value * 10_000) / 10_000;
 
+/**
+ * Prints, from the print log.
+ *
+ * `printerDays` is passed rather than derived, because the two rates have
+ * different denominators on purpose: "Prints / day" covers the WHOLE window
+ * (the print log is complete for its own history), while "Prints per printer /
+ * day" divides by counted printer-days, which only a RECORDED bucket produces.
+ * On a young instance the two are therefore not comparable with each other,
+ * which is what the row's hint now says.
+ */
 function throughputValuesFrom(
   cells: Record<string, MatrixCell>,
   elapsed: number,
-  inFleet: number,
+  printerDays: number,
 ): ThroughputValues {
   const byOutcome: Record<string, number> = {};
   const byPrinter: Record<string, Partial<Record<PrintOutcome, number>>> = {};
@@ -288,7 +350,6 @@ function throughputValuesFrom(
   const completed = byOutcome.completed ?? 0;
   const failed = byOutcome.failed ?? 0;
   const days = elapsed / DAY_S;
-  const printerDays = days * inFleet;
   return {
     by_outcome: byOutcome as Partial<Record<PrintOutcome, number>>,
     total: sum(byOutcome),
@@ -354,7 +415,24 @@ function readSummary(
  * did not cover (only the incident ledger did), one partly observed bucket, a
  * workhorse, a printer with real downtime, a deactivated one and a deleted one.
  */
-function defaultCell(index: number, printer: MatrixPrinter, shape: BucketShape): MatrixCell {
+interface CellOptions {
+  /**
+   * The unrecorded stretch carries what a REAL instance's does: prints (the
+   * print log is complete for its own history and does not stop because the
+   * state recorder was not running yet) and a declared service hold beside the
+   * faults, so `avg_by_group` there holds both ledger groups.
+   *
+   * Opt-in so the older fixtures keep the exact shapes their tests pin.
+   */
+  production?: boolean;
+}
+
+function defaultCell(
+  index: number,
+  printer: MatrixPrinter,
+  shape: BucketShape,
+  { production = false }: CellOptions = {},
+): MatrixCell {
   const elapsed = shape.elapsed_seconds;
   if (elapsed <= 0) return makeCell(0, {}, { filler: 'idle', basis: 'observed' });
 
@@ -365,10 +443,23 @@ function defaultCell(index: number, printer: MatrixPrinter, shape: BucketShape):
   // Buckets the recorder never covered: the fault ledger is the only evidence.
   if (shape.observed_seconds === 0) {
     const fault = printer.printer_id === PROBLEM_PRINTER_ID ? Math.min(4 * HOUR_S, elapsed) : 0;
+    const hold =
+      production && printer.printer_id === HEALTHY_PRINTER_ID && index % 7 === 0
+        ? Math.min(2 * HOUR_S, elapsed)
+        : 0;
     return makeCell(
       elapsed,
-      fault > 0 ? { 'down:fault:jam': fault } : {},
-      { filler: 'unobserved', basis: 'incidents_only' },
+      {
+        ...(fault > 0 ? { 'down:fault:jam': fault } : {}),
+        ...(hold > 0 ? { planned: hold } : {}),
+      },
+      {
+        filler: 'unobserved',
+        basis: 'incidents_only',
+        prints: production
+          ? { completed: 8 + (index % 5), failed: index % 4 === 0 ? 1 : 0 }
+          : {},
+      },
     );
   }
 
@@ -512,6 +603,24 @@ export interface FleetOverviewOptions {
   currentLast?: boolean;
   /** Nothing has ever been observed: the first-run variant. */
   firstRun?: boolean;
+  /**
+   * Exactly how much of the LAST bucket the recorder covered, in seconds.
+   *
+   * The production shape's whole point: a recorder an hour old under a window
+   * weeks long, which `incidentsOnlyLead` alone cannot express because it only
+   * says "none of it".
+   */
+  lastObservedSeconds?: number;
+  /** The unrecorded stretch carries prints and holds — see `CellOptions`. */
+  production?: boolean;
+  /**
+   * Trailing buckets that have NOT HAPPENED: `elapsed_seconds: 0`.
+   *
+   * A window is a grid, so a window ending today carries the hours (or the
+   * day) still to come. They are not an edge case — every `Today` view has
+   * them from midnight until 23:00.
+   */
+  futureTail?: number;
   dateFrom?: string;
   dateTo?: string;
 }
@@ -531,12 +640,26 @@ export function makeFleetOverview(options: FleetOverviewOptions = {}): FleetOver
     bucket === 'hour' ? `${FIXTURE_SITE_TODAY}T09:00:00` : `${FIXTURE_SITE_TODAY}T00:00:00`;
   const starts = bucketStarts(bucket, count, lastSiteStart);
 
+  const production = options.production ?? false;
+
+  const futureTail = options.futureTail ?? 0;
+  /** The bucket NOW falls in: the last one before the buckets still to come. */
+  const currentIndex = count - 1 - futureTail;
+
   const shapes: BucketShape[] = starts.map((start, index) => {
-    const isLast = index === count - 1;
-    const elapsed = isLast && currentLast ? Math.round(width / 2) : width;
+    // Past the current bucket is the future: no elapsed time, so nothing to
+    // observe and nothing to be zero.
+    if (index > currentIndex) {
+      return { start, seconds: width, elapsed_seconds: 0, observed_seconds: 0 };
+    }
+    const isCurrent = index === currentIndex;
+    const elapsed = isCurrent && currentLast ? Math.round(width / 2) : width;
     let observed = elapsed;
     if (index < incidentsOnlyLead) observed = 0;
     else if (index === partialIndex) observed = Math.round(elapsed / 2);
+    if (isCurrent && options.lastObservedSeconds !== undefined) {
+      observed = Math.min(elapsed, options.lastObservedSeconds);
+    }
     return { start, seconds: width, elapsed_seconds: elapsed, observed_seconds: observed };
   });
 
@@ -546,7 +669,7 @@ export function makeFleetOverview(options: FleetOverviewOptions = {}): FleetOver
     cell: (index, printer, shape) =>
       firstRun
         ? makeCell(shape.elapsed_seconds, {}, { filler: 'not_recorded', basis: 'incidents_only' })
-        : defaultCell(index, printer, shape),
+        : defaultCell(index, printer, shape, { production }),
   });
 
   const fleetBuckets: SeriesBucket<FleetSeriesValues>[] = shapes.map((shape, index) => ({
@@ -556,11 +679,20 @@ export function makeFleetOverview(options: FleetOverviewOptions = {}): FleetOver
     observed_seconds: shape.observed_seconds,
     utc_offset_minutes: FIXTURE_UTC_OFFSET_MINUTES,
     basis: shape.observed_seconds > 0 ? 'observed' : 'incidents_only',
-    values: fleetValuesFrom(perBucketCells[index] ?? {}, Math.max(1, shape.elapsed_seconds)),
+    values: fleetValuesFrom(
+      perBucketCells[index] ?? {},
+      Math.max(1, shape.elapsed_seconds),
+      shape.observed_seconds,
+    ),
   }));
 
   const totalElapsed = shapes.reduce((total, shape) => total + shape.elapsed_seconds, 0);
-  const fleetTotals = fleetValuesFrom(matrixSeries.totals.printers, Math.max(1, totalElapsed));
+  const totalObserved = shapes.reduce((total, shape) => total + shape.observed_seconds, 0);
+  const fleetTotals = fleetValuesFrom(
+    matrixSeries.totals.printers,
+    Math.max(1, totalElapsed),
+    totalObserved,
+  );
   fleetTotals.peak_down = Math.max(...fleetBuckets.map((entry) => entry.values.peak_down), 0);
 
   const throughputBuckets: SeriesBucket<ThroughputValues>[] = shapes.map((shape, index) => ({
@@ -571,16 +703,24 @@ export function makeFleetOverview(options: FleetOverviewOptions = {}): FleetOver
     utc_offset_minutes: FIXTURE_UTC_OFFSET_MINUTES,
     // Print data is complete for its own history — the backend never marks it.
     basis: null,
+    // Counted printer-days come from the RECORDED part of the bucket, so an
+    // `incidents_only` bucket contributes none and its per-printer rate is
+    // null — while its plain prints-per-day is a real figure from the log.
     values: throughputValuesFrom(
       perBucketCells[index] ?? {},
       Math.max(1, shape.elapsed_seconds),
-      fleetBuckets[index]?.values.printers_in_fleet ?? 1,
+      (shape.observed_seconds / DAY_S) * (fleetBuckets[index]?.values.printers_in_fleet ?? 0),
     ),
   }));
   const throughputTotals = throughputValuesFrom(
     matrixSeries.totals.printers,
     Math.max(1, totalElapsed),
-    fleetTotals.printers_in_fleet || 1,
+    shapes.reduce(
+      (total, shape, index) =>
+        total +
+        (shape.observed_seconds / DAY_S) * (fleetBuckets[index]?.values.printers_in_fleet ?? 0),
+      0,
+    ),
   );
 
   const observed = shapes.some((shape) => shape.observed_seconds > 0);
@@ -634,6 +774,53 @@ export const makeFleetOverviewHour = (): FleetOverview => makeFleetOverview({ bu
 /** Nothing observed yet: every bucket is `not_recorded`, every state row null. */
 export const makeFleetOverviewFirstRun = (): FleetOverview => makeFleetOverview({ firstRun: true });
 
+/** How many of the today-shaped hour grid's twenty-four hours are still to come. */
+export const TODAY_FUTURE_HOURS = 6;
+
+/**
+ * TODAY, as an hour grid: eighteen hours that have happened and six that have
+ * not.
+ *
+ * The shape the matrix is read in every morning, and the one that exposed three
+ * lies at once — future hours claiming an observed zero under a full hatch, the
+ * per-row Details control opening 23:00, and the "Today" chip landing on a
+ * single hour column.
+ */
+export const makeFleetOverviewTodayHours = (): FleetOverview =>
+  makeFleetOverview({
+    bucket: 'hour',
+    count: 24,
+    incidentsOnlyLead: 0,
+    partialIndex: null,
+    currentLast: true,
+    futureTail: TODAY_FUTURE_HOURS,
+  });
+
+/** How many days the production-shaped window spans. */
+export const PRODUCTION_WINDOW_DAYS = 44;
+
+/**
+ * PRODUCTION, as of this wave: a state recorder under an hour old beneath a
+ * window six weeks deep.
+ *
+ * Forty-three `incidents_only` days carrying fault and hold seconds and a full
+ * print log, then a current day the recorder caught the last hour of. It is not
+ * an edge case — it is what every farm's Fleet tab looks like for its first
+ * month — and it is the shape under which the tab has to have no NaN, no
+ * Infinity, no raw i18n key and no figure presented as a reading that nobody
+ * took.
+ */
+export const makeFleetOverviewProduction = (): FleetOverview =>
+  makeFleetOverview({
+    bucket: 'day',
+    count: PRODUCTION_WINDOW_DAYS,
+    incidentsOnlyLead: PRODUCTION_WINDOW_DAYS - 1,
+    partialIndex: null,
+    currentLast: true,
+    lastObservedSeconds: HOUR_S,
+    production: true,
+  });
+
 // ── status ──────────────────────────────────────────────────────────────────
 
 export interface FleetStatusOptions {
@@ -641,6 +828,10 @@ export interface FleetStatusOptions {
   firstRun?: boolean;
   generatedAt?: string;
   printers?: PrinterStatus[];
+  /** The recorder's first instant. Overrides `firstRun`'s null. */
+  recordingSince?: string | null;
+  /** The earlier of that and the first incident — what "all time" resolves to. */
+  historySince?: string | null;
 }
 
 const STATUS_PRINTERS: PrinterStatus[] = [
@@ -694,8 +885,18 @@ export function makeFleetStatus(options: FleetStatusOptions = {}): FleetStatus {
     generated_at: options.generatedAt ?? `${FIXTURE_SITE_TODAY}T00:04:00`,
     site_today: FIXTURE_SITE_TODAY,
     tz_name: FIXTURE_TZ_NAME,
-    recording_since: options.firstRun ? null : '2026-09-01T03:00:00',
-    history_since: options.firstRun ? null : '2026-08-02T11:30:00',
+    recording_since:
+      'recordingSince' in options
+        ? (options.recordingSince ?? null)
+        : options.firstRun
+          ? null
+          : '2026-09-01T03:00:00',
+    history_since:
+      'historySince' in options
+        ? (options.historySince ?? null)
+        : options.firstRun
+          ? null
+          : '2026-08-02T11:30:00',
     printers,
     counts_by_group: countsByGroup as FleetStatus['counts_by_group'],
     counts_by_class: countsByClass as FleetStatus['counts_by_class'],
@@ -703,6 +904,18 @@ export function makeFleetStatus(options: FleetStatusOptions = {}): FleetStatus {
 }
 
 export const makeFleetStatusFirstRun = (): FleetStatus => makeFleetStatus({ firstRun: true });
+
+/**
+ * The live tile beside `makeFleetOverviewProduction`: a recorder that first
+ * wrote an hour before the answer was built, over a fault ledger six weeks
+ * deep. `2026-09-20T23:00:00` naive UTC is 11:00 on the site's 21st, one hour
+ * before the window's "now".
+ */
+export const makeFleetStatusProduction = (): FleetStatus =>
+  makeFleetStatus({
+    recordingSince: '2026-09-20T23:00:00',
+    historySince: '2026-08-08T06:00:00',
+  });
 
 // ── intervals ───────────────────────────────────────────────────────────────
 

@@ -13,7 +13,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { render, screen, waitFor, within } from '../../utils';
-import { formatCount, formatPrinters } from '../../../utils/fleetMetrics';
+import {
+  bucketLabel,
+  currentBucketIndex,
+  formatCount,
+  formatHours,
+  formatPrinters,
+} from '../../../utils/fleetMetrics';
 import i18n from '../../../i18n';
 import { FleetMatrix } from '../../../components/fleet/FleetMatrix';
 import {
@@ -24,6 +30,7 @@ import {
   makeFleetOverviewDay,
   makeFleetOverviewFirstRun,
   makeFleetOverviewHour,
+  makeFleetOverviewTodayHours,
   makeFleetOverviewWeek,
   makeFleetStatus,
   makeFleetStatusFirstRun,
@@ -114,6 +121,9 @@ describe('FleetMatrix', () => {
           to: 'Sep 21, 2026',
         }),
       );
+      // "by printer", never "per printer": the tab has a metric called "Prints
+      // per printer", and the Prints-lens caption used to name that rate.
+      expect(grid.querySelector('caption')?.textContent).not.toContain('per printer');
       // The three frozen columns plus seven day buckets.
       expect(within(grid).getAllByRole('columnheader')).toHaveLength(FIRST_BUCKET_COL + 7);
       // Three printers (the deleted one is hidden) plus the fleet row.
@@ -322,6 +332,54 @@ describe('FleetMatrix', () => {
       ).toBeGreaterThan(0);
     });
 
+    it('captions the grid for whichever lens is up', async () => {
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      const caption = (): string => theGrid().querySelector('caption')?.textContent ?? '';
+
+      expect(caption()).toContain(LENS_PRINTS());
+      await switchLens(user, LENS_HOURS());
+      expect(caption()).toContain(LENS_HOURS());
+      expect(caption()).not.toContain(LENS_PRINTS());
+      await switchLens(user, LENS_SPLIT());
+      expect(caption()).toContain(LENS_SPLIT());
+      // Whichever lens it names, it names the GRID, never the rate metric.
+      expect(caption()).not.toContain('per printer');
+    });
+
+    it('captions a ONE-DAY window with its single date', () => {
+      const overview = makeFleetOverview({ bucket: 'hour', count: 12 });
+      overview.date_from = overview.date_to;
+      render(<FleetMatrix overview={overview} />);
+
+      const caption = theGrid().querySelector('caption')?.textContent ?? '';
+      expect(caption).toContain('Sep 21, 2026');
+      // Not "Sep 21, 2026 to Sep 21, 2026" — one date, said once.
+      expect(caption.match(/Sep 21, 2026/g)).toHaveLength(1);
+    });
+
+    it('spells only every third hour header, and all of them for a screen reader', () => {
+      // 14 px columns: labelling all twenty-four ran them into `000102030405…`.
+      render(<FleetMatrix overview={makeFleetOverview({ bucket: 'hour', count: 24 })} />);
+      const grid = theGrid();
+      const headers = [...grid.querySelectorAll('thead th')].slice(FIRST_BUCKET_COL);
+      expect(headers).toHaveLength(24);
+
+      // A header's aria-hidden spans are [optional month-or-Today overlay,
+      // top line, bottom line] — the hour is the top line, second from last.
+      const visible = headers.map((header) => {
+        const spans = header.querySelectorAll('[aria-hidden="true"]');
+        return spans[spans.length - 2]?.textContent?.trim() ?? '';
+      });
+      const labelled = visible.filter((text) => text !== '');
+      // The window ends at 09:00, so it opens at 10:00 the day before.
+      expect(labelled).toEqual(['12', '15', '18', '21', '00', '03', '06', '09']);
+
+      // Every one of the twenty-four still carries its full site stamp.
+      for (const header of headers) {
+        expect(header.querySelector('.sr-only')?.textContent ?? '').toMatch(/\d{2}:\d{2}/);
+      }
+    });
+
     it('renders 14 px hour columns and opens the detail from the row control', async () => {
       render(<FleetMatrix overview={makeFleetOverviewHour()} />);
       const grid = theGrid();
@@ -360,7 +418,7 @@ describe('FleetMatrix', () => {
       expect(cell.textContent).toContain('–');
     });
 
-    it('hatches and names a bucket the recorder only partly covered', async () => {
+    it('names each partly-observed bucket for what it actually is', async () => {
       render(<FleetMatrix overview={makeFleetOverviewDay()} />);
       await switchLens(user, LENS_HOURS());
       const grid = theGrid();
@@ -372,10 +430,43 @@ describe('FleetMatrix', () => {
           t('fleetMetrics.class.incidents_only'),
         ),
       ).toBeInTheDocument();
-      // Bucket 3 is half observed.
+      // Bucket 3 is half observed — a DIFFERENT claim, and it used to borrow
+      // the "No data" leaf from the bucket's `basis` instead of naming itself.
       expect(
-        within(cellAt(grid, row, FIRST_BUCKET_COL + 3)).getByText(t('fleetMetrics.class.unobserved')),
+        within(cellAt(grid, row, FIRST_BUCKET_COL + 3)).getByText(
+          t('fleetMetrics.widgets.partlyObserved'),
+        ),
       ).toBeInTheDocument();
+    });
+
+    it('never says "No data" beside a figure', async () => {
+      // Production: a hatched Hours-down cell showing 12 announced "No data".
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      await switchLens(user, LENS_HOURS());
+      const grid = theGrid();
+
+      const offenders = gridRows(grid)
+        .flatMap((gridRow) => [...gridRow.children].slice(FIRST_BUCKET_COL))
+        .filter((cell) => {
+          const text = cell.textContent ?? '';
+          return text.includes(t('fleetMetrics.class.unobserved')) && /\d/.test(text);
+        });
+      expect(offenders).toHaveLength(0);
+    });
+
+    it('keeps the texture off the digits of a cell that has some', async () => {
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      await switchLens(user, LENS_HOURS());
+      const grid = theGrid();
+      const row = rowOf(grid, '001-H2S');
+
+      // Bucket 3 is half observed and still shows its hours: the marker is a
+      // band along the bottom edge, not a hatch across the number.
+      const withFigure = cellAt(grid, row, FIRST_BUCKET_COL + 3) as HTMLTableCellElement;
+      expect(withFigure.textContent).toMatch(/\d/);
+      expect(withFigure.style.backgroundPosition).toBe('left bottom');
+      expect(withFigure.style.backgroundRepeat).toBe('no-repeat');
+      expect(withFigure.style.backgroundSize).not.toBe('auto');
     });
 
     it('renders flat ground and names a printer that was out of the fleet', async () => {
@@ -407,6 +498,156 @@ describe('FleetMatrix', () => {
 
       await switchLens(user, LENS_HOURS());
       expect(bucketText()).toContain(t('fleetMetrics.class.incidents_only'));
+    });
+  });
+
+  describe('the hours still to come', () => {
+    /** The last column of the today-shaped hour grid: an hour that has not arrived. */
+    const FUTURE_COL = FIRST_BUCKET_COL + 23;
+
+    it('draws flat ground with no figure and no marker', async () => {
+      // They read sr-only "0 Faults and holds only" under a full hatch, over a
+      // detail dialog that correctly said there was no data for the range.
+      render(<FleetMatrix overview={makeFleetOverviewTodayHours()} />);
+      await switchLens(user, LENS_HOURS());
+      const grid = theGrid();
+      const future = cellAt(grid, rowOf(grid, '001-H2S'), FUTURE_COL) as HTMLTableCellElement;
+
+      expect(within(future).getByText(t('fleetMetrics.class.upcoming'))).toBeInTheDocument();
+      // No figure, and none of the three things a reader could mistake it for.
+      expect(future.textContent).toBe(t('fleetMetrics.class.upcoming'));
+      expect(future.textContent).not.toMatch(/\d/);
+      expect(future.style.backgroundImage).toBe('');
+      expect(future.textContent).not.toContain(t('fleetMetrics.class.incidents_only'));
+    });
+
+    it('keeps its place in the grid but opens nothing', async () => {
+      // The column stays, so the arrow keys stay rectangular; there is simply
+      // nothing behind it to open.
+      render(<FleetMatrix overview={makeFleetOverviewTodayHours()} />);
+      const grid = theGrid();
+      focusTarget(cellAt(grid, 1, FUTURE_COL)).focus();
+
+      await user.keyboard('{Enter}');
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+      // …while an hour that HAS happened still opens.
+      focusTarget(cellAt(grid, 1, FIRST_BUCKET_COL)).focus();
+      await user.keyboard('{Enter}');
+      expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    });
+
+    it('opens the CURRENT hour from the per-row Details control, never 23:00', async () => {
+      // It opened `buckets.length - 1` — on Today that is 23:00, a future empty
+      // hour, even for a printer that was down seventeen hours today.
+      const overview = makeFleetOverviewTodayHours();
+      render(<FleetMatrix overview={overview} />);
+
+      const controls = within(theGrid()).getAllByRole('button', {
+        name: new RegExp(t('fleetMetrics.matrix.details')),
+      });
+      await user.click(controls[0]!);
+
+      const dialog = await screen.findByRole('dialog');
+      const buckets = overview.matrix.series.buckets;
+      const current = buckets[currentBucketIndex(buckets)]!;
+      const label = bucketLabel(current, { bucket: 'hour', locale: i18n.language });
+      expect(dialog).toHaveAccessibleName(expect.stringContaining(label.full));
+    });
+  });
+
+  describe('the Today chip', () => {
+    /** Everything a header row shows a sighted reader, as one string. */
+    const shownIn = (header: Element): string =>
+      [...header.querySelectorAll('[aria-hidden="true"]')]
+        .map((node) => node.textContent ?? '')
+        .join(' ');
+
+    const bucketHeaders = (grid: HTMLElement): Element[] =>
+      [...grid.querySelectorAll('thead th')].slice(FIRST_BUCKET_COL);
+
+    it('rides no hour column of an all-today grid, and leaves the cadence whole', () => {
+      // It sat on ONE hour column — naming one hour of today "Today" while the
+      // twenty-three beside it are the same day — and broke the every-third-hour
+      // cadence exactly where it sat.
+      render(<FleetMatrix overview={makeFleetOverviewTodayHours()} />);
+      const headers = bucketHeaders(theGrid());
+
+      for (const header of headers) {
+        expect(shownIn(header)).not.toContain(t('fleetMetrics.units.today'));
+      }
+      const labelled = headers.filter((header) => {
+        const spans = header.querySelectorAll('[aria-hidden="true"]');
+        return (spans[spans.length - 2]?.textContent ?? '').trim() !== '';
+      });
+      expect(labelled).toHaveLength(8);
+    });
+
+    it('still rides the current DAY column of a day grid', () => {
+      render(<FleetMatrix overview={makeFleetOverviewDay()} />);
+      expect(
+        within(theGrid()).getAllByText(t('fleetMetrics.units.today')).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('rides no week column — the current week is named by its own start', () => {
+      render(<FleetMatrix overview={makeFleetOverviewWeek()} />);
+      for (const header of bucketHeaders(theGrid())) {
+        expect(shownIn(header)).not.toContain(t('fleetMetrics.units.today'));
+      }
+    });
+  });
+
+  describe('the Fleet row’s Avg', () => {
+    /** Every printer down for the whole of every counted day. */
+    const allDownAllDay = (): FleetOverview => {
+      const overview = makeFleetOverviewDay();
+      overview.matrix.printers = overview.matrix.printers.map((printer) => ({
+        ...printer,
+        deleted: false,
+        hours_down_per_day: 24,
+        prints_per_day: 6,
+      }));
+      return overview;
+    };
+
+    const fleetAvgCell = (grid: HTMLElement): HTMLElement =>
+      cellAt(grid, gridRows(grid).length - 1, COL_AVG);
+
+    it('is a per-printer MEAN under Hours down, so it never exceeds a day', async () => {
+      // It was the SUM: twelve printers at ~20 h/day read 86 "h/day" beside
+      // rows of 22 and 18, and a day has twenty-four hours.
+      render(<FleetMatrix overview={allDownAllDay()} />);
+      await switchLens(user, LENS_HOURS());
+      const grid = theGrid();
+
+      expect(fleetAvgCell(grid).textContent).toContain(formatHours(24, i18n.language));
+      // …which is exactly what each row above it reads, so the two compare.
+      expect(cellAt(grid, rowOf(grid, '001-H2S'), COL_AVG).textContent).toContain(
+        formatHours(24, i18n.language),
+      );
+    });
+
+    it('stays the fleet SUM under Prints — that IS the fleet’s output', async () => {
+      render(<FleetMatrix overview={allDownAllDay()} />);
+      const grid = theGrid();
+      const printerRows = gridRows(grid).length - 2;
+
+      expect(fleetAvgCell(grid).textContent).toContain(
+        formatPrinters(6 * printerRows, i18n.language),
+      );
+    });
+
+    it('says WHICH of the two it is, for a reader who cannot see the column', async () => {
+      render(<FleetMatrix overview={allDownAllDay()} />);
+
+      expect(fleetAvgCell(theGrid()).textContent).toContain(
+        t('fleetMetrics.matrix.fleetAvgSum'),
+      );
+      await switchLens(user, LENS_HOURS());
+      expect(fleetAvgCell(theGrid()).textContent).toContain(
+        t('fleetMetrics.matrix.fleetAvgMean'),
+      );
     });
   });
 

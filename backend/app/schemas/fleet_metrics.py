@@ -7,9 +7,12 @@ of it has ELAPSED, how much of it was actually observed — travels with the num
 rather than being reconstructed beside them.
 
 **Every figure arrives finished.** These models carry averages, rates and shares, not
-raw totals a client would have to divide: the denominator rules (divide by elapsed,
-never by width and never by observed) are arithmetic the backend owns, and a second
-division on the client is a second definition of *uptime*.
+raw totals a client would have to divide, because the denominator is the hard part and
+there is no single right one. A fleet STATE average is measured inside the time the
+farm was actually being watched (``observed_seconds``); a rate whose numerator is
+complete for its own history, like prints per day, divides by ``elapsed_seconds``; the
+matrix divides by neither and reports seconds. The backend owns those choices, and a
+second division on the client is a second definition of *uptime*.
 
 **Sparse maps mean zero, never unknown.** A class or an outcome with no seconds is
 omitted from its map. Absence of DATA is carried by ``observed_seconds`` and
@@ -43,10 +46,13 @@ class SeriesBucket(BaseModel, Generic[ValuesT]):
     start: datetime
     seconds: float
     # The width clamped to "now": 0 for a bucket entirely in the future, and the whole
-    # width for a closed one. EVERY average and rate in ``values`` divides by this.
+    # width for a closed one. The denominator of every rate whose numerator is COMPLETE
+    # for the bucket — prints per day and the like.
     elapsed_seconds: float
     # How much of the bucket the state recorder covered (a union over printers, so it
-    # never exceeds the width). Less than ``elapsed_seconds`` is what the UI hatches.
+    # never exceeds the width). Less than ``elapsed_seconds`` is what the UI hatches —
+    # and it is also the DENOMINATOR of every fleet state average in ``values``, which
+    # are measured inside that coverage and nowhere else.
     observed_seconds: float
     utc_offset_minutes: int
     # ``observed`` | ``incidents_only``. Null (omitted) on a series whose source is not
@@ -88,20 +94,33 @@ class FleetSeriesValues(BaseModel):
     Stating an average in printers rather than in hours is what lets "2 down now" sit
     beside "2.1 down on average" in one column: the two are comparable numbers of the
     same thing.
+
+    **Every figure here is measured inside ``observed_seconds``** — the stretches in
+    which the farm was being watched — and not over the bucket's elapsed time. The two
+    differ enormously on a young recorder, and dividing by elapsed time reports a fleet
+    of twelve as a fleet of one for as long as the unwatched stretch dominates. On an
+    ``incidents_only`` bucket nothing was watched at all, so only what the incident
+    ledger knows is reported (the down and planned averages) and the rest is withheld.
     """
 
     printers_known: int
-    # printers_known − out of fleet − not recorded, averaged over the bucket.
+    # printers_known − out of fleet − not recorded, measured inside the observed
+    # coverage. 0.0 on a bucket that measured nothing — the field cannot be null, so
+    # read ``basis`` before reading this; the summary row an operator sees is withheld
+    # outright there.
     printers_in_fleet: float
     # class GROUP -> average concurrent printers. Sparse. Sums to ``printers_known``
-    # for any bucket with elapsed time.
+    # on any OBSERVED bucket; on an ``incidents_only`` bucket it carries the ledger's
+    # two groups (down, planned) and nothing else.
     avg_by_group: dict[str, float]
     # down CAUSE -> average concurrent printers. Sparse. Sums to ``avg_down``.
     avg_down_by_cause: dict[str, float]
     avg_down: float
     # The most printers down AT ONCE inside the bucket, from a joint sweep across
     # printers — a different question from the average, and the one that says whether
-    # a quiet average hides a bad hour.
+    # a quiet average hides a bad hour. Taken over everything KNOWN in the bucket, the
+    # incident ledger included, so it is an upper bound on ``avg_down`` rather than a
+    # figure from the same evidence.
     peak_down: int
     # Null when nothing was scheduled, and on an ``incidents_only`` bucket: a ratio
     # whose denominator nobody measured is not a low number, it is no number.
@@ -113,7 +132,13 @@ class FleetSeriesValues(BaseModel):
 
 
 class MatrixCell(BaseModel):
-    """One printer's (or the fleet's) bucket: where its time went, and what it made."""
+    """One printer's (or the fleet's) bucket: where its time went, and what it made.
+
+    Seconds over the FULL elapsed bucket, incident-ledger evidence included — the other
+    coverage from the fleet averages, deliberately. A fault the ledger proves stood
+    through a recorder gap is this printer's downtime whether or not anyone was
+    watching, and it is exactly what an operator opens a cell to find.
+    """
 
     # class KEY -> seconds. Sparse.
     class_seconds: dict[str, float]
@@ -131,10 +156,19 @@ class MatrixValues(BaseModel):
 
 
 class MatrixPrinter(PrinterRef):
-    """A matrix row's identity and the two per-day figures shown beside the name."""
+    """A matrix row's identity and the two per-day figures shown beside the name.
 
-    # Null before this printer had any time in service — a rate with no denominator.
+    The two divide by different denominators on purpose, because their numerators come
+    from different records — mixing them is what reported 48 prints a day for a printer
+    that completed twenty in a week.
+    """
+
+    # Down hours ÷ the elapsed days the farm could have known anything about (observed,
+    # or after the first span or incident). Days predating every record are excluded
+    # rather than counted as days the printer was fine. Null when there are none.
     hours_down_per_day: float | None
+    # Completed prints ÷ the window's elapsed days. The print log is complete for its
+    # own history, so the state recorder has no say in this number.
     prints_per_day: float | None
 
 
@@ -165,9 +199,10 @@ class ThroughputValues(BaseModel):
     # COMPLETED prints per day — the same numerator as the per-printer rate below, so
     # the two summary rows are consistent with each other.
     prints_per_day: float | None
-    # Completed ÷ printer-days IN SERVICE (elapsed less out-of-fleet and not-recorded
-    # time). Null where that denominator is zero — before recording, there is no
-    # honest per-printer rate.
+    # Completed ÷ (printers measured in the fleet × the bucket's elapsed days), over
+    # the OBSERVED buckets only. Null where no fleet size was measured: the print count
+    # is real, but there is nothing to divide it among, and falling back to the roster
+    # would turn an unmeasured period into a per-printer figure.
     prints_per_printer_per_day: float | None
     # completed ÷ (completed + failed). Cancelled prints are excluded: somebody
     # stopping a print is not the printer failing.

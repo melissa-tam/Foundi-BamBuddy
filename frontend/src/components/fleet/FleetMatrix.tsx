@@ -80,8 +80,16 @@ import {
   formatInstantSiteDay,
   formatPercent,
   formatPrinters,
+  FLEET_AVG_DESCRIPTION_KEY,
+  LENS_FLEET_AVG_MODE,
+  bucketHasElapsed,
+  currentBucketIndex,
+  fleetAverage,
   formatSiteDate,
+  hourHeaderLabel,
   isRowHidden,
+  isSingleDayRange,
+  matrixCaptionKey,
   type BucketLabel,
   type FleetLens,
   type MatrixFrozenColumn,
@@ -166,8 +174,9 @@ interface RowFigures {
  * Total and Avg come from the PAYLOAD — the window's totals cell and the
  * per-printer per-day rates the backend already divided by each printer's own
  * counted days. The component never re-derives a rate from seconds it summed
- * itself; the one sum it does make is the fleet row's Avg, which is the
- * fleet-wide per-day figure and is by definition the printers' rates added up.
+ * itself; the one figure it combines is the fleet row's Avg, and how it
+ * combines them is the lens's decision (`LENS_FLEET_AVG_MODE`), not this
+ * function's.
  */
 function rowFigures(
   lens: FleetLens,
@@ -297,7 +306,12 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
   };
 
   const openDetail = (printerId: number, bucketIndex: number) => {
-    if (bucketIndex < 0 || bucketIndex >= buckets.length) return;
+    const bucket = buckets[bucketIndex];
+    if (bucket === undefined) return;
+    // A future bucket keeps its place in the grid so the arrow keys stay
+    // rectangular, but there is nothing behind it to open: the dialog would
+    // report "no data for this range" for an hour that has not arrived.
+    if (!bucketHasElapsed(bucket)) return;
     setDetail({ printerId, bucketIndex });
   };
 
@@ -468,11 +482,19 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
             role="grid"
             className="table-fixed w-max border-separate border-spacing-0 text-xs"
           >
+            {/*
+              "by printer", not "per printer": the tab already has a metric
+              called "Prints per printer", and a Prints-lens caption reading
+              "Prints per printer, Sep 15 to Sep 21" named that rate rather
+              than the grid underneath it. A one-day window names its date
+              once — the leaf choice is the util's, not this component's.
+            */}
             <caption className="sr-only">
-              {t('fleetMetrics.matrix.caption', {
+              {t(matrixCaptionKey(isSingleDayRange(overview.date_from, overview.date_to)), {
                 lens: t(LENS_LABEL_KEY[activeLens]),
                 from: formatSiteDate(overview.date_from, locale),
                 to: formatSiteDate(overview.date_to, locale),
+                date: formatSiteDate(overview.date_from, locale),
               })}
             </caption>
             <colgroup>
@@ -534,19 +556,19 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                         `relative border-b border-bambu-dark-tertiary px-0 pt-4 pb-1 align-bottom font-normal ${SECONDARY_TEXT_CLASS} focus:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-inset`,
                       )}
                     >
-                      {label.isCurrent || label.month ? (
+                      {label.showsTodayChip || label.month ? (
                         <span
                           aria-hidden="true"
                           className="pointer-events-none absolute left-0 top-0 whitespace-nowrap text-[10px]"
                         >
-                          {label.isCurrent ? t('fleetMetrics.units.today') : label.month}
+                          {label.showsTodayChip ? t('fleetMetrics.units.today') : label.month}
                         </span>
                       ) : null}
                       <span
                         aria-hidden="true"
                         className={`block leading-tight ${label.isWeekend ? 'opacity-50' : ''}`}
                       >
-                        {topLine(bucketWidth, label)}
+                        {topLine(bucketWidth, label, locale)}
                       </span>
                       <span aria-hidden="true" className="block leading-tight">
                         {bottomLine(bucketWidth, label, newDay)}
@@ -555,7 +577,7 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                         {bucketWidth === 'week'
                           ? t('fleetMetrics.units.weekOf', { date: label.full })
                           : label.full}
-                        {label.isCurrent ? ` ${t('fleetMetrics.units.today')}` : ''}
+                        {label.showsTodayChip ? ` ${t('fleetMetrics.units.today')}` : ''}
                       </span>
                     </th>
                   );
@@ -601,9 +623,12 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                           onClick={() =>
                             openDetail(
                               printer.printer_id,
+                              // The bucket the reader is on, else the one NOW
+                              // falls in — never `buckets.length - 1`, which on
+                              // Today is 23:00 and has not happened.
                               activeCol >= FIRST_BUCKET_COL
                                 ? activeCol - FIRST_BUCKET_COL
-                                : buckets.length - 1,
+                                : currentBucketIndex(buckets),
                             )
                           }
                           aria-label={`${t('fleetMetrics.matrix.details')} ${nameOf(printer)}`}
@@ -696,6 +721,7 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                   value={fleetPerDay(activeLens, sorted)}
                   lens={activeLens}
                   kind="avg"
+                  description={t(FLEET_AVG_DESCRIPTION_KEY[LENS_FLEET_AVG_MODE[activeLens]])}
                   plumbing={cellPlumbing(rowCount - 1, COL_AVG)}
                   cellRef={register(rowCount - 1, COL_AVG)}
                   onKeyDown={handleKeyDown}
@@ -746,17 +772,20 @@ function compareFigures(a: number | null, b: number | null, direction: SortDirec
 }
 
 /**
- * The fleet row's Avg: the fleet-wide per-day figure, which IS the printers'
- * own per-day rates added up. Null only when no printer has a denominator yet.
+ * The fleet row's Avg, combined the way the ACTIVE LENS needs.
+ *
+ * It was always the sum, which is right under Prints — twelve printers making
+ * six a day is a farm making seventy-two a day — and wrong under Hours down,
+ * where it printed 86 "h/day" beside rows reading 22 and 18. A day has
+ * twenty-four hours, so the one column built to be comparable with the rows
+ * above it was the one column that could not be. `LENS_FLEET_AVG_MODE` owns
+ * which lens takes which; `fleetAverage` owns the arithmetic.
  */
 function fleetPerDay(lens: FleetLens, printers: MatrixPrinter[]): number | null {
-  let total: number | null = null;
-  for (const printer of printers) {
-    const value = lens === 'prints' ? printer.prints_per_day : printer.hours_down_per_day;
-    if (value === null) continue;
-    total = (total ?? 0) + value;
-  }
-  return total;
+  const rates = printers.map((printer) =>
+    lens === 'prints' ? printer.prints_per_day : printer.hours_down_per_day,
+  );
+  return fleetAverage(rates, LENS_FLEET_AVG_MODE[lens]);
 }
 
 interface FrozenFigureProps {
@@ -767,10 +796,25 @@ interface FrozenFigureProps {
   plumbing: { tabIndex: number; onFocus: () => void };
   cellRef: (element: HTMLElement | null) => void;
   onKeyDown: (event: KeyboardEvent<HTMLElement>) => void;
+  /**
+   * Spoken after the figure. The FLEET row's Avg needs it: the same column is a
+   * per-printer mean under one lens and the fleet's own total under another,
+   * and the number alone cannot say which.
+   */
+  description?: string;
 }
 
 /** One frozen figure cell — Total or Avg, formatted in the active lens's unit. */
-function FrozenFigure({ column, value, lens, kind, plumbing, cellRef, onKeyDown }: FrozenFigureProps) {
+function FrozenFigure({
+  column,
+  value,
+  lens,
+  kind,
+  plumbing,
+  cellRef,
+  onKeyDown,
+  description,
+}: FrozenFigureProps) {
   const { i18n } = useTranslation();
   const locale = i18n.language;
 
@@ -790,13 +834,22 @@ function FrozenFigure({ column, value, lens, kind, plumbing, cellRef, onKeyDown 
       className={`${FROZEN_CLASS[column]} ${MATRIX_CELL_BASE} border-b border-bambu-dark-tertiary`}
     >
       {text}
+      {/* sr-only rather than an `aria-label`, which would REPLACE the cell's
+          content and drop the row and column headers a real table gives it. */}
+      {description !== undefined && <span className="sr-only">{description}</span>}
     </td>
   );
 }
 
 /** The top header line: weekday initial by day, the hour by hour, blank by week. */
-function topLine(bucketWidth: string, label: BucketLabel): string {
-  if (bucketWidth === 'hour') return label.hour?.slice(0, 2) ?? '';
+function topLine(bucketWidth: string, label: BucketLabel, locale: string): string {
+  // Only every third hour is SPELLED (`hourHeaderLabel` owns that rule): at
+  // 14 px a two-digit label fills its column, so labelling all twenty-four ran
+  // them into one band of digits. An unlabelled column keeps the same
+  // non-breaking space the week lens uses, so the header row's height is the
+  // same across all of them — and all twenty-four still carry their full
+  // site-local stamp as sr-only text below.
+  if (bucketWidth === 'hour') return hourHeaderLabel(label, locale) || ' ';
   if (bucketWidth === 'week') return ' ';
   return label.weekdayInitial;
 }

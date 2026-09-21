@@ -72,6 +72,45 @@ export const CHART_GRID_DASH = '3 3';
 /** Tick label size where a chart has no reason to pick another. */
 export const CHART_TICK_FONT_SIZE = 11;
 
+/**
+ * Advance width of one tick DIGIT as a fraction of the tick font size, in the
+ * app's UI stack. Digits are the only glyphs a numeric axis draws and they are
+ * tabular, so one ratio covers the lot; 0.6 is the widest of them plus the
+ * hair of tracking between two.
+ */
+export const CHART_TICK_GLYPH_RATIO = 0.6;
+
+/**
+ * The px an axis spends on things that are not glyphs: recharts' own tick line
+ * and the gap it leaves between the label and the plot.
+ */
+export const CHART_AXIS_TICK_GUTTER_PX = 10;
+
+/**
+ * Glyphs of headroom over the data's own widest label.
+ *
+ * TWO, not one: recharts rounds a domain UP to a round tick, and the round tick
+ * above 900 is 1,000 — which is one more digit AND the group separator that
+ * arrives with it. Allowing a single glyph sized the axis for a label recharts
+ * was never going to draw.
+ */
+export const CHART_AXIS_TICK_HEADROOM_GLYPHS = 2;
+
+/**
+ * Width in px for a y axis whose widest DATA tick is `widestTick`.
+ *
+ * DERIVED, because a typed-in axis width is only ever right for one dataset:
+ * the Prints-per-day axis shipped at 34 px, which fits `900` and clips `10,000`
+ * — the axis then silently dropped a digit off the number the whole chart is
+ * scaled to. Sizing it for the data actually drawn also gives the narrow
+ * windows their plot area back instead of reserving a five-digit column for a
+ * two-digit farm.
+ */
+export function chartYAxisWidth(widestTick: string, fontSize: number): number {
+  const glyphs = widestTick.length + CHART_AXIS_TICK_HEADROOM_GLYPHS;
+  return Math.ceil(glyphs * fontSize * CHART_TICK_GLYPH_RATIO) + CHART_AXIS_TICK_GUTTER_PX;
+}
+
 interface ChartAxisTick {
   fill: string;
   fontSize: number;
