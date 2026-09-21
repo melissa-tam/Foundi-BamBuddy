@@ -151,62 +151,61 @@ export function FleetTab({ timeframe, gridKey }: FleetTabProps) {
         statusError={statusQuery.isError}
         overview={overview}
         preset={timeframe.preset}
+        range={range}
         firstRun={firstRun}
       />
 
-      {/* One section-level state row, always in the flow, so resolving a load
-          never shifts the card above it or the sections below. */}
-      <div className="min-h-[2.75rem]">
-        {overviewQuery.isError ? (
-          <InlineAlert severity="error">
-            <span className="flex flex-wrap items-center gap-3">
-              <span>{t('fleetMetrics.states.loadFailed')}</span>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => {
-                  void overviewQuery.refetch();
-                }}
-              >
-                {t('fleetMetrics.states.retry')}
-              </Button>
-            </span>
-          </InlineAlert>
-        ) : historyLoading ? (
-          <p role="status" className={`flex items-center gap-2 text-sm ${SECONDARY_TEXT_CLASS}`}>
-            <Loader2 className="w-4 h-4 animate-spin text-bambu-green" aria-hidden="true" />
-            {t('fleetMetrics.states.loading')}
-          </p>
-        ) : isEmpty ? (
-          <p className={`text-sm ${SECONDARY_TEXT_CLASS}`}>{t('fleetMetrics.states.empty')}</p>
-        ) : null}
-      </div>
-
       {/*
-        The matrix and the grid render only from a LOADED window. Neither has a
-        loading or error surface of its own — the state row above owns both for
-        the whole tab, which is what keeps one failed sweep from producing three
-        error messages. A refetch keeps the previous window on screen
+        The matrix SECTION is always in the flow, and history's loading, error
+        and empty states live INSIDE it. They used to sit in a reserved row of
+        their own between the two cards, which cost ~83 px of dead space in the
+        steady state — a permanent gap to report a condition that is normally
+        absent. Inside the section they occupy space the section had reserved
+        anyway, and the matrix card's top edge never moves.
+
+        A refetch keeps the previous window on screen
         (`placeholderData: keepPreviousData`), so changing the timeframe redraws
         the old numbers rather than blanking the page.
       */}
-      {overview === undefined ? (
-        <div className={SECTION_RESERVE_CLASS} />
-      ) : (
-        <>
-          <section aria-labelledby={matrixHeadingId} className={SECTION_RESERVE_CLASS}>
-            <Card>
-              <CardHeader>
-                <h2 id={matrixHeadingId} className="text-lg font-semibold text-white">
-                  {t('fleetMetrics.sections.matrix')}
-                </h2>
-              </CardHeader>
-              <CardContent>
-                <FleetMatrix overview={overview} status={status} />
-              </CardContent>
-            </Card>
-          </section>
+      <section aria-labelledby={matrixHeadingId} className={SECTION_RESERVE_CLASS}>
+        <Card>
+          <CardHeader>
+            <h2 id={matrixHeadingId} className="text-lg font-semibold text-white">
+              {t('fleetMetrics.sections.matrix')}
+            </h2>
+          </CardHeader>
+          <CardContent>
+            {overviewQuery.isError ? (
+              <InlineAlert severity="error">
+                <span className="flex flex-wrap items-center gap-3">
+                  <span>{t('fleetMetrics.states.loadFailed')}</span>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => {
+                      void overviewQuery.refetch();
+                    }}
+                  >
+                    {t('fleetMetrics.states.retry')}
+                  </Button>
+                </span>
+              </InlineAlert>
+            ) : historyLoading ? (
+              <p role="status" className={`flex items-center gap-2 text-sm ${SECONDARY_TEXT_CLASS}`}>
+                <Loader2 className="w-4 h-4 animate-spin text-bambu-green" aria-hidden="true" />
+                {t('fleetMetrics.states.loading')}
+              </p>
+            ) : isEmpty || overview === undefined ? (
+              <p className={`text-sm ${SECONDARY_TEXT_CLASS}`}>{t('fleetMetrics.states.empty')}</p>
+            ) : (
+              <FleetMatrix overview={overview} status={status} />
+            )}
+          </CardContent>
+        </Card>
+      </section>
 
+      {overview !== undefined && !isEmpty && (
+        <>
           {/*
             `gridKey` is the header's Reset-layout remount key: clearing the
             stored layout does not itself re-render the grid, which reads

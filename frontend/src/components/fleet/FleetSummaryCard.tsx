@@ -52,7 +52,7 @@ import { Link } from 'react-router-dom';
 import { Card, CardContent, CardHeader } from '../Card';
 import { InfoHint } from '../ui/InfoHint';
 import { Sparkline } from './Sparkline';
-import { TIMEFRAME_PERIOD_LABEL_KEY } from '../../hooks/useFleetMetrics';
+import { TIMEFRAME_PERIOD_LABEL_KEY, type FleetRange } from '../../hooks/useFleetMetrics';
 import {
   DOWN_CAUSE_ORDER,
   SECONDARY_TEXT_CLASS,
@@ -60,6 +60,7 @@ import {
   SUMMARY_ROW_HINT_KEY,
   SUMMARY_ROW_LABEL_KEY,
   SUMMARY_ROW_NOW_GROUP,
+  SUMMARY_ROW_ORDER,
   classLabelKey,
   formatCount,
   formatDuration,
@@ -81,24 +82,6 @@ import type { TimeframeState } from '../../utils/timeframe';
 
 /** The formats `SUMMARY_ROW_FORMAT` assigns a row. */
 type RowFormat = (typeof SUMMARY_ROW_FORMAT)[SummaryRowKey];
-
-/**
- * The rows the card can render from `/status` ALONE, in the order the wireframe
- * reads them.
- *
- * Without this the card would have no rows at all until the history sweep
- * answered — the row SET came from the overview — and "is anything down right
- * now" would wait on the slow query after all, which is the one thing the
- * two-query split exists to prevent. Once `/overview` lands, the server's own
- * row list takes over completely; this is a floor, never a merge.
- *
- * Derived from `SUMMARY_ROW_NOW_GROUP` rather than re-typed, so a row can never
- * appear here without the live count that gives it a Now column.
- */
-const LIVE_ROW_ORDER: SummaryRowKey[] = [
-  ...(Object.keys(SUMMARY_ROW_NOW_GROUP) as SummaryRowKey[]),
-  'printers_in_fleet',
-];
 
 /** Rendered as a sub-line under Down, never as a row of its own. */
 const PEAK_ROW: SummaryRowKey = 'peak_down';
@@ -324,6 +307,11 @@ export interface FleetSummaryCardProps {
   overview: FleetOverview | undefined;
   /** The preset whose period label heads the second column. */
   preset: TimeframeState['preset'];
+  /**
+   * The window the client resolved, so the header can name the dates before
+   * the server has echoed anything. Undefined until `/status` answers.
+   */
+  range: FleetRange | undefined;
   /** Nothing observed yet: rows with no figure are dropped rather than dashed. */
   firstRun: boolean;
 }
@@ -334,6 +322,7 @@ export function FleetSummaryCard({
   statusError,
   overview,
   preset,
+  range,
   firstRun,
 }: FleetSummaryCardProps) {
   const { t, i18n } = useTranslation();
@@ -341,10 +330,38 @@ export function FleetSummaryCard({
   const headingId = useId();
   const periodLabel = t(TIMEFRAME_PERIOD_LABEL_KEY[preset]);
 
+  /**
+   * The header's one line. The loaded form names the bucket as well; the
+   * pending form states everything that is already known and nothing that is
+   * not. Null only before `/status` has answered, when there is no window to
+   * name at all.
+   */
+  const headerLine: string | null =
+    overview !== undefined
+      ? t('fleetMetrics.header.range', {
+          from: formatSiteDate(overview.date_from, locale),
+          to: formatSiteDate(overview.date_to, locale),
+          bucket: t(`fleetMetrics.header.bucket.${overview.bucket}`),
+          tz: overview.tz_name,
+        })
+      : range !== undefined && status !== undefined
+        ? t('fleetMetrics.header.rangePending', {
+            from: formatSiteDate(range.dateFrom, locale),
+            to: formatSiteDate(range.dateTo, locale),
+            tz: status.tz_name,
+          })
+        : null;
+
   const fromServer = overview !== undefined;
+  // The floor is the WHOLE row set, not just the rows `/status` can fill.
+  // Every row is rendered from first paint in its final geometry — the state
+  // rows carrying their live Now value, the rate rows carrying "—" until
+  // history lands — so the card's bounding box does not change when it does.
+  // A floor of only the live rows made the card grow 89 px on arrival and
+  // shoved the matrix and the entire widget grid down the page.
   const allRows: SummaryRow[] =
     overview?.summary.rows ??
-    LIVE_ROW_ORDER.map((key) => ({ key, figure: null, previous: null, series: [] }));
+    SUMMARY_ROW_ORDER.map((key) => ({ key, figure: null, previous: null, series: [] }));
   const peakRow = allRows.find((row) => row.key === PEAK_ROW);
   const rows = allRows.filter(
     // Peak is a sub-line of Down, and on a first run a row the server has no
@@ -359,6 +376,7 @@ export function FleetSummaryCard({
 
   const downNow = downNowPrinters(status);
   const overflow = Math.max(0, downNow.length - MAX_DOWN_ROWS);
+  const [downNowExpanded, setDownNowExpanded] = useState(false);
 
   return (
     // `@container`, not a viewport breakpoint: this page's width changes with
@@ -369,14 +387,24 @@ export function FleetSummaryCard({
           <h2 id={headingId} className="text-lg font-semibold text-white">
             {t('fleetMetrics.sections.fleet')}
           </h2>
-          {overview !== undefined && (
-            <p className={`text-sm ${SECONDARY_TEXT_CLASS}`}>
-              {t('fleetMetrics.header.range', {
-                from: formatSiteDate(overview.date_from, locale),
-                to: formatSiteDate(overview.date_to, locale),
-                bucket: t(`fleetMetrics.header.bucket.${overview.bucket}`),
-                tz: overview.tz_name,
-              })}
+          {/*
+            Stated from FIRST PAINT: the resolved window and the site's zone are
+            both known as soon as `/status` answers, and the reader should not
+            have to wait on a 90-day sweep to learn which days they are looking
+            at. The bucket joins when the server echoes its own choice.
+
+            One line, always — `truncate` rather than wrapping, with the full
+            sentence on the element. A header that gained a second line when the
+            bucket arrived would move the card, which is the very thing this
+            card is being fixed for; and a truncated value's full text belongs
+            in a tooltip (react-best-practices §9).
+          */}
+          {headerLine !== null && (
+            <p
+              className={`min-w-0 flex-1 truncate text-sm ${SECONDARY_TEXT_CLASS}`}
+              title={headerLine}
+            >
+              {headerLine}
             </p>
           )}
         </CardHeader>
@@ -446,18 +474,34 @@ export function FleetSummaryCard({
                         ) : (
                           formatFigure(row.figure, format, locale)
                         )}
-                        {row.key === PEAK_HOST_ROW && peakRow !== undefined && peakRow.figure !== null && (
+                        {/* The sub-line is RESERVED, not conditional: it is
+                            the Down row's second line whether or not a peak is
+                            known yet, so the row — and the card, and everything
+                            below it — is the same height before and after the
+                            history sweep answers. */}
+                        {row.key === PEAK_HOST_ROW && (
                           <span className={`block text-xs font-normal ${SECONDARY_TEXT_CLASS}`}>
-                            {t('fleetMetrics.summary.peak', {
-                              count: Math.round(peakRow.figure),
-                            })}
+                            {peakRow?.figure == null
+                              ? ' '
+                              : t('fleetMetrics.summary.peak', {
+                                  count: Math.round(peakRow.figure),
+                                })}
                           </span>
                         )}
                       </td>
                       <td
                         className={`py-1.5 px-3 hidden @md:table-cell ${SECONDARY_TEXT_CLASS} ${startsRateBlock ? 'pt-3' : ''}`}
                       >
-                        <Sparkline points={row.series} ariaLabel={t('fleetMetrics.summary.trend')} />
+                        {/* Named for ITS OWN row. Ten sparklines all called
+                            "Trend" are ten identical images to a screen-reader
+                            user, and the column header cannot disambiguate them
+                            because it is the same header for all ten. */}
+                        <Sparkline
+                          points={row.series}
+                          ariaLabel={t('fleetMetrics.summary.trendOf', {
+                            metric: t(SUMMARY_ROW_LABEL_KEY[row.key]),
+                          })}
+                        />
                       </td>
                       <td className={`py-1.5 pl-3 text-right ${startsRateBlock ? 'pt-3' : ''}`}>
                         <ChangeCell change={change} format={format} periodLabel={periodLabel} />
@@ -482,7 +526,7 @@ export function FleetSummaryCard({
                     {t('fleetMetrics.summary.nothingDown')}
                   </li>
                 )}
-                {downNow.slice(0, MAX_DOWN_ROWS).map((printer) => {
+                {downNow.slice(0, downNowExpanded ? downNow.length : MAX_DOWN_ROWS).map((printer) => {
                   const seconds =
                     status === undefined ? null : sinceSeconds(printer, status.generated_at);
                   return (
@@ -509,9 +553,28 @@ export function FleetSummaryCard({
                     </li>
                   );
                 })}
-                {overflow > 0 && (
-                  <li className={`text-sm ${SECONDARY_TEXT_CLASS}`}>
-                    {t('common.more', { count: overflow })}
+                {(overflow > 0 || downNowExpanded) && (
+                  <li>
+                    {/*
+                      A real control, not a caption. "+9 more" that cannot be
+                      pressed tells the operator there are nine more printers
+                      down and then refuses to name them — on a lights-out farm
+                      that is the most important list on the page.
+
+                      The growth is USER-initiated, so it is allowed to move the
+                      page; the 30 s poll still never does, because the
+                      collapsed list keeps its fixed min-height.
+                    */}
+                    <button
+                      type="button"
+                      aria-expanded={downNowExpanded}
+                      onClick={() => setDownNowExpanded((shown) => !shown)}
+                      className={`rounded text-sm underline-offset-2 hover:text-white hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green/50 ${SECONDARY_TEXT_CLASS}`}
+                    >
+                      {downNowExpanded
+                        ? t('fleetMetrics.summary.showFewer')
+                        : t('common.more', { count: overflow })}
+                    </button>
                   </li>
                 )}
               </ul>

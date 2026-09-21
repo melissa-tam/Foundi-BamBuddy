@@ -7580,6 +7580,7 @@ export default {
     summary: {
       now: 'Now',
       trend: 'Trend',
+      trendOf: '{{metric}} trend',
       vsPrevious: 'vs previous',
       period: {
         today: 'Today',
@@ -7608,6 +7609,7 @@ export default {
       peak: 'peak {{count}}',
       downNow: 'Down now',
       nothingDown: 'Nothing down',
+      showFewer: 'Show fewer',
       updated: 'Updated {{time}}',
       stale: 'Status {{age}} old',
       openPrinter: 'Open printer',
@@ -7723,6 +7725,7 @@ export default {
     },
     header: {
       range: '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+      rangePending: '{{from}} – {{to}} · {{tz}}',
       bucket: {
         hour: 'hourly',
         day: 'daily',

@@ -44,6 +44,13 @@ function gridRows(grid: HTMLElement): HTMLTableRowElement[] {
   ];
 }
 
+/** The `<col>` that sizes one column. Widths are the colgroup's alone. */
+function colAt(grid: HTMLElement, col: number): HTMLTableColElement {
+  const element = grid.querySelectorAll('col')[col];
+  if (!(element instanceof HTMLTableColElement)) throw new Error(`no col at ${col}`);
+  return element;
+}
+
 function cellAt(grid: HTMLElement, row: number, col: number): HTMLElement {
   const cell = gridRows(grid)[row]?.children[col];
   if (!(cell instanceof HTMLElement)) throw new Error(`no cell at ${row},${col}`);
@@ -71,7 +78,14 @@ function rowOf(grid: HTMLElement, label: string | RegExp): number {
   return index;
 }
 
-const FIRST_BUCKET_COL = 4;
+/**
+ * The frozen block is three columns wide — Printer · Total · Avg — and the
+ * bucket columns begin immediately after it. There is no fourth "Time split"
+ * column: a column between the frozen block and the buckets cannot be hidden
+ * at the wide breakpoint without shifting every bucket cell off its `<col>`,
+ * so the phone's split bar lives inside the printer cell instead.
+ */
+const FIRST_BUCKET_COL = 3;
 
 async function switchLens(user: ReturnType<typeof userEvent.setup>, name: string) {
   await user.click(screen.getByRole('tab', { name }));
@@ -96,7 +110,7 @@ describe('FleetMatrix', () => {
           to: 'Sep 21, 2026',
         }),
       );
-      // Three frozen columns + the phone Time-split column + seven day buckets.
+      // The three frozen columns plus seven day buckets.
       expect(within(grid).getAllByRole('columnheader')).toHaveLength(FIRST_BUCKET_COL + 7);
       // Three printers (the deleted one is hidden) plus the fleet row.
       expect(within(grid).getAllByRole('rowheader')).toHaveLength(4);
@@ -294,7 +308,9 @@ describe('FleetMatrix', () => {
       const grid = theGrid();
 
       expect(within(grid).getAllByRole('columnheader')).toHaveLength(FIRST_BUCKET_COL + 6);
-      expect(cellAt(grid, 0, FIRST_BUCKET_COL).style.width).toBe('40px');
+      // Widths live on the `<colgroup>` — one owner, and the sticky offsets are
+      // summed from the same constants.
+      expect(colAt(grid, FIRST_BUCKET_COL).style.width).toBe('40px');
       expect(
         within(grid).getAllByText(t('fleetMetrics.units.weekOf', { date: 'Sep 21, 2026' }), {
           exact: false,

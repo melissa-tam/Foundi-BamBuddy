@@ -7544,6 +7544,7 @@ export default {
     summary: {
       now: 'Jetzt',
       trend: 'Verlauf',
+      trendOf: 'Verlauf: {{metric}}',
       vsPrevious: 'ggü. Vorzeitraum',
       period: {
         today: 'Heute',
@@ -7572,6 +7573,7 @@ export default {
       peak: 'Spitze {{count}}',
       downNow: 'Jetzt ausgefallen',
       nothingDown: 'Nichts ausgefallen',
+      showFewer: 'Weniger anzeigen',
       updated: 'Aktualisiert {{time}}',
       stale: 'Status {{age}} alt',
       openPrinter: 'Drucker öffnen',
@@ -7687,6 +7689,7 @@ export default {
     },
     header: {
       range: '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+      rangePending: '{{from}} – {{to}} · {{tz}}',
       bucket: {
         hour: 'stündlich',
         day: 'täglich',

@@ -16,6 +16,10 @@ import { Rectangle, type BarShapeProps } from 'recharts';
 import { Button } from '../../Button';
 import { InfoHint } from '../../ui/InfoHint';
 import {
+  CHART_BAND_SEPARATOR_STROKE,
+  CHART_BAND_SEPARATOR_WIDTH,
+} from '../../../utils/chartChrome';
+import {
   FLEET_PATTERN_CSS,
   SECONDARY_TEXT_CLASS,
   patternFill,
@@ -219,6 +223,12 @@ export interface PartialAwareBarProps extends BarShapeProps {
   /** The band's own colour. Passed explicitly: the computed props do not type it. */
   fill: string;
   /**
+   * The series' own pattern — its SECOND encoding channel, drawn over the fill.
+   * Supplied where hue alone cannot carry identity (the outcome stack under
+   * deuteranopia); omitted where the bands already separate by value.
+   */
+  pattern?: FleetPattern;
+  /**
    * Which of the two bucket uncertainties make THIS chart's bars understate.
    *
    * Always includes `inProgress` — a sum over a running bucket is short of a
@@ -247,12 +257,27 @@ export function PartialAwareBar({
   height,
   radius,
   fill,
+  pattern,
   uncertain,
 }: PartialAwareBarProps) {
   const rect = { x, y, width, height, radius };
   return (
     <>
-      <Rectangle {...rect} fill={fill} />
+      {/*
+        The colour, edged in the card's own ground. The edge is what makes a
+        stack COUNTABLE: two adjacent fills a colour-blind reader cannot tell
+        apart otherwise merge into one block, and no legend can rescue that.
+        It is the cheapest redundant channel a stack can carry.
+      */}
+      <Rectangle
+        {...rect}
+        fill={fill}
+        stroke={CHART_BAND_SEPARATOR_STROKE}
+        strokeWidth={CHART_BAND_SEPARATOR_WIDTH}
+      />
+      {/* The series' own texture, over its colour. */}
+      {pattern && <Rectangle {...rect} fill={patternFill(pattern)} />}
+      {/* And the bucket's honesty hatch, over both. */}
       {rowIsUncertain(uncertaintyOf(payload), uncertain) && (
         <Rectangle {...rect} fill={patternFill('sparse')} />
       )}

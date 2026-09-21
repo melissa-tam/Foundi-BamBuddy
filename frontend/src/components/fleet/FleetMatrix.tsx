@@ -46,15 +46,16 @@
  * discloses the bucket columns behind "Show days" — ONE `<table>` and a
  * responsive column set. Nothing is dropped, only disclosed.
  */
-import { useRef, useState, type KeyboardEvent } from 'react';
+import { useRef, useState, type CSSProperties, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useTabs, type TabDefinition } from '../../hooks/useTabs';
 import { InfoHint } from '../ui/InfoHint';
 import { TabList, TabPanel } from '../ui/Tabs';
 import { BucketDetail } from './BucketDetail';
-import { FleetMatrixCell, MATRIX_CELL_BASE } from './FleetMatrixCell';
+import { FleetMatrixCell, FleetSplitBar, MATRIX_CELL_BASE } from './FleetMatrixCell';
 import { FleetMatrixLegend } from './FleetMatrixLegend';
+import { elementIsLaidOut, stepVisibleColumn } from '../../utils/rovingGrid';
 import type {
   FleetOverview,
   FleetStatus,
@@ -66,6 +67,9 @@ import type {
 import {
   BUCKET_COLUMN_WIDTH_PX,
   FLEET_LENSES,
+  MATRIX_FROZEN_COLUMNS,
+  MATRIX_FROZEN_WIDTH_PX,
+  matrixFrozenLeft,
   LENS_LABEL_KEY,
   SECONDARY_TEXT_CLASS,
   bucketLabel,
@@ -78,9 +82,9 @@ import {
   formatSiteDate,
   isRowHidden,
   sumMap,
-  type AbsenceHeader,
   type BucketLabel,
   type FleetLens,
+  type MatrixFrozenColumn,
 } from '../../utils/fleetMetrics';
 
 const SECONDS_PER_HOUR = 3600;
@@ -92,20 +96,33 @@ const PAGE_COLUMNS = 10;
 const COL_PRINTER = 0;
 const COL_TOTAL = 1;
 const COL_AVG = 2;
-const COL_SPLIT = 3;
-const FIRST_BUCKET_COL = 4;
-
-/** Width of the phone-only Time-split column, in px. */
-const SPLIT_COLUMN_WIDTH_PX = 72;
+const FIRST_BUCKET_COL = 3;
 
 /** The opaque ground the frozen block scrolls under. Theme variable, all 8 grounds. */
 const FROZEN_BG = 'bg-bambu-dark-secondary';
 
+/**
+ * A frozen cell's chrome. Its WIDTH and its `left` offset are not here — both
+ * come from `MATRIX_FROZEN_WIDTH_PX` via the `<colgroup>` and `frozenStyle`,
+ * because a width utility and a matching offset utility are two statements of
+ * one fact and they drifted (see the constant's own note).
+ */
 const FROZEN_CLASS: Record<number, string> = {
-  [COL_PRINTER]: `sticky left-0 z-20 ${FROZEN_BG} w-28 max-w-28 @2xl:w-40 @2xl:max-w-40 text-left`,
-  [COL_TOTAL]: `sticky left-28 @2xl:left-40 z-20 ${FROZEN_BG} w-14 max-w-14 @2xl:w-16 @2xl:max-w-16 text-right`,
-  [COL_AVG]: `sticky left-[10.5rem] @2xl:left-56 z-20 ${FROZEN_BG} w-14 max-w-14 @2xl:w-16 @2xl:max-w-16 text-right`,
+  [COL_PRINTER]: `sticky z-20 ${FROZEN_BG} text-left`,
+  [COL_TOTAL]: `sticky z-20 ${FROZEN_BG} text-right`,
+  [COL_AVG]: `sticky z-20 ${FROZEN_BG} text-right`,
 };
+
+const FROZEN_COLUMN_OF: Record<number, MatrixFrozenColumn> = {
+  [COL_PRINTER]: 'printer',
+  [COL_TOTAL]: 'total',
+  [COL_AVG]: 'avg',
+};
+
+/** Where a frozen cell pins itself: the summed width of the columns before it. */
+function frozenStyle(column: number): CSSProperties {
+  return { left: matrixFrozenLeft(FROZEN_COLUMN_OF[column] ?? 'printer') };
+}
 
 type SortKey = 'printer' | 'total' | 'avg';
 type SortDirection = 'asc' | 'desc';
@@ -199,12 +216,6 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
     bucketLabel(bucket, { bucket: bucketWidth, locale }, index === 0 ? undefined : buckets[index - 1]),
   );
 
-  /** The window as one header, for the frozen block's own absence verdict. */
-  const windowHeader: AbsenceHeader = {
-    elapsed_seconds: buckets.reduce((sum, bucket) => sum + bucket.elapsed_seconds, 0),
-    observed_seconds: buckets.reduce((sum, bucket) => sum + bucket.observed_seconds, 0),
-  };
-
   const cellOf = (bucketIndex: number, printerId: number): MatrixCell | undefined =>
     buckets[bucketIndex]?.values.printers[String(printerId)];
 
@@ -283,17 +294,38 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
     setDetail({ printerId, bucketIndex });
   };
 
+  /**
+   * The columns the layout is actually showing, in order.
+   *
+   * Read from the HEADER row, which has a cell for every column and is the one
+   * row that is always present: a column is navigable exactly when its own
+   * header is on screen. Computed at key time rather than held in state — the
+   * answer changes with the container width and with "Show days", and neither
+   * of those tells React anything.
+   */
+  const visibleColumns = (): number[] => {
+    const visible: number[] = [];
+    for (let col = 0; col < columnCount; col += 1) {
+      const header = cells.current.get(`0:${col}`);
+      if (!header || elementIsLaidOut(header)) visible.push(col);
+    }
+    return visible;
+  };
+
   const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const lastRow = rowCount - 1;
-    const lastCol = columnCount - 1;
     let next: { row: number; col: number } | null = null;
+    const visible = visibleColumns();
+    const step = (delta: number): number => stepVisibleColumn(visible, activeCol, delta);
+    const firstCol = visible[0] ?? 0;
+    const lastCol = visible[visible.length - 1] ?? 0;
 
     switch (event.key) {
       case 'ArrowRight':
-        next = { row: activeRow, col: Math.min(lastCol, activeCol + 1) };
+        next = { row: activeRow, col: step(1) };
         break;
       case 'ArrowLeft':
-        next = { row: activeRow, col: Math.max(0, activeCol - 1) };
+        next = { row: activeRow, col: step(-1) };
         break;
       case 'ArrowDown':
         next = { row: Math.min(lastRow, activeRow + 1), col: activeCol };
@@ -302,7 +334,10 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
         next = { row: Math.max(0, activeRow - 1), col: activeCol };
         break;
       case 'Home':
-        next = event.ctrlKey || event.metaKey ? { row: 0, col: 0 } : { row: activeRow, col: 0 };
+        next =
+          event.ctrlKey || event.metaKey
+            ? { row: 0, col: firstCol }
+            : { row: activeRow, col: firstCol };
         break;
       case 'End':
         next =
@@ -311,10 +346,10 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
             : { row: activeRow, col: lastCol };
         break;
       case 'PageDown':
-        next = { row: activeRow, col: Math.min(lastCol, activeCol + PAGE_COLUMNS) };
+        next = { row: activeRow, col: step(PAGE_COLUMNS) };
         break;
       case 'PageUp':
-        next = { row: activeRow, col: Math.max(0, activeCol - PAGE_COLUMNS) };
+        next = { row: activeRow, col: step(-PAGE_COLUMNS) };
         break;
       case 'Enter':
       case ' ': {
@@ -404,7 +439,21 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
         />
 
         <div className="overflow-x-auto">
-          <table role="grid" className="border-separate border-spacing-0 text-xs">
+          {/*
+            `table-fixed` + `w-max` + the `<colgroup>` below are ONE mechanism,
+            and the frozen block depends on all three. Under the default
+            `table-layout: auto` a width utility is only a hint: the columns
+            collapsed to their content (a 54 px Printer column where 128 px was
+            asked for) while the sticky offsets stayed at the nominal figure, so
+            the three frozen cells detached and day columns rendered in the gaps
+            between them. Fixed layout makes the `<col>` widths AUTHORITATIVE,
+            and `w-max` stops the table stretching its last column to fill a
+            wide viewport.
+          */}
+          <table
+            role="grid"
+            className="table-fixed w-max border-separate border-spacing-0 text-xs"
+          >
             <caption className="sr-only">
               {t('fleetMetrics.matrix.caption', {
                 lens: t(LENS_LABEL_KEY[activeLens]),
@@ -412,6 +461,14 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                 to: formatSiteDate(overview.date_to, locale),
               })}
             </caption>
+            <colgroup>
+              {MATRIX_FROZEN_COLUMNS.map((column) => (
+                <col key={column} style={{ width: MATRIX_FROZEN_WIDTH_PX[column] }} />
+              ))}
+              {buckets.map((bucket) => (
+                <col key={bucket.start} style={{ width: columnWidth }} />
+              ))}
+            </colgroup>
             <thead>
               <tr>
                 {(['printer', 'total', 'avg'] as const).map((key, index) => {
@@ -421,6 +478,7 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                       key={key}
                       scope="col"
                       aria-sort={isSorted ? ARIA_SORT[effectiveSort.direction] : 'none'}
+                      style={frozenStyle(index)}
                       className={`${FROZEN_CLASS[index]} border-b border-bambu-dark-tertiary px-1 py-1 align-bottom font-medium`}
                     >
                       <button
@@ -446,16 +504,6 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                     </th>
                   );
                 })}
-                <th
-                  scope="col"
-                  ref={register(0, COL_SPLIT)}
-                  {...cellPlumbing(0, COL_SPLIT)}
-                  onKeyDown={handleKeyDown}
-                  style={{ width: SPLIT_COLUMN_WIDTH_PX }}
-                  className={`@2xl:hidden border-b border-bambu-dark-tertiary px-1 py-1 align-bottom font-medium ${SECONDARY_TEXT_CLASS}`}
-                >
-                  {t('fleetMetrics.matrix.lens.timeSplit')}
-                </th>
                 {buckets.map((bucket, index) => {
                   const label = labels[index];
                   if (!label) return null;
@@ -513,9 +561,16 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                       ref={rowControl ? undefined : register(row, COL_PRINTER)}
                       {...(rowControl ? {} : cellPlumbing(row, COL_PRINTER))}
                       onKeyDown={handleKeyDown}
+                      style={frozenStyle(COL_PRINTER)}
                       className={`${FROZEN_CLASS[COL_PRINTER]} border-b border-bambu-dark-tertiary px-1 py-1 font-normal focus:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-inset`}
                     >
-                      <span className="block truncate">{nameOf(printer)}</span>
+                      {/* Fixed 128 px column: a long name truncates, and its
+                          full text stays recoverable on the element itself
+                          (react-best-practices §9 — a truncated value's full
+                          text rides a tooltip, never a second line). */}
+                      <span className="block truncate" title={nameOf(printer)}>
+                        {nameOf(printer)}
+                      </span>
                       {!printer.deleted && !printer.is_active ? (
                         <span
                           className={`mt-0.5 inline-block rounded border border-bambu-dark-tertiary px-1 text-[10px] ${SECONDARY_TEXT_CLASS}`}
@@ -543,6 +598,19 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                           {t('fleetMetrics.matrix.details')}
                         </button>
                       ) : null}
+                      {/*
+                        The phone's Time-split bar. It lives INSIDE the printer
+                        cell rather than in a column of its own: a column here
+                        would sit between the frozen block and the buckets, and
+                        a middle column that the wide layout hides cannot be
+                        removed with `display:none` without shifting every
+                        bucket cell one column off its `<col>`. In the name cell
+                        it simply disappears at `@2xl`, and the first bucket
+                        column begins exactly where the frozen block ends.
+                      */}
+                      <span className="mt-1 block @2xl:hidden">
+                        <FleetSplitBar split={foldTimeSplit(totalsCell?.class_seconds ?? {})} />
+                      </span>
                     </th>
                     <FrozenFigure
                       column={COL_TOTAL}
@@ -562,21 +630,6 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                       cellRef={register(row, COL_AVG)}
                       onKeyDown={handleKeyDown}
                     />
-                    <FleetMatrixCell
-                      cell={totalsCell}
-                      header={windowHeader}
-                      lens="time_split"
-                      bucketWidth={bucketWidth}
-                      mode={resolvedMode}
-                      printsMax={printsMax}
-                      heat={false}
-                      valueHidden={false}
-                      width={SPLIT_COLUMN_WIDTH_PX}
-                      cellRef={register(row, COL_SPLIT)}
-                      {...cellPlumbing(row, COL_SPLIT)}
-                      onKeyDown={handleKeyDown}
-                      className="@2xl:hidden border-b border-bambu-dark-tertiary"
-                    />
                     {buckets.map((bucket, index) => (
                       <FleetMatrixCell
                         key={bucket.start}
@@ -588,7 +641,6 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                         printsMax={printsMax}
                         heat
                         valueHidden={rowControl}
-                        width={columnWidth}
                         cellRef={register(row, FIRST_BUCKET_COL + index)}
                         {...cellPlumbing(row, FIRST_BUCKET_COL + index)}
                         onKeyDown={handleKeyDown}
@@ -608,9 +660,13 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                   ref={register(rowCount - 1, COL_PRINTER)}
                   {...cellPlumbing(rowCount - 1, COL_PRINTER)}
                   onKeyDown={handleKeyDown}
+                  style={frozenStyle(COL_PRINTER)}
                   className={`${FROZEN_CLASS[COL_PRINTER]} px-1 py-1 font-medium focus:outline-none focus-visible:ring-2 focus-visible:ring-white focus-visible:ring-inset`}
                 >
                   {t('fleetMetrics.matrix.fleetRow')}
+                  <span className="mt-1 block @2xl:hidden">
+                    <FleetSplitBar split={foldTimeSplit(totals.fleet.class_seconds)} />
+                  </span>
                 </th>
                 <FrozenFigure
                   column={COL_TOTAL}
@@ -630,21 +686,6 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                   cellRef={register(rowCount - 1, COL_AVG)}
                   onKeyDown={handleKeyDown}
                 />
-                <FleetMatrixCell
-                  cell={totals.fleet}
-                  header={windowHeader}
-                  lens="time_split"
-                  bucketWidth={bucketWidth}
-                  mode={resolvedMode}
-                  printsMax={printsMax}
-                  heat={false}
-                  valueHidden={false}
-                  width={SPLIT_COLUMN_WIDTH_PX}
-                  cellRef={register(rowCount - 1, COL_SPLIT)}
-                  {...cellPlumbing(rowCount - 1, COL_SPLIT)}
-                  onKeyDown={handleKeyDown}
-                  className="@2xl:hidden"
-                />
                 {buckets.map((bucket, index) => (
                   <FleetMatrixCell
                     key={bucket.start}
@@ -656,7 +697,6 @@ export function FleetMatrix({ overview, status }: FleetMatrixProps) {
                     printsMax={printsMax}
                     heat={false}
                     valueHidden={rowControl}
-                    width={columnWidth}
                     cellRef={register(rowCount - 1, FIRST_BUCKET_COL + index)}
                     {...cellPlumbing(rowCount - 1, FIRST_BUCKET_COL + index)}
                     onKeyDown={handleKeyDown}
@@ -732,6 +772,7 @@ function FrozenFigure({ column, value, lens, kind, plumbing, cellRef, onKeyDown 
       ref={cellRef}
       {...plumbing}
       onKeyDown={onKeyDown}
+      style={frozenStyle(column)}
       className={`${FROZEN_CLASS[column]} ${MATRIX_CELL_BASE} border-b border-bambu-dark-tertiary`}
     >
       {text}

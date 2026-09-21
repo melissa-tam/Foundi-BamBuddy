@@ -395,6 +395,8 @@ const FLEET_FORMAT_TEMPLATES = [
   '{{hours}} h+',
   '{{printer}} · {{bucket}}',
   '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+  // The same header before the server has echoed its bucket choice.
+  '{{from}} – {{to}} · {{tz}}',
 ];
 
 const IDENTICAL_TO_EN_ALLOWED = {

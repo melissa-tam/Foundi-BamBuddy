@@ -30,6 +30,7 @@ import {
   PartialAwareBar,
   type ChartLegendEntry,
 } from './ChartFrame';
+import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
 import { partsRows, partsTotals, skuSeries, type PartsRowValues, type SkuSeries } from './rows';
 import type { FleetOverview } from '../../../types/fleetMetrics';
@@ -37,8 +38,6 @@ import {
   CHART_AXIS_STROKE,
   CHART_GRID_DASH,
   CHART_GRID_STROKE,
-  CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TOOLTIP_LABEL_STYLE,
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
@@ -112,9 +111,13 @@ export function PartsBySkuWidget({ overview, size }: PartsBySkuWidgetProps) {
               allowDecimals={false}
             />
             <Tooltip
-              contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-              labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-              formatter={(value) => (typeof value === 'number' ? formatCount(value, locale) : '')}
+              content={(props) => (
+                <FleetChartTooltip
+                  active={props.active}
+                  payload={props.payload}
+                  formatValue={(value) => formatCount(value, locale)}
+                />
+              )}
             />
             {series.map((entry, index) => {
               const color = skuBandColor(index, entry.sku === null);

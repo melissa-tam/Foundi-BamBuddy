@@ -286,6 +286,29 @@ export const SUMMARY_ROW_NOW_GROUP: Partial<Record<SummaryRowKey, FleetGroup>> =
   avg_planned: 'planned',
 };
 
+/**
+ * Every summary row the backend composes, in the order it composes them.
+ *
+ * The card renders this list BEFORE the history sweep answers, with empty
+ * figures, so that the card it draws at first paint is the same shape as the
+ * card it draws when the numbers land. It used to fall back to the five live
+ * rows plus "In fleet", and the card then grew by 89 px when `/overview`
+ * returned — shoving the matrix and the whole grid below it down the page.
+ */
+export const SUMMARY_ROW_ORDER: readonly SummaryRowKey[] = [
+  'avg_printing',
+  'avg_cycle_overhead',
+  'avg_idle',
+  'avg_down',
+  'avg_planned',
+  'peak_down',
+  'printers_in_fleet',
+  'prints_per_day',
+  'prints_per_printer_per_day',
+  'uptime',
+  'time_printing',
+];
+
 /** Summary row key → its label leaf. The backend composes the rows; this names them. */
 export const SUMMARY_ROW_LABEL_KEY: Record<SummaryRowKey, string> = {
   avg_printing: 'fleetMetrics.summary.rows.avg_printing',
@@ -592,6 +615,23 @@ export function incidentKindTextColor(kind: PrinterIncidentKind): string {
     : downCauseTextColor(incidentKindCause(kind));
 }
 
+/**
+ * The i18n key that NAMES an incident kind.
+ *
+ * Not `causeLabelKey(incidentKindCause(kind))`, which is what the Recovery
+ * widget used to spell: that builds `fault:service_hold` for the one DECLARED
+ * kind and so asks for `printers.incident.service_hold`, a leaf that does not
+ * exist — the legend, the series name and the data-table header all printed the
+ * raw key. The two colour lookups above have always made the declared/fault
+ * distinction; the label lookup has to make the same one, and it is made HERE
+ * so that no consumer has to remember it a fourth time.
+ */
+export function incidentKindLabelKey(kind: PrinterIncidentKind): string {
+  return kind === SERVICE_HOLD_KIND
+    ? GROUP_LABEL_KEY.planned
+    : causeLabelKey(incidentKindCause(kind));
+}
+
 /** One heat step: an opaque tile and the text colour proven legible on it. */
 export interface HeatStep {
   background: string;
@@ -756,6 +796,27 @@ export const FLEET_IN_PROGRESS_CSS: PatternCss = {
   backgroundSize: 'auto',
 };
 
+/**
+ * Print outcome → its pattern: the SECOND encoding channel for the outcome
+ * stack, the one the state chart has always had and this one did not.
+ *
+ * Hue alone is not identity. Under deuteranopia the outcome bands' green, red
+ * and amber collapse into near-identical olive, and a reader cannot tell a
+ * failed print from one an operator stopped — which is the single distinction
+ * the chart exists to draw. The two that matter therefore carry a texture as
+ * well: failed hatches (the same 45° hatch that already means "down"),
+ * cancelled takes the dots that already mean "a person intervened". `completed`
+ * stays plain, so the good case is the quiet one and the textures read as
+ * exceptions rather than as noise.
+ *
+ * Every surface that names a band draws the same pattern: the bar, the legend
+ * swatch and the tooltip swatch.
+ */
+export const OUTCOME_PATTERN: Partial<Record<PrintOutcome, FleetPattern>> = {
+  failed: 'hatch',
+  cancelled: 'dots',
+};
+
 /** The pattern a group carries wherever it is drawn. Groups not listed carry none. */
 export const GROUP_PATTERN: Partial<Record<FleetGroup, FleetPattern>> = {
   down: 'hatch',
@@ -775,6 +836,54 @@ export const BUCKET_HOURS: Record<FleetBucket, number> = { hour: 1, day: 24, wee
  * fits a wider one.
  */
 export const BUCKET_COLUMN_WIDTH_PX: Record<FleetBucket, number> = { hour: 14, day: 28, week: 40 };
+
+/**
+ * The matrix's FROZEN block: the width of each column beside the printer name,
+ * in px, and nothing else allowed to state it.
+ *
+ * These are the numbers a `<colgroup>` hands the table AND the numbers each
+ * sticky cell's `left` offset is summed from (`matrixFrozenLeft`). They were
+ * two hand-synchronised things — Tailwind width utilities (`w-28`, `@2xl:w-40`)
+ * on the cells and literal offsets (`left-28`, `left-[10.5rem]`) — and under
+ * `table-layout: auto` the widths were merely ADVISORY, so the columns
+ * collapsed to their content (54 px, not 112) while the offsets stayed at the
+ * nominal figure. The frozen cells detached from each other and day columns
+ * rendered in the gaps. One definition, in px, makes that unrepresentable.
+ *
+ * Deliberately NOT responsive. A second set switched at a container query would
+ * put the breakpoint back into two places (the `<col>` and the offsets) and is
+ * what the bug was made of; 128 px holds the fleet's names ("001-H2S",
+ * "Printer 12") at every width, and a longer one truncates with its full text
+ * on the cell — react-best-practices §9.
+ */
+export const MATRIX_FROZEN_WIDTH_PX = { printer: 128, total: 56, avg: 56 } as const;
+
+/** The frozen columns in their DOM order. The `left` offsets are their prefix sums. */
+export const MATRIX_FROZEN_COLUMNS = ['printer', 'total', 'avg'] as const;
+
+export type MatrixFrozenColumn = (typeof MATRIX_FROZEN_COLUMNS)[number];
+
+/**
+ * How far from the scroller's left edge a frozen column is pinned: the sum of
+ * the widths BEFORE it. Derived, never typed — the first column is flush at 0
+ * and each next one begins exactly where the previous ended, which is the whole
+ * definition of "contiguous".
+ */
+export function matrixFrozenLeft(column: MatrixFrozenColumn): number {
+  let left = 0;
+  for (const name of MATRIX_FROZEN_COLUMNS) {
+    if (name === column) return left;
+    left += MATRIX_FROZEN_WIDTH_PX[name];
+  }
+  return left;
+}
+
+/** Total width of the frozen block — where the first bucket column begins. */
+export const MATRIX_FROZEN_TOTAL_PX = MATRIX_FROZEN_COLUMNS.reduce(
+  (total, name) => total + MATRIX_FROZEN_WIDTH_PX[name],
+  0,
+);
+
 
 /**
  * localStorage key of the Fleet tab's widget grid. Here rather than beside the

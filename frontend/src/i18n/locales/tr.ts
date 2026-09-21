@@ -7472,6 +7472,7 @@ export default {
     summary: {
       now: 'Şu an',
       trend: 'Eğilim',
+      trendOf: 'Eğilim: {{metric}}',
       vsPrevious: 'önceki döneme göre',
       period: {
         today: 'Bugün',
@@ -7500,6 +7501,7 @@ export default {
       peak: 'zirve {{count}}',
       downNow: 'Şu an duruşta',
       nothingDown: 'Duruşta bir şey yok',
+      showFewer: 'Daha az göster',
       updated: 'Güncellendi {{time}}',
       stale: 'Durum {{age}} eskimiş',
       openPrinter: 'Yazıcıyı aç',
@@ -7615,6 +7617,7 @@ export default {
     },
     header: {
       range: '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+      rangePending: '{{from}} – {{to}} · {{tz}}',
       bucket: {
         hour: 'saatlik',
         day: 'günlük',

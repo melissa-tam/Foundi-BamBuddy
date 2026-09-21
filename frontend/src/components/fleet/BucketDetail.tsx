@@ -26,8 +26,8 @@
  * asking for a day and filtering is cheaper than a narrower contract nobody
  * else needs.
  */
-import { useId } from 'react';
-import { Loader2 } from 'lucide-react';
+import { useId, useRef } from 'react';
+import { Loader2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { CardContent, CardHeader } from '../Card';
@@ -105,6 +105,7 @@ export function BucketDetail({
   const locale = i18n.language;
   const baseId = useId();
   const titleId = `${baseId}title`;
+  const closeRef = useRef<HTMLButtonElement>(null);
   /**
    * Every section is a named region. Four unlabelled lists in one dialog are
    * four "list"s a screen-reader user has to read into to tell apart, and the
@@ -152,17 +153,37 @@ export function BucketDetail({
     response !== undefined && Date.parse(`${end}Z`) >= Date.parse(`${response.generated_at}Z`);
 
   return (
-    <Modal onClose={onClose} labelledBy={titleId} size="lg">
-      <CardHeader>
-        <h2 id={titleId} className="text-base font-semibold text-white">
-          {t('fleetMetrics.detail.title', {
-            printer: printer.deleted
-              ? t('fleetMetrics.matrix.deletedPrinter', { id: printer.printer_id })
-              : printer.name,
-            bucket: label.full,
-          })}
-        </h2>
-        <p className={`text-xs ${SECONDARY_TEXT_CLASS}`}>{tzName}</p>
+    <Modal onClose={onClose} labelledBy={titleId} size="lg" initialFocusRef={closeRef}>
+      {/*
+        The close control is the dialog's FIRST focusable element and takes the
+        initial focus. Without it the only focusable thing in here was "Open
+        printer", at the bottom of a list that can run to nineteen hundred
+        pixels — so opening the dialog scrolled the reader to its end, and a
+        pointer user had no visible way out at all. Escape and the backdrop
+        still close it, and `Modal` still returns focus to the cell that opened
+        it.
+      */}
+      <CardHeader className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 id={titleId} className="text-base font-semibold text-white">
+            {t('fleetMetrics.detail.title', {
+              printer: printer.deleted
+                ? t('fleetMetrics.matrix.deletedPrinter', { id: printer.printer_id })
+                : printer.name,
+              bucket: label.full,
+            })}
+          </h2>
+          <p className={`text-xs ${SECONDARY_TEXT_CLASS}`}>{tzName}</p>
+        </div>
+        <button
+          ref={closeRef}
+          type="button"
+          onClick={onClose}
+          aria-label={t('common.close')}
+          className={`shrink-0 rounded p-1 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-bambu-green/50 ${SECONDARY_TEXT_CLASS}`}
+        >
+          <X className="h-5 w-5" aria-hidden="true" />
+        </button>
       </CardHeader>
 
       <CardContent className="space-y-4">

@@ -7169,6 +7169,7 @@ export default {
     summary: {
       now: '현재',
       trend: '추이',
+      trendOf: '{{metric}} 추이',
       vsPrevious: '이전 기간 대비',
       period: {
         today: '오늘',
@@ -7197,6 +7198,7 @@ export default {
       peak: '최대 {{count}}',
       downNow: '현재 중단',
       nothingDown: '중단 없음',
+      showFewer: '간략히 보기',
       updated: '갱신 {{time}}',
       stale: '상태가 {{age}} 지남',
       openPrinter: '프린터 열기',
@@ -7312,6 +7314,7 @@ export default {
     },
     header: {
       range: '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+      rangePending: '{{from}} – {{to}} · {{tz}}',
       bucket: {
         hour: '시간 단위',
         day: '일 단위',

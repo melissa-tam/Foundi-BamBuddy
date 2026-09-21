@@ -47,7 +47,11 @@ import {
   groupLabelKey,
   incidentKindCause,
   incidentKindColor,
+  incidentKindLabelKey,
   incidentKindTextColor,
+  BASIS_LABEL_KEY,
+  LENS_LABEL_KEY,
+  OUTCOME_LABEL_KEY,
   OUTCOME_COLOR,
   OUTCOME_ORDER,
   OUTCOME_TEXT,
@@ -193,6 +197,53 @@ describe('label keys', () => {
       (key) => typeof lookup(key) !== 'string',
     );
     expect(missing).toEqual([]);
+  });
+
+  /**
+   * EVERY label key the Fleet tab can ask for, against the real `en.ts`.
+   *
+   * The defect this exists for: `incidentKindLabelKey` used to be spelled
+   * `causeLabelKey(incidentKindCause(kind))` at four call sites, which builds
+   * `fault:service_hold` for the one DECLARED kind and so asked for
+   * `printers.incident.service_hold` — a leaf that does not exist. The Recovery
+   * legend, its series name and its data-table header all printed that raw key
+   * to the operator. The per-family tests above each passed, because none of
+   * them walked the incident kinds.
+   *
+   * So this one walks every family the tab can name, in one place, and a new
+   * member of any of them joins it automatically.
+   */
+  it('resolves EVERY label the Fleet tab can produce to a leaf that exists', () => {
+    const kinds: PrinterIncidentKind[] = [
+      'jam',
+      'runout',
+      'physical',
+      'power_loss',
+      'plate_vision',
+      'z_reference_lost',
+      // The declared kind — the one the old spelling got wrong.
+      'service_hold',
+    ];
+    const keys = [
+      ...allClassKeys().map(classLabelKey),
+      ...CHART_STACK_GROUPS.map(groupLabelKey),
+      ...DOWN_CAUSE_ORDER.map(causeLabelKey),
+      ...kinds.map(incidentKindLabelKey),
+      ...OUTCOME_ORDER.map((outcome) => OUTCOME_LABEL_KEY[outcome]),
+      ...Object.values(SUMMARY_ROW_LABEL_KEY),
+      ...Object.values(LENS_LABEL_KEY),
+      ...Object.values(BASIS_LABEL_KEY),
+    ];
+    const missing = keys.filter((key) => typeof lookup(key) !== 'string');
+    expect(missing).toEqual([]);
+  });
+
+  it('names the declared hold as maintenance, never as a fault kind', () => {
+    // `fault:service_hold` is not a cause the classifier can emit, so asking
+    // for its label is asking for a key nobody wrote.
+    expect(incidentKindLabelKey('service_hold')).toBe(groupLabelKey('planned'));
+    expect(incidentKindLabelKey('jam')).toBe(causeLabelKey('fault:jam'));
+    expect(lookup(incidentKindLabelKey('service_hold'))).toBe('Maintenance');
   });
 });
 

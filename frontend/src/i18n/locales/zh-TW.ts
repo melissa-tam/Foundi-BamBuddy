@@ -7530,6 +7530,7 @@ export default {
     summary: {
       now: '目前',
       trend: '走勢',
+      trendOf: '{{metric}}走勢',
       vsPrevious: '較上一期',
       period: {
         today: '今天',
@@ -7558,6 +7559,7 @@ export default {
       peak: '尖峰 {{count}}',
       downNow: '目前停機',
       nothingDown: '無停機',
+      showFewer: '顯示更少',
       updated: '更新於 {{time}}',
       stale: '狀態已過 {{age}}',
       openPrinter: '開啟印表機',
@@ -7673,6 +7675,7 @@ export default {
     },
     header: {
       range: '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+      rangePending: '{{from}} – {{to}} · {{tz}}',
       bucket: {
         hour: '依小時',
         day: '依天',

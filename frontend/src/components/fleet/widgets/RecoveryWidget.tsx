@@ -35,6 +35,7 @@ import {
   PartialAwareBar,
   type ChartLegendEntry,
 } from './ChartFrame';
+import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
 import {
   NO_VALUE,
@@ -49,18 +50,15 @@ import {
   CHART_AXIS_STROKE,
   CHART_GRID_DASH,
   CHART_GRID_STROKE,
-  CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TOOLTIP_LABEL_STYLE,
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
-  causeLabelKey,
   formatCount,
   formatDuration,
   formatHours,
   formatPercent,
-  incidentKindCause,
   incidentKindColor,
+  incidentKindLabelKey,
   incidentKindTextColor,
   SUM_UNCERTAINTY,
 } from '../../../utils/fleetMetrics';
@@ -90,13 +88,13 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
     .filter((entry) => entry.median_recover_s !== null)
     .map(
       (entry) =>
-        `${t(causeLabelKey(incidentKindCause(entry.kind)))}: ${formatDuration(entry.median_recover_s ?? 0, locale)}`,
+        `${t(incidentKindLabelKey(entry.kind))}: ${formatDuration(entry.median_recover_s ?? 0, locale)}`,
     )
     .join(' · ');
 
   const legend: ChartLegendEntry[] = kinds.map((kind) => ({
     key: kind,
-    label: t(causeLabelKey(incidentKindCause(kind))),
+    label: t(incidentKindLabelKey(kind)),
     color: incidentKindColor(kind),
     textColor: incidentKindTextColor(kind),
   }));
@@ -104,7 +102,7 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
   const columns: ChartDataColumn<RecoveryRowValues>[] = [
     ...kinds.map((kind) => ({
       key: kind,
-      header: t(causeLabelKey(incidentKindCause(kind))),
+      header: t(incidentKindLabelKey(kind)),
       format: (values: RecoveryRowValues) => formatCount(values[kind] ?? 0, locale),
     })),
     {
@@ -132,7 +130,7 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
               detail:
                 headline.leadRecovery === null
                   ? undefined
-                  : t(causeLabelKey(incidentKindCause(headline.leadRecovery.kind))),
+                  : t(incidentKindLabelKey(headline.leadRecovery.kind)),
               hint: recoveryByKind === '' ? undefined : recoveryByKind,
             },
             {
@@ -169,15 +167,19 @@ export function RecoveryWidget({ overview, size }: RecoveryWidgetProps) {
               allowDecimals={false}
             />
             <Tooltip
-              contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-              labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-              formatter={(value) => (typeof value === 'number' ? formatCount(value, locale) : '')}
+              content={(props) => (
+                <FleetChartTooltip
+                  active={props.active}
+                  payload={props.payload}
+                  formatValue={(value) => formatCount(value, locale)}
+                />
+              )}
             />
             {kinds.map((kind) => (
               <Bar
                 key={kind}
                 dataKey={kind}
-                name={t(causeLabelKey(incidentKindCause(kind)))}
+                name={t(incidentKindLabelKey(kind))}
                 stackId="kind"
                 fill={incidentKindColor(kind)}
                 // The incident ledger is complete for its own history — a

@@ -7543,6 +7543,7 @@ export default {
     summary: {
       now: '現在',
       trend: '推移',
+      trendOf: '{{metric}}の推移',
       vsPrevious: '前期間比',
       period: {
         today: '今日',
@@ -7571,6 +7572,7 @@ export default {
       peak: 'ピーク {{count}}',
       downNow: '現在停止中',
       nothingDown: '停止なし',
+      showFewer: '少なく表示',
       updated: '更新 {{time}}',
       stale: '状態は{{age}}前のもの',
       openPrinter: 'プリンターを開く',
@@ -7686,6 +7688,7 @@ export default {
     },
     header: {
       range: '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+      rangePending: '{{from}} – {{to}} · {{tz}}',
       bucket: {
         hour: '1時間単位',
         day: '1日単位',

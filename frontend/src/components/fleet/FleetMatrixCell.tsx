@@ -133,8 +133,6 @@ export interface FleetMatrixCellProps {
   heat: boolean;
   /** Hour columns are 14 px wide: the figure rides sr-only text instead. */
   valueHidden: boolean;
-  /** Column width in px, from `BUCKET_COLUMN_WIDTH_PX`. */
-  width: number;
   tabIndex: number;
   cellRef?: Ref<HTMLTableCellElement>;
   onFocus: () => void;
@@ -152,7 +150,6 @@ export function FleetMatrixCell({
   printsMax,
   heat,
   valueHidden,
-  width,
   tabIndex,
   cellRef,
   onFocus,
@@ -163,7 +160,10 @@ export function FleetMatrixCell({
   const { t, i18n } = useTranslation();
   const locale = i18n.language;
 
-  const style: CSSProperties = { width, minWidth: width, maxWidth: width };
+  // No inline WIDTH here: the table's `<colgroup>` is the ONE place a column's
+  // width is stated. A cell that also declared one would out-specify the
+  // `<col>` and put the frozen block's offsets back out of step with reality.
+  const style: CSSProperties = {};
   /** The visible figure, if the cell has one. */
   let text: string | null = null;
   /** Why this cell has no ordinary number, spoken but not shown. */

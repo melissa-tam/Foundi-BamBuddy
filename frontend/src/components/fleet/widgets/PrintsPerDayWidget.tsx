@@ -33,22 +33,22 @@ import {
   PartialAwareBar,
   type ChartLegendEntry,
 } from './ChartFrame';
+import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
 import { NO_VALUE, printsRows, printsTotals, type PrintsRowValues } from './rows';
-import type { FleetOverview } from '../../../types/fleetMetrics';
+import type { FleetOverview, PrintOutcome } from '../../../types/fleetMetrics';
 import {
   CHART_AXIS_STROKE,
   CHART_GRID_DASH,
   CHART_GRID_STROKE,
   CHART_MUTED_TEXT,
-  CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TOOLTIP_LABEL_STYLE,
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
   OUTCOME_COLOR,
   OUTCOME_LABEL_KEY,
   OUTCOME_ORDER,
+  OUTCOME_PATTERN,
   OUTCOME_TEXT,
   formatCount,
   formatPercent,
@@ -80,6 +80,7 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
       label: t(OUTCOME_LABEL_KEY[outcome]),
       color: OUTCOME_COLOR[outcome],
       textColor: OUTCOME_TEXT[outcome],
+      pattern: OUTCOME_PATTERN[outcome],
     })),
     {
       key: 'per_printer',
@@ -147,9 +148,14 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
               allowDecimals={false}
             />
             <Tooltip
-              contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-              labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-              formatter={(value) => (typeof value === 'number' ? formatCount(value, locale) : NO_VALUE)}
+              content={(props) => (
+                <FleetChartTooltip
+                  active={props.active}
+                  payload={props.payload}
+                  formatValue={(value) => formatCount(value, locale)}
+                  patternFor={(key) => OUTCOME_PATTERN[key as PrintOutcome]}
+                />
+              )}
             />
             {OUTCOME_ORDER.map((outcome) => (
               <Bar
@@ -165,6 +171,7 @@ export function PrintsPerDayWidget({ overview, size }: PrintsPerDayWidgetProps) 
                   <PartialAwareBar
                     {...props}
                     fill={OUTCOME_COLOR[outcome]}
+                    pattern={OUTCOME_PATTERN[outcome]}
                     uncertain={SUM_UNCERTAINTY}
                   />
                 )}

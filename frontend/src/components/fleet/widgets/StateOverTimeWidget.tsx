@@ -48,6 +48,7 @@ import {
 } from 'recharts';
 import { ChartDataTable, type ChartDataColumn } from '../ChartDataTable';
 import { ChartFrame, ChartLegend, type ChartLegendEntry } from './ChartFrame';
+import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
 import { NO_VALUE, stateHasData, stateRows, stateTotals, type StateRowValues } from './rows';
 import type { FleetOverview } from '../../../types/fleetMetrics';
@@ -56,12 +57,11 @@ import {
   CHART_GRID_DASH,
   CHART_GRID_STROKE,
   CHART_MUTED_TEXT,
-  CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TOOLTIP_LABEL_STYLE,
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
   CHART_STACK_GROUPS,
+  type ChartedGroup,
   FLEET_ABSENCE_COLOR,
   FLEET_ABSENCE_TEXT,
   FLEET_GROUP_COLOR,
@@ -166,9 +166,14 @@ export function StateOverTimeWidget({ overview, size }: StateOverTimeWidgetProps
               allowDecimals
             />
             <Tooltip
-              contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-              labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-              formatter={(value) => printers(typeof value === 'number' ? value : null)}
+              content={(props) => (
+                <FleetChartTooltip
+                  active={props.active}
+                  payload={props.payload}
+                  formatValue={(value) => printers(value)}
+                  patternFor={(key) => GROUP_PATTERN[key as ChartedGroup]}
+                />
+              )}
             />
 
             {/* Channel one and two: hue and the luminance ladder, bottom to top. */}

@@ -773,16 +773,21 @@ describe('StatsPage', () => {
           '1',
         );
       });
-      // …the two history sections are not, and the wait is ANNOUNCED once
-      // rather than left as a blank page.
+      // …the wait is ANNOUNCED once rather than left as a blank page…
       const announcing = screen
         .getAllByRole('status')
         .filter((node) => node.textContent !== '')
         .map((node) => node.textContent);
       expect(announcing).toEqual([t('fleetMetrics.states.loading')]);
+      // …and it is announced INSIDE the matrix section, which is always in the
+      // flow. The section used to appear only once history landed, with a
+      // reserved status row of its own above it; that row cost ~83 px of dead
+      // space in the steady state to report a condition that is normally
+      // absent, and its arrival moved the page.
       expect(
-        screen.queryByRole('heading', { level: 2, name: t('fleetMetrics.sections.matrix') }),
-      ).toBeNull();
+        screen.getByRole('heading', { level: 2, name: t('fleetMetrics.sections.matrix') }),
+      ).toBeInTheDocument();
+      // The grid itself and the widget grid still wait for real data.
       expect(screen.queryByRole('grid')).toBeNull();
       expect(screen.queryAllByRole('heading', { level: 3 })).toHaveLength(0);
     });

@@ -43,6 +43,7 @@ import {
   PartialAwareBar,
   type ChartLegendEntry,
 } from './ChartFrame';
+import { FleetChartTooltip } from './FleetChartTooltip';
 import { AXIS_TICK_SIZE, CHART_HEIGHT } from './chartLayout';
 import { downtimeCauses, downtimeRows, downtimeTotals, type DowntimeRowValues } from './rows';
 import type { FleetOverview } from '../../../types/fleetMetrics';
@@ -50,8 +51,6 @@ import {
   CHART_AXIS_STROKE,
   CHART_GRID_DASH,
   CHART_GRID_STROKE,
-  CHART_TOOLTIP_CONTENT_STYLE,
-  CHART_TOOLTIP_LABEL_STYLE,
   chartAxisTick,
 } from '../../../utils/chartChrome';
 import {
@@ -125,13 +124,15 @@ export function DowntimeByCauseWidget({ overview, size }: DowntimeByCauseWidgetP
               unit={t('fleetMetrics.units.hours')}
             />
             <Tooltip
-              contentStyle={CHART_TOOLTIP_CONTENT_STYLE}
-              labelStyle={CHART_TOOLTIP_LABEL_STYLE}
-              formatter={(value) =>
-                typeof value === 'number'
-                  ? `${formatHours(value, locale)} ${t('fleetMetrics.units.hours')}`
-                  : ''
-              }
+              content={(props) => (
+                <FleetChartTooltip
+                  active={props.active}
+                  payload={props.payload}
+                  formatValue={(value) =>
+                    `${formatHours(value, locale)} ${t('fleetMetrics.units.hours')}`
+                  }
+                />
+              )}
             />
             {causes.map((cause) => (
               <Bar

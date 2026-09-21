@@ -49,6 +49,23 @@ export const CHART_AXIS_STROKE = CHART_MUTED_TEXT;
 /** Grid lines. Same hairline as every card border in the app. */
 export const CHART_GRID_STROKE = 'var(--border-color)';
 
+/**
+ * The hairline between two segments of ONE stacked bar.
+ *
+ * The card's own ground, so the separator reads as a gap rather than as a
+ * fourth colour — and it is a `var()`, so it is the right gap on all 8 grounds.
+ *
+ * Why it exists: a stacked bar encodes its segments by fill, and two adjacent
+ * fills that a colour-blind reader cannot distinguish become one indivisible
+ * block — the segments stop being COUNTABLE. A 1 px ground-coloured edge makes
+ * the boundaries legible whatever happens to the hues, which is the cheapest
+ * redundant channel a stack can carry and the only one that costs no legend.
+ */
+export const CHART_BAND_SEPARATOR_STROKE = 'var(--bg-secondary)';
+
+/** Width of that hairline. One CSS pixel — a separator, never a border. */
+export const CHART_BAND_SEPARATOR_WIDTH = 1;
+
 /** The dash pattern every chart in the app already used for its grid. */
 export const CHART_GRID_DASH = '3 3';
 

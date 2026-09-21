@@ -7532,6 +7532,7 @@ export default {
     summary: {
       now: 'Maintenant',
       trend: 'Tendance',
+      trendOf: 'Tendance : {{metric}}',
       vsPrevious: 'vs période précédente',
       period: {
         today: 'Aujourd’hui',
@@ -7560,6 +7561,7 @@ export default {
       peak: 'pic {{count}}',
       downNow: 'Hors service actuellement',
       nothingDown: 'Rien hors service',
+      showFewer: 'Afficher moins',
       updated: 'Mis à jour {{time}}',
       stale: 'État vieux de {{age}}',
       openPrinter: 'Ouvrir l’imprimante',
@@ -7675,6 +7677,7 @@ export default {
     },
     header: {
       range: '{{from}} – {{to}} · {{bucket}} · {{tz}}',
+      rangePending: '{{from}} – {{to}} · {{tz}}',
       bucket: {
         hour: 'par heure',
         day: 'par jour',

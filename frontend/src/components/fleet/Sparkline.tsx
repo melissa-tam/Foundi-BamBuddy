@@ -74,9 +74,23 @@ export function Sparkline({
 }: SparklineProps) {
   const segments = toSegments(points);
   const values = segments.flatMap((segment) => segment.points.map((point) => point.value));
-  // Nothing was ever observed in this window: the cell stays empty rather than
-  // drawing a flat line, which would read as "steady at zero".
-  if (values.length === 0) return null;
+  // Nothing was ever observed in this window: the cell draws no line — a flat
+  // one would read as "steady at zero" — but it still OCCUPIES its 72 × 20 box.
+  // Returning null instead collapsed the row, so the whole summary card grew
+  // when history arrived and shoved the page down; and an empty graphic has
+  // nothing to announce, so it carries no `role="img"` and no name.
+  if (values.length === 0) {
+    return (
+      <svg
+        aria-hidden="true"
+        width={width}
+        height={height}
+        className={className}
+        style={style}
+        focusable="false"
+      />
+    );
+  }
 
   const min = Math.min(...values);
   const max = Math.max(...values);
