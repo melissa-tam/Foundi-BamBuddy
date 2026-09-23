@@ -275,7 +275,7 @@ class TestPauseStallWatch:
     async def test_recovering_with_live_task_owned(self, db_session, monkeypatch):
         """A ``spool_jam_recovering`` pause backed by a LIVE recovery task is owned —
         no flag, and the token is left for the recovery driver."""
-        from backend.app.services import spool_recovery
+        from backend.app.services import printer_incidents
 
         class _Live:
             def done(self) -> bool:
@@ -284,7 +284,7 @@ class TestPauseStallWatch:
         item = await _add_printing(db_session, 7)
         item.waiting_reason = "spool_jam_recovering"
         await db_session.commit()
-        monkeypatch.setitem(spool_recovery._active_tasks, 7, _Live())
+        monkeypatch.setitem(printer_incidents._drivers, 7, _Live())  # noqa: SLF001 — the store's liveness slot
         mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
         with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
             await farm_stall.check_paused_prints(db_session, manager=mgr, now=0.0)
@@ -331,7 +331,7 @@ class TestPauseStallWatch:
     async def test_skips_live_recovery_task_fires_when_done(self, db_session, monkeypatch):
         item = await _add_printing(db_session, 7)
         mgr = _FakeManager({7: True}, {7: _FakeState("PAUSE")})
-        from backend.app.services import spool_recovery
+        from backend.app.services import printer_incidents
 
         class _FakeTask:
             def __init__(self, done: bool):
@@ -342,7 +342,7 @@ class TestPauseStallWatch:
 
         with patch.object(notification_service, "on_print_paused_stalled", new_callable=AsyncMock) as mock_n:
             # A LIVE recovery task owns the pause → skip (no flag).
-            monkeypatch.setitem(spool_recovery._active_tasks, 7, _FakeTask(done=False))
+            monkeypatch.setitem(printer_incidents._drivers, 7, _FakeTask(done=False))  # noqa: SLF001
             await farm_stall.check_paused_prints(db_session, manager=mgr, now=0.0)
             await farm_stall.check_paused_prints(db_session, manager=mgr, now=_PAUSE_GRACE_S + 100)
             mock_n.assert_not_awaited()
@@ -350,7 +350,7 @@ class TestPauseStallWatch:
             assert item.waiting_reason is None
 
             # Task DONE → no longer owns the pause → the watch fires.
-            monkeypatch.setitem(spool_recovery._active_tasks, 7, _FakeTask(done=True))
+            monkeypatch.setitem(printer_incidents._drivers, 7, _FakeTask(done=True))  # noqa: SLF001
             await farm_stall.check_paused_prints(db_session, manager=mgr, now=_PAUSE_GRACE_S + 200)
             await farm_stall.check_paused_prints(db_session, manager=mgr, now=2 * _PAUSE_GRACE_S + 300)
             mock_n.assert_awaited_once()
@@ -1078,14 +1078,14 @@ class TestDeadDispatchClaims:
         assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
 
     async def test_a_live_recovery_task_owns_the_printer(self, db_session, monkeypatch):
-        from backend.app.services import spool_recovery
+        from backend.app.services import printer_incidents
 
         class _Live:
             def done(self) -> bool:
                 return False
 
         item = await _add_claim(db_session, 30)
-        monkeypatch.setitem(spool_recovery._active_tasks, 30, _Live())
+        monkeypatch.setitem(printer_incidents._drivers, 30, _Live())  # noqa: SLF001
         mgr = _FakeManager({30: True}, {30: _FakeState("IDLE")})
 
         await _mature(db_session, mgr)
@@ -1577,7 +1577,7 @@ class TestAmsWedgedIdle:
         mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
 
         with (
-            patch("backend.app.services.spool_recovery.has_live_recovery", return_value=True),
+            patch("backend.app.services.printer_incidents.driver_live", return_value=True),
             patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock) as mock_n,
         ):
             await self._mature(db_session, mgr)

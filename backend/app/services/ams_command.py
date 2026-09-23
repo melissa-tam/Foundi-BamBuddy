@@ -171,13 +171,6 @@ def snapshot(state: PrinterState | None) -> AmsWireSnapshot:
     )
 
 
-#: The postures :func:`posture` returns for a mid filament-change AMS
-#: (``bambu_mqtt.ams_mid_filament_change``) — the ONE statement of which postures those
-#: are, for readers that hold a posture rather than the snapshot it was read from (a
-#: recovery driver's command records). Pinned against :func:`posture` by its own tests.
-MID_CHANGE_POSTURES: frozenset[Posture] = frozenset({"mid_change_loaded", "mid_change_empty"})
-
-
 def posture(snap: AmsWireSnapshot) -> Posture:
     """The posture a command is sent INTO — the key the classifier's rows are read by.
 

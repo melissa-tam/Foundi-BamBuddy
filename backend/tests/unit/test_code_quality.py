@@ -392,6 +392,183 @@ class TestRecoveryIncidentOwnership:
         assert start <= line < start + len(source), "the one construction must live inside _build_incident"
 
 
+# --- The recovery driver's single owners (2026-09-23, the wedge release ladder) -------
+
+_SPOOL_RECOVERY = ("services", "spool_recovery.py")
+_AMS_COMMAND = ("services", "ams_command.py")
+_PRINTER_INCIDENTS = ("services", "printer_incidents.py")
+
+# The frames a release verb publishes. In ``spool_recovery`` they are published by the
+# lever table's own lambdas, by THE reader's pause arms, and by the runout refill /
+# path-repair auto-resume lane (a different feature: ``_resume_after_evidence``) — and
+# nowhere else, so no second reading of a verb's effect can grow beside the reader.
+_RELEASE_FRAMES = {"resume_print", "pause_print", "ams_control", "clean_print_error"}
+_RELEASE_FRAME_SCOPES = {"_LEVERS", "_read_after", "_resume_after_evidence"}
+
+
+def _called(func: ast.expr) -> tuple[str | None, str | None]:
+    """``(owner, name)`` of a call's target: ``("printer_incidents", "driver_live")`` for
+    ``printer_incidents.driver_live(...)``, ``(None, "driver_live")`` for a bare call."""
+    if isinstance(func, ast.Name):
+        return None, func.id
+    if isinstance(func, ast.Attribute):
+        owner = func.value.id if isinstance(func.value, ast.Name) else None
+        return owner, func.attr
+    return None, None
+
+
+def _scoped_nodes(tree: ast.Module):
+    """Every node with its SCOPE: the enclosing class/function names, outermost first,
+    and ``("_LEVERS",)`` for a node inside the module-level ``_LEVERS`` table."""
+    stack: list[tuple[ast.AST, tuple[str, ...]]] = [(tree, ())]
+    while stack:
+        node, scope = stack.pop()
+        yield node, scope
+        for child in ast.iter_child_nodes(node):
+            child_scope = scope
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                child_scope = (*scope, child.name)
+            elif not scope and isinstance(child, (ast.Assign, ast.AnnAssign)):
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                if any(isinstance(t, ast.Name) and t.id == "_LEVERS" for t in targets):
+                    child_scope = ("_LEVERS",)
+            stack.append((child, child_scope))
+
+
+def _app_trees() -> list[tuple[tuple[str, ...], ast.Module]]:
+    return [(_relative_parts(f), ast.parse(f.read_text(encoding="utf-8"))) for f in get_python_files(BACKEND_DIR)]
+
+
+class TestRecoveryDriverOwnership:
+    """ONE owner per fact of the recovery driver. SOURCE pins, like their neighbours: every
+    failure they catch is a well-formed second copy that every behaviour test passes."""
+
+    def test_no_answer_is_re_judged_from_a_posture_outside_ams_command(self):
+        """``ams_command.classify`` is THE reading of a command's answer, and the posture is
+        its private key: nothing outside ``ams_command`` may read ``posture()`` or re-derive
+        a verdict from a mid-change posture set (``MID_CHANGE_POSTURES`` is deleted) — the
+        feeder question is ``spool_recovery._feeder_position``'s."""
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            if parts == _AMS_COMMAND:
+                continue
+            posture_imported = any(
+                isinstance(n, ast.ImportFrom)
+                and (n.module or "").endswith("ams_command")
+                and any(alias.name == "posture" for alias in n.names)
+                for n in ast.walk(tree)
+            )
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    owner, name = _called(node.func)
+                    if name == "posture" and (owner == "ams_command" or (owner is None and posture_imported)):
+                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} calls ams_command.posture()")
+                if (isinstance(node, ast.Name) and node.id == "MID_CHANGE_POSTURES") or (
+                    isinstance(node, ast.Attribute) and node.attr == "MID_CHANGE_POSTURES"
+                ):
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} reads MID_CHANGE_POSTURES")
+        assert not strays, "An AMS command's answer is re-judged from its posture:\n" + "\n".join(strays)
+
+        # Liveness: the classifier still keys its rows by the posture it owns.
+        (tree,) = [t for parts, t in _app_trees() if parts == _AMS_COMMAND]
+        assert any(isinstance(n, ast.FunctionDef) and n.name == "posture" for n in ast.walk(tree))
+        assert not any(isinstance(n, ast.Name) and n.id == "MID_CHANGE_POSTURES" for n in ast.walk(tree))
+
+    def test_driver_liveness_has_one_store(self):
+        """Liveness is ``printer_incidents``'s (``register_driver`` / ``release_driver`` /
+        ``driver_live``). The module dict and its reader it replaced exist nowhere, and
+        every reader asks the store through its module — never a copied function."""
+        strays: list[str] = []
+        callers: set[tuple[str, ...]] = set()
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                for symbol in ("_active_tasks", "has_live_recovery"):
+                    if (
+                        (isinstance(node, ast.Name) and node.id == symbol)
+                        or (isinstance(node, ast.Attribute) and node.attr == symbol)
+                        or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol)
+                    ):
+                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} names {symbol}")
+                if isinstance(node, ast.Call):
+                    owner, name = _called(node.func)
+                    if name != "driver_live":
+                        continue
+                    if owner == "printer_incidents" or (owner is None and parts == _PRINTER_INCIDENTS):
+                        callers.add(parts)
+                    else:
+                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} calls driver_live() off the store")
+        assert not strays, "Driver liveness grew a second spelling:\n" + "\n".join(strays)
+        # Liveness: the driver and the pause-stall watch still ask the store.
+        assert {_SPOOL_RECOVERY, ("services", "farm_stall.py")} <= callers
+
+    def test_the_step_ledger_has_one_writer(self):
+        """``printer_incidents.note_step`` / ``answer_step`` are called ONLY by the evidence
+        log's own mutators, so a step is recorded at the send and answered at the read in
+        exactly one place."""
+        allowed = {("_RecoveryEvidence", "note"): "note_step", ("_RecoveryEvidence", "answer"): "answer_step"}
+        found: set[str] = set()
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                _owner, name = _called(node.func)
+                if name not in ("note_step", "answer_step"):
+                    continue
+                if parts == _SPOOL_RECOVERY and allowed.get(tuple(scope[-2:])) == name:
+                    found.add(name)
+                else:
+                    strays.append(
+                        f"  - {'/'.join(parts)}:{node.lineno} calls {name}() in {'.'.join(scope) or '<module>'}"
+                    )
+        assert not strays, "The recovery step ledger grew a second writer:\n" + "\n".join(strays)
+        assert found == {"note_step", "answer_step"}
+
+    def test_the_release_frames_have_one_publisher_per_role(self):
+        """In ``spool_recovery`` a release frame (resume / pause / ams_control /
+        clean_print_error) is published by the lever table's lambdas, THE reader's pause
+        arms (``_read_after``) and the refill / repair auto-resume lane
+        (``_resume_after_evidence``) — nowhere else."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
+        seen: set[str] = set()
+        strays: list[str] = []
+        for node, scope in _scoped_nodes(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            _owner, name = _called(node.func)
+            if name not in _RELEASE_FRAMES:
+                continue
+            home = next((s for s in scope if s in _RELEASE_FRAME_SCOPES), None)
+            if home is None:
+                strays.append(f"  - spool_recovery:{node.lineno} publishes {name}() in {'.'.join(scope) or '<module>'}")
+            else:
+                seen.add(home)
+        assert not strays, "A release frame is published outside its owners:\n" + "\n".join(strays)
+        assert seen == _RELEASE_FRAME_SCOPES
+
+    def test_the_evidence_log_is_built_only_from_the_ledger(self):
+        """``_RecoveryEvidence`` is constructed ONLY by ``from_row`` — the one constructor
+        both spawn paths use, so a driver can never start from an in-memory log that
+        forgot what the incident already sent."""
+        strays: list[str] = []
+        builds_from_row = False
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                _owner, name = _called(node.func)
+                if name == "_RecoveryEvidence":
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} constructs _RecoveryEvidence")
+                if (
+                    parts == _SPOOL_RECOVERY
+                    and name == "cls"
+                    and tuple(scope[-2:]) == ("_RecoveryEvidence", "from_row")
+                ):
+                    builds_from_row = True
+        assert not strays, "The evidence log is built outside from_row:\n" + "\n".join(strays)
+        assert builds_from_row
+
+
 def _scan_resolution_vocabulary(py_file: Path) -> list[tuple[str, int]]:
     """Every USE (never a mention in prose) of a class literal or ``resolution_class``.
 

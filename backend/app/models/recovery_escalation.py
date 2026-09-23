@@ -35,7 +35,7 @@ class RecoveryEscalation(Base):
     printer_id: Mapped[int] = mapped_column(ForeignKey("printers.id"), index=True, nullable=False)
     # Naive UTC, matching the fork's other timestamp columns (datetime.utcnow()).
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    # The escalation reason token (e.g. "unload_failed", "stuck_reset_failed"). Every
+    # The escalation reason token (e.g. "unload_failed", "wedge_unreleased"). Every
     # escalation writes its row — the ledger is the complete forensic record — but the
     # quarantine COUNT reads only the jam-machine's hardware-suspect reasons
     # (``spool_recovery._JAM_QUARANTINE_REASONS``), because the quarantine's own

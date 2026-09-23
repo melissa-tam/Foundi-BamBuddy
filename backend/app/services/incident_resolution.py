@@ -305,8 +305,8 @@ def _wire_running_edge(row: PrinterIncident, ctx: Context) -> Verdict:
     point, because the pre-WS2b hold could only be cleared by the one path that set it.
 
     It stands only while a recovery DRIVER is live: a RUNNING sample taken during a
-    resume the driver ITSELF published (the W1 stuck-change reset,
-    ``_resume_and_confirm``) is an intermediate reading of that procedure, and the
+    resume the driver ITSELF published (a release lever of the wedge ladder, or the
+    swap round's resume, both read by ``_read_after``) is an intermediate reading, and the
     driver consumes it. The deferred edge is not lost — ``_run_recovery``'s handover
     re-reads the level once the slot is free, and that handover is why the test here
     is the LIVE TASK and not :func:`driver_owns`: a row still reading ``recovering``

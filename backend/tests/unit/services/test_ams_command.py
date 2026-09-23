@@ -34,7 +34,6 @@ import pytest
 from backend.app.schemas.printer import AmsCommandOutcome
 from backend.app.services import ams_command, spool_respool
 from backend.app.services.ams_command import (
-    MID_CHANGE_POSTURES,
     OPERATOR_ACK_S,
     UNLOAD_GRACE_S,
     AmsCommandResult,
@@ -146,13 +145,9 @@ class TestPosture:
     )
     def test_posture_of_a_snapshot(self, snap: AmsWireSnapshot, expected: Posture) -> None:
         assert posture(snap) == expected
-        # MID_CHANGE_POSTURES is exactly the postures a mid filament-change snapshot
+        # The two mid-change postures are exactly what a mid filament-change snapshot
         # reads as — the one-origin predicate decides membership, case by case.
-        assert (posture(snap) in MID_CHANGE_POSTURES) is ams_mid_filament_change(snap)
-
-    def test_the_mid_change_postures_are_the_posture_vocabulary_s_own(self) -> None:
-        assert frozenset({"mid_change_loaded", "mid_change_empty"}) == MID_CHANGE_POSTURES
-        assert set(get_args(Posture)) >= MID_CHANGE_POSTURES
+        assert (posture(snap) in {"mid_change_loaded", "mid_change_empty"}) is ams_mid_filament_change(snap)
 
 
 class TestSnapshot:
@@ -566,7 +561,7 @@ class TestHeldBehindTheChange:
 
     @pytest.mark.parametrize(
         "command, entry_posture",
-        [(c, p) for c, p in sorted(ams_command._ROWS) if p not in MID_CHANGE_POSTURES],
+        [(c, p) for c, p in sorted(ams_command._ROWS) if not ams_mid_filament_change(_ENTRY[p])],
     )
     def test_outside_a_change_a_command_is_never_held(self, command: Command, entry_posture: Posture) -> None:
         entry = _ENTRY[entry_posture]
