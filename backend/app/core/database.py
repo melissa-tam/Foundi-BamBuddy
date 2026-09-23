@@ -3696,12 +3696,12 @@ async def run_migrations(conn):
         # printer ran out twice in 28 h with a full roll one slot over. The farm cannot
         # rewrite an RFID or operator-bound tray, so the operator is the fix.
         ("on_backup_group_split", "1", "TRUE"),
-        # AMS wedged mid filament-change on an IDLE printer (002-H2S 2026-09-11): at
-        # ams_status_main == 1 the firmware drops every load and unload, and since the
-        # scheduler's idle gate refuses to dispatch there, a latched wedge holds the
-        # printer out of the queue with nothing else anywhere saying so — no print, no
-        # incident row, no HMS code once the jam that caused it clears. Only a human
-        # pressing Retry/Continue on the screen frees it.
+        # AMS parked mid filament-change on an IDLE printer (002-H2S 2026-09-11): at
+        # ams_status_main == 1 the scheduler's idle gate refuses to dispatch, so a
+        # parked AMS holds the printer out of the queue with nothing else anywhere
+        # saying so — no print, no incident row, no HMS code once the jam that caused
+        # it clears. The farm has not commanded anything there; the page names the
+        # printer's Continue and the printer card's Unload.
         ("on_ams_wedged_idle", "1", "TRUE"),
         # USB storage-low: the printer's USB filled up and the farm ran auto-cleanup.
         ("on_storage_low", "1", "TRUE"),
@@ -3946,6 +3946,11 @@ async def run_migrations(conn):
     # now that callers pass the whole target noun phrase (a printers pool has no single
     # model). See ``_migrate_queue_assigned_template_pool_label``.
     await _migrate_queue_assigned_template_pool_label(conn)
+
+    # Migration: restate the default ``ams_wedged_idle`` body as the measured facts (the
+    # "drops every load/unload" premise is retracted). See
+    # ``_migrate_ams_wedged_idle_template_measured``.
+    await _migrate_ams_wedged_idle_template_measured(conn)
 
     # Migration (WI-1, FIFO substrate): record when a spool FIRST entered service.
     # TIMESTAMP (not DATETIME) so the ADD COLUMN is valid on both SQLite and
@@ -5650,6 +5655,61 @@ async def _migrate_queue_assigned_template_pool_label(conn) -> None:
                 "AND is_default = :isdef AND body_template = :old"
             ),
             {"new": _QUEUE_ASSIGNED_TEMPLATE_NEW_BODY, "old": _QUEUE_ASSIGNED_TEMPLATE_OLD_BODY, "isdef": True},
+        )
+
+
+# The exact 2026-09-11 default body — the migration only rewrites a row still holding
+# this text (an untouched default), never a user-customised template.
+_AMS_WEDGED_IDLE_TEMPLATE_OLD_BODY = (
+    "{printer_name}: the AMS has been mid filament-change for {minutes} min with no print running "
+    "and no incident open. It drops every load/unload in this state and dispatch is held until it "
+    "clears. Press Retry/Continue on the printer screen."
+)
+_AMS_WEDGED_IDLE_TEMPLATE_NEW_BODY = (
+    "{printer_name}: AMS parked mid filament-change for {minutes} min with no print running. "
+    "Press Continue on the printer, or unload from the printer card."
+)
+
+
+async def _migrate_ams_wedged_idle_template_measured(conn) -> None:
+    """Restate the default ``ams_wedged_idle`` notification body as the measured facts.
+
+    The 2026-09-11 default told the operator the AMS "drops every load/unload in this
+    state" and to press Retry/Continue. The wire record supports only a load into an
+    EMPTY path under the firmware's change-error modal (dropped, 3 witnesses); an
+    unload with nothing loaded cannot be judged, and commands with filament loaded were
+    never measured. ``services/ams_command`` now measures every AMS command per posture,
+    and the printer card's Unload reports whether the AMS moved, so the page names both
+    exits and asserts nothing unmeasured.
+
+    ``seed_notification_templates`` only INSERTS missing event types — it never updates
+    an existing row — so installs that already seeded the old default keep the retracted
+    copy without this backfill. Updates ONLY the untouched default row (``is_default``
+    set AND body still equal to the old default text); a template an admin customised is
+    left alone. One bound-parameter UPDATE: atomic and SQLite + Postgres safe
+    (``is_default`` adapts to 1 / true per dialect); idempotent because the second pass
+    matches nothing. Logs once, on the pass that changes a row.
+
+    Rollback = the inverse guarded UPDATE::
+
+        UPDATE notification_templates SET body_template = :old
+        WHERE event_type = 'ams_wedged_idle' AND is_default = :isdef AND body_template = :new
+    """
+    from sqlalchemy import text
+
+    async with conn.begin_nested():
+        result = await conn.execute(
+            text(
+                "UPDATE notification_templates SET body_template = :new "
+                "WHERE event_type = 'ams_wedged_idle' "
+                "AND is_default = :isdef AND body_template = :old"
+            ),
+            {"new": _AMS_WEDGED_IDLE_TEMPLATE_NEW_BODY, "old": _AMS_WEDGED_IDLE_TEMPLATE_OLD_BODY, "isdef": True},
+        )
+    if result.rowcount:
+        logger.info(
+            "[MIGRATION] ams_wedged_idle default notification body restated as measured facts (%s row)",
+            result.rowcount,
         )
 
 

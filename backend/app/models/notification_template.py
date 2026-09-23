@@ -279,15 +279,16 @@ DEFAULT_TEMPLATES = [
         "title_template": "No backup slot for the active print — {printer_name}",
         "body_template": "{printer_name}: {slot} is printing and has no backup slot. {partner_slot} holds the same filament with a different tray {dimension} ({picked_value} vs {partner_value}); the printer will not switch to it on runout. Set both slots to the same tray {dimension} on the printer.",
     },
-    # 002-H2S 2026-09-11: the AMS latched at ams_status_main == 1 behind a layer-0 jam.
+    # 002-H2S 2026-09-11: the AMS parked at ams_status_main == 1 behind a layer-0 jam.
     # The copy must not read as a pause — the printer is IDLE and looks healthy on every
-    # surface — and it must name the one action that clears it, which is on the printer,
-    # not in this UI.
+    # surface — and it names both exits: the printer's Continue, and the printer card's
+    # Unload (which reports whether the AMS moved). Installs seeded with the earlier body
+    # are corrected by ``core.database._migrate_ams_wedged_idle_template_measured``.
     {
         "event_type": "ams_wedged_idle",
         "name": "AMS Stuck Mid Filament-Change",
         "title_template": "AMS stuck mid filament-change",
-        "body_template": "{printer_name}: the AMS has been mid filament-change for {minutes} min with no print running and no incident open. It drops every load/unload in this state and dispatch is held until it clears. Press Retry/Continue on the printer screen.",
+        "body_template": "{printer_name}: AMS parked mid filament-change for {minutes} min with no print running. Press Continue on the printer, or unload from the printer card.",
     },
     {
         "event_type": "storage_low",

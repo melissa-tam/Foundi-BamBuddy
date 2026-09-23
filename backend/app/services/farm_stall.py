@@ -35,10 +35,12 @@ reconcile / operator resolves the true outcome.
   neither the startup reconcile nor the connected edge can ever see it.
 
 * ``check_ams_wedged_idle`` — the printer is CONNECTED, IDLE and taking no work
-  because its AMS is latched mid filament-change (``ams_status_main == 1``), a state
-  in which the firmware drops every load and unload. Nothing else can see it: no
-  print, no incident row, no HMS code once the jam that caused it clears (002-H2S
-  2026-09-11). One WARNING + one ``on_ams_wedged_idle`` page per episode.
+  because its AMS is parked mid filament-change (``ams_status_main == 1``): the
+  dispatcher refuses this printer while the AMS is mid-change, and the farm has not
+  commanded anything here. Nothing else can see it: no print, no incident row, no
+  HMS code once the jam that caused it clears (002-H2S 2026-09-11). One WARNING +
+  one ``on_ams_wedged_idle`` page per episode. What a load or unload does in this
+  posture is measured per command by ``ams_command`` (``[ams-command] … answer=``).
 
 Invoked as guarded calls from the scheduler's ``check_queue`` tick (mirroring the
 stagger consumer), so there is no new periodic loop / lifespan task. State (edge
@@ -737,11 +739,13 @@ _AMS_WEDGED_IDLE_DWELL_S = 600.0
 async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
     """One bounded page for an AMS latched mid filament-change on an IDLE printer.
 
-    At ``ams_status_main == 1`` the firmware drops every ``ams_change_filament``
-    (:func:`bambu_mqtt.ams_mid_filament_change` carries the wire evidence), and since
-    2026-09-11 the scheduler's idle gate refuses to dispatch there. That refusal is
-    correct and it is also SILENT: with no print running and no incident open, a
-    latched wedge holds the printer out of the queue with nothing anywhere saying so
+    At ``ams_status_main == 1`` (:func:`bambu_mqtt.ams_mid_filament_change`) the
+    scheduler's idle gate refuses to dispatch (since 2026-09-11), and with no incident
+    open and no recovery driver live the farm has not commanded anything here. What a
+    load or unload does in this posture is not assumed: :mod:`ams_command` measures
+    each one and logs the wire's answer. The refusal is correct and it is also SILENT:
+    with no print running and no incident open, a parked AMS holds the printer out of
+    the queue with nothing anywhere saying so
     — literally incident #60's shape (2026-08-29: 15 h, seven pending units, zero
     notifications) transplanted into a new field. A gate that can hold forever needs a
     watch that says so once.
@@ -753,8 +757,9 @@ async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, no
     recovery task, whose resume rounds pass through this state by design.
 
     Never writes: no queue row, no incident, no quarantine. The WARNING and the single
-    ``on_ams_wedged_idle`` page are the whole surface, and the fix is one press of
-    Retry/Continue on the printer's screen.
+    ``on_ams_wedged_idle`` page are the whole surface. The page names two exits: the
+    printer's Continue, and the printer card's Unload, which reports whether the AMS
+    moved.
     """
     now = time.time() if now is None else now
 
@@ -799,9 +804,9 @@ async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, no
             minutes = (now - first) / 60.0
             _ams_wedged_paged.add(pid)
             logger.warning(
-                "farm_stall: printer %s AMS latched mid filament-change for %.0f min with no print running and "
-                "no incident open (state=%s tray_now=%s pending_tray_target=%s) — it drops every load/unload "
-                "and dispatch is held until it clears; Retry/Continue on the printer screen",
+                "farm_stall: printer %s AMS parked mid filament-change for %.0f min with no print running and "
+                "no incident open (state=%s tray_now=%s pending_tray_target=%s) — the dispatcher refuses this "
+                "printer while the AMS is mid-change; the farm has not commanded anything here",
                 pid,
                 minutes,
                 getattr(st, "state", None),

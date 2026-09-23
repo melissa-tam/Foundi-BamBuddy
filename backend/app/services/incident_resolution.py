@@ -250,7 +250,7 @@ def path_quiet(state: PrinterState | None) -> bool:
     invariant 1: one taxonomy, never a new HMS frozenset).
 
     The wedge test is separate from the fault test because a wedge OUTLIVES the code
-    that caused it and drops every subsequent move.
+    that caused it: the wire can read fault-free while the AMS is still mid-change.
     """
     return not live_candidates(state) and not ams_mid_filament_change(state)
 

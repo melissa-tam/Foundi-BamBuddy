@@ -321,7 +321,7 @@ class TestTheRepairLaneMotionEvidence:
         assert resolve(_row(RESOLUTION_REPAIR), "sweep_tick", ctx).close is False
 
     def test_a_wedged_ams_keeps_the_hold(self):
-        """A wedge outlives the code that caused it and drops every subsequent move."""
+        """A wedge outlives the code that caused it: a fault-free wire with the AMS mid-change keeps the hold."""
         ctx = self._ctx(ams_status_main=1, load_at=_OPENED_AT + timedelta(seconds=30))
 
         assert resolve(_row(RESOLUTION_REPAIR), "sweep_tick", ctx).close is False
