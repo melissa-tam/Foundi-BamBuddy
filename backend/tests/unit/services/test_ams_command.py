@@ -6,10 +6,14 @@ it. This suite pins the measurement that replaces it:
 
 * the classifier table — every ``(command, posture)`` row against every answer it can
   give, the ``session_changed`` precedence, the grace-held completions, the
-  ``mid_change_empty`` undecidable short-circuit, ``acted`` vs ``no_movement`` at the
-  deadline, and a missing row RAISING (the ``incident_resolution`` pattern);
+  ``mid_change_empty`` undecidable short-circuit, ``held`` (acknowledged + unmoved, the
+  012-H2S 2026-09-23 measurement) in exactly the mid-change rows that can move,
+  ``acted`` vs ``no_movement`` at the deadline, and a missing row RAISING (the
+  ``incident_resolution`` pattern);
+* the ACK correlation — the firmware's ACK is read for the send's OWN sequence id;
 * the verbs — the only two refusals kept, the pre-send mark and snapshot ordering, the
-  operator attribution stamp and its session-epoch scope, a publish that did not go out;
+  send's sequence id, the operator attribution stamp and its session-epoch scope, a
+  publish that did not go out;
 * the operator facade's outcome mapping and its log lines;
 * the single-caller pin: only ``ams_command`` calls the client's motion publishers.
 """
@@ -40,6 +44,8 @@ from backend.app.services.ams_command import (
     Observation,
     Posture,
     Refusal,
+    Sent,
+    ack_of,
     classify,
     command_for_operator,
     observe,
@@ -47,7 +53,7 @@ from backend.app.services.ams_command import (
     posture,
     snapshot,
 )
-from backend.app.services.bambu_mqtt import PrinterState, ams_mid_filament_change
+from backend.app.services.bambu_mqtt import CommandAck, PrinterState, ams_mid_filament_change
 from backend.tests._fixtures.ast_tree import ParsedModule, ParsedTree
 from backend.tests._fixtures.clock import FakeClock
 
@@ -86,6 +92,11 @@ def _snap(
     )
 
 
+def _ack(result: str | None, *, seq: str = "7", command: str = "ams_change_filament") -> CommandAck:
+    """One firmware ACK as ``bambu_mqtt`` records it."""
+    return CommandAck(command=command, sequence_id=seq, result=result, reason=None, at=0.0)
+
+
 def _run(
     command: Command,
     target: int | None,
@@ -93,11 +104,15 @@ def _run(
     polls: list[tuple[float, AmsWireSnapshot]],
     *,
     deadline_s: float = _DRIVER_DEADLINE_S,
+    ack: CommandAck | None = None,
+    ack_from_s: float = 0.0,
 ) -> tuple[Answer | None, float | None]:
-    """Feed the polls through ONE observation, as a caller's loop does; return the first
-    answer and the elapsed time it landed at."""
+    """Feed the polls through ONE observation, as a caller's loop does — folding the
+    send's ACK before every call, the ACK visible from ``ack_from_s`` on; return the
+    first answer and the elapsed time it landed at."""
     observation = Observation()
     for elapsed_s, now in polls:
+        observation.fold_ack(ack if elapsed_s >= ack_from_s else None)
         answer = classify(
             command, target, entry, now, observation=observation, elapsed_s=elapsed_s, deadline_s=deadline_s
         )
@@ -396,11 +411,198 @@ class TestLoadInEveryPosture:
         assert _run("load", 255, entry, _held(entry, 1.0, _DRIVER_DEADLINE_S)) == ("no_movement", _DRIVER_DEADLINE_S)
 
 
+class TestFoldAck:
+    """``Observation.fold_ack`` — the firmware's ACK for THIS send, folded by the caller."""
+
+    def test_unseen_is_none(self) -> None:
+        observation = Observation()
+
+        observation.fold_ack(None)
+
+        assert observation.acked is None
+
+    @pytest.mark.parametrize("result", ["success", "SUCCESS", "ok", "OK", "Success"])
+    def test_the_success_spellings(self, result: str) -> None:
+        """The wire has shown ``result=success`` (motion echoes) and ``result=SUCCESS``
+        (the ``ams_control resume`` echo), 012-H2S 2026-09-23."""
+        observation = Observation()
+
+        observation.fold_ack(_ack(result))
+
+        assert observation.acked is True
+
+    @pytest.mark.parametrize("result", ["fail", "failed", "busy", "", None])
+    def test_anything_else_is_a_failure(self, result: str | None) -> None:
+        observation = Observation()
+
+        observation.fold_ack(_ack(result))
+
+        assert observation.acked is False
+
+    def test_an_ack_once_seen_stays_seen(self) -> None:
+        """A later ``None`` (the ACK rolled out of the client's bounded log) changes nothing."""
+        observation = Observation()
+
+        observation.fold_ack(_ack("success"))
+        observation.fold_ack(None)
+
+        assert observation.acked is True
+
+
+# The three rows ``held`` belongs to, with a target that differs from the entry feeder.
+_HELD_ROWS: list[tuple[Command, Posture, int | None]] = [
+    ("unload", "mid_change_loaded", None),
+    ("load", "mid_change_loaded", 2),
+    ("load", "mid_change_empty", 2),
+]
+
+
+class TestHeldBehindTheChange:
+    """``held`` — acknowledged + unmoved in a mid-change AMS. 012-H2S 2026-09-23: six
+    commands sent into the loaded wedge each echoed ``success`` and moved nothing, then
+    ran in order after the terminal."""
+
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_ROWS)
+    def test_a_success_ack_and_nothing_moved_is_held_at_the_grace(
+        self, command: Command, entry_posture: Posture, target: int | None
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+
+        assert _run(command, target, entry, _held(entry, 1.0, UNLOAD_GRACE_S - 0.1), ack=_ack("success")) == (
+            None,
+            None,
+        )
+        assert _run(command, target, entry, _held(entry, 1.0, UNLOAD_GRACE_S), ack=_ack("success")) == (
+            "held",
+            UNLOAD_GRACE_S,
+        )
+
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_ROWS)
+    def test_no_ack_is_no_movement_at_the_deadline(
+        self, command: Command, entry_posture: Posture, target: int | None
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+
+        assert _run(command, target, entry, _held(entry, 1.0, UNLOAD_GRACE_S, 50.0, _DRIVER_DEADLINE_S)) == (
+            "no_movement",
+            _DRIVER_DEADLINE_S,
+        )
+
+    @pytest.mark.parametrize("result", ["fail", None])
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_ROWS)
+    def test_a_failure_ack_is_no_movement_at_the_deadline(
+        self, command: Command, entry_posture: Posture, target: int | None, result: str | None
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+        polls = _held(entry, 1.0, UNLOAD_GRACE_S, 50.0, _DRIVER_DEADLINE_S)
+
+        assert _run(command, target, entry, polls, ack=_ack(result)) == ("no_movement", _DRIVER_DEADLINE_S)
+
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_ROWS)
+    def test_an_ack_landing_after_the_grace_is_held_at_the_first_poll_that_reads_it(
+        self, command: Command, entry_posture: Posture, target: int | None
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+        polls = _held(entry, 1.0, UNLOAD_GRACE_S, 29.0, 30.0, _DRIVER_DEADLINE_S)
+
+        assert _run(command, target, entry, polls, ack=_ack("success"), ack_from_s=30.0) == ("held", 30.0)
+
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_ROWS)
+    def test_a_movement_is_never_held(self, command: Command, entry_posture: Posture, target: int | None) -> None:
+        entry = _ENTRY[entry_posture]
+        stirred = replace(entry, ams_status_sub=6)
+
+        assert _run(command, target, entry, _held(stirred, 1.0, UNLOAD_GRACE_S, 50.0), ack=_ack("success")) == (
+            None,
+            None,
+        )
+        assert _run(command, target, entry, _held(stirred, 1.0, _DRIVER_DEADLINE_S), ack=_ack("success")) == (
+            "acted",
+            _DRIVER_DEADLINE_S,
+        )
+
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_ROWS)
+    def test_the_operator_window_answers_held_at_its_end(
+        self, command: Command, entry_posture: Posture, target: int | None
+    ) -> None:
+        """A window shorter than the grace (the operator's) reads the held rule at its own
+        deadline — the ``_unload_mid_change_empty`` pattern — so an acknowledged click
+        into a wedge is told ``held``, not ``no_movement``."""
+        entry = _ENTRY[entry_posture]
+        polls = _held(entry, 1.0, OPERATOR_ACK_S)
+
+        assert _run(command, target, entry, polls, deadline_s=OPERATOR_ACK_S, ack=_ack("success")) == (
+            "held",
+            OPERATOR_ACK_S,
+        )
+        assert _run(command, target, entry, polls, deadline_s=OPERATOR_ACK_S) == ("no_movement", OPERATOR_ACK_S)
+
+    def test_an_unload_that_empties_the_feeder_after_the_grace_is_still_complete(self) -> None:
+        """``complete`` keeps its own rule inside the step timeout: the feeder leaves for
+        255 at 10 s and the empty reading holds for the grace after its edge."""
+        entry = _ENTRY["mid_change_loaded"]
+        emptied = _snap(main=1, sub=5, tray_now=255)
+        polls = [(1.0, entry), (10.0, emptied), (24.9, emptied)]
+
+        assert _run("unload", None, entry, polls, ack=_ack("success")) == (None, None)
+        assert _run("unload", None, entry, [*polls, (25.0, emptied)], ack=_ack("success")) == ("complete", 25.0)
+
+    @pytest.mark.parametrize("entry_posture", ["mid_change_loaded", "mid_change_empty"])
+    def test_a_load_that_reaches_its_target_after_the_grace_is_still_complete(self, entry_posture: Posture) -> None:
+        entry = _ENTRY[entry_posture]
+        polls = [(1.0, entry), (10.0, replace(entry, tray_tar=2)), (40.0, replace(entry, tray_now=2, tray_tar=2))]
+
+        assert _run("load", 2, entry, polls, ack=_ack("success")) == ("complete", 40.0)
+
+    def test_an_unload_with_nothing_loaded_stays_undecidable(self) -> None:
+        """``(unload, mid_change_empty)``: nothing physical can answer — an ACK does not
+        make a no-op a hold."""
+        entry = _ENTRY["mid_change_empty"]
+
+        assert _run("unload", None, entry, _held(entry, 1.0, UNLOAD_GRACE_S), ack=_ack("success")) == (
+            "undecidable",
+            UNLOAD_GRACE_S,
+        )
+
+    @pytest.mark.parametrize(
+        "command, entry_posture",
+        [(c, p) for c, p in sorted(ams_command._ROWS) if p not in MID_CHANGE_POSTURES],
+    )
+    def test_outside_a_change_a_command_is_never_held(self, command: Command, entry_posture: Posture) -> None:
+        entry = _ENTRY[entry_posture]
+        polls = _held(entry, 1.0, UNLOAD_GRACE_S, 50.0, _DRIVER_DEADLINE_S)
+
+        assert _run(command, 5, entry, polls, ack=_ack("success")) == ("no_movement", _DRIVER_DEADLINE_S)
+
+    def test_held_is_reachable_from_exactly_the_mid_change_rows_that_can_move(self) -> None:
+        """The table-level pin: every row, fed an acknowledged and unmoved window."""
+        held_rows = {
+            (command, entry_posture)
+            for command, entry_posture in ams_command._ROWS
+            if _run(
+                command,
+                5,
+                _ENTRY[entry_posture],
+                _held(_ENTRY[entry_posture], 1.0, UNLOAD_GRACE_S, _DRIVER_DEADLINE_S),
+                ack=_ack("success"),
+            )[0]
+            == "held"
+        }
+
+        assert held_rows == {(command, entry_posture) for command, entry_posture, _ in _HELD_ROWS}
+
+
 # --- the verbs -----------------------------------------------------------------------------
 
 
 class _FakeClient:
-    """The two motion publishers, recording call order into a shared log."""
+    """The two motion publishers plus the ACK lane's two reads, recording call order into
+    a shared log.
+
+    Every publish that goes out is numbered like the real client's (``"1"``, ``"2"``, …,
+    read back through ``last_sent_sequence_id``); ``echo`` makes the fake firmware ACK
+    each send with that ``result`` under the send's own id, as the report-topic echo does.
+    """
 
     def __init__(
         self,
@@ -408,26 +610,45 @@ class _FakeClient:
         *,
         sent: bool = True,
         on_publish: Callable[[int | None], None] | None = None,
+        echo: str | None = None,
     ) -> None:
         self.log = log
         self.sent = sent
         self.on_publish = on_publish
+        self.echo = echo
         self.loads: list[int] = []
         self.unloads = 0
+        self.acks: list[CommandAck] = []
+        self._seq = 0
+        self._last_sent: str | None = None
+
+    def _went_out(self, tray: int | None) -> None:
+        self._seq += 1
+        self._last_sent = str(self._seq)
+        if self.echo is not None:
+            self.acks.append(_ack(self.echo, seq=self._last_sent))
+        if self.on_publish is not None:
+            self.on_publish(tray)
 
     def ams_load_filament(self, tray_id: int) -> bool:
         self.log.append(f"publish_load:{tray_id}")
         self.loads.append(tray_id)
-        if self.sent and self.on_publish is not None:
-            self.on_publish(tray_id)
+        if self.sent:
+            self._went_out(tray_id)
         return self.sent
 
     def ams_unload_filament(self) -> bool:
         self.log.append("publish_unload")
         self.unloads += 1
-        if self.sent and self.on_publish is not None:
-            self.on_publish(None)
+        if self.sent:
+            self._went_out(None)
         return self.sent
+
+    def last_sent_sequence_id(self, command: str) -> str | None:
+        return self._last_sent if command == "ams_change_filament" else None
+
+    def ack_for(self, command: str, sequence_id: str) -> CommandAck | None:
+        return next((a for a in reversed(self.acks) if (a.command, a.sequence_id) == (command, sequence_id)), None)
 
 
 class _FakeManager:
@@ -522,7 +743,7 @@ class TestVerbRefusals:
         client = _FakeClient(call_log)
         _install(monkeypatch, _FakeManager(client=client, state=_state(state="PAUSE", hms_errors=[_BARE_8011])))
 
-        assert isinstance(ams_command.unload(_PID, actor="operator"), AmsWireSnapshot)
+        assert isinstance(ams_command.unload(_PID, actor="operator"), Sent)
         assert client.unloads == 1
 
     @pytest.mark.parametrize("verb", ["load", "unload"])
@@ -542,8 +763,8 @@ class TestVerbRefusals:
             else ams_command.unload(_PID, actor="operator")
         )
 
-        assert isinstance(sent, AmsWireSnapshot)
-        assert posture(sent) == "mid_change_loaded"
+        assert isinstance(sent, Sent)
+        assert posture(sent.entry) == "mid_change_loaded"
         assert len(client.loads) + client.unloads == 1
 
     @pytest.mark.parametrize("verb", ["load", "unload"])
@@ -577,11 +798,11 @@ class TestVerbSend:
 
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=lands), state=state))
 
-        entry = ams_command.load(_PID, 5, actor="driver")
+        sent = ams_command.load(_PID, 5, actor="driver")
 
         assert call_log == [f"mark:{_PID}:5", "publish_load:5"]
-        assert isinstance(entry, AmsWireSnapshot)
-        assert (entry.tray_now, entry.ams_status_main) == (255, 0)  # read BEFORE the publish moved it
+        assert isinstance(sent, Sent)
+        assert (sent.entry.tray_now, sent.entry.ams_status_main) == (255, 0)  # read BEFORE the publish moved it
 
     def test_an_unload_snapshot_precedes_the_publish(
         self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]
@@ -593,10 +814,22 @@ class TestVerbSend:
 
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=lands), state=state))
 
-        entry = ams_command.unload(_PID, actor="driver")
+        sent = ams_command.unload(_PID, actor="driver")
 
         assert call_log == ["publish_unload"]  # an unload carries no load mark
-        assert isinstance(entry, AmsWireSnapshot) and entry.tray_now == 3
+        assert isinstance(sent, Sent) and sent.entry.tray_now == 3
+
+    def test_each_send_carries_its_own_sequence_id(self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]) -> None:
+        """The id the client published under, read right after the publish — the key the
+        firmware's ACK is correlated by."""
+        state = _state(tray_now=3, ams_status_main=0)
+        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=state))
+
+        first = ams_command.load(_PID, 2, actor="driver")
+        second = ams_command.unload(_PID, actor="driver")
+
+        assert first == Sent(entry=first.entry, sequence_id="1")
+        assert second == Sent(entry=second.entry, sequence_id="2")
 
     def test_the_send_line_carries_the_entry_snapshot(
         self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], caplog: pytest.LogCaptureFixture
@@ -609,9 +842,41 @@ class TestVerbSend:
 
         lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ams-command]")]
         assert lines == [
-            f"[ams-command] actor=driver command=load printer={_PID} target=2 posture=mid_change_loaded "
+            f"[ams-command] actor=driver command=load printer={_PID} target=2 seq=1 posture=mid_change_loaded "
             "entry tray_now=3 ams_status=1/5 tray_tar=3 epoch=7"
         ]
+
+
+class TestAckOf:
+    """``ack_of`` — the ONE correlation of a send to the firmware's ACK for it."""
+
+    def _sent(self, seq: str | None) -> Sent:
+        return Sent(entry=_ENTRY["mid_change_loaded"], sequence_id=seq)
+
+    def test_reads_the_ack_for_the_send_s_own_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _FakeClient([])
+        client.acks = [_ack("fail", seq="6"), _ack("success", seq="7"), _ack("fail", seq="8")]
+        _install(monkeypatch, _FakeManager(client=client, state=None))
+
+        assert ack_of(_PID, self._sent("7")) == _ack("success", seq="7")
+
+    def test_an_ack_for_another_command_is_not_this_send_s(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ACK is keyed by ``(command, id)``: an ACK another command carries under the
+        same id is not this send's."""
+        client = _FakeClient([])
+        client.acks = [_ack("success", seq="7", command="ams_control")]
+        _install(monkeypatch, _FakeManager(client=client, state=None))
+
+        assert ack_of(_PID, self._sent("7")) is None
+
+    def test_no_client_or_no_id_is_no_ack(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _FakeClient([])
+        client.acks = [_ack("success", seq="7")]
+        _install(monkeypatch, _FakeManager(client=None, state=None))
+        assert ack_of(_PID, self._sent("7")) is None
+
+        _install(monkeypatch, _FakeManager(client=client, state=None))
+        assert ack_of(_PID, self._sent(None)) is None
 
 
 class TestOperatorAttribution:
@@ -739,6 +1004,43 @@ class TestCommandForOperator:
 
         assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("no_movement", message)
 
+    @pytest.mark.parametrize(
+        "command, tray_id, message",
+        [
+            ("load", 2, "Load accepted. Held behind the paused print's filament change."),
+            ("unload", None, "Unload accepted. Held behind the paused print's filament change."),
+        ],
+    )
+    async def test_an_acknowledged_click_into_a_wedge_is_held(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        call_log: list[str],
+        short_ack: float,
+        command: Command,
+        tray_id: int | None,
+        message: str,
+    ) -> None:
+        """012-H2S 2026-09-23: the operator's clicks into the loaded wedge were each echoed
+        ``success`` and moved nothing — the click is told so, not "did not move"."""
+        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
+        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, echo="success"), state=state))
+
+        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("held", message)
+
+    @pytest.mark.parametrize("command, tray_id", [("load", 2), ("unload", None)])
+    async def test_a_failure_ack_into_a_wedge_is_no_movement(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        call_log: list[str],
+        short_ack: float,
+        command: Command,
+        tray_id: int | None,
+    ) -> None:
+        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
+        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, echo="fail"), state=state))
+
+        assert (await command_for_operator(_PID, command, tray_id)).outcome == "no_movement"
+
     async def test_an_unload_with_nothing_loaded_mid_change_is_undecidable(
         self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float
     ) -> None:
@@ -808,7 +1110,9 @@ class TestObserve:
 
         _install(monkeypatch, _FakeManager(client=None, state=state, on_status=one_second_per_poll))
 
-        answer = await observe(_PID, "unload", None, entry, timeout_s=_DRIVER_DEADLINE_S, poll_s=0.0)
+        answer = await observe(
+            _PID, "unload", None, Sent(entry=entry, sequence_id=None), timeout_s=_DRIVER_DEADLINE_S, poll_s=0.0
+        )
 
         assert answer == "complete"
         lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ams-command]")]
@@ -825,8 +1129,48 @@ class TestObserve:
         entry = snapshot(state)
         _install(monkeypatch, _FakeManager(client=None, state=state, on_status=lambda: clock.advance(1.0)))
 
-        assert await observe(_PID, "load", 5, entry, timeout_s=3.0, poll_s=0.0) == "no_movement"
+        assert await observe(_PID, "load", 5, Sent(entry=entry, sequence_id=None), timeout_s=3.0, poll_s=0.0) == (
+            "no_movement"
+        )
         assert clock.t == entry.taken_at + 3.0
+
+    async def test_folds_the_ack_for_its_own_send_and_answers_held_at_the_grace(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, clock: FakeClock
+    ) -> None:
+        """The 012-H2S 2026-09-23 posture over the driver's window: the unload is echoed
+        ``success`` and nothing moves — ``held`` at the grace, not a 90 s wait."""
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        monkeypatch.setattr(ams_command, "_monotonic", clock)
+        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
+        client = _FakeClient([])
+        client.acks = [_ack("fail", seq="6"), _ack("success", seq="7")]
+        entry = snapshot(state)
+        _install(monkeypatch, _FakeManager(client=client, state=state, on_status=lambda: clock.advance(1.0)))
+
+        answer = await observe(
+            _PID, "unload", None, Sent(entry=entry, sequence_id="7"), timeout_s=_DRIVER_DEADLINE_S, poll_s=0.0
+        )
+
+        assert answer == "held"
+        assert clock.t == entry.taken_at + UNLOAD_GRACE_S
+        assert [r.getMessage() for r in caplog.records if "answer=" in r.getMessage()] == [
+            f"[ams-command] actor=operator printer={_PID} command=unload target=None posture=mid_change_loaded "
+            "answer=held after 15.0s (tray_now 3→3 ams_status 1/5→1/5 tray_tar None→None)"
+        ]
+
+    async def test_an_ack_for_an_older_send_is_not_this_one_s(
+        self, monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+    ) -> None:
+        monkeypatch.setattr(ams_command, "_monotonic", clock)
+        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
+        client = _FakeClient([])
+        client.acks = [_ack("success", seq="6")]
+        entry = snapshot(state)
+        _install(monkeypatch, _FakeManager(client=client, state=state, on_status=lambda: clock.advance(1.0)))
+
+        assert await observe(_PID, "unload", None, Sent(entry=entry, sequence_id="7"), timeout_s=30.0, poll_s=0.0) == (
+            "no_movement"
+        )
 
 
 # --- the single-caller pin -----------------------------------------------------------------

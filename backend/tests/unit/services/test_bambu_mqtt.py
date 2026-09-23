@@ -32,6 +32,7 @@ from backend.app.services.bambu_mqtt import (
     _AMS_REFUSAL_LOG_TEXT,
     _ZERO_EXIST_BITS_TRUST_PUSHES,
     BambuMQTTClient,
+    CommandAck,
     HMSError,
     ams_mid_filament_change,
     apply_tray_exist_bits,
@@ -6194,14 +6195,16 @@ class TestAmsControlPublisher:
     def test_the_whitelist_covers_every_action_the_hms_modal_dispatches(self, mqtt_client, action):
         assert mqtt_client.ams_control(action) is True
 
+        # A fresh client's first sequenced send — BambuStudio's `m_sequence_id++` shape.
         assert _published_payloads(mqtt_client)[0] == {
-            "print": {"command": "ams_control", "param": action, "sequence_id": "0"}
+            "print": {"command": "ams_control", "param": action, "sequence_id": "1"}
         }
 
     def test_an_unknown_action_is_refused(self, mqtt_client):
         assert mqtt_client.ams_control("detonate") is False
 
         assert _published_payloads(mqtt_client) == []
+        assert mqtt_client.last_sent_sequence_id("ams_control") is None  # no id burnt either
 
     def test_a_bare_call_carries_no_pushall(self, mqtt_client):
         """The recovery driver reads the AMS state machine off the next ~1 Hz push
@@ -6305,3 +6308,235 @@ class TestAmsMotionEcho:
         responses = [r for r in caplog.records if "Received command response: push_status" in r.getMessage()]
         assert [r.levelno for r in responses] == [logging.DEBUG]
         assert not any("echo:" in r.getMessage() for r in caplog.records)
+
+
+def _ack_fields(ack):
+    """A ``CommandAck`` without its receipt time (``time.monotonic`` at the parse)."""
+    return (ack.command, ack.sequence_id, ack.result, ack.reason)
+
+
+class TestCommandAckLane:
+    """Invariant 14 — every command echo with a ``result`` is an ACK, recorded on
+    ``state.command_acks`` at the ONE parse point, whatever the command. ``ams_command``
+    correlates it to its own send by sequence id through ``ack_for``."""
+
+    client_kwargs = {"serial": "TEST_ACK"}
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ams_change_filament",
+            "ams_control",
+            "pause",
+            "resume",
+            "clean_print_error",
+            "ams_filament_setting",
+            "extrusion_cali_sel",
+        ],
+    )
+    def test_an_echo_with_a_result_lands_as_a_command_ack(self, mqtt_client, command):
+        before = time.monotonic()
+
+        mqtt_client._process_message(
+            {"print": {"command": command, "sequence_id": "42", "result": "success", "reason": "busy"}}
+        )
+
+        [ack] = mqtt_client.state.command_acks
+        assert _ack_fields(ack) == (command, "42", "success", "busy")
+        assert before <= ack.at <= time.monotonic()
+
+    def test_the_motion_echo_line_is_still_logged_beside_the_ack(self, mqtt_client, caplog):
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+
+        mqtt_client._process_message({"print": {"command": "ams_control", "sequence_id": "3", "result": "SUCCESS"}})
+
+        assert "[TEST_ACK] ams_control echo: sequence_id=3 result=SUCCESS reason=None" in [
+            r.getMessage() for r in caplog.records
+        ]
+        assert [_ack_fields(a) for a in mqtt_client.state.command_acks] == [("ams_control", "3", "SUCCESS", None)]
+
+    def test_a_numeric_id_and_result_are_normalised_to_strings(self, mqtt_client):
+        """So a numeric echo compares equal to the string the publisher sent."""
+        mqtt_client._process_message({"print": {"command": "resume", "sequence_id": 42, "result": 0}})
+
+        assert [_ack_fields(a) for a in mqtt_client.state.command_acks] == [("resume", "42", "0", None)]
+
+    def test_an_absent_id_is_empty_and_a_null_result_is_none(self, mqtt_client):
+        mqtt_client._process_message({"print": {"command": "pause", "result": None}})
+
+        assert [_ack_fields(a) for a in mqtt_client.state.command_acks] == [("pause", "", None, None)]
+
+    def test_an_echo_without_a_result_is_not_an_ack(self, mqtt_client):
+        mqtt_client._process_message({"print": {"command": "push_status", "sequence_id": "1"}})
+        mqtt_client._process_message({"print": {"command": "ams_change_filament", "sequence_id": "2"}})
+
+        assert list(mqtt_client.state.command_acks) == []
+
+    def test_the_log_is_bounded_and_keeps_the_newest(self, mqtt_client):
+        for seq in range(70):
+            mqtt_client._process_message({"print": {"command": "pause", "sequence_id": str(seq), "result": "ok"}})
+
+        acks = mqtt_client.state.command_acks
+        assert len(acks) == 64
+        assert (acks[0].sequence_id, acks[-1].sequence_id) == ("6", "69")
+
+    def test_ack_for_returns_the_newest_match(self, mqtt_client):
+        for echo in (
+            {"command": "ams_change_filament", "sequence_id": "7", "result": "fail"},
+            {"command": "ams_control", "sequence_id": "7", "result": "success"},
+            {"command": "ams_change_filament", "sequence_id": "8", "result": "success"},
+            {"command": "ams_change_filament", "sequence_id": "7", "result": "success"},
+        ):
+            mqtt_client._process_message({"print": echo})
+
+        assert _ack_fields(mqtt_client.ack_for("ams_change_filament", "7")) == (
+            "ams_change_filament",
+            "7",
+            "success",
+            None,
+        )
+        assert _ack_fields(mqtt_client.ack_for("ams_control", "7")) == ("ams_control", "7", "success", None)
+        assert mqtt_client.ack_for("ams_change_filament", "9") is None
+        assert mqtt_client.ack_for("pause", "7") is None
+
+    def test_the_write_consumer_still_receives_only_the_two_config_writes(self, mqtt_client):
+        """The tagless write-epoch consumer answers config writes; a motion or control
+        ACK is recorded, never delivered to it."""
+        delivered = []
+        mqtt_client.on_ams_command_result = delivered.append
+        commands = [
+            "ams_change_filament",
+            "ams_control",
+            "pause",
+            "resume",
+            "clean_print_error",
+            "ams_filament_setting",
+            "extrusion_cali_sel",
+        ]
+
+        for seq, command in enumerate(commands):
+            mqtt_client._process_message({"print": {"command": command, "sequence_id": str(seq), "result": "success"}})
+
+        assert [echo["command"] for echo in delivered] == ["ams_filament_setting", "extrusion_cali_sel"]
+        assert [a.command for a in mqtt_client.state.command_acks] == commands
+
+
+# Each sequenced publisher, called once, and the wire command name it records under.
+_SEQUENCED_PUBLISHERS = [
+    pytest.param(lambda c: c.ams_control("resume"), "ams_control", id="ams_control"),
+    pytest.param(lambda c: c.pause_print(), "pause", id="pause_print"),
+    pytest.param(lambda c: c.resume_print(), "resume", id="resume_print"),
+    pytest.param(lambda c: c.clean_print_error(), "clean_print_error", id="clean_print_error"),
+    pytest.param(lambda c: c.ams_load_filament(1), "ams_change_filament", id="ams_load_filament"),
+    pytest.param(lambda c: c.ams_unload_filament(), "ams_change_filament", id="ams_unload_filament"),
+]
+
+
+class TestSequencedPublishers:
+    """The six publishers an ACK must be matched to send a REAL incrementing
+    ``sequence_id`` (BambuStudio's ``command_ams_control`` sends ``m_sequence_id++``) and
+    record it for ``last_sent_sequence_id``. With every send numbered ``"0"`` no ACK
+    could name the send it answers."""
+
+    client_kwargs = {"serial": "TEST_SEQ", "connected": True, "tray_now": 255}
+
+    @pytest.mark.parametrize("publish, wire_command", _SEQUENCED_PUBLISHERS)
+    def test_each_send_carries_a_fresh_non_zero_id_and_records_it(self, mqtt_client, publish, wire_command):
+        assert mqtt_client.last_sent_sequence_id(wire_command) is None
+
+        assert publish(mqtt_client) is True
+        assert publish(mqtt_client) is True
+
+        frames = [p["print"] for p in _published_payloads(mqtt_client) if "print" in p]
+        assert [f["command"] for f in frames] == [wire_command, wire_command]
+        assert [f["sequence_id"] for f in frames] == ["1", "2"]
+        assert mqtt_client.last_sent_sequence_id(wire_command) == "2"
+
+    def test_one_counter_numbers_every_command(self, mqtt_client):
+        mqtt_client.pause_print()
+        mqtt_client.ams_control("resume")
+        mqtt_client.resume_print()
+
+        assert [p["print"]["sequence_id"] for p in _published_payloads(mqtt_client)] == ["1", "2", "3"]
+        assert (
+            mqtt_client.last_sent_sequence_id("pause"),
+            mqtt_client.last_sent_sequence_id("ams_control"),
+            mqtt_client.last_sent_sequence_id("resume"),
+        ) == ("1", "2", "3")
+
+    @pytest.mark.parametrize("publish, wire_command", _SEQUENCED_PUBLISHERS)
+    def test_a_disconnected_client_publishes_nothing_and_burns_no_id(self, mqtt_client, publish, wire_command):
+        mqtt_client.state.connected = False
+
+        assert publish(mqtt_client) is False
+
+        assert _published_payloads(mqtt_client) == []
+        assert mqtt_client._sequence_id == 0
+        assert mqtt_client.last_sent_sequence_id(wire_command) is None
+
+
+class TestCleanPrintErrorPublisher:
+    """``clean_print_error`` is the ONE publisher of that frame: the frame only, no local
+    state write (a recovery lever must not fake a quiet path by wiping the HMS list
+    itself). ``clear_hms_errors`` keeps its local wipe for the REST route."""
+
+    client_kwargs = {"serial": "TEST_CLEAN", "connected": True}
+
+    _STANDING = [HMSError(code="0x8006", attr=0x07000000, module=7, severity=2)]
+
+    def test_the_frame_only(self, mqtt_client):
+        mqtt_client.state.hms_errors = list(self._STANDING)
+
+        assert mqtt_client.clean_print_error() is True
+
+        assert _published_payloads(mqtt_client) == [{"print": {"command": "clean_print_error", "sequence_id": "1"}}]
+        assert mqtt_client.state.hms_errors == self._STANDING, "no local wipe"
+
+    def test_clear_hms_errors_publishes_through_the_one_frame_and_wipes_locally(self, mqtt_client):
+        mqtt_client.state.hms_errors = list(self._STANDING)
+
+        assert mqtt_client.clear_hms_errors() is True
+
+        assert _published_payloads(mqtt_client) == [{"print": {"command": "clean_print_error", "sequence_id": "1"}}]
+        assert mqtt_client.last_sent_sequence_id("clean_print_error") == "1"
+        assert mqtt_client.state.hms_errors == []
+
+    def test_clear_hms_errors_disconnected_sends_nothing_and_keeps_the_list(self, mqtt_client):
+        mqtt_client.state.connected = False
+        mqtt_client.state.hms_errors = list(self._STANDING)
+
+        assert mqtt_client.clear_hms_errors() is False
+
+        assert _published_payloads(mqtt_client) == []
+        assert mqtt_client.state.hms_errors == self._STANDING
+
+    def test_the_hms_modal_ok_publishes_the_frame_then_a_pushall(self, mqtt_client):
+        from backend.app.services.hms_actions import HMSAction
+
+        assert mqtt_client.execute_hms_action("03008070", HMSAction.OK_BUTTON) is True
+
+        assert _published_payloads(mqtt_client) == [
+            {"print": {"command": "clean_print_error", "sequence_id": "1"}},
+            {"pushing": {"command": "pushall", "sequence_id": "0"}},
+        ]
+
+    def test_the_hms_modal_double_check_ok_keeps_its_uiop_close(self, mqtt_client):
+        from backend.app.services.hms_actions import HMSAction
+
+        assert mqtt_client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK) is True
+
+        payloads = _published_payloads(mqtt_client)
+        assert payloads[:2] == [
+            {"print": {"command": "clean_print_error", "sequence_id": "1"}},
+            {"pushing": {"command": "pushall", "sequence_id": "0"}},
+        ]
+        assert payloads[2]["system"]["command"] == "uiop"
+        assert payloads[3] == {"pushing": {"command": "pushall", "sequence_id": "0"}}
+        assert len(payloads) == 4
+
+    def test_the_module_spells_the_frame_exactly_once(self):
+        """One publisher per frame: the HMS modal's private copy is gone, and a second
+        spelling of the frame would be a second publisher nobody numbers."""
+        source = inspect.getsource(mqtt_mod)
+
+        assert source.count('"command": "clean_print_error"') == 1

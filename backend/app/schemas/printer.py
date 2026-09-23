@@ -16,16 +16,19 @@ RecheckOutcome = Literal["unchanged", "minted", "identified", "queued", "empty",
 #: The CLOSED set of answers an operator's AMS Load / Unload click can get —
 #: ``services/ams_command.command_for_operator`` returns exactly one, and
 #: ``api/routes/printers.py`` only maps it (the two refusals to 400 / 409, every wire
-#: answer to 200). The five wire answers are ``ams_command.Answer``, measured by the ONE
-#: classifier; the two refusals are the only pre-publish refusals kept (no client, or a
-#: failed publish; a standing runout hold). Lives here, in the dependency-free DTO layer,
-#: for ``RecheckOutcome``'s reason: the service is typed by it and the wire validates it.
+#: answer to 200). The six wire answers are ``ams_command.Answer``, measured by the ONE
+#: classifier (``held`` = the firmware acknowledged the command and nothing moved: it
+#: sits behind the paused print's filament change); the two refusals are the only
+#: pre-publish refusals kept (no client, or a failed publish; a standing runout hold).
+#: Lives here, in the dependency-free DTO layer, for ``RecheckOutcome``'s reason: the
+#: service is typed by it and the wire validates it.
 AmsCommandOutcome = Literal[
     "refused_not_connected",
     "refused_runout_hold",
     "complete",
     "acted",
     "no_movement",
+    "held",
     "undecidable",
     "session_changed",
 ]
@@ -200,6 +203,9 @@ class OpenIncidentState(BaseModel):
     slot_desc: str | None = None
     created_at: str | None = None
     operator_exits: bool = False
+    #: a recovery driver task is live on this printer (projected from the incident
+    #: store's liveness registry, never derived from ``status``)
+    driver_live: bool = False
 
 
 class ServiceHoldEnterResponse(BaseModel):

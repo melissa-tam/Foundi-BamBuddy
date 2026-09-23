@@ -20,16 +20,32 @@ This module replaces the assertion with a measurement: every AMS load / unload i
 published, the wire is observed, and ONE classifier names the answer for the posture
 the command was sent into, recorded on one greppable ``[ams-command]`` line.
 
+The measured fact behind ``held``
+---------------------------------
+Commands sent into a job-owned filament change are ACKNOWLEDGED and HELD behind it,
+then run in order at the next release. 012-H2S 2026-09-23: six commands sent into the
+loaded wedge (the driver's unload, four operator unloads, one load of slot 3) each
+echoed ``result=success`` and moved nothing; after the print's terminal the AMS ran
+them in order from 02:06:36 to 02:10:14 (3→255, →2, a full cycle, back to 255 because
+the last one was an unload) with no farm command and no touchscreen use
+(operator-confirmed). :func:`classify` names that measurement ``held`` in the
+mid-change rows: the firmware's ACK for THIS send — correlated by the send's own
+``sequence_id`` through ``BambuMQTTClient.ack_for`` (:func:`ack_of`) — reads success,
+AND nothing moved. A held command is a hazard, not a tool: a held UNLOAD that drains
+while the print is RUNNING empties the extruder mid-print.
+
 What it owns
 ------------
 * The two verbs :func:`load` and :func:`unload` — the ONLY callers of
   ``BambuMQTTClient.ams_load_filament`` / ``ams_unload_filament`` in ``backend/app``
   (AST-pinned in ``tests/unit/services/test_ams_command.py``). They own the pre-send
-  mark (``spool_respool.note_commanded_load``), the entry snapshot, the only two
-  pre-publish refusals kept (no client or a publish that did not go out; a standing
-  runout hold, which LATCHES a load in firmware — 006-H2S 2026-07-26), the operator
-  attribution stamp, and the INFO send line.
-* :func:`classify` — the ONE reading of "what did the wire answer this command".
+  mark (``spool_respool.note_commanded_load``), the entry snapshot, the send's
+  sequence id (:class:`Sent`), the only two pre-publish refusals kept (no client or a
+  publish that did not go out; a standing runout hold, which LATCHES a load in
+  firmware — 006-H2S 2026-07-26), the operator attribution stamp, and the INFO send
+  line.
+* :func:`classify` — the ONE reading of "what did the wire answer this command" — and
+  :func:`ack_of`, the ONE correlation of a send to the firmware's ACK for it.
 * The operator facade :func:`command_for_operator` and its wait :func:`observe`.
 * :func:`operator_commanded_since` — the attribution a recovery driver's takeover
   predicate reads, so a driver's verdict can never be an operator's move.
@@ -59,7 +75,14 @@ from typing import Literal
 
 from backend.app.schemas.printer import AmsCommandOutcome
 from backend.app.services import spool_respool
-from backend.app.services.bambu_mqtt import AMS_STATUS_ASSIST, AMS_STATUS_IDLE, PrinterState, ams_mid_filament_change
+from backend.app.services.bambu_mqtt import (
+    AMS_STATUS_ASSIST,
+    AMS_STATUS_IDLE,
+    BambuMQTTClient,
+    CommandAck,
+    PrinterState,
+    ams_mid_filament_change,
+)
 from backend.app.services.hms_errors import current_runout_demand, runout_hold_active
 from backend.app.services.printer_incidents import runout_slot_desc
 from backend.app.services.printer_manager import printer_manager
@@ -75,8 +98,18 @@ logger = logging.getLogger(__name__)
 Command = Literal["load", "unload"]
 Actor = Literal["driver", "operator"]
 Posture = Literal["idle", "assist", "mid_change_loaded", "mid_change_empty", "other"]
-Answer = Literal["complete", "acted", "no_movement", "undecidable", "session_changed"]
+Answer = Literal["complete", "acted", "no_movement", "held", "undecidable", "session_changed"]
 RefusalReason = Literal["not_connected", "runout_hold"]
+
+#: The wire command both verbs publish: a load and an unload are one frame,
+#: ``ams_change_filament``, told apart by ``target`` 255 — so it is also the command
+#: name the firmware's ACK for either carries.
+_WIRE_COMMAND = "ams_change_filament"
+
+#: The ACK ``result`` spellings that mean success, compared lower-cased — the wire has
+#: shown both ``result=success`` (the motion echoes) and ``result=SUCCESS`` (the
+#: ``ams_control resume`` echo), 012-H2S 2026-09-23. Anything else is a failure.
+_ACK_SUCCESS_RESULTS = frozenset({"success", "ok"})
 
 #: How long the AMS must hold its "nothing fed" reading before an unload with NO
 #: observed change cycle counts as complete (and how long a mid-change unload's empty
@@ -89,7 +122,10 @@ UNLOAD_GRACE_S: float = 15.0
 #: The operator facade's observe window: how long a Load / Unload click waits for the
 #: wire before answering. UNMEASURED — a first guess sized to a human click, not a
 #: firmware latency. The grace-held completions (:data:`UNLOAD_GRACE_S`) cannot land
-#: inside it, so an accepted operator unload usually answers ``acted``; the recovery
+#: inside it, so an accepted operator unload usually answers ``acted``; a click into a
+#: job-owned change that the firmware acknowledged and did not act on answers ``held``
+#: at the end of it (the held rule reads the shorter of the grace and the window; an
+#: ACK that lands after the window leaves the click at ``no_movement``). The recovery
 #: driver observes over its own, longer step timeout.
 OPERATOR_ACK_S: float = 5.0
 
@@ -168,10 +204,11 @@ class Observation:
 
     Caller-owned and threaded through every :func:`classify` call for that command
     (one instance per command, never shared). It is the classifier's ONLY state:
-    :func:`classify` folds each ``now`` into it and the table rows read it, so the
-    rows themselves stay pure functions of their arguments. Every time in it is on the
-    CALLER's elapsed timeline (``elapsed_s``) — no clock is read here, so a driver on a
-    fake clock and the operator facade on the real one classify identically.
+    :func:`classify` folds each ``now`` into it, the CALLER folds the firmware's ACK
+    for the send into it (:meth:`fold_ack`, before every call), and the table rows read
+    it, so the rows themselves stay pure functions of their arguments. Every time in it
+    is on the CALLER's elapsed timeline (``elapsed_s``) — no clock is read here, so a
+    driver on a fake clock and the operator facade on the real one classify identically.
     """
 
     #: Some wire field (tray_now / ams_status_main / ams_status_sub / tray_tar) read
@@ -186,6 +223,21 @@ class Observation:
     #: ``elapsed_s`` at which the current unbroken run of "nothing fed" (tray_now 255)
     #: began, whatever the AMS state; ``None`` when the latest poll broke it.
     empty_since_s: float | None = None
+    #: The firmware's ACK for THIS send: ``None`` = no ACK seen yet, ``True`` = a
+    #: success result, ``False`` = any other result.
+    acked: bool | None = None
+
+    def fold_ack(self, ack: CommandAck | None) -> None:
+        """Fold the firmware's ACK for this send (:func:`ack_of`) into the running facts.
+
+        A ``result`` that lower-cases to ``success`` or ``ok`` is success; anything else
+        (``fail``, a null result) is a failure. ``None`` — no ACK yet, or one already
+        rolled out of the client's bounded ACK log — changes nothing: an ACK once seen
+        stays seen.
+        """
+        if ack is None:
+            return
+        self.acked = ack.result is not None and ack.result.lower() in _ACK_SUCCESS_RESULTS
 
     def fold(self, entry: AmsWireSnapshot, now: AmsWireSnapshot, elapsed_s: float) -> None:
         """Fold one poll into the running facts. Idempotent for a repeated ``now``."""
@@ -240,16 +292,31 @@ def _unload_settled(
     return None
 
 
+def _held_behind_the_change(obs: Observation, elapsed_s: float, deadline_s: float) -> Answer | None:
+    """``held`` — the measured fact in the module docstring, for a command sent into a
+    mid-change AMS: the firmware ACKNOWLEDGED this send (``obs.acked is True``) and
+    nothing moved by :data:`UNLOAD_GRACE_S` (or by the deadline when the window is
+    shorter — the operator's), so the command sits behind the print's own change and
+    runs at the next release. An EARLY exit, the :func:`_unload_mid_change_empty`
+    pattern: an acknowledged, unmoved command answers at the grace, never after a full
+    step timeout. No ACK, or a failure ACK, is not ``held`` — the deadline rule answers
+    ``no_movement``; a movement is never ``held``."""
+    if obs.acked is True and not obs.moved and elapsed_s >= min(UNLOAD_GRACE_S, deadline_s):
+        return "held"
+    return None
+
+
 def _unload_mid_change_loaded(
     target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
 ) -> Answer | None:
     """An unload sent into a mid-change AMS with a real feeder loaded: complete when
     ``tray_now`` left that feeder for 255 and the empty reading has held for
     :data:`UNLOAD_GRACE_S`. The AMS may legitimately STAY in state 1 — the print still
-    owes the change — so idle is not required."""
+    owes the change — so idle is not required. Otherwise ``held`` when acknowledged
+    and unmoved (:func:`_held_behind_the_change`) — the 012-H2S 2026-09-23 posture."""
     if obs.empty_since_s is not None and elapsed_s - obs.empty_since_s >= UNLOAD_GRACE_S:
         return "complete"
-    return None
+    return _held_behind_the_change(obs, elapsed_s, deadline_s)
 
 
 def _unload_mid_change_empty(
@@ -278,7 +345,21 @@ def _load_reached_target(
     return None
 
 
+def _load_mid_change(
+    target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
+) -> Answer | None:
+    """A load sent into a mid-change AMS, loaded or empty: ``complete`` exactly as
+    :func:`_load_reached_target`; otherwise ``held`` when acknowledged and unmoved
+    (:func:`_held_behind_the_change` — the 012-H2S 2026-09-23 load of slot 3)."""
+    return _load_reached_target(target, now, obs, elapsed_s, deadline_s) or _held_behind_the_change(
+        obs, elapsed_s, deadline_s
+    )
+
+
 # EXPLICIT, every cell, no default: a missing key RAISES at the lookup (``_row``).
+# ``held`` is reachable only from the mid-change rows that can MOVE: an unload with
+# nothing loaded (``mid_change_empty``) has no physical answer, so it stays
+# ``undecidable``, and outside a change a command is never held behind one.
 _ROWS: dict[tuple[Command, Posture], Row] = {
     ("unload", "idle"): _unload_settled,
     ("unload", "assist"): _unload_settled,
@@ -288,8 +369,8 @@ _ROWS: dict[tuple[Command, Posture], Row] = {
     ("load", "idle"): _load_reached_target,
     ("load", "assist"): _load_reached_target,
     ("load", "other"): _load_reached_target,
-    ("load", "mid_change_loaded"): _load_reached_target,
-    ("load", "mid_change_empty"): _load_reached_target,
+    ("load", "mid_change_loaded"): _load_mid_change,
+    ("load", "mid_change_empty"): _load_mid_change,
 }
 
 
@@ -322,11 +403,19 @@ def classify(
     the design chosen over handing the rows the whole poll history: one object threaded
     through the caller's loop, O(1) per poll, and the rows stay pure readers of it.
 
+    The firmware's ACK is the CALLER's to fold: before every call, the caller folds the
+    ACK for its send into ``observation`` (``observation.fold_ack(ack_of(printer_id,
+    sent))``) — :func:`observe` does, and so must any loop that runs this classifier
+    itself. A caller that never folds one never gets ``held``: the mid-change rows then
+    answer as if no ACK arrived (``no_movement`` at the deadline).
+
     Order, for every command:
 
     1. ``now.connection_epoch != entry.connection_epoch`` → ``session_changed`` (the
        session the command was sent on is gone; nothing read after it answers it).
     2. The row for ``(command, posture(entry))`` — a missing row raises ``LookupError``.
+       The mid-change rows that can move answer ``held`` early (acknowledged + unmoved,
+       :func:`_held_behind_the_change`).
     3. At ``elapsed_s >= deadline_s``: a moved field → ``acted``, nothing moved →
        ``no_movement``.
     """
@@ -354,6 +443,22 @@ class Refusal:
 
 
 @dataclass(frozen=True)
+class Sent:
+    """A command that WENT OUT.
+
+    ``entry`` is the snapshot taken BEFORE the publish (the posture the command was sent
+    into, the baseline movement is read against). ``sequence_id`` is the id the client
+    published it under — ``BambuMQTTClient.last_sent_sequence_id`` read in the same
+    synchronous stretch as the publish, so it is this send's own — and the key the
+    firmware's ACK is correlated by (:func:`ack_of`). ``None`` only when the client
+    recorded no id for the publish, which leaves the send with no ACK to read.
+    """
+
+    entry: AmsWireSnapshot
+    sequence_id: str | None
+
+
+@dataclass(frozen=True)
 class _OperatorStamp:
     connection_epoch: int | None
     at: float
@@ -363,9 +468,10 @@ class _OperatorStamp:
 _operator_commanded: dict[int, _OperatorStamp] = {}
 
 
-def load(printer_id: int, tray_id: int, *, actor: Actor) -> AmsWireSnapshot | Refusal:
-    """Publish an AMS load of ``tray_id``. Returns the ENTRY snapshot (taken before the
-    publish) or the :class:`Refusal` that kept it from going out.
+def load(printer_id: int, tray_id: int, *, actor: Actor) -> Sent | Refusal:
+    """Publish an AMS load of ``tray_id``. Returns the :class:`Sent` (the ENTRY snapshot
+    taken before the publish, and the send's sequence id) or the :class:`Refusal` that
+    kept it from going out.
 
     Refused only for no client / a publish the client did not send (``not_connected``)
     and a standing runout hold (``runout_hold``): while the printer is PAUSEd for a
@@ -383,20 +489,21 @@ def load(printer_id: int, tray_id: int, *, actor: Actor) -> AmsWireSnapshot | Re
     # edge as a firmware runout and spends the departed spool (the 006 false-stamp mode).
     spool_respool.note_commanded_load(printer_id, tray_id)
     entry = snapshot(state)
-    sent = client.ams_load_filament(tray_id)
-    return _after_publish(printer_id, "load", tray_id, entry, actor=actor, sent=sent)
+    published = client.ams_load_filament(tray_id)
+    return _after_publish(printer_id, "load", tray_id, entry, client=client, actor=actor, published=published)
 
 
-def unload(printer_id: int, *, actor: Actor) -> AmsWireSnapshot | Refusal:
-    """Publish an AMS unload. Returns the ENTRY snapshot (taken before the publish) or
-    the ``not_connected`` :class:`Refusal`. Sent in every posture — no posture refuses
-    an unload (doctrine invariant 8: the unload is unconditional before a load)."""
+def unload(printer_id: int, *, actor: Actor) -> Sent | Refusal:
+    """Publish an AMS unload. Returns the :class:`Sent` (the ENTRY snapshot taken before
+    the publish, and the send's sequence id) or the ``not_connected`` :class:`Refusal`.
+    Sent in every posture — no posture refuses an unload (doctrine invariant 8: the
+    unload is unconditional before a load)."""
     client = printer_manager.get_client(printer_id)
     if client is None:
         return Refusal("not_connected", _NOT_CONNECTED)
     entry = snapshot(printer_manager.get_status(printer_id))
-    sent = client.ams_unload_filament()
-    return _after_publish(printer_id, "unload", None, entry, actor=actor, sent=sent)
+    published = client.ams_unload_filament()
+    return _after_publish(printer_id, "unload", None, entry, client=client, actor=actor, published=published)
 
 
 def _after_publish(
@@ -405,10 +512,11 @@ def _after_publish(
     target: int | None,
     entry: AmsWireSnapshot,
     *,
+    client: BambuMQTTClient,
     actor: Actor,
-    sent: bool,
-) -> AmsWireSnapshot | Refusal:
-    if not sent:
+    published: bool,
+) -> Sent | Refusal:
+    if not published:
         logger.warning(
             "[ams-command] actor=%s command=%s printer=%s target=%s not sent (the client refused the publish)",
             actor,
@@ -417,18 +525,22 @@ def _after_publish(
             target,
         )
         return Refusal("not_connected", _NOT_SENT)
+    # The send's own id: read in the same synchronous stretch as the publish (no await
+    # between), so no other publish can have been recorded over it.
+    sequence_id = client.last_sent_sequence_id(_WIRE_COMMAND)
     # Stamped only once the command actually went out: an unsent click must never make
     # a driver stand down. Same synchronous stretch as the publish (no await between),
     # so no reader can observe the wire's answer before the stamp.
     if actor == "operator":
         _operator_commanded[printer_id] = _OperatorStamp(connection_epoch=entry.connection_epoch, at=_monotonic())
     logger.info(
-        "[ams-command] actor=%s command=%s printer=%s target=%s posture=%s entry tray_now=%s ams_status=%s/%s "
-        "tray_tar=%s epoch=%s",
+        "[ams-command] actor=%s command=%s printer=%s target=%s seq=%s posture=%s entry tray_now=%s "
+        "ams_status=%s/%s tray_tar=%s epoch=%s",
         actor,
         command,
         printer_id,
         target,
+        sequence_id,
         posture(entry),
         entry.tray_now,
         entry.ams_status_main,
@@ -436,7 +548,7 @@ def _after_publish(
         entry.tray_tar,
         entry.connection_epoch,
     )
-    return entry
+    return Sent(entry=entry, sequence_id=sequence_id)
 
 
 def _runout_hold_detail(printer_id: int, state: PrinterState | None) -> str:
@@ -451,6 +563,23 @@ def _runout_hold_detail(printer_id: int, state: PrinterState | None) -> str:
         f"this slot (006-H2S 2026-07-26). Insert filament into {where or 'the slot that ran out'} "
         "and the print resumes from there."
     )
+
+
+def ack_of(printer_id: int, sent: Sent) -> CommandAck | None:
+    """The firmware's ACK for ``sent`` — the ONE correlation of a motion command to its
+    ACK: the live client's ``ack_for`` keyed by the wire command both verbs publish and
+    the send's own sequence id (invariant 14: the ACK is consumed into the classifier).
+
+    ``None`` = no ACK has arrived yet, or there is nothing to correlate by (the client
+    is gone, or the send carries no id). Any loop that runs :func:`classify` folds this
+    into its :class:`Observation` before every call (``observation.fold_ack(...)``).
+    """
+    if sent.sequence_id is None:
+        return None
+    client = printer_manager.get_client(printer_id)
+    if client is None:
+        return None
+    return client.ack_for(_WIRE_COMMAND, sent.sequence_id)
 
 
 def operator_commanded_since(printer_id: int, since_monotonic: float) -> bool:
@@ -516,16 +645,23 @@ async def observe(
     printer_id: int,
     command: Command,
     target: int | None,
-    entry: AmsWireSnapshot,
+    sent: Sent,
     *,
     timeout_s: float,
     poll_s: float = 0.25,
 ) -> Answer:
     """Poll the live state and return the classifier's first answer (the operator
     facade's wait; the recovery driver runs :func:`classify` inside its own confirm
-    loops). ``elapsed_s`` is measured from the entry snapshot, i.e. from the send."""
+    loops). ``elapsed_s`` is measured from the entry snapshot, i.e. from the send.
+
+    Each poll folds the firmware's ACK for ``sent`` (:func:`ack_of`) into the
+    observation BEFORE reading the snapshot, so an ACK is never paired with a snapshot
+    older than itself: a movement that began before the ACK was read is in the snapshot
+    the held rule reads."""
+    entry = sent.entry
     observation = Observation()
     while True:
+        observation.fold_ack(ack_of(printer_id, sent))
         now = snapshot(printer_manager.get_status(printer_id))
         elapsed_s = now.taken_at - entry.taken_at
         answer = classify(
@@ -568,10 +704,12 @@ _ANSWER_COPY: dict[tuple[Command, Answer], str] = {
     ("load", "complete"): "Loading filament from {target}",
     ("load", "acted"): "Loading filament from {target}",
     ("load", "no_movement"): "Load sent. AMS did not move.",
+    ("load", "held"): "Load accepted. Held behind the paused print's filament change.",
     ("load", "session_changed"): "Printer reconnected during the command. Check the AMS.",
     ("unload", "complete"): "Unloading filament",
     ("unload", "acted"): "Unloading filament",
     ("unload", "no_movement"): "Unload sent. AMS did not move.",
+    ("unload", "held"): "Unload accepted. Held behind the paused print's filament change.",
     ("unload", "undecidable"): "Unload sent. Nothing was loaded.",
     ("unload", "session_changed"): "Printer reconnected during the command. Check the AMS.",
 }
