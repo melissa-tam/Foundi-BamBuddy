@@ -135,6 +135,13 @@ def snapshot(state: PrinterState | None) -> AmsWireSnapshot:
     )
 
 
+#: The postures :func:`posture` returns for a mid filament-change AMS
+#: (``bambu_mqtt.ams_mid_filament_change``) — the ONE statement of which postures those
+#: are, for readers that hold a posture rather than the snapshot it was read from (a
+#: recovery driver's command records). Pinned against :func:`posture` by its own tests.
+MID_CHANGE_POSTURES: frozenset[Posture] = frozenset({"mid_change_loaded", "mid_change_empty"})
+
+
 def posture(snap: AmsWireSnapshot) -> Posture:
     """The posture a command is sent INTO — the key the classifier's rows are read by.
 
@@ -469,6 +476,42 @@ def _reset_state() -> None:
 # --- the operator facade --------------------------------------------------------------
 
 
+def log_answer(
+    *,
+    actor: Actor,
+    printer_id: int,
+    command: Command,
+    target: int | None,
+    entry: AmsWireSnapshot,
+    now: AmsWireSnapshot,
+    answer: Answer,
+    elapsed_s: float,
+) -> None:
+    """THE answer line — the measurement's grep token (``answer=``), one format string
+    for every reader of the wire's answer: the operator facade (:func:`observe`) and the
+    recovery driver's own confirm loops. It carries the posture the command was sent
+    into and every moving field's entry→now edge."""
+    logger.info(
+        "[ams-command] actor=%s printer=%s command=%s target=%s posture=%s answer=%s after %.1fs "
+        "(tray_now %s→%s ams_status %s/%s→%s/%s tray_tar %s→%s)",
+        actor,
+        printer_id,
+        command,
+        target,
+        posture(entry),
+        answer,
+        elapsed_s,
+        entry.tray_now,
+        now.tray_now,
+        entry.ams_status_main,
+        entry.ams_status_sub,
+        now.ams_status_main,
+        now.ams_status_sub,
+        entry.tray_tar,
+        now.tray_tar,
+    )
+
+
 async def observe(
     printer_id: int,
     command: Command,
@@ -489,23 +532,15 @@ async def observe(
             command, target, entry, now, observation=observation, elapsed_s=elapsed_s, deadline_s=timeout_s
         )
         if answer is not None:
-            logger.info(
-                "[ams-command] printer=%s command=%s target=%s posture=%s answer=%s after %.1fs "
-                "(tray_now %s→%s ams_status %s/%s→%s/%s tray_tar %s→%s)",
-                printer_id,
-                command,
-                target,
-                posture(entry),
-                answer,
-                elapsed_s,
-                entry.tray_now,
-                now.tray_now,
-                entry.ams_status_main,
-                entry.ams_status_sub,
-                now.ams_status_main,
-                now.ams_status_sub,
-                entry.tray_tar,
-                now.tray_tar,
+            log_answer(
+                actor="operator",
+                printer_id=printer_id,
+                command=command,
+                target=target,
+                entry=entry,
+                now=now,
+                answer=answer,
+                elapsed_s=elapsed_s,
             )
             return answer
         await asyncio.sleep(min(poll_s, max(0.0, timeout_s - elapsed_s)))

@@ -5454,7 +5454,8 @@ async def run_migrations(conn):
     # the taxonomy has no row for — is left exactly as it stands.
     #
     # KNOWN LIMIT, accepted: ``feed_fault_code`` holds ONE representative short code
-    # (``spool_recovery._primary_code``), so a mixed incident whose lowest-sorted feed
+    # (the incident's ``code`` — ``spool_recovery._primary_candidate``, the lowest short
+    # code of the deciding class), so a mixed incident whose lowest-sorted feed
     # code happened to be ``0300_801E`` is cleared here even though an AMS-side code
     # stood beside it. That is the safe direction: a wrongly returned roll re-parks
     # itself on its next genuine jam, while a wrongly parked roll never returns itself.

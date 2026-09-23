@@ -30,6 +30,7 @@ import pytest
 from backend.app.schemas.printer import AmsCommandOutcome
 from backend.app.services import ams_command, spool_respool
 from backend.app.services.ams_command import (
+    MID_CHANGE_POSTURES,
     OPERATOR_ACK_S,
     UNLOAD_GRACE_S,
     AmsCommandResult,
@@ -46,7 +47,7 @@ from backend.app.services.ams_command import (
     posture,
     snapshot,
 )
-from backend.app.services.bambu_mqtt import PrinterState
+from backend.app.services.bambu_mqtt import PrinterState, ams_mid_filament_change
 from backend.tests._fixtures.ast_tree import ParsedModule, ParsedTree
 from backend.tests._fixtures.clock import FakeClock
 
@@ -130,6 +131,13 @@ class TestPosture:
     )
     def test_posture_of_a_snapshot(self, snap: AmsWireSnapshot, expected: Posture) -> None:
         assert posture(snap) == expected
+        # MID_CHANGE_POSTURES is exactly the postures a mid filament-change snapshot
+        # reads as — the one-origin predicate decides membership, case by case.
+        assert (posture(snap) in MID_CHANGE_POSTURES) is ams_mid_filament_change(snap)
+
+    def test_the_mid_change_postures_are_the_posture_vocabulary_s_own(self) -> None:
+        assert frozenset({"mid_change_loaded", "mid_change_empty"}) == MID_CHANGE_POSTURES
+        assert set(get_args(Posture)) >= MID_CHANGE_POSTURES
 
 
 class TestSnapshot:
@@ -805,8 +813,8 @@ class TestObserve:
         assert answer == "complete"
         lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ams-command]")]
         assert lines == [
-            f"[ams-command] printer={_PID} command=unload target=None posture=mid_change_loaded answer=complete "
-            "after 16.0s (tray_now 3→255 ams_status 1/5→1/5 tray_tar None→None)"
+            f"[ams-command] actor=operator printer={_PID} command=unload target=None posture=mid_change_loaded "
+            "answer=complete after 16.0s (tray_now 3→255 ams_status 1/5→1/5 tray_tar None→None)"
         ]
 
     async def test_answers_at_the_deadline_when_nothing_decides(

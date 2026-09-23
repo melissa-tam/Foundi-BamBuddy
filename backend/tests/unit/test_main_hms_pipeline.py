@@ -371,7 +371,7 @@ def _err(*, code: str, attr: int, module: int, full_code: str, severity: int = 2
     return SimpleNamespace(code=code, attr=attr, module=module, severity=severity, full_code=full_code)
 
 
-# A recoverable AMS feed fault (0700_8010 ∈ RECOVERABLE_HMS_CODES).
+# A recoverable AMS feed fault (0700_8010 classifies mechanical_feed in the hms_errors taxonomy).
 _FEED_FAULT = _err(code="0x8010", attr=0x07000000, module=0x07, full_code="0700000000008010")
 # A slot-attributed runout companion: short code "0700_0001" (which must NEVER be
 # matched as a bare string — it collides with runout routing), but attr 0x07002000 +
