@@ -60,25 +60,37 @@ AMS_STATUS_IDENTIFYING = 2
 # self-heal on 2026-07-20).
 AMS_STATUS_IDLE = 0
 
-# AMS main status 1 = filament_change: the ONLY state in which the AMS ignores
-# every unload/load and only the firmware CONTINUE (a ``resume``) frees it (009-H2S
-# 2026-07-20 — four unloads were silent no-ops until the resume unwedged it). An
-# assist (3) fault, by contrast, leaves the feeder engaged and DOES accept unloads
-# (006-H2S 2026-07-21). Exported so spool_recovery keys the stuck-change reset off
-# this one origin.
+# AMS main status 1 = filament_change: the AMS is inside a filament change. What a
+# motion command does in this state depends on the POSTURE (is filament loaded?), and
+# only some postures are measured — see ams_mid_filament_change. Exported so
+# spool_recovery and services/ams_command key the posture off this one origin.
 AMS_STATUS_FILAMENT_CHANGE = 1
+
+# AMS main status 3 = assist: the steady state of every RUNNING H2S (fleet sample
+# 2026-09-11). An assist fault leaves the feeder engaged and DOES accept unloads
+# (006-H2S 2026-07-21). Exported so services/ams_command names the posture from this
+# one origin instead of restating the integer.
+AMS_STATUS_ASSIST = 3
 
 
 def ams_mid_filament_change(state) -> bool:
-    """Whether this printer's AMS is mid filament-change, and therefore DEAF.
+    """Whether this printer's AMS is mid filament-change — a POSTURE, not a refusal.
 
-    At ``ams_status_main == 1`` the firmware drops every ``ams_change_filament`` —
-    load and unload alike — and only the firmware CONTINUE (``print.resume`` /
-    ``ams_control resume``) moves the state machine on: 009-H2S 2026-07-20 (four
-    unloads silently ignored until a resume unwedged it) and 002-H2S 2026-09-11
-    (a layer-0 jam parked the AMS here behind a PAUSE; the operator's two Load
-    clicks returned HTTP 200 and moved nothing, and the scheduler dispatched onto
-    that AMS 31 s after the stop).
+    ``ams_status_main == 1``: the AMS is inside a filament change. What the wire does
+    with a motion command in this state is measured per posture, not asserted:
+
+    * a LOAD into an empty path while the firmware's change-error modal stands
+      (``tray_now = 255``) was dropped — 3 witnesses (009-H2S 2026-07-20, 002-H2S
+      2026-09-11 05:44 and 05:47);
+    * an UNLOAD with nothing loaded is undecidable — nothing physical can move, so
+      "no movement" answers nothing (8 sends across 009/002/012, all silent);
+    * a command with filament LOADED (a mechanical feed fault behind a PAUSE) was
+      never measured before 2026-09-23; ``services/ams_command`` now measures every
+      attempt and records the wire's answer per posture.
+
+    The two operator routes (``/ams/load``, ``/ams/unload``) no longer refuse on this
+    predicate — they publish, observe and report. Readers that still consult it ask
+    about the posture; none may treat it as "the AMS drops every command".
 
     Value 1 ONLY, by measurement, never "non-idle": a fleet sample on 2026-09-11
     read ``ams_status_main = 3`` (assist) on every RUNNING H2S and 0 on an idle H2C,
@@ -107,6 +119,13 @@ _AMS_COMMAND_RESULT_COMMANDS = frozenset({"ams_filament_setting", "extrusion_cal
 # AMS state), and re-serving it on the ack lane would give the farm a second,
 # copy-shaped path to the same wire data.
 _AMS_COMMAND_RESULT_FIELDS = ("command", "result", "ams_id", "tray_id", "sequence_id", "reason")
+
+# The AMS MOTION commands whose report-topic echo is the firmware's own answer to a
+# load / unload / CONTINUE. Logged at INFO (never DEBUG) so the answer lands in every
+# support bundle beside services/ams_command's measured verdict — invariant 14: every
+# command ACK is consumed. Whether the firmware echoes these at all is itself the first
+# fact the live witness records.
+_AMS_MOTION_ECHO_COMMANDS = frozenset({"ams_change_filament", "ams_control"})
 
 # Tray `state` codes that mean a spool is physically PRESENT — DEFINED in
 # ``tray_fields`` (beside the parser that reads the field and the ``tray_presence``
@@ -585,6 +604,12 @@ class PrinterState:
     active_extruder: int = 0
     # Currently loaded tray (global ID): 254/255 = external spools, 255 = no filament on legacy printers
     tray_now: int = 255
+    # The AMS's own TARGET tray (``print.ams.tray_tar``), exactly as the wire spelled it —
+    # never disambiguated (on H2D it is a local slot 0-3, not a global id), so no reader
+    # may treat it as a feeder id. Recorded because it is part of the wire's answer to a
+    # motion command (services/ams_command reads it as movement evidence). None = no push
+    # has carried a parseable value yet.
+    tray_tar: int | None = None
     # Last valid tray_now (0-253) — survives unload (255) for usage tracking after print completes
     last_loaded_tray: int = -1
     # Pending load target - used to track what tray we're loading for H2D disambiguation
@@ -1646,7 +1671,17 @@ class BambuMQTTClient:
             # Check for command responses
             if "command" in print_data:
                 cmd = print_data.get("command")
-                logger.debug("[%s] Received command response: %s", self.serial_number, cmd)
+                if cmd in _AMS_MOTION_ECHO_COMMANDS:
+                    logger.info(
+                        "[%s] %s echo: sequence_id=%s result=%s reason=%s",
+                        self.serial_number,
+                        cmd,
+                        print_data.get("sequence_id"),
+                        print_data.get("result"),
+                        print_data.get("reason"),
+                    )
+                else:
+                    logger.debug("[%s] Received command response: %s", self.serial_number, cmd)
                 if cmd in ("extrusion_cali_sel", "extrusion_cali_set", "extrusion_cali_del", "ams_filament_setting"):
                     logger.debug("[%s] %s response: %s", self.serial_number, cmd, print_data)
                 # AMS drying responses are rare (user-initiated only) and the
@@ -2672,6 +2707,12 @@ class BambuMQTTClient:
                     self.state.last_loaded_tray = self.state.tray_now
 
                 logger.debug("[%s] tray_now updated: %s", self.serial_number, self.state.tray_now)
+
+            # tray_tar rides the same dict (and the P1S partial update). Recorded raw —
+            # no disambiguation: it is movement evidence for services/ams_command, never
+            # a feeder id. An absent field keeps the last value, as tray_now does.
+            if "tray_tar" in ams_data:
+                self.state.tray_tar = parse_int_field(ams_data["tray_tar"])
 
             # NOTE: ams_status is parsed BEFORE tray_now (see above) to ensure correct
             # state when checking filament change mode for H2D disambiguation

@@ -13,6 +13,23 @@ from pydantic import BaseModel, Field, field_validator
 #: slot pipeline's whole model graph into every import of this module.
 RecheckOutcome = Literal["unchanged", "minted", "identified", "queued", "empty", "restored"]
 
+#: The CLOSED set of answers an operator's AMS Load / Unload click can get —
+#: ``services/ams_command.command_for_operator`` returns exactly one, and
+#: ``api/routes/printers.py`` only maps it (the two refusals to 400 / 409, every wire
+#: answer to 200). The five wire answers are ``ams_command.Answer``, measured by the ONE
+#: classifier; the two refusals are the only pre-publish refusals kept (no client, or a
+#: failed publish; a standing runout hold). Lives here, in the dependency-free DTO layer,
+#: for ``RecheckOutcome``'s reason: the service is typed by it and the wire validates it.
+AmsCommandOutcome = Literal[
+    "refused_not_connected",
+    "refused_runout_hold",
+    "complete",
+    "acted",
+    "no_movement",
+    "undecidable",
+    "session_changed",
+]
+
 #: The CLOSED set of answers a manual eject can give. ``eject/manual.manual_eject``
 #: returns exactly one :class:`~backend.app.services.eject.manual.EjectVerdict` carrying
 #: one of these, and ``api/routes/printer_eject.py`` maps each to its HTTP shape — the
@@ -769,3 +786,16 @@ class SlotRecheckResponse(BaseModel):
     # the operator must be able to tell "the farm asked" from "the farm could not ask".
     read_issued: bool = False
     undo_available: bool = False
+
+
+class AmsCommandResponse(BaseModel):
+    """What ``POST /printers/{id}/ams/load`` and ``/ams/unload`` answer with a 200.
+
+    ``outcome`` is the wire's measured answer (``ams_command.classify``) — the UI keys its
+    toast off it. ``message`` is the non-UI-client fallback sentence only. Closed type for
+    ``SlotRecheckResponse``'s reason: a bare ``str`` would let a new outcome reach a client
+    unannounced.
+    """
+
+    outcome: AmsCommandOutcome
+    message: str
