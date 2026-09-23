@@ -803,7 +803,9 @@ class TestRunoutCodeRelocation:
         from backend.app.services.hms_errors import RUNOUT_HMS_CODES
 
         assert spool_respool.RUNOUT_HMS_CODES is RUNOUT_HMS_CODES
-        assert spool_recovery.RUNOUT_HMS_CODES is RUNOUT_HMS_CODES
+        # spool_recovery reads the runout CLASS off the live candidates (both wire
+        # lanes) and holds no short-code set at all — not even a re-export.
+        assert not hasattr(spool_recovery, "RUNOUT_HMS_CODES")
 
 
 class TestAmsFaultTaxonomyShortLane:
@@ -849,12 +851,10 @@ class TestAmsFaultTaxonomyShortLane:
         must not outlive the wave that acts on it."""
         from backend.app.services import hms_errors
         from backend.app.services.hms_errors import classify_short_code, mechanical_feed_short_codes
-        from backend.app.services.spool_recovery import FEED_FAULT_HMS_CODES
 
         for short in ("0700_8005", "0700_8006", "0700_8028"):
             assert classify_short_code(short).fault_class.value == "mechanical_feed"
-            assert short in FEED_FAULT_HMS_CODES
-        assert mechanical_feed_short_codes() == FEED_FAULT_HMS_CODES
+            assert short in mechanical_feed_short_codes()
         assert not hasattr(hms_errors, "legacy_swap_short_codes")
 
     def test_an_unclassified_short_code_is_none(self):

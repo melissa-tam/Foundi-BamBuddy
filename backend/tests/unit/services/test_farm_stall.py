@@ -1487,10 +1487,11 @@ async def _add_printer(db, name="002-H2S"):
 
 
 class TestAmsWedgedIdle:
-    """A latched ``ams_status_main == 1`` on an IDLE printer is 002-H2S's wedge with
-    the jam code gone: the AMS drops every load and unload, the dispatch gate refuses
-    the printer forever, and NOTHING else in the farm can see it — no incident row, no
-    print, no HMS. The #60 shape in a new field, so it gets the same bounded page.
+    """A parked ``ams_status_main == 1`` on an IDLE printer is 002-H2S's wedge with
+    the jam code gone: the dispatch gate refuses the printer while it stands, the farm
+    has not commanded anything there, and NOTHING else in the farm can see it — no
+    incident row, no print, no HMS. The #60 shape in a new field, so it gets the same
+    bounded page.
     """
 
     async def _mature(self, db, mgr, *, base=_NOW):
@@ -1508,6 +1509,25 @@ class TestAmsWedgedIdle:
         mock_n.assert_awaited_once()
         assert mock_n.await_args.kwargs["printer_id"] == printer.id
         assert mock_n.await_args.kwargs["minutes"] >= 10
+
+    async def test_the_warning_states_the_refusal_not_a_firmware_claim(self, db_session, caplog):
+        """The retracted premise ("drops every load/unload") is not restated: the line names
+        the dispatcher's refusal and that the farm sent nothing, and instructs no action."""
+        printer = await _add_printer(db_session)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _WedgedState("IDLE", 1)})
+
+        with (
+            patch.object(notification_service, "on_ams_wedged_idle", new_callable=AsyncMock),
+            caplog.at_level("WARNING", logger="backend.app.services.farm_stall"),
+        ):
+            await self._mature(db_session, mgr)
+
+        lines = [r.getMessage() for r in caplog.records if "mid filament-change" in r.getMessage()]
+        assert len(lines) == 1
+        assert "the dispatcher refuses this printer while the AMS is mid-change" in lines[0]
+        assert "the farm has not commanded anything here" in lines[0]
+        assert "drops every" not in lines[0]
+        assert "Retry" not in lines[0]
 
     async def test_does_not_page_before_the_dwell(self, db_session):
         printer = await _add_printer(db_session)

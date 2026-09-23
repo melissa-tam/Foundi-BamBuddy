@@ -34,19 +34,27 @@ sequence:
     notification instead (2026-07-20 incident — an entry-time stamp+announce, then a
     same-spool self-heal 90 s later, misled the operator).
 
-    W1 (009-H2S 2026-07-20): after a feed fault the AMS can sit WEDGED mid
-    filament-change (gcode_state PAUSE, ``ams_status_main == 1``) where it silently
-    ignores every unload — recovery's two AND the operator's two were all no-ops for
-    hours. The ONLY verb that freed it was a ``resume`` (the touchscreen CONTINUE for
-    the standing 07008010). So every candidate round now runs
-    :func:`_reset_stuck_change` FIRST: on any other ``ams_status_main`` it is a no-op;
-    on a wedged filament-change it re-issues the firmware CONTINUE and reads the
-    outcome — the firmware may self-heal outright (no swap), re-fault and re-pause on
-    its own, or hang RUNNING in an incomplete change (the live case) which we re-pause
-    before the swap round. A non-``1`` non-idle state is NOT a wedge: 006-H2S
-    2026-07-21 faulted at ``ams_status_main == 3`` (assist) with the feeder still
-    engaged and the unload was accepted immediately — that round skips the reset and
-    runs the swap machine directly.
+    W1 (009-H2S 2026-07-20): after a feed fault the AMS can sit mid filament-change
+    (gcode_state PAUSE, ``ams_status_main == 1``). On 009 a ``resume`` (the touchscreen
+    CONTINUE for the standing 07008010) freed it; the four unloads sent before it went
+    out at ``tray_now == 255`` — nothing was loaded, so nothing physical could move, and
+    their silence is UNDECIDABLE, not proof that the firmware drops an unload in that
+    state. What is measured per posture lives in ``services/ams_command`` (its module
+    docstring): a load into an empty path while the change-error modal stands was dropped
+    (3 witnesses); an unload with nothing loaded answers nothing; a command with filament
+    LOADED behind a mechanical fault was never measured before 2026-09-23. So every
+    candidate round runs :func:`_reset_stuck_change` FIRST — the LEVER LADDER: on any
+    other ``ams_status_main`` it is a no-op; mid-change it pulls the firmware CONTINUEs
+    it has not yet spent this driver and reads each outcome — the firmware may self-heal
+    outright (no swap), re-fault and re-pause on its own, or hang RUNNING in an
+    incomplete change (the live case) which we re-pause. Whatever it reads, the round
+    then SENDS the swap commands and records what the wire answered (a still-wedged AMS
+    is a measurement to take, not a reason to give up). An unload the AMS did not move
+    on gets the ladder's last lever — resume then pause, the July "workable PAUSE" — and
+    one resend. A non-``1`` non-idle state is NOT a wedge: 006-H2S 2026-07-21 faulted at
+    ``ams_status_main == 3`` (assist) with the feeder still engaged and the unload was
+    accepted immediately — that round skips the ladder and runs the swap machine
+    directly.
 
     W2: a printer whose recovery escalates repeatedly within a rolling window is
     quarantined off the durable ``recovery_escalation`` ledger — a recurring AMS jam
@@ -55,13 +63,20 @@ sequence:
 The unload is UNCONDITIONAL after a feed fault, even when ``tray_now`` already
 reads 255. Production incident 009-H2S 2026-07-20: an earlier ``tray_now == 255``
 short-circuit made the machine send ZERO unloads across four candidate loads while
-the AMS sat stuck mid-filament-change (``ams_status_main == 1``); every load was
-doomed and it escalated to a human. The operator then recovered the identical
-state in 90 s with the commands the machine already had — an explicit unload (sent
-at ``tray_now == 255``), a load, a resume. After a feed fault 255 means "nothing is
-feeding", NOT "the path is clear": only an explicit unload resets the stuck change
-state machine. The short-circuit now survives ONLY for the genuinely-clean restart
-case it was written for (see :func:`_unload_skippable`).
+the AMS sat mid filament-change (``ams_status_main == 1``); it escalated to a human.
+The operator then recovered the identical state in 90 s with the commands the machine
+already had — an explicit unload (sent at ``tray_now == 255``), a load, a resume. After
+a feed fault 255 means "nothing is feeding", NOT "the path is clear" (doctrine
+invariant 8), so the unload always goes out before a load. The short-circuit survives
+ONLY for the genuinely-clean restart case it was written for (see
+:func:`_unload_skippable`).
+
+Every AMS load and unload goes through ``services/ams_command`` (the verbs publish;
+``ams_command.classify`` is the ONE reading of what the wire answered). The driver
+keeps its own poll loops — each asks :func:`_takeover` on every poll — and records
+every lever it pulled and every command that went out (:class:`_RecoveryEvidence`),
+so the give-up reason and the operator page are derived from what was sent and what
+the wire said, never from a premise.
 
 SCOPE (WS2b, 2026-08-09). Entry is :func:`on_ams_fault`, and what it acts on comes
 from the WS2a fault TAXONOMY (``hms_errors.classify_hms_entry`` over both wire
@@ -132,9 +147,9 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, assert_never
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -157,19 +172,15 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import incident_resolution, printer_incidents, spool_respool, tray_fields
+from backend.app.services import ams_command, incident_resolution, printer_incidents, spool_respool, tray_fields
 from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, ams_mid_filament_change
 from backend.app.services.hms_errors import (
-    RUNOUT_HMS_CODES,
     AmsFaultClass,
     FaultCandidate,
     candidate_fingerprint,
     current_runout_demand,
-    extruder_side_short_codes,
     fault_tokens,
-    hms_short_code,
     live_candidates,
-    mechanical_feed_short_codes,
     power_loss_prompt_standing,
 )
 from backend.app.services.incident_resolution import (
@@ -195,54 +206,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# --- Trigger code sets ------------------------------------------------------
-# DERIVED from the AMS fault taxonomy (``hms_errors``), never re-listed here: the
-# classification of a firmware code is that module's job, and a second literal copy
-# is exactly how two modules come to disagree about one code (doctrine invariant 1).
-# The two names below are ONE class — MECHANICAL_FEED — split by WHERE the fault
-# sits, so recovery can reason about the common factor on a re-jam (see
-# extruder_side_only below). Nothing else narrows them.
+# --- The live-fault vocabulary --------------------------------------------
+# DERIVED from the AMS fault taxonomy (``hms_errors``), by CLASS, never from a
+# short-code list: the classification of a firmware code is that module's job, and a
+# second literal copy is exactly how two modules come to disagree about one code
+# (doctrine invariant 1). What the machine may be STARTED by is the taxonomy's
+# classification of the live entries (:func:`live_candidates`, both wire lanes); the
+# DRIVER asks the same classification a narrower question — "is the fault this incident
+# is working on still standing" (:func:`_active_recoverable_codes`,
+# :func:`_feed_fault_live`).
 #
-# WIDENED 2026-08-09 (WS2b, operator-ratified partition): the swap machine now
-# triggers on the whole mechanical-feed class. It previously acted on the
-# ``legacy_swap`` subset (the 8010 family + 0300_801E) while the taxonomy already
-# classified the send-out 8005, feed-into-extruder 8006 and feed-to-extruder 8028
-# families the same way — a marker that existed solely to keep WS2a
-# behavior-neutral, and that this wave deliberately spends. The widened members
-# describe the same physical obstruction one step further along the path, and every
-# one of them PAUSEs the print, so the machine can only ever act on a printer that
-# is already stopped.
+# By class and over BOTH lanes, because the short-code sets this block used to hold
+# could not see an attr-lane-only code: ``0700_0012`` (AMS A slot N feeder motor
+# stalled — 012-H2S 2026-09-22, incident 304) has only a code-word row, so a driver
+# reading short codes saw "no fault" while it stood alone, and the self-heal test and
+# the repause-vs-abort choice answered on a fault they could not see.
 #
-# The deliberate EXCLUSIONS that used to be recorded in this block now live with
-# the classification they qualify, in the ``hms_errors`` taxonomy tables: the
-# ``0700_0001`` ban (short-code header), the ``0700_0025`` precursor
-# (INFORMATIONAL, code word 0x00020025), the pull-out/pull-back families
-# (PHYSICAL_FAULT, 8003/8004) and the clog family (PHYSICAL_FAULT,
-# 0300_801A/801C/8016 + 0300_4006). Those are no longer unowned: since WS2b the
-# PHYSICAL_FAULT class escalates loudly with a hold instead of waiting for the
-# generic pause-stall watchdog — it just never enters the swap loop.
-AMS_FEED_FAULT_HMS_CODES: frozenset[str] = mechanical_feed_short_codes() - extruder_side_short_codes()
-
-# Extruder-side (the MAIN extruder motor overloaded, not the AMS assist motor).
-# Production incident 2026-07-17: 004-H2S sat PAUSEd ~2h40m with no reaction
-# because this code was outside the trigger set. A swap still helps (fresh
-# filament often clears the immediate overload), but the extruder — not the
-# spool — is the common factor, so a re-jam after the swap must NOT penalize the
-# healthy replacement (extruder_side_only).
-EXTRUDER_FEED_FAULT_HMS_CODES: frozenset[str] = mechanical_feed_short_codes() & extruder_side_short_codes()
-
-# Public union — kept as the single name the rest of the module (and main.py's
-# import) reads, so RECOVERABLE_HMS_CODES / _primary_code / is_feed_fault are
-# unchanged.
-FEED_FAULT_HMS_CODES: frozenset[str] = AMS_FEED_FAULT_HMS_CODES | EXTRUDER_FEED_FAULT_HMS_CODES
-
-# The DRIVER's live-fault vocabulary — "is the fault this incident is working on
-# still standing on the wire" (:func:`_active_recoverable_codes`, read by the
-# resume-confirm's repause-vs-abort decision and by :func:`_feed_fault_live`).
-# Deliberately NOT the entry vocabulary: what the machine may be STARTED by is the
-# taxonomy's classification of the live entries (:func:`live_candidates`), which
-# also covers physical faults and external runouts the swap driver never touches.
-RECOVERABLE_HMS_CODES: frozenset[str] = FEED_FAULT_HMS_CODES | RUNOUT_HMS_CODES
+# WIDENED 2026-08-09 (WS2b, operator-ratified partition): the swap machine triggers on
+# the whole mechanical-feed class — the send-out 8005, feed-into-extruder 8006 and
+# feed-to-extruder 8028 families beside the 8010 / 801E ones. The deliberate EXCLUSIONS
+# live with the classification they qualify, in the ``hms_errors`` taxonomy tables: the
+# ``0700_0001`` ban (short-code header), the ``0700_0025`` precursor (INFORMATIONAL),
+# the pull-out/pull-back families (PHYSICAL_FAULT, 8003/8004) and the clog family
+# (PHYSICAL_FAULT, 0300_801A/801C/8016 + 0300_4006) — the PHYSICAL_FAULT class escalates
+# with a hold and never enters the swap loop.
+_FEED_FAULT_CLASSES: frozenset[AmsFaultClass] = frozenset({AmsFaultClass.MECHANICAL_FEED})
+# Feed faults plus the AMS-slot runout: the codes a re-PAUSE after a resume may stand
+# on and still be a FAULT (``repause``) rather than somebody pausing the print (``abort``).
+_RECOVERABLE_FAULT_CLASSES: frozenset[AmsFaultClass] = frozenset({AmsFaultClass.MECHANICAL_FEED, AmsFaultClass.RUNOUT})
 
 # class -> incident kind. ONE mapping; the model's KIND_* constants are the
 # vocabulary and this is the only place a fault class becomes one of them.
@@ -305,35 +296,29 @@ _POLL_INTERVAL_S = 1.0  # live-state poll spacing during every confirm wait
 _POST_RESUME_STABLE_S = 60  # RUNNING must hold this long after a resume = success
 _REPAUSE_WATCH_S = 120  # ceiling on how long we wait for RUNNING after a resume
 _MAX_CANDIDATES = 3  # distinct replacement trays tried before escalating
-# Minimum time the AMS must hold idle + empty before an unload counts as complete
-# when NO filament-change cycle was observed at all (command latency, or an unload
-# the firmware treats as a no-op). The operator's proven manual recovery left 16 s
-# between the unload and the load that worked; 15 s is that gap, floored.
-_UNLOAD_GRACE_S = 15.0
 # Absolute floor a replacement spool must clear even past the protected layers —
 # never load a known-empty spool. A ledger ≤ 5 g is empty for replacement purposes.
 _RECOVERY_HARD_MIN_G = 5
-# Stuck-change firmware resets allowed per incident. The resume that unwedges a
-# stuck filament-change is the touchscreen CONTINUE action (the vendored
-# hms_actions.json 093-family action for 07008010 is ["CHECK_ASSISTANT","CONTINUE"])
-# and it worked ONCE on 009-H2S 2026-07-20 after four unloads were silently
-# ignored. Bounded-by-evidence at 1: a reset that did not free the AMS means it is
-# genuinely wedged and needs hands, so a second resume would only loop, not heal.
-_MAX_STUCK_RESETS = 1
-# Second unwedge tier per (printer, job). Tier 1 is ``print.resume`` — the verb that
-# freed 009-H2S. The fork has a SECOND spelling of the same firmware CONTINUE,
-# ``ams_control("resume")`` (what the HMS modal's CONTINUE / RETRY actions publish,
-# per the vendored hms_actions catalog), and the swap machine had never sent it:
-# 002-H2S 2026-09-11 spent tier 1, re-PAUSEd still wedged, and escalated with the
-# other CONTINUE untried. Bounded at 1 for the same evidence reason as _MAX_STUCK_RESETS.
-_MAX_AMS_CONTROL_TIERS = 1
+# How many times ONE driver may pull each lever of the wedge ladder
+# (:data:`_LADDER`). Each lever is a distinct firmware verb whose outcome is recorded
+# (:class:`LeverRecord`), and a second pull of the same verb against the same wedge
+# measures nothing the first did not: tier 1 (``print.resume``, the touchscreen
+# CONTINUE — vendored hms_actions.json 093-family ["CHECK_ASSISTANT","CONTINUE"]) freed
+# 009-H2S 2026-07-20 once; tier 2 (``ams_control("resume")``, the HMS modal's own
+# CONTINUE/RETRY frame) was the verb 002-H2S 2026-09-11 never got; tier 3 (resume, then
+# ``print.pause`` on the first RUNNING sample) is the July "workable PAUSE". A spent
+# lever is a RECORD in the driver's evidence, never a process-lifetime counter: the
+# counters this replaced were keyed by (printer, job), so 003-H2S 2026-09-19 04:31 met a
+# second fault 69 s after a self-heal on the same job and gave up with ZERO CONTINUEs
+# sent ("reset budget spent (1/1)"). A new incident is a new driver with fresh levers.
+_MAX_LEVER_PULLS = 1
 
 # Refill auto-resume timing (code constants, NOT operator knobs — precedent
-# _UNLOAD_GRACE_S). The AMS needs to register the freshly-inserted filament before a
-# resume can land: a resume published on the presence edge itself races the firmware's
-# own tray-state settle and is rejected. 15 s mirrors the operator's proven manual
-# gap (_UNLOAD_GRACE_S) — long enough to settle, short enough that the operator is
-# still standing at the printer.
+# ``ams_command.UNLOAD_GRACE_S``). The AMS needs to register the freshly-inserted
+# filament before a resume can land: a resume published on the presence edge itself
+# races the firmware's own tray-state settle and is rejected. 15 s mirrors the
+# operator's proven manual gap (``ams_command.UNLOAD_GRACE_S``) — long enough to settle,
+# short enough that the operator is still standing at the printer.
 _RUNOUT_RESUME_SETTLE_S = 15.0
 # Bound on how long we wait for RUNNING after the resume before standing aside.
 _RUNOUT_RESUME_CONFIRM_S = 30.0
@@ -397,22 +382,24 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "Printer is in maintenance mode — the fault is recorded and no recovery was attempted. "
         "It stays held until the fault is cleared."
     ),
-    # The two wedged-change reasons state the FIRMWARE FACT and then the action that
-    # ends it, in that order: at ams_status_main=1 the firmware drops every load and
-    # unload, so "try again from the farm" is never the answer and "check the
-    # buffer/feeder" (the pre-2026-09-11 copy) sent the operator to inspect hardware
-    # before pressing the one button that frees it. 002-H2S 2026-09-11.
+    # The three reasons a jam reaches after the farm's own CONTINUEs and swap commands
+    # were SENT. Each states what the wire answered and ends with the PHYSICAL exit
+    # first: the driver has just sent CONTINUE (and, for the swap reasons, the unload /
+    # load), so "press Retry/Continue" alone — the pre-2026-09-23 copy — instructed the
+    # very action the page's own evidence sentence records as ineffective (012-H2S
+    # 2026-09-22, incident 304). What was sent and what the wire said is composed from
+    # the driver's records (:func:`_compose_detail`), never restated here.
     "unload_failed": (
-        "The AMS is wedged mid filament-change (ams_status_main=1): the firmware drops every load and unload in "
-        "this state, so the unloads were dropped, and the farm's CONTINUE (resume, then ams_control resume) did "
-        "not move it. On the printer screen press Retry/Continue on the standing filament error; if it re-fails, "
-        "open the AMS, free the filament at the feeder, then Retry. The farm swaps or resumes from there."
+        "The unload did not complete. Open the AMS and free the filament at the feeder, then press Continue on "
+        "the printer."
     ),
     "stuck_reset_failed": (
-        "The AMS is wedged mid filament-change (ams_status_main=1): the firmware drops every load and unload in "
-        "this state, and the farm's CONTINUE (resume, then ams_control resume) did not move it. On the printer "
-        "screen press Retry/Continue on the standing filament error; if it re-fails, open the AMS, free the "
-        "filament at the feeder, then Retry. The farm swaps or resumes from there."
+        "The farm's CONTINUE could not be sent, or the printer never moved on it. Open the AMS and free the "
+        "filament at the feeder, then press Continue on the printer."
+    ),
+    "swap_dropped_wedged": (
+        "The AMS stayed mid filament-change and did not act on the farm's swap commands. Open the AMS and free "
+        "the filament at the feeder, then press Continue on the printer."
     ),
     "repeated_jams": (
         "Auto-recovered several times this job but the fault keeps returning — likely an "
@@ -456,30 +443,162 @@ class RecoverySettings:
     protect_layers: int
 
 
+# --- the driver's records: what it pulled, what it sent, what the wire said ----
+
+# The wedge LEVER LADDER, in pull order (:func:`_reset_stuck_change`). Three firmware
+# verbs, each pulled at most :data:`_MAX_LEVER_PULLS` times per driver:
+#
+# * ``resume`` — ``print.resume``, the touchscreen CONTINUE (freed 009-H2S 2026-07-20);
+# * ``ams_control_resume`` — ``ams_control("resume")``, the frame the HMS modal's own
+#   CONTINUE / RETRY actions publish (vendored ``hms_actions.json``);
+# * ``resume_then_pause`` — ``print.resume``, then ``print.pause`` on the first RUNNING
+#   sample that is not healthy: the July 2026-07-20 "workable PAUSE", the one measured
+#   route to an ACCEPTED command out of a wedge (a load accepted 3 s after it).
+#
+# ``ams_control("reset")`` is deliberately NOT a lever: the fork has no HMS mapping for
+# it, and its firmware meaning is "end the filament change" — the operation the paused
+# print is waiting on.
+Lever = Literal["resume", "ams_control_resume", "resume_then_pause"]
+_LADDER: tuple[Lever, ...] = ("resume", "ams_control_resume", "resume_then_pause")
+
+# The two places the ladder is entered, and the levers each may pull (unspent ones, in
+# ladder order). The top of a round pulls the two CONTINUEs; an unload the AMS did not
+# move on may pull all three. NEVER after an unload the AMS completed: a resume over an
+# extruder the FARM emptied is the class the 2026-09-17 ruling rejects (prevent, never
+# detect after) — :meth:`_RecoveryEvidence.extruder_emptied_by_farm` withholds every
+# lever while that stands.
+LadderEntry = Literal["round_start", "after_unload_no_movement"]
+_LEVERS_AT: dict[LadderEntry, tuple[Lever, ...]] = {
+    "round_start": ("resume", "ams_control_resume"),
+    "after_unload_no_movement": _LADDER,
+}
+
+# What ONE unwedge read answered (:func:`_await_unwedge`, the one reader):
+# ``ok`` / ``wedged`` — the printer moved and is back at PAUSE, with the AMS out of /
+# still in the filament change (:func:`_unwedged_verdict`); ``paused_clear`` /
+# ``paused_wedged`` — the same two readings after tier 3's RUNNING→PAUSE;
+# ``recovered`` — a stable self-heal; ``never_moved`` — the state machine never moved
+# (outcome d); ``no_pause`` — a re-pause the printer never reached.
+UnwedgeReading = Literal[
+    "ok", "wedged", "recovered", "never_moved", "no_pause", "paused_clear", "paused_wedged", "abort", "handover"
+]
+# A lever's recorded outcome: the reading, or ``not_sent`` (the publish returned False),
+# or ``taken_over`` (a :func:`_takeover` token ended the read). The ``lever=… outcome=…``
+# INFO line carries exactly this token.
+LeverOutcome = Literal[
+    "not_sent", "ok", "wedged", "recovered", "never_moved", "no_pause", "paused_clear", "paused_wedged", "taken_over"
+]
+# :func:`_reset_stuck_change`'s verdict. ``wedged`` — the AMS is still in state 1 after
+# every lever this entry may pull (including "all already spent"); ``fail`` — a lever's
+# publish did not go out, the printer could not be brought back to PAUSE, or no lever
+# this entry pulled moved the state machine at all (outcome d).
+ResetVerdict = Literal["skipped", "ok", "recovered", "wedged", "fail", "abort", "handover"]
+# The unload step (:func:`_unload_and_confirm`): an ``ams_command.Answer`` for a publish
+# that went out, or the step's own ``skipped`` / ``drying`` / ``refused`` (every publish
+# was an ``ams_command.Refusal``), or a takeover.
+UnloadStep = Literal[
+    "complete",
+    "acted",
+    "no_movement",
+    "undecidable",
+    "session_changed",
+    "skipped",
+    "drying",
+    "refused",
+    "abort",
+    "handover",
+]
+# The load step (:func:`_load_and_confirm`). No ``undecidable``: only an unload into a
+# mid-change AMS with nothing loaded can be (``ams_command``'s table).
+LoadStep = Literal["complete", "acted", "no_movement", "session_changed", "drying", "refused", "abort", "handover"]
+# The resume step (:func:`_resume_and_confirm`).
+ResumeStep = Literal["success", "repause", "not_taken", "abort", "handover"]
+# What a step answers when :func:`_takeover` ends it (:func:`_note_takeover`).
+StepTakeover = Literal["abort", "handover"]
+
+
+@dataclass(frozen=True)
+class LeverRecord:
+    """One lever this driver pulled, and what the wire answered it."""
+
+    lever: Lever
+    outcome: LeverOutcome
+    at: float  # :func:`_monotonic` when the outcome was read
+
+
+@dataclass(frozen=True)
+class CommandRecord:
+    """One AMS motion command that WENT OUT (an ``ams_command`` verb returned its entry
+    snapshot), with the posture it was sent into and the wire's answer. ``answer`` is
+    None when the driver stood down (a takeover) before the wire answered."""
+
+    command: ams_command.Command
+    target: int | None
+    posture: ams_command.Posture
+    answer: ams_command.Answer | None
+    at: float  # the entry snapshot's ``taken_at`` — the send
+
+
 @dataclass
 class _RecoveryEvidence:
-    """What the candidate loop actually achieved, so the escalation reason is chosen
-    by evidence instead of by position in the code.
+    """What the driver pulled, what it sent and what the wire answered — the RECORDS the
+    escalation reason and the operator page are derived from, instead of by position in
+    the code.
 
-    The 009-H2S incident reported ``no_eligible_spool`` after four failed loads —
-    a lie that sent the operator looking for spools instead of at the feed path.
+    The 009-H2S incident reported ``no_eligible_spool`` after four failed loads — a lie
+    that sent the operator looking for spools instead of at the feed path. One driver,
+    one evidence: a new incident is a new driver with fresh levers.
     """
 
-    # Unload commands the driver PUBLISHED this incident, confirmed or not (the ``ok``
-    # and ``fail`` verdicts of :func:`_unload_and_confirm`; ``skipped`` and ``drying``
-    # publish nothing). It answers exactly one question — did the FARM empty this
-    # extruder? — which is the give-up's restore precondition.
-    unloads_sent: int = 0
-    # Unload cycles the AMS confirmed complete. Since the swap waits for a replacement
-    # to be in hand (004-H2S 2026-09-17), every one of them PRECEDED a load attempt —
-    # the reorder's one semantic narrowing, and the reason ``feed_path_blocked`` still
-    # means what it says: the AMS unloaded cleanly and the path still would not feed.
-    confirmed_unloads: int = 0
-    loads_attempted: int = 0  # candidates we sent an ams_change_filament for
-    loads_confirmed: int = 0  # loads the printer confirmed on tray_now
+    loads_attempted: int = 0  # candidates we sent a load for (the restore is not one)
+    loads_confirmed: int = 0  # candidate loads the wire answered ``complete``
+    levers: list[LeverRecord] = field(default_factory=list)
+    commands: list[CommandRecord] = field(default_factory=list)
+
+    @property
+    def unloads_sent(self) -> int:
+        """Unload publishes that WENT OUT, answered or not. It answers exactly one
+        question — did the FARM move this extruder? — which is the give-up's restore
+        precondition."""
+        return sum(1 for record in self.commands if record.command == "unload")
+
+    @property
+    def confirmed_unloads(self) -> int:
+        """Unloads the wire answered ``complete``. Since the swap waits for a
+        replacement to be in hand (004-H2S 2026-09-17), every one of them PRECEDED a load
+        attempt — which is why ``feed_path_blocked`` still means what it says: the AMS
+        unloaded cleanly and the path still would not feed."""
+        return sum(1 for record in self.commands if record.command == "unload" and record.answer == "complete")
+
+    def lever_spent(self, lever: Lever) -> bool:
+        """Has this driver already pulled ``lever`` its :data:`_MAX_LEVER_PULLS` times?"""
+        return sum(1 for record in self.levers if record.lever == lever) >= _MAX_LEVER_PULLS
+
+    def extruder_emptied_by_farm(self) -> bool:
+        """Is this driver's last COMPLETED motion an unload — an extruder the FARM emptied
+        and has not refilled? The ladder pulls no resume over it (2026-09-17 ruling)."""
+        for record in reversed(self.commands):
+            if record.answer == "complete":
+                return record.command == "unload"
+        return False
+
+    def swap_dropped_in_wedge(self) -> bool:
+        """Did the last command that went out enter a mid-change AMS and move nothing?"""
+        if not self.commands:
+            return False
+        last = self.commands[-1]
+        return last.posture in ams_command.MID_CHANGE_POSTURES and last.answer == "no_movement"
+
+    def unload_failure_reason(self) -> str:
+        """The honest reason for an unload step that never reached ``complete``."""
+        return "swap_dropped_wedged" if self.swap_dropped_in_wedge() else "unload_failed"
 
     def exhaustion_reason(self) -> str:
         """The honest escalation reason for running out of candidates/rounds."""
+        if self.swap_dropped_in_wedge():
+            # The AMS stayed mid-change and did not act on the swap command — another
+            # candidate would cost a full step timeout for the same answer.
+            return "swap_dropped_wedged"
         if self.loads_attempted == 0:
             return "no_eligible_spool"  # genuinely nothing to try
         if self.loads_confirmed:
@@ -535,6 +654,14 @@ class RecoveryIncident:
     code: str
     printer_name: str
     job_name: str
+    # The :func:`time.monotonic` reading when this driver context was built — the
+    # instant the driver's ownership of the printer began. :func:`_takeover` reads an
+    # operator's AMS command stamped at or after it
+    # (``ams_command.operator_commanded_since``) as the operator taking the printer
+    # over. Taken by the construction itself, so both construction sites (the entry
+    # gate and the startup re-entry, through :func:`_build_incident`) carry it without
+    # restating it.
+    started_at: float = field(default_factory=time.monotonic)
 
     @property
     def is_feed_fault(self) -> bool:
@@ -672,28 +799,6 @@ _wire_sample: dict[int, tuple[str, tuple[int, int] | None, frozenset[str], int, 
 # still standing across a restart deserves one incident and one alert.
 _blocked: dict[tuple[int, str], set[str]] = {}
 
-# Stuck-change reset budget: (printer_id, job_id) -> firmware resets (resumes)
-# already published for that JOB. Bounds the wedged-change reset to
-# _MAX_STUCK_RESETS; a frozen RecoveryIncident cannot carry a mutable counter, so
-# this follows the module's per-(printer, job) dict idiom.
-#
-# The key is the JOB, not the incident — which is deliberate and was load-bearing on
-# 006-H2S 2026-09-04: the duplicate driver found the budget already spent and skipped
-# straight to a second unload on one AMS. A per-incident key would have handed it a
-# fresh reset instead. The duplicate itself is gone (the closer now defers to a live
-# driver), and this bound stays job-scoped: one wedge per print gets one firmware
-# CONTINUE, whatever the incident bookkeeping around it.
-# Process-lifetime like the rest of this block — a post-restart re-fire gets its
-# one bounded reset again, which is safe.
-_stuck_resets: dict[tuple[int, str], int] = {}
-
-# (printer_id, job_id) -> ``ams_control("resume")`` tiers already published for that
-# JOB. Same key, same lifetime and same reasoning as _stuck_resets above. Tier 1's own
-# budget already gates the path that reaches tier 2 (a second wedged round in one job
-# never republishes anything), so this is the bound that keeps holding if that
-# ordering is ever changed — not a second spelling of it.
-_ams_control_tiers: dict[tuple[int, str], int] = {}
-
 # The MOTION evidence a ``repair`` hold ends on lives in
 # ``incident_resolution.ledger`` — the rule that reads it owns it, and this module's
 # per-push sampler stays its ONE writer (:func:`note_demand_watch`).
@@ -747,8 +852,9 @@ _JAM_QUARANTINE_REASONS: frozenset[str] = frozenset(
     {
         "jammed_tray_unresolved",  # a mechanical fault whose feeder no witness could name
         "feed_path_blocked",  # clean unloads every round and still nothing would feed
-        "unload_failed",  # the AMS ignored the unload and the reset did not free it
-        "stuck_reset_failed",  # wedged mid filament-change, unresponsive to the firmware reset
+        "unload_failed",  # the AMS did not complete the unload the farm sent
+        "stuck_reset_failed",  # the farm's CONTINUE could not be sent, or never moved the printer
+        "swap_dropped_wedged",  # mid filament-change, and the AMS did not act on the swap commands
         "repeated_jams",  # recovered repeatedly this job and the fault keeps returning
         "candidates_exhausted",  # every replacement loaded and none held a stable resume
         "candidate_loads_failed",  # eligible spools were found and none of them would load
@@ -779,8 +885,6 @@ _NON_QUARANTINE_REASONS: frozenset[str] = frozenset(
 def _reset_state() -> None:
     """Test hook: clear module-level edge/dedup state between cases."""
     _active_tasks.clear()
-    _stuck_resets.clear()
-    _ams_control_tiers.clear()
     _last_eval.clear()
     _guidance_sent.clear()
     _wire_sample.clear()
@@ -907,9 +1011,9 @@ def _eval_throttled(printer_id: int, job_id: str, fingerprint: str) -> bool:
 
 
 def _log_candidate_outcome(incident: RecoveryIncident, *, gtid: int | None, verdict: str) -> None:
-    """One parseable INFO line after a non-ok unload/load confirm, at each unwedge
-    tier and at candidate-loop end, carrying the live telemetry that explains WHY a
-    step didn't take — candidate global tray, verdict, live tray_now,
+    """One parseable INFO line after an unload/load answer other than ``complete``, at
+    each restore and at candidate-loop end, carrying the live telemetry that explains WHY
+    a step didn't take — candidate global tray, verdict, live tray_now,
     ams_status_main/sub, the pending tray target the firmware is honoring, and the
     recoverable codes STILL standing (without them a wedge line says the AMS did not
     move but never which fault it is holding)."""
@@ -949,16 +1053,6 @@ def _get_state(printer_id: int) -> PrinterState | None:
     return printer_manager.get_status(printer_id)
 
 
-def _primary_code(codes: frozenset[str]) -> str:
-    """The representative short code for feed_fault_code / notifications — a
-    feed-fault code when present, else the lowest recoverable code."""
-    feed = sorted(codes & FEED_FAULT_HMS_CODES)
-    if feed:
-        return feed[0]
-    ordered = sorted(codes)
-    return ordered[0] if ordered else ""
-
-
 def _dominant_class(candidates) -> AmsFaultClass | None:
     """Which class decides the incident when several are live (:data:`_CLASS_PRECEDENCE`)."""
     live = {c.fault_class for c in candidates}
@@ -975,15 +1069,12 @@ def _primary_candidate(candidates, fault_class: AmsFaultClass) -> FaultCandidate
     return members[0] if members else None
 
 
-def _active_recoverable_codes(state) -> set[str]:
-    """Recoverable HMS short codes currently live on the printer state."""
-    out: set[str] = set()
-    for e in getattr(state, "hms_errors", None) or []:
-        try:
-            out.add(hms_short_code(e.attr, e.code))
-        except Exception:  # noqa: BLE001 — a malformed HMS entry must not crash recovery
-            continue
-    return out & RECOVERABLE_HMS_CODES
+def _active_recoverable_codes(state) -> frozenset[str]:
+    """The short codes of the recoverable faults live on the printer state — every
+    candidate the taxonomy classifies :data:`_RECOVERABLE_FAULT_CLASSES`, over both wire
+    lanes (so the attr-lane-only ``0700_0012`` counts). Never raises:
+    :func:`live_candidates` skips a malformed entry."""
+    return frozenset(c.short_code for c in live_candidates(state) if c.fault_class in _RECOVERABLE_FAULT_CLASSES)
 
 
 def _spool_label(spool: Spool) -> str:
@@ -1433,8 +1524,10 @@ FeederKind = Literal["jammed", "empty", "other", "external", "unknown"]
 # :func:`_escalate` straight from the entry gate with nothing unloaded, and after a feed
 # fault ``tray_now`` frequently already reads 255 — so a wire-inferred "was unloaded"
 # would attribute an act to the farm that never happened, and a bare boolean would claim
-# a failed reload on the give-ups where none is attempted.
-RestoreVerdict = Literal["ok", "fail", "skipped_wedged", "skipped_drying"]
+# a failed reload on the give-ups where none is attempted. ``dropped`` = the reload went
+# out and the AMS did not move (``ams_command``'s ``no_movement``); ``fail`` = every
+# other reload that never reached ``complete``.
+RestoreVerdict = Literal["ok", "fail", "dropped", "skipped_drying"]
 
 
 @dataclass(frozen=True)
@@ -1524,10 +1617,10 @@ def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None) -> 
                 f"No filament is loaded: {slot} was unloaded and the reload failed. "
                 "Check the filament path, load a spool, then resume on the printer."
             )
-        if restore == "skipped_wedged":
+        if restore == "dropped":
             return (
-                f"No filament is loaded: {slot} was unloaded; the AMS is mid filament-change, "
-                "so no reload was attempted."
+                f"No filament is loaded: {slot} was unloaded; the reload was sent and the AMS did not move. "
+                "Free the filament at the feeder, load a spool, then resume on the printer."
             )
         if restore == "skipped_drying":
             return (
@@ -1571,18 +1664,83 @@ def _retract_clause(incident: RecoveryIncident) -> str:
     return "Then resume on the printer."
 
 
-def _compose_detail(incident: RecoveryIncident, reason: str, restore: RestoreVerdict | None) -> str:
-    """THE human detail of an escalation: static reason copy plus at most one clause.
+# The operator-page wording of each record token (:func:`_evidence_sentence`). Explicit
+# tables, every key spelled: a new lever, outcome or answer without its wording raises
+# at the lookup rather than rendering a raw token on a page.
+_LEVER_TEXT: dict[Lever, str] = {
+    "resume": "resume",
+    "ams_control_resume": "ams_control resume",
+    "resume_then_pause": "resume-then-pause",
+}
+_LEVER_OUTCOME_TEXT: dict[LeverOutcome, str] = {
+    "not_sent": "not sent",
+    "ok": "re-paused, AMS left the change",
+    "wedged": "re-paused, still mid-change",
+    "recovered": "self-healed",
+    "never_moved": "printer did not move",
+    "no_pause": "did not re-pause",
+    "paused_clear": "paused, AMS left the change",
+    "paused_wedged": "paused, still mid-change",
+    "taken_over": "taken over",
+}
+_ANSWER_TEXT: dict[ams_command.Answer, str] = {
+    "complete": "completed",
+    "acted": "AMS moved, did not complete",
+    "no_movement": "AMS did not move",
+    "undecidable": "nothing was loaded",
+    "session_changed": "printer reconnected",
+}
+
+
+def _command_label(record: CommandRecord) -> str:
+    """``unload``, or ``load <slot>`` through the one slot-name origin."""
+    if record.command == "unload":
+        return "unload"
+    return f"load {runout_slot_desc(record.target) or f'tray {record.target}'}"
+
+
+def _evidence_sentence(evidence: _RecoveryEvidence) -> str | None:
+    """ONE sentence of what the driver sent and what the wire answered, from its RECORDS
+    alone — the levers in pull order, then every command that went out, consecutive
+    identical (command, target, answer) runs collapsed: ``Sent: resume (re-paused, still
+    mid-change); unload ×2 (AMS did not move).`` None when nothing was sent."""
+    parts = [f"{_LEVER_TEXT[r.lever]} ({_LEVER_OUTCOME_TEXT[r.outcome]})" for r in evidence.levers]
+    runs: list[tuple[str, str, int]] = []
+    for record in evidence.commands:
+        label = _command_label(record)
+        answer = _ANSWER_TEXT[record.answer] if record.answer is not None else "no answer"
+        if runs and runs[-1][0] == label and runs[-1][1] == answer:
+            runs[-1] = (label, answer, runs[-1][2] + 1)
+        else:
+            runs.append((label, answer, 1))
+    parts.extend(f"{label}{f' ×{count}' if count > 1 else ''} ({answer})" for label, answer, count in runs)
+    if not parts:
+        return None
+    return "Sent: " + "; ".join(parts) + "."
+
+
+def _compose_detail(
+    incident: RecoveryIncident,
+    reason: str,
+    *,
+    restore: RestoreVerdict | None,
+    evidence: _RecoveryEvidence | None,
+) -> str:
+    """THE human detail of an escalation: static reason copy plus the kind's clauses.
 
     The reason copy says WHY the farm gave up — one string per reason token, shared by
-    every kind that can reach it. The clause says what the operator is walking up to,
-    and that IS kind-specific, so it is keyed on the incident's kind rather than woven
-    into the reason table (which would multiply out to reason × kind copies).
+    every kind that can reach it. The clauses say what the farm DID and what the
+    operator is walking up to, and those ARE kind-specific, so they are keyed on the
+    incident's kind rather than woven into the reason table (which would multiply out to
+    reason × kind copies).
 
-    Exactly two kinds carry one:
+    Exactly two kinds carry any:
 
-    * JAM → :func:`_feeder_clause` — where the filament sits, read off the live wire
-      plus the driver's own restore verdict (incident 192's missing half).
+    * JAM → :func:`_evidence_sentence` (what the driver sent and what the wire
+      answered — ``evidence`` is a PARAMETER, the driver's own records, never re-read
+      from the wire here; ``None`` for the entry and startup escalations, which sent
+      nothing), then :func:`_feeder_clause` — where the filament sits, read off the live
+      wire plus the driver's own restore verdict (incident 192's missing half).
     * PHYSICAL, and only under the ``physical_fault`` reason → :func:`_retract_clause`
       — what the screen's Retry will do (incident 289's missing half).
 
@@ -1598,15 +1756,17 @@ def _compose_detail(incident: RecoveryIncident, reason: str, restore: RestoreVer
     resume on the printer. Then resume on the printer." One instruction, once.
     """
     detail = _ESCALATE_DETAIL.get(reason, reason)
-    clause: str | None = None
+    clauses: list[str] = []
     if incident.is_feed_fault:
-        clause = _feeder_clause(
+        sent = _evidence_sentence(evidence) if evidence is not None else None
+        feeder = _feeder_clause(
             _feeder_position(_get_state(incident.printer_id), incident.jammed_global_tray, incident.printer_id),
             restore,
         )
+        clauses = [clause for clause in (sent, feeder) if clause is not None]
     elif incident.kind == KIND_PHYSICAL and reason == "physical_fault":
-        clause = _retract_clause(incident)
-    return f"{detail} {clause}" if clause is not None else detail
+        clauses = [_retract_clause(incident)]
+    return " ".join([detail, *clauses])
 
 
 async def _route_fault(
@@ -1984,65 +2144,66 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             await _escalate(incident, "external_spool_runout" if incident.external else "runout_needs_refill")
             return
 
-        # (3) Try up to _MAX_CANDIDATES replacement trays. Every round runs a
-        #     stuck-change reset first (W1) and then its own unload cycle — the
-        #     009-H2S fix: after a feed fault the AMS can sit wedged mid-change,
-        #     silently ignoring unloads; only a firmware CONTINUE (resume) frees it,
-        #     and a round that follows a failed load must reset the AMS before
-        #     loading again.
+        # (3) Try up to _MAX_CANDIDATES replacement trays. Every round runs the wedge
+        #     LEVER LADDER first (W1, :func:`_reset_stuck_change`) and then SENDS its own
+        #     unload → load → resume, reading each answer through ``ams_command``. After a
+        #     feed fault the AMS can sit mid filament-change, and whether it acts on a
+        #     command there is MEASURED per posture, never assumed: the 2026-09-11
+        #     premise "the firmware drops every load and unload" refused the swap on
+        #     three printers (003/006/012-H2S, 09-19..22) that then waited hours for a
+        #     human. Every step verdict is a closed Literal dispatched by ``match`` with
+        #     ``assert_never``, so a verdict nobody handled cannot fall through into the
+        #     next step (a bare ``str`` once fell past ``if load == "fail"`` into a resume).
         tried: set[int] = set()
         evidence = _RecoveryEvidence()
-        # The commit boundary (a reset that leaves recovery committed to a swap or
-        # wedged) is crossed exactly ONCE per incident, never at entry — so a no-swap
-        # self-heal leaves the spool untouched. What the crossing DOES about the spool
-        # is `_commit_out_of_rotation`'s alone: on an extruder-side fault it parks
+        # The commit boundary (a replacement in hand, or a CONTINUE that could not even
+        # move the printer) is crossed exactly ONCE per incident, never at entry — so a
+        # no-swap self-heal leaves the spool untouched. What the crossing DOES about the
+        # spool is `_commit_out_of_rotation`'s alone: on an extruder-side fault it parks
         # nothing, which is why this flag records the BOUNDARY rather than a stamp.
         oor_committed = False
         for _round in range(_MAX_CANDIDATES):
             if await _takeover_exit(incident, awaiting="PAUSE", step="round_start"):
                 return
-            # W1: reset an AMS wedged mid filament-change before touching the unload.
-            reset = await _reset_stuck_change(incident, client)
-            if reset == "abort":
-                await _abort(incident)
-                return
-            if reset == "handover":
-                _hand_over(incident)
-                return
-            if reset == "fail":
-                # The feeder is genuinely wedged — hands are needed and the jammed
-                # spool is legitimately out of rotation. Cross the commit boundary
-                # (once) here, THEN give up.
-                if not oor_committed and incident.jammed_global_tray is not None:
-                    await _commit_out_of_rotation(incident, incident.jammed_global_tray, role="jammed")
-                    oor_committed = True
-                await _give_up(incident, client, "stuck_reset_failed", evidence=evidence)
-                return
-            if reset == "recovered":
-                # Same-feeder self-heal: the firmware reset cleared the jam with no
-                # swap. The swap-commit boundary was never reached, so THIS incident
-                # stamped nothing; the _clear_oor call below is now a safety net for a
-                # flag a PREVIOUS incident on this feeder may have left. Count the
-                # self-heal toward the per-job flap cap and close as a no-swap success
-                # (which fires the truthful self-heal notification) — never resume/swap
-                # on top of a running print.
-                from backend.app.core.database import async_session
-
-                async with async_session() as db:
-                    await _clear_oor_if_resumed_on_jammed_feeder(db, incident)
-                await _succeed(incident, incident.jammed_global_tray, swapped=False)
-                return
-            # reset in ("skipped", "ok") → LOOK BEFORE YOU LEAP. Selection runs here,
-            # ahead of the stamp and the unload, because everything below it COMMITS
-            # the swap: 004-H2S 2026-09-17 (incident 192) stamped a spool out of
-            # rotation and unloaded it, and only then asked what to load — the honest
-            # answer was "nothing", and the printer was handed to a human with an empty
-            # extruder that no copy described. Selection touches no feeder (it reads
-            # tray telemetry and may force a bare-tray config write), so running it
-            # first costs the swap nothing and buys round 1 the right to abandon
-            # cleanly: with no candidate to load there is no unload, and invariants 7
-            # (the stamp is the swap-commit boundary) and 8 (an unload is unconditional
-            # BEFORE A LOAD) both hold literally.
+            # W1: the ladder's first entry, before touching the unload.
+            reset = await _reset_stuck_change(incident, client, evidence=evidence, entry="round_start")
+            match reset:
+                case "abort":
+                    await _abort(incident)
+                    return
+                case "handover":
+                    _hand_over(incident)
+                    return
+                case "fail":
+                    # The farm's CONTINUE could not be sent, the printer never moved on
+                    # it, or it could not be brought back to PAUSE — hands are needed and
+                    # the jammed spool is legitimately out of rotation. Cross the commit
+                    # boundary (once) here, THEN give up.
+                    if not oor_committed and incident.jammed_global_tray is not None:
+                        await _commit_out_of_rotation(incident, incident.jammed_global_tray, role="jammed")
+                        oor_committed = True
+                    await _give_up(incident, client, "stuck_reset_failed", evidence=evidence)
+                    return
+                case "recovered":
+                    await _close_self_healed(incident)
+                    return
+                case "skipped" | "ok" | "wedged":
+                    # ``wedged`` proceeds exactly like ``ok``: a still-wedged AMS is a
+                    # measurement to TAKE (the swap commands go out and their answers are
+                    # recorded), not a reason to give up unsent.
+                    pass
+                case _:
+                    assert_never(reset)
+            # LOOK BEFORE YOU LEAP. Selection runs here, ahead of the stamp and the
+            # unload, because everything below it COMMITS the swap: 004-H2S 2026-09-17
+            # (incident 192) stamped a spool out of rotation and unloaded it, and only
+            # then asked what to load — the honest answer was "nothing", and the printer
+            # was handed to a human with an empty extruder that no copy described.
+            # Selection touches no feeder (it reads tray telemetry and may force a
+            # bare-tray config write), so running it first costs the swap nothing and
+            # buys round 1 the right to abandon cleanly: with no candidate to load there
+            # is no unload, and invariants 7 (the stamp is the swap-commit boundary) and 8
+            # (an unload is unconditional BEFORE A LOAD) both hold literally (shape 39).
             target, only_low = await _select_replacement(incident, tried)
             if target is None:
                 # A takeover during the (possibly bounded) selection / forced
@@ -2074,69 +2235,117 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
             # A replacement is in hand → the swap COMMITS, ONCE, right before the first
             # unload. Boundary semantics: a stamp written here means "recovery is
             # abandoning this spool", so every give-up that can follow this point
-            # (ams_drying, unload_failed, load exhaustion) correctly KEEPS it; only a
-            # clean swap-and-resume or an external-takeover abort resolves it (the
-            # latter's _clear reverses it when the operator resumed on the jammed feeder
-            # — never on a feeder the driver restored). Whether a stamp is written at
-            # all is `_commit_out_of_rotation`'s call: an extruder-side fault commits
-            # the SWAP and parks nothing (006-H2S 2026-09-21, incident 289).
+            # (ams_drying, unload_failed, swap_dropped_wedged, load exhaustion) correctly
+            # KEEPS it; only a clean swap-and-resume, a self-heal on the jammed feeder or
+            # an external-takeover abort resolves it (the latter's _clear reverses it
+            # when the operator resumed on the jammed feeder — never on a feeder the
+            # driver restored). Whether a stamp is written at all is
+            # `_commit_out_of_rotation`'s call: an extruder-side fault commits the SWAP
+            # and parks nothing (006-H2S 2026-09-21, incident 289).
             if not oor_committed and incident.jammed_global_tray is not None:
                 await _commit_out_of_rotation(incident, incident.jammed_global_tray, role="jammed")
                 oor_committed = True
-            unload = await _unload_and_confirm(incident, client)
-            if unload in ("ok", "fail"):
-                # The command went out — confirmed or not, the FARM moved this feeder,
-                # which is what the give-up's restore is allowed to undo.
-                evidence.unloads_sent += 1
-            if unload not in ("ok", "skipped"):
+            unload = await _unload_and_confirm(
+                incident, client, evidence=evidence, attempts=incident.settings.max_attempts
+            )
+            if unload == "no_movement":
+                # The ladder's second entry: nothing has moved yet, so the last lever —
+                # resume then pause, the July "workable PAUSE" — may be pulled, then the
+                # unload is resent ONCE and that answer is the measurement.
+                _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict="unload_no_movement")
+                reset = await _reset_stuck_change(incident, client, evidence=evidence, entry="after_unload_no_movement")
+                match reset:
+                    case "abort":
+                        await _abort(incident)
+                        return
+                    case "handover":
+                        _hand_over(incident)
+                        return
+                    case "fail":
+                        await _give_up(incident, client, "stuck_reset_failed", evidence=evidence)
+                        return
+                    case "recovered":
+                        await _close_self_healed(incident)
+                        return
+                    case "skipped" | "ok" | "wedged":
+                        pass
+                    case _:
+                        assert_never(reset)
+                unload = await _unload_and_confirm(incident, client, evidence=evidence, attempts=1)
+            if unload not in ("complete", "skipped"):
                 _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
-            if unload == "abort":
-                await _abort(incident)
-                return
-            if unload == "handover":
-                _hand_over(incident)
-                return
-            if unload == "drying":
-                await _give_up(incident, client, "ams_drying", evidence=evidence)
-                return
-            if unload == "fail":
-                await _give_up(incident, client, "unload_failed", evidence=evidence)
-                return
-            if unload == "ok":
-                evidence.confirmed_unloads += 1
+            match unload:
+                case "complete" | "undecidable" | "skipped":
+                    # ``undecidable``: the unload WAS sent (invariant 8 holds) into a
+                    # mid-change AMS with nothing loaded — nothing physical could answer
+                    # it, so the load is the next measurement.
+                    pass
+                case "acted" | "refused" | "no_movement":
+                    await _give_up(incident, client, evidence.unload_failure_reason(), evidence=evidence)
+                    return
+                case "drying":
+                    await _give_up(incident, client, "ams_drying", evidence=evidence)
+                    return
+                case "session_changed":
+                    await _abort_session_changed(incident, step="unload")
+                    return
+                case "abort":
+                    await _abort(incident)
+                    return
+                case "handover":
+                    _hand_over(incident)
+                    return
+                case _:
+                    assert_never(unload)
 
             evidence.loads_attempted += 1
-            load = await _load_and_confirm(incident, client, target)
-            if load != "ok":
+            load = await _load_and_confirm(incident, client, target, evidence=evidence)
+            if load != "complete":
                 _log_candidate_outcome(incident, gtid=target, verdict=f"load_{load}")
-            if load == "abort":
-                await _abort(incident)
-                return
-            if load == "handover":
-                _hand_over(incident)
-                return
-            if load == "drying":
-                await _give_up(incident, client, "ams_drying", evidence=evidence)
-                return
-            if load == "fail":
-                continue  # load never confirmed — try the next candidate
-            evidence.loads_confirmed += 1
+            match load:
+                case "complete":
+                    evidence.loads_confirmed += 1
+                case "no_movement" if evidence.swap_dropped_in_wedge():
+                    # The AMS is mid filament-change and did not act on the load: another
+                    # candidate would cost a full step timeout for the same answer.
+                    await _give_up(incident, client, evidence.exhaustion_reason(), evidence=evidence)
+                    return
+                case "acted" | "refused" | "no_movement":
+                    continue  # the load never completed — try the next candidate
+                case "drying":
+                    await _give_up(incident, client, "ams_drying", evidence=evidence)
+                    return
+                case "session_changed":
+                    await _abort_session_changed(incident, step="load")
+                    return
+                case "abort":
+                    await _abort(incident)
+                    return
+                case "handover":
+                    _hand_over(incident)
+                    return
+                case _:
+                    assert_never(load)
 
             resume = await _resume_and_confirm(incident, client, target)
-            if resume == "abort":
-                await _abort(incident)
-                return
-            if resume == "handover":
-                _hand_over(incident)
-                return
-            if resume == "success":
-                await _succeed(incident, target)
-                return
-
-            # resume in ("repause", "not_taken"): one extra pause/resume cycle (mirrors
-            # the live 16:21:24 → 16:22:57 recovery where the first resume didn't
-            # stick). The two verdicts differ only in what the SECOND cycle's answer is
-            # allowed to conclude about the spool, below.
+            match resume:
+                case "abort":
+                    await _abort(incident)
+                    return
+                case "handover":
+                    _hand_over(incident)
+                    return
+                case "success":
+                    await _succeed(incident, target)
+                    return
+                case "repause" | "not_taken":
+                    # One extra pause/resume cycle (mirrors the live 16:21:24 → 16:22:57
+                    # recovery where the first resume didn't stick). The two verdicts
+                    # differ only in what the SECOND cycle's answer is allowed to conclude
+                    # about the spool, below.
+                    pass
+                case _:
+                    assert_never(resume)
             if client.pause_print():
                 await printer_manager.await_state(
                     pid, {"PAUSE"}, incident.settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
@@ -2149,27 +2358,32 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                     pid,
                 )
             resume2 = await _resume_and_confirm(incident, client, target)
-            if resume2 == "abort":
-                await _abort(incident)
-                return
-            if resume2 == "handover":
-                _hand_over(incident)
-                return
-            if resume2 == "success":
-                await _succeed(incident, target)
-                return
-            if resume2 == "not_taken":
-                # The print never ran, so nothing faulted and there is NOTHING to
-                # conclude about this spool. 002-H2S 2026-09-11: this branch used to be
-                # spelled the same as a re-jam and stamped the operator's healthy
-                # slot-1 roll out of rotation against a printer they had just stopped.
-                logger.info(
-                    "spool_recovery: printer %s resume never took on tray %s — no fault evidence, replacement "
-                    "kept in rotation; trying the next candidate",
-                    pid,
-                    target,
-                )
-                continue
+            match resume2:
+                case "abort":
+                    await _abort(incident)
+                    return
+                case "handover":
+                    _hand_over(incident)
+                    return
+                case "success":
+                    await _succeed(incident, target)
+                    return
+                case "not_taken":
+                    # The print never ran, so nothing faulted and there is NOTHING to
+                    # conclude about this spool. 002-H2S 2026-09-11: this branch used to
+                    # be spelled the same as a re-jam and stamped the operator's healthy
+                    # slot-1 roll out of rotation against a printer they had just stopped.
+                    logger.info(
+                        "spool_recovery: printer %s resume never took on tray %s — no fault evidence, replacement "
+                        "kept in rotation; trying the next candidate",
+                        pid,
+                        target,
+                    )
+                    continue
+                case "repause":
+                    pass
+                case _:
+                    assert_never(resume2)
 
             # resume2 == "repause": the print RAN and a recoverable fault stopped it
             # again — the ONE path on which a replacement may be parked at all. Ask the
@@ -2218,14 +2432,21 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
 
 # --- step helpers -----------------------------------------------------------
 
-# The only two live states that can be THIS driver's own doing. The W1 reset moves
+# The only two live states that can be THIS driver's own doing. A ladder lever moves
 # PAUSE→RUNNING and the self-pause moves RUNNING→PAUSE, so every verb the machine
 # publishes lands inside this pair — which is what lets everything OUTSIDE it be read
 # as somebody else's action without a single per-step exception.
 _DRIVER_STATES: tuple[str, ...] = ("PAUSE", "RUNNING")
 
 
-def _takeover(incident: RecoveryIncident, st, *, awaiting: str | None, target: int | None = None) -> str | None:
+TakeoverToken = Literal[
+    "state_lost", "reclassified", "job_changed", "job_ended", "hijacked_load", "operator_command", "resumed"
+]
+
+
+def _takeover(
+    incident: RecoveryIncident, st, *, awaiting: str | None, target: int | None = None
+) -> TakeoverToken | None:
     """Has this driver lost the job it was bound to? The token that says so, else None.
 
     ONE predicate for every poll loop in the machine (precedent :func:`_hold_over` —
@@ -2262,6 +2483,13 @@ def _takeover(incident: RecoveryIncident, st, *, awaiting: str | None, target: i
         It cannot fire on the driver's own verbs (see :data:`_DRIVER_STATES`).
     ``hijacked_load``
         The firmware is honouring a load for a tray that is not the one we commanded.
+    ``operator_command``
+        An operator's AMS load/unload went out on this printer since this driver began
+        (``ams_command.operator_commanded_since`` against
+        :attr:`RecoveryIncident.started_at`, session-epoch scoped). The operator owns the
+        printer now: the Load / Unload buttons no longer refuse a mid-change AMS, so a
+        click can land inside a confirm window, and a driver's verdict must never be read
+        off an operator's move.
     ``resumed``
         A step waiting for PAUSE found the printer RUNNING: someone resumed the print
         while we were mid-procedure.
@@ -2282,12 +2510,14 @@ def _takeover(incident: RecoveryIncident, st, *, awaiting: str | None, target: i
     ptt = getattr(st, "pending_tray_target", None)
     if target is not None and ptt is not None and ptt != target:
         return "hijacked_load"
+    if ams_command.operator_commanded_since(incident.printer_id, incident.started_at):
+        return "operator_command"
     if awaiting == "PAUSE" and live == "RUNNING":
         return "resumed"
     return None
 
 
-def _note_takeover(incident: RecoveryIncident, token: str, step: str) -> str:
+def _note_takeover(incident: RecoveryIncident, token: TakeoverToken, step: str) -> StepTakeover:
     """Log a takeover ONCE, where it was noticed, and map it onto the step's verdict.
 
     Every step answers a takeover the same way — ``abort``, except the one token that
@@ -2339,8 +2569,9 @@ def _hand_over(incident: RecoveryIncident) -> None:
 
 
 def _feed_fault_live(state) -> bool:
-    """True while a FEED-FAULT HMS code is standing on the live printer state."""
-    return bool(_active_recoverable_codes(state) & FEED_FAULT_HMS_CODES)
+    """True while a FEED fault (:data:`_FEED_FAULT_CLASSES`, either wire lane) stands on
+    the live printer state."""
+    return any(c.fault_class in _FEED_FAULT_CLASSES for c in live_candidates(state))
 
 
 def _change_completed(state) -> bool:
@@ -2350,59 +2581,99 @@ def _change_completed(state) -> bool:
     return tray is not None and 0 <= tray <= 253
 
 
-async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
-    """Free an AMS wedged mid filament-change, then read the outcome. Runs at the TOP
-    of every candidate round, BEFORE the unload.
+def _change_healthy(state) -> bool:
+    """The self-heal reading of a RUNNING printer: no feed fault standing, and the change
+    completed onto a real tray or the AMS back at idle. ONE spelling, read by every arm
+    of :func:`_await_unwedge` (the in-loop stable hold, the deadline, and tier 3's
+    first-RUNNING-sample test)."""
+    return not _feed_fault_live(state) and (
+        _change_completed(state) or getattr(state, "ams_status_main", None) == AMS_STATUS_IDLE
+    )
 
-    TWO TIERS of the same firmware verb, because the fork has two spellings of it and
-    only one had ever been sent. Tier 1 is ``print.resume`` — the touchscreen CONTINUE
-    that freed 009-H2S 2026-07-20 after four unloads were silently ignored. Tier 2 is
-    ``ams_control("resume")``, the frame the HMS modal's own CONTINUE / RETRY actions
-    publish (vendored ``hms_actions.json``), and it is what 002-H2S 2026-09-11 never
-    got: tier 1 moved the printer, the AMS stayed in the change, and the machine
-    escalated with the other CONTINUE untried.
 
-    Returns one of:
+async def _close_self_healed(incident: RecoveryIncident) -> None:
+    """Same-feeder self-heal: a firmware CONTINUE cleared the jam with no swap.
 
-    ``skipped`` — not applicable this round: the AMS is not wedged (a normal round).
-        The caller falls through to the unload UNCHANGED — zero behaviour change on a
-        healthy AMS.
-    ``ok`` — the state machine moved, the AMS is OUT of the filament change, and the
-        printer is back at PAUSE: proceed to the swap round.
-    ``recovered`` — the firmware fully self-healed: fault gone, RUNNING stable, and the
-        pending change completed (a real tray feeds) or the AMS returned to idle. No
-        swap needed — the caller clears the jammed spool's out-of-rotation flag and
-        closes the incident as a success.
-    ``fail`` — the AMS is still wedged (both tiers), the resume send failed, or the
-        budget was already spent on this job: the caller escalates ``stuck_reset_failed``.
-    ``abort`` / ``handover`` — :func:`_takeover` (an external actor, a job that ended,
-        or a re-classified row).
+    The ladder can read it at either entry. At the top of a round the swap-commit
+    boundary was never reached, so THIS incident stamped nothing and the clear below is
+    a safety net for a flag a PREVIOUS incident on this feeder may have left; after an
+    unload the AMS did not move on, the boundary WAS crossed and the clear is what
+    returns the jammed spool the print is running on. Counted toward the per-job flap
+    cap and closed as a no-swap success (the truthful self-heal notification) — never a
+    resume or a swap on top of a running print.
+    """
+    from backend.app.core.database import async_session
 
-    The resume this publishes is the driver's OWN, and the printer answers it on the
-    wire like any other: the per-push sampler sees a PAUSE→RUNNING transition and
-    would hand it to :func:`on_observed_running`. It must not close this incident —
-    RUNNING here is an intermediate reading of the procedure above (outcome (a)
-    re-faults and auto-PAUSEs from exactly that state, and (c) hangs RUNNING in an
-    incomplete change), so the closer defers while this driver is live and the
-    handover re-reads the level afterwards. 006-H2S 2026-09-04 is what happens
-    otherwise: the row closed at the resume, the re-PAUSE found no open incident, and
-    a second driver ran the swap round on the same AMS.
+    async with async_session() as db:
+        await _clear_oor_if_resumed_on_jammed_feeder(db, incident)
+    await _succeed(incident, incident.jammed_global_tray, swapped=False)
 
-    Entry gate (else ``skipped``): the wedge must be LIVE — gcode_state PAUSE AND
-    ``ams_status_main == 1`` (filament_change). Non-idle alone is NOT a wedge: only
-    main=1 is resume-resettable. Counter-evidence (006-H2S 2026-07-21): an extruder
-    ``0300_801E`` fault with ``ams_status_main == 3`` (assist) and the feeder still
-    engaged is NOT a stuck change — the unload is accepted immediately, so that round
-    skips this reset and runs the unload→swap machine directly.
 
-    The budget test comes AFTER the wedge test, and that ordering is the 002 fix: a
-    round that finds the AMS wedged with the budget already spent is not a "skip", it
-    is a round whose every unload the firmware will drop, so it FAILS into the
-    escalation instead of feeding the swap machine commands that cannot land.
+async def _abort_session_changed(incident: RecoveryIncident, *, step: str) -> None:
+    """A command's MQTT session ended under it (``ams_command``'s ``session_changed``).
+
+    The ``state_lost`` token: nothing read on the new session answers the command that
+    went out on the old one, so the driver stands down exactly as it does for a lost
+    state — logged once where it was noticed, then the ordinary abort."""
+    _note_takeover(incident, "state_lost", step)
+    await _abort(incident, token="state_lost")
+
+
+async def _reset_stuck_change(
+    incident: RecoveryIncident,
+    client,
+    *,
+    evidence: _RecoveryEvidence,
+    entry: LadderEntry,
+) -> ResetVerdict:
+    """The wedge LEVER LADDER: pull the unspent levers this ``entry`` permits, in order,
+    and read each outcome through the ONE reader (:func:`_await_unwedge`).
+
+    Entries (:data:`_LEVERS_AT`) — exactly two:
+
+    * ``round_start`` — the top of every candidate round, BEFORE the unload: pulls
+      ``resume`` then, still wedged, ``ams_control_resume``;
+    * ``after_unload_no_movement`` — an unload the AMS did not move on (nothing has
+      moved yet): pulls any earlier unspent lever first, then ``resume_then_pause``.
+
+    Every lever is pulled at most :data:`_MAX_LEVER_PULLS` times per DRIVER, and "spent"
+    is a :class:`LeverRecord` in ``evidence`` — never a process-lifetime counter keyed by
+    the job (003-H2S 2026-09-19 04:31 met a second fault 69 s after a self-heal and gave
+    up with zero CONTINUEs sent).
+
+    No lever is pulled while the driver's last COMPLETED motion was an unload
+    (:meth:`_RecoveryEvidence.extruder_emptied_by_farm`): a resume over an extruder the
+    farm emptied is the class the 2026-09-17 ruling rejects — prevented here, never
+    detected after.
+
+    Returns:
+
+    ``skipped`` — the AMS is not mid filament-change (``ams_status_main != 1``): nothing
+        to reset. A non-``1`` non-idle state is NOT a wedge — 006-H2S 2026-07-21 faulted
+        at 3 (assist) with the feeder engaged and the unload was accepted at once.
+    ``ok`` — a lever moved the printer and it is back at PAUSE with the AMS out of the
+        change; or tier 3 took the printer RUNNING and back to PAUSE, REGARDLESS of the
+        wedge predicate — its measurement is the resend that follows, and the predicate's
+        reading is recorded in the lever outcome (``paused_wedged`` / ``paused_clear``).
+    ``recovered`` — the firmware fully self-healed: RUNNING stable, fault clear, the
+        change completed or the AMS idle. No swap needed.
+    ``wedged`` — the AMS is still in state 1 after every lever this entry may pull
+        (including "all already spent", and "withheld over an emptied extruder"). The
+        caller proceeds exactly as for ``ok``: the swap commands go out and their
+        answers are the measurement.
+    ``fail`` — a lever's publish did not go out, the printer could not be brought back
+        to PAUSE, or no lever this entry pulled moved the state machine at all (outcome
+        d): the caller escalates ``stuck_reset_failed``.
+    ``abort`` / ``handover`` — :func:`_takeover`.
+
+    The resumes this publishes are the driver's OWN, and the printer answers them on the
+    wire like any other: the per-push sampler sees PAUSE→RUNNING and would hand it to
+    :func:`on_observed_running`. It must not close this incident — RUNNING here is an
+    intermediate reading of the procedure — so the closer defers while this driver is
+    live and the handover re-reads the level afterwards (006-H2S 2026-09-04: the row
+    closed at the resume, and a second driver ran the swap round on the same AMS).
     """
     pid = incident.printer_id
-    key = (pid, incident.job_id)
-
     st = _get_state(pid)
     # A lost state (or any takeover) at THIS read ends the round through the one
     # predicate — never a "skipped" that falls through to the out-of-rotation stamp
@@ -2413,94 +2684,205 @@ async def _reset_stuck_change(incident: RecoveryIncident, client) -> str:
         return _note_takeover(incident, token, "reset_stuck_change")
     if not ams_mid_filament_change(st):
         return "skipped"
-    initial_ams = getattr(st, "ams_status_main", None)
-
-    if _stuck_resets.get(key, 0) >= _MAX_STUCK_RESETS:
-        logger.warning(
-            "spool_recovery: printer %s still wedged mid filament-change (ams_status_main=%s tray_now=%s) with the "
-            "reset budget spent (%d/%d) — the firmware drops every load and unload in this state",
+    if evidence.extruder_emptied_by_farm():
+        logger.info(
+            "[spool_recovery] ladder withheld printer=%s entry=%s — the farm emptied this extruder (last completed "
+            "motion: unload); no resume over it (ams_status=%s/%s tray_now=%s)",
             pid,
-            initial_ams,
+            entry,
+            getattr(st, "ams_status_main", None),
+            getattr(st, "ams_status_sub", None),
             getattr(st, "tray_now", None),
-            _stuck_resets.get(key, 0),
-            _MAX_STUCK_RESETS,
         )
-        return "fail"
+        return "wedged"
 
-    # The AMS is wedged mid-change. Spend a reset and re-issue the firmware CONTINUE.
-    _stuck_resets[key] = _stuck_resets.get(key, 0) + 1
-    logger.info(
-        "spool_recovery: printer %s AMS wedged mid filament-change (state=PAUSE ams_status_main=%s tray_now=%s) "
-        "— publishing resume to reset the stuck state machine (reset %d/%d)",
-        pid,
-        initial_ams,
-        getattr(st, "tray_now", None),
-        _stuck_resets[key],
-        _MAX_STUCK_RESETS,
-    )
-    if not client.resume_print():
+    pulled: list[LeverOutcome] = []
+    for lever in _LEVERS_AT[entry]:
+        if evidence.lever_spent(lever):
+            continue
+        reading = await _pull_lever(incident, client, lever, evidence=evidence)
+        match reading:
+            case "wedged" | "never_moved":
+                pulled.append(reading)  # still in state 1 — the next lever, if any
+            case "ok" | "paused_clear" | "paused_wedged":
+                return "ok"
+            case "recovered":
+                return "recovered"
+            case "not_sent" | "no_pause":
+                return "fail"
+            case "abort" | "handover":
+                return reading
+            case _:
+                assert_never(reading)
+    if pulled and all(outcome == "never_moved" for outcome in pulled):
         logger.warning(
-            "spool_recovery: printer %s reset resume_print send returned False (offline?) — reset failed", pid
+            "[spool_recovery] ladder printer=%s entry=%s — no lever moved the state machine (%s)",
+            pid,
+            entry,
+            ", ".join(record.lever for record in evidence.levers),
         )
         return "fail"
+    st = _get_state(pid)
+    logger.info(
+        "[spool_recovery] ladder exhausted printer=%s entry=%s levers=%s — AMS still mid filament-change "
+        "(ams_status=%s/%s tray_now=%s); the swap commands go out and are measured",
+        pid,
+        entry,
+        ",".join(f"{record.lever}:{record.outcome}" for record in evidence.levers) or "-",
+        getattr(st, "ams_status_main", None),
+        getattr(st, "ams_status_sub", None),
+        getattr(st, "tray_now", None),
+    )
+    return "wedged"
 
-    verdict = await _await_unwedge(incident, client, initial_ams=initial_ams, allow_self_pause=True)
-    if verdict != "fail":
-        return verdict
-    return await _ams_control_tier(incident, client, key=key, initial_ams=initial_ams)
+
+def _publish_lever(client, lever: Lever) -> bool:
+    """Publish ONE lever's firmware verb. True when the client sent it."""
+    match lever:
+        case "resume" | "resume_then_pause":
+            return bool(client.resume_print())
+        case "ams_control_resume":
+            return bool(client.ams_control("resume"))
+        case _:
+            assert_never(lever)
 
 
-def _unwedged_verdict(incident: RecoveryIncident, *, stage: str) -> str:
-    """``ok`` only when a FRESH read says the AMS has LEFT the filament change.
+async def _pull_lever(
+    incident: RecoveryIncident, client, lever: Lever, *, evidence: _RecoveryEvidence
+) -> UnwedgeReading | Literal["not_sent"]:
+    """Pull ONE lever, read its outcome, and RECORD it (spent from here on).
 
-    THE 002-H2S 2026-09-11 HOLE. "The state machine moved and is back at PAUSE" was
-    read as "the swap round can run", and those are not the same statement: the printer
-    had retried the same slot, stalled and re-PAUSEd with ``ams_status_main`` still 1,
-    where the firmware DROPS every load and unload
-    (:func:`bambu_mqtt.ams_mid_filament_change`). The round's two unloads went nowhere,
-    it escalated ``unload_failed``, and the one fact that explained it — the AMS never
-    left the change — appeared in no log line at all.
+    The ``lever=<lever> outcome=<outcome>`` INFO line is the measurement the next wedge
+    is triaged by — one per pull, every outcome, greppable."""
+    pid = incident.printer_id
+    st = _get_state(pid)
+    entry_ams = getattr(st, "ams_status_main", None)
+    entry_sub = getattr(st, "ams_status_sub", None)
+    entry_tray = getattr(st, "tray_now", None)
+    started = _now()
+    logger.info(
+        "[spool_recovery] lever=%s publishing printer=%s (state=%s ams_status=%s/%s tray_now=%s codes=%s)",
+        lever,
+        pid,
+        getattr(st, "state", None),
+        entry_ams,
+        entry_sub,
+        entry_tray,
+        sorted(_active_recoverable_codes(st)),
+    )
+    reading: UnwedgeReading | Literal["not_sent"]
+    if _publish_lever(client, lever):
+        reading = await _await_unwedge(
+            incident, client, initial_ams=entry_ams, pause_on_running=lever == "resume_then_pause"
+        )
+    else:
+        logger.warning("spool_recovery: printer %s lever %s send returned False (offline?)", pid, lever)
+        reading = "not_sent"
+    outcome: LeverOutcome
+    match reading:
+        case "abort" | "handover":
+            outcome = "taken_over"
+        case _:
+            outcome = reading
+    evidence.levers.append(LeverRecord(lever=lever, outcome=outcome, at=_monotonic()))
+    st = _get_state(pid)
+    logger.info(
+        "[spool_recovery] lever=%s outcome=%s printer=%s after %.1fs (state=%s ams_status %s/%s→%s/%s "
+        "tray_now %s→%s codes=%s)",
+        lever,
+        outcome,
+        pid,
+        _now() - started,
+        getattr(st, "state", None),
+        entry_ams,
+        entry_sub,
+        getattr(st, "ams_status_main", None),
+        getattr(st, "ams_status_sub", None),
+        entry_tray,
+        getattr(st, "tray_now", None),
+        sorted(_active_recoverable_codes(st)),
+    )
+    return reading
 
-    Gates EVERY ``ok`` exit of :func:`_await_unwedge`, so there is no path by which the
-    caller learns "proceed" without that read having been taken.
+
+def _unwedged_verdict(incident: RecoveryIncident, *, stage: str) -> Literal["ok", "wedged"]:
+    """``ok`` when a FRESH read says the AMS has LEFT the filament change, else
+    ``wedged``.
+
+    002-H2S 2026-09-11: "the state machine moved and is back at PAUSE" was read as "the
+    AMS left the change", and the one fact that distinguished them — ``ams_status_main``
+    still 1 — appeared in no log line. That fresh read gates every ``ok`` exit of
+    :func:`_await_unwedge`. A still-wedged answer is a READING the caller records, never
+    a give-up: whether a mid-change AMS acts on an unload or a load is measured by
+    sending it (``services/ams_command``), not assumed.
     """
     st = _get_state(incident.printer_id)
     if not ams_mid_filament_change(st):
         return "ok"
-    logger.warning(
-        "spool_recovery: printer %s %s but the AMS did not leave the filament change "
-        "(ams_status_main=%s tray_now=%s) — the firmware drops every load and unload in this state",
+    logger.info(
+        "spool_recovery: printer %s %s with the AMS still mid filament-change (ams_status_main=%s tray_now=%s)",
         incident.printer_id,
         stage,
         getattr(st, "ams_status_main", None),
         getattr(st, "tray_now", None),
     )
-    return "fail"
+    return "wedged"
 
 
-async def _await_unwedge(incident: RecoveryIncident, client, *, initial_ams: int, allow_self_pause: bool) -> str:
-    """Read the outcome of ONE unwedge attempt, bounded by ``step_timeout_s``.
+def _repause_reading(
+    incident: RecoveryIncident, *, tier3: bool, stage: str
+) -> Literal["ok", "wedged", "paused_clear", "paused_wedged"]:
+    """The reading of a printer back at PAUSE after a lever: tiers 1/2 through
+    :func:`_unwedged_verdict`; tier 3 (the printer went RUNNING and came back) as
+    ``paused_clear`` / ``paused_wedged`` — the ladder's ``ok`` either way."""
+    verdict = _unwedged_verdict(incident, stage=stage)
+    if not tier3:
+        return verdict
+    return "paused_wedged" if verdict == "wedged" else "paused_clear"
 
-    The reader both tiers share, so a second verb cannot grow a second, subtly
-    different reading of the same wire. Four outcomes, all from the 009/002 wire:
 
-    (a) the firmware moves and then re-faults / re-PAUSEs on its own → ``ok``;
-    (b) it fully self-heals — RUNNING, fault clear, change completed or AMS idle, held
-        stable for :data:`_POST_RESUME_STABLE_S` → ``recovered``;
+async def _pause_and_read(incident: RecoveryIncident, client, *, tier3: bool, stage: str) -> UnwedgeReading:
+    """Publish ``print.pause`` and read the PAUSE it brings back — outcome (c)'s
+    self-pause and tier 3's workable PAUSE share it. ``no_pause`` when the send failed or
+    PAUSE never arrived (unless a takeover explains it)."""
+    pid = incident.printer_id
+    if client.pause_print() and await printer_manager.await_state(
+        pid, {"PAUSE"}, incident.settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
+    ):
+        return _repause_reading(incident, tier3=tier3, stage=stage)
+    token = _takeover(incident, _get_state(pid), awaiting=None)
+    if token is not None:
+        return _note_takeover(incident, token, "await_unwedge_pause")
+    logger.warning("spool_recovery: printer %s could not be brought back to PAUSE (%s)", pid, stage)
+    return "no_pause"
+
+
+async def _await_unwedge(
+    incident: RecoveryIncident, client, *, initial_ams: int | None, pause_on_running: bool
+) -> UnwedgeReading:
+    """Read the outcome of ONE lever, bounded by ``step_timeout_s``. THE reader every
+    lever shares, so a verb cannot grow a second, subtly different reading of the wire.
+
+    Outcomes, all from the 009/002/012 wire:
+
+    (a) the firmware moves and then re-faults / re-PAUSEs on its own →
+        :func:`_unwedged_verdict` (``ok`` / ``wedged``);
+    (b) it fully self-heals — RUNNING, :func:`_change_healthy`, held stable for
+        :data:`_POST_RESUME_STABLE_S` → ``recovered``;
     (c) it hangs RUNNING in an incomplete change (the live 009 case, ~2.5 min) → we
-        re-pause it ourselves and proceed → ``ok``;
-    (d) it never moves at all → ``fail``.
+        re-pause it ourselves at the deadline (:func:`_pause_and_read`);
+    (d) it never moves at all → ``never_moved``.
 
-    Every ``ok`` — (a), (c) and the deadline's re-PAUSE — is gated by
-    :func:`_unwedged_verdict`, because all three say only that the PRINTER moved, and
-    the question the caller is actually asking is whether the AMS will accept a command.
-
-    ``allow_self_pause`` is (c)'s arm: a tier that must not take the print back to PAUSE
-    reports ``fail`` there instead and leaves the decision to the caller.
+    ``pause_on_running`` is tier 3 — the July "workable PAUSE". On the FIRST RUNNING
+    sample, if the change has not completed or a feed fault is live, ``print.pause`` goes
+    out at once instead of waiting out (c); if that first sample is already healthy, the
+    read falls into (b) instead of pausing. Either way a printer that went RUNNING and
+    came back to PAUSE reads ``paused_clear`` / ``paused_wedged`` (the ladder's ``ok``).
     """
     pid = incident.printer_id
     deadline = _now() + incident.settings.step_timeout_s
     saw_leave = False  # observed the machine leave PAUSE or change ams_status — the (a)/(d) discriminator
+    saw_running = False
     healthy_since: float | None = None
     while _now() < deadline:
         st = _get_state(pid)
@@ -2511,15 +2893,28 @@ async def _await_unwedge(incident: RecoveryIncident, client, *, initial_ams: int
         ams = getattr(st, "ams_status_main", None)
         if state != "PAUSE" or ams != initial_ams:
             saw_leave = True
-        # (b) healthy self-heal — RUNNING, fault clear, change done or AMS idle,
-        #     held stable for _POST_RESUME_STABLE_S (mirrors _resume_and_confirm).
-        if state == "RUNNING" and not _feed_fault_live(st) and (_change_completed(st) or ams == AMS_STATUS_IDLE):
-            if healthy_since is None:
+        if state == "RUNNING":
+            first_running = not saw_running
+            saw_running = True
+            if not _change_healthy(st):
+                healthy_since = None
+                if pause_on_running and first_running:
+                    logger.info(
+                        "spool_recovery: printer %s RUNNING in an incomplete change after the resume "
+                        "(tray_now=%s ams_status_main=%s fault_live=%s) — publishing pause (the workable PAUSE)",
+                        pid,
+                        getattr(st, "tray_now", None),
+                        ams,
+                        _feed_fault_live(st),
+                    )
+                    return await _pause_and_read(incident, client, tier3=True, stage="paused on the first RUNNING")
+            elif healthy_since is None:
                 healthy_since = _now()
             elif _now() - healthy_since >= _POST_RESUME_STABLE_S:
+                # (b) healthy self-heal, held stable (mirrors _resume_and_confirm).
                 logger.info(
-                    "spool_recovery: printer %s firmware reset self-healed the change — RUNNING stable, fault clear, "
-                    "tray_now=%s ams_status_main=%s; no swap needed",
+                    "spool_recovery: printer %s firmware CONTINUE self-healed the change — RUNNING stable, fault "
+                    "clear, tray_now=%s ams_status_main=%s; no swap needed",
                     pid,
                     getattr(st, "tray_now", None),
                     ams,
@@ -2527,15 +2922,15 @@ async def _await_unwedge(incident: RecoveryIncident, client, *, initial_ams: int
                 return "recovered"
         else:
             healthy_since = None
-            # (a) the firmware re-faulted and auto-paused on its own AFTER moving.
             if state == "PAUSE" and saw_leave:
+                # (a) the firmware re-faulted and auto-paused on its own AFTER moving.
                 logger.info(
-                    "spool_recovery: printer %s state machine moved then re-PAUSEd after the reset "
+                    "spool_recovery: printer %s state machine moved then re-PAUSEd after the CONTINUE "
                     "(ams_status_main=%s)",
                     pid,
                     ams,
                 )
-                return _unwedged_verdict(incident, stage="moved then re-PAUSEd after the reset")
+                return _repause_reading(incident, tier3=pause_on_running and saw_running, stage="moved then re-PAUSEd")
         await asyncio.sleep(_POLL_INTERVAL_S)
 
     # Deadline reached.
@@ -2546,9 +2941,9 @@ async def _await_unwedge(incident: RecoveryIncident, client, *, initial_ams: int
     state = getattr(st, "state", None)
     ams = getattr(st, "ams_status_main", None)
     if state == "RUNNING":
-        if not _feed_fault_live(st) and (_change_completed(st) or ams == AMS_STATUS_IDLE):
+        if _change_healthy(st):
             logger.info(
-                "spool_recovery: printer %s firmware reset left the print RUNNING and healthy at the deadline "
+                "spool_recovery: printer %s firmware CONTINUE left the print RUNNING and healthy at the deadline "
                 "(tray_now=%s ams_status_main=%s); no swap needed",
                 pid,
                 getattr(st, "tray_now", None),
@@ -2558,104 +2953,27 @@ async def _await_unwedge(incident: RecoveryIncident, client, *, initial_ams: int
         # (c) THE LIVE 009 HUNG CASE: RUNNING but the change never completed and the
         #     fault stands (it sat like this ~2.5 min). Re-pause it ourselves so the
         #     proven unload→swap→resume round can run.
-        if not allow_self_pause:
-            logger.warning(
-                "spool_recovery: printer %s hung RUNNING in an incomplete filament-change "
-                "(tray_now=%s ams_status_main=%s) and this tier does not self-pause",
-                pid,
-                getattr(st, "tray_now", None),
-                ams,
-            )
-            return "fail"
         logger.info(
-            "spool_recovery: printer %s hung RUNNING in an incomplete filament-change after the reset "
+            "spool_recovery: printer %s hung RUNNING in an incomplete filament-change after the CONTINUE "
             "(tray_now=%s ams_status_main=%s fault_live=%s) — self-pausing to run the swap round",
             pid,
             getattr(st, "tray_now", None),
             ams,
             _feed_fault_live(st),
         )
-        if client.pause_print() and await printer_manager.await_state(
-            pid, {"PAUSE"}, incident.settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
-        ):
-            return _unwedged_verdict(incident, stage="self-paused the hung change")
-        logger.warning("spool_recovery: printer %s could not re-pause after the reset — escalating", pid)
-        return "fail"
+        return await _pause_and_read(incident, client, tier3=pause_on_running, stage="self-paused the hung change")
     if state == "PAUSE" and saw_leave:
         # Re-faulted and re-paused right at the deadline.
-        return _unwedged_verdict(incident, stage="re-PAUSEd at the reset deadline")
-    # (d) the state machine never moved — still wedged (PAUSE + non-idle) at the
-    #     deadline without ever leaving. A resume cannot free it.
+        return _repause_reading(incident, tier3=pause_on_running and saw_running, stage="re-PAUSEd at the deadline")
+    # (d) the state machine never moved — still PAUSE at the same ams_status for the
+    #     whole window.
     logger.warning(
-        "spool_recovery: printer %s AMS never left the wedged change after the reset (state=%s ams_status_main=%s)",
+        "spool_recovery: printer %s never left the change after the CONTINUE (state=%s ams_status_main=%s)",
         pid,
         state,
         ams,
     )
-    return "fail"
-
-
-async def _ams_control_tier(incident: RecoveryIncident, client, *, key: tuple[int, str], initial_ams: int) -> str:
-    """Tier 2: the OTHER firmware CONTINUE, ``ams_control("resume")``.
-
-    Entry is EVIDENCE, not a record of why tier 1 gave up: a fresh read must still show
-    the printer PAUSEd AND the AMS inside the filament change. That one reading excludes
-    both fail modes a second publish cannot help — an offline client (which returned
-    False before any wait, so nothing reached the wire) and a self-pause that did not
-    take (the printer is RUNNING, not PAUSE, and an AMS frame published at a running
-    printer is not the operator's CONTINUE) — without storing a reason code
-    (derive-don't-store).
-
-    ``ams_control("reset")`` is deliberately NOT a third tier. The fork has no HMS
-    mapping for it, and its firmware meaning is "end the filament change" — which is
-    the very operation the paused print is waiting on, so a reset that succeeds might
-    leave the print resumable only by a human anyway. Deferred, logged at the decision
-    point, and the next real jam decides.
-    """
-    pid = incident.printer_id
-    st = _get_state(pid)
-    if getattr(st, "state", None) != "PAUSE" or not ams_mid_filament_change(st):
-        return "fail"
-
-    spent = _ams_control_tiers.get(key, 0)
-    if spent >= _MAX_AMS_CONTROL_TIERS:
-        logger.warning(
-            "spool_recovery: printer %s still wedged with the ams_control tier spent (%d/%d) — hands are needed",
-            pid,
-            spent,
-            _MAX_AMS_CONTROL_TIERS,
-        )
-        return "fail"
-    _ams_control_tiers[key] = spent + 1
-
-    logger.info(
-        "spool_recovery: printer %s print.resume did not free the filament change (ams_status_main=%s tray_now=%s) "
-        "— publishing ams_control(resume), the firmware's other CONTINUE (tier %d/%d)",
-        pid,
-        getattr(st, "ams_status_main", None),
-        getattr(st, "tray_now", None),
-        _ams_control_tiers[key],
-        _MAX_AMS_CONTROL_TIERS,
-    )
-    _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict="unwedge_tier2_sent")
-    if not client.ams_control("resume"):
-        logger.warning(
-            "spool_recovery: printer %s ams_control(resume) send returned False (offline?) — tier 2 failed", pid
-        )
-        return "fail"
-
-    verdict = await _await_unwedge(incident, client, initial_ams=initial_ams, allow_self_pause=True)
-    if verdict in ("ok", "recovered"):
-        _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict="unwedge_tier2_ok")
-        return verdict
-    if verdict == "fail":
-        _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict="unwedge_tier2_fail")
-        logger.info(
-            'spool_recovery: printer %s both firmware CONTINUEs left the AMS wedged — ams_control("reset") deferred: '
-            "no HMS mapping in the fork and it may end the change the print is waiting on; the next real jam decides",
-            pid,
-        )
-    return verdict
+    return "never_moved"
 
 
 def _unload_skippable(state) -> bool:
@@ -2710,17 +3028,45 @@ async def _wait_ams_write_window(client, ams_id: int) -> str | None:
     return client.ams_write_refusal(ams_id)
 
 
-async def _unload_and_confirm(incident: RecoveryIncident, client) -> str:
-    """Unload the feeder and confirm the AMS finished the cycle.
+def _record_command(
+    evidence: _RecoveryEvidence,
+    command: ams_command.Command,
+    target: int | None,
+    entry: ams_command.AmsWireSnapshot,
+    answer: ams_command.Answer | StepTakeover,
+) -> None:
+    """Append the :class:`CommandRecord` for one publish that went out."""
+    match answer:
+        case "abort" | "handover":
+            recorded: ams_command.Answer | None = None
+        case _:
+            recorded = answer
+    evidence.commands.append(
+        CommandRecord(
+            command=command, target=target, posture=ams_command.posture(entry), answer=recorded, at=entry.taken_at
+        )
+    )
 
-    ``ok`` (a confirmed unload cycle ran) / ``skipped`` (nothing to unload — see
-    :func:`_unload_skippable`) / ``drying`` (the AMS is drying: a doomed lane) /
-    ``fail`` / ``abort`` (an external RESUME mid-unload).
+
+async def _unload_and_confirm(
+    incident: RecoveryIncident, client, *, evidence: _RecoveryEvidence, attempts: int
+) -> UnloadStep:
+    """Unload the feeder through ``ams_command.unload`` and read the wire's answer.
+
+    ``skipped`` (nothing to unload — :func:`_unload_skippable`) / ``drying`` (the AMS is
+    drying: a doomed lane) / an ``ams_command.Answer`` for the last publish that went out
+    / ``refused`` (every publish this call made was an ``ams_command.Refusal`` — each one
+    consumes an attempt at once, no confirm wait) / ``abort`` / ``handover``.
+
+    Up to ``attempts`` publishes: an ``acted`` answer (the AMS moved and never
+    completed) and a refusal are resent; every other answer returns at once —
+    ``no_movement`` in particular goes back to the round loop, which pulls the ladder's
+    last lever before the one resend it owns. Every publish that went out appends a
+    :class:`CommandRecord`.
 
     The unload is sent even when ``tray_now`` already reads 255 — the client encodes
-    that as ``ams_id/slot_id/target = 255``, which is byte-for-byte the operator's
-    proven manual recovery command and the only thing that resets a stuck
-    filament-change state machine.
+    that as ``ams_id/slot_id/target = 255``, byte-for-byte the operator's proven manual
+    recovery command (invariant 8: unconditional before a load).
     """
     st = _get_state(incident.printer_id)
     if _unload_skippable(st):
@@ -2731,67 +3077,85 @@ async def _unload_and_confirm(incident: RecoveryIncident, client) -> str:
     if refusal == _REFUSAL_DRYING:
         return "drying"
 
-    for _ in range(max(1, incident.settings.max_attempts)):
-        if not client.ams_unload_filament():
-            # Offline / refused / rejected send: a no-op that never confirms —
-            # consume the attempt and advance immediately instead of burning a full
-            # confirm wait.
+    verdict: UnloadStep = "refused"
+    for _ in range(max(1, attempts)):
+        sent = ams_command.unload(incident.printer_id, actor="driver")
+        if isinstance(sent, ams_command.Refusal):
             logger.warning(
-                "spool_recovery: printer %s ams_unload_filament send returned False (offline?) — attempt consumed",
+                "spool_recovery: printer %s unload not sent (%s) — attempt consumed",
                 incident.printer_id,
+                sent.reason,
             )
+            verdict = "refused"
             continue
-        verdict = await _confirm_unloaded(incident)
-        if verdict != "timeout":
-            return verdict
-    return "fail"
+        answer = await _confirm_unloaded(incident, sent)
+        _record_command(evidence, "unload", None, sent, answer)
+        match answer:
+            case "acted":
+                verdict = "acted"
+            case "complete" | "no_movement" | "undecidable" | "session_changed" | "abort" | "handover":
+                return answer
+            case _:
+                assert_never(answer)
+    return verdict
 
 
-async def _confirm_unloaded(incident: RecoveryIncident) -> str:
-    """Wait for the commanded unload to COMPLETE.
-    ``ok`` / ``timeout`` / ``abort`` / ``handover``.
+async def _observe_command(
+    incident: RecoveryIncident,
+    command: ams_command.Command,
+    target: int | None,
+    entry: ams_command.AmsWireSnapshot,
+    *,
+    step: str,
+) -> ams_command.Answer | StepTakeover:
+    """THE driver's confirm loop for one published AMS motion command.
 
-    ``tray_now == 255`` alone is not completion: after a feed fault it already reads
-    255 before the unload, so the old criterion returned instantly and the load then
-    raced an AMS that was still mid-cycle (009-H2S 2026-07-20). Two evidence paths,
-    both bounded by ``step_timeout_s``:
-
-    (a) The AMS is observed going NON-idle — the change cycle started. Completion is
-        its return to idle with nothing feeding.
-    (b) No non-idle transition is ever observed (command latency, or an unload the
-        firmware no-ops). Then idle + empty must hold across consecutive polls for
-        :data:`_UNLOAD_GRACE_S` before it counts; any contrary poll restarts the dwell.
-
-    A state machine still stuck non-idle at the deadline returns ``timeout`` — the
-    caller resends, and ultimately escalates ``unload_failed`` rather than loading
-    into a busy AMS.
+    Asks :func:`_takeover` on EVERY poll, and judges the wire ONLY through
+    ``ams_command.classify`` — one ``Observation`` per publish, ``elapsed_s`` measured
+    from the entry snapshot (the send) on ``ams_command``'s own clock, the step timeout
+    as the deadline. The classifier always answers at the deadline, so the loop needs
+    no clock of its own. One ``answer=`` line per command (``ams_command.log_answer``,
+    the one format of it), the measurement's grep token.
     """
-    deadline = _now() + incident.settings.step_timeout_s
-    saw_cycle = False
-    settled_since: float | None = None
+    observation = ams_command.Observation()
+    deadline_s = incident.settings.step_timeout_s
     while True:
         st = _get_state(incident.printer_id)
-        token = _takeover(incident, st, awaiting="PAUSE")
+        token = _takeover(incident, st, awaiting="PAUSE", target=target)
         if token is not None:
-            return _note_takeover(incident, token, "confirm_unloaded")
-        idle = getattr(st, "ams_status_main", None) == AMS_STATUS_IDLE
-        empty = getattr(st, "tray_now", None) == _NO_FILAMENT
-        if not idle:
-            saw_cycle = True  # the change cycle is running
-            settled_since = None
-        elif not empty:
-            settled_since = None  # idle but still feeding — not unloaded
-        elif saw_cycle:
-            return "ok"  # cycle ran and returned to idle with nothing feeding
-        else:
-            # No cycle observed yet: idle + empty must HOLD for the grace dwell.
-            if settled_since is None:
-                settled_since = _now()
-            if _now() - settled_since >= _UNLOAD_GRACE_S:
-                return "ok"
-        if _now() >= deadline:
-            return "timeout"
+            return _note_takeover(incident, token, step)
+        now = ams_command.snapshot(st)
+        elapsed_s = now.taken_at - entry.taken_at
+        answer = ams_command.classify(
+            command, target, entry, now, observation=observation, elapsed_s=elapsed_s, deadline_s=deadline_s
+        )
+        if answer is not None:
+            ams_command.log_answer(
+                actor="driver",
+                printer_id=incident.printer_id,
+                command=command,
+                target=target,
+                entry=entry,
+                now=now,
+                answer=answer,
+                elapsed_s=elapsed_s,
+            )
+            return answer
         await asyncio.sleep(_POLL_INTERVAL_S)
+
+
+async def _confirm_unloaded(
+    incident: RecoveryIncident, entry: ams_command.AmsWireSnapshot
+) -> ams_command.Answer | StepTakeover:
+    """Read what the wire answered the unload published at ``entry``.
+
+    ``tray_now == 255`` alone is never completion — after a feed fault it already reads
+    255 before the unload (009-H2S 2026-07-20). Completion, and every other answer, is
+    ``ams_command.classify``'s per-posture row: outside a change, idle + nothing fed
+    after an observed cycle or held for ``ams_command.UNLOAD_GRACE_S``; mid-change with a
+    feeder loaded, the feeder leaving for 255 and holding; mid-change with nothing
+    loaded, ``undecidable`` (nothing physical can answer)."""
+    return await _observe_command(incident, "unload", None, entry, step="confirm_unloaded")
 
 
 async def _select_replacement(incident: RecoveryIncident, tried: set[int]) -> tuple[int | None, bool]:
@@ -3184,57 +3548,69 @@ async def _log_tray_snapshot(incident: RecoveryIncident) -> None:
         logger.exception("spool_recovery: tray snapshot failed for printer %s", incident.printer_id)
 
 
-async def _load_and_confirm(incident: RecoveryIncident, client, target: int) -> str:
-    """Load ``target`` until ``tray_now == target``. ``ok`` / ``drying`` / ``fail`` /
-    ``abort``.
+async def _load_and_confirm(
+    incident: RecoveryIncident, client, target: int, *, evidence: _RecoveryEvidence
+) -> LoadStep:
+    """Load ``target`` through ``ams_command.load`` and read the wire's answer.
 
-    The live incident needed two sends before the load took, hence the resend
-    loop. A ``pending_tray_target`` that becomes something other than our target
-    means another actor issued a load → abort. A drying target unit is a doomed lane
-    (the client refuses every write to it) — reported so the caller escalates instead
-    of burning attempts.
+    ``drying`` (a drying target unit is a doomed lane — reported so the caller escalates
+    instead of burning attempts) / an ``ams_command.Answer`` for the last publish that
+    went out / ``refused`` (every publish was an ``ams_command.Refusal`` — each consumes
+    an attempt at once, no confirm wait) / ``abort`` / ``handover``.
+
+    Up to ``max_attempts`` publishes (the live incident needed two sends before the load
+    took): ``acted`` and a refusal are resent, and so is ``no_movement`` outside a
+    filament change. A ``no_movement`` answer to a load sent INTO a mid-change AMS returns
+    at once — the AMS is not acting on loads, and a resend (or another candidate) costs a
+    full step timeout for the same answer. ``ams_command.load`` owns the pre-send
+    ``note_commanded_load`` mark and the entry snapshot; a ``pending_tray_target`` that
+    turns into something other than ``target`` is :func:`_takeover`'s ``hijacked_load``.
+    Every publish that went out appends a :class:`CommandRecord`.
     """
-    from backend.app.services import spool_respool
-
     refusal = await _wait_ams_write_window(client, _ams_unit_for_tray(target))
     if refusal == _REFUSAL_DRYING:
         return "drying"
 
+    verdict: LoadStep = "refused"
     for _ in range(max(1, incident.settings.max_attempts)):
-        # Mark every load send as ours BEFORE it goes out, so the backup-swap
-        # detector suppresses the resulting tray_now edge instead of spending the
-        # departed spool (the 006 self-inflicted false-stamp mode).
-        spool_respool.note_commanded_load(incident.printer_id, target)
-        if not client.ams_load_filament(target):
-            # Offline / rejected send: a no-op that never confirms — consume the
-            # attempt and advance immediately instead of burning a full confirm wait.
+        sent = ams_command.load(incident.printer_id, target, actor="driver")
+        if isinstance(sent, ams_command.Refusal):
             logger.warning(
-                "spool_recovery: printer %s ams_load_filament(%s) send returned False (offline?) — attempt consumed",
+                "spool_recovery: printer %s load of tray %s not sent (%s) — attempt consumed",
                 incident.printer_id,
                 target,
+                sent.reason,
             )
+            verdict = "refused"
             continue
-        verdict = await _confirm_loaded(incident, target)
-        if verdict != "timeout":
-            return verdict
-    return "fail"
+        answer = await _confirm_loaded(incident, target, sent)
+        _record_command(evidence, "load", target, sent, answer)
+        match answer:
+            case "no_movement" if ams_command.posture(sent) in ams_command.MID_CHANGE_POSTURES:
+                return "no_movement"
+            case "acted" | "no_movement":
+                verdict = answer
+            case "complete" | "session_changed" | "abort" | "handover":
+                return answer
+            case "undecidable":
+                # ``ams_command``'s table gives no load row this answer; a classifier
+                # that changed shape must fail loudly, never be read as a verdict.
+                raise LookupError("ams_command answered a load 'undecidable' — only an unload into an empty change can")
+            case _:
+                assert_never(answer)
+    return verdict
 
 
-async def _confirm_loaded(incident: RecoveryIncident, target: int) -> str:
-    """Wait for ``tray_now == target``. ``ok`` / ``timeout`` / ``abort`` / ``handover``."""
-    deadline = _now() + incident.settings.step_timeout_s
-    while _now() < deadline:
-        st = _get_state(incident.printer_id)
-        token = _takeover(incident, st, awaiting="PAUSE", target=target)
-        if token is not None:
-            return _note_takeover(incident, token, "confirm_loaded")
-        if getattr(st, "tray_now", None) == target:
-            return "ok"
-        await asyncio.sleep(_POLL_INTERVAL_S)
-    return "timeout"
+async def _confirm_loaded(
+    incident: RecoveryIncident, target: int, entry: ams_command.AmsWireSnapshot
+) -> ams_command.Answer | StepTakeover:
+    """Read what the wire answered the load of ``target`` published at ``entry``:
+    ``complete`` on ``tray_now == target`` in every posture (``ams_command``'s load
+    row), ``acted`` / ``no_movement`` at the step timeout."""
+    return await _observe_command(incident, "load", target, entry, step="confirm_loaded")
 
 
-async def _resume_and_confirm(incident: RecoveryIncident, client, target: int) -> str:
+async def _resume_and_confirm(incident: RecoveryIncident, client, target: int) -> ResumeStep:
     """Resume and confirm RUNNING held stable.
     ``success`` / ``repause`` / ``not_taken`` / ``abort`` / ``handover``.
 
@@ -3590,21 +3966,28 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
 
 
 async def _restore_jammed_feeder(
-    incident: RecoveryIncident, client
-) -> RestoreVerdict | Literal["abort", "handover"] | None:
+    incident: RecoveryIncident, client, *, evidence: _RecoveryEvidence
+) -> RestoreVerdict | StepTakeover | None:
     """Put the jammed spool back when the swap emptied the extruder and failed.
 
     The invariant the driver owns: it never hands a printer to a human with NOTHING
     loaded when the AMS would load something. After the selection reorder the only way
     the extruder is empty at a give-up is the residual — the swap committed, a
-    replacement load FAILED, and no further candidate exists — and at that boundary a
-    reload is state RESTORATION, not re-selection: invariant 7 holds (the stamp neither
-    moves nor clears; it did jam, and the flag only bars auto-selection) and invariant 8
-    holds (this incident's confirmed unload precedes the reload).
+    replacement load did not complete, and no further candidate exists — and at that
+    boundary a reload is state RESTORATION, not re-selection: invariant 7 holds (the
+    stamp neither moves nor clears; it did jam, and the flag only bars auto-selection)
+    and invariant 8 holds (this incident's unload precedes the reload).
 
-    ``None`` = not needed (the feeder is not empty, so nothing was left dangling). The
-    three refusals and the two outcomes are :data:`RestoreVerdict`; ``abort`` /
-    ``handover`` propagate exactly as they do from every other step.
+    ``None`` = not needed (the feeder is not empty, or there is no jammed tray to load
+    back). The outcomes are :data:`RestoreVerdict`; ``abort`` / ``handover`` propagate
+    exactly as they do from every other step.
+
+    The reload is ATTEMPTED in every posture, a mid filament-change included, and the
+    wire's answer is what the page reports: ``complete`` → ``ok``; ``no_movement`` →
+    ``dropped`` (sent, and the AMS did not move); ``drying`` → ``skipped_drying``;
+    anything else that never completed → ``fail``. The pre-2026-09-23 refusal in a
+    mid-change AMS rested on "the firmware drops every load" — measured only for a load
+    into an empty path while the change-error modal stood; this sends and reads.
 
     Called ONLY by :func:`_give_up`, and only once that has established the driver
     published an unload of its own (``_RecoveryEvidence.unloads_sent``) — this function
@@ -3612,32 +3995,35 @@ async def _restore_jammed_feeder(
     firmware retracted. What it adds is the other half: a driver that unloaded but whose
     jammed tray reads loaded again has nothing left to restore.
 
-    Two preconditions beyond "the extruder is empty":
-
-    * ``not ams_mid_filament_change(state)`` — the fork's ONE wedge predicate (value 1
-      only). ``== AMS_STATUS_IDLE`` would fail OPEN at the assist state 3 that every
-      RUNNING H2S reads, and an assist-state AMS does accept loads.
-    * a known jammed tray — there is no slot to load back otherwise.
-
     It reuses :func:`_load_and_confirm` whole, so the drying pre-flight, the
-    ``note_commanded_load`` marking (the backup-swap detector must not spend the
-    departed spool) and the takeover handling are the swap's own, not a second copy.
-    The load is NOT counted in :class:`_RecoveryEvidence` — it is not a candidate, and
-    the escalation reason must read exactly as it did before the restore existed.
+    ``ams_command`` verb (its ``note_commanded_load`` mark — the backup-swap detector
+    must not spend the departed spool) and the takeover handling are the swap's own, not
+    a second copy. The reload is recorded as a command that went out, but it is NOT a
+    candidate: :attr:`_RecoveryEvidence.loads_attempted` does not count it, and the
+    escalation reason is chosen before it runs.
     """
     jammed = incident.jammed_global_tray
     state = _get_state(incident.printer_id)
-    if _feeder_position(state, jammed, incident.printer_id).kind != "empty" or jammed is None:
+    if jammed is None or _feeder_position(state, jammed, incident.printer_id).kind != "empty":
         return None
-    if ams_mid_filament_change(state):
-        # The firmware drops every load in this state; the lever is its own CONTINUE,
-        # which the wedged reasons' copy already names.
-        _log_candidate_outcome(incident, gtid=jammed, verdict="restore_skipped_wedged")
-        return "skipped_wedged"
-    load = await _load_and_confirm(incident, client, jammed)
-    if load in ("abort", "handover"):
-        return load
-    verdict: RestoreVerdict = "skipped_drying" if load == "drying" else ("ok" if load == "ok" else "fail")
+    load = await _load_and_confirm(incident, client, jammed, evidence=evidence)
+    verdict: RestoreVerdict
+    match load:
+        case "abort" | "handover":
+            return load
+        case "session_changed":
+            _note_takeover(incident, "state_lost", "restore")
+            return "abort"
+        case "complete":
+            verdict = "ok"
+        case "no_movement":
+            verdict = "dropped"
+        case "drying":
+            verdict = "skipped_drying"
+        case "acted" | "refused":
+            verdict = "fail"
+        case _:
+            assert_never(load)
     _log_candidate_outcome(incident, gtid=jammed, verdict=f"restore_{verdict}")
     return verdict
 
@@ -3647,23 +4033,23 @@ async def _give_up(incident: RecoveryIncident, client, reason: str, *, evidence:
 
     Every ``_escalate`` reachable inside :func:`_run_recovery`'s candidate loop and
     after it routes through here, so the restore decision is made ONCE from live state
-    instead of six inline conditions drifting apart. The escalations that never enter
-    the loop (the entry gate, the startup re-entry, the runout branch) call
-    :func:`_escalate` directly with ``restore=None``: they unloaded nothing, so they
-    have nothing to restore and nothing to claim about a reload.
+    instead of inline conditions drifting apart, and the page is composed from the
+    driver's own records (``evidence``). The escalations that never enter the loop (the
+    entry gate, the startup re-entry, the runout branch) call :func:`_escalate` directly
+    with ``restore=None`` and no evidence: they sent nothing, so they have nothing to
+    restore and nothing to claim.
 
     :func:`_abort` and :func:`_hand_over` deliberately leave the extruder as it is —
     another actor owns the printer, and a takeover is never a give-up.
     """
     # The restore exists to undo the DRIVER's OWN unload — nothing else. A give-up that
-    # published none (round 1 on an AMS the firmware wedged itself, or a no-candidate
-    # verdict while ``tray_now`` already read 255 because the firmware retracted after
-    # the fault — see :func:`_resolve_jammed_tray`) leaves the printer exactly as the
-    # firmware left it, and the reason copy stands on its own: moving filament there
-    # would be the farm acting on a state it never created, on a load with no explicit
-    # unload behind it — the one a wedged AMS drops (invariant 8). The wire position
-    # alone cannot tell those apart, because 255 is what BOTH look like.
-    verdict = await _restore_jammed_feeder(incident, client) if evidence.unloads_sent else None
+    # published none (a CONTINUE that never moved the printer, or a no-candidate verdict
+    # while ``tray_now`` already read 255 because the firmware retracted after the
+    # fault — see :func:`_resolve_jammed_tray`) leaves the printer exactly as the
+    # firmware left it: moving filament there would be the farm acting on a state it
+    # never created, on a load with no explicit unload behind it (invariant 8). The wire
+    # position alone cannot tell those apart, because 255 is what BOTH look like.
+    verdict = await _restore_jammed_feeder(incident, client, evidence=evidence) if evidence.unloads_sent else None
     if verdict == "abort":
         # A takeover DURING the restore must not un-stamp the spool: the operator
         # resumed on a feeder the FARM had just reloaded, so the click is not the
@@ -3676,7 +4062,7 @@ async def _give_up(incident: RecoveryIncident, client, reason: str, *, evidence:
         return
     logger.info(
         "[spool_recovery] give-up printer=%s reason=%s restore=%s unloads_sent=%s unloads_confirmed=%s "
-        "loads_attempted=%s loads_confirmed=%s",
+        "loads_attempted=%s loads_confirmed=%s levers=%s",
         incident.printer_id,
         reason,
         verdict,
@@ -3684,11 +4070,18 @@ async def _give_up(incident: RecoveryIncident, client, reason: str, *, evidence:
         evidence.confirmed_unloads,
         evidence.loads_attempted,
         evidence.loads_confirmed,
+        ",".join(f"{record.lever}:{record.outcome}" for record in evidence.levers) or "-",
     )
-    await _escalate(incident, reason, restore=verdict)
+    await _escalate(incident, reason, restore=verdict, evidence=evidence)
 
 
-async def _escalate(incident: RecoveryIncident, reason: str, *, restore: RestoreVerdict | None = None) -> None:
+async def _escalate(
+    incident: RecoveryIncident,
+    reason: str,
+    *,
+    restore: RestoreVerdict | None = None,
+    evidence: _RecoveryEvidence | None = None,
+) -> None:
     """Give up: hold the incident ESCALATED, project the token, notify, leave PAUSED.
 
     NEVER resumes — a human must intervene. The incident stays OPEN (an escalation is
@@ -3702,10 +4095,10 @@ async def _escalate(incident: RecoveryIncident, reason: str, *, restore: Restore
     why an escalation, and not a wire edge, is what a hold spanning a deploy can rely on.
 
     ``restore`` is :func:`_give_up`'s statement about an extruder the DRIVER emptied,
-    and it is what lets the composed detail say where the filament is (:func:
-    `_compose_detail` → :func:`_feeder_clause`). It is passed explicitly and never
-    inferred: the default ``None`` is the truthful answer for every caller that
-    unloaded nothing.
+    and ``evidence`` its records of what it sent and what the wire answered; together
+    they let the composed detail say what the farm did and where the filament is
+    (:func:`_compose_detail`). Both are passed explicitly and never inferred: the
+    defaults (``None``) are the truthful answer for every caller that sent nothing.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -3714,7 +4107,7 @@ async def _escalate(incident: RecoveryIncident, reason: str, *, restore: Restore
     # Per-tray diagnostic snapshot on every escalation (the 18:45 forensics gap).
     await _log_tray_snapshot(incident)
 
-    detail = _compose_detail(incident, reason, restore)
+    detail = _compose_detail(incident, reason, restore=restore, evidence=evidence)
     # The hold's projection onto the farm unit, one token per kind. A foreign print
     # has no unit — the incident row carries the whole state there.
     token = waiting_reason_for(incident.kind, external=incident.external)

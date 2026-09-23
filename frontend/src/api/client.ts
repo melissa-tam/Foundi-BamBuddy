@@ -595,6 +595,25 @@ export interface SlotRecheckResult {
   undo_available: boolean;
 }
 
+/**
+ * What the wire answered to an operator AMS load/unload — mirrors the backend
+ * `AmsCommandOutcome` owned by `services/ams_command.py`, minus the two refusals
+ * (`refused_not_connected` 400, `refused_runout_hold` 409), which arrive as
+ * `ApiError`s instead of a 200 body:
+ *   - `complete`        the commanded end state was observed
+ *   - `acted`           the AMS moved but had not reached the end state in the window
+ *   - `no_movement`     nothing on the wire moved in the window
+ *   - `undecidable`     unload sent mid filament change with nothing loaded; no motion can answer it
+ *   - `session_changed` the MQTT session reconnected while the command was observed
+ */
+export type AmsCommandOutcome = 'complete' | 'acted' | 'no_movement' | 'undecidable' | 'session_changed';
+
+/** `message` is the non-UI-client fallback; the UI renders copy keyed off `outcome`. */
+export interface AmsCommandResult {
+  outcome: AmsCommandOutcome;
+  message: string;
+}
+
 export interface NozzleInfo {
   nozzle_type: string;  // "stainless_steel" or "hardened_steel"
   nozzle_diameter: string;  // e.g., "0.4"
@@ -4565,14 +4584,14 @@ export const api = {
 
   // Load filament from a tray. trayId: 0-15 for AMS (amsId*4+slotId), 254 for external spool.
   loadAmsTray: (printerId: number, trayId: number) =>
-    request<{ success: boolean; message: string }>(
+    request<AmsCommandResult>(
       `/printers/${printerId}/ams/load?tray_id=${trayId}`,
       { method: 'POST' }
     ),
 
   // Unload the currently loaded filament.
   unloadAms: (printerId: number) =>
-    request<{ success: boolean; message: string }>(
+    request<AmsCommandResult>(
       `/printers/${printerId}/ams/unload`,
       { method: 'POST' }
     ),

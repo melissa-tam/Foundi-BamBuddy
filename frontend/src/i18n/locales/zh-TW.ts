@@ -877,6 +877,10 @@ export default {
       unloadInitiated: '卸載耗材中…',
       failedToLoad: '載入耗材失敗',
       failedToUnload: '卸載耗材失敗',
+      amsLoadNoMovement: '已送出載入指令。AMS 未動作。',
+      amsUnloadNoMovement: '已送出卸載指令。AMS 未動作。',
+      amsUnloadNothingLoaded: '已送出卸載指令。此前未載入耗材。',
+      amsCommandSessionChanged: '指令執行期間印表機重新連線。請檢查 AMS。',
     },
     // Connection status
     connection: {

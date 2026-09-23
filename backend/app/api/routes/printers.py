@@ -24,6 +24,7 @@ from backend.app.models.printer import Printer
 from backend.app.models.slot_preset import SlotPresetMapping
 from backend.app.models.user import User
 from backend.app.schemas.printer import (
+    AmsCommandResponse,
     AmsLabelBody,
     AMSTray,
     AMSUnit,
@@ -46,7 +47,7 @@ from backend.app.schemas.printer import (
     ServiceHoldState,
     SlotRecheckResponse,
 )
-from backend.app.services import service_hold
+from backend.app.services import ams_command, service_hold
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     cleanup_downloaded_3mf,
@@ -57,14 +58,12 @@ from backend.app.services.bambu_ftp import (
     get_storage_info_async,
     list_files_async,
 )
-from backend.app.services.bambu_mqtt import ams_mid_filament_change
 from backend.app.services.eject.monitor import eject_cooldown_monitor
-from backend.app.services.hms_errors import current_runout_demand, hms_error_payload, runout_hold_active
+from backend.app.services.hms_errors import hms_error_payload
 from backend.app.services.pause_recovery import on_plate_cleared
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
 from backend.app.services.print_control import stop_as_operator
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
-from backend.app.services.printer_incidents import runout_slot_desc
 from backend.app.services.printer_manager import (
     _eject_watch_payload,
     get_derived_status_name,
@@ -4107,132 +4106,62 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
         logger.warning("Failed to apply PA profile after RFID re-read: %s", e)
 
 
-@router.post("/{printer_id}/ams/load")
+@router.post("/{printer_id}/ams/load", response_model=AmsCommandResponse)
 async def ams_load(
     printer_id: int,
     tray_id: int = Query(..., description="Tray ID: 0-15 for AMS slots (ams_id*4+slot_id), 254 for external spool"),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
-):
-    """Load filament from a specific AMS slot or external spool.
+) -> AmsCommandResponse:
+    """Load filament from a specific AMS slot or external spool — publish, observe, report.
 
     Tray ID encoding (matches Bambu firmware convention):
     - 0..15: AMS slot, computed as ams_id * 4 + slot_id
     - 254: external spool (single-external printers, or Ext-L on dual-nozzle H2D)
     - 255: Ext-R on dual-nozzle H2D
 
-    Refused with 409 while the printer is PAUSEd holding for a same-slot filament
-    refill — see the gate below.
+    ``services/ams_command`` sends the load in every AMS posture, reads the wire for its
+    operator window and answers 200 ``{outcome, message}`` with the measured outcome.
+    400 when the printer has no client or the publish did not go out; 409 while the
+    printer is PAUSEd holding for a same-slot refill (the load would latch in firmware —
+    006-H2S 2026-07-26).
     """
     if tray_id not in range(16) and tray_id not in (254, 255):
         raise HTTPException(400, "tray_id must be 0..15 (AMS slot), 254 (external / Ext-L), or 255 (Ext-R)")
 
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
-    printer = result.scalar_one_or_none()
-    if not printer:
+    if result.scalar_one_or_none() is None:
         raise HTTPException(404, "Printer not found")
 
-    client = printer_manager.get_client(printer_id)
-    if not client:
-        raise HTTPException(400, "Printer not connected")
-
-    # Runout-hold gate (006-H2S 2026-07-26 — the incident's actual vector). While the
-    # printer is PAUSEd waiting for a same-slot refill, the AMS executes NO filament
-    # change: the operator's Load click on slot 2 returned 200, published an
-    # ams_change_filament, moved nothing — and LATCHED in firmware, resurfacing at the
-    # resume 12 h later as a bogus demand for slot 2. A 200 that silently arms a
-    # future fault is worse than a refusal, so refuse and say what to do instead.
-    state = printer_manager.get_status(printer_id)
-    if runout_hold_active(state):
-        demand = current_runout_demand(getattr(state, "hms_errors", None) or [])
-        where = runout_slot_desc(demand[0] * 4 + demand[1]) if demand else None
-        raise HTTPException(
-            409,
-            (
-                f"{printer.name} is PAUSEd waiting for a filament refill in "
-                f"{where or 'the slot that ran out'}. The AMS executes no load in this state — the "
-                "request would latch in the firmware and resurface at the resume as a bogus demand for "
-                f"this slot (006-H2S 2026-07-26). Insert filament into {where or 'the slot that ran out'} "
-                "and the print resumes from there."
-            ),
-        )
-
-    # Mid-filament-change gate (002-H2S 2026-09-11). A layer-0 jam parked the AMS at
-    # ams_status_main == 1 behind a PAUSE; the operator clicked Load on slot 1 twice,
-    # both returned 200, and the firmware dropped both — it drops EVERY
-    # ams_change_filament in this state and only its own CONTINUE moves it on. A
-    # different cause from the runout hold above and not covered by it (no runout code
-    # need be standing), but the same defect: a 200 that moves nothing.
-    if ams_mid_filament_change(state):
-        raise HTTPException(
-            409,
-            (
-                f"{printer.name}'s AMS is mid filament-change (ams_status_main=1). The firmware drops "
-                "every load in this state — the click would return 200 and move nothing "
-                "(002-H2S 2026-09-11). Press Retry/Continue on the printer screen (or resume the "
-                "print) so the change completes, then load."
-            ),
-        )
-
-    # Mark this as an operator-commanded load so the backup-swap detector does not
-    # mistake the resulting tray_now edge for a firmware runout and spend the
-    # departed spool (spool_respool commanded-swap suppression).
-    from backend.app.services import spool_respool
-
-    spool_respool.note_commanded_load(printer_id, tray_id)
-
-    success = client.ams_load_filament(tray_id)
-    if not success:
-        raise HTTPException(500, "Failed to send load command")
-
-    if tray_id == 254:
-        target = "external spool"
-    elif tray_id == 255:
-        target = "Ext-R"
-    else:
-        target = f"AMS {tray_id // 4} slot {tray_id % 4 + 1}"
-    return {"success": True, "message": f"Loading filament from {target}"}
+    return _ams_command_response(await ams_command.command_for_operator(printer_id, "load", tray_id))
 
 
-@router.post("/{printer_id}/ams/unload")
+@router.post("/{printer_id}/ams/unload", response_model=AmsCommandResponse)
 async def ams_unload(
     printer_id: int,
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
-):
-    """Unload the currently loaded filament.
+) -> AmsCommandResponse:
+    """Unload the currently loaded filament — publish, observe, report.
 
-    Refused with 409 while the AMS is mid filament-change — see the gate below.
+    ``services/ams_command`` sends the unload in every AMS posture, reads the wire for
+    its operator window and answers 200 ``{outcome, message}`` with the measured
+    outcome. 400 when the printer has no client or the publish did not go out.
     """
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
-    printer = result.scalar_one_or_none()
-    if not printer:
+    if result.scalar_one_or_none() is None:
         raise HTTPException(404, "Printer not found")
 
-    client = printer_manager.get_client(printer_id)
-    if not client:
-        raise HTTPException(400, "Printer not connected")
+    return _ams_command_response(await ams_command.command_for_operator(printer_id, "unload"))
 
-    # Mid-filament-change gate — the unload half of the same firmware fact. 009-H2S
-    # 2026-07-20 spent FOUR unloads here (recovery's two and the operator's two), all
-    # silently dropped, before a resume unwedged the state machine; this route had no
-    # gate at all until 2026-09-11.
-    if ams_mid_filament_change(printer_manager.get_status(printer_id)):
-        raise HTTPException(
-            409,
-            (
-                f"{printer.name}'s AMS is mid filament-change (ams_status_main=1). The firmware drops "
-                "every unload in this state — the click would return 200 and move nothing "
-                "(009-H2S 2026-07-20: four unloads, all ignored). Press Retry/Continue on the printer "
-                "screen (or resume the print) so the change completes, then unload."
-            ),
-        )
 
-    success = client.ams_unload_filament()
-    if not success:
-        raise HTTPException(500, "Failed to send unload command")
-
-    return {"success": True, "message": "Unloading filament"}
+def _ams_command_response(result: ams_command.AmsCommandResult) -> AmsCommandResponse:
+    """Outcome → HTTP. The service decides and composes the sentence; this only maps."""
+    if result.outcome == "refused_not_connected":
+        raise HTTPException(400, result.message)
+    if result.outcome == "refused_runout_hold":
+        raise HTTPException(409, result.message)
+    return AmsCommandResponse(outcome=result.outcome, message=result.message)
 
 
 @router.get("/{printer_id}/runtime-debug")

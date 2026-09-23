@@ -288,9 +288,9 @@ class TestBusyDiagnostic:
 
 class TestAmsMidFilamentChangeGate:
     """002-H2S 2026-09-11: the AMS sat at ``ams_status_main == 1`` behind a layer-0
-    jam — a state in which the firmware drops every ``ams_change_filament`` — and the
-    scheduler dispatched onto it 31 s after the stop. The wedge carries no HMS code of
-    its own once the fault clears, so the standing-fault gate above cannot see it.
+    jam and the scheduler dispatched onto it 31 s after the stop. The wedge carries no
+    HMS code of its own once the fault clears, so the standing-fault gate above cannot
+    see it.
     """
 
     def _mid_change(self, live: str = "IDLE"):

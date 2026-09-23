@@ -2470,11 +2470,16 @@ class NotificationService:
     ):
         """Fire when a printer sits IDLE with its AMS latched mid filament-change.
 
-        At ``ams_status_main == 1`` the firmware drops every ``ams_change_filament``,
-        load and unload alike, and only its own CONTINUE moves it on. 002-H2S
-        2026-09-11: a layer-0 jam parked the AMS there, the operator's two Load clicks
-        returned 200 and moved nothing, and the printer would have taken no work until
-        somebody touched its screen.
+        At ``ams_status_main == 1`` the dispatcher refuses this printer while the AMS
+        is mid-change, and with no incident open and no recovery driver live the farm
+        has not commanded anything here. 002-H2S 2026-09-11: a layer-0 jam parked the
+        AMS there with nothing loaded, the operator's two Load clicks into that empty
+        path returned 200 and moved nothing, and the printer would have taken no work
+        until somebody touched its screen. A load into an empty path under the
+        firmware's change-error modal is the one measured posture; every other command
+        in this state is measured per send by :mod:`ams_command`. The page names the
+        printer's Continue and the printer card's Unload, which reports whether the AMS
+        moved.
 
         Its own event rather than a reuse of the pause-stall copy, because the printer
         is NOT paused — it is idle, looks healthy on every surface, and is held out of

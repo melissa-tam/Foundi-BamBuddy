@@ -2066,12 +2066,14 @@ class PrintScheduler:
             )
             return self._refuse(printer_id, "standing_fault:" + ",".join(codes))
 
-        # AMS wedged mid filament-change (002-H2S 2026-09-11). A DIFFERENT question
-        # from the one above and invisible to it: the wedge outlives the jam code
-        # that caused it, so the wire can read clean while the AMS still drops every
-        # filament move. Dispatching there is what happened at 31 s after the stop —
-        # the print cannot feed, and the firmware only leaves this state on a CONTINUE
-        # somebody presses. Value-1-only by measurement; see the predicate.
+        # AMS parked mid filament-change (002-H2S 2026-09-11). A DIFFERENT question
+        # from the one above and invisible to it: the posture outlives the jam code
+        # that caused it, so the wire can read clean while the AMS is still mid-change.
+        # The farm dispatched into it 31 s after the stop; the dispatch watchdog then
+        # force-reconnected MQTT three times. This gate refuses a DISPATCH into a parked
+        # change. What a load or unload does in this posture is a separate question,
+        # measured per command by ``ams_command`` (the ``[ams-command] … answer=``
+        # line). Value-1-only by measurement; see the predicate.
         if ams_mid_filament_change(state):
             logger.debug(
                 "Printer %d: not idle — AMS mid filament-change (ams_status_main=1, state=%s)",

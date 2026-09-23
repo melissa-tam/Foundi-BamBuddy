@@ -877,6 +877,10 @@ export default {
       unloadInitiated: 'Filament wird entladen…',
       failedToLoad: 'Filament konnte nicht geladen werden',
       failedToUnload: 'Filament konnte nicht entladen werden',
+      amsLoadNoMovement: 'Laden gesendet. AMS hat sich nicht bewegt.',
+      amsUnloadNoMovement: 'Entladen gesendet. AMS hat sich nicht bewegt.',
+      amsUnloadNothingLoaded: 'Entladen gesendet. Es war nichts geladen.',
+      amsCommandSessionChanged: 'Drucker während des Befehls neu verbunden. AMS prüfen.',
     },
     // Connection status
     connection: {

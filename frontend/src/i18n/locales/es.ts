@@ -877,6 +877,10 @@ export default {
       unloadInitiated: 'Descargando filamento…',
       failedToLoad: 'Error al cargar el filamento',
       failedToUnload: 'Error al descargar el filamento',
+      amsLoadNoMovement: 'Carga enviada. El AMS no se movió.',
+      amsUnloadNoMovement: 'Descarga enviada. El AMS no se movió.',
+      amsUnloadNothingLoaded: 'Descarga enviada. No había nada cargado.',
+      amsCommandSessionChanged: 'La impresora se reconectó durante el comando. Revise el AMS.',
     },
     // Connection status
     connection: {

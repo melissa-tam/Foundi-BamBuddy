@@ -877,6 +877,10 @@ export default {
       unloadInitiated: 'Déchargement du filament…',
       failedToLoad: 'Échec du chargement du filament',
       failedToUnload: 'Échec du déchargement du filament',
+      amsLoadNoMovement: 'Chargement envoyé. L’AMS n’a pas bougé.',
+      amsUnloadNoMovement: 'Déchargement envoyé. L’AMS n’a pas bougé.',
+      amsUnloadNothingLoaded: 'Déchargement envoyé. Rien n’était chargé.',
+      amsCommandSessionChanged: 'Imprimante reconnectée pendant la commande. Vérifiez l’AMS.',
     },
     // Connection status
     connection: {

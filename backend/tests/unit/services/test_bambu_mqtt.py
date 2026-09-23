@@ -6220,3 +6220,88 @@ class TestAmsControlPublisher:
 
         assert mqtt_client.ams_control("resume") is False
         assert _published_payloads(mqtt_client) == []
+
+
+class TestTrayTarParse:
+    """``tray_tar`` — the AMS's own target tray, part of the wire's answer to a motion
+    command (``services/ams_command`` reads it as movement evidence). Recorded exactly as
+    the wire spelled it, beside ``tray_now``, and never disambiguated."""
+
+    client_kwargs = {"serial": "TEST_TRAY_TAR"}
+
+    def test_unseen_is_none(self, mqtt_client):
+        assert mqtt_client.state.tray_tar is None
+
+    def test_parsed_from_the_ams_dict(self, mqtt_client):
+        mqtt_client._process_message({"print": {"ams": {"tray_now": "3", "tray_tar": "3"}}})
+
+        assert mqtt_client.state.tray_tar == 3
+
+    def test_the_p1s_partial_update_carries_it_too(self, mqtt_client):
+        mqtt_client._handle_ams_data({"tray_now": 255, "tray_tar": 6})
+
+        assert mqtt_client.state.tray_tar == 6
+
+    def test_an_absent_field_keeps_the_last_value(self, mqtt_client):
+        mqtt_client._process_message({"print": {"ams": {"tray_now": "3", "tray_tar": "3"}}})
+        mqtt_client._process_message({"print": {"ams": {"tray_now": "255"}}})
+
+        assert mqtt_client.state.tray_tar == 3
+
+    def test_an_unparseable_value_asserts_nothing(self, mqtt_client):
+        mqtt_client._process_message({"print": {"ams": {"tray_now": "3", "tray_tar": "garbage"}}})
+
+        assert mqtt_client.state.tray_tar is None
+
+    def test_tray_now_is_untouched_by_it(self, mqtt_client):
+        """No tray_now disambiguation reads tray_tar: a target that differs from the fed
+        tray changes nothing about tray_now."""
+        mqtt_client._process_message({"print": {"ams": {"tray_now": "2", "tray_tar": "7"}}})
+
+        assert (mqtt_client.state.tray_now, mqtt_client.state.tray_tar) == (2, 7)
+
+    def test_serialized_beside_tray_now(self, mqtt_client):
+        from backend.app.services.printer_manager import printer_state_to_dict
+
+        mqtt_client._process_message({"print": {"ams": {"tray_now": "3", "tray_tar": "3"}}})
+
+        frame = printer_state_to_dict(mqtt_client.state)
+        assert (frame["tray_now"], frame["tray_tar"]) == (3, 3)
+
+
+class TestAmsMotionEcho:
+    """The firmware's echo of a motion command is its own answer to it — invariant 14
+    (every command ACK is consumed). It used to be dropped at DEBUG."""
+
+    client_kwargs = {"serial": "TEST_ECHO"}
+
+    @pytest.mark.parametrize("command", ["ams_change_filament", "ams_control"])
+    def test_a_motion_echo_is_logged_at_info(self, mqtt_client, caplog, command):
+        caplog.set_level(logging.DEBUG, logger="backend.app.services.bambu_mqtt")
+
+        mqtt_client._process_message(
+            {"print": {"command": command, "sequence_id": "42", "result": "fail", "reason": "busy"}}
+        )
+
+        echoes = [r for r in caplog.records if "echo:" in r.getMessage()]
+        assert [(r.levelno, r.getMessage()) for r in echoes] == [
+            (logging.INFO, f"[TEST_ECHO] {command} echo: sequence_id=42 result=fail reason=busy")
+        ]
+
+    def test_missing_fields_are_none(self, mqtt_client, caplog):
+        caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
+
+        mqtt_client._process_message({"print": {"command": "ams_change_filament"}})
+
+        assert "[TEST_ECHO] ams_change_filament echo: sequence_id=None result=None reason=None" in [
+            r.getMessage() for r in caplog.records
+        ]
+
+    def test_other_command_responses_stay_at_debug(self, mqtt_client, caplog):
+        caplog.set_level(logging.DEBUG, logger="backend.app.services.bambu_mqtt")
+
+        mqtt_client._process_message({"print": {"command": "push_status", "sequence_id": "1"}})
+
+        responses = [r for r in caplog.records if "Received command response: push_status" in r.getMessage()]
+        assert [r.levelno for r in responses] == [logging.DEBUG]
+        assert not any("echo:" in r.getMessage() for r in caplog.records)

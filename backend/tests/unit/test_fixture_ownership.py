@@ -125,7 +125,6 @@ CLOCK_CLASS_ALLOWLIST = frozenset(
         "backend/tests/unit/services/eject/test_remote.py",
         "backend/tests/unit/services/test_ams_write_epoch.py",
         "backend/tests/unit/services/test_plate_occupancy.py",
-        "backend/tests/unit/services/test_spool_recovery.py",
         "backend/tests/unit/services/test_spool_tagless_reconcile.py",
         "backend/tests/unit/test_retry_window.py",
     }

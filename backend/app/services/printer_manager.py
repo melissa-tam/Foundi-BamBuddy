@@ -1566,6 +1566,9 @@ def printer_state_to_dict(
         "ams_status_main": state.ams_status_main,
         "ams_status_sub": state.ams_status_sub,
         "tray_now": state.tray_now,
+        # The AMS's own target tray, raw (never a feeder id) — the wire's answer to a
+        # motion command, read by services/ams_command as movement evidence.
+        "tray_tar": state.tray_tar,
         # Last tray fed THIS job (reset to -1 at print start; survives the
         # end-of-print retract → 255). Drives the "was feeding" dimmed AMS ring
         # during a runout PAUSE, when tray_now reads 255 and clears the live ring.

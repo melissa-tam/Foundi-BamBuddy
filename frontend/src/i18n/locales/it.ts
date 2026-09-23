@@ -877,6 +877,10 @@ export default {
       unloadInitiated: 'Scaricamento filamento…',
       failedToLoad: 'Caricamento filamento fallito',
       failedToUnload: 'Scaricamento filamento fallito',
+      amsLoadNoMovement: 'Caricamento inviato. L’AMS non si è mosso.',
+      amsUnloadNoMovement: 'Scaricamento inviato. L’AMS non si è mosso.',
+      amsUnloadNothingLoaded: 'Scaricamento inviato. Non era caricato nulla.',
+      amsCommandSessionChanged: 'Stampante riconnessa durante il comando. Controlla l’AMS.',
     },
     // Connection status
     connection: {

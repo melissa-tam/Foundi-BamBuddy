@@ -128,7 +128,7 @@ class NotificationProvider(Base):
     )  # A dispatch picked a tray with NO firmware backup partner while a near-identical tray sat beside it
     on_ams_wedged_idle = Column(
         Boolean, default=True
-    )  # AMS latched mid filament-change on an IDLE printer: it drops every load/unload and dispatch is held
+    )  # AMS parked mid filament-change on an IDLE printer: the dispatcher refuses it while the AMS is mid-change
     on_storage_low = Column(
         Boolean, default=True
     )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)

@@ -30,7 +30,7 @@ from backend.app.models.printer_incident import KIND_PLATE_VISION, PrinterIncide
 from backend.app.models.recovery_escalation import RecoveryEscalation
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import incident_resolution, printer_incidents, spool_recovery
+from backend.app.services import ams_command, incident_resolution, printer_incidents, spool_recovery
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
 from backend.app.services.printer_incidents import (
     WAITING_REASON_FAILED,
@@ -41,6 +41,7 @@ from backend.app.services.spool_recovery import (
     clear_on_reinsert,
     on_ams_fault,
 )
+from backend.tests._fixtures.clock import FakeClock
 
 _NONE_TAG = "0000000000000000"
 _NONE_UUID = "0" * 32
@@ -52,8 +53,12 @@ _NONE_UUID = "0" * 32
 @pytest.fixture(autouse=True)
 def _reset():
     spool_recovery._reset_state()
+    # The operator-attribution stamps the driver's takeover predicate reads live in
+    # ams_command (its owner), so a stamp one case made must not reach the next.
+    ams_command._reset_state()
     yield
     spool_recovery._reset_state()
+    ams_command._reset_state()
 
 
 @pytest.fixture(autouse=True)
@@ -61,10 +66,10 @@ def _fast_timing(monkeypatch):
     monkeypatch.setattr(spool_recovery, "_POLL_INTERVAL_S", 0.005)
     monkeypatch.setattr(spool_recovery, "_POST_RESUME_STABLE_S", 0.02)
     monkeypatch.setattr(spool_recovery, "_REPAUSE_WATCH_S", 0.03)
-    # The unload settle dwell is wall-clock by nature; zero it so the confirm
-    # resolves on the first idle+empty poll. The dwell itself is pinned with a fake
-    # clock in TestUnloadGraceDwell.
-    monkeypatch.setattr(spool_recovery, "_UNLOAD_GRACE_S", 0.0)
+    # The unload settle dwell is wall-clock by nature; zero it so the classifier's
+    # grace-held rows answer on the first qualifying poll. The dwell itself is pinned
+    # with a fake clock in TestUnloadGraceDwell (and row by row in test_ams_command).
+    monkeypatch.setattr(ams_command, "UNLOAD_GRACE_S", 0.0)
     # The entry-gate throttle is a per-push cost bound, not a decision: zero it so
     # every case exercises the DURABLE gates. Its own behaviour is pinned in
     # TestEntryThrottle.
@@ -227,6 +232,9 @@ class FakeClient:
         resume_ret=True,
         pause_ret=True,
         unload_stuck=False,
+        unload_deaf=False,
+        unload_sub_only=False,
+        unload_keeps_change=False,
         write_refusal=None,
         refusal_clears_on_settle=False,
         resume_unwedges=True,
@@ -256,6 +264,16 @@ class FakeClient:
         # unload_stuck: the AMS accepts the command but stays mid-filament-change
         # (ams_status_main == 1) — the live 009-H2S state machine.
         self.unload_stuck = unload_stuck
+        # The three other unload answers ``ams_command.classify`` tells apart:
+        # unload_deaf — the publish goes out and NOTHING on the wire moves
+        #   (``no_movement``, or ``undecidable`` into an empty mid-change AMS);
+        # unload_sub_only — the AMS moves (``ams_status_sub`` steps) and never completes
+        #   (``acted``);
+        # unload_keeps_change — the feeder empties (tray_now → 255) while the AMS stays in
+        #   the change the print still owes (the ``mid_change_loaded`` ``complete``).
+        self.unload_deaf = unload_deaf
+        self.unload_sub_only = unload_sub_only
+        self.unload_keeps_change = unload_keeps_change
         # write_refusal: what ams_write_refusal() reports (None = wire is clear).
         self.write_refusal = write_refusal
         self.refusal_clears_on_settle = refusal_clears_on_settle
@@ -292,6 +310,14 @@ class FakeClient:
             return True
         if self.unload_stuck:
             self.state.ams_status_main = 1  # filament_change never completes
+            return True
+        if self.unload_deaf:
+            return True  # published; the AMS does not move
+        if self.unload_sub_only:
+            self.state.ams_status_sub += 1  # the AMS moved; the feeder never empties
+            return True
+        if self.unload_keeps_change:
+            self.state.tray_now = 255  # the feeder emptied; ams_status_main untouched
             return True
         self.state.ams_status_main = 0  # the change state machine returned to idle
         if self._unload >= self.unload_after:
@@ -1816,10 +1842,17 @@ def _escalated_reasons(caplog) -> list[str]:
 
 
 async def test_incident_pin_unloads_before_first_load_when_ams_stuck_mid_change(
-    db_session, printer_factory, install_settings, monkeypatch
+    db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
     """THE INCIDENT PIN: PAUSE + tray_now 255 + ams_status_main 1 (filament_change)
-    + a live 0700_8010 → an unload MUST be published before the first load."""
+    + a live 0700_8010 → an unload MUST be published before the first load, and its
+    answer is MEASURED (``ams_command.classify``), never assumed.
+
+    Here the firmware CONTINUE frees the change first, so the unload goes into an idle
+    AMS and completes on the classifier's idle-and-empty row. What 009 measured about
+    the unloads sent BEFORE its CONTINUE — four at ``tray_now == 255``, all silent — is
+    that nothing loaded cannot move: undecidable, not "the firmware drops every unload"
+    (see test_an_undecidable_unload_proceeds_to_the_load)."""
     install_settings()
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -1828,14 +1861,18 @@ async def test_incident_pin_unloads_before_first_load_when_ams_stuck_mid_change(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    task = await on_ams_fault(printer.id, state)
-    await task
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        task = await on_ams_fault(printer.id, state)
+        await task
 
     motion = [c for c in client.calls if c[0] in ("unload", "load")]
     assert motion, "recovery sent no AMS motion at all"
     assert motion[0] == ("unload",), f"the first AMS command must be the unload, got {motion}"
     assert ("load", 1) in client.calls
     assert state.state == "RUNNING"  # self-healed, no human needed
+    answers = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ams-command] actor=driver")]
+    assert any("command=unload" in line and "answer=complete" in line for line in answers)
+    assert any("command=load" in line and "answer=complete" in line for line in answers)
 
 
 async def test_every_candidate_round_unloads_again_after_a_failed_load(
@@ -1903,27 +1940,45 @@ async def test_unload_confirms_only_after_the_ams_returns_to_idle(
     assert state.state == "RUNNING"
 
 
-async def test_unload_stuck_non_idle_never_confirms_and_never_loads(
-    db_session, printer_factory, install_settings, monkeypatch, caplog
+@pytest.mark.parametrize(
+    "unload_knob,answer",
+    [
+        # The AMS moved (ams_status_sub stepped) and never completed: resent within
+        # max_attempts, then given up.
+        ("unload_sub_only", "acted"),
+        # Nothing on the wire moved, outside a filament change: the ladder's second entry
+        # has nothing to pull (``skipped``), the unload is resent ONCE, then given up.
+        ("unload_deaf", "no_movement"),
+    ],
+)
+async def test_an_unload_that_never_completed_never_leads_to_a_load(
+    db_session, printer_factory, install_settings, monkeypatch, caplog, unload_knob, answer
 ):
-    """An AMS state machine still non-idle at the step timeout is NOT a confirmed
-    unload: the send is retried, then recovery escalates `unload_failed` — it never
-    loads into a busy AMS."""
+    """An unload the wire answered ``acted`` or ``no_movement`` is NOT a completed
+    unload: it is resent, then recovery escalates ``unload_failed`` — no load is ever
+    published behind it (invariant 8), and the page names what the wire answered."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
-    _spy(monkeypatch, "on_spool_recovery_failed")
-    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
-    client = FakeClient(state, unload_stuck=True)  # never returns to idle
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    _spy(monkeypatch, "on_spool_out_of_rotation")
+    # The feeder is engaged at an idle AMS (posture ``idle``): no filament change, so no
+    # lever is ever pulled — the unload's own answer decides.
+    state = _make_state(tray_now=0, ams_status_main=0, trays=[_ams_tray(0), _ams_tray(1)])
+    client = FakeClient(state, **{unload_knob: True})
     _wire(monkeypatch, state, client)
 
-    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert client.calls.count(("unload",)) == 2  # both attempts resent
-    assert not any(c[0] == "load" for c in client.calls)  # never loaded unconfirmed
+    assert client.calls.count(("unload",)) == 2
+    assert not any(c[0] == "load" for c in client.calls)  # never loaded behind an unfinished unload
     assert _escalated_reasons(caplog) == ["unload_failed"]
+    lines = [r.getMessage() for r in caplog.records]
+    assert sum(1 for m in lines if "command=unload" in m and f"answer={answer}" in m) == 2
+    assert not any("lever=" in m for m in lines)
+    assert "Sent: unload ×2 (" in failed.call_args.kwargs["detail"]
     assert state.state == "PAUSE"
     db_session.expunge_all()
     assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
@@ -1931,8 +1986,9 @@ async def test_unload_stuck_non_idle_never_confirms_and_never_loads(
 
 # ===========================================================================
 # Unload settle dwell: with no observed filament-change cycle (command latency or
-# a no-op unload), idle+empty must HOLD for _UNLOAD_GRACE_S before the load starts.
-# Driven on a fake clock — no test ever sleeps for real.
+# a no-op unload), idle+empty must HOLD for ams_command.UNLOAD_GRACE_S before the
+# classifier calls the unload complete. Driven on a fake clock — no test ever sleeps
+# for real.
 # ===========================================================================
 
 
@@ -1975,49 +2031,56 @@ def _incident(
     )
 
 
+def _unload_record(answer="complete", posture="idle"):
+    """One unload the driver's evidence records as having gone out."""
+    return spool_recovery.CommandRecord(command="unload", target=None, posture=posture, answer=answer, at=0.0)
+
+
+async def _ladder(incident, client, *, evidence=None, entry="round_start"):
+    """Drive ONE ladder entry with a driver's evidence (a fresh driver when omitted)."""
+    return await spool_recovery._reset_stuck_change(
+        incident,
+        client,
+        evidence=evidence if evidence is not None else spool_recovery._RecoveryEvidence(),
+        entry=entry,
+    )
+
+
 class TestUnloadGraceDwell:
-    """`_confirm_unloaded`'s no-cycle-observed path. The operator's proven manual
-    recovery left 16 s between the unload and the load that worked; the machine now
-    gives the spool at least `_UNLOAD_GRACE_S` of held idle+empty before loading."""
+    """`_confirm_unloaded` reads the unload through ``ams_command.classify``, whose
+    no-cycle-observed row needs idle + nothing fed HELD for ``UNLOAD_GRACE_S`` (the
+    operator's proven manual recovery left 16 s between the unload and the load that
+    worked). The row itself is pinned in test_ams_command; these pin that the DRIVER's
+    loop honours it — elapsed measured from the entry snapshot on ``ams_command``'s
+    clock, the step timeout as the deadline."""
 
     @pytest.fixture
     def clock(self, monkeypatch):
-        class _Clock:
-            """Monotonic fake clock advanced only by the module's poll sleep."""
-
-            def __init__(self, step: float = 2.0):
-                self.t = 0.0
-                self.step = step
-
-            def now(self) -> float:
-                return self.t
-
-            async def sleep(self, _delay):
-                self.t += self.step
-
-        c = _Clock()
-        monkeypatch.setattr(spool_recovery, "_now", c.now)
+        # Advanced only by the module's poll sleep. No loop yield inside the sleep: the
+        # stand-in IS ``asyncio.sleep`` here, so yielding through it would recurse.
+        c = FakeClock(start=0.0, step=2.0, sleep_mode="step", yield_on_sleep=False)
+        monkeypatch.setattr(ams_command, "_monotonic", c)
         monkeypatch.setattr(spool_recovery.asyncio, "sleep", c.sleep)
-        monkeypatch.setattr(spool_recovery, "_UNLOAD_GRACE_S", 15.0)  # the production value
+        monkeypatch.setattr(ams_command, "UNLOAD_GRACE_S", 15.0)  # the production value
         return c
 
-    async def test_ok_only_after_the_grace_dwell_elapsed(self, clock, monkeypatch):
+    async def test_complete_only_after_the_grace_dwell_elapsed(self, clock, monkeypatch):
         state = _make_state(tray_now=255, ams_status_main=0)
         _wire(monkeypatch, state, FakeClient(state))
 
-        verdict = await spool_recovery._confirm_unloaded(_incident(1, step_timeout_s=60.0))
+        verdict = await spool_recovery._confirm_unloaded(_incident(1, step_timeout_s=60.0), ams_command.snapshot(state))
 
-        assert verdict == "ok"
-        assert clock.t >= spool_recovery._UNLOAD_GRACE_S  # never confirmed early
+        assert verdict == "complete"
+        assert clock.t >= ams_command.UNLOAD_GRACE_S  # never confirmed early
 
-    async def test_timeout_when_the_dwell_cannot_fit_in_the_step_timeout(self, clock, monkeypatch):
+    async def test_no_movement_when_the_dwell_cannot_fit_in_the_step_timeout(self, clock, monkeypatch):
         state = _make_state(tray_now=255, ams_status_main=0)
         _wire(monkeypatch, state, FakeClient(state))
 
-        verdict = await spool_recovery._confirm_unloaded(_incident(1, step_timeout_s=10.0))
+        verdict = await spool_recovery._confirm_unloaded(_incident(1, step_timeout_s=10.0), ams_command.snapshot(state))
 
-        assert verdict == "timeout"  # idle+empty held, but not long enough
-        assert clock.t < spool_recovery._UNLOAD_GRACE_S
+        assert verdict == "no_movement"  # idle+empty held, but not long enough — and nothing moved
+        assert clock.t < ams_command.UNLOAD_GRACE_S
 
     async def test_dwell_restarts_when_the_ams_goes_busy_again(self, clock, monkeypatch):
         """Any contrary poll restarts the dwell — and once a cycle IS observed, the
@@ -2032,10 +2095,10 @@ class TestUnloadGraceDwell:
 
         _wire(monkeypatch, state, FakeClient(state), on_poll=_on_poll)
 
-        verdict = await spool_recovery._confirm_unloaded(_incident(1, step_timeout_s=60.0))
+        verdict = await spool_recovery._confirm_unloaded(_incident(1, step_timeout_s=60.0), ams_command.snapshot(state))
 
-        assert verdict == "ok"
-        assert clock.t < spool_recovery._UNLOAD_GRACE_S  # confirmed by the cycle, not the dwell
+        assert verdict == "complete"
+        assert clock.t < ams_command.UNLOAD_GRACE_S  # confirmed by the cycle, not the dwell
 
 
 # ===========================================================================
@@ -2104,9 +2167,9 @@ async def test_confirmed_unloads_with_every_load_failing_escalates_feed_path_blo
 
     One unload per attempted load (004-H2S 2026-09-17): the third round finds no
     candidate and abandons at selection without unloading, and the give-up then tries to
-    put the jammed spool BACK. With no load confirming, that reload fails too — so the
-    page states the left-behind state instead of implying it, and the reason is
-    unchanged (the restore is not a candidate and is not counted as evidence)."""
+    put the jammed spool BACK. The AMS does not move on that reload either — so the page
+    states the left-behind state and the wire's answer instead of implying it, and the
+    reason is unchanged (the restore is not a candidate and is not counted as evidence)."""
     install_settings()
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -2124,7 +2187,10 @@ async def test_confirmed_unloads_with_every_load_failing_escalates_feed_path_blo
     assert _escalated_reasons(caplog) == ["feed_path_blocked"]
     assert ("load", 0) in client.calls  # the restore tried to reload the jammed tray
     assert state.tray_now == 255  # ...and it did not take: nothing is loaded
-    assert "No filament is loaded: AMS A slot 1 was unloaded and the reload failed" in failed.call_args.kwargs["detail"]
+    assert (
+        "No filament is loaded: AMS A slot 1 was unloaded; the reload was sent and the AMS did not move."
+        in failed.call_args.kwargs["detail"]
+    )
 
 
 async def test_drying_refusal_escalates_ams_drying_without_burning_attempts(
@@ -2176,15 +2242,19 @@ def test_every_escalation_reason_has_operator_facing_copy():
     for reason in ("no_eligible_spool", "candidate_loads_failed", "feed_path_blocked", "ams_drying"):
         assert reason in spool_recovery._ESCALATE_DETAIL
         assert spool_recovery._ESCALATE_DETAIL[reason].endswith("Left PAUSED for a human.")
-    # W1/002-H2S: the wedged-change reasons state the FIRMWARE FACT first and then
-    # the action that ends it. "Check the buffer/feeder" sent the operator to inspect
-    # hardware before pressing the one button that frees a wedged filament-change.
-    for reason in ("unload_failed", "stuck_reset_failed"):
+    # The three reasons a jam reaches after the farm SENT its CONTINUEs and swap
+    # commands (012-H2S 2026-09-22, incident 304). The copy never instructs the action
+    # the driver just proved ineffective — no bare "press Retry/Continue" — never
+    # restates the retracted premise ("ams_status_main=1: the firmware drops every
+    # load and unload"), and ends with the PHYSICAL exit first. What was sent and what
+    # the wire answered is the evidence sentence's job (_compose_detail), not the copy's.
+    for reason in ("unload_failed", "stuck_reset_failed", "swap_dropped_wedged"):
         assert reason in spool_recovery._ESCALATE_DETAIL
         detail = spool_recovery._ESCALATE_DETAIL[reason]
-        assert "ams_status_main=1" in detail  # the firmware fact
-        assert "Retry/Continue" in detail  # the on-printer action
-        assert detail.endswith("The farm swaps or resumes from there.")
+        assert "Retry" not in detail
+        assert "ams_status_main" not in detail
+        assert "drops every" not in detail
+        assert detail.endswith("Open the AMS and free the filament at the feeder, then press Continue on the printer.")
 
 
 # ===========================================================================
@@ -2218,12 +2288,13 @@ async def test_jam_attributed_to_live_tray_when_attr_carries_no_slot(
 
 
 # ===========================================================================
-# W1: stuck-change firmware reset (009-H2S 2026-07-20).
+# W1: the wedge lever ladder (009-H2S 2026-07-20).
 #
-# After a feed fault the AMS can sit WEDGED mid filament-change (PAUSE +
-# ams_status_main non-idle) where it silently ignores unloads. The ONLY verb that
-# freed it live was a resume (the touchscreen CONTINUE). Every candidate round now
-# runs _reset_stuck_change FIRST.
+# After a feed fault the AMS can sit mid filament-change (PAUSE + ams_status_main 1).
+# On 009 a resume (the touchscreen CONTINUE) freed it; the unloads sent before it went
+# out with nothing loaded, so their silence was undecidable — not proof the firmware
+# ignores an unload there. Every candidate round runs _reset_stuck_change FIRST, and
+# whatever the ladder reads, the swap commands then go out and are measured.
 # ===========================================================================
 
 
@@ -2242,8 +2313,8 @@ class _SelfHealClient(FakeClient):
 
 
 class _WedgedClient(FakeClient):
-    """The AMS ignores even the reset resume: the send is accepted but the state
-    machine never moves (still PAUSE, still non-idle) — a genuinely dead AMS."""
+    """The printer never moves on the resume: the send is accepted but the state
+    machine stays PAUSE at the same ``ams_status`` — outcome (d), ``never_moved``."""
 
     def resume_print(self):
         self.calls.append(("resume",))
@@ -2304,7 +2375,7 @@ async def test_reset_outcome_auto_refault_returns_ok_no_self_pause(monkeypatch):
     client = FakeClient(state)
     _wire(monkeypatch, state, client, on_poll=_on_poll)
 
-    verdict = await spool_recovery._reset_stuck_change(_incident(7, step_timeout_s=1.0), client)
+    verdict = await _ladder(_incident(7, step_timeout_s=1.0), client)
 
     assert verdict == "ok"
     assert ("resume",) in client.calls  # the reset resume was published
@@ -2369,10 +2440,12 @@ async def test_reset_recovered_self_heals_without_swap(db_session, printer_facto
 async def test_reset_never_moves_escalates_stuck_reset_failed(
     db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
-    """Reset (d): the AMS ignores even the reset resume (state never leaves PAUSE +
-    non-idle) → recovery escalates the new stuck_reset_failed reason, never touching
-    the unload. The feeder is genuinely wedged, so the jammed spool IS taken out of
-    rotation at this commit boundary — before the escalation."""
+    """Outcome (d): the printer never moves on EITHER CONTINUE (state never leaves
+    PAUSE at the same ams_status) → ``fail`` → ``stuck_reset_failed``, never touching the
+    unload. ``fail`` is narrow: a CONTINUE that could not be sent or never moved the
+    printer — a still-wedged AMS after a CONTINUE that DID move it is ``wedged`` and the
+    swap round runs. The jammed spool IS taken out of rotation at this commit boundary,
+    and the page carries what was sent and what the wire answered."""
     install_settings(step_timeout_s=0.05)
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
@@ -2387,11 +2460,13 @@ async def test_reset_never_moves_escalates_stuck_reset_failed(
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert ("resume",) in client.calls  # the reset was attempted
+    assert ("resume",) in client.calls  # tier 1 was attempted
+    assert ("ams_control", "resume") in client.calls  # ...and tier 2: the AMS was still in the change
     assert ("unload",) not in client.calls  # escalated before the unload
     assert _escalated_reasons(caplog) == ["stuck_reset_failed"]
-    assert "ams_status_main=1" in failed.call_args.kwargs["detail"]  # names the firmware fact
-    assert "Retry/Continue" in failed.call_args.kwargs["detail"]  # ...and the on-printer action
+    detail = failed.call_args.kwargs["detail"]
+    assert detail.startswith(spool_recovery._ESCALATE_DETAIL["stuck_reset_failed"])
+    assert "Sent: resume (printer did not move); ams_control resume (printer did not move)." in detail
     oor.assert_awaited_once()  # the wedged feeder's spool taken out of rotation at the commit boundary
     assert state.state == "PAUSE"  # never resumed blind
     db_session.expunge_all()
@@ -2406,32 +2481,48 @@ async def test_reset_skipped_when_ams_idle(monkeypatch):
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    verdict = await spool_recovery._reset_stuck_change(_incident(7, step_timeout_s=1.0), client)
+    verdict = await _ladder(_incident(7, step_timeout_s=1.0), client)
 
     assert verdict == "skipped"
     assert client.calls == []  # nothing published on an idle AMS
 
 
-async def test_stuck_reset_budget_spent_no_second_resume(monkeypatch):
-    """The reset budget is one per job: a second wedged round publishes NO second
-    resume — and it FAILS rather than skipping.
+async def test_levers_are_records_per_driver_not_per_job(monkeypatch):
+    """Each lever is pulled at most once per DRIVER, and "spent" is a LeverRecord in
+    that driver's evidence — never a counter keyed by the job.
 
-    "Skipped" meant "fall through to the unload exactly as an idle-AMS round would",
-    which on a still-wedged AMS is a round whose every command the firmware drops
-    (002-H2S 2026-09-11). The budget question is asked AFTER the wedge question for
-    that reason: an un-wedged AMS still skips."""
+    A second wedged round of the SAME driver publishes neither CONTINUE again and reads
+    ``wedged`` (the swap commands then go out and are measured) — not the retracted
+    "budget spent, the firmware drops every command" ``fail``. A NEW incident on the
+    same job is a new driver with fresh levers: 003-H2S 2026-09-19 04:31 met a second
+    fault 69 s after a self-heal and gave up with ZERO CONTINUEs sent ("reset budget
+    spent (1/1)") because the counter was keyed (printer, job)."""
     state = _make_state(tray_now=255, ams_status_main=1)
-    client = _WedgedClient(state)  # resume never moves the state machine
+    client = FakeClient(state, resume_unwedges=False)  # moves the printer; the AMS stays in the change
     _wire(monkeypatch, state, client)
     incident = _incident(7, step_timeout_s=0.02)
+    first_driver = spool_recovery._RecoveryEvidence()
 
-    v1 = await spool_recovery._reset_stuck_change(incident, client)
-    assert v1 == "fail"  # wedged: neither CONTINUE freed it
-    assert client.calls.count(("resume",)) == 1  # the first round published the reset
+    v1 = await _ladder(incident, client, evidence=first_driver)
+    assert v1 == "wedged"  # tier 1 moved it and it re-paused still wedged; tier 2 did not move it
+    assert [(r.lever, r.outcome) for r in first_driver.levers] == [
+        ("resume", "wedged"),
+        ("ams_control_resume", "never_moved"),
+    ]
+    assert client.calls.count(("resume",)) == 1
+    assert client.calls.count(("ams_control", "resume")) == 1
 
-    v2 = await spool_recovery._reset_stuck_change(incident, client)
-    assert v2 == "fail"  # budget spent AND still wedged — the caller escalates
-    assert client.calls.count(("resume",)) == 1  # NO second resume
+    v2 = await _ladder(incident, client, evidence=first_driver)
+    assert v2 == "wedged"  # every lever this entry may pull is spent: still wedged, never a give-up
+    assert client.calls.count(("resume",)) == 1  # NO second pull of either lever
+    assert client.calls.count(("ams_control", "resume")) == 1
+    assert len(first_driver.levers) == 2
+
+    second_driver = spool_recovery._RecoveryEvidence()  # a new incident on the same job
+    v3 = await _ladder(replace(incident, incident_id=8), client, evidence=second_driver)
+    assert v3 == "wedged"
+    assert client.calls.count(("resume",)) == 2  # its own tier 1
+    assert client.calls.count(("ams_control", "resume")) == 2  # ...and its own tier 2
 
 
 async def test_incident_pin_engaged_feeder_assist_fault_skips_reset_and_swaps(
@@ -2485,19 +2576,19 @@ async def test_incident_pin_engaged_feeder_assist_fault_skips_reset_and_swaps(
 @pytest.mark.parametrize("ams_main", [2, 3, 4])
 async def test_reset_skipped_for_non_filament_change_states(ams_main, monkeypatch):
     """Only ams_status_main == 1 (filament_change) is resume-resettable (009 evidence).
-    assist(3), identifying(2) and calibration(4) are NOT stuck changes: the reset is a
-    no-op ('skipped') that publishes NO resume and spends NO reset budget, so the
+    assist(3), identifying(2) and calibration(4) are NOT stuck changes: the ladder is a
+    no-op ('skipped') that publishes NO resume and records NO lever, so the
     unload→swap machine owns the round (006-H2S 2026-07-21)."""
     state = _make_state(tray_now=3, ams_status_main=ams_main)
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
-    incident = _incident(7, step_timeout_s=1.0)
+    evidence = spool_recovery._RecoveryEvidence()
 
-    verdict = await spool_recovery._reset_stuck_change(incident, client)
+    verdict = await _ladder(_incident(7, step_timeout_s=1.0), client, evidence=evidence)
 
     assert verdict == "skipped"
     assert client.calls == []  # nothing published on a non-filament-change AMS
-    assert (7, "task-1") not in spool_recovery._stuck_resets  # no reset budget spent
+    assert evidence.levers == []  # no lever spent
 
 
 async def test_confirm_unloaded_ok_after_engaged_assist_returns_to_idle(monkeypatch):
@@ -2515,9 +2606,9 @@ async def test_confirm_unloaded_ok_after_engaged_assist_returns_to_idle(monkeypa
     client = FakeClient(state)
     _wire(monkeypatch, state, client, on_poll=_on_poll)
 
-    verdict = await spool_recovery._confirm_unloaded(_incident(7, step_timeout_s=1.0))
+    verdict = await spool_recovery._confirm_unloaded(_incident(7, step_timeout_s=1.0), ams_command.snapshot(state))
 
-    assert verdict == "ok"
+    assert verdict == "complete"
 
 
 # ===========================================================================
@@ -2707,6 +2798,7 @@ class TestQuarantineReasonAllowlist:
             "feed_path_blocked",
             "unload_failed",
             "stuck_reset_failed",
+            "swap_dropped_wedged",
             "repeated_jams",
             "candidates_exhausted",
             "candidate_loads_failed",
@@ -3479,10 +3571,11 @@ async def test_assist_never_raises_on_a_broken_client(db_session, printer_factor
 
 
 # --- Trigger-set derivation -------------------------------------------------
-# The trigger sets are VIEWS of the hms_errors AMS fault taxonomy rather than
-# literals in spool_recovery. The pins below spell out the RATIFIED membership
-# independently of the module's own data, so a taxonomy edit that would change what
-# this machine ACTS on fails here rather than moving with it.
+# What this machine acts on is the hms_errors AMS fault TAXONOMY, read by class — the
+# short-code sets spool_recovery used to hold are deleted (they could not see an
+# attr-lane-only code such as 0700_0012). The pins below spell out the RATIFIED
+# membership of the taxonomy's own views independently of its data, so a taxonomy edit
+# that would change what this machine ACTS on fails here rather than moving with it.
 #
 # WIDENED 2026-08-09 (WS2b, operator-ratified partition): the swap machine's trigger
 # vocabulary is now the WHOLE mechanical-feed class. WS2a had pinned it to the
@@ -3551,35 +3644,65 @@ _RATIFIED_RUNOUT = frozenset(
 )
 
 
+def _short_lane_hms(short: str) -> HMSError:
+    """A short-code-lane entry for ``MMMM_CCCC`` (module word in the attr high half)."""
+    module, code = short.split("_")
+    return HMSError(code=code, attr=int(module, 16) << 16, module=int(module[:2], 16), severity=2)
+
+
 def test_ams_feed_fault_set_matches_the_ratified_partition():
-    assert spool_recovery.AMS_FEED_FAULT_HMS_CODES == _RATIFIED_AMS_FEED
+    from backend.app.services.hms_errors import extruder_side_short_codes, mechanical_feed_short_codes
+
+    assert mechanical_feed_short_codes() - extruder_side_short_codes() == _RATIFIED_AMS_FEED
 
 
 def test_extruder_feed_fault_set_matches_the_ratified_partition():
-    assert spool_recovery.EXTRUDER_FEED_FAULT_HMS_CODES == _RATIFIED_EXTRUDER
+    from backend.app.services.hms_errors import extruder_side_short_codes, mechanical_feed_short_codes
+
+    assert mechanical_feed_short_codes() & extruder_side_short_codes() == _RATIFIED_EXTRUDER
 
 
 def test_feed_fault_union_matches_the_ratified_partition():
-    assert spool_recovery.FEED_FAULT_HMS_CODES == _RATIFIED_AMS_FEED | _RATIFIED_EXTRUDER
+    from backend.app.services.hms_errors import mechanical_feed_short_codes
+
+    assert mechanical_feed_short_codes() == _RATIFIED_AMS_FEED | _RATIFIED_EXTRUDER
 
 
 def test_recoverable_set_matches_the_ratified_partition():
-    assert spool_recovery.RECOVERABLE_HMS_CODES == (_RATIFIED_AMS_FEED | _RATIFIED_EXTRUDER | _RATIFIED_RUNOUT)
+    from backend.app.services.hms_errors import AmsFaultClass, runout_short_codes
+
+    assert runout_short_codes() == _RATIFIED_RUNOUT
+    # The driver's live-fault vocabulary is the two CLASSES those views are drawn from.
+    assert frozenset({AmsFaultClass.MECHANICAL_FEED}) == spool_recovery._FEED_FAULT_CLASSES
+    assert frozenset({AmsFaultClass.MECHANICAL_FEED, AmsFaultClass.RUNOUT}) == (
+        spool_recovery._RECOVERABLE_FAULT_CLASSES
+    )
 
 
 def test_the_swap_set_is_exactly_the_mechanical_feed_class():
     """The widening's real contract: no marker sits between the taxonomy and the
-    machine any more, so a code classified mechanical_feed IS a swap trigger.
+    machine, so a code classified mechanical_feed IS a live feed fault to the driver.
 
     The one thing that DOES sit between them is hardware: an external-holder member
     of the same class is routed away from the machine by ``_route_fault``, not by
     being kept out of this vocabulary (a second membership list is exactly the
     drift doctrine invariant 1 forbids)."""
-    from backend.app.services.hms_errors import mechanical_feed_short_codes
-
-    assert mechanical_feed_short_codes() == spool_recovery.FEED_FAULT_HMS_CODES
     for short in ("0700_8005", "0700_8006", "0700_8028", "07FF_8005"):
-        assert short in spool_recovery.RECOVERABLE_HMS_CODES
+        state = _make_state(hms=[_short_lane_hms(short)])
+        assert spool_recovery._feed_fault_live(state), short
+        assert short in spool_recovery._active_recoverable_codes(state), short
+
+
+def test_an_attr_lane_only_feeder_stall_is_a_live_feed_fault():
+    """012-H2S 2026-09-22 (incident 304): ``0700_0012`` — AMS A slot 4 feeder motor
+    stalled — has ONLY a code-word row (the attr lane). The deleted short-code sets could
+    not see it, so the self-heal test and the repause-vs-abort choice read "no fault"
+    while it stood alone. Read by class over both lanes, it is live."""
+    state = _make_state(tray_now=3, ams_status_main=1, hms=[_mech_wire_hms(0, 3)])
+
+    assert spool_recovery._feed_fault_live(state)
+    assert spool_recovery._active_recoverable_codes(state) == frozenset({"0700_0012"})
+    assert not spool_recovery._unload_skippable(state)  # a standing feed fault is never "clean"
 
 
 def test_the_legacy_swap_marker_is_gone():
@@ -3592,9 +3715,11 @@ def test_the_legacy_swap_marker_is_gone():
 
 def test_external_spool_runouts_are_not_recoverable():
     """No AMS slot means no sibling tray — the swap machine has nothing to swap to."""
-    from backend.app.services.hms_errors import runout_external_short_codes
+    from backend.app.services.hms_errors import AmsFaultClass
 
-    assert not (runout_external_short_codes() & spool_recovery.RECOVERABLE_HMS_CODES)
+    assert AmsFaultClass.RUNOUT_EXTERNAL not in spool_recovery._RECOVERABLE_FAULT_CLASSES
+    state = _make_state(hms=[_short_lane_hms("07FF_8011")])
+    assert spool_recovery._active_recoverable_codes(state) == frozenset()
 
 
 # ===========================================================================
@@ -5466,11 +5591,12 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
 # 002-H2S 2026-09-11: the driver that outlived its own job, and the CONTINUE it
 # never sent.
 #
-# A layer-0 jam left the AMS PAUSEd and wedged mid filament-change
-# (`ams_status_main == 1`). The W1 reset published `print.resume`; the printer
-# retried the same slot, stalled and re-PAUSEd STILL wedged — and the reader called
-# that "ok", so the swap round's two unloads went into an AMS that drops every
-# unload, and it escalated `unload_failed`. The fork's SECOND spelling of the
+# A layer-0 jam left the AMS PAUSEd mid filament-change (`ams_status_main == 1`).
+# The W1 reset published `print.resume`; the printer retried the same slot, stalled
+# and re-PAUSEd STILL in the change — and the reader called that "ok" without a line
+# saying the AMS never left it. The swap round's two unloads went out with nothing
+# loaded (an undecidable posture: nothing physical can move), and it escalated
+# `unload_failed`. The fork's SECOND spelling of the
 # firmware CONTINUE, `ams_control("resume")`, had never been sent. Then the operator
 # STOPPED the print: `on_job_terminal` closed the incident row and nothing told the
 # driver, which loaded slot 1 itself, published resume/pause/resume against a FAILED
@@ -5692,55 +5818,67 @@ class TestTheResumeVocabulary:
 
 class TestTheUnwedgeReaderChecksTheAms:
     """WS3: every ``ok`` the reader returns is gated on the AMS having LEFT the
-    filament change. "The state machine moved" was never the same statement."""
+    filament change. "The state machine moved" was never the same statement — and a
+    still-wedged reading is a MEASUREMENT the round then takes, never a give-up."""
 
-    async def test_a_repause_that_is_still_wedged_is_a_fail(self, monkeypatch, caplog):
+    async def test_a_repause_that_is_still_wedged_reads_wedged(self, monkeypatch, caplog):
         """002's second wedge: the printer moved, retried, stalled and re-PAUSEd with
-        ``ams_status_main`` still 1. Today that was ``ok`` and the round unloaded into
-        a deaf AMS."""
+        ``ams_status_main`` still 1. The reader says so (``wedged``) — it is not ``ok``,
+        and since 2026-09-23 it is not ``fail`` either: whether the AMS acts on the swap
+        commands in that posture is what the round measures next."""
         state = _make_state(tray_now=255, ams_status_main=1)
         client = FakeClient(state, resume_unwedges=False)
         # The printer MOVES (the driver observes RUNNING), then re-PAUSEs — and the
         # AMS is still in the filament change underneath it.
         _wire(monkeypatch, state, client, on_poll=_repause_after_running(1))
+        evidence = spool_recovery._RecoveryEvidence()
 
-        with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
-            verdict = await spool_recovery._reset_stuck_change(_incident(7, step_timeout_s=0.1), client)
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            verdict = await _ladder(_incident(7, step_timeout_s=0.1), client, evidence=evidence)
 
-        assert verdict == "fail"
-        assert any("did not leave the filament change" in r.getMessage() for r in caplog.records)
+        assert verdict == "wedged"
+        assert evidence.levers[0].lever == "resume" and evidence.levers[0].outcome == "wedged"
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("with the AMS still mid filament-change" in m for m in lines)
+        assert any("lever=resume outcome=wedged" in m for m in lines)
+        assert not any("drops every" in m for m in lines)  # the retracted premise is never logged
 
-    async def test_the_wedged_round_escalates_without_unloading(
+    async def test_an_undecidable_unload_proceeds_to_the_load(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
     ):
-        """The driver half of the same fact: an AMS that never leaves the change
-        escalates ``stuck_reset_failed`` with the jammed spool taken out of rotation
-        ONCE — and not one unload is published into it."""
+        """The driver half (case iv): both CONTINUEs leave the AMS in the change with
+        NOTHING loaded (the 009 posture). The round no longer gives up unsent — it runs
+        selection, commits, and SENDS the unload. Nothing physical can answer an unload
+        with nothing loaded, so the classifier says ``undecidable``; the unload WAS sent
+        (invariant 8 holds) and the load is the next measurement — here it lands."""
         install_settings(step_timeout_s=0.05)
         printer = await printer_factory()
         await _farm_item(db_session, printer.id)
-        jammed = await _bind_spool(db_session, printer.id, 0, 0)
-        failed = _spy(monkeypatch, "on_spool_recovery_failed")
-        oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+        await _bind_spool(db_session, printer.id, 0, 0)
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
         state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
-        client = FakeClient(state, resume_unwedges=False)
-        _wire(monkeypatch, state, client, on_poll=_repause_after_running(1))
+        client = FakeClient(state, resume_unwedges=False, unload_deaf=True)
+        _wire(monkeypatch, state, client)
 
-        with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_recovery"):
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
             task = await on_ams_fault(printer.id, state)
             await task
 
-        assert ("unload",) not in client.calls
-        assert _escalated_reasons(caplog) == ["stuck_reset_failed"]
-        failed.assert_awaited_once()
-        oor.assert_awaited_once()
-        db_session.expunge_all()
-        assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None
+        motion = [c for c in client.calls if c[0] in ("unload", "load")]
+        assert motion == [("unload",), ("load", 1)]  # sent once, answered, then the load
+        lines = [r.getMessage() for r in caplog.records]
+        assert any(
+            "command=unload" in m and "posture=mid_change_empty" in m and "answer=undecidable" in m for m in lines
+        )
+        assert any("command=load" in m and "answer=complete" in m for m in lines)
+        assert state.state == "RUNNING"
+        succeeded.assert_awaited_once()
 
 
 class TestTheSecondUnwedgeTier:
-    """WS6: the fork's other spelling of the firmware CONTINUE, in the one function
-    that owns unwedging."""
+    """WS6: the fork's other spelling of the firmware CONTINUE — the ladder's second
+    lever, pulled only while the AMS is still in the change after the first."""
 
     async def test_tier2_unwedges_and_the_swap_round_runs(
         self, db_session, printer_factory, install_settings, monkeypatch
@@ -5769,11 +5907,13 @@ class TestTheSecondUnwedgeTier:
         assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # a real swap
         assert json.loads((await db_session.get(PrintQueueItem, item.id)).ams_mapping) == [1, -1, -1, -1]
 
-    async def test_tier2_still_wedged_escalates_once(
+    async def test_tier2_still_wedged_sends_the_swap_and_escalates_once(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
     ):
-        """Both CONTINUEs left it wedged: one escalation, one ledger row, one
-        out-of-rotation stamp — and the deferred decision point is on the record."""
+        """Both CONTINUEs left it wedged: the round SENDS the swap and measures it. The
+        unload is undecidable (nothing loaded), the load goes into the change and the AMS
+        does not move — ``swap_dropped_wedged``, with one escalation, one ledger row and
+        one out-of-rotation stamp, and both levers on the record."""
         install_settings(step_timeout_s=0.05)
         printer = await printer_factory()
         await _farm_item(db_session, printer.id)
@@ -5782,7 +5922,7 @@ class TestTheSecondUnwedgeTier:
         oor = _spy(monkeypatch, "on_spool_out_of_rotation")
         _spy_ws(monkeypatch)
         state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
-        client = FakeClient(state, resume_unwedges=False)
+        client = FakeClient(state, resume_unwedges=False, unload_deaf=True, load_ok_targets=set())
         _wire(monkeypatch, state, client)
 
         with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
@@ -5790,12 +5930,14 @@ class TestTheSecondUnwedgeTier:
             await task
 
         assert client.calls.count(("ams_control", "resume")) == 1
-        assert _escalated_reasons(caplog) == ["stuck_reset_failed"]
+        assert ("unload",) in client.calls and ("load", 1) in client.calls
+        assert _escalated_reasons(caplog) == ["swap_dropped_wedged"]
         failed.assert_awaited_once()
         oor.assert_awaited_once()
         assert len(await _escalation_rows(db_session, printer.id)) == 1
-        assert any("unwedge_tier2_fail" in r.getMessage() for r in caplog.records)
-        assert any('ams_control("reset") deferred' in r.getMessage() for r in caplog.records)
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("lever=resume outcome=wedged" in m for m in lines)
+        assert any("lever=ams_control_resume outcome=never_moved" in m for m in lines)
         db_session.expunge_all()
         assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None
 
@@ -5825,24 +5967,295 @@ class TestTheSecondUnwedgeTier:
         state = _make_state(tray_now=255, ams_status_main=1)
         client = FakeClient(state, resume_ret=False)
         _wire(monkeypatch, state, client)
+        evidence = spool_recovery._RecoveryEvidence()
 
-        verdict = await spool_recovery._reset_stuck_change(_incident(7, step_timeout_s=0.05), client)
+        verdict = await _ladder(_incident(7, step_timeout_s=0.05), client, evidence=evidence)
 
         assert verdict == "fail"
         assert not [c for c in client.calls if c[0] == "ams_control"]
+        assert [(r.lever, r.outcome) for r in evidence.levers] == [("resume", "not_sent")]
 
-    async def test_one_second_tier_per_job(self, monkeypatch):
-        """A second wedged round in the SAME job publishes neither CONTINUE again."""
+    async def test_one_pull_of_each_continue_per_driver(self, monkeypatch):
+        """A second wedged round in the SAME driver publishes neither CONTINUE again —
+        and with nothing left to pull it reads ``wedged``, never a give-up on a budget."""
         state = _make_state(tray_now=255, ams_status_main=1)
         client = _WedgedClient(state)  # neither verb moves the state machine
         _wire(monkeypatch, state, client)
         incident = _incident(7, step_timeout_s=0.02)
+        evidence = spool_recovery._RecoveryEvidence()
 
-        assert await spool_recovery._reset_stuck_change(incident, client) == "fail"
-        assert await spool_recovery._reset_stuck_change(incident, client) == "fail"
+        assert await _ladder(incident, client, evidence=evidence) == "fail"  # no lever moved it at all (d)
+        assert await _ladder(incident, client, evidence=evidence) == "wedged"  # all spent: nothing sent
 
         assert client.calls.count(("resume",)) == 1
         assert client.calls.count(("ams_control", "resume")) == 1
+
+
+# ===========================================================================
+# 012-H2S 2026-09-22 (incident 304): the wedge is MEASURED, not assumed.
+#
+# PAUSEd at layer 6 with `0700_0012` (AMS A slot 4 feeder motor stalled — attr lane
+# only) + `0700_8006` (unable to feed into the extruder), `tray_now=3` (the jammed slot
+# IS the loaded one), `ams_status_main=1 / sub=5`, three other loaded PETG slots. The
+# 2026-09-11 premise "the firmware drops every load and unload in state 1" made the
+# driver give up `stuck_reset_failed` 90 s later with `unloads_sent=0 loads_attempted=0`
+# — three printers in four days, each recovered by a human hours later. That premise
+# was measured only for a LOAD into an EMPTY path; an unload with filament LOADED behind
+# a mechanical fault had never been sent. Now it is sent, and the wire's answer decides.
+# ===========================================================================
+
+
+def _wedge_012(**client_kw):
+    """The incident-304 wire, and a FakeClient whose CONTINUEs leave the AMS in the
+    change (tier 1 moves the printer and it re-pauses still wedged; tier 2 moves
+    nothing) — so every case below reaches the swap commands through ``wedged``."""
+    state = _make_state(
+        tray_now=3,
+        ams_status_main=1,
+        layer=6,
+        hms=[_mech_wire_hms(0, 3), _feed_into_extruder_hms()],
+        trays=[_ams_tray(0), _ams_tray(1), _ams_tray(2), _ams_tray(3)],
+    )
+    state.ams_status_sub = 5
+    client = FakeClient(state, resume_unwedges=False, **client_kw)
+    return state, client
+
+
+def _loads(client) -> list[int]:
+    return [c[1] for c in client.calls if c[0] == "load"]
+
+
+class TestTheWedgeIsMeasured:
+    async def test_a_loaded_feeder_unload_completes_mid_change_and_the_swap_recovers(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """Case (i). The unload goes into ``mid_change_loaded`` and the feeder leaves for
+        255 while the AMS STAYS in state 1 (the change the print still owes): the
+        classifier's mid-change-loaded row calls that ``complete``. The load then lands,
+        the resume holds — RECOVERED by a swap, zero human touch."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id, ams_mapping="[3, -1, -1, -1]")
+        await _bind_spool(db_session, printer.id, 0, 3)
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _wedge_012(unload_keeps_change=True)
+        _wire(monkeypatch, state, client)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            assert task is not None
+            await task
+
+        (target,) = _loads(client)
+        assert target in (0, 1, 2)
+        motion = [c for c in client.calls if c[0] in ("unload", "load")]
+        assert motion == [("unload",), ("load", target)]
+        lines = [r.getMessage() for r in caplog.records]
+        assert any(
+            "command=unload" in m and "posture=mid_change_loaded" in m and "answer=complete" in m and "→255" in m
+            for m in lines
+        )
+        assert any(f"swapped 3 → {target}" in m for m in lines)
+        assert state.state == "RUNNING"
+        succeeded.assert_awaited_once()
+        failed.assert_not_awaited()
+        db_session.expunge_all()
+        assert json.loads((await db_session.get(PrintQueueItem, item.id)).ams_mapping)[0] == target
+
+    async def test_an_unload_the_ams_does_not_move_on_pulls_the_workable_pause_then_gives_up_measured(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """Case (ii). The unload goes into ``mid_change_loaded`` and nothing moves →
+        ``no_movement`` → the ladder's second entry pulls tier 3 (resume, then pause on
+        the first RUNNING sample — the July "workable PAUSE") → the unload is resent ONCE
+        → still ``no_movement`` → ``swap_dropped_wedged``. The page carries what was sent
+        and what the wire said, then where the filament is; the jammed spool is still
+        loaded, so there is nothing to restore and no load is ever sent."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[3, -1, -1, -1]")
+        await _bind_spool(db_session, printer.id, 0, 3)
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _wedge_012(unload_stuck=True)
+        _wire(monkeypatch, state, client)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert _escalated_reasons(caplog) == ["swap_dropped_wedged"]
+        assert client.calls.count(("unload",)) == 2  # the first, and the one resend after tier 3
+        assert _loads(client) == []  # never a load behind an unload that did not move
+        assert state.tray_now == 3  # the jammed spool is still loaded
+        assert client.calls.count(("pause",)) == 2  # tier 1's hung self-pause, then tier 3's
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("lever=resume_then_pause outcome=paused_wedged" in m for m in lines)
+        assert not any("verdict=restore_" in m for m in lines)  # nothing to restore
+        detail = failed.call_args.kwargs["detail"]
+        assert detail == (
+            spool_recovery._ESCALATE_DETAIL["swap_dropped_wedged"]
+            + " Sent: resume (re-paused, still mid-change); ams_control resume (printer did not move); "
+            "resume-then-pause (paused, still mid-change); unload ×2 (AMS did not move)."
+            + " The jammed spool is still loaded (AMS A slot 4). Clear the extruder, then resume on the printer."
+        )
+
+    async def test_an_accepted_unload_then_a_dropped_load_restores_and_never_pulls_tier3(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """Case (iii). The unload completes (the feeder left, the AMS stayed in state 1);
+        the load goes into the change and the AMS does not move → ``swap_dropped_wedged``
+        at once (another candidate costs a step timeout for the same answer). The give-up
+        ATTEMPTS the restore — the reload is sent and measured, ``dropped`` — and the page
+        says so. NO tier 3: the extruder is one the FARM emptied (2026-09-17 ruling)."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[3, -1, -1, -1]")
+        await _bind_spool(db_session, printer.id, 0, 3)
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _wedge_012(unload_keeps_change=True, load_ok_targets=set())
+        _wire(monkeypatch, state, client)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert _escalated_reasons(caplog) == ["swap_dropped_wedged"]
+        loads = _loads(client)
+        assert len(loads) == 2 and loads[1] == 3  # one candidate (not resent), then the restore of slot 4
+        assert client.calls.count(("resume",)) == 1  # tier 1 only — never a resume over the emptied extruder
+        lines = [r.getMessage() for r in caplog.records]
+        assert not any("lever=resume_then_pause" in m for m in lines)
+        assert any("verdict=restore_dropped" in m for m in lines)
+        detail = failed.call_args.kwargs["detail"]
+        assert "unload (completed)" in detail
+        assert detail.endswith(
+            "No filament is loaded: AMS A slot 4 was unloaded; the reload was sent and the AMS did not move. "
+            "Free the filament at the feeder, load a spool, then resume on the printer."
+        )
+
+    async def test_no_lever_is_pulled_over_an_extruder_the_farm_emptied(self, monkeypatch, caplog):
+        """The 2026-09-17 ruling as a PREVENTION: while the driver's last completed motion
+        is an unload, the ladder publishes nothing at either entry — tier 3 included —
+        and reads ``wedged`` (the swap commands then go out and are measured)."""
+        state = _make_state(tray_now=255, ams_status_main=1)
+        client = FakeClient(state, resume_unwedges=False)
+        _wire(monkeypatch, state, client)
+        evidence = spool_recovery._RecoveryEvidence(
+            commands=[
+                spool_recovery.CommandRecord(
+                    command="unload", target=None, posture="mid_change_loaded", answer="complete", at=0.0
+                )
+            ]
+        )
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            for entry in ("round_start", "after_unload_no_movement"):
+                assert await _ladder(_incident(7, step_timeout_s=0.05), client, evidence=evidence, entry=entry) == (
+                    "wedged"
+                )
+
+        assert client.calls == []  # not one resume, pause or ams_control frame
+        assert evidence.levers == []
+        assert sum(1 for r in caplog.records if "ladder withheld" in r.getMessage()) == 2
+
+    async def test_tier3_first_running_sample_healthy_self_heals_without_a_pause(self, monkeypatch):
+        """Case (viii). Tier 3's first RUNNING sample is already healthy (change
+        completed, fault clear): the read falls into the stable-hold self-heal —
+        ``recovered`` — and ``print.pause`` is never published."""
+        state = _make_state(tray_now=255, ams_status_main=1)
+        client = _SelfHealClient(state)
+        _wire(monkeypatch, state, client)
+        evidence = spool_recovery._RecoveryEvidence(
+            levers=[
+                spool_recovery.LeverRecord(lever="resume", outcome="wedged", at=0.0),
+                spool_recovery.LeverRecord(lever="ams_control_resume", outcome="never_moved", at=0.0),
+            ]
+        )
+
+        verdict = await _ladder(
+            _incident(7, step_timeout_s=1.0), client, evidence=evidence, entry="after_unload_no_movement"
+        )
+
+        assert verdict == "recovered"
+        assert ("pause",) not in client.calls
+        assert client.calls.count(("resume",)) == 1  # tier 3's resume, nothing else
+        assert (evidence.levers[-1].lever, evidence.levers[-1].outcome) == ("resume_then_pause", "recovered")
+
+    async def test_an_operator_command_inside_a_confirm_window_is_a_takeover(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """Case (v). With the 409 gone an operator's Unload can land inside the driver's
+        own confirm window. ``_takeover`` reads it (``operator_command``) and the driver
+        stands down: the operator owns the printer, and the wire's next reading is THEIR
+        command's answer, never the driver's."""
+        install_settings(max_attempts=2, step_timeout_s=1.0)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state, unload_deaf=True)  # keeps the driver's window open
+        fired = {"done": False}
+
+        def _poll(_n, _st):
+            if ("unload",) in client.calls and not fired["done"]:
+                fired["done"] = True
+                sent = ams_command.unload(printer.id, actor="operator")  # the operator's click
+                assert not isinstance(sent, ams_command.Refusal)
+
+        _wire(monkeypatch, state, client, on_poll=_poll)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert any("recovery aborted (operator_command)" in r.getMessage() for r in caplog.records)
+        assert client.calls.count(("unload",)) == 2  # the driver's, then the operator's
+        assert _loads(client) == []
+        failed.assert_not_awaited()  # a takeover is never a give-up
+        rows = await _incident_rows(db_session, printer.id)
+        assert [r.status for r in rows] == ["aborted"]
+
+    async def test_a_session_change_inside_a_confirm_window_aborts(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """Case (ix). The MQTT session the unload went out on is gone (a reconnect bumps
+        ``connection_epoch``): nothing read on the new session answers that command —
+        ``session_changed`` — so the driver stands down as for a lost state."""
+        install_settings(max_attempts=2, step_timeout_s=1.0)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state, unload_deaf=True)
+        bumped = {"done": False}
+
+        def _poll(_n, st):
+            if ("unload",) in client.calls and not bumped["done"]:
+                bumped["done"] = True
+                st.connection_epoch += 1  # the printer reconnected
+
+        _wire(monkeypatch, state, client, on_poll=_poll)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("command=unload" in m and "answer=session_changed" in m for m in lines)
+        assert any("recovery aborted (state_lost) during unload" in m for m in lines)
+        assert client.calls.count(("unload",)) == 1
+        assert _loads(client) == []
+        failed.assert_not_awaited()
+        rows = await _incident_rows(db_session, printer.id)
+        assert [r.status for r in rows] == ["aborted"]
 
 
 # --- WS7: an AMS physical fault is an EQUIPMENT record (2026-09-11, 003-H2S) -------
@@ -6604,8 +7017,9 @@ def test_feeder_clause_table():
         "No filament is loaded: AMS A slot 1 was unloaded and the reload failed. "
         "Check the filament path, load a spool, then resume on the printer."
     )
-    assert spool_recovery._feeder_clause(empty, "skipped_wedged") == (
-        "No filament is loaded: AMS A slot 1 was unloaded; the AMS is mid filament-change, so no reload was attempted."
+    assert spool_recovery._feeder_clause(empty, "dropped") == (
+        "No filament is loaded: AMS A slot 1 was unloaded; the reload was sent and the AMS did not move. "
+        "Free the filament at the feeder, load a spool, then resume on the printer."
     )
     assert spool_recovery._feeder_clause(empty, "skipped_drying") == (
         "No filament is loaded: AMS A slot 1 was unloaded; the AMS is drying, so no reload was attempted. "
@@ -6617,7 +7031,7 @@ def test_feeder_clause_table():
     assert spool_recovery._feeder_clause(_position("other", 1), None) == "AMS A slot 2 is loaded."
     # No AMS slot to name, or nothing to be relative to: no clause at any verdict.
     for kind in ("external", "unknown"):
-        for restore in (None, "ok", "fail", "skipped_wedged", "skipped_drying"):
+        for restore in (None, "ok", "fail", "dropped", "skipped_drying"):
             assert spool_recovery._feeder_clause(_position(kind, None), restore) is None
 
 
@@ -6691,9 +7105,24 @@ async def test_the_give_up_restores_the_jammed_feeder(
     assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # the stamp STAYS
 
 
-async def test_the_give_up_pages_a_refused_restore(db_session, printer_factory, install_settings, monkeypatch, caplog):
-    """The odd case is PAGED, not machined: the reload was attempted and refused, so
-    the printer really is empty and the page says exactly that."""
+@pytest.mark.parametrize(
+    "client_kw,verdict,clause",
+    [
+        # The reload went out and the AMS did not move: ``no_movement`` → ``dropped``.
+        (
+            {"load_ok_targets": set()},
+            "dropped",
+            "No filament is loaded: AMS A slot 1 was unloaded; the reload was sent and the AMS did not move.",
+        ),
+        # The reload never went out (every publish refused): ``fail``.
+        ({"load_ret": False}, "fail", "No filament is loaded: AMS A slot 1 was unloaded and the reload failed."),
+    ],
+)
+async def test_the_give_up_pages_a_restore_that_did_not_land(
+    db_session, printer_factory, install_settings, monkeypatch, caplog, client_kw, verdict, clause
+):
+    """The odd case is PAGED, not machined: the reload was attempted and did not land,
+    so the printer really is empty — and the page says what the wire answered."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -6701,7 +7130,7 @@ async def test_the_give_up_pages_a_refused_restore(db_session, printer_factory, 
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
     _spy(monkeypatch, "on_spool_out_of_rotation")
     state = _make_state(trays=[_ams_tray(0), _ams_tray(1), _ams_tray(2)])
-    client = FakeClient(state, load_ok_targets=set())  # nothing loads, not even the restore
+    client = FakeClient(state, **client_kw)  # nothing loads, not even the restore
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
@@ -6711,8 +7140,8 @@ async def test_the_give_up_pages_a_refused_restore(db_session, printer_factory, 
     assert client.calls.count(("load", 0)) == 2  # both attempts spent on the restore
     assert state.tray_now == 255  # ...and nothing is loaded
     assert _escalated_reasons(caplog) == ["feed_path_blocked"]  # the reason is unchanged
-    assert "No filament is loaded: AMS A slot 1 was unloaded and the reload failed" in failed.call_args.kwargs["detail"]
-    assert any("verdict=restore_fail" in r.getMessage() for r in caplog.records)
+    assert clause in failed.call_args.kwargs["detail"]
+    assert any(f"verdict=restore_{verdict}" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_takeover_during_the_restore_keeps_the_stamp(
@@ -6750,10 +7179,15 @@ async def test_a_takeover_during_the_restore_keeps_the_stamp(
     assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # stamp kept
 
 
-async def test_a_wedged_ams_refuses_the_restore(db_session, printer_factory, install_settings, monkeypatch, caplog):
-    """`ams_status_main == 1`: the firmware drops every load, so a reload would be
-    dropped too. The give-up says so instead of pretending it tried — the lever is the
-    printer's own Retry/Continue, which the wedged copy already names."""
+async def test_a_wedged_ams_gets_the_restore_sent_and_measured(
+    db_session, printer_factory, install_settings, monkeypatch, caplog
+):
+    """`ams_status_main == 1` under the driver, after the farm emptied the extruder: the
+    reload is SENT anyway and its answer decides the page — here the AMS does not move,
+    so the restore reads ``dropped`` and the page says the reload went out and did not
+    land. Pre-2026-09-23 this refused the reload outright on "the firmware drops every
+    load", measured only for a load into an empty path. And no resume is published over
+    the extruder the farm emptied: the ladder is withheld (2026-09-17 ruling)."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -6762,12 +7196,10 @@ async def test_a_wedged_ams_refuses_the_restore(db_session, printer_factory, ins
     _spy(monkeypatch, "on_spool_out_of_rotation")
     state = _make_state(trays=[_ams_tray(0), _ams_tray(1)])
     client = FakeClient(state, load_ok_targets=set(), resume_unwedges=False)
-    repause = _repause_after_running(1)
 
-    def _poll(n, st):
+    def _poll(_n, st):
         if client.calls.count(("load", 1)) >= 2:
             st.ams_status_main = 1  # the AMS wedges mid-change under the driver
-        repause(n, st)  # ...and the W1 CONTINUE cannot move it
 
     _wire(monkeypatch, state, client, on_poll=_poll)
 
@@ -6775,10 +7207,16 @@ async def test_a_wedged_ams_refuses_the_restore(db_session, printer_factory, ins
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert ("load", 0) not in client.calls  # no load published into a deaf AMS
-    assert _escalated_reasons(caplog) == ["stuck_reset_failed"]
-    assert any("verdict=restore_skipped_wedged" in r.getMessage() for r in caplog.records)
-    assert "the AMS is mid filament-change, so no reload was attempted" in failed.call_args.kwargs["detail"]
+    assert client.calls.count(("load", 0)) == 1  # the restore went out, once: no resend into the change
+    assert ("resume",) not in client.calls  # no CONTINUE over the extruder the farm emptied
+    assert _escalated_reasons(caplog) == ["feed_path_blocked"]
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("ladder withheld" in m for m in lines)
+    assert any("verdict=restore_dropped" in m for m in lines)
+    assert (
+        "No filament is loaded: AMS A slot 1 was unloaded; the reload was sent and the AMS did not move."
+        in failed.call_args.kwargs["detail"]
+    )
 
 
 async def test_a_drying_ams_at_the_unload_refuses_the_restore(
@@ -6845,24 +7283,16 @@ async def test_a_drying_ams_between_the_unload_and_the_load_refuses_the_restore(
     assert "the AMS is drying, so no reload was attempted" in failed.call_args.kwargs["detail"]
 
 
-@pytest.mark.parametrize(
-    "ams_main,restore_attempted",
-    [(3, True), (1, False)],
-)
-async def test_the_restore_precondition_is_the_wedge_predicate_not_idleness(
-    db_session, printer_factory, monkeypatch, caplog, ams_main, restore_attempted
-):
-    """`not ams_mid_filament_change(state)` (value 1 only), never `== AMS_STATUS_IDLE`.
-
-    A fleet sample on 2026-09-11 read `ams_status_main = 3` (assist) on every RUNNING
-    H2S, and an assist-state AMS accepts loads — an idleness test would fail OPEN there
-    and refuse the restore on the commonest state of all. The wedge (1) is the only
-    state that drops it."""
+@pytest.mark.parametrize("ams_main", [3, 1])
+async def test_the_restore_is_attempted_in_every_posture(db_session, printer_factory, monkeypatch, caplog, ams_main):
+    """The reload is SENT whatever ``ams_status_main`` reads — assist (3, the steady
+    state of every RUNNING H2S) and mid filament-change (1) alike — and the wire's answer
+    decides the verdict. The wedge refusal this replaces rested on an unmeasured premise."""
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
     _spy(monkeypatch, "on_spool_recovery_failed")
     state = _make_state(tray_now=255, ams_status_main=ams_main)
-    client = FakeClient(state, load_ret=False)  # a sent load is observable, with no confirm wait
+    client = FakeClient(state, load_ret=False)  # a publish that does not go out: no confirm wait
     _wire(monkeypatch, state, client)
     incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
 
@@ -6871,30 +7301,31 @@ async def test_the_restore_precondition_is_the_wedge_predicate_not_idleness(
             incident,
             client,
             "feed_path_blocked",
-            evidence=spool_recovery._RecoveryEvidence(unloads_sent=1, confirmed_unloads=1, loads_attempted=1),
+            evidence=spool_recovery._RecoveryEvidence(loads_attempted=1, commands=[_unload_record()]),
         )
 
-    assert (("load", 0) in client.calls) is restore_attempted
-    verdict = "restore_fail" if restore_attempted else "restore_skipped_wedged"
-    assert any(f"verdict={verdict}" in r.getMessage() for r in caplog.records)
+    assert ("load", 0) in client.calls
+    assert any("verdict=restore_fail" in r.getMessage() for r in caplog.records)
 
 
-async def test_a_firmware_wedge_the_driver_never_unloaded_is_left_alone(
+async def test_a_firmware_wedge_with_no_candidate_is_left_alone(
     db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
     """Round 1 meets an AMS the FIRMWARE wedged mid-change (`ams_status_main=1`, and
-    `tray_now` already 255 after the fault); the W1 CONTINUE cannot move it.
+    `tray_now` already 255 after the fault); the CONTINUEs do not free it, and there is
+    nothing to swap to.
 
-    The farm published no unload, so it restores nothing and claims nothing — the
-    static wedged copy stands. The wire alone could not tell this from an extruder the
-    driver emptied: 255 is what both look like."""
+    ``wedged`` proceeds to selection like ``ok`` — and with no candidate there is no
+    commit: no stamp, no unload, no restore (shape 39). The page is the reason copy plus
+    what the farm sent; the wire alone could not tell this 255 from an extruder the
+    driver emptied, so no clause claims an unload."""
     install_settings(step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
     jammed = await _bind_spool(db_session, printer.id, 0, 0)
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
     oor = _spy(monkeypatch, "on_spool_out_of_rotation")
-    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
+    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0)])
     client = FakeClient(state, resume_unwedges=False)
     _wire(monkeypatch, state, client, on_poll=_repause_after_running(1))
 
@@ -6902,12 +7333,54 @@ async def test_a_firmware_wedge_the_driver_never_unloaded_is_left_alone(
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert ("unload",) not in client.calls  # the driver never emptied this extruder...
-    assert ("load", 0) not in client.calls  # ...so it never puts anything back
-    assert _escalated_reasons(caplog) == ["stuck_reset_failed"]
-    assert failed.call_args.kwargs["detail"] == spool_recovery._ESCALATE_DETAIL["stuck_reset_failed"]
+    assert ("unload",) not in client.calls  # nothing to load → nothing to unload
+    assert not any(c[0] == "load" for c in client.calls)
+    assert _escalated_reasons(caplog) == ["no_eligible_spool"]
+    assert failed.call_args.kwargs["detail"] == (
+        spool_recovery._ESCALATE_DETAIL["no_eligible_spool"]
+        + " Sent: resume (re-paused, still mid-change); ams_control resume (printer did not move)."
+    )
     assert any("restore=None" in r.getMessage() for r in caplog.records)
-    oor.assert_awaited_once()  # a genuinely wedged feeder IS out of rotation
+    oor.assert_not_awaited()  # no replacement in hand → the swap never committed
+    db_session.expunge_all()
+    assert (await db_session.get(Spool, jammed.id)).feed_fault_at is None
+
+
+async def test_a_firmware_wedge_with_a_candidate_sends_the_swap_and_reads_swap_dropped_wedged(
+    db_session, printer_factory, install_settings, monkeypatch, caplog
+):
+    """The same firmware wedge with a replacement in hand. Pre-2026-09-23 this gave up
+    ``stuck_reset_failed`` with nothing sent. Now the swap commits and the commands go
+    out: the unload is ``undecidable`` (nothing loaded), the load goes into the change
+    and the AMS does not move → ``swap_dropped_wedged``. The farm DID publish an unload,
+    so the give-up attempts the restore — sent, measured, ``dropped``."""
+    install_settings(step_timeout_s=0.05)
+    printer = await printer_factory()
+    await _farm_item(db_session, printer.id)
+    jammed = await _bind_spool(db_session, printer.id, 0, 0)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+    state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
+    client = FakeClient(state, resume_unwedges=False, unload_deaf=True, load_ok_targets=set())
+    _wire(monkeypatch, state, client, on_poll=_repause_after_running(1))
+
+    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        task = await on_ams_fault(printer.id, state)
+        await task
+
+    assert [c for c in client.calls if c[0] in ("unload", "load")] == [("unload",), ("load", 1), ("load", 0)]
+    assert _escalated_reasons(caplog) == ["swap_dropped_wedged"]
+    detail = failed.call_args.kwargs["detail"]
+    assert detail.startswith(spool_recovery._ESCALATE_DETAIL["swap_dropped_wedged"])
+    assert (
+        "unload (nothing was loaded); load AMS A slot 2 (AMS did not move); load AMS A slot 1 (AMS did not move)."
+        in detail
+    )
+    assert detail.endswith(
+        "No filament is loaded: AMS A slot 1 was unloaded; the reload was sent and the AMS did not move. "
+        "Free the filament at the feeder, load a spool, then resume on the printer."
+    )
+    oor.assert_awaited_once()  # the swap committed with a replacement in hand
     db_session.expunge_all()
     assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None
 
@@ -6949,9 +7422,11 @@ async def test_a_no_candidate_give_up_at_255_never_loads_what_it_did_not_unload(
 async def test_an_unconfirmed_unload_still_counts_as_the_farm_moving_the_feeder(
     db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
-    """`unloads_sent` counts the COMMAND, not the confirmation: the unload went out and
-    the AMS stayed mid-change (the 009-H2S state machine), so the farm DID move this
-    feeder and the give-up owes the operator a statement about it."""
+    """`unloads_sent` counts the COMMAND, not the confirmation: the first unload moved
+    the AMS into the change and never completed (``acted``), the resend went into it with
+    nothing loaded (``undecidable``) — neither is ``complete``, both went out, so the farm
+    DID move this feeder and the give-up owes the operator the restore and a statement
+    about it. The load into the change did not move: ``swap_dropped_wedged``."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -6959,19 +7434,23 @@ async def test_an_unconfirmed_unload_still_counts_as_the_farm_moving_the_feeder(
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
     _spy(monkeypatch, "on_spool_out_of_rotation")
     state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0), _ams_tray(1)])
-    client = FakeClient(state, unload_stuck=True, resume_unwedges=False)
+    client = FakeClient(state, unload_stuck=True, resume_unwedges=False, load_ok_targets=set())
     _wire(monkeypatch, state, client)
 
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert client.calls.count(("unload",)) == 2  # both attempts published, neither confirmed
-    assert _escalated_reasons(caplog) == ["unload_failed"]
-    assert any("unloads_sent=1 unloads_confirmed=0" in r.getMessage() for r in caplog.records)
-    assert any("verdict=restore_skipped_wedged" in r.getMessage() for r in caplog.records)
-    assert ("load", 0) not in client.calls  # a deaf AMS drops loads — say so, don't try
-    assert "the AMS is mid filament-change, so no reload was attempted" in failed.call_args.kwargs["detail"]
+    assert client.calls.count(("unload",)) == 2  # both attempts published, neither complete
+    assert _escalated_reasons(caplog) == ["swap_dropped_wedged"]
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("unloads_sent=2 unloads_confirmed=0" in m for m in lines)
+    assert any("verdict=restore_dropped" in m for m in lines)
+    assert ("load", 0) in client.calls  # the restore was sent into the change, and measured
+    assert (
+        "No filament is loaded: AMS A slot 1 was unloaded; the reload was sent and the AMS did not move."
+        in failed.call_args.kwargs["detail"]
+    )
 
 
 # --- causality and single-origin pins ---------------------------------------
@@ -6999,7 +7478,7 @@ async def test_the_clause_never_claims_an_unload_the_driver_did_not_do(
         assert "was unloaded" not in detail
         await _close_row(db_session, printer.id)
 
-    # The same wire state, after the driver's OWN confirmed unload and a refused
+    # The same wire state, after the driver's OWN completed unload and a refused
     # reload, does carry it.
     incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
@@ -7007,7 +7486,7 @@ async def test_the_clause_never_claims_an_unload_the_driver_did_not_do(
             incident,
             client,
             "feed_path_blocked",
-            evidence=spool_recovery._RecoveryEvidence(unloads_sent=1, confirmed_unloads=1, loads_attempted=1),
+            evidence=spool_recovery._RecoveryEvidence(loads_attempted=1, commands=[_unload_record()]),
         )
     assert "AMS A slot 1 was unloaded and the reload failed" in failed.call_args.kwargs["detail"]
 
@@ -7088,7 +7567,7 @@ async def test_the_restore_follows_the_classifier_not_tray_now(
     monkeypatch.setattr(spool_recovery, "_feeder_position", lambda *_a, **_k: _position(kind, 0))
     incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
 
-    verdict = await spool_recovery._restore_jammed_feeder(incident, client)
+    verdict = await spool_recovery._restore_jammed_feeder(incident, client, evidence=spool_recovery._RecoveryEvidence())
 
     assert (("load", 0) in client.calls) is expect_load
     assert verdict == ("fail" if expect_load else None)
@@ -7125,9 +7604,10 @@ def test_every_give_up_inside_the_loop_goes_through_one_boundary():
     assert len(escalates) == 1, f"only the runout branch may escalate directly, found {len(escalates)}"
     assert give_ups, "the loop escalates through _give_up"
     assert min(give_ups) > escalates[0], "no direct _escalate after the runout branch"
-    # The six sites: reset fail, no candidate, unload drying, unload fail, load drying,
-    # post-loop exhaustion.
-    assert len(give_ups) == 6
+    # The eight sites: the ladder's ``fail`` at each of its two entries, no candidate,
+    # an unload that never completed, unload drying, a load the wedged AMS did not move
+    # on, load drying, post-loop exhaustion.
+    assert len(give_ups) == 8
 
 
 def test_no_second_slot_rendering_in_the_module():
@@ -7282,7 +7762,10 @@ class TestTheIncidentFactory:
         await reentry
 
         entry_incident, reentry_incident = built
-        assert entry_incident == reentry_incident
+        # ``started_at`` is not a wire fact: it is each driver's own start (the instant an
+        # operator's AMS command begins to count as a takeover), read at construction.
+        assert entry_incident.started_at <= reentry_incident.started_at
+        assert replace(entry_incident, started_at=0.0) == replace(reentry_incident, started_at=0.0)
         assert entry_incident.extruder_side_only is True
         assert entry_incident.retract_failure is False
 

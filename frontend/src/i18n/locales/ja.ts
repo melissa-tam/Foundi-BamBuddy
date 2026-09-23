@@ -876,6 +876,10 @@ export default {
       unloadInitiated: 'フィラメントをアンロード中…',
       failedToLoad: 'フィラメントのロードに失敗',
       failedToUnload: 'フィラメントのアンロードに失敗',
+      amsLoadNoMovement: 'ロードを送信しました。AMS は動作しませんでした。',
+      amsUnloadNoMovement: 'アンロードを送信しました。AMS は動作しませんでした。',
+      amsUnloadNothingLoaded: 'アンロードを送信しました。何もロードされていませんでした。',
+      amsCommandSessionChanged: 'コマンド実行中にプリンターが再接続しました。AMS を確認してください。',
     },
     // Connection status
     connection: {
