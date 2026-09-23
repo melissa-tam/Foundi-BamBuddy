@@ -73,7 +73,7 @@ ID_REUSE_REASONED: dict[str, str] = {
     "orca_base_profiles": _NO_INBOUND + "cached vendor profiles, a leaf",
     "pending_uploads": _NO_INBOUND + "in-flight upload rows are a leaf",
     "print_log_entries": _NO_INBOUND + "append-only print log, a leaf",
-    "printer_incident": _NO_INBOUND + "durable fault rows are a leaf",
+    "printer_incident_step": _NO_INBOUND + "append-only recovery step ledger, a leaf",
     "printer_model_geometry": _NO_INBOUND + "registry keyed by model_key in every reader",
     "printer_observation_span": _NO_INBOUND + "append-only observation history, a leaf",
     "printer_sensor_history": _NO_INBOUND + "append-only sample history, a leaf",
@@ -104,6 +104,8 @@ ID_REUSE_REASONED: dict[str, str] = {
     "maintenance_types": _CLEARED + "system types soft-delete; a custom type ORM-cascades its items and history",
     "notification_providers": _CLEARED + "ORM cascade takes notification_logs and the digest queue",
     "oidc_providers": _CLEARED + "ORM cascade deletes user_oidc_links with the provider",
+    "printer_incident": _CLEARED
+    + "no code path deletes an incident row, so no id is ever recycled; the step ledger that cites it declares ON DELETE CASCADE",
     "printer_maintenance": _CLEARED + "ORM cascade deletes maintenance_history with the item",
 }
 

@@ -116,8 +116,9 @@ class Context:
 
     ``state`` is the printer's live status (``None`` when it is not speaking to us —
     a cached read during a disconnect is a memory, not evidence). ``ledger`` is the
-    process's motion memory. ``driver_live`` is ``spool_recovery.has_live_recovery``
-    for this printer, asked by the caller because the task slot is the caller's store.
+    process's motion memory. ``driver_live`` is ``printer_incidents.driver_live`` for
+    this printer — the ONE liveness store — asked by the caller and passed in, so a
+    verdict is a pure function of what it is handed.
     """
 
     state: PrinterState | None
@@ -266,7 +267,8 @@ def driver_owns(row: PrinterIncident, *, live: bool) -> bool:
     (006-H2S 2026-09-04: the re-PAUSE found no open incident and spawned a SECOND
     driver onto one AMS).
 
-    ``_active_tasks`` stays the store and stops deciding — callers pass its answer in.
+    ``printer_incidents.driver_live`` is the store and it does not decide — callers
+    pass its answer in as ``live``.
     """
     return row.status == STATUS_RECOVERING or live
 
@@ -315,9 +317,24 @@ def _wire_running_edge(row: PrinterIncident, ctx: Context) -> Verdict:
     return Verdict(close=True, source=RESOLVE_OBSERVED_RUNNING, evidence="the printer is RUNNING again")
 
 
-def _wire_job_terminal(_row: PrinterIncident, _ctx: Context) -> Verdict:
+def _wire_job_terminal(_row: PrinterIncident, ctx: Context) -> Verdict:
     """A JOB HOLD cannot outlive the job. A terminal is as good a statement as the
-    wire makes that the fault it interrupted is over."""
+    wire makes that the fault it interrupted is over.
+
+    It stands aside while a recovery DRIVER is live — the running edge's test, for the
+    running edge's reason (review F2, 2026-09-23 wave). A terminal the driver's OWN verb
+    produced (a release lever that ended the print) is a reading of that procedure, and
+    the driver must record it: its reader returns ``ended`` and the driver closes the row
+    with its own source token (``printer_incidents.RESOLVE_DRIVER_ENDED``) and pages.
+    Closing it here would free the row from under a task still writing outcomes for it —
+    the 006-H2S 2026-09-04 shape, now at the terminal instead of the resume.
+
+    The test is the LIVE TASK, not :func:`driver_owns`, exactly as at the running edge: a
+    row still reading ``recovering`` because its driver died (an R1 orphan) has no owner
+    left, and its job's terminal must still close it.
+    """
+    if ctx.driver_live:
+        return Verdict(close=False, evidence="a recovery driver is live and owns the outcome; closer stands aside")
     return Verdict(close=True, source=RESOLVE_TERMINAL, evidence="the job it held reached a terminal")
 
 
