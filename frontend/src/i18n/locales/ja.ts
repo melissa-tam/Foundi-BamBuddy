@@ -880,6 +880,8 @@ export default {
       amsUnloadNoMovement: 'アンロードを送信しました。AMS は動作しませんでした。',
       amsUnloadNothingLoaded: 'アンロードを送信しました。何もロードされていませんでした。',
       amsCommandSessionChanged: 'コマンド実行中にプリンターが再接続しました。AMS を確認してください。',
+      amsLoadHeld: 'ロードを受け付けました。一時停止中の印刷のフィラメント交換の後で保留中です。',
+      amsUnloadHeld: 'アンロードを受け付けました。一時停止中の印刷のフィラメント交換の後で保留中です。',
     },
     // Connection status
     connection: {
@@ -1079,6 +1081,9 @@ export default {
       pauseTitle: '印刷を一時停止',
       pauseMessage: '「{{name}}」の現在の印刷を一時停止しますか？',
       pauseButton: '印刷を一時停止',
+      amsRecoveryTitle: '復旧処理中',
+      amsRecoveryMessage: '{{name}}：復旧処理を実行中です。このコマンドを送信すると復旧処理は終了します。',
+      amsCommandButton: '送信',
       resumeTitle: '印刷を再開',
       resumeMessage: '「{{name}}」の印刷を再開しますか？',
       resumeButton: '印刷を再開',

@@ -72,6 +72,7 @@ function incident(
     slot_desc: null,
     created_at: '2026-09-17T09:43:00Z',
     operator_exits: operatorExits,
+    driver_live: false,
   };
 }
 

@@ -890,6 +890,8 @@ export default {
       amsUnloadNoMovement: 'Unload sent. AMS did not move.',
       amsUnloadNothingLoaded: 'Unload sent. Nothing was loaded.',
       amsCommandSessionChanged: 'Printer reconnected during the command. Check the AMS.',
+      amsLoadHeld: "Load accepted. Held behind the paused print's filament change.",
+      amsUnloadHeld: "Unload accepted. Held behind the paused print's filament change.",
     },
     // Connection status
     connection: {
@@ -1094,6 +1096,9 @@ export default {
       pauseTitle: 'Pause Print',
       pauseMessage: 'Are you sure you want to pause the current print on "{{name}}"?',
       pauseButton: 'Pause Print',
+      amsRecoveryTitle: 'Recovery in progress',
+      amsRecoveryMessage: '{{name}}: recovery is running. Sending this command ends it.',
+      amsCommandButton: 'Send',
       resumeTitle: 'Resume Print',
       resumeMessage: 'Are you sure you want to resume the print on "{{name}}"?',
       resumeButton: 'Resume Print',

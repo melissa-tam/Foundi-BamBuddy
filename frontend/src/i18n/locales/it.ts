@@ -881,6 +881,8 @@ export default {
       amsUnloadNoMovement: 'Scaricamento inviato. L’AMS non si è mosso.',
       amsUnloadNothingLoaded: 'Scaricamento inviato. Non era caricato nulla.',
       amsCommandSessionChanged: 'Stampante riconnessa durante il comando. Controlla l’AMS.',
+      amsLoadHeld: 'Caricamento accettato. In attesa dietro il cambio filamento della stampa in pausa.',
+      amsUnloadHeld: 'Scaricamento accettato. In attesa dietro il cambio filamento della stampa in pausa.',
     },
     // Connection status
     connection: {
@@ -1080,6 +1082,9 @@ export default {
       pauseTitle: 'Pausa Stampa',
       pauseMessage: 'Sei sicuro di mettere in pausa la stampa corrente su "{{name}}"?',
       pauseButton: 'Pausa Stampa',
+      amsRecoveryTitle: 'Ripristino in corso',
+      amsRecoveryMessage: '{{name}}: ripristino in corso. L’invio di questo comando lo termina.',
+      amsCommandButton: 'Invia',
       resumeTitle: 'Riprendi Stampa',
       resumeMessage: 'Sei sicuro di riprendere la stampa su "{{name}}"?',
       resumeButton: 'Riprendi Stampa',
