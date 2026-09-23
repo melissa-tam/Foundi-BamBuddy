@@ -877,6 +877,10 @@ export default {
       unloadInitiated: 'Descarregando filamento…',
       failedToLoad: 'Falha ao carregar filamento',
       failedToUnload: 'Falha ao descarregar filamento',
+      amsLoadNoMovement: 'Carregamento enviado. O AMS não se moveu.',
+      amsUnloadNoMovement: 'Descarregamento enviado. O AMS não se moveu.',
+      amsUnloadNothingLoaded: 'Descarregamento enviado. Nada estava carregado.',
+      amsCommandSessionChanged: 'A impressora reconectou durante o comando. Verifique o AMS.',
     },
     // Connection status
     connection: {

@@ -851,6 +851,10 @@ export default {
       unloadInitiated: '필라멘트 언로딩 중…',
       failedToLoad: '필라멘트 로드 실패',
       failedToUnload: '필라멘트 언로드 실패',
+      amsLoadNoMovement: '로드 전송됨. AMS가 움직이지 않았습니다.',
+      amsUnloadNoMovement: '언로드 전송됨. AMS가 움직이지 않았습니다.',
+      amsUnloadNothingLoaded: '언로드 전송됨. 로드된 필라멘트가 없었습니다.',
+      amsCommandSessionChanged: '명령 중 프린터가 재연결되었습니다. AMS를 확인하세요.',
       connectionFailedNotAdded: '프린터에 연결할 수 없습니다. IP, 시리얼 번호, 액세스 코드를 확인하고 LAN 전용 모드가 켜져 있는지 확인하세요. 프린터가 추가되지 않았습니다.'
     },
     connection: {

@@ -877,6 +877,10 @@ export default {
       unloadInitiated: 'Filament çıkarılıyor…',
       failedToLoad: 'Filament yüklenemedi',
       failedToUnload: 'Filament çıkarılamadı',
+      amsLoadNoMovement: 'Yükleme gönderildi. AMS hareket etmedi.',
+      amsUnloadNoMovement: 'Çıkarma gönderildi. AMS hareket etmedi.',
+      amsUnloadNothingLoaded: 'Çıkarma gönderildi. Yüklü filament yoktu.',
+      amsCommandSessionChanged: 'Komut sırasında yazıcı yeniden bağlandı. AMS durumunu kontrol edin.',
     },
     // Bağlantı durumu
     connection: {

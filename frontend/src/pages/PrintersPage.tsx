@@ -173,6 +173,7 @@ import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '..
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { wasFeedingTrayId, slotRanOut } from '../utils/slotStatus';
+import { amsCommandToast } from '../utils/amsCommand';
 import { OutOfRotationChip } from '../components/OutOfRotationChip';
 import { EjectPhaseChip } from '../components/EjectPhaseChip';
 import { Collapsible } from '../components/Collapsible';
@@ -2960,7 +2961,8 @@ function PrinterCard({
   const loadAmsTrayMutation = useMutation({
     mutationFn: ({ trayId }: { trayId: number }) => api.loadAmsTray(printer.id, trayId),
     onSuccess: (data) => {
-      showToast(data.message || t('printers.toast.loadInitiated'));
+      const { key, type } = amsCommandToast('load', data.outcome);
+      showToast(t(key), type);
     },
     onError: (error: Error) => {
       showToast(error.message || t('printers.toast.failedToLoad'), 'error');
@@ -2970,7 +2972,8 @@ function PrinterCard({
   const unloadAmsMutation = useMutation({
     mutationFn: () => api.unloadAms(printer.id),
     onSuccess: (data) => {
-      showToast(data.message || t('printers.toast.unloadInitiated'));
+      const { key, type } = amsCommandToast('unload', data.outcome);
+      showToast(t(key), type);
     },
     onError: (error: Error) => {
       showToast(error.message || t('printers.toast.failedToUnload'), 'error');

@@ -9,15 +9,51 @@
  *
  * Unload is NOT a slot verb: `/ams/unload` takes no tray argument, so it lives
  * once in each AMS unit's header (B4 slot-verb consolidation) and needs no hover.
+ *
+ * A 200 answers `{ outcome, message }`; the toast is keyed off `outcome` and the
+ * backend `message` is never rendered. `showToast` is spied (and still forwarded
+ * to the real provider) so each case pins both the rendered copy and the variant.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { render } from '../utils';
 import { PrintersPage } from '../../pages/PrintersPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
+import type { AmsCommandOutcome } from '../../api/client';
+import type { ToastType } from '../../contexts/ToastContext';
+import en from '../../i18n/locales/en';
+
+const { showToastSpy } = vi.hoisted(() => ({ showToastSpy: vi.fn() }));
+
+/**
+ * Record every showToast call, then forward it so the real ToastProvider still
+ * renders the toast. The wrapper is cached per provider function so its identity
+ * is as stable as the provider's own useCallback.
+ */
+vi.mock('../../contexts/ToastContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../contexts/ToastContext')>();
+  type ShowToast = ReturnType<typeof actual.useToast>['showToast'];
+  const spied = new WeakMap<ShowToast, ShowToast>();
+  return {
+    ...actual,
+    useToast: () => {
+      const context = actual.useToast();
+      let showToast = spied.get(context.showToast);
+      if (!showToast) {
+        const original = context.showToast;
+        showToast = (message, type) => {
+          showToastSpy(message, type);
+          original(message, type);
+        };
+        spied.set(original, showToast);
+      }
+      return { ...context, showToast };
+    },
+  };
+});
 
 const mockPrinter = {
   id: 1,
@@ -101,8 +137,32 @@ async function hoverSlot(slot: Element) {
   });
 }
 
+const toastCopy = en.printers.toast;
+
+/** [outcome, rendered copy, toast variant] for a Load click. */
+const loadOutcomes: Array<[AmsCommandOutcome, string, ToastType]> = [
+  ['complete', toastCopy.loadInitiated, 'success'],
+  ['acted', toastCopy.loadInitiated, 'success'],
+  ['no_movement', toastCopy.amsLoadNoMovement, 'warning'],
+  ['undecidable', toastCopy.amsUnloadNothingLoaded, 'info'],
+  ['session_changed', toastCopy.amsCommandSessionChanged, 'warning'],
+];
+
+/** [outcome, rendered copy, toast variant] for an Unload click. */
+const unloadOutcomes: Array<[AmsCommandOutcome, string, ToastType]> = [
+  ['complete', toastCopy.unloadInitiated, 'success'],
+  ['acted', toastCopy.unloadInitiated, 'success'],
+  ['no_movement', toastCopy.amsUnloadNoMovement, 'warning'],
+  ['undecidable', toastCopy.amsUnloadNothingLoaded, 'info'],
+  ['session_changed', toastCopy.amsCommandSessionChanged, 'warning'],
+];
+
+/** A backend sentence that must never reach the screen. */
+const BACKEND_MESSAGE = 'backend fallback sentence';
+
 describe('PrintersPage - AMS load/unload (#891)', () => {
   beforeEach(() => {
+    showToastSpy.mockClear();
     server.use(
       http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinter])),
       http.get('/api/v1/queue/', () => HttpResponse.json([])),
@@ -118,7 +178,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
       http.post('/api/v1/printers/:id/ams/load', ({ request }) => {
         const url = new URL(request.url);
         captured = { tray_id: url.searchParams.get('tray_id') };
-        return HttpResponse.json({ success: true, message: 'Loading filament from AMS 0 slot 3' });
+        return HttpResponse.json({ outcome: 'acted', message: 'Loading filament from AMS 0 slot 3' });
       }),
     );
 
@@ -147,7 +207,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
       http.get('/api/v1/printers/:id/status', () => HttpResponse.json(mockIdleStatusWithAms)),
       http.post('/api/v1/printers/:id/ams/unload', () => {
         unloadCalled = true;
-        return HttpResponse.json({ success: true, message: 'Unloading filament' });
+        return HttpResponse.json({ outcome: 'acted', message: 'Unloading filament' });
       }),
     );
 
@@ -229,7 +289,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
       ),
       http.post('/api/v1/printers/:id/ams/load', ({ request }) => {
         captured = new URL(request.url).searchParams.get('tray_id');
-        return HttpResponse.json({ success: true, message: 'Loading filament from external spool' });
+        return HttpResponse.json({ outcome: 'acted', message: 'Loading filament from external spool' });
       }),
     );
 
@@ -246,5 +306,53 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
     await waitFor(() => {
       expect(captured).toBe('254');
     });
+  });
+
+  it.each(loadOutcomes)('Load answered %s renders "%s" as a %s toast', async (outcome, copy, type) => {
+    const user = userEvent.setup();
+
+    server.use(
+      http.get('/api/v1/printers/:id/status', () => HttpResponse.json(mockIdleStatusWithAms)),
+      http.post('/api/v1/printers/:id/ams/load', () =>
+        HttpResponse.json({ outcome, message: BACKEND_MESSAGE }),
+      ),
+    );
+
+    render(<PrintersPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId('filament-slot').length).toBeGreaterThan(0);
+    });
+
+    const slots = screen.getAllByTestId('filament-slot');
+    await hoverSlot(slots[0]);
+    await user.click(screen.getByText('Load'));
+
+    expect(await screen.findByText(copy)).toBeInTheDocument();
+    expect(showToastSpy).toHaveBeenCalledWith(copy, type);
+    expect(screen.queryByText(BACKEND_MESSAGE)).not.toBeInTheDocument();
+  });
+
+  it.each(unloadOutcomes)('Unload answered %s renders "%s" as a %s toast', async (outcome, copy, type) => {
+    const user = userEvent.setup();
+
+    server.use(
+      http.get('/api/v1/printers/:id/status', () => HttpResponse.json(mockIdleStatusWithAms)),
+      http.post('/api/v1/printers/:id/ams/unload', () =>
+        HttpResponse.json({ outcome, message: BACKEND_MESSAGE }),
+      ),
+    );
+
+    render(<PrintersPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId('filament-slot').length).toBeGreaterThan(0);
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Unload' }));
+
+    expect(await screen.findByText(copy)).toBeInTheDocument();
+    expect(showToastSpy).toHaveBeenCalledWith(copy, type);
+    expect(screen.queryByText(BACKEND_MESSAGE)).not.toBeInTheDocument();
   });
 });

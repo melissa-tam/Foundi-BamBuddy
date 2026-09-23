@@ -886,6 +886,10 @@ export default {
       unloadInitiated: 'Unloading filament…',
       failedToLoad: 'Failed to load filament',
       failedToUnload: 'Failed to unload filament',
+      amsLoadNoMovement: 'Load sent. AMS did not move.',
+      amsUnloadNoMovement: 'Unload sent. AMS did not move.',
+      amsUnloadNothingLoaded: 'Unload sent. Nothing was loaded.',
+      amsCommandSessionChanged: 'Printer reconnected during the command. Check the AMS.',
     },
     // Connection status
     connection: {
