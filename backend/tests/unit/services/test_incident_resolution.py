@@ -230,6 +230,54 @@ class TestTheWireLane:
         assert verdict.close is True
         assert verdict.source == RESOLVE_OBSERVED_RUNNING
 
+    def test_a_live_driver_defers_the_job_terminal(self):
+        """Review F2 (2026-09-23 wave): a live driver owns the outcome at a job terminal
+        too. A release lever can END the print, and that terminal is a reading of the
+        driver's own procedure — the driver records it (``ended``) and closes its row with
+        its own source; the terminal closer must not free the row from under it."""
+        ctx = Context(
+            state=_state("IDLE"),
+            ledger=MotionLedger(),
+            driver_live=True,
+            terminal=TerminalEvent(status="failed", eject=False, job_id=_JOB),
+        )
+
+        verdict = resolve(_row(RESOLUTION_WIRE, status=STATUS_RECOVERING), "job_terminal", ctx)
+
+        assert (verdict.close, verdict.source) == (False, None)
+        assert "closer stands aside" in verdict.evidence
+
+    @pytest.mark.parametrize("status", [STATUS_RECOVERING, STATUS_ESCALATED])
+    def test_with_no_live_driver_the_job_terminal_closes_the_wire_hold(self, status):
+        """Liveness is the test, not the row's status: a ``recovering`` row whose driver
+        died (the R1 orphan) has no owner left, and its job's terminal still closes it."""
+        ctx = Context(
+            state=_state("IDLE"),
+            ledger=MotionLedger(),
+            driver_live=False,
+            terminal=TerminalEvent(status="failed", eject=False, job_id=_JOB),
+        )
+
+        verdict = resolve(_row(RESOLUTION_WIRE, status=status), "job_terminal", ctx)
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_TERMINAL)
+
+    def test_both_wire_edges_stand_aside_on_the_same_sentence(self):
+        """One ownership rule at the two told-occasions a driver's own verb can cause, so
+        the closers' two log lines read the same reason."""
+        ctx = Context(
+            state=_state("RUNNING"),
+            ledger=MotionLedger(),
+            driver_live=True,
+            terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
+        )
+
+        running = resolve(_row(RESOLUTION_WIRE), "running_edge", ctx)
+        terminal = resolve(_row(RESOLUTION_WIRE), "job_terminal", ctx)
+
+        assert running == terminal
+        assert running.close is False
+
     @pytest.mark.parametrize("live", ["", "UNKNOWN", "PAUSE"])
     def test_a_non_positive_state_never_closes_a_wire_hold(self, live):
         """``""``/``UNKNOWN`` are absence of evidence; ``PAUSE`` IS the hold."""

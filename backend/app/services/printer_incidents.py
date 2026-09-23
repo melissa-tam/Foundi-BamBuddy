@@ -42,6 +42,33 @@ UN-GATES a printer that is held — which is why every mutator here refreshes it
 :func:`rehydrate` rebuilds it at startup, and why the scheduler reads the WIRE
 beside it: the wire owns "a fault stands NOW", this row owns "an unresolved hold
 exists", and neither is derivable from the other.
+
+**Liveness lives here too (2026-09-23, 012-H2S shape 41).** Two different facts answer
+"is somebody acting on this printer's fault", and this module holds both:
+
+* the open row is the durable PROMISE — ``recovering`` says a driver undertook to produce
+  an outcome, and it survives a restart because the obligation does;
+* the driver registry (:func:`register_driver` / :func:`release_driver`) is LIVENESS — a
+  task is running right now. Process memory by design: a restart kills the task, so an
+  empty registry after one is the truth; and ``.done()`` is asked rather than membership
+  trusted, so a driver that died without releasing reads not-live (the R1 orphan).
+
+:func:`driver_live` is the ONE spelling of the second fact, and every reader projects it
+from here: the printer card through :func:`snapshot` / :func:`snapshots` (computed at READ
+time and never cached — the projection is filled at open and at rehydrate, and would go
+stale the moment a driver spawned or exited), the resolution closers through
+``incident_resolution.Context.driver_live``, and the stall watchdog.
+``incident_resolution.driver_owns`` keeps taking ``live`` as a PARAMETER, so the rule
+table stays a pure function of what it is handed. Registration is observability, never a
+gate — entry exclusivity stays the partial unique index above. The slot used to live in
+``spool_recovery``, and it moved for the reason this module exists at all: a status
+serializer must not import the recovery machine to ask whether the machine is running.
+
+**The step ledger is written here as well** (:func:`note_step` / :func:`answer_step`, the
+ONE writer of ``printer_incident_step``): what a driver SENT against an incident, one row
+per lever pulled or command sent. The wire cannot restate it — a stalled feeder answers
+every release lever with the same re-PAUSE in the same change — so a restart must read it
+here to resume the ladder at the next unpulled lever instead of re-grinding the feeder.
 """
 
 from __future__ import annotations
@@ -80,13 +107,24 @@ from backend.app.models.printer_incident import (
     STATUS_RESOLVED,
     PrinterIncident,
 )
+from backend.app.models.printer_incident_step import PrinterIncidentStep, StepKind
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import Iterable
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+# The recovery DRIVER's own close when a release verb it pulled ENDED the print (the
+# reader's ``ended`` verdict, 2026-09-23): the terminal closer stands aside while a driver
+# is live (``incident_resolution._wire_job_terminal``), so the driver records the terminal
+# itself and closes its row with this token. It joins the model's ``RESOLVE_*`` vocabulary
+# in the driver capsule; ``resolve_source`` is free text, so the token needs no migration.
+# Deliberately NOT in :data:`_FARM_CLOSES`: a print the farm's own verb ended is not a
+# recovery, whatever else the close says.
+RESOLVE_DRIVER_ENDED = "driver_ended"
 
 # The statuses that mean "closed" — both stamp ``resolved_at`` (see the model
 # docstring's lifecycle table), so the open/closed question is asked of that column
@@ -99,6 +137,12 @@ CLOSED_STATUSES: tuple[str, ...] = (STATUS_RESOLVED, STATUS_ABORTED)
 # recovery driver learns its own row was re-classified — must be able to ask about
 # ONE row while the kind under it changes.
 _open_cache: dict[int, dict[int, dict]] = {}
+
+# printer_id -> the recovery DRIVER task acting on that printer's fault. LIVENESS, not
+# ownership (see the module docstring): the open row is the promise, this is whether a
+# task is keeping it right now. Written only by :func:`register_driver` /
+# :func:`release_driver`, read only through :func:`driver_live`.
+_drivers: dict[int, asyncio.Task[object]] = {}
 
 
 # --- waiting_reason vocabulary (rendered by the queue UI, mapped in waitingReason.ts) ---
@@ -304,8 +348,14 @@ def waiting_reason_for(kind: str, *, external: bool = False) -> str:
 
 
 def _reset_state() -> None:
-    """Test hook: drop the projection cache between cases."""
+    """Test hook: drop the projection cache AND the driver liveness slots between cases.
+
+    One hook for the store's whole process state, so no test can reset half of it.
+    :func:`rehydrate` deliberately clears only the cache: it re-reads ROWS, and a restart
+    has already emptied the registry by killing the tasks it held.
+    """
     _open_cache.clear()
+    _drivers.clear()
 
 
 def is_known_kind(kind: str) -> bool:
@@ -350,6 +400,10 @@ def _payload(incident: PrinterIncident) -> dict:
     that raised no plate gate and no quarantine (011-H2S 2026-09-17, and the
     ``z_reference_lost`` hold before it).
 
+    ``driver_live`` is deliberately ABSENT: it is liveness, not a fact of the row, and a
+    cached copy would go stale the moment a driver spawned or exited. :func:`snapshot`
+    adds it at read time (:func:`_with_liveness`).
+
     Only JSON PRIMITIVES: the WS lane serializes this dict with a bare ``json.dumps``.
     """
     return {
@@ -379,6 +433,9 @@ def snapshot(printer_id: int | None, *, kind: str | None = None) -> dict | None:
     Without it, the highest-:data:`KIND_PRECEDENCE` open row: the printer card shows
     ONE chip, and it should name the fault that interrupted the work.
 
+    The dict carries the cached row payload plus ``driver_live``, read LIVE from the
+    registry (:func:`_with_liveness`) — a fresh dict, so no reader can write into the cache.
+
     Pure and DB-free — read by ``printer_state_to_dict`` on every status broadcast.
     """
     if not printer_id:
@@ -387,8 +444,10 @@ def snapshot(printer_id: int | None, *, kind: str | None = None) -> dict | None:
     if not rows:
         return None
     if kind is not None:
-        return next((payload for payload in rows.values() if payload.get("kind") == kind), None)
-    return min(rows.values(), key=lambda payload: _precedence(payload.get("kind")))
+        payload = next((payload for payload in rows.values() if payload.get("kind") == kind), None)
+    else:
+        payload = min(rows.values(), key=lambda payload: _precedence(payload.get("kind")))
+    return None if payload is None else _with_liveness(printer_id, payload)
 
 
 def snapshots(printer_id: int | None) -> list[dict]:
@@ -396,14 +455,28 @@ def snapshots(printer_id: int | None) -> list[dict]:
 
     The diagnostic-line reader (``print_scheduler._incident_summary``): a printer
     holding a jam AND a lost-Z frame must name both, or the line that is supposed to
-    explain a refusal explains half of it. Pure, DB-free, sync.
+    explain a refusal explains half of it. Each dict carries ``driver_live`` exactly as
+    :func:`snapshot`'s does. Pure, DB-free, sync.
     """
     if not printer_id:
         return []
     rows = _open_cache.get(printer_id)
     if not rows:
         return []
-    return sorted(rows.values(), key=lambda payload: _precedence(payload.get("kind")))
+    ordered = sorted(rows.values(), key=lambda payload: _precedence(payload.get("kind")))
+    return [_with_liveness(printer_id, payload) for payload in ordered]
+
+
+def _with_liveness(printer_id: int, payload: dict) -> dict:
+    """``payload`` plus the printer's LIVE ``driver_live`` — a new dict; the cache is untouched.
+
+    Computed per read because the cache is filled at open and at :func:`rehydrate` and
+    knows nothing of tasks. It is the PRINTER's liveness, projected onto every row of it:
+    the registry holds one slot per printer, and the question the card asks with it —
+    would a manual AMS command end a recovery that is running — is about the printer's
+    AMS, not about one row.
+    """
+    return {**payload, "driver_live": driver_live(printer_id)}
 
 
 def open_kinds(printer_id: int | None) -> frozenset[str]:
@@ -474,6 +547,55 @@ def cached_kind(printer_id: int, incident_id: int) -> str | None:
     if cached is None:
         return None
     return cached.get("kind")
+
+
+# --- driver liveness (2026-09-23) ---------------------------------------------------
+
+
+def register_driver(printer_id: int, task: asyncio.Task[object], *, incident_id: int) -> None:
+    """Take this printer's liveness slot for a freshly spawned recovery driver.
+
+    OBSERVABILITY, not a gate. Entry exclusivity stays the DB's partial unique index, so
+    no liveness check guards the spawn — the durable row is the authority and a second,
+    in-memory one would only drift from it. But a driver spawning over a LIVE one means a
+    closer freed the open row from under that one, so if it ever happens it must be one
+    grep away: 006-H2S 17:23:55 (2026-09-04) produced no line at all, and the single line
+    naming the moment is the difference between a grep and a 15 h triage.
+    """
+    live = _drivers.get(printer_id)
+    if live is not None and not live.done():
+        logger.warning(
+            "printer_incidents: printer %s: spawning a recovery driver while one is live — invariant violated (%s)",
+            printer_id,
+            f"incident {incident_id} spawned over a live driver",
+        )
+    _drivers[printer_id] = task
+
+
+def release_driver(printer_id: int, task: asyncio.Task[object]) -> None:
+    """Give the slot back — ONLY if it still holds ``task``.
+
+    A driver exits in its own ``finally``, and by then a SUCCESSOR may already hold the
+    slot (the spawn-over-live case :func:`register_driver` warns about). Popping by
+    printer alone would erase the successor's liveness, and every closer would then read
+    "no driver" under a task that is running — so the release is identity-checked, and a
+    release by a task that does not hold the slot is a no-op.
+    """
+    if _drivers.get(printer_id) is task:
+        del _drivers[printer_id]
+
+
+def driver_live(printer_id: int | None) -> bool:
+    """Is a recovery driver task RUNNING on this printer right now? Pure, DB-free, sync.
+
+    THE one spelling of liveness (module docstring). True iff a task holds the slot and
+    ``not task.done()``: an empty slot and a finished task both read False, so a driver
+    that crashed without releasing — the R1 orphan — never silences a closer forever.
+    """
+    if not printer_id:
+        return False
+    task = _drivers.get(printer_id)
+    return task is not None and not task.done()
 
 
 async def open_rows(db: AsyncSession, printer_id: int) -> list[PrinterIncident]:
@@ -880,6 +1002,83 @@ async def close_open_for_printer(
         if row is not None:
             closed.append(row)
     return closed
+
+
+# --- the step ledger (2026-09-23) --------------------------------------------------
+#
+# What a recovery driver SENT against an incident, one ``printer_incident_step`` row per
+# lever pulled or command sent (the model docstring has the why). This module is its ONE
+# writer: a step is noted at the SEND and answered at the READ, so a crash between the
+# two leaves "sent, never read" on disk — exactly what re-entry must know, because that
+# lever is spent and nobody saw what it did.
+
+
+async def note_step(
+    db: AsyncSession,
+    incident_id: int,
+    *,
+    seq: int,
+    kind: StepKind,
+    name: str,
+    target: int | None = None,
+    feeder: str | None = None,
+) -> PrinterIncidentStep:
+    """Persist one step AT THE SEND and commit. Returns the row.
+
+    ``seq`` is the driver's own send order within the incident; a duplicate
+    ``(incident_id, seq)`` is a driver that lost count of its own log, and the unique
+    index raises ``IntegrityError`` for it — after this rolls the failed commit back, so
+    the caller's session stays usable.
+    """
+    step = PrinterIncidentStep(
+        incident_id=incident_id,
+        seq=seq,
+        kind=kind,
+        name=name,
+        target=target,
+        feeder=feeder,
+        sent_at=datetime.utcnow(),
+    )
+    db.add(step)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise
+    logger.info("printer_incidents: incident %s step %s %s=%s sent", incident_id, seq, kind, name)
+    return step
+
+
+async def answer_step(db: AsyncSession, incident_id: int, seq: int, *, outcome: str) -> PrinterIncidentStep | None:
+    """Record what the READ of step ``seq`` found, stamp ``read_at`` and commit.
+
+    ``None`` when the incident has no such step — nothing was sent, so there is nothing
+    to answer.
+    """
+    step = await db.scalar(
+        select(PrinterIncidentStep)
+        .where(PrinterIncidentStep.incident_id == incident_id)
+        .where(PrinterIncidentStep.seq == seq)
+    )
+    if step is None:
+        return None
+    step.outcome = outcome
+    step.read_at = datetime.utcnow()
+    await db.commit()
+    logger.info(
+        "printer_incidents: incident %s step %s %s=%s outcome=%s", incident_id, seq, step.kind, step.name, outcome
+    )
+    return step
+
+
+async def steps_of(db: AsyncSession, incident_id: int) -> list[PrinterIncidentStep]:
+    """Every step of this incident, in send order (``seq`` ascending)."""
+    result = await db.execute(
+        select(PrinterIncidentStep)
+        .where(PrinterIncidentStep.incident_id == incident_id)
+        .order_by(PrinterIncidentStep.seq)
+    )
+    return list(result.scalars().all())
 
 
 # --- the outcome ledger (2026-09-11) ------------------------------------------------

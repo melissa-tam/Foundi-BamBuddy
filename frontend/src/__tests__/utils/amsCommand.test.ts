@@ -18,11 +18,13 @@ const table: Array<[AmsCommand, AmsCommandOutcome, AmsCommandToastKey, ToastType
   ['load', 'no_movement', 'printers.toast.amsLoadNoMovement', 'warning'],
   ['load', 'undecidable', 'printers.toast.amsUnloadNothingLoaded', 'info'],
   ['load', 'session_changed', 'printers.toast.amsCommandSessionChanged', 'warning'],
+  ['load', 'held', 'printers.toast.amsLoadHeld', 'warning'],
   ['unload', 'complete', 'printers.toast.unloadInitiated', 'success'],
   ['unload', 'acted', 'printers.toast.unloadInitiated', 'success'],
   ['unload', 'no_movement', 'printers.toast.amsUnloadNoMovement', 'warning'],
   ['unload', 'undecidable', 'printers.toast.amsUnloadNothingLoaded', 'info'],
   ['unload', 'session_changed', 'printers.toast.amsCommandSessionChanged', 'warning'],
+  ['unload', 'held', 'printers.toast.amsUnloadHeld', 'warning'],
 ];
 
 /** Walks a dotted i18n key through the `en` locale object. */

@@ -13,16 +13,20 @@
  * A 200 answers `{ outcome, message }`; the toast is keyed off `outcome` and the
  * backend `message` is never rendered. `showToast` is spied (and still forwarded
  * to the real provider) so each case pins both the rendered copy and the variant.
+ *
+ * While a recovery driver is live (`open_incident.driver_live`) a Load/Unload click
+ * asks first — sending the command ends the driver. The gate is `driver_live` alone:
+ * a `recovering` row without a live driver, or no incident, sends at once.
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { screen, waitFor, fireEvent } from '@testing-library/react';
+import { screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { render } from '../utils';
 import { PrintersPage } from '../../pages/PrintersPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
-import type { AmsCommandOutcome } from '../../api/client';
+import type { AmsCommandOutcome, OpenIncidentState } from '../../api/client';
 import type { ToastType } from '../../contexts/ToastContext';
 import en from '../../i18n/locales/en';
 
@@ -146,6 +150,7 @@ const loadOutcomes: Array<[AmsCommandOutcome, string, ToastType]> = [
   ['no_movement', toastCopy.amsLoadNoMovement, 'warning'],
   ['undecidable', toastCopy.amsUnloadNothingLoaded, 'info'],
   ['session_changed', toastCopy.amsCommandSessionChanged, 'warning'],
+  ['held', toastCopy.amsLoadHeld, 'warning'],
 ];
 
 /** [outcome, rendered copy, toast variant] for an Unload click. */
@@ -155,6 +160,7 @@ const unloadOutcomes: Array<[AmsCommandOutcome, string, ToastType]> = [
   ['no_movement', toastCopy.amsUnloadNoMovement, 'warning'],
   ['undecidable', toastCopy.amsUnloadNothingLoaded, 'info'],
   ['session_changed', toastCopy.amsCommandSessionChanged, 'warning'],
+  ['held', toastCopy.amsUnloadHeld, 'warning'],
 ];
 
 /** A backend sentence that must never reach the screen. */
@@ -354,5 +360,140 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
     expect(await screen.findByText(copy)).toBeInTheDocument();
     expect(showToastSpy).toHaveBeenCalledWith(copy, type);
     expect(screen.queryByText(BACKEND_MESSAGE)).not.toBeInTheDocument();
+  });
+
+  describe('while a recovery driver is live', () => {
+    const confirmCopy = en.printers.confirm;
+    const confirmMessage = confirmCopy.amsRecoveryMessage.replace('{{name}}', mockPrinter.name);
+
+    /** A wedge posture: PAUSE with an open `recovering` jam row; `driver_live` is the only gate. */
+    function statusWithIncident(driverLive: boolean) {
+      const incident: OpenIncidentState = {
+        id: 304,
+        kind: 'jam',
+        status: 'recovering',
+        slot_desc: null,
+        created_at: null,
+        operator_exits: false,
+        driver_live: driverLive,
+      };
+      return { ...mockIdleStatusWithAms, state: 'PAUSE', open_incident: incident };
+    }
+
+    function recoveryDialog() {
+      return screen.queryByRole('dialog', { name: confirmCopy.amsRecoveryTitle });
+    }
+
+    async function renderCard(status: object) {
+      server.use(http.get('/api/v1/printers/:id/status', () => HttpResponse.json(status)));
+      render(<PrintersPage />);
+      await waitFor(() => {
+        expect(screen.getAllByTestId('filament-slot').length).toBeGreaterThan(0);
+      });
+    }
+
+    /** Status fixtures on which a click must send at once, with no dialog. */
+    const sendsAtOnce: Array<[string, object]> = [
+      ['driver_live false', statusWithIncident(false)],
+      ['no open incident', mockIdleStatusWithAms],
+    ];
+
+    it('Load asks first: Cancel sends nothing, Send posts the tray and closes', async () => {
+      const user = userEvent.setup();
+      const sentTrayIds: Array<string | null> = [];
+      server.use(
+        http.post('/api/v1/printers/:id/ams/load', ({ request }) => {
+          sentTrayIds.push(new URL(request.url).searchParams.get('tray_id'));
+          return HttpResponse.json({ outcome: 'held', message: BACKEND_MESSAGE });
+        }),
+      );
+      await renderCard(statusWithIncident(true));
+
+      const slots = screen.getAllByTestId('filament-slot');
+      await hoverSlot(slots[2]);
+      await user.click(screen.getByText('Load'));
+
+      const dialog = await screen.findByRole('dialog', { name: confirmCopy.amsRecoveryTitle });
+      expect(within(dialog).getByText(confirmMessage)).toBeInTheDocument();
+      await user.click(within(dialog).getByRole('button', { name: en.common.cancel }));
+      expect(recoveryDialog()).not.toBeInTheDocument();
+
+      await hoverSlot(slots[2]);
+      await user.click(screen.getByText('Load'));
+      const again = await screen.findByRole('dialog', { name: confirmCopy.amsRecoveryTitle });
+      await user.click(within(again).getByRole('button', { name: confirmCopy.amsCommandButton }));
+      expect(recoveryDialog()).not.toBeInTheDocument();
+
+      // The toast lands after the confirmed request's response, so any request the
+      // first click or the Cancel had sent would already be recorded here.
+      expect(await screen.findByText(toastCopy.amsLoadHeld)).toBeInTheDocument();
+      expect(sentTrayIds).toEqual(['2']);
+    });
+
+    it('Unload asks first: Cancel sends nothing, Send posts the unload and closes', async () => {
+      const user = userEvent.setup();
+      let unloadCalls = 0;
+      server.use(
+        http.post('/api/v1/printers/:id/ams/unload', () => {
+          unloadCalls += 1;
+          return HttpResponse.json({ outcome: 'held', message: BACKEND_MESSAGE });
+        }),
+      );
+      await renderCard(statusWithIncident(true));
+
+      await user.click(screen.getByRole('button', { name: 'Unload' }));
+      const dialog = await screen.findByRole('dialog', { name: confirmCopy.amsRecoveryTitle });
+      expect(within(dialog).getByText(confirmMessage)).toBeInTheDocument();
+      await user.click(within(dialog).getByRole('button', { name: en.common.cancel }));
+      expect(recoveryDialog()).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Unload' }));
+      const again = await screen.findByRole('dialog', { name: confirmCopy.amsRecoveryTitle });
+      await user.click(within(again).getByRole('button', { name: confirmCopy.amsCommandButton }));
+      expect(recoveryDialog()).not.toBeInTheDocument();
+
+      expect(await screen.findByText(toastCopy.amsUnloadHeld)).toBeInTheDocument();
+      expect(unloadCalls).toBe(1);
+    });
+
+    it.each(sendsAtOnce)('Load with %s posts at once with no dialog', async (_label, status) => {
+      const user = userEvent.setup();
+      let captured: string | null = null;
+      server.use(
+        http.post('/api/v1/printers/:id/ams/load', ({ request }) => {
+          captured = new URL(request.url).searchParams.get('tray_id');
+          return HttpResponse.json({ outcome: 'acted', message: BACKEND_MESSAGE });
+        }),
+      );
+      await renderCard(status);
+
+      const slots = screen.getAllByTestId('filament-slot');
+      await hoverSlot(slots[1]);
+      await user.click(screen.getByText('Load'));
+      expect(recoveryDialog()).not.toBeInTheDocument();
+
+      await waitFor(() => {
+        expect(captured).toBe('1');
+      });
+    });
+
+    it.each(sendsAtOnce)('Unload with %s posts at once with no dialog', async (_label, status) => {
+      const user = userEvent.setup();
+      let unloadCalled = false;
+      server.use(
+        http.post('/api/v1/printers/:id/ams/unload', () => {
+          unloadCalled = true;
+          return HttpResponse.json({ outcome: 'acted', message: BACKEND_MESSAGE });
+        }),
+      );
+      await renderCard(status);
+
+      await user.click(screen.getByRole('button', { name: 'Unload' }));
+      expect(recoveryDialog()).not.toBeInTheDocument();
+
+      await waitFor(() => {
+        expect(unloadCalled).toBe(true);
+      });
+    });
   });
 });

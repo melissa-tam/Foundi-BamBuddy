@@ -881,6 +881,8 @@ export default {
       amsUnloadNoMovement: 'Entladen gesendet. AMS hat sich nicht bewegt.',
       amsUnloadNothingLoaded: 'Entladen gesendet. Es war nichts geladen.',
       amsCommandSessionChanged: 'Drucker während des Befehls neu verbunden. AMS prüfen.',
+      amsLoadHeld: 'Laden angenommen. Wartet hinter dem Filamentwechsel des pausierten Drucks.',
+      amsUnloadHeld: 'Entladen angenommen. Wartet hinter dem Filamentwechsel des pausierten Drucks.',
     },
     // Connection status
     connection: {
@@ -1080,6 +1082,9 @@ export default {
       pauseTitle: 'Druck pausieren',
       pauseMessage: 'Möchten Sie den aktuellen Druck auf "{{name}}" wirklich pausieren?',
       pauseButton: 'Druck pausieren',
+      amsRecoveryTitle: 'Wiederherstellung läuft',
+      amsRecoveryMessage: '{{name}}: Wiederherstellung läuft. Dieser Befehl beendet sie.',
+      amsCommandButton: 'Senden',
       resumeTitle: 'Druck fortsetzen',
       resumeMessage: 'Möchten Sie den Druck auf "{{name}}" fortsetzen?',
       resumeButton: 'Druck fortsetzen',

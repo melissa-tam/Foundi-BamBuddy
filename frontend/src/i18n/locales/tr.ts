@@ -881,6 +881,8 @@ export default {
       amsUnloadNoMovement: 'Çıkarma gönderildi. AMS hareket etmedi.',
       amsUnloadNothingLoaded: 'Çıkarma gönderildi. Yüklü filament yoktu.',
       amsCommandSessionChanged: 'Komut sırasında yazıcı yeniden bağlandı. AMS durumunu kontrol edin.',
+      amsLoadHeld: 'Yükleme kabul edildi. Duraklatılmış baskının filament değişiminin arkasında bekletiliyor.',
+      amsUnloadHeld: 'Çıkarma kabul edildi. Duraklatılmış baskının filament değişiminin arkasında bekletiliyor.',
     },
     // Bağlantı durumu
     connection: {
@@ -1080,6 +1082,9 @@ export default {
       pauseTitle: 'Baskıyı Duraklat',
       pauseMessage: '"{{name}}" üzerindeki mevcut baskıyı duraklatmak istediğinizden emin misiniz?',
       pauseButton: 'Baskıyı Duraklat',
+      amsRecoveryTitle: 'Kurtarma sürüyor',
+      amsRecoveryMessage: '{{name}}: kurtarma çalışıyor. Bu komutu göndermek kurtarmayı sonlandırır.',
+      amsCommandButton: 'Gönder',
       resumeTitle: 'Baskıya Devam Et',
       resumeMessage: '"{{name}}" üzerindeki baskıya devam etmek istediğinizden emin misiniz?',
       resumeButton: 'Baskıya Devam Et',

@@ -23,7 +23,7 @@ over a demonstrably idle printer. Operators stopped those units by hand first, w
 the farm losing an argument with its own bookkeeping.
 
 So liveness is ASKED rather than assumed (:func:`has_live_start_watchdog`, the same
-shape as ``spool_recovery.has_live_recovery``), and what is left of the clock is one
+shape as ``printer_incidents.driver_live``), and what is left of the clock is one
 honest number: :data:`DISPATCH_START_BUDGET_S`, the measured window in which a printer
 that has ACCEPTED a job may still report a non-active state. It is the watchdog's own
 Phase A timeout — ONE origin, read by the watchdog as its ``timeout`` default — so the
@@ -95,7 +95,7 @@ def register_start_watchdog(item_id: int, task: asyncio.Task) -> None:
 
     A task that is already done is still recorded: :func:`has_live_start_watchdog`
     asks ``.done()`` rather than trusting membership, exactly as
-    ``spool_recovery.has_live_recovery`` does, so the two answers cannot diverge on a
+    ``printer_incidents.driver_live`` does, so the two answers cannot diverge on a
     callback that has not run yet.
     """
     _start_watchdogs[item_id] = task

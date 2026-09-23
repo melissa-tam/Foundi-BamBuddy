@@ -881,6 +881,8 @@ export default {
       amsUnloadNoMovement: 'Descarregamento enviado. O AMS não se moveu.',
       amsUnloadNothingLoaded: 'Descarregamento enviado. Nada estava carregado.',
       amsCommandSessionChanged: 'A impressora reconectou durante o comando. Verifique o AMS.',
+      amsLoadHeld: 'Carregamento aceito. Retido atrás da troca de filamento da impressão pausada.',
+      amsUnloadHeld: 'Descarregamento aceito. Retido atrás da troca de filamento da impressão pausada.',
     },
     // Connection status
     connection: {
@@ -1080,6 +1082,9 @@ export default {
       pauseTitle: 'Pausar Impressão',
       pauseMessage: 'Tem certeza de que deseja pausar a impressão atual em "{{name}}"?',
       pauseButton: 'Pausar Impressão',
+      amsRecoveryTitle: 'Recuperação em andamento',
+      amsRecoveryMessage: '{{name}}: recuperação em andamento. Enviar este comando a encerra.',
+      amsCommandButton: 'Enviar',
       resumeTitle: 'Retomar Impressão',
       resumeMessage: 'Tem certeza de que deseja retomar a impressão em "{{name}}"?',
       resumeButton: 'Retomar Impressão',

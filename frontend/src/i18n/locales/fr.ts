@@ -881,6 +881,8 @@ export default {
       amsUnloadNoMovement: 'Déchargement envoyé. L’AMS n’a pas bougé.',
       amsUnloadNothingLoaded: 'Déchargement envoyé. Rien n’était chargé.',
       amsCommandSessionChanged: 'Imprimante reconnectée pendant la commande. Vérifiez l’AMS.',
+      amsLoadHeld: 'Chargement accepté. En attente derrière le changement de filament de l’impression en pause.',
+      amsUnloadHeld: 'Déchargement accepté. En attente derrière le changement de filament de l’impression en pause.',
     },
     // Connection status
     connection: {
@@ -1080,6 +1082,9 @@ export default {
       pauseTitle: 'Mettre en pause',
       pauseMessage: 'Mettre en pause l\'impression sur "{{name}}" ?',
       pauseButton: 'Pause',
+      amsRecoveryTitle: 'Récupération en cours',
+      amsRecoveryMessage: '{{name}} : récupération en cours. L’envoi de cette commande y met fin.',
+      amsCommandButton: 'Envoyer',
       resumeTitle: 'Reprendre l\'impression',
       resumeMessage: 'Reprendre l\'impression sur "{{name}}" ?',
       resumeButton: 'Reprendre',

@@ -11,7 +11,9 @@ export type AmsCommandToastKey =
   | 'printers.toast.amsLoadNoMovement'
   | 'printers.toast.amsUnloadNoMovement'
   | 'printers.toast.amsUnloadNothingLoaded'
-  | 'printers.toast.amsCommandSessionChanged';
+  | 'printers.toast.amsCommandSessionChanged'
+  | 'printers.toast.amsLoadHeld'
+  | 'printers.toast.amsUnloadHeld';
 
 export interface AmsCommandToast {
   key: AmsCommandToastKey;
@@ -28,6 +30,9 @@ export interface AmsCommandToast {
  * `undecidable` is only produced for an unload (the backend's classifier has no
  * load row that answers it); a load answered `undecidable` still maps to the
  * nothing-loaded copy so the table has no hole.
+ *
+ * `held` is a warning, not a success: the AMS accepted the command but runs it only
+ * after the paused print's own filament change releases.
  *
  * The `never` default makes a new backend outcome a `tsc -b` failure here rather
  * than a silent fall-through; at runtime an unknown outcome throws, which TanStack
@@ -50,6 +55,11 @@ export function amsCommandToast(command: AmsCommand, outcome: AmsCommandOutcome)
       return { key: 'printers.toast.amsUnloadNothingLoaded', type: 'info' };
     case 'session_changed':
       return { key: 'printers.toast.amsCommandSessionChanged', type: 'warning' };
+    case 'held':
+      return {
+        key: command === 'load' ? 'printers.toast.amsLoadHeld' : 'printers.toast.amsUnloadHeld',
+        type: 'warning',
+      };
     default: {
       const unhandled: never = outcome;
       throw new Error(`Unhandled AMS command outcome: ${String(unhandled)}`);

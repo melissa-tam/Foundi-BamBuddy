@@ -2136,6 +2136,9 @@ class TestOpenIncidentProjection:
             "slot_desc": "AMS A slot 3",
             "created_at": "2026-08-09T12:00:00",
             "operator_exits": False,
+            # Computed at read time from the store's liveness registry, never cached
+            # with the row: no driver is registered here, so the card reads False.
+            "driver_live": False,
         }
 
 

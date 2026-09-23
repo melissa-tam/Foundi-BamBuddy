@@ -107,7 +107,7 @@ WAITING_REASON_PAUSED = "print_paused_stalled"
 # pause-stall watch must not double-flag or double-notify it.
 #
 # WAITING_REASON_RECOVERING is deliberately NOT here (R1): a spool-recovery pause is
-# "owned" only while a LIVE recovery task exists (spool_recovery.has_live_recovery),
+# "owned" only while a LIVE recovery task exists (printer_incidents.driver_live),
 # not by the token string. The recovery task's state is process-lifetime in-memory,
 # so a server restart mid-recovery orphans the DB token — treating the token alone
 # as ownership would leave the printer PAUSEd forever with the watchdog silenced.
@@ -318,7 +318,7 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
     grace_s = await _grace_seconds(db, "farm_pause_stall_minutes", _DEFAULT_PAUSE_GRACE_MINUTES)
     # Local import (matches the fork's cycle-avoidance convention here) — the sole
     # ownership signal for a spool-recovery pause is a LIVE task, not the token.
-    from backend.app.services import printer_incidents, spool_recovery
+    from backend.app.services import printer_incidents
 
     # Printers whose pause an AMS incident already owns. Read ONCE per tick (the
     # durable successor of "the item carries an escalated token": it also covers a
@@ -350,7 +350,7 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
         # must not sit in the UI forever), then fall through so a still-PAUSEd printer
         # re-enters the normal unattended-pause grace flow below (operator notified
         # after farm_pause_stall_minutes).
-        if item.waiting_reason == WAITING_REASON_RECOVERING and not spool_recovery.has_live_recovery(pid):
+        if item.waiting_reason == WAITING_REASON_RECOVERING and not printer_incidents.driver_live(pid):
             item.waiting_reason = None
             dirty = True
             logger.warning(
@@ -380,7 +380,7 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
         # never the token (an orphaned token was already reclaimed above).
         owned = (
             item.waiting_reason in _ATTENDED_PAUSE_REASONS
-            or spool_recovery.has_live_recovery(pid)
+            or printer_incidents.driver_live(pid)
             or pid in incident_printers
         )
         if owned:
@@ -577,7 +577,7 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
     the six guards this docstring used to enumerate in prose. What is gathered, per
     claim: the live wire (connected, non-stale, state, echoed subtask), the DB (the
     archive-printing disjointness, the claim's age), and the two liveness registries
-    (``dispatch_claim.has_live_start_watchdog``, ``spool_recovery.has_live_recovery``).
+    (``dispatch_claim.has_live_start_watchdog``, ``printer_incidents.driver_live``).
 
     **Ownership is ASKED, not timed (2026-09-19).** The old guard 4 required a claim to
     be 600 s old before this watch would look at it, so that the start watchdog was
@@ -615,7 +615,7 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
     from datetime import datetime, timezone
 
     from backend.app.models.archive import PrintArchive
-    from backend.app.services import printer_incidents, spool_recovery
+    from backend.app.services import printer_incidents
     from backend.app.services.queue_transitions import release_unstarted_claim
 
     try:
@@ -676,7 +676,7 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
                 # physical hold the terminal no longer launders) must still be released.
                 recovery_acting=(
                     any(row.status == STATUS_RECOVERING for row in await printer_incidents.open_rows(db, pid))
-                    or spool_recovery.has_live_recovery(pid)
+                    or printer_incidents.driver_live(pid)
                 ),
             )
             verdict = judge(evidence)
@@ -764,7 +764,7 @@ async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, no
     now = time.time() if now is None else now
 
     from backend.app.models.printer import Printer
-    from backend.app.services import printer_incidents, spool_recovery
+    from backend.app.services import printer_incidents
     from backend.app.services.bambu_mqtt import ams_mid_filament_change
     from backend.app.services.notification_service import notification_service
     from backend.app.services.print_scheduler import ACTIVE_PRINT_STATES
@@ -790,7 +790,7 @@ async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, no
                 _drop(pid)
                 continue
 
-            if await printer_incidents.get_open(db, pid) is not None or spool_recovery.has_live_recovery(pid):
+            if await printer_incidents.get_open(db, pid) is not None or printer_incidents.driver_live(pid):
                 _drop(pid)
                 continue
 

@@ -881,6 +881,8 @@ export default {
       amsUnloadNoMovement: '已发送卸载指令。AMS 未动作。',
       amsUnloadNothingLoaded: '已发送卸载指令。此前未加载耗材。',
       amsCommandSessionChanged: '指令执行期间打印机重新连接。请检查 AMS。',
+      amsLoadHeld: '加载指令已接受。排在暂停打印的换料之后。',
+      amsUnloadHeld: '卸载指令已接受。排在暂停打印的换料之后。',
     },
     // Connection status
     connection: {
@@ -1080,6 +1082,9 @@ export default {
       pauseTitle: '暂停打印',
       pauseMessage: '确定要暂停"{{name}}"上的当前打印吗？',
       pauseButton: '暂停打印',
+      amsRecoveryTitle: '恢复进行中',
+      amsRecoveryMessage: '{{name}}：恢复正在运行。发送此指令将终止恢复。',
+      amsCommandButton: '发送',
       resumeTitle: '继续打印',
       resumeMessage: '确定要继续"{{name}}"上的打印吗？',
       resumeButton: '继续打印',

@@ -122,10 +122,50 @@ _AMS_COMMAND_RESULT_FIELDS = ("command", "result", "ams_id", "tray_id", "sequenc
 
 # The AMS MOTION commands whose report-topic echo is the firmware's own answer to a
 # load / unload / CONTINUE. Logged at INFO (never DEBUG) so the answer lands in every
-# support bundle beside services/ams_command's measured verdict — invariant 14: every
-# command ACK is consumed. Whether the firmware echoes these at all is itself the first
-# fact the live witness records.
+# support bundle beside services/ams_command's measured verdict. The log line only: the
+# ACK itself is recorded for EVERY command on `PrinterState.command_acks` (see
+# `CommandAck`). The firmware does echo them — 012-H2S 2026-09-23 answered six motion
+# commands `result=success` (and the `ams_control resume` lever `SUCCESS`).
 _AMS_MOTION_ECHO_COMMANDS = frozenset({"ams_change_filament", "ams_control"})
+
+# How many ACKs `PrinterState.command_acks` keeps. A reader asks for ONE send's ACK
+# within its own observe window (seconds to a recovery step timeout); the farm's command
+# rate is a handful per minute, so 64 spans minutes of history — bounded so a chatty
+# write lane can never grow the state without limit.
+_COMMAND_ACK_KEEP = 64
+
+
+@dataclass(frozen=True)
+class CommandAck:
+    """One firmware ACK: a REPORT-topic echo carrying the request's own ``command`` AND a
+    ``result`` key — invariant 14, every command ACK is consumed.
+
+    Every such echo, whatever the command (the config writes, the motion commands, the
+    ``ams_control`` / ``pause`` / ``resume`` / ``clean_print_error`` controls), is
+    appended to ``PrinterState.command_acks`` at the ONE parse point in
+    ``_process_message``. ``services/ams_command`` correlates an ACK to its own send by
+    ``sequence_id`` (:meth:`BambuMQTTClient.ack_for`), which is why the sequenced
+    publishers send a real incrementing id (BambuStudio's ``m_sequence_id++``) instead
+    of ``"0"``: with every send numbered ``"0"`` no ACK could name the send it answers.
+
+    ``sequence_id`` is ``str()``-normalised so a numeric echo compares equal to the
+    string the publisher sent (an absent id is ``""``, a number no send carries).
+    ``result`` / ``reason`` are the wire's values as strings, ``None`` when null or
+    absent — reading them (``success`` vs ``SUCCESS`` vs ``fail``) is the reader's job,
+    not the transport's. ``at`` is :func:`time.monotonic` at receipt.
+    """
+
+    command: str
+    sequence_id: str
+    result: str | None
+    reason: str | None
+    at: float
+
+
+def _wire_str(value: object) -> str | None:
+    """A scalar echo field as the string the wire spelled it; ``None`` when null/absent."""
+    return None if value is None else str(value)
+
 
 # Tray `state` codes that mean a spool is physically PRESENT — DEFINED in
 # ``tray_fields`` (beside the parser that reads the field and the ``tray_presence``
@@ -610,6 +650,11 @@ class PrinterState:
     # motion command (services/ams_command reads it as movement evidence). None = no push
     # has carried a parseable value yet.
     tray_tar: int | None = None
+    # The firmware's command ACKs, oldest first, bounded (invariant 14): EVERY command
+    # echo with a `result` lands here as a `CommandAck`, written only at the echo parse
+    # point in `_process_message` and read through `BambuMQTTClient.ack_for`, which
+    # services/ams_command uses to correlate the ACK to its own send by sequence id.
+    command_acks: deque[CommandAck] = field(default_factory=lambda: deque(maxlen=_COMMAND_ACK_KEEP))
     # Last valid tray_now (0-253) — survives unload (255) for usage tracking after print completes
     last_loaded_tray: int = -1
     # Pending load target - used to track what tray we're loading for H2D disambiguation
@@ -986,6 +1031,9 @@ class BambuMQTTClient:
 
         # K-profile command tracking
         self._sequence_id: int = 0
+        # Wire command name -> the sequence_id of this client's most recent publish of it,
+        # written by the sequenced publishers at the publish (see last_sent_sequence_id).
+        self._last_sent_sequence: dict[str, str] = {}
         self._pending_kprofile_response: asyncio.Event | None = None
         self._kprofile_response_data: list | None = None
 
@@ -1718,12 +1766,71 @@ class BambuMQTTClient:
                 # in-client duty above (dev-mode probe, zombie detection) and — because
                 # `print.ams` is handled further up — the status half of the same payload
                 # is already merged: a consumer acting on the verdict sees the AMS state
-                # that came with it, never a half-applied push.
+                # that came with it, never a half-applied push. Every ACK is recorded
+                # (invariant 14); only the two config writes are also DELIVERED.
+                self._record_command_ack(print_data)
                 self._deliver_command_result(print_data)
             if "command" in print_data and print_data.get("command") == "extrusion_cali_get":
                 self._handle_kprofile_response(print_data)
 
             self._update_state(print_data)
+
+    def _record_command_ack(self, print_data: dict) -> None:
+        """Append a command echo to ``state.command_acks`` when it is an ACK — the
+        request's own ``command`` plus a ``result`` key — whatever the command.
+
+        Invariant 14: every command ACK is consumed. This is the ONE writer of
+        ``command_acks``; readers correlate an ACK to their own send by sequence id
+        through :meth:`ack_for` (``services/ams_command`` reads the ACK for each motion
+        command it publishes). An echo without ``result`` (a status push that happens to
+        carry ``command``, e.g. ``push_status``) is not an ACK and is not recorded.
+        """
+        if "result" not in print_data:
+            return
+        sequence_id = print_data.get("sequence_id")
+        self.state.command_acks.append(
+            CommandAck(
+                command=str(print_data["command"]),
+                sequence_id="" if sequence_id is None else str(sequence_id),
+                result=_wire_str(print_data["result"]),
+                reason=_wire_str(print_data.get("reason")),
+                at=time.monotonic(),
+            )
+        )
+
+    def ack_for(self, command: str, sequence_id: str) -> CommandAck | None:
+        """The newest ACK on ``state.command_acks`` for the send ``(command, sequence_id)``,
+        or ``None`` when none has arrived (yet — or it already rolled out of the bounded
+        log).
+
+        ``sequence_id`` is the id this client's publisher sent (:meth:`last_sent_sequence_id`).
+        The ids are this client's own counter, not globally unique: another LAN client
+        numbering its own sends could in principle echo a colliding id for the same
+        command. The log is appended on the MQTT network thread, so it is copied in one
+        ``tuple()`` call (atomic under the GIL) before the Python-level scan — iterating
+        the live deque would raise if an ACK landed mid-scan.
+        """
+        for ack in reversed(tuple(self.state.command_acks)):
+            if ack.command == command and ack.sequence_id == sequence_id:
+                return ack
+        return None
+
+    def _next_sequence_id(self) -> str:
+        """Allocate the next ``sequence_id`` for a publish: increment this client's counter
+        and return it as the wire's string. BambuStudio's ``command_ams_control`` sends
+        ``m_sequence_id++`` — the vendor shape, and what lets an ACK name its send."""
+        self._sequence_id += 1
+        return str(self._sequence_id)
+
+    def last_sent_sequence_id(self, command: str) -> str | None:
+        """The ``sequence_id`` of this client's most recent publish of the wire command
+        ``command`` (``"ams_change_filament"``, ``"ams_control"``, ``"pause"``,
+        ``"resume"``, ``"clean_print_error"``), or ``None`` when it never published one.
+
+        Recorded by the publishers themselves at the publish, so a caller reading it in
+        the same synchronous stretch as its own publish reads its own send's id.
+        """
+        return self._last_sent_sequence.get(command)
 
     def _deliver_command_result(self, print_data: dict) -> None:
         """Hand an AMS write's firmware ACK to ``on_ams_command_result``.
@@ -1745,6 +1852,11 @@ class BambuMQTTClient:
         A payload that is not a dict, carries an unrelated command, or has no
         ``result`` key is not an ACK and is ignored. Guarded like every other
         entry hook: a farm-side failure must never break the MQTT callback chain.
+
+        Every OTHER command's ACK (motion, controls) is recorded on
+        ``state.command_acks`` by :meth:`_record_command_ack` and never delivered
+        here: the consumer is the tagless write-epoch, and a motion ACK is not the
+        answer to a config write.
         """
         if not self.on_ams_command_result:
             return
@@ -5950,37 +6062,70 @@ class BambuMQTTClient:
     # =========================================================================
 
     def pause_print(self) -> bool:
-        """Pause the current print job."""
+        """Pause the current print job.
+
+        Sequenced: the frame carries a real id (:meth:`_next_sequence_id`), recorded for
+        :meth:`last_sent_sequence_id`; the firmware's echo lands on ``state.command_acks``.
+        """
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot pause print: not connected", self.serial_number)
             return False
 
-        command = {"print": {"command": "pause", "sequence_id": "0"}}
+        seq = self._next_sequence_id()
+        command = {"print": {"command": "pause", "sequence_id": seq}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        logger.info("[%s] Sent pause print command", self.serial_number)
+        self._last_sent_sequence["pause"] = seq
+        logger.info("[%s] Sent pause print command (seq=%s)", self.serial_number, seq)
         return True
 
     def resume_print(self) -> bool:
-        """Resume a paused print job."""
+        """Resume a paused print job.
+
+        Sequenced: the frame carries a real id (:meth:`_next_sequence_id`), recorded for
+        :meth:`last_sent_sequence_id`; the firmware's echo lands on ``state.command_acks``.
+        """
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot resume print: not connected", self.serial_number)
             return False
 
-        command = {"print": {"command": "resume", "sequence_id": "0"}}
+        seq = self._next_sequence_id()
+        command = {"print": {"command": "resume", "sequence_id": seq}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        logger.info("[%s] Sent resume print command", self.serial_number)
+        self._last_sent_sequence["resume"] = seq
+        logger.info("[%s] Sent resume print command (seq=%s)", self.serial_number, seq)
+        return True
+
+    def clean_print_error(self) -> bool:
+        """Publish the printer's clean-print-error command — the ONE publisher of that
+        frame in this module (pinned by a source count in ``test_bambu_mqtt.py``).
+
+        The vendor meaning is the error dialog's OK / close: it clears whatever error
+        dialog is currently active; Bambu expects no ``print_error`` in the body. The
+        FRAME only — no local state is written, so a caller reading the HMS list
+        afterwards reads what the printer reports, never a wipe of its own making (a
+        recovery driver asking "is the path quiet?" must not be answered by its own
+        lever). :meth:`clear_hms_errors` is the REST route's wrapper that also wipes
+        locally. Sequenced like the other controls; the echo lands on
+        ``state.command_acks``.
+        """
+        if not self._client or not self.state.connected:
+            logger.warning("[%s] Cannot clean print error: not connected", self.serial_number)
+            return False
+
+        seq = self._next_sequence_id()
+        command = {"print": {"command": "clean_print_error", "sequence_id": seq}}
+        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        self._last_sent_sequence["clean_print_error"] = seq
+        logger.info("[%s] Sent clean print error command (seq=%s)", self.serial_number, seq)
         return True
 
     def clear_hms_errors(self) -> bool:
-        """Clear HMS/print errors on the printer and locally."""
-        if not self._client or not self.state.connected:
-            logger.warning("[%s] Cannot clear HMS errors: not connected", self.serial_number)
+        """Clear HMS/print errors on the printer and locally: :meth:`clean_print_error`,
+        then the local wipe the REST route's caller expects to see at once."""
+        if not self.clean_print_error():
             return False
-
-        command = {"print": {"command": "clean_print_error", "sequence_id": "0"}}
-        self._client.publish(self.topic_publish, json.dumps(command), qos=1)
         self.state.hms_errors = []
-        logger.info("[%s] Sent clear HMS errors command", self.serial_number)
+        logger.info("[%s] Cleared HMS errors locally", self.serial_number)
         return True
 
     def skip_objects(self, object_ids: list[int]) -> bool:
@@ -6371,11 +6516,11 @@ class BambuMQTTClient:
         if self._refuse_ams_write("ams_change_filament (load)", ams_id) is not None:
             return False
 
-        self._sequence_id += 1
+        seq = self._next_sequence_id()
         command = {
             "print": {
                 "command": "ams_change_filament",
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": seq,
                 "ams_id": ams_id,
                 "slot_id": slot_id,
                 "target": tray_id,
@@ -6387,6 +6532,7 @@ class BambuMQTTClient:
         command_json = json.dumps(command)
         logger.info("[%s] Publishing ams_change_filament command: %s", self.serial_number, command_json)
         self._client.publish(self.topic_publish, command_json, qos=1)
+        self._last_sent_sequence["ams_change_filament"] = seq
         logger.info("[%s] Loading filament from tray %s (AMS %s slot %s)", self.serial_number, tray_id, ams_id, slot_id)
 
         # Track this load request for H2D dual-nozzle disambiguation
@@ -6437,11 +6583,11 @@ class BambuMQTTClient:
         if nozzle_temp < 180:
             nozzle_temp = 210  # Default to PLA temp if nozzle is cold
 
-        self._sequence_id += 1
+        seq = self._next_sequence_id()
         command = {
             "print": {
                 "command": "ams_change_filament",
-                "sequence_id": str(self._sequence_id),
+                "sequence_id": seq,
                 "ams_id": ams_id,
                 "slot_id": 255,  # 255 = unload marker
                 "target": 255,  # 255 = unload destination
@@ -6453,6 +6599,7 @@ class BambuMQTTClient:
         command_json = json.dumps(command)
         logger.info("[%s] Publishing ams_change_filament (unload) command: %s", self.serial_number, command_json)
         self._client.publish(self.topic_publish, command_json, qos=1)
+        self._last_sent_sequence["ams_change_filament"] = seq
         logger.info("[%s] Unloading filament (tray_now was %s)", self.serial_number, tray_now)
 
         # Clear tracked load request since we're unloading
@@ -6478,6 +6625,11 @@ class BambuMQTTClient:
                 because the modal's underlying status query is a one-shot read that
                 must reflect the new error list immediately.
 
+        The frame carries a real incrementing ``sequence_id`` — BambuStudio's
+        ``command_ams_control`` sends ``m_sequence_id++`` — recorded for
+        :meth:`last_sent_sequence_id`, so the echo on ``state.command_acks`` can be
+        matched to this send. An invalid action is refused before an id is allocated.
+
         Returns:
             True if command was sent, False otherwise
         """
@@ -6489,13 +6641,15 @@ class BambuMQTTClient:
             logger.warning("[%s] Invalid AMS action: %s", self.serial_number, action)
             return False
 
-        command = {"print": {"command": "ams_control", "param": action, "sequence_id": "0"}}
+        seq = self._next_sequence_id()
+        command = {"print": {"command": "ams_control", "param": action, "sequence_id": seq}}
         self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+        self._last_sent_sequence["ams_control"] = seq
         if request_pushall:
             self._client.publish(
                 self.topic_publish, json.dumps({"pushing": {"command": "pushall", "sequence_id": "0"}}), qos=1
             )
-        logger.info("[%s] AMS control: %s", self.serial_number, action)
+        logger.info("[%s] AMS control: %s (seq=%s)", self.serial_number, action, seq)
         return True
 
     def _ams_write_refusal(self, ams_id: int) -> str | None:
@@ -7008,11 +7162,14 @@ class BambuMQTTClient:
 
         # Always re-push the full state after a command so the modal's underlying
         # status query reflects the new error list (or absence) on the next tick.
-        def publish(payload: dict):
-            self._client.publish(self.topic_publish, json.dumps(payload), qos=1)
+        def pushall():
             self._client.publish(
                 self.topic_publish, json.dumps({"pushing": {"command": "pushall", "sequence_id": "0"}}), qos=1
             )
+
+        def publish(payload: dict):
+            self._client.publish(self.topic_publish, json.dumps(payload), qos=1)
+            pushall()
 
         def hms_resume():
             # BambuStudio's actual shape — plain resume, no err / no job_id.
@@ -7072,19 +7229,6 @@ class BambuMQTTClient:
                 }
             )
 
-        def clean_print_error():
-            # Matches the existing `clear_hms_errors` shape — Bambu does not
-            # expect `print_error` in the body; the command clears whatever
-            # error dialog is currently active on the printer.
-            publish(
-                {
-                    "print": {
-                        "command": "clean_print_error",
-                        "sequence_id": "0",
-                    }
-                }
-            )
-
         def uiop_close():
             # `err` is the 8-char hex short code (already a string from the
             # frontend), uppercased for consistency with how BambuStudio sends it.
@@ -7136,11 +7280,15 @@ class BambuMQTTClient:
             case HMSAction.ABORT:
                 self.ams_control("abort", request_pushall=True)
 
+            # The dialog's OK: the ONE clean-print-error publisher (frame only — the
+            # modal re-reads the printer's own list off the pushall), then the pushall.
             case HMSAction.OK_BUTTON:
-                clean_print_error()
+                self.clean_print_error()
+                pushall()
 
             case HMSAction.DBL_CHECK_OK:
-                clean_print_error()
+                self.clean_print_error()
+                pushall()
                 uiop_close()
 
             case HMSAction.DBL_CHECK_RESUME:

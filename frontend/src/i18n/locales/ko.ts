@@ -855,6 +855,8 @@ export default {
       amsUnloadNoMovement: '언로드 전송됨. AMS가 움직이지 않았습니다.',
       amsUnloadNothingLoaded: '언로드 전송됨. 로드된 필라멘트가 없었습니다.',
       amsCommandSessionChanged: '명령 중 프린터가 재연결되었습니다. AMS를 확인하세요.',
+      amsLoadHeld: '로드 수락됨. 일시정지된 인쇄의 필라멘트 교체 뒤에 보류되었습니다.',
+      amsUnloadHeld: '언로드 수락됨. 일시정지된 인쇄의 필라멘트 교체 뒤에 보류되었습니다.',
       connectionFailedNotAdded: '프린터에 연결할 수 없습니다. IP, 시리얼 번호, 액세스 코드를 확인하고 LAN 전용 모드가 켜져 있는지 확인하세요. 프린터가 추가되지 않았습니다.'
     },
     connection: {
@@ -1046,6 +1048,9 @@ export default {
       pauseTitle: '인쇄 일시정지',
       pauseMessage: '"{{name}}"의 현재 인쇄를 일시정지하시겠습니까?',
       pauseButton: '인쇄 일시정지',
+      amsRecoveryTitle: '복구 진행 중',
+      amsRecoveryMessage: '{{name}}: 복구가 실행 중입니다. 이 명령을 전송하면 복구가 종료됩니다.',
+      amsCommandButton: '전송',
       resumeTitle: '인쇄 재개',
       resumeMessage: '"{{name}}"의 인쇄를 재개하시겠습니까?',
       resumeButton: '인쇄 재개',

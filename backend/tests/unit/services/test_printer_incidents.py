@@ -10,6 +10,9 @@ The migration is exercised against a throwaway engine, twice, because
 ``run_migrations`` runs on every boot.
 """
 
+import asyncio
+import logging
+
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +29,7 @@ from backend.app.models.printer_incident import (
     STATUS_RESOLVED,
     PrinterIncident,
 )
+from backend.app.models.printer_incident_step import STEP_KIND_COMMAND, STEP_KIND_LEVER
 from backend.app.services import printer_incidents
 
 pytestmark = pytest.mark.asyncio
@@ -996,6 +1000,29 @@ class TestOutcomeDerivation:
         row = self._row(status=STATUS_RESOLVED, source=RESOLVE_TERMINAL, kind=KIND_JAM)
         assert printer_incidents.outcome_of(row) == "resolved_unpaged"
 
+    async def test_a_print_the_drivers_own_verb_ended_is_not_a_recovery(self):
+        """``driver_ended`` (2026-09-23) is the driver's close when a release lever ENDED
+        the print. The farm acted, but nothing was recovered — the unit is requeued — so
+        it must never land in the zero-human ``auto_recovered`` bucket. The token lives in
+        the store until it joins the model's vocabulary, so the model-scanning totality
+        case above cannot see it; this case pins it by name."""
+        source = printer_incidents.RESOLVE_DRIVER_ENDED
+
+        assert printer_incidents.outcome_of(self._row(status=STATUS_RESOLVED, source=source)) == "resolved_unpaged"
+        assert (
+            printer_incidents.outcome_of(self._row(status=STATUS_RESOLVED, escalated=True, source=source))
+            == "human_resolved"
+        )
+
+    async def test_the_driver_ended_token_is_new_and_fits_its_column(self):
+        import backend.app.models.printer_incident as model
+
+        model_tokens = {getattr(model, name) for name in dir(model) if name.startswith("RESOLVE_")}
+        column = PrinterIncident.__table__.c.resolve_source
+
+        assert printer_incidents.RESOLVE_DRIVER_ENDED not in model_tokens
+        assert len(printer_incidents.RESOLVE_DRIVER_ENDED) <= column.type.length
+
     def test_every_paged_close_is_human_resolved(self):
         import backend.app.models.printer_incident as model
 
@@ -1307,3 +1334,327 @@ class TestNoCloserEndsADeclaredHold:
         assert await spool_recovery.rearm_incidents_on_startup() == 0
 
         await self._still_open(db_session, printer.id)
+
+
+# --- 2026-09-23: liveness has ONE store, and the driver's step ledger ---------------
+
+
+@pytest.fixture
+async def driver_tasks():
+    """Spawn REAL tasks that stay running until teardown.
+
+    ``driver_live`` asks ``task.done()``, so a stand-in that cannot finish (or cannot
+    run) would pin nothing about the one question the store answers.
+    """
+    release = asyncio.Event()
+    spawned: list[asyncio.Task[object]] = []
+
+    def _spawn() -> asyncio.Task[object]:
+        task = asyncio.create_task(release.wait())
+        spawned.append(task)
+        return task
+
+    yield _spawn
+    release.set()
+    await asyncio.gather(*spawned)
+
+
+async def _finished_task() -> asyncio.Task[object]:
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    return task
+
+
+_SPAWN_OVER_LIVE = "spawning a recovery driver while one is live"
+
+
+def _spawn_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and _SPAWN_OVER_LIVE in record.getMessage()
+    ]
+
+
+class TestDriverLiveness:
+    """THE liveness store. The open row is the durable PROMISE that somebody will produce
+    an outcome; this slot is whether a task is keeping it RIGHT NOW. ``driver_live`` is the
+    one spelling, and it asks ``.done()`` rather than trusting membership."""
+
+    async def test_no_printer_and_an_empty_slot_read_not_live(self):
+        assert printer_incidents.driver_live(None) is False
+        assert printer_incidents.driver_live(0) is False
+        assert printer_incidents.driver_live(7) is False
+
+    async def test_a_registered_running_task_is_live_on_its_printer_only(self, driver_tasks):
+        printer_incidents.register_driver(7, driver_tasks(), incident_id=1)
+
+        assert printer_incidents.driver_live(7) is True
+        assert printer_incidents.driver_live(8) is False
+
+    async def test_a_finished_task_reads_not_live(self):
+        """The R1 orphan: a driver that died without releasing its slot must not read as
+        live, or every closer would stand aside under a task nobody is running."""
+        printer_incidents.register_driver(7, await _finished_task(), incident_id=1)
+
+        assert printer_incidents.driver_live(7) is False
+
+    async def test_release_frees_the_slot_it_holds(self, driver_tasks):
+        task = driver_tasks()
+        printer_incidents.register_driver(7, task, incident_id=1)
+
+        printer_incidents.release_driver(7, task)
+
+        assert printer_incidents.driver_live(7) is False
+
+    async def test_a_release_by_a_task_not_holding_the_slot_is_a_no_op(self, driver_tasks):
+        """A driver's ``finally`` can run after a SUCCESSOR took the slot. Popping by
+        printer alone would erase the successor's liveness while it runs."""
+        predecessor, successor = driver_tasks(), driver_tasks()
+        printer_incidents.register_driver(7, predecessor, incident_id=1)
+        printer_incidents.register_driver(7, successor, incident_id=2)
+
+        printer_incidents.release_driver(7, predecessor)
+
+        assert printer_incidents.driver_live(7) is True
+        printer_incidents.release_driver(7, successor)
+        assert printer_incidents.driver_live(7) is False
+
+    async def test_a_release_of_an_empty_slot_is_a_no_op(self, driver_tasks):
+        printer_incidents.release_driver(7, driver_tasks())
+
+        assert printer_incidents.driver_live(7) is False
+
+    async def test_spawning_over_a_live_driver_warns_once_and_still_takes_the_slot(self, driver_tasks, caplog):
+        """Observability, not a gate: the spawn goes through, and the moment is one grep
+        away (006-H2S 17:23:55 on 2026-09-04 produced no line at all)."""
+        successor = driver_tasks()
+        printer_incidents.register_driver(7, driver_tasks(), incident_id=1)
+
+        with caplog.at_level(logging.WARNING, logger=printer_incidents.logger.name):
+            printer_incidents.register_driver(7, successor, incident_id=2)
+
+        warnings = _spawn_warnings(caplog)
+        assert len(warnings) == 1
+        assert "invariant violated (incident 2 spawned over a live driver)" in warnings[0]
+        printer_incidents.release_driver(7, successor)
+        assert printer_incidents.driver_live(7) is False  # the slot was the successor's
+
+    async def test_spawning_over_a_finished_driver_is_silent(self, driver_tasks, caplog):
+        printer_incidents.register_driver(7, await _finished_task(), incident_id=1)
+
+        with caplog.at_level(logging.WARNING, logger=printer_incidents.logger.name):
+            printer_incidents.register_driver(7, driver_tasks(), incident_id=2)
+
+        assert _spawn_warnings(caplog) == []
+        assert printer_incidents.driver_live(7) is True
+
+    async def test_the_reset_hook_clears_the_slots(self, driver_tasks):
+        printer_incidents.register_driver(7, driver_tasks(), incident_id=1)
+
+        printer_incidents._reset_state()
+
+        assert printer_incidents.driver_live(7) is False
+
+    async def test_rehydrate_leaves_the_slots_alone(self, db_session, driver_tasks):
+        """A rehydrate re-reads ROWS. It neither invents a task nor kills one."""
+        printer_incidents.register_driver(7, driver_tasks(), incident_id=1)
+
+        await printer_incidents.rehydrate(db_session)
+
+        assert printer_incidents.driver_live(7) is True
+
+
+class TestSnapshotProjectsDriverLiveness:
+    """``driver_live`` rides the wire dict, computed at READ time: the cache is filled at
+    open and at rehydrate and would be stale the moment a driver spawned or exited."""
+
+    async def test_snapshot_follows_the_registry_live(self, db_session, printer_factory, driver_tasks):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010")
+        task = driver_tasks()
+
+        assert printer_incidents.snapshot(printer.id)["driver_live"] is False
+
+        printer_incidents.register_driver(printer.id, task, incident_id=row.id)
+        assert printer_incidents.snapshot(printer.id)["driver_live"] is True
+        assert printer_incidents.snapshot(printer.id, kind=KIND_JAM)["driver_live"] is True
+
+        printer_incidents.release_driver(printer.id, task)
+        assert printer_incidents.snapshot(printer.id)["driver_live"] is False
+
+    async def test_snapshots_carry_it_on_every_row(self, db_session, printer_factory, driver_tasks):
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010")
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, code="", codes="")
+
+        assert [snap["driver_live"] for snap in printer_incidents.snapshots(printer.id)] == [False, False]
+
+        printer_incidents.register_driver(printer.id, driver_tasks(), incident_id=row.id)
+        assert [snap["driver_live"] for snap in printer_incidents.snapshots(printer.id)] == [True, True]
+
+    async def test_a_finished_driver_projects_false(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010")
+
+        printer_incidents.register_driver(printer.id, await _finished_task(), incident_id=row.id)
+
+        assert printer_incidents.snapshot(printer.id)["driver_live"] is False
+
+    async def test_the_cached_payload_never_holds_it_and_a_read_is_a_copy(
+        self, db_session, printer_factory, driver_tasks
+    ):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010")
+        printer_incidents.register_driver(printer.id, driver_tasks(), incident_id=row.id)
+
+        snap = printer_incidents.snapshot(printer.id)
+        listed = printer_incidents.snapshots(printer.id)[0]
+        snap["kind"] = "mutated-by-a-reader"
+        listed["status"] = "mutated-by-a-reader"
+
+        cached = printer_incidents._open_cache[printer.id][row.id]
+        assert "driver_live" not in cached
+        assert cached["kind"] == KIND_JAM
+        assert cached["status"] == STATUS_RECOVERING
+        assert printer_incidents.cached_kind(printer.id, row.id) == KIND_JAM
+
+
+class TestStepLedger:
+    """What a recovery driver SENT against an incident — noted at the send, answered at
+    the read, read back in send order. ``printer_incidents`` is the one writer."""
+
+    @staticmethod
+    async def _incident_id(db_session, printer_factory) -> int:
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010")
+        return row.id
+
+    async def test_a_step_is_persisted_at_the_send_unanswered(
+        self, db_session, printer_factory, own_session_factory, caplog
+    ):
+        incident_id = await self._incident_id(db_session, printer_factory)
+
+        with caplog.at_level(logging.INFO, logger=printer_incidents.logger.name):
+            step = await printer_incidents.note_step(
+                db_session, incident_id, seq=1, kind=STEP_KIND_LEVER, name="resume", feeder="jammed"
+            )
+
+        assert (step.incident_id, step.seq, step.kind, step.name, step.target, step.feeder) == (
+            incident_id,
+            1,
+            "lever",
+            "resume",
+            None,
+            "jammed",
+        )
+        assert step.sent_at is not None
+        assert (step.outcome, step.read_at) == (None, None)
+        # COMMITTED, not merely flushed: a second session sees it.
+        async with own_session_factory() as other:
+            assert [s.name for s in await printer_incidents.steps_of(other, incident_id)] == ["resume"]
+        assert f"printer_incidents: incident {incident_id} step 1 lever=resume sent" in caplog.text
+
+    async def test_answer_step_fills_the_read(self, db_session, printer_factory, own_session_factory, caplog):
+        incident_id = await self._incident_id(db_session, printer_factory)
+        await printer_incidents.note_step(
+            db_session, incident_id, seq=1, kind=STEP_KIND_COMMAND, name="unload", target=3, feeder="jammed"
+        )
+
+        with caplog.at_level(logging.INFO, logger=printer_incidents.logger.name):
+            step = await printer_incidents.answer_step(db_session, incident_id, 1, outcome="held")
+
+        assert step is not None
+        assert (step.outcome, step.target) == ("held", 3)
+        assert step.read_at is not None and step.read_at >= step.sent_at
+        async with own_session_factory() as other:
+            (stored,) = await printer_incidents.steps_of(other, incident_id)
+            assert (stored.outcome, stored.read_at) == ("held", step.read_at)
+        assert f"printer_incidents: incident {incident_id} step 1 command=unload outcome=held" in caplog.text
+
+    async def test_answering_a_step_that_was_never_sent_answers_none(self, db_session, printer_factory):
+        incident_id = await self._incident_id(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, incident_id, seq=1, kind=STEP_KIND_LEVER, name="resume")
+
+        assert await printer_incidents.answer_step(db_session, incident_id, 2, outcome="wedged") is None
+        assert await printer_incidents.answer_step(db_session, incident_id + 1000, 1, outcome="wedged") is None
+
+    async def test_steps_come_back_in_send_order_and_only_their_incidents(self, db_session, printer_factory):
+        first = await self._incident_id(db_session, printer_factory)
+        second = await self._incident_id(db_session, printer_factory)
+        # Written out of order on purpose: the log's order is ``seq``, never insertion.
+        await printer_incidents.note_step(db_session, first, seq=2, kind=STEP_KIND_LEVER, name="ams_control_resume")
+        await printer_incidents.note_step(db_session, second, seq=1, kind=STEP_KIND_LEVER, name="resume")
+        await printer_incidents.note_step(db_session, first, seq=3, kind=STEP_KIND_COMMAND, name="unload", target=3)
+        await printer_incidents.note_step(db_session, first, seq=1, kind=STEP_KIND_LEVER, name="resume")
+
+        steps = await printer_incidents.steps_of(db_session, first)
+
+        assert [(s.seq, s.name) for s in steps] == [(1, "resume"), (2, "ams_control_resume"), (3, "unload")]
+        assert [s.seq for s in await printer_incidents.steps_of(db_session, second)] == [1]
+
+    async def test_a_duplicate_seq_raises_and_leaves_the_session_usable(self, db_session, printer_factory):
+        """A driver that lost count of its own log dies loudly — and the failed commit is
+        rolled back inside the writer, so the caller's session goes on working."""
+        incident_id = await self._incident_id(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, incident_id, seq=1, kind=STEP_KIND_LEVER, name="resume")
+
+        with pytest.raises(IntegrityError):
+            await printer_incidents.note_step(
+                db_session, incident_id, seq=1, kind=STEP_KIND_LEVER, name="ams_control_resume"
+            )
+
+        await printer_incidents.note_step(
+            db_session, incident_id, seq=2, kind=STEP_KIND_LEVER, name="ams_control_resume"
+        )
+        steps = await printer_incidents.steps_of(db_session, incident_id)
+        assert [(s.seq, s.name) for s in steps] == [(1, "resume"), (2, "ams_control_resume")]
+
+
+class TestStepLedgerCascade:
+    """The steps are a property of their incident: ``ON DELETE CASCADE``.
+
+    The fork opens SQLite with foreign keys OFF and no code path deletes an incident row,
+    so on the farm's SQLite the clause is the declared contract; PostgreSQL enforces it.
+    This case runs the ORM-built schema with enforcement ON, which is the only way to see
+    the clause act rather than merely exist."""
+
+    async def test_deleting_the_incident_deletes_its_steps(self):
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        from backend.app.models.printer import Printer
+        from backend.tests._fixtures.db import create_memory_engine
+
+        engine = await create_memory_engine()
+        try:
+            async with engine.connect() as conn:
+                await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                # Guard against a vacuous pass: the pragma is silently ignored inside a
+                # transaction, and then a cascade would "work" by never being asked.
+                assert (await conn.exec_driver_sql("PRAGMA foreign_keys")).scalar() == 1
+            async with AsyncSession(engine, expire_on_commit=False) as db:
+                printer = Printer(
+                    name="Cascade Printer",
+                    serial_number="00M09A999999999",
+                    ip_address="192.168.1.250",
+                    access_code="12345678",
+                    model="H2S",
+                )
+                db.add(printer)
+                await db.commit()
+                incident = await _open(db, printer.id, kind=KIND_JAM, codes="jam:0700_8010")
+                incident_id = incident.id
+                await printer_incidents.note_step(db, incident_id, seq=1, kind=STEP_KIND_LEVER, name="resume")
+                await printer_incidents.note_step(
+                    db, incident_id, seq=2, kind=STEP_KIND_COMMAND, name="unload", target=3
+                )
+
+                await db.delete(incident)
+                await db.commit()
+
+                assert await printer_incidents.steps_of(db, incident_id) == []
+                assert (await db.execute(text("SELECT COUNT(*) FROM printer_incident_step"))).scalar() == 0
+        finally:
+            await engine.dispose()

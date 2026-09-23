@@ -173,7 +173,7 @@ import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '..
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { wasFeedingTrayId, slotRanOut } from '../utils/slotStatus';
-import { amsCommandToast } from '../utils/amsCommand';
+import { amsCommandToast, type AmsCommand } from '../utils/amsCommand';
 import { OutOfRotationChip } from '../components/OutOfRotationChip';
 import { EjectPhaseChip } from '../components/EjectPhaseChip';
 import { Collapsible } from '../components/Collapsible';
@@ -1757,6 +1757,11 @@ const PRINTER_HIGHLIGHT_MS = 5000;
  */
 const PRINTER_HIGHLIGHT_STYLE = { outline: '4px solid #facc15', outlineOffset: '2px' } as const;
 
+/** A manual AMS command held for the operator's confirmation while a recovery driver is live. */
+type PendingAmsCommand =
+  | { command: Extract<AmsCommand, 'load'>; trayId: number }
+  | { command: Extract<AmsCommand, 'unload'> };
+
 function PrinterCard({
   printer,
   hideIfDisconnected,
@@ -1858,6 +1863,7 @@ function PrinterCard({
   const [amsBackupModalOpen, setAmsBackupModalOpen] = useState(false);
   const [showStopConfirm, setShowStopConfirm] = useState(false);
   const [showPauseConfirm, setShowPauseConfirm] = useState(false);
+  const [pendingAmsCommand, setPendingAmsCommand] = useState<PendingAmsCommand | null>(null);
   const [showSpeedMenu, setShowSpeedMenu] = useState<number | null>(null);
   const [showAirductMenu, setShowAirductMenu] = useState<number | null>(null);
   const [showBedJogMenu, setShowBedJogMenu] = useState<number | null>(null);
@@ -2980,6 +2986,28 @@ function PrinterCard({
     },
   });
 
+  /** Sends a manual AMS command to its mutation — the ONE dispatch the click sites and the confirm share. */
+  const sendAmsCommand = (pending: PendingAmsCommand) => {
+    if (pending.command === 'load') {
+      loadAmsTrayMutation.mutate({ trayId: pending.trayId });
+    } else {
+      unloadAmsMutation.mutate();
+    }
+  };
+
+  /**
+   * A manual AMS command while a recovery driver is live asks first (sending it ends
+   * the driver); otherwise it is sent at once. Liveness is the backend's
+   * `driver_live`, never `status === 'recovering'`.
+   */
+  const requestAmsCommand = (pending: PendingAmsCommand) => {
+    if (status?.open_incident?.driver_live === true) {
+      setPendingAmsCommand(pending);
+    } else {
+      sendAmsCommand(pending);
+    }
+  };
+
   // Plate references state
   const [plateReferences, setPlateReferences] = useState<{
     references: Array<{ index: number; label: string; timestamp: string; has_image: boolean; thumbnail_url: string }>;
@@ -3465,7 +3493,7 @@ function PrinterCard({
           onClick={(e) => {
             e.stopPropagation();
             if (printerBusy || !hasPermission('printers:control')) return;
-            loadAmsTrayMutation.mutate({ trayId: loadTrayId });
+            requestAmsCommand({ command: 'load', trayId: loadTrayId });
           }}
           disabled={printerBusy || !hasPermission('printers:control')}
           title={printerBusy ? t('printers.bedJog.disabledWhilePrinting') : !hasPermission('printers:control') ? t('printers.permission.noControl') : undefined}
@@ -3494,7 +3522,7 @@ function PrinterCard({
         onClick={(e) => {
           e.stopPropagation();
           if (blocked) return;
-          unloadAmsMutation.mutate();
+          requestAmsCommand({ command: 'unload' });
         }}
         disabled={blocked}
         aria-label={t('printers.ams.unload')}
@@ -7214,6 +7242,21 @@ function PrinterCard({
             setShowPauseConfirm(false);
           }}
           onCancel={() => setShowPauseConfirm(false)}
+        />
+      )}
+
+      {/* Manual AMS command while a recovery driver is live — sending it ends the driver. */}
+      {pendingAmsCommand !== null && (
+        <ConfirmModal
+          title={t('printers.confirm.amsRecoveryTitle')}
+          message={t('printers.confirm.amsRecoveryMessage', { name: printer.name })}
+          confirmText={t('printers.confirm.amsCommandButton')}
+          variant="default"
+          onConfirm={() => {
+            sendAmsCommand(pendingAmsCommand);
+            setPendingAmsCommand(null);
+          }}
+          onCancel={() => setPendingAmsCommand(null)}
         />
       )}
 

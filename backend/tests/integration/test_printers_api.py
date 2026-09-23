@@ -31,16 +31,41 @@ def _mock_printer_test_connection():
         yield m
 
 
+#: The sequence id the fake client reports for its motion publish (``_ams_command_wire``).
+_SENT_SEQ = "7"
+
+
 @contextmanager
 def _ams_command_wire(
-    *, client: MagicMock | None, state: SimpleNamespace | None, name: str = "P"
+    *,
+    client: MagicMock | None,
+    state: SimpleNamespace | None,
+    name: str = "P",
+    ack_result: str | None = None,
 ) -> Iterator[MagicMock]:
     """The printer_manager reads ``services/ams_command`` makes, faked — plus its operator
     observe window shortened, so a wire that never moves answers in 50 ms instead of 5 s.
 
     The AMS routes are controller-thin: the SERVICE reads the client, the live state and
-    the cached printer name, so that is where the fake goes.
+    the cached printer name, so that is where the fake goes. The client's ACK lane is
+    explicit: its motion publish is numbered :data:`_SENT_SEQ`, and the firmware ACKs
+    that send with ``ack_result`` (``None`` = no ACK arrives) — ``ack_for`` answers only
+    for that ``(command, id)``, as the real client's does.
     """
+    if client is not None:
+        from backend.app.services.bambu_mqtt import CommandAck
+
+        ack = (
+            None
+            if ack_result is None
+            else CommandAck(
+                command="ams_change_filament", sequence_id=_SENT_SEQ, result=ack_result, reason=None, at=0.0
+            )
+        )
+        client.last_sent_sequence_id.return_value = _SENT_SEQ
+        client.ack_for.side_effect = lambda command, seq: (
+            ack if (command, seq) == ("ams_change_filament", _SENT_SEQ) else None
+        )
     with (
         patch("backend.app.services.ams_command.printer_manager") as mock_pm,
         patch("backend.app.services.ams_command.OPERATOR_ACK_S", 0.05),
@@ -5040,6 +5065,42 @@ class TestAmsMidFilamentChangeIsMeasured:
         assert response.status_code == 200
         assert response.json() == {"outcome": "no_movement", "message": "Unload sent. AMS did not move."}
         mock_client.ams_unload_filament.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        "path, publisher, message",
+        [
+            pytest.param(
+                "ams/load?tray_id=2",
+                "ams_load_filament",
+                "Load accepted. Held behind the paused print's filament change.",
+                id="load",
+            ),
+            pytest.param(
+                "ams/unload",
+                "ams_unload_filament",
+                "Unload accepted. Held behind the paused print's filament change.",
+                id="unload",
+            ),
+        ],
+    )
+    async def test_an_acknowledged_command_into_a_wedge_that_never_moves_answers_held(
+        self, async_client: AsyncClient, printer_factory, path: str, publisher: str, message: str
+    ):
+        """012-H2S 2026-09-23: every command sent into the loaded wedge echoed ``success``
+        and moved nothing — it is held behind the print's own change and runs at the next
+        release, and the click is told so. The ACK is read for the send's OWN id."""
+        printer = await printer_factory(name="012-H2S")
+        mock_client = MagicMock()
+        getattr(mock_client, publisher).return_value = True
+
+        with _ams_command_wire(client=mock_client, state=self._wedged(tray_now=3), ack_result="success"):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/{path}")
+
+        assert response.status_code == 200
+        assert response.json() == {"outcome": "held", "message": message}
+        mock_client.ack_for.assert_called_with("ams_change_filament", _SENT_SEQ)
 
     @pytest.mark.asyncio
     @pytest.mark.integration

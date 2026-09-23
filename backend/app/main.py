@@ -966,6 +966,18 @@ def mark_printer_stopped_by_user(printer_id: int) -> None:
     logging.getLogger(__name__).info("Marked printer %s as user-stopped from queue", printer_id)
 
 
+def printer_stopped_by_user(printer_id: int) -> bool:
+    """Is the active print on this printer marked as stopped by the user?
+
+    The read half of :func:`mark_printer_stopped_by_user`, for a reader outside this
+    module: a recovery driver that reads a terminal inside a release verb's window asks
+    it whether the terminal was the operator's Stop (``spool_recovery``) or its own
+    verb's doing. The mark lives until the print's terminal callback or the next print
+    start drops it.
+    """
+    return printer_id in _user_stopped_printers
+
+
 _last_status_broadcast: dict[int, str] = {}
 # Track printers where we've updated nozzle_count
 _nozzle_count_updated: set[int] = set()

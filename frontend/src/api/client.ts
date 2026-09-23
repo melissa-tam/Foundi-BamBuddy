@@ -393,8 +393,14 @@ export interface OpenIncidentState {
   /** Row id, so a reader can ask about THIS row rather than "whatever is open". */
   id: number;
   kind: PrinterIncidentKind;
-  /** An OPEN row is only ever recovering (a driver is acting) or escalated. */
+  /** `recovering` is the row's PROMISE that a driver will act; whether one is live right now is `driver_live`. */
   status: 'recovering' | 'escalated';
+  /**
+   * True iff a recovery driver task is live on this printer right now — projected by
+   * the backend from its liveness registry. Never derive it in the UI from
+   * `status === 'recovering'`, which is a promise, not liveness.
+   */
+  driver_live: boolean;
   slot_desc: string | null;
   created_at: string | null;
   /**
@@ -605,8 +611,16 @@ export interface SlotRecheckResult {
  *   - `no_movement`     nothing on the wire moved in the window
  *   - `undecidable`     unload sent mid filament change with nothing loaded; no motion can answer it
  *   - `session_changed` the MQTT session reconnected while the command was observed
+ *   - `held`            the AMS acknowledged the command and holds it behind the paused
+ *                       print's own filament change; it runs at the next release
  */
-export type AmsCommandOutcome = 'complete' | 'acted' | 'no_movement' | 'undecidable' | 'session_changed';
+export type AmsCommandOutcome =
+  | 'complete'
+  | 'acted'
+  | 'no_movement'
+  | 'undecidable'
+  | 'session_changed'
+  | 'held';
 
 /** `message` is the non-UI-client fallback; the UI renders copy keyed off `outcome`. */
 export interface AmsCommandResult {

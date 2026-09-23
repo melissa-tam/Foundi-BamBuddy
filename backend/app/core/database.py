@@ -198,6 +198,7 @@ async def init_db():
         print_queue,
         printer,
         printer_incident,
+        printer_incident_step,
         printer_model_geometry,
         printer_observation_span,
         printer_sensor_history,
@@ -4437,6 +4438,55 @@ async def run_migrations(conn):
     await _safe_execute(
         conn,
         "CREATE INDEX IF NOT EXISTS ix_printer_incident_item_id ON printer_incident (item_id)",
+    )
+
+    # Migration (2026-09-23, 012-H2S shape 41): the recovery driver's STEP LEDGER, a 3NF
+    # child of printer_incident. The wire cannot restate which verbs a driver already
+    # sent — a stalled feeder answers every release lever with the same re-PAUSE in the
+    # same change — so a driver that re-entered after a restart started its ladder over
+    # and re-ground a feeder it had already proved stalled. One row per lever pulled or
+    # command sent, written at the send and answered at the read, so re-entry resumes at
+    # the next UNPULLED lever. Same dialect-branched shape as printer_incident above; the
+    # index names are the model's, so create_all and this DDL converge on one object each.
+    await _safe_execute(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS printer_incident_step (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id INTEGER NOT NULL REFERENCES printer_incident(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            kind VARCHAR(8) NOT NULL,
+            name VARCHAR(32) NOT NULL,
+            target INTEGER,
+            feeder VARCHAR(16),
+            outcome VARCHAR(32),
+            sent_at TIMESTAMP NOT NULL,
+            read_at TIMESTAMP
+        )
+        """
+        if is_sqlite()
+        else """
+        CREATE TABLE IF NOT EXISTS printer_incident_step (
+            id SERIAL PRIMARY KEY,
+            incident_id INTEGER NOT NULL REFERENCES printer_incident(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            kind VARCHAR(8) NOT NULL,
+            name VARCHAR(32) NOT NULL,
+            target INTEGER,
+            feeder VARCHAR(16),
+            outcome VARCHAR(32),
+            sent_at TIMESTAMP NOT NULL,
+            read_at TIMESTAMP
+        )
+        """,
+    )
+    await _safe_execute(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_printer_incident_step_seq ON printer_incident_step (incident_id, seq)",
+    )
+    await _safe_execute(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_printer_incident_step_incident ON printer_incident_step (incident_id)",
     )
 
     # Migration (WS7, 2026-08-09): the roll's SECOND RFID chip. A Bambu roll physically

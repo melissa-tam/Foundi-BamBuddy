@@ -190,7 +190,7 @@ class TestExecuteHmsActionDispatch:
     def test_filament_extruded_sends_ams_done(self, client):
         client.execute_hms_action("07008029", HMSAction.FILAMENT_EXTRUDED)
         cmds = self._published_commands(client)
-        assert cmds[0] == {"print": {"command": "ams_control", "param": "done", "sequence_id": "0"}}
+        assert cmds[0] == {"print": {"command": "ams_control", "param": "done", "sequence_id": "1"}}
 
     def test_retry_sends_ams_resume(self, client):
         client.execute_hms_action("07008029", HMSAction.RETRY_FILAMENT_EXTRUDED)
@@ -208,7 +208,7 @@ class TestExecuteHmsActionDispatch:
         # field, which the original PR mistakenly added.
         client.execute_hms_action("03008070", HMSAction.OK_BUTTON)
         cmds = self._published_commands(client)
-        assert cmds[0] == {"print": {"command": "clean_print_error", "sequence_id": "0"}}
+        assert cmds[0] == {"print": {"command": "clean_print_error", "sequence_id": "1"}}
 
     def test_dbl_check_ok_sends_clean_then_uiop_close(self, client):
         client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK)
@@ -305,7 +305,7 @@ class TestAmsControlBranchesDelegateToTheOnePublisher:
     )
     def test_the_published_bytes_are_unchanged(self, client, action, param):
         client.execute_hms_action("07008029", action)
-        expected = json.dumps({"print": {"command": "ams_control", "param": param, "sequence_id": "0"}})
+        expected = json.dumps({"print": {"command": "ams_control", "param": param, "sequence_id": "1"}})
         assert self._raw(client)[0] == expected
 
     @pytest.mark.parametrize(
