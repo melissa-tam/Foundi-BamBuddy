@@ -189,8 +189,10 @@ interface StopSourceLabel {
  * THE `stop_source` → copy map. Two tokens are NOT a human and must never
  * render "Stopped by operator" — nobody touched the printer:
  *
- * - `farm_vision_abort` — the plate-check trip the farm answers by stopping the
- *   print (stamped on the row before the stop command, 2026-09-04 wave).
+ * - `farm_vision_abort` — the farm's own stop of a plate-check trip (the
+ *   2026-09-04 wave). The farm no longer stops on a trip (the print stays paused
+ *   for a human), so nothing writes this token now; the row renders STORED
+ *   history and stays until no unit carries it.
  * - `reconcile_unknown` — the downtime reconcile found a print it could not
  *   read an outcome for (printer idle, or a subtask id that no longer matches),
  *   so the unit is cancelled with the outcome unknown and the run holds.

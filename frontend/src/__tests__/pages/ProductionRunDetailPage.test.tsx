@@ -14,6 +14,7 @@ import { render } from '../utils';
 import { server } from '../mocks/server';
 import { ProductionRunDetailPage } from '../../pages/ProductionRunDetailPage';
 import type { ProductionRun, RunPrinterState, RunUnit } from '../../types/productionRuns';
+import en from '../../i18n/locales/en';
 
 function printerState(overrides: Partial<RunPrinterState> = {}): RunPrinterState {
   return {
@@ -195,7 +196,9 @@ describe('ProductionRunDetailPage', () => {
     expect(screen.getAllByText('Quarantined').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/device reports H2C, registered as H2S/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('Offline-stalled mid-print')).toBeInTheDocument();
-    expect(screen.getByText('Plate not empty (printer vision)')).toBeInTheDocument();
+    // An open plate_vision hold on this printer — asserted against the locale
+    // leaf, so the reason renders without pinning its wording.
+    expect(screen.getByText(en.productionRuns.detail.printerState.visionHold)).toBeInTheDocument();
     // Not-eligible panel lists the two blocked printers up front.
     expect(screen.getByText('Printers not participating')).toBeInTheDocument();
   });
@@ -276,6 +279,8 @@ describe('ProductionRunDetailPage', () => {
               // No human touched this printer, so it must not be attributed to
               // an operator — the lineage is what tells a reader whether a
               // plate was abandoned deliberately or re-checked by the farm.
+              // Stored history since 2026-09-24 (no writer remains); the label
+              // still renders it.
               unit({
                 id: 105,
                 status: 'cancelled',
@@ -309,11 +314,10 @@ describe('ProductionRunDetailPage', () => {
     expect(within(table).getAllByText('Stopped by operator')).toHaveLength(1);
     expect(within(table).getByText('Retry #1 of unit 101')).toBeInTheDocument();
     expect(within(table).getByText('HMS 0300_8017')).toBeInTheDocument();
-    // Copy changed in the 2026-09-04 wave: the farm now STOPS the print on the
-    // second trip, so the old "resume on the printer" instruction is false —
-    // the plate gate is human-clear-only.
+    // The plate-check waiting reason renders its mapped copy (the print is
+    // PAUSED for a human since 2026-09-24), never the humanized token.
     expect(
-      within(table).getByText(/plate check tripped twice/i),
+      within(table).getByText(en.productionRuns.detail.waiting.visionHold),
     ).toBeInTheDocument();
     // Unit ids render for cross-referencing.
     expect(within(table).getByText('#101')).toBeInTheDocument();

@@ -375,6 +375,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
         slot_desc: null,
         created_at: null,
         operator_exits: false,
+        printer_messages: [],
         driver_live: driverLive,
       };
       return { ...mockIdleStatusWithAms, state: 'PAUSE', open_incident: incident };

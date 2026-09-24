@@ -52,4 +52,17 @@ describe('printer incident chip labels', () => {
   it('has the in-progress label the chip shows while an incident is still recovering', () => {
     expect(labels.recovering).toBeTruthy();
   });
+
+  /** The chip's tooltip (`printers.incidentAction.<kind>`) is looked up the same
+   *  dynamic way, so a chip kind without it renders its raw key on hover. */
+  it('has the action tooltip for every incident kind the chip renders, and none for the others', () => {
+    const actions: Record<string, string> = en.printers.incidentAction;
+    for (const kind of Object.keys(INCIDENT_KINDS) as PrinterIncidentKind[]) {
+      if (OWN_SURFACE_INCIDENT_KINDS.includes(kind)) {
+        expect(actions[kind], `printers.incidentAction.${kind} must not exist`).toBeUndefined();
+      } else {
+        expect(actions[kind], `missing printers.incidentAction.${kind}`).toBeTruthy();
+      }
+    }
+  });
 });
