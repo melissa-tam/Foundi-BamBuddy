@@ -288,6 +288,33 @@ def own_session_factory(test_engine: AsyncEngine) -> async_sessionmaker[AsyncSes
 
 
 @pytest.fixture
+async def wal_session_factory(tmp_path: Path) -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    """Sessions on a FILE database wearing PRODUCTION's connection pragmas.
+
+    The shared test engine deliberately runs the driver defaults (rollback journal, a
+    5 s busy handler), which is enough to test what the farm writes but not HOW its
+    writers contend: that is decided by ``core.database._set_sqlite_pragmas`` — WAL
+    (readers never block the writer, and a stale read snapshot CANNOT be upgraded to a
+    write) and ``busy_timeout``. A test about lock contention must run under exactly
+    those rules, so this engine is built with the production connect hook attached,
+    its own file under ``tmp_path``, and the full schema. Owned and disposed per test.
+    """
+    from sqlalchemy import event
+
+    from backend.app.core.database import _set_sqlite_pragmas
+
+    import_all_models()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'wal.db').as_posix()}")
+    event.listen(engine.sync_engine, "connect", _set_sqlite_pragmas)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        yield async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
 def force_sqlite_dialect(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the SQLite branch regardless of test env settings.
 

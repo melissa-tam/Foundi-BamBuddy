@@ -307,8 +307,43 @@ class TestWatchdogRevertsWhenStuck:
 class TestRevertGoesThroughTheCanonicalTransition:
     """2026-08-29: the revert used to be a hand-rolled ORM read-then-write of
     ``printing → pending`` — the exact shape ``queue_transitions`` exists to remove,
-    and a second copy of a transition the farm now performs from two places (here
-    and ``farm_stall.check_dead_dispatch_claims``). It is one writer now."""
+    and a second copy of a transition the farm performs from three places (here,
+    ``farm_stall.check_dead_dispatch_claims`` and the refused-commit unwind). It is one
+    writer now, reached through one owner: ``requeue.return_to_queue`` (2026-09-24),
+    which adds the head-of-line seat and the run gate."""
+
+    @pytest.mark.asyncio
+    async def test_the_revert_is_the_requeue_owners(self, db_session):
+        from backend.app.services import print_scheduler as scheduler_module
+
+        seen: list[tuple[int, str]] = []
+        real = scheduler_module.return_to_queue
+
+        async def _spy(db, item_id, *, cause):
+            seen.append((item_id, cause))
+            return await real(db, item_id, cause=cause)
+
+        get_status = MagicMock(return_value=_status("FINISH", "OLD_SUBTASK"))
+        with (
+            patch("backend.app.services.print_scheduler.printer_manager.get_status", get_status),
+            patch("backend.app.services.print_scheduler.printer_manager.get_client", MagicMock(return_value=None)),
+            patch("backend.app.services.print_scheduler.async_session", db_session),
+            patch("backend.app.core.database.async_session", db_session),
+            patch.object(scheduler_module, "return_to_queue", new=_spy),
+        ):
+            await PrintScheduler._watchdog_print_start(
+                queue_item_id=1,
+                printer_id=42,
+                pre_state="FINISH",
+                pre_subtask_id="OLD_SUBTASK",
+                timeout=0.2,
+                poll_interval=0.05,
+            )
+
+        assert seen == [(1, "start_watchdog")]
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+            assert (item.status, item.position, item.been_jumped) == ("pending", 1, True)
 
     @pytest.mark.asyncio
     async def test_the_revert_calls_release_unstarted_claim(self, db_session):

@@ -854,10 +854,11 @@ async def _stale_then_reappear(printer_id: int, err: SimpleNamespace) -> None:
 @pytest.mark.asyncio
 class TestMovedConsumersRideTheAppearanceEdge:
     async def test_plate_occupancy_fires_on_an_edge_notify_dedup_calls_stale(self):
-        # The vision edge now drives ``pause_recovery.on_plate_vision_trip`` (the lane
-        # that records the trip and STOPS the print); ``on_native_plate_detection`` is
-        # deleted. It is SPAWNED rather than awaited — the lane sends a stop and can
-        # sleep for its retry, and the ~1 Hz status flow must not wait on either.
+        # The vision edge drives ``pause_recovery.on_plate_vision_trip`` (the lane that
+        # records the job-pause hold and pages in the printer's words — it sends the
+        # printer nothing); ``on_native_plate_detection`` is deleted. It is SPAWNED
+        # rather than awaited — the lane opens a row and pages, and the ~1 Hz status flow
+        # must not wait on either.
         with (
             _Harness() as h,
             patch("backend.app.services.pause_recovery.on_plate_vision_trip", new=AsyncMock()) as plate_hook,

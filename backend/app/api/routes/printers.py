@@ -59,6 +59,7 @@ from backend.app.services.bambu_ftp import (
     list_files_async,
 )
 from backend.app.services.eject.monitor import eject_cooldown_monitor
+from backend.app.services.hms_actions import HMSAction
 from backend.app.services.hms_errors import hms_error_payload
 from backend.app.services.pause_recovery import on_plate_cleared
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
@@ -2967,9 +2968,9 @@ async def clear_plate(
         # printer is sitting on a terminal state). Same 400 shape it has always had.
         raise HTTPException(400, "Printer is not awaiting plate-clear acknowledgment")
 
-    # The operator's clear IS the resolution of the two holds a human owns — a
-    # confirmed plate-check trip and a Z reference lost to a reboot (2026-09-04
-    # pause-recovery wave). Wire-resolved holds are left to their own lanes, and a
+    # The operator's clear IS the resolution of the hold a human owns — a Z reference
+    # lost to a reboot (2026-09-04 pause-recovery wave). A paused plate check is answered
+    # by resuming or stopping its job, wire-resolved holds by their own lanes, and a
     # filament-path hold needs Recover, not this. What it DID close is reported rather
     # than swallowed: an operator whose click ended nothing must be able to see that.
     closed = await on_plate_cleared(printer_id)
@@ -4228,7 +4229,16 @@ async def execute_hms_action(
     pre_gcode = client.state.state
     pre_hms_count = len(client.state.hms_errors)
 
-    success = client.execute_hms_action(body.print_error, body.action, body.job_id)
+    if body.action == HMSAction.STOP_PRINTING:
+        # The printer's own dialog offering "Stop printing" is an operator pressing Stop,
+        # and the operator's Stop has ONE owner (``print_control.stop_as_operator``): the
+        # MQTT stop AND the user-stopped mark, with nothing awaited between them. Sent
+        # through the dialog dispatcher it went out WITHOUT the mark, so the terminal
+        # read as a genuine failure — retry, quarantine count — for a print a human
+        # stopped on purpose.
+        success = stop_as_operator(printer_id)
+    else:
+        success = client.execute_hms_action(body.print_error, body.action, body.job_id)
     if not success:
         raise HTTPException(400, "Failed to execute HMS action")
 

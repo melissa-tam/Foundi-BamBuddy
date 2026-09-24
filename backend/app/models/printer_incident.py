@@ -90,7 +90,7 @@ KIND_PHYSICAL = "physical"  # physical_fault — hands needed, never a swap
 # 2. The pause-cause vocabulary (``services/pause_recovery.py``) — holds that are
 #    NOT AMS faults but are, exactly like them, "this printer is held for a human":
 KIND_POWER_LOSS = "power_loss"  # the firmware's power-loss prompt could not be answered (resume refused/failed)
-KIND_PLATE_VISION = "plate_vision"  # the pre-print plate check tripped (confirmed on the second consecutive trip)
+KIND_PLATE_VISION = "plate_vision"  # the pre-print plate check tripped; the job is PAUSED for a human's answer
 KIND_Z_REFERENCE_LOST = "z_reference_lost"  # rebooted with a part on the plate; the eject's Z frame is fiction
 #
 # 3. The DECLARED vocabulary — a hold no fault produced. A human declared it with a
@@ -132,8 +132,17 @@ FAULT_KINDS: frozenset[str] = ALL_KINDS - DECLARED_KINDS
 #               running on it, or the job it interrupted completing) — the
 #               ``repair`` cells of ``incident_resolution._TABLE``.
 # ``"operator"`` only a human act ends it (``clear_plate`` / ``operator_recover``),
-#               because the terminal that follows was CAUSED by the farm (a
-#               plate-vision stop) or the wire cannot see the plate (a lost Z frame).
+#               because the wire cannot see the thing the hold is about (a part on
+#               the plate after a reboot — a lost Z frame).
+# ``"job_pause"`` the printer PAUSED ONE JOB and is asking a human about it — its
+#               own pre-print plate check (2026-09-24, 003-H2S). The answer IS the job:
+#               the operator resumes it (its RUNNING ends the hold, the same job
+#               continues) or stops it (its terminal ends the hold, and the terminal's
+#               verdict hands the plate to the plate authority). Neither a plate act
+#               nor Recover answers it — "the plate is clear" is not "resume the
+#               print" — and no automatic lane may resume the job underneath it
+#               (``printer_incidents.job_pause_held``). Bound to the row's OWN job
+#               (``job_id``): another job's edge or terminal says nothing about it.
 # ``"declared"`` no FAULT opened it, so no evidence closes it: it ends ONLY through
 #               the verb that opened it — never a plate act, a wire edge, a terminal
 #               or repair evidence. 2026-09-12 (001/009/010-H2S maintenance): an
@@ -156,6 +165,7 @@ FAULT_KINDS: frozenset[str] = ALL_KINDS - DECLARED_KINDS
 RESOLUTION_WIRE = "wire"
 RESOLUTION_REPAIR = "repair"
 RESOLUTION_OPERATOR = "operator"
+RESOLUTION_JOB_PAUSE = "job_pause"
 RESOLUTION_DECLARED = "declared"
 
 RESOLVES_ON: dict[tuple[str, bool], str] = {
@@ -168,12 +178,41 @@ RESOLVES_ON: dict[tuple[str, bool], str] = {
     # The three pause-cause kinds have no external variant — they are not AMS faults,
     # so there is no spool holder for them to sit on.
     (KIND_POWER_LOSS, False): RESOLUTION_WIRE,
-    (KIND_PLATE_VISION, False): RESOLUTION_OPERATOR,
+    (KIND_PLATE_VISION, False): RESOLUTION_JOB_PAUSE,
     (KIND_Z_REFERENCE_LOST, False): RESOLUTION_OPERATOR,
     # A declared hold has no external variant either — there is no hardware for it to
     # sit on. It is a statement about the MACHINE, not about a spool path.
     (KIND_SERVICE_HOLD, False): RESOLUTION_DECLARED,
 }
+
+# Does the operator's **Recover** verb end a hold of this CLASS? One attribute per class,
+# beside the table it qualifies, so "can Recover end it" is READ rather than re-derived:
+# ``printer_incidents.closed_by_recover`` reads it (projected as ``operator_exits``), and a
+# test pins it cell-for-cell against the rule table's own ``plate_cleared``-with-Recover
+# verdict — the store may not import the rule table, so the pin is what keeps the two
+# answers one answer.
+#
+# * ``operator`` — yes: the evidence IS a human act, and Recover is its strong form;
+# * ``repair``   — yes: "an operator inspected this machine" is the third return-to-normal
+#                  the class admits beside its two motion evidences;
+# * ``wire``     — no: a runout hold is not answered by somebody clearing a plate;
+# * ``job_pause`` — no: the answer is RESUME or STOP of the paused job, never a plate act;
+# * ``declared`` — no, by definition: only the verb that declared it ends it.
+RECOVER_ENDS: dict[str, bool] = {
+    RESOLUTION_WIRE: False,
+    RESOLUTION_REPAIR: True,
+    RESOLUTION_OPERATOR: True,
+    RESOLUTION_JOB_PAUSE: False,
+    RESOLUTION_DECLARED: False,
+}
+
+# The kinds whose hold is a PAUSED JOB a human must answer (class ``job_pause``). DERIVED
+# from the table rather than re-listed — the ``DECLARED_KINDS`` idiom — so a kind joins by
+# being registered with the class, and ``printer_incidents.job_pause_held`` (the one
+# predicate every job-resuming lane reads) follows it by construction.
+JOB_PAUSE_KINDS: frozenset[str] = frozenset(
+    kind for (kind, _external), resolution in RESOLVES_ON.items() if resolution == RESOLUTION_JOB_PAUSE
+)
 
 # The ONE order a single-slot reader uses when a printer carries more than one open
 # fault — ``printer_incidents.get_open`` without ``kinds``, ``snapshot`` without
@@ -252,6 +291,15 @@ RESOLVE_DRIVER_SELF_HEAL = "driver_self_heal"
 # The startup rearm found the printer positive and closed the row: a RESTART's
 # reconciliation, not a witnessed resume — the edge itself was never observed.
 RESOLVE_REARM = "startup_rearm"
+# A JOB PAUSE whose job the printer POSITIVELY reports over — a terminal / idle state, or
+# another job on the printer — without the farm ever seeing that job's own terminal (a
+# restart or a dropped session swallowed it, and no reconcile synthesised one). A job
+# pause cannot outlive its job (2026-09-24): without this close the row had no exit at
+# all — neither plate verb answers a job pause — and it would block dispatch and stand
+# every resume lane aside on its printer for good. Its own token so the ledger can tell
+# an unseen end from an answered one. 16 characters — inside ``resolve_source``'s
+# VARCHAR(24).
+RESOLVE_JOB_ENDED_UNSEEN = "job_ended_unseen"
 
 
 class PrinterIncident(Base):
@@ -290,6 +338,16 @@ class PrinterIncident(Base):
     # firmware attributed one. NULL for slot-agnostic faults and every external-spool
     # runout (there is no AMS slot to name).
     slot_global_tray: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The printer's OWN words for this hold: the firmware's full HMS codes (16-hex for
+    # the ``hms[]`` lane, 8-hex for ``print_error``), comma-joined, recorded when the row
+    # opened (or was re-classified). A fact about the incident, not the printer's live
+    # state — a ladder verb, a stop or the next job clears the printer's dialog while the
+    # hold it explained still stands, and 2026-09-24 (003-H2S) is what happens when the
+    # hold outlives the words: the operator never saw "align the build plate". Rendered
+    # through the one catalog renderer into ``printer_incidents._payload``'s
+    # ``printer_messages``. NULL on rows opened before the column existed (the renderer
+    # falls back to ``code``) and on code-less kinds.
+    hms_full_codes: Mapped[str | None] = mapped_column(String(512), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     # Naive UTC, matching the fork's other timestamp columns.
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

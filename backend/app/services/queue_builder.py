@@ -8,18 +8,25 @@ drift — the production run does not copy-paste the route's loop.
 
 It also owns :func:`requeue_fields`, the ONE answer to "print this plate again with
 the SAME settings" — an explicit allowlist rather than another hand-kept copy of the
-columns somebody remembered.
+columns somebody remembered — and the position primitives every requeue lands
+through (:func:`seat_at_head`, ``create_queue_items(insert_at_top=True)``); the
+DECISION to requeue lives in ``services/requeue.py``.
 
-Neither helper commits; the caller owns the transaction.
+None of these helpers commits; the caller owns the transaction. Every position
+writer takes the scope lock first, and on SQLite that lock is the database's WRITE
+lock, held from the allocation's first read until the caller commits — so a caller
+must not await anything slow (network, file transfer, a notification) between a
+position write and its commit.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select, text, update
 
+from backend.app.core.database import hold_write_lock
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.dispatch_target import target_of
 
@@ -35,10 +42,11 @@ if TYPE_CHECKING:
 # a test pins that their union is the model's column set. The point is the failure
 # mode it creates: adding a column to the model without deciding which set it joins
 # breaks CI, instead of silently reverting to a model default on every requeue — which
-# is what had been happening. ``farm_policy.create_retry_if_absent`` copied 16 columns
-# and dropped 19 (``use_ams``, the whole calibration block, ``skip_filament_check``,
-# the operator's slot pin…), and ``production_run.top_up_run`` copied 8, so a retried
-# plate quietly printed with different settings from the one it replaced.
+# is what had been happening. The old retry insert (``farm_policy.create_retry_if_absent``,
+# now ``requeue.requeue_attempt``) copied 16 columns and dropped 19 (``use_ams``, the
+# whole calibration block, ``skip_filament_check``, the operator's slot pin…), and the
+# top-up copied 8, so a retried plate quietly printed with different settings from the
+# one it replaced.
 
 # Carried onto the new row: the print's CONFIGURATION — what file, which plate, which
 # profile, and every option the operator chose for it.
@@ -84,10 +92,13 @@ CARRIED_COLUMNS: frozenset[str] = frozenset(
 #    ``started_at``, ``completed_at``): a new row is a new attempt.
 # 2. PER-ATTEMPT STATE the new row must start clean on — the caller owns ``status``
 #    and ``manual_start`` (a paused run stages its requeues), ``position`` is
-#    re-allocated at the tail of the run's pending units by
-#    :func:`allocate_queue_positions`, and the rest are the old attempt's residue:
-#    ``waiting_reason`` / ``error_message`` / ``dispatch_subtask_id`` / ``stop_source``
-#    / ``eject_dispatched_at`` / ``been_jumped`` / ``filament_short``.
+#    re-allocated by :func:`allocate_queue_positions` (a requeue takes the HEAD of
+#    its scope, ``services/requeue.py``), ``been_jumped`` is the requeue's own
+#    decision (it writes True so the SJF ordering serves the plate first too, never
+#    a copy of the old attempt's starvation history), and the rest are the old
+#    attempt's residue: ``waiting_reason`` / ``error_message`` /
+#    ``dispatch_subtask_id`` / ``stop_source`` / ``eject_dispatched_at`` /
+#    ``filament_short``.
 #    ``cleanup_library_after_dispatch`` is state too, and dangerous state: it is the
 #    Direct-Print lane's own "this upload is transient, delete it after dispatch"
 #    stamp, and copying it onto a requeue would arm a second deletion of a file the
@@ -121,14 +132,14 @@ NOT_CARRIED_COLUMNS: frozenset[str] = frozenset(
     }
 )
 
-# The chain, written by the requeue itself (``farm_policy.create_retry_if_absent``)
-# and never copied from the source row: ``retry_of_id`` points AT the source and is
-# the DB-backed idempotency guard, ``retry_count`` is the generation index the
+# The chain, written by the requeue itself (``requeue.requeue_attempt``, the only
+# writer) and never copied from the source row: ``retry_of_id`` points AT the source
+# and is the DB-backed idempotency guard, ``retry_count`` is the generation index the
 # run-detail lineage renders. Note what ``retry_count`` is NOT: the genuine-failure
 # cap. That is derived from the statuses of the ancestors in the chain
-# (``farm_policy._genuine_failure_count``), so a lineage-only requeue — a plate the
-# farm itself refused, or one an operator stopped on a fault-held printer — never
-# consumes a unit's one retry.
+# (``requeue.failed_ancestor_count``), so a lineage-only requeue — a plate the farm
+# itself refused, or one an operator stopped on a fault-held printer — never consumes
+# a unit's one retry.
 LINEAGE_COLUMNS: frozenset[str] = frozenset({"retry_of_id", "retry_count"})
 
 
@@ -192,17 +203,33 @@ def position_scope_filter(printer_id: int | None) -> tuple[ColumnElement[bool], 
 
 
 async def _lock_position_scope(db: AsyncSession, printer_id: int | None) -> None:
-    """Serialize concurrent position writers within one scope (Postgres only).
+    """Serialize concurrent position writers within one scope, on BOTH engines.
 
-    SQLite serializes writes implicitly, so this is a no-op there. Dialect is
-    checked against the LIVE binding, not the ``is_sqlite()`` settings helper,
-    because the test fixture overrides ``get_db`` with a SQLite engine while
+    A position write is read-then-write — ``max(position)`` (or the scope's current
+    order) is read and the new numbers are written from it — so two writers must not
+    interleave between the read and the write.
+
+    * **PostgreSQL**: a transaction-scoped advisory lock keyed by the scope.
+    * **SQLite**: the database's WRITE lock, taken before the read by
+      ``core.database.hold_write_lock`` (``BEGIN IMMEDIATE``). SQLite does serialize
+      WRITES, but not a read and the write that depends on it: without the lock two
+      writers appending to one scope (two units queued onto the shared NULL-printer
+      sequence at once) both read the same ``max(position)`` and write the same
+      number, and a read made inside an already-open deferred transaction cannot be
+      upgraded at all once another connection has committed (``database is
+      locked``, no busy wait — the lost requeues of 2026-09-06..24). SQLite's lock is
+      database-wide rather than per-scope, which is coarser than needed and correct.
+
+    Dialect is checked against the LIVE binding, not the ``is_sqlite()`` settings
+    helper, because the test fixture overrides ``get_db`` with a SQLite engine while
     ``settings.database_url`` may still point at Postgres.
     """
     bind = db.get_bind()
     if bind.dialect.name == "postgresql":
         scope_key = printer_id if printer_id is not None else 0
         await db.execute(text("SELECT pg_advisory_xact_lock(1625, :k)"), {"k": scope_key})
+        return
+    await hold_write_lock(db)
 
 
 async def allocate_queue_positions(
@@ -239,6 +266,44 @@ async def allocate_queue_positions(
     result = await db.execute(select(func.max(PrintQueueItem.position)).where(*queue_scope))
     max_pos = result.scalar() or 0
     return max_pos + 1
+
+
+async def seat_at_head(db: AsyncSession, item: PrintQueueItem) -> None:
+    """Move an EXISTING ``pending`` row to the head of its position scope.
+
+    The head is the same slot the operator's "insert at top" and a new requeue row
+    take — :func:`allocate_queue_positions` with ``insert_at_top`` — so there is one
+    rule for "first in line", not a second one written for rows that already exist.
+    The allocation shifts every pending row of the scope up by one (``item`` too, if
+    it is already numbered there) and ``item`` then takes the freed slot.
+
+    The scope is read off the row as it stands NOW (:func:`position_scope_of`), so
+    ``item`` must reflect the database: a caller that moved the row with one of
+    ``queue_transitions``' conditional UPDATEs (``synchronize_session=False``) reloads
+    it first — on a pool row ``release_unstarted_claim`` clears ``printer_id``, and a
+    stale instance would seat the row in the scope of the printer it just left.
+    Does not commit.
+    """
+    item.position = await allocate_queue_positions(db, printer_id=position_scope_of(item), count=1, insert_at_top=True)
+
+
+async def seat_for_repin(db: AsyncSession, item: PrintQueueItem, *, new_printer_id: int | None) -> None:
+    """An operator edit is moving a ``pending`` row's PIN: seat it at the TAIL of its new scope.
+
+    A queue position is only meaningful inside its scope (:func:`position_scope_filter`),
+    so a row whose ``printer_id`` changes carries a number from a sequence it no longer
+    belongs to — it lands wherever that stale number happens to fall among strangers.
+    An edit is not a requeue: the row joins the back of the line it moves into.
+
+    Call BEFORE writing ``new_printer_id`` onto the row: the allocation reads the new
+    scope while the row still sits in its old one, so it can never count itself. A no-op
+    when the pin (and therefore the scope) is unchanged — a change of pool membership or
+    model moves a NULL-printer row within the ONE shared sequence it already lives in.
+    Does not commit.
+    """
+    if new_printer_id == position_scope_of(item):
+        return
+    item.position = await allocate_queue_positions(db, printer_id=new_printer_id, count=1)
 
 
 async def renumber_pending(db: AsyncSession, ordered_ids: Sequence[int]) -> int:
@@ -316,31 +381,54 @@ async def renumber_pending(db: AsyncSession, ordered_ids: Sequence[int]) -> int:
     return len(named)
 
 
+async def create_queue_rows(
+    db: AsyncSession,
+    *,
+    printer_id: int | None,
+    rows: Sequence[Mapping[str, Any]],
+    insert_position: int | None = None,
+    insert_at_top: bool = False,
+) -> list[PrintQueueItem]:
+    """Allocate ONE contiguous block of positions and create one queue item per ``rows`` entry.
+
+    THE constructor of a positioned queue row. Each entry of ``rows`` holds that item's
+    column values (everything except ``position``, which is assigned from the
+    allocated start in ``rows`` order), and every row lands in ``printer_id``'s scope —
+    so a caller creating rows that differ (one per library file, one per plate of a
+    multi-plate upload) gets them contiguous, in its own order, from one allocation.
+    Items are added to the session but NOT committed. Returns them in position order.
+    """
+    if not rows:
+        return []
+    start_position = await allocate_queue_positions(
+        db,
+        printer_id=printer_id,
+        count=len(rows),
+        insert_position=insert_position,
+        insert_at_top=insert_at_top,
+    )
+    items: list[PrintQueueItem] = []
+    for offset, fields in enumerate(rows):
+        item = PrintQueueItem(position=start_position + offset, **fields)
+        db.add(item)
+        items.append(item)
+    return items
+
+
 async def create_queue_items(
     db: AsyncSession,
     *,
     count: int,
     printer_id: int | None,
-    fields: dict[str, Any],
+    fields: Mapping[str, Any],
     insert_position: int | None = None,
     insert_at_top: bool = False,
 ) -> list[PrintQueueItem]:
-    """Allocate positions and create ``count`` queue items sharing ``fields``.
-
-    ``fields`` are the per-item column values (everything except ``position``,
-    which is assigned contiguously from the allocated start). Items are added to
-    the session but NOT committed. Returns the created items in position order.
-    """
-    start_position = await allocate_queue_positions(
+    """:func:`create_queue_rows` for ``count`` items that share ``fields`` — N copies of one plate."""
+    return await create_queue_rows(
         db,
         printer_id=printer_id,
-        count=count,
+        rows=[fields] * count,
         insert_position=insert_position,
         insert_at_top=insert_at_top,
     )
-    items: list[PrintQueueItem] = []
-    for i in range(count):
-        item = PrintQueueItem(position=start_position + i, **fields)
-        db.add(item)
-        items.append(item)
-    return items

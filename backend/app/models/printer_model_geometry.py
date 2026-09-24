@@ -77,8 +77,8 @@ class PrinterModelGeometry(Base):
     # dialect (SQLite ``0`` / Postgres ``false``), matching the migration's own ``_false``.
     z_reference_validated: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
 
-    # How far (mm) the bed rises off its bottom stop while the printer is HELD after a
-    # confirmed plate-check trip. A clearance measured from the PHYSICAL stop, not from
+    # How far (mm) the bed rises off its bottom stop after the printer's plate check
+    # REFUSED the plate and the paused job was stopped (``farm_policy._maybe_lift_held_bed``). A clearance measured from the PHYSICAL stop, not from
     # the firmware's frame, so it stays true whatever the frame says. The distance that
     # clears the operator's plate-release aid is a hardware fact the code cannot know
     # (red line 3), hence a registry column; 12.0 is the vendor's own value from the

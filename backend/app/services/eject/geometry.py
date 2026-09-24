@@ -59,8 +59,8 @@ class ModelGeometry:
     # unable to produce the block, so a new motion can never appear by omission. Pinned
     # by a test.
     z_reference_validated: bool = False
-    # Bed clearance (mm) off the PHYSICAL bottom stop while the printer is held after a
-    # confirmed plate-check trip. Read by the hold lane, never by the eject generator.
+    # Bed clearance (mm) off the PHYSICAL bottom stop after the printer's plate check
+    # refused the plate. Read by the refused-plate lift, never by the eject generator.
     hold_lift_mm: float = 12.0
     # Cooldown plate-hold limits (2026-09-10) — the two PHYSICAL numbers that decide
     # whether the finished plate may be held at the nozzle plane through the eject

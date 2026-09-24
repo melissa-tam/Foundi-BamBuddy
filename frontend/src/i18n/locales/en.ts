@@ -172,6 +172,8 @@ export default {
       printerCol: 'Printer',
       timeCol: 'Finished / started',
       stoppedByOperator: 'Stopped by operator',
+      stoppedAtPlateCheck: 'Stopped at plate check',
+      // History only: labels stored `farm_vision_abort` rows; nothing writes that token now.
       stoppedByFarmVision: 'Stopped by the farm: plate check',
       stoppedByReconcileUnknown: 'Outcome unknown after reconnect',
       firstArticleBadge: 'First article',
@@ -192,7 +194,7 @@ export default {
         printerOfflineStalled: 'Printer offline mid-print — outcome unknown until it reconnects',
         printerServiceHold: 'Printer in maintenance mode',
         printPausedStalled: 'Paused on the printer — needs attention (no auto-recovery)',
-        visionHold: 'Plate check tripped twice — clear the bed, then Mark plate cleared',
+        visionHold: 'Paused at plate check — fix the plate, then resume',
         powerLossHold: 'Held at the printer\'s power-loss prompt — resume at the printer',
         zReferenceLost: 'Restarted with a part on the plate — remove it by hand',
         previousPrintFailed: 'Held: previous print failed',
@@ -214,7 +216,7 @@ export default {
         quarantined: 'Quarantined',
         modelMismatch: 'Model mismatch',
         stalled: 'Offline-stalled mid-print',
-        visionHold: 'Plate not empty (printer vision)',
+        visionHold: 'Plate check hold',
         filamentShort: 'Low filament',
         noUsbDrive: 'No USB drive',
       },
@@ -961,6 +963,8 @@ export default {
       markOccupiedSuccess: 'Plate marked as occupied — dispatch blocked until cleared',
       ejectInProgress: 'Eject in progress · {{age}}',
       ejectStalled: 'Eject stalled · {{age}} — the farm lost track of the sweep',
+      // A refused plate's gate: the printer's plate-check words, on the plate row.
+      refusal: 'Plate check: {{message}}',
       menuRecover: 'Recover printer',
       clearedClosedFault: 'Equipment fault closed',
     },
@@ -1283,8 +1287,14 @@ export default {
       runout: 'Refill the demanded slot; the print resumes on its own',
       physical: 'Filament path blocked. Clears when a slot loads or the interrupted print completes through the path, or on Recover.',
       power_loss: 'Resume at the printer',
-      plate_vision: 'Clear the bed, then Mark plate cleared',
+      plate_vision: 'Fix the plate, then resume the print',
       z_reference_lost: 'Restarted with a part on the plate — remove it by hand, then Mark plate cleared',
+    },
+    // A hold's RECORDED printer words, one line under the chip while the
+    // printer no longer shows them live; `notShown` is that line's tooltip.
+    holdMessage: {
+      reported: 'Printer reported: {{message}}',
+      notShown: 'No longer shown on the printer',
     },
     // Fans
     fans: {

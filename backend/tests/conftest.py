@@ -110,6 +110,7 @@ from backend.tests._fixtures.db import (  # noqa: E402,F401
     module_database,
     own_session_factory,
     test_engine,
+    wal_session_factory,
 )
 
 

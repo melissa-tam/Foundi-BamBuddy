@@ -26,21 +26,18 @@ closers once treated "not operator / not repair" as the WIRE lane through a bare
 :class:`Context`, so the closers depend on the rule and the rule depends on nothing
 that closes. ``printer_incidents`` must never import this module back.
 
-**Two lanes end rows of this family OUTSIDE the table, by declaration:**
+**One lane ends rows of this family OUTSIDE the table, by declaration:**
+``service_hold.exit`` closes the ``declared`` hold it opened. A declared hold ends ONLY
+through the verb that opened it; giving the table a cell that could close one would be
+a second way to end it, which is precisely what the class exists to refuse. (The
+2026-09-04 plate-vision first-trip re-check in ``farm_policy`` was the other declared
+lane; it was deleted on 2026-09-24 with the lane that STOPPED a paused print — the
+plate-check hold is now a ``job_pause`` row, closed here by its own job's resume or
+terminal.)
 
-* ``farm_policy``'s plate-vision FIRST-TRIP re-check closes its own
-  ``plate_vision`` row with ``source=terminal`` when the farm requeues the unit for
-  the printer's own second opinion. It stays there because it owns the state the
-  decision is made of — the windowed trip count, whether the farm can vouch for the
-  re-check, and the gate it raises when it cannot. Ending the row is one step of that
-  disposition, not an occasion anybody else observes.
-* ``service_hold.exit`` closes the ``declared`` hold it opened. A declared hold ends
-  ONLY through the verb that opened it; giving the table a cell that could close one
-  would be a second way to end it, which is precisely what the class exists to refuse.
-
-Both are named in the AST pin's allowlist (``test_code_quality`` /
-``test_incident_resolution``), so a THIRD closer appearing anywhere fails the suite
-rather than quietly becoming a second owner.
+It is named in the AST pin's allowlist (``test_code_quality`` /
+``test_incident_resolution``), so a second closer appearing anywhere fails the suite
+rather than quietly becoming another owner.
 """
 
 from __future__ import annotations
@@ -53,9 +50,11 @@ from typing import Literal
 
 from backend.app.models.printer_incident import (
     RESOLUTION_DECLARED,
+    RESOLUTION_JOB_PAUSE,
     RESOLUTION_OPERATOR,
     RESOLUTION_REPAIR,
     RESOLUTION_WIRE,
+    RESOLVE_JOB_ENDED_UNSEEN,
     RESOLVE_OBSERVED_RUNNING,
     RESOLVE_OPERATOR,
     RESOLVE_REARM,
@@ -197,7 +196,6 @@ class MotionLedger:
         ~1 Hz push. The first sample for a printer SEEDS only: an edge that happened
         before we looked is not an edge we witnessed.
         """
-        live = ((getattr(state, "state", None) or "") if state is not None else "").upper()
         feeder = valid_feeder(getattr(state, "tray_now", None))
         prev = self._feeder.get(printer_id)
         self._feeder[printer_id] = (epoch, feeder)
@@ -217,7 +215,7 @@ class MotionLedger:
         # printer at some point after the fault opened" is a fact a reconnect cannot
         # fabricate (the printer is demonstrably printing), and the eject exclusion is
         # asked HERE because a sweep's RUNNING must never enter the ledger at all.
-        if live == "RUNNING" and plate_occupancy.eject_identity(printer_id) is None:
+        if running_without_eject(state, printer_id):
             self._running_seen_at[printer_id] = datetime.utcnow()
 
     def load_completed_at(self, printer_id: int) -> datetime | None:
@@ -254,6 +252,17 @@ def path_quiet(state: PrinterState | None) -> bool:
     that caused it: the wire can read fault-free while the AMS is still mid-change.
     """
     return not live_candidates(state) and not ams_mid_filament_change(state)
+
+
+def running_without_eject(state: PrinterState | None, printer_id: int) -> bool:
+    """Is a PRINT running on this printer right now — RUNNING, and no eject owns it?
+
+    THE one reading of "a print is feeding", shared by the motion ledger's positive
+    stamp, the ``repair`` class's (b) evidence and the ``job_pause`` class's resume
+    evidence. The eject exclusion is not incidental: a sweep is filament-LESS and is not
+    the job a hold paused, so a toolhead crossing the plate says nothing about either.
+    """
+    return _live_state(state).upper() == "RUNNING" and plate_occupancy.eject_identity(printer_id) is None
 
 
 def driver_owns(row: PrinterIncident, *, live: bool) -> bool:
@@ -403,7 +412,7 @@ def _repair_motion(row: PrinterIncident, ctx: Context) -> Verdict:
     loaded_at = ctx.ledger.load_completed_at(row.printer_id)
     if loaded_at is not None and row.created_at is not None and loaded_at > row.created_at:
         return Verdict(close=True, source=RESOLVE_REPAIR_OBSERVED, evidence=_REPAIR_EVIDENCE_LOAD)
-    if _live_state(ctx.state).upper() == "RUNNING" and plate_occupancy.eject_identity(row.printer_id) is None:
+    if running_without_eject(ctx.state, row.printer_id):
         return Verdict(close=True, source=RESOLVE_REPAIR_OBSERVED, evidence=_REPAIR_EVIDENCE_RUNNING)
     return Verdict(close=False, evidence="no repair evidence")
 
@@ -482,15 +491,147 @@ def _repair_plate_cleared(_row: PrinterIncident, ctx: Context) -> Verdict:
 
 
 def _operator_plate_cleared(_row: PrinterIncident, ctx: Context) -> Verdict:
-    """Both verbs. The evidence a human produces for a confirmed plate-check trip or a
-    lost Z datum is the part coming off the plate, and Recover is the stronger form of
-    the same statement."""
+    """Both verbs. The evidence a human produces for a lost Z datum is the part coming
+    off the plate, and Recover is the stronger form of the same statement."""
     recovered = ctx.cleared is not None and ctx.cleared.recover
     return Verdict(
         close=True,
         source=RESOLVE_OPERATOR,
         evidence="the operator recovered the printer" if recovered else "the operator cleared the plate",
     )
+
+
+# --- the ``job_pause`` class --------------------------------------------------------
+#
+# The printer paused ONE job and is asking a human about it (its own pre-print plate
+# check). The answer is that job: resumed — its RUNNING ends the hold and the same job
+# continues — or stopped — its terminal ends the hold, and the terminal's verdict
+# (``plate_refused``) hands the plate to the plate authority. Every cell is bound to the
+# row's OWN job, because another job's edge or terminal says nothing about this pause.
+#
+# ...and a job pause cannot outlive its job. When the farm never saw that job's terminal
+# (a restart or a dropped session swallowed it and no reconcile synthesised one), the
+# per-tick sweep closes the row on the printer's POSITIVE report that the job is over.
+
+# The states in which a printer is positively holding NO job paused: the job it had ran
+# to a terminal, or it is idle. ``PAUSE`` is this hold's own reading and the active
+# states (``PREPARE`` / ``SLICING`` / ``RUNNING``) belong to a job; ``""`` / ``UNKNOWN``
+# are the printer saying nothing at all.
+_JOB_OVER_STATES: frozenset[str] = frozenset({"FINISH", "FAILED", "IDLE"})
+
+
+def _same_job(row: PrinterIncident, job_id: str | None) -> bool:
+    """Is ``job_id`` the job this row paused? Both sides normalised to the stripped
+    string — the row stores ``''`` for "the printer named no job", and an equally
+    degenerate echo of that same job is the same job."""
+    return (job_id or "").strip() == (row.job_id or "").strip()
+
+
+def _live_job(state: PrinterState | None) -> str:
+    """The printer's live ``subtask_id`` ("" when it names none or is not reporting)."""
+    return ((getattr(state, "subtask_id", None) or "") if state is not None else "").strip()
+
+
+def _job_pause_running_edge(row: PrinterIncident, ctx: Context) -> Verdict:
+    """The paused job RUNNING again ends the hold — whoever resumed it.
+
+    Stands aside while a recovery DRIVER is live, the wire cell's rule for the wire
+    cell's reason (a RUNNING sample taken during a resume a driver published is its
+    reading, not this hold's answer). And only for the row's OWN job.
+    """
+    if ctx.driver_live:
+        return Verdict(close=False, evidence="a recovery driver is live and owns the outcome; closer stands aside")
+    if not _same_job(row, _live_job(ctx.state)):
+        return Verdict(close=False, evidence="the RUNNING job is not the one the printer paused")
+    return Verdict(close=True, source=RESOLVE_OBSERVED_RUNNING, evidence="the paused job is RUNNING again")
+
+
+def _job_pause_job_terminal(row: PrinterIncident, ctx: Context) -> Verdict:
+    """The paused job's terminal ends the hold — the job it asked about is over.
+
+    What happens to the PLATE is not this cell's question: the terminal's classification
+    (``farm_correlation.classify_stop`` → ``plate_refused``) was captured BEFORE this
+    closer ran, and the plate authority acts on it.
+    """
+    terminal = ctx.terminal
+    if terminal is None:
+        return Verdict(close=False, evidence="no terminal event was supplied")
+    if terminal.eject:
+        return Verdict(close=False, evidence="the terminal is an eject sweep — not the job the printer paused")
+    if not _same_job(row, terminal.job_id):
+        return Verdict(close=False, evidence="the terminal is not the job the printer paused")
+    return Verdict(close=True, source=RESOLVE_TERMINAL, evidence="the paused job reached a terminal")
+
+
+def _job_pause_running(row: PrinterIncident, ctx: Context) -> Verdict:
+    """The two LOOKING occasions' evidence: a positive RUNNING of the paused job, with no
+    eject owning the printer. A pause is this hold's NORMAL reading, so nothing short of
+    the job printing again answers it here."""
+    if not running_without_eject(ctx.state, row.printer_id):
+        return Verdict(close=False, evidence="the paused job is not RUNNING")
+    if not _same_job(row, _live_job(ctx.state)):
+        return Verdict(close=False, evidence="the RUNNING job is not the one the printer paused")
+    return Verdict(close=True, source=RESOLVE_OBSERVED_RUNNING, evidence="the paused job is RUNNING again")
+
+
+def _job_pause_ended_unseen(row: PrinterIncident, ctx: Context) -> Verdict | None:
+    """The printer POSITIVELY reports the paused job over — or None when it does not.
+
+    Two readings, each a statement the printer makes, never an absence: a terminal or
+    idle state (:data:`_JOB_OVER_STATES`), or a DIFFERENT job's subtask id on a printer
+    that is reporting (a printer runs one job, so another one means this one ended). A
+    pause of the same job, a silent printer and a disconnected one say nothing.
+
+    No plate gate follows from this close: the farm never saw the job end, so it holds no
+    refusal to record — and the printer's own plate check runs again at the next job's
+    start, which is exactly the check that raised this hold.
+    """
+    live = _live_state(ctx.state).upper()
+    if live in _JOB_OVER_STATES:
+        return Verdict(
+            close=True,
+            source=RESOLVE_JOB_ENDED_UNSEEN,
+            evidence=f"the printer reports {live} — the paused job is over",
+            dwell=True,
+        )
+    job = _live_job(ctx.state)
+    if _reporting(ctx.state) and job and not _same_job(row, job):
+        return Verdict(
+            close=True,
+            source=RESOLVE_JOB_ENDED_UNSEEN,
+            evidence="the printer is on another job — the paused job is over",
+            dwell=True,
+        )
+    return None
+
+
+def _job_pause_sweep_tick(row: PrinterIncident, ctx: Context) -> Verdict:
+    """The paused job printing again, or the printer's positive report that it is over —
+    either way after the sweep's dwell.
+
+    The edge closer and the terminal closer are the first responders; this catches what
+    they missed: a reconnect straight into RUNNING, and a terminal the farm never saw. The
+    dwell is what keeps it second — a stopped job's own terminal lands within a second of
+    the printer reporting FAILED, and that terminal is the one that carries the
+    ``plate_refused`` verdict to the plate authority.
+    """
+    verdict = _job_pause_running(row, ctx)
+    if verdict.close:
+        return Verdict(close=True, source=verdict.source, evidence=verdict.evidence, dwell=True)
+    ended = _job_pause_ended_unseen(row, ctx)
+    return ended if ended is not None else verdict
+
+
+def _job_pause_startup(row: PrinterIncident, ctx: Context) -> Verdict:
+    """The same RUNNING evidence with no dwell, under the rearm's own token — the resume
+    itself was never witnessed by this process.
+
+    Deliberately NOT the ended-unseen reading: a job stopped while the farm was down is
+    answered by the downtime reconcile's synthesised terminal, which classifies it
+    ``plate_refused`` only while this row is still OPEN — closing it here first would
+    lose the refused plate's gate."""
+    verdict = _job_pause_running(row, ctx)
+    return Verdict(close=True, source=RESOLVE_REARM, evidence=verdict.evidence) if verdict.close else verdict
 
 
 # --- the table ----------------------------------------------------------------------
@@ -515,7 +656,7 @@ _TABLE: dict[tuple[str, Occasion], Handler] = {
     (RESOLUTION_REPAIR, "plate_cleared"): _repair_plate_cleared,
     (RESOLUTION_OPERATOR, "running_edge"): _stand("a RUNNING edge is not a human clearing a plate"),
     (RESOLUTION_OPERATOR, "job_terminal"): _stand(
-        "the terminal is frequently the farm's OWN stop of that print — it cannot answer the hold"
+        "a part on the plate after a reboot is not answered by a job ending — only a human clearing it is"
     ),
     (RESOLUTION_OPERATOR, "sweep_tick"): _stand(
         "a part on the plate and a lost Z datum are facts no HMS list reports — 'clean and idle' is "
@@ -523,6 +664,14 @@ _TABLE: dict[tuple[str, Occasion], Handler] = {
     ),
     (RESOLUTION_OPERATOR, "startup"): _stand("a restart is not a human clearing a plate"),
     (RESOLUTION_OPERATOR, "plate_cleared"): _operator_plate_cleared,
+    (RESOLUTION_JOB_PAUSE, "running_edge"): _job_pause_running_edge,
+    (RESOLUTION_JOB_PAUSE, "job_terminal"): _job_pause_job_terminal,
+    (RESOLUTION_JOB_PAUSE, "sweep_tick"): _job_pause_sweep_tick,
+    (RESOLUTION_JOB_PAUSE, "startup"): _job_pause_startup,
+    (RESOLUTION_JOB_PAUSE, "plate_cleared"): _stand(
+        "the printer paused a JOB — the answer is resuming or stopping it, and the plate "
+        "question is the plate authority's"
+    ),
     (RESOLUTION_DECLARED, "running_edge"): _stand(
         "an operator may start a print from the screen WHILE the printer is held — that is what "
         "maintenance mode keeps legal"

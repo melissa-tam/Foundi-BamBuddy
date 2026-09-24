@@ -44,7 +44,7 @@ function createStatus(overrides: Partial<PrinterStatus> = {}): PrinterStatus {
 /** An occupancy record with nothing held — each test raises one thing. */
 function occupancy(overrides: Partial<NonNullable<PrinterStatus['occupancy']>> = {}) {
   return {
-    plate: { occupied: false, source_subtask_id: null, policy: null, since: null },
+    plate: { occupied: false, source_subtask_id: null, policy: null, since: null, refusal: null },
     eject: null,
     lease_age_s: null,
     ...overrides,
@@ -72,6 +72,7 @@ function incident(
     slot_desc: null,
     created_at: '2026-09-17T09:43:00Z',
     operator_exits: operatorExits,
+    printer_messages: [],
     driver_live: false,
   };
 }
@@ -91,7 +92,7 @@ describe('recoverEffects', () => {
   it('reports the raised plate gate', () => {
     const status = createStatus({
       occupancy: occupancy({
-        plate: { occupied: true, source_subtask_id: '783388626', policy: 'CooldownEject', since: null },
+        plate: { occupied: true, source_subtask_id: '783388626', policy: 'CooldownEject', since: null, refusal: null },
       }),
     });
 
@@ -150,7 +151,7 @@ describe('recoverEffects', () => {
   it('reports several effects at once, in RECOVER_EFFECTS order', () => {
     const status = createStatus({
       occupancy: occupancy({
-        plate: { occupied: true, source_subtask_id: '1', policy: null, since: null },
+        plate: { occupied: true, source_subtask_id: '1', policy: null, since: null, refusal: null },
         eject: ejectClaim(true),
         lease_age_s: 42,
       }),

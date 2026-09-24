@@ -428,11 +428,14 @@ class TestManualEjectItemResolution:
         resolution = await manual._resolve_manual_eject_item(db_session, printer.id, None)
         assert resolution.lane == "none"
 
-    async def test_a_vision_trip_demotes_a_farm_owned_plate_out_of_the_matched_lane(self, db_session):
-        """A plate-vision trip rewrites the plate SOURCELESS, so the unit that made the
-        part can no longer be matched to it and what was a sweepable plate becomes a job
-        for a human. Pinned as CURRENT behaviour, not endorsed — the trip's own caller
-        (``farm_policy``) fires it on a plate the farm may already own."""
+    async def test_a_refused_plate_demotes_a_farm_owned_plate_out_of_the_matched_lane(self, db_session):
+        """A REFUSED plate (the printer's plate check paused the job, which was then
+        stopped) is gated SOURCELESS by its terminal's disposition: nothing was printed,
+        so the unit whose dispatch it was can no longer be matched to the plate, and what
+        might have been a sweepable plate becomes a job for a human."""
+        from backend.app.services.farm_correlation import terminal_disposition
+        from backend.app.services.plate_occupancy import DepositEvidence, PlateRefusal
+
         printer = await _mk_printer(db_session, "RESVIS", gate="SUB-1")
         item = await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1")
         await db_session.commit()
@@ -440,7 +443,23 @@ class TestManualEjectItemResolution:
         matched = await manual._resolve_manual_eject_item(db_session, printer.id, "SUB-1")
         assert (matched.lane, matched.item.id) == ("eject", item.id)
 
-        plate_occupancy.note_plate_detected(printer.id, "plate_vision_confirmed:0500_808C")
+        plate_occupancy.note_terminal(
+            printer.id,
+            terminal_disposition(
+                verdict="matched",
+                item_id=item.id,
+                eject_profile_id=item.eject_profile_id,
+                first_article=False,
+                batch_id=None,
+                source_subtask_id="SUB-1",
+                evidence=DepositEvidence(
+                    final_status="cancelled", is_dry_run=False, peaks_reliable=True, last_layer_num=0, last_progress=0
+                ),
+                raise_gate=True,
+                refusal=PlateRefusal(messages=()),
+            ),
+        )
+        assert plate_occupancy.plate_source(printer.id) is None
 
         resolution = await manual._resolve_manual_eject_item(
             db_session, printer.id, plate_occupancy.plate_source(printer.id)

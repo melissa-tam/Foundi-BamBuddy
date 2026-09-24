@@ -2321,10 +2321,29 @@ class TestOccupancyProjection:
         payload = occupancy_payload(4242)
 
         assert payload == {
-            "plate": {"occupied": False, "source_subtask_id": None, "policy": None, "since": None},
+            "plate": {"occupied": False, "source_subtask_id": None, "policy": None, "since": None, "refusal": None},
             "eject": None,
             "lease_age_s": None,
         }
+
+    def test_payload_carries_a_refused_plates_words_as_json_primitives(self):
+        """``plate.refusal`` is a FIXED frontend contract: always present, ``None`` for
+        every other gate, ``{"messages": [{"short_code", "description"}]}`` for a plate the
+        printer's own plate check refused."""
+        import json
+
+        from backend.app.services.hms_errors import PrinterMessage
+        from backend.app.services.plate_occupancy import EscalationOnly, PlateRefusal
+
+        refusal = PlateRefusal(messages=(PrinterMessage(short_code="0500_808C", description="Offset."),))
+        plate_occupancy.hydrate_plate(4243, None, EscalationOnly(refusal=refusal))
+        plate_occupancy.hydrate_plate(4244, None, EscalationOnly())
+
+        assert occupancy_payload(4243)["plate"]["refusal"] == {
+            "messages": [{"short_code": "0500_808C", "description": "Offset."}]
+        }
+        assert occupancy_payload(4244)["plate"]["refusal"] is None
+        json.dumps(occupancy_payload(4243))
 
     def test_payload_carries_the_plate_source_and_its_policy_class_name(self):
         """``policy`` is the class NAME: the UI renders "what happens to this plate

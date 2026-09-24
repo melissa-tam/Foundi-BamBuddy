@@ -142,6 +142,8 @@ import { CameraWall } from '../components/CameraWall';
 import { MQTTDebugModal } from '../components/MQTTDebugModal';
 import { HMSErrorModal } from '../components/HMSErrorModal';
 import { HMSErrorSummary } from '../components/HMSErrorSummary';
+import { PrinterMessageLines } from '../components/PrinterMessageLines';
+import { unshownPrinterMessages } from '../utils/printerMessages';
 import { FarmUnitChip } from '../components/FarmUnitChip';
 import { hmsTone } from '../utils/hmsTone';
 import { showNoUsbChip } from '../utils/noUsbChip';
@@ -2207,6 +2209,9 @@ function PrinterCard({
   // means dispatch is held pending a manual clear.
   const needsPlateClear = status?.awaiting_plate_clear === true;
   const showClearPlateButton = status?.connected && needsPlateClear && !isPrintingOrPaused;
+  // A refused plate: the operator stopped a print the printer's own plate check
+  // had paused. The stop wiped the printer's words, so the gate carries them.
+  const plateRefusal = status?.occupancy?.plate.refusal;
   // W3: while a cooldown eject watch is armed, marking the plate cleared cancels
   // the pending auto-eject (the watch exits without sweeping). Surface that as a
   // hint on the mark-cleared button so the operator isn't surprised.
@@ -4331,6 +4336,20 @@ function PrinterCard({
                   onOpen={() => setShowHMSModal(true)}
                 />
               )}
+              {/* The hold's own record of what the printer said, for every hold
+                  kind: a ladder verb, a stop or the next job can clear the
+                  printer's dialog while the hold stands. Only the messages the
+                  live list no longer carries — a live one is on the summary
+                  above. Connected only: the comparison needs a live list, and
+                  "no longer shown" is a claim about one. */}
+              {status?.connected && status.open_incident && (
+                <PrinterMessageLines
+                  messages={unshownPrinterMessages(status.open_incident.printer_messages, status.hms_errors ?? [])}
+                  labelKey="printers.holdMessage.reported"
+                  hint={t('printers.holdMessage.notShown')}
+                  className="mt-1"
+                />
+              )}
             </div>
           )}
         </div>
@@ -4974,6 +4993,15 @@ function PrinterCard({
               </div>
             )}
 
+            {/* A refused plate names the check that refused it, beside the
+                control that releases the gate. */}
+            {viewMode === 'expanded' && showClearPlateButton && plateRefusal && (
+              <PrinterMessageLines
+                messages={plateRefusal.messages}
+                labelKey="printers.plateStatus.refusal"
+                className="mt-2"
+              />
+            )}
             {viewMode === 'expanded' && showClearPlateButton && (
               <div className="mt-2 flex gap-2">
                 <button

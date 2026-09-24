@@ -658,7 +658,7 @@ class TestPolicyDriverArming:
         async def _never_run():  # pragma: no cover — the spawns fixture closes it
             return None
 
-        def _fake_escalation(printer_id, *, farm_source=False):
+        def _fake_escalation(printer_id, *, farm_source=False, refusal=None):
             seen.append((printer_id, farm_source))
             return _never_run()
 
@@ -668,6 +668,31 @@ class TestPolicyDriverArming:
         _occupy(8, EscalationOnly(), source=None)  # a print the farm did not dispatch
 
         assert seen == [(7, True), (8, False)]
+
+    def test_a_refused_plates_cause_rides_the_policy_into_the_watch(self, spawns):
+        """The printer's refusal is a fact the plate RECORD does not own (its durable
+        mirror is the gate and the source), and it changes what the watch SAYS — so it
+        rides the policy, and a gate whose cause changes is a different watch."""
+        from backend.app.services.hms_errors import PrinterMessage
+        from backend.app.services.plate_occupancy import PlateRefusal
+
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        seen: list = []
+
+        async def _never_run():  # pragma: no cover — the spawns fixture closes it
+            return None
+
+        def _fake_escalation(printer_id, *, farm_source=False, refusal=None):
+            seen.append((printer_id, refusal))
+            return _never_run()
+
+        mon._escalation_only = _fake_escalation
+        refusal = PlateRefusal(messages=(PrinterMessage(short_code="0500_808C", description="Offset."),))
+
+        _occupy(9, EscalationOnly(refusal=refusal), source=None)
+
+        assert seen == [(9, refusal)]
 
     def test_release_now_is_unset_until_requested(self, spawns):
         mon = EjectCooldownMonitor()
@@ -1839,6 +1864,30 @@ class TestWatchGateEscalationOnly:
             "A farm unit's eject did not run — the part is still on the plate. "
             "Remove it by hand, then Mark plate cleared."
         )
+
+    async def test_the_default_page_names_the_printers_refusal_in_its_own_words(self, monkeypatch):
+        """A refused plate (the printer's plate check paused the job, which was then
+        stopped) pages the printer's words — the stop wiped them off the printer."""
+        from backend.app.services.hms_errors import PrinterMessage
+        from backend.app.services.plate_occupancy import PlateRefusal
+
+        details = self._capture_default_page(monkeypatch)
+        _gate_up(3)
+        sleep = _ClearAfter(3, after_polls=3)
+        refusal = PlateRefusal(
+            messages=(PrinterMessage(short_code="0500_808C", description="Detected build plate offset."),)
+        )
+
+        outcome = await watch_gate_escalation_only(
+            3, escalate_s=40, check_interval_s=20, sleep=sleep, farm_source=True, refusal=refusal
+        )
+
+        assert outcome == "cleared"
+        assert details == [
+            "The printer's plate check refused the plate and the print was stopped. "
+            "The printer reported: [0500_808C] Detected build plate offset. "
+            "Fix the plate, then Mark plate cleared."
+        ]
 
     async def test_the_default_page_keeps_the_foreign_sentence_for_a_foreign_deposit(self, monkeypatch):
         """Liveness pair: the foreign copy is unchanged, and it is still the default."""

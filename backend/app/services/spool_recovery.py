@@ -183,6 +183,7 @@ from backend.app.services.hms_errors import (
     candidate_fingerprint,
     current_runout_demand,
     fault_tokens,
+    full_codes_of,
     live_candidates,
     power_loss_prompt_standing,
 )
@@ -2148,6 +2149,10 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         # AMS fault beside a holder fault is still an AMS fault to recover.
         external = primary.external if primary is not None else False
         code = primary.short_code if primary is not None else ""
+        # The printer's own words for the faults this incident will speak for, recorded
+        # now: a release lever, a stop or the next job clears them off the printer while
+        # the hold they explain still stands.
+        full_codes = full_codes_of(getattr(state, "hms_errors", None) or [], {c.short_code for c in candidates})
 
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer
@@ -2171,6 +2176,24 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                     fingerprint,
                     "not opened — this printer already has an open AMS incident",
                     detail=f"incident {existing.id} {existing.status} kind={existing.kind}",
+                )
+                return None
+
+            if existing is None and printer_incidents.job_pause_held(printer_id):
+                # The printer PAUSED this job to ask a human about the plate (its own
+                # pre-print check), and every act this machine owns ends in a resume — a
+                # release lever, the swap round's resume, the refill auto-resume. Any of
+                # them would restart the print onto the plate the printer refused. So no
+                # new AMS incident is opened while that question stands: the human's
+                # resume ends the job pause, and a fault still standing then is owned on
+                # the very next push (and its raw alert reaches them meanwhile —
+                # ``will_own`` mirrors this gate). An AMS row ALREADY open keeps its
+                # owner; the upgrade below only re-classifies it and resumes nothing.
+                _note_outcome(
+                    printer_id,
+                    job_id,
+                    fingerprint,
+                    "not owned — the printer paused this job for a human (plate check); the answer comes first",
                 )
                 return None
 
@@ -2232,7 +2255,13 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 # store is about to mutate in this session.
                 upgraded_from = existing.kind
                 row = await printer_incidents.upgrade(
-                    db, existing.id, kind=kind, code=code, codes=fingerprint, slot_global_tray=tray
+                    db,
+                    existing.id,
+                    kind=kind,
+                    code=code,
+                    codes=fingerprint,
+                    slot_global_tray=tray,
+                    hms_full_codes=full_codes,
                 )
                 if row is None:
                     _note_outcome(printer_id, job_id, fingerprint, "not upgraded — the open incident closed underneath")
@@ -2247,6 +2276,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                     code=code,
                     codes=fingerprint,
                     slot_global_tray=tray,
+                    hms_full_codes=full_codes,
                     status=STATUS_ESCALATED if escalate_reason is not None else STATUS_RECOVERING,
                 )
                 if row is None:
@@ -2323,6 +2353,11 @@ async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
         # plate-vision row standing beside a jam must not silence the jam's raw alert.
         if await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS) is not None:
             return True
+        # Mirrors the entry gate: while the printer's job is paused for a human (its own
+        # plate check), no NEW AMS incident is opened, so nothing speaks for this fault
+        # and its raw alert is the only word the operator gets about it.
+        if printer_incidents.job_pause_held(printer_id):
+            return False
         job_id = (getattr(state, "subtask_id", None) or "").strip()
         # A barred fault will never be owned again — let the raw alert through
         # rather than suppressing into silence.
@@ -5435,6 +5470,18 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
             )
             return False
 
+        if printer_incidents.job_pause_held(printer_id):
+            # The printer ALSO paused this job to ask a human about the plate. A refill
+            # resume would answer that question too, onto the plate it refused — the one
+            # predicate every job-resuming lane reads. The runout hold stays open and the
+            # human's resume closes both.
+            logger.info(
+                "spool_recovery: printer %s is held at a job pause (the printer's plate check) — refill seen, "
+                "not resuming; the operator resumes on the printer",
+                printer_id,
+            )
+            return False
+
         from backend.app.core.database import async_session
 
         async with async_session() as db:
@@ -5497,6 +5544,16 @@ async def _resume_after_repair(printer_id: int, incident_id: int) -> bool:
             logger.info(
                 "spool_recovery: printer %s in maintenance mode — repair seen, not resuming; "
                 "resume on the printer or release the hold",
+                printer_id,
+            )
+            return False
+
+        if printer_incidents.job_pause_held(printer_id):
+            # Same rule as the refill lane: the printer paused this job for a human's
+            # answer about the plate, and a repair resume would answer it for them.
+            logger.info(
+                "spool_recovery: printer %s is held at a job pause (the printer's plate check) — repair seen, "
+                "not resuming; the operator resumes on the printer",
                 printer_id,
             )
             return False

@@ -237,11 +237,14 @@ class TestPoolUnitNeverCarriesThePick:
 # Hazard #3 — model retries never inherit a stale per-printer AMS mapping
 # --------------------------------------------------------------------------- #
 class TestModelRetryUnpinned:
-    async def test_model_retry_starts_unpinned_and_unmapped(self, db_session):
-        """farm_policy.create_retry_if_absent never copies ams_mapping, and returns a
-        model unit's retry to the unassigned pool — so no stale-mapping leak."""
-        from backend.app.services.farm_policy import create_retry_if_absent
+    async def test_model_retry_starts_unpinned_and_unmapped(self, db_session, own_session_factory, monkeypatch):
+        """requeue.requeue_attempt never copies a dispatched row's ams_mapping, and
+        returns a model unit's retry to the unassigned pool — so no stale-mapping leak."""
+        from backend.app.core import database as core_db
+        from backend.app.services.requeue import requeue_attempt
 
+        # The requeue is its own unit of work: its session must be on the test engine.
+        monkeypatch.setattr(core_db, "async_session", own_session_factory)
         printer = await _mk_printer(db_session, "RT")
         item = PrintQueueItem(
             printer_id=printer.id,
@@ -255,8 +258,9 @@ class TestModelRetryUnpinned:
         db_session.add(item)
         await db_session.commit()
 
-        retry = await create_retry_if_absent(db_session, item)
-        assert retry is not None
+        result = await requeue_attempt(item.id, cause="failed", stage_manual=False)
+        assert result is not None
+        retry = await db_session.get(PrintQueueItem, result.item_id)
         assert retry.printer_id is None  # model unit returns to the pool
         assert retry.ams_mapping is None  # never inherits the donor's per-printer mapping
 

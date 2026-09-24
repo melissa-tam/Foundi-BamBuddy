@@ -7246,7 +7246,37 @@ class TestPhysicalHoldsOutliveTheJob:
         assert physical.resolved_at is None, "the hold suppresses the ACT; the fault record stands"
 
     async def test_will_own_ignores_a_pause_cause_row(self, db_session, printer_factory, install_settings, monkeypatch):
-        """A plate-vision hold beside a jam must not silence the jam's raw alert."""
+        """A lost-Z hold beside a jam is not the jam's owner — the jam still will be."""
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST, STATUS_ESCALATED
+
+        install_settings()
+        printer = await printer_factory()
+        assert (
+            await printer_incidents.open_new(
+                db_session,
+                printer_id=printer.id,
+                job_id="",
+                item_id=None,
+                kind=KIND_Z_REFERENCE_LOST,
+                code="power_loss",
+                codes="",
+                slot_global_tray=None,
+                status=STATUS_ESCALATED,
+            )
+            is not None
+        )
+        state = _make_state(hms=[_feed_fault_hms()])
+
+        # Nothing AMS-side owns the printer, so the predicate falls through to the
+        # aborted-close bar — which is empty — and answers True (it WILL own it).
+        assert await spool_recovery.will_own(db_session, printer.id, state) is True
+
+    async def test_will_own_mirrors_the_job_pause_gate(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        """While the printer's job is PAUSED at its plate check, no new AMS incident is
+        opened (``on_ams_fault``'s entry gate) — so nothing speaks for the fault and its
+        raw alert must reach the operator: ``will_own`` answers False."""
         from backend.app.models.printer_incident import STATUS_ESCALATED
 
         install_settings()
@@ -7267,9 +7297,87 @@ class TestPhysicalHoldsOutliveTheJob:
         )
         state = _make_state(hms=[_feed_fault_hms()])
 
-        # Nothing AMS-side owns the printer, so the predicate falls through to the
-        # aborted-close bar — which is empty — and answers True (it WILL own it).
-        assert await spool_recovery.will_own(db_session, printer.id, state) is True
+        assert await spool_recovery.will_own(db_session, printer.id, state) is False
+
+
+class TestAJobPauseStandsTheAmsEntryAside:
+    """No lane resumes a job a human must answer (2026-09-24). Every act the AMS machine
+    owns ends in a resume, so while the printer's plate check has its job paused no NEW
+    AMS incident opens and no driver spawns — the human's resume ends the job pause, and a
+    fault still standing then is owned on the next push. Liveness-paired."""
+
+    async def _plate_check(self, db, printer_id):
+        from backend.app.models.printer_incident import STATUS_ESCALATED
+
+        row = await printer_incidents.open_new(
+            db,
+            printer_id=printer_id,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="0500_808C",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+        )
+        assert row is not None
+        assert printer_incidents.job_pause_held(printer_id) is True
+
+    async def test_a_fault_during_a_plate_check_pause_opens_nothing_and_commands_nothing(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        await self._plate_check(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(hms=[_physical_wire_hms()])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        task = await on_ams_fault(printer.id, state)
+
+        assert task is None
+        assert client.calls == []
+        assert [row.kind for row in await printer_incidents.open_rows(db_session, printer.id)] == [KIND_PLATE_VISION]
+
+    async def test_a_refill_during_a_plate_check_pause_does_not_resume(
+        self, db_session, printer_factory, monkeypatch, _fast_resume
+    ):
+        """The refill auto-resume is a lane that RESUMES a job. The unheld twin
+        (``test_refill_on_the_demanded_slot_resumes_once``) is the liveness pair: there
+        the same refill resumes the print."""
+        printer = await printer_factory()
+        item = await _runout_held_item(db_session, printer.id)
+        resumed = _spy(monkeypatch, "on_runout_auto_resumed")
+        await self._plate_check(db_session, printer.id)
+        state = _runout_paused_state(tray_id=2)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is False
+
+        assert client.calls == []
+        assert state.state == "PAUSE"
+        resumed.assert_not_awaited()
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
+
+    async def test_without_a_job_pause_the_same_fault_is_owned(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
+        from backend.app.models.printer_incident import KIND_PHYSICAL
+
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(hms=[_physical_wire_hms()])
+        _wire(monkeypatch, state, FakeClient(state))
+
+        await on_ams_fault(printer.id, state)
+
+        assert [row.kind for row in await printer_incidents.open_rows(db_session, printer.id)] == [KIND_PHYSICAL]
 
 
 class TestMaintenanceModeRecordsAndStandsDown:

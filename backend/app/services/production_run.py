@@ -50,12 +50,13 @@ from backend.app.services.farm_staging import release_filament_staged
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.queue_builder import create_queue_items, requeue_fields
+from backend.app.services.queue_builder import create_queue_items
 from backend.app.services.queue_transitions import (
     cancel_pending_items,
     delete_items_unless_printing,
     printing_units_conflict,
 )
+from backend.app.services.requeue import lineage_root, mint_replacements
 from backend.app.services.sku_catalog import median_cycle_seconds, plate_units
 from backend.app.services.usb_storage import usb_present
 from backend.app.utils.printer_models import is_dual_nozzle_model
@@ -415,13 +416,11 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
     for the never-connected case: a printer with no live status yet is *unknown*,
     not offline, so tests/startup don't spuriously report every printer blocked.
 
-    ``vision_hold`` is the one flag that does NOT come from a unit token, and since
-    2026-09-04 it cannot: a plate-check trip now STOPS the print, so the tripped unit
-    becomes ``cancelled`` and its ``waiting_reason`` is cleared at the terminal, while
-    the hold itself is printer-scoped and outlives the requeue. It is read from the
-    incident store's projection (``printer_incidents.snapshot`` — pure, DB-free, the
-    same source the printer card's chip renders), which is the row that actually holds
-    the printer.
+    ``vision_hold`` is the one flag that does NOT come from a unit token: the
+    plate-check hold is printer-scoped — a foreign print trips it too, with no unit to
+    project onto — so it is read from the incident store's projection
+    (``printer_incidents.snapshot`` — pure, DB-free, the same source the printer card's
+    chip renders), which is the row that actually holds the printer.
     """
     states: list[dict] = []
     any_blocked = False
@@ -1025,10 +1024,10 @@ async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:
 
     A unit that was cancelled/stopped — or failed with its retry chain exhausted —
     leaves the run short of its planned plate count. This recomputes the shortfall
-    from LIVE queue state (never a stored counter — 3NF) and materialises exactly
-    that many fresh plate items, reusing the same per-plate field template the run
-    was built with (via ``create_queue_items``, the shared builder — no hand-rolled
-    fields). Idempotent: called on every RESUME, a zero-deficit resume is a no-op.
+    from LIVE queue state (never a stored counter — 3NF) and has
+    ``requeue.mint_replacements`` put exactly that many fresh, lineage-free plates at
+    the head of the queue, from the same per-plate settings the run was built with.
+    Idempotent: called on every RESUME, a zero-deficit resume is a no-op.
     Returns the number of replacement items created.
 
     Deficit = (primary plate chains) − (chains still productive), where a plate
@@ -1055,19 +1054,12 @@ async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:
     items = list(run.queue_items)
     if not items:
         return 0
-    by_id = {it.id: it for it in items}
 
-    def _root_id(it: PrintQueueItem) -> int:
-        cur = it
-        guard = 0
-        while cur.retry_of_id is not None and cur.retry_of_id in by_id and guard < 1000:
-            cur = by_id[cur.retry_of_id]
-            guard += 1
-        return cur.id
-
+    # The run's items are loaded, so the walk answers from the identity map.
     chains: dict[int, list[PrintQueueItem]] = {}
     for it in items:
-        chains.setdefault(_root_id(it), []).append(it)
+        root = await lineage_root(db, it)
+        chains.setdefault(root.id, []).append(it)
 
     live_statuses = {"completed", "pending", "printing"}
     productive = sum(1 for members in chains.values() if any(m.status in live_statuses for m in members))
@@ -1086,26 +1078,10 @@ async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:
     template = next((it for it in primaries if not it.first_article), None) or (primaries[0] if primaries else None)
     if template is None:
         return 0
-    # The replacement plate is the SAME plate, so it carries the same settings —
-    # through ``queue_builder.requeue_fields``, the one allowlist shared with
-    # ``farm_policy.create_retry_if_absent``. This template used to name 8 columns by
-    # hand and reverted the rest to model defaults, so a topped-up run printed with
-    # different calibrations and filament overrides from the plates it was replacing.
-    # ``first_article`` is forced False after the spread: a replacement is never the
-    # run's first article, whatever the template happened to be.
-    #
-    # Same target as the template row — spread LAST so no stale target column survives.
-    # ``target.printer_id`` is the position scope: None (the shared pool scope) for a
-    # pool template, the pin for a genuinely pinned one — the same scope rule as before.
-    target = target_of(template)
-    fields = {
-        **requeue_fields(template),
-        "batch_id": run.id,
-        "status": "pending",
-        "first_article": False,
-        **target.fields(),
-    }
-    await create_queue_items(db, count=deficit, printer_id=target.printer_id, fields=fields)
+    # The replacement plate is the SAME plate: same settings (the one allowlist), the
+    # template's TARGET (never the printer a dispatched primary merely ran on), never a
+    # first article, no lineage — and NEXT in line. All of that is the requeue owner's.
+    await mint_replacements(db, run, count=deficit, template=template)
     await db.commit()
     broadcast_production_run_changed(run.id)
     logger.info("production_run: topped up run %s with %d replacement plate(s)", run.id, deficit)

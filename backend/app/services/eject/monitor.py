@@ -61,6 +61,7 @@ from backend.app.schemas.settings import AppSettings
 from backend.app.services import printer_incidents
 from backend.app.services.eject import cooldown_prep, remote as eject_remote
 from backend.app.services.eject.cooldown_prep import WatchVerdict
+from backend.app.services.hms_errors import summary_of
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     EscalationOnly,
@@ -68,6 +69,7 @@ from backend.app.services.plate_occupancy import (
     ForeignAutoEject,
     OccupancyPolicy,
     OccupancyView,
+    PlateRefusal,
     plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
@@ -652,6 +654,26 @@ async def watch_bed_and_clear(
             held_s += check_interval_s
 
 
+def escalation_sentence(*, farm_source: bool, refusal: PlateRefusal | None) -> str:
+    """The escalation page's sentence for a plate only a human may clear — ONE origin.
+
+    Three causes, most specific first: the printer REFUSED the plate (its plate check
+    paused the job and the job was stopped — the printer's own words ride in); a farm
+    unit's own part whose eject never ran; a part a print the farm did not dispatch left.
+    """
+    if refusal is not None:
+        words = summary_of(refusal.messages)
+        # The catalog's own sentences end in a period; the page adds exactly one.
+        reported = f" The printer reported: {words.rstrip('.')}." if words else ""
+        return (
+            f"The printer's plate check refused the plate and the print was stopped.{reported} "
+            "Fix the plate, then Mark plate cleared."
+        )
+    if farm_source:
+        return "A farm unit's eject did not run — the part is still on the plate. Remove it by hand, then Mark plate cleared."
+    return "A print the farm did not dispatch left a part on the plate. Clear the bed to resume dispatch."
+
+
 async def watch_gate_escalation_only(
     printer_id: int,
     *,
@@ -661,9 +683,11 @@ async def watch_gate_escalation_only(
     notify: Callable[[int], Awaitable[None]] | None = None,
     held: Callable[[], bool] | None = None,
     farm_source: bool = False,
+    refusal: PlateRefusal | None = None,
 ) -> str:
     """Escalation-only gate watch for a plate only a human may clear — a foreign
-    deposit, or a farm unit's own plate whose eject never ran.
+    deposit, a farm unit's own plate whose eject never ran, or a plate the printer's
+    own plate check refused.
 
     Unlike :func:`watch_bed_and_clear` this NEVER releases the gate: the plate is
     held by an unknown job and only a human clearing it (which NULLs the gate) may
@@ -678,6 +702,12 @@ async def watch_gate_escalation_only(
     driver, read off the SAME occupancy view the policy came from, because the fact —
     ``PlateOccupied.source_subtask_id`` — belongs to the plate record and a watch that
     re-read it mid-flight would be a second opinion with its own timing.
+
+    ``refusal`` (2026-09-24) outranks both: the printer's plate check paused a job and
+    the job was then stopped, so the page names the printer's OWN words for what is wrong
+    with the plate (:func:`escalation_sentence`) — the stop wiped them off the printer,
+    and the cause is the only place they survive. Memory-only: after a restart the gate
+    stands and this reads the generic sentence.
 
     A disconnected/stale tick does NOT end the watch — its lifetime is the gated
     PHASE, not connectivity (mirroring ``watch_bed_and_clear``'s unreadable-bed
@@ -696,17 +726,11 @@ async def watch_gate_escalation_only(
     again after the hold lifted. Holding the page keeps it for the moment it can be read.
     """
     if notify is None:
-        # Escalation source, distinct from cooldown_timeout: a part is on the plate and
-        # no sweep is coming. Whose part it is decides the sentence — the farm's own unit
-        # (its eject never ran) or a print the farm did not dispatch.
+        # Escalation source, distinct from cooldown_timeout: the plate is held and no
+        # sweep is coming. WHY it is held decides the sentence.
         notify = functools.partial(
             notify_plate_not_empty,
-            source_detail=(
-                "A farm unit's eject did not run — the part is still on the plate. "
-                "Remove it by hand, then Mark plate cleared."
-                if farm_source
-                else "A print the farm did not dispatch left a part on the plate. Clear the bed to resume dispatch."
-            ),
+            source_detail=escalation_sentence(farm_source=farm_source, refusal=refusal),
         )
     elapsed = 0
     escalated = False
@@ -1349,7 +1373,8 @@ class EjectCooldownMonitor:
             self.stand_down(printer_id, f"{cause} — policy changed to {type(desired).__name__}")
         # Whose part is on this plate, read off the SAME view the policy came from. The
         # escalation hold pages a human, and the sentence differs for a farm unit's own
-        # plate; taking it here keeps one origin and one instant for both facts.
+        # plate; taking it here keeps one origin and one instant for both facts. (A
+        # refused plate's cause rides the policy itself, so it needs no second read.)
         self._arm(printer_id, desired, farm_source=view.plate_source_subtask_id is not None)
 
     def reconsider(self, printer_id: int, cause: str) -> None:
@@ -1420,7 +1445,8 @@ class EjectCooldownMonitor:
             )
             name = f"eject-foreign-watch-{printer_id}"
         else:
-            coro = self._escalation_only(printer_id, farm_source=farm_source)
+            refusal = policy.refusal if isinstance(policy, EscalationOnly) else None
+            coro = self._escalation_only(printer_id, farm_source=farm_source, refusal=refusal)
             name = f"eject-gate-escalation-{printer_id}"
         task = spawn_background_task(coro, name=name)
         self._armed[printer_id] = _ArmedWatch(
@@ -1779,16 +1805,20 @@ class EjectCooldownMonitor:
         finally:
             self._release_record(printer_id, asyncio.current_task())
 
-    async def _escalation_only(self, printer_id: int, *, farm_source: bool = False) -> None:
+    async def _escalation_only(
+        self, printer_id: int, *, farm_source: bool = False, refusal: PlateRefusal | None = None
+    ) -> None:
         try:
             # The hold as a per-tick LEVEL, same shape as the cooldown watch's — a plain
             # partial here, because this watch owns no ``hold_z`` and no ``deferred`` and
-            # so has no edges of its own to detect. ``farm_source`` rides in from the arm,
-            # where the plate record was read: it selects the page's sentence only.
+            # so has no edges of its own to detect. ``farm_source`` and ``refusal`` ride in
+            # from the arm, where the plate record was read: they select the page's
+            # sentence only.
             await watch_gate_escalation_only(
                 printer_id,
                 held=functools.partial(printer_incidents.automation_held, printer_id),
                 farm_source=farm_source,
+                refusal=refusal,
             )
         except asyncio.CancelledError:
             raise

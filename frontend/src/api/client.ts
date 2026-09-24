@@ -385,6 +385,20 @@ export interface ServiceHoldState {
 }
 
 /**
+ * One HMS message the printer showed, as RECORDED by the farm — rendered by the
+ * backend's one catalog renderer (full code first, short-code fallback), so the
+ * frontend holds no code→text table. A record outlives the printer's own dialog:
+ * a ladder verb, a stop or the next job can clear what the printer shows, while
+ * the hold that message explained still stands.
+ */
+export interface PrinterMessage {
+  /** Canonical "MMMM_CCCC" — the same key a live `HMSError.short_code` carries. */
+  short_code: string;
+  /** The vendor fault text; empty when the catalog does not know the code. */
+  description: string;
+}
+
+/**
  * The OPEN `printer_incident` row this printer is held by — the projection the
  * backend builds once (`printer_incidents._payload`) and serves on BOTH the REST
  * status and the WS frame.
@@ -409,6 +423,21 @@ export interface OpenIncidentState {
    * which is why the resolution-class vocabulary stays off the wire.
    */
   operator_exits: boolean;
+  /**
+   * The printer's HMS messages recorded when this hold opened (may be empty — a
+   * declared hold has none). The card shows the ones the live `hms_errors` no
+   * longer carries; a live one is already on the card's HMS summary.
+   */
+  printer_messages: PrinterMessage[];
+}
+
+/**
+ * Why the plate authority raised this gate on a REFUSED plate: the operator
+ * stopped a print the printer's own plate check had paused. `messages` are the
+ * printer's words for that check — the stop wipes them off the printer.
+ */
+export interface PlateRefusal {
+  messages: PrinterMessage[];
 }
 
 /** An in-flight eject claim held by the plate-occupancy authority. */
@@ -775,7 +804,7 @@ export interface PrinterStatus {
   // Plate-occupancy authority (WS2): the single record behind
   // `awaiting_plate_clear`, exposed so a client can see WHO owns the plate and
   // whether an eject is in flight rather than inferring it from the flag.
-  // Absent on backends predating the authority; nothing renders it yet.
+  // Absent on backends predating the authority.
   occupancy?: {
     plate: {
       occupied: boolean;
@@ -785,6 +814,10 @@ export interface PrinterStatus {
       policy: string | null;
       /** ISO timestamp the plate became occupied. */
       since: string | null;
+      /** Set when the gate holds a refused plate; null for every other gate
+       *  (and for a clear plate). Memory-only on the backend: after a restart
+       *  the gate stands without it. */
+      refusal: PlateRefusal | null;
     };
     /** In-flight eject claim on this printer; null when none is owned. */
     eject: PlateEjectClaim | null;

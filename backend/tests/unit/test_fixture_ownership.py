@@ -82,7 +82,6 @@ ASYNC_SESSIONMAKER_ALLOWLIST = frozenset(
         "backend/tests/integration/test_security.py",
         "backend/tests/integration/test_spoolman_tracking_slot_fallback.py",
         "backend/tests/unit/services/test_ams_presence.py",
-        "backend/tests/unit/services/test_farm_policy.py",
         "backend/tests/unit/services/test_farm_staging.py",
         "backend/tests/unit/services/test_farm_stall.py",
         "backend/tests/unit/services/test_hms_event.py",

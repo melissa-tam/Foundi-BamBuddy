@@ -1,8 +1,9 @@
 """The requeue ALLOWLIST: every ``PrintQueueItem`` column has a decided home (W10).
 
 Before ``queue_builder.requeue_fields`` there were two partial copies of "the same
-settings" — ``farm_policy.create_retry_if_absent`` named 16 columns and
-``production_run.top_up_run`` named 8 — so a retried or replacement plate silently
+settings" — the retry insert (then ``farm_policy.create_retry_if_absent``, now
+``requeue.requeue_attempt``) named 16 columns and ``production_run.top_up_run`` named
+8 — so a retried or replacement plate silently
 reverted 19 columns to model defaults: ``use_ams``, the whole calibration block,
 ``skip_filament_check``, the operator's slot pin, the timelapse flag. Nothing failed;
 the plate just printed differently from the one it replaced.
@@ -19,7 +20,7 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.sku import Sku, SkuFile
-from backend.app.services import farm_policy, production_run
+from backend.app.services import production_run, requeue
 from backend.app.services.dispatch_target import encode_printer_ids
 from backend.app.services.queue_builder import (
     CARRIED_COLUMNS,
@@ -109,6 +110,23 @@ async def _mk_item(db, batch, lib, **overrides):
     return item
 
 
+@pytest.fixture(autouse=True)
+def _requeue_sessions(own_session_factory, monkeypatch):
+    """``requeue.requeue_attempt`` is its own unit of work: point the session it opens
+    (``core.database.async_session``) at the test engine."""
+    from backend.app.core import database as core_db
+
+    monkeypatch.setattr(core_db, "async_session", own_session_factory)
+
+
+async def _requeue(db, item: PrintQueueItem) -> PrintQueueItem:
+    result = await requeue.requeue_attempt(item.id, cause="failed", stage_manual=False)
+    assert result is not None
+    retry = await db.get(PrintQueueItem, result.item_id)
+    assert retry is not None
+    return retry
+
+
 class TestColumnCensus:
     def test_every_column_belongs_to_exactly_one_set(self):
         """The union IS the model's column set — the pin that forces a decision.
@@ -140,9 +158,8 @@ class TestRoundTrip:
         batch, lib = await _mk_farm_run(db_session)
         item = await _mk_item(db_session, batch, lib, status="failed", waiting_reason="stale", error_message="boom")
 
-        retry = await farm_policy.create_retry_if_absent(db_session, item)
+        retry = await _requeue(db_session, item)
 
-        assert retry is not None
         for column in CARRIED_COLUMNS:
             expected = getattr(item, column)
             if column == "ams_mapping":
@@ -165,15 +182,17 @@ class TestRoundTrip:
             cleanup_library_after_dispatch=True,
         )
 
-        retry = await farm_policy.create_retry_if_absent(db_session, item)
+        retry = await _requeue(db_session, item)
 
-        assert retry is not None
         assert retry.status == "pending"
         assert retry.waiting_reason is None
         assert retry.error_message is None
         assert retry.dispatch_subtask_id is None
         assert retry.stop_source is None
-        assert retry.been_jumped is False
+        # ``been_jumped`` is the REQUEUE's own decision, never the old attempt's
+        # starvation history: every plate put back is served first by the SJF ordering
+        # too (services/requeue.py, "next in line").
+        assert retry.been_jumped is True
         assert retry.filament_short is False
         # A transient Direct-Print upload's delete-after-dispatch stamp must never be
         # copied: the first dispatch already reaped that file (2026-08-15 class).

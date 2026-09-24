@@ -1247,12 +1247,23 @@ def occupancy_payload(printer_id: int | None) -> dict | None:
     so a raw ``datetime`` here kills every ``printer_status`` broadcast AND the initial
     status send on connect (clients then reconnect-loop) for as long as ANY printer
     holds a raised plate gate.
+
+    ``plate.refusal`` is ALWAYS present — ``{"messages": [{"short_code",
+    "description"}]}`` when the gate holds a plate the printer's own plate check refused
+    (the policy's :class:`~backend.app.services.plate_occupancy.PlateRefusal`), None for
+    every other gate and a clear plate. A fixed frontend contract: the card renders the
+    printer's words beside Mark plate cleared. Memory-only on the authority, so after a
+    restart the gate stands with ``refusal`` None.
     """
     if not printer_id:
         return None
-    from backend.app.services.plate_occupancy import plate_occupancy
+    from backend.app.services.plate_occupancy import EscalationOnly, plate_occupancy
 
     view = plate_occupancy.snapshot(printer_id)
+    policy = view.plate_policy
+    refusal = None
+    if isinstance(policy, EscalationOnly) and policy.refusal is not None:
+        refusal = {"messages": [message.as_payload() for message in policy.refusal.messages]}
     eject = None
     if view.eject_purpose is not None:
         eject = {
@@ -1272,6 +1283,7 @@ def occupancy_payload(printer_id: int | None) -> dict | None:
             "source_subtask_id": view.plate_source_subtask_id,
             "policy": type(view.plate_policy).__name__ if view.plate_policy is not None else None,
             "since": view.plate_since.isoformat() if view.plate_since is not None else None,
+            "refusal": refusal,
         },
         "eject": eject,
         "lease_age_s": view.lease_age_s,

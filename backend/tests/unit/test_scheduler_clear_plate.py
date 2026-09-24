@@ -595,6 +595,8 @@ class TestDeclareDuringDispatch:
         assert row.status == "pending"  # returned for the next tick, not failed
         assert row.started_at is None
         assert row.ams_mapping is None  # the decided mapping is not a pin
+        # ...and NEXT in line: the unwind is ``requeue.return_to_queue``'s (2026-09-24).
+        assert (row.position, row.been_jumped) == (1, True)
 
         # The operator's statement stands, and the printer claim is gone.
         assert plate_occupancy.is_plate_occupied(printer_id) is True

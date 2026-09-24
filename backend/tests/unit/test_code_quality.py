@@ -231,16 +231,21 @@ _RESOLUTION_LITERALS = {
     "RESOLUTION_WIRE",
     "RESOLUTION_REPAIR",
     "RESOLUTION_OPERATOR",
+    "RESOLUTION_JOB_PAUSE",
     "RESOLUTION_DECLARED",
     "RESOLVES_ON",
+    # Keyed by the class literals: a read of it outside the family is a second copy of
+    # "can Recover end this" — the store's ``closed_by_recover`` is the one reader.
+    "RECOVER_ENDS",
 }
 
-# WHO may end an equipment-fault row. The family's own closers plus the TWO lanes the
-# rule table's module docstring DECLARES as out-of-table, each because it owns state the
-# table cannot see:
-#   * ``farm_policy``  — the plate-vision first-trip re-check (the windowed trip count,
-#                        the vouching test, the gate it raises when it cannot vouch);
+# WHO may end an equipment-fault row. The family's own closers plus the ONE lane the
+# rule table's module docstring DECLARES as out-of-table, because it owns state the table
+# cannot see:
 #   * ``service_hold`` — ``exit``, the declared hold's own and only counterpart verb.
+# ``farm_policy`` was the second declared lane (the 2026-09-04 plate-vision first-trip
+# re-check) until 2026-09-24: the plate-check hold is now a ``job_pause`` row the table
+# closes on its own job's resume or terminal, and the farm policy ends no row at all.
 # A close appearing anywhere else fails this test BY CONSTRUCTION. That is the point:
 # the allowlist is a declaration, so a new closer has to be argued for in a diff rather
 # than added in silence.
@@ -248,7 +253,6 @@ _INCIDENT_CLOSERS = {
     ("services", "printer_incidents.py"),  # defines it
     ("services", "spool_recovery.py"),
     ("services", "pause_recovery.py"),
-    ("services", "farm_policy.py"),
     ("services", "service_hold.py"),
 }
 
@@ -258,10 +262,14 @@ _INCIDENT_CLOSERS = {
 # WHO may call ``print_control.stop_as_operator``. The pair it sends (MQTT ``print.stop``
 # plus the user-stopped mark) MEANS "a human pressed Stop", and the whole terminal
 # disposition downstream is built on that meaning: the unit lands ``cancelled`` with a
-# ``stop_source``, the run holds, RESUME tops the deficit back up. Two routes are the two
-# Stop buttons an operator can actually press:
-#   * ``api/routes/printers.py``    — the printer card's stop;
-#   * ``api/routes/print_queue.py`` — the queue page's stop.
+# ``stop_source``, the run holds, RESUME tops the deficit back up. Every caller is a Stop
+# an operator can actually press:
+#   * ``api/routes/printers.py``    — the printer card's stop, and the printer's own HMS
+#                                     dialog "Stop printing" (2026-09-24);
+#   * ``api/routes/print_queue.py`` — the queue page's stop;
+#   * ``api/routes/webhook.py``     — an API client's ``/stop`` and ``/cancel`` (2026-09-24:
+#                                     both used to send a bare stop with no mark — and
+#                                     ``/cancel`` called a method that does not exist).
 # The third caller used to be ``service_hold.quiesce``, and deleting it IS the 2026-09-19
 # ruling: **no mode verb ends a print.** Entering maintenance mode or deactivating a
 # printer stands the FARM's own actions down — a sweep it commanded, a dispatch not yet on
@@ -272,6 +280,22 @@ _OPERATOR_STOP_CALLERS = {
     ("services", "print_control.py"),  # defines it
     ("api", "routes", "printers.py"),
     ("api", "routes", "print_queue.py"),
+    ("api", "routes", "webhook.py"),
+}
+
+# WHO may send a RAW ``stop_print`` — the MQTT ``print.stop`` WITHOUT the operator mark.
+# A bare stop is the FARM ending a job it owns, and there are exactly two such acts:
+#   * ``print_control``   — the operator verb itself (the stop, then the mark);
+#   * ``eject/remote``    — the eject lane's kill of its OWN sweep (the runtime watchdog,
+#                           the start deadline, the re-drive).
+# ``printer_manager`` is the per-printer facade that forwards to the client.
+# ``pause_recovery``'s plate-check stop is gone (2026-09-24: the printer's plate check
+# PAUSES the job for a human, and the farm sends nothing), and so is every route's bare
+# stop — an operator's stop goes through ``print_control`` so it carries its mark.
+_RAW_STOP_CALLERS = {
+    ("services", "print_control.py"),
+    ("services", "eject", "remote.py"),
+    ("services", "printer_manager.py"),
 }
 
 
@@ -298,6 +322,78 @@ def _scan_operator_stops(py_file: Path) -> list[tuple[str, int]]:
     return hits
 
 
+def _scan_raw_stops(py_file: Path) -> list[tuple[str, int]]:
+    """Every CALL of ``stop_print`` (the method or a function of that name)."""
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name == "stop_print":
+            hits.append(("stop_print()", node.lineno))
+    return hits
+
+
+class TestRawStopOwnership:
+    """A bare ``print.stop`` is the FARM ending its own job — only two lanes may send one."""
+
+    def test_only_the_allowlisted_lanes_send_a_raw_stop(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts in _RAW_STOP_CALLERS:
+                continue
+            for symbol, line in _scan_raw_stops(py_file):
+                strays.append(f"  - {'/'.join(parts)}:{line} calls {symbol}")
+        if strays:
+            pytest.fail(
+                "A raw stop_print is sent outside the allowlisted lanes:\n"
+                + "\n".join(strays)
+                + "\n\nAn operator's stop goes through print_control.stop_as_operator (it carries the "
+                "user-stopped mark, so the terminal records a cancel). A farm lane that must end its own "
+                "job is a decision to argue in the diff, and belongs in the allowlist with its reason."
+            )
+
+    def test_the_allowlisted_raw_stop_lanes_are_still_there(self):
+        """The liveness half: every allowlisted module still sends one."""
+        senders = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_raw_stops(f)}
+        assert senders == _RAW_STOP_CALLERS
+
+
+class TestTerminalPolicyHook:
+    """``main.on_print_complete`` hands every terminal to the farm policy ONCE.
+
+    The hook used to live inside BOTH notification closures (the archive and the
+    no-archive path), sharing their sessions and dying with their failures. It is now one
+    spawned task with its own session; a second call is how the policy ends up running
+    twice for one terminal, or not at all when a notification throws.
+    """
+
+    def test_main_calls_the_farm_policy_exactly_once(self):
+        tree = ast.parse((BACKEND_DIR / "main.py").read_text(encoding="utf-8"))
+        aliases = {"on_terminal"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "backend.app.services.farm_policy":
+                aliases |= {alias.asname or alias.name for alias in node.names if alias.name == "on_terminal"}
+        calls = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id in aliases)
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "on_terminal"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "farm_policy"
+                )
+            )
+        ]
+        assert len(calls) == 1, f"main.py must call farm_policy.on_terminal exactly once, found calls at {calls}"
+
+
 class TestOperatorStopOwnership:
     """Only an operator's Stop button may send an operator stop.
 
@@ -307,7 +403,7 @@ class TestOperatorStopOwnership:
     a lie.
     """
 
-    def test_only_the_two_stop_routes_send_an_operator_stop(self):
+    def test_only_the_stop_routes_send_an_operator_stop(self):
         strays: list[str] = []
         for py_file in get_python_files(BACKEND_DIR):
             parts = _relative_parts(py_file)
@@ -318,7 +414,7 @@ class TestOperatorStopOwnership:
 
         if strays:
             pytest.fail(
-                "Something outside the two Stop routes sends an operator stop:\n"
+                "Something outside the Stop routes sends an operator stop:\n"
                 + "\n".join(strays)
                 + "\n\nNo mode verb ends a print (2026-09-19): maintenance mode and deactivation "
                 "stand the FARM's actions down and leave the operator's print running. If a new "
@@ -333,6 +429,140 @@ class TestOperatorStopOwnership:
         callers = _OPERATOR_STOP_CALLERS - {("services", "print_control.py")}
         senders = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_operator_stops(f)}
         assert senders == callers
+
+
+# --- Putting a plate back has ONE owner (operator ruling 2026-09-24) ----------------
+
+# ``services/requeue.py`` is THE owner of "put a plate back in the queue": every
+# automatic path that returns an un-started claim, mints a new attempt or tops up a
+# run goes through one of its verbs, which is what makes "a requeued plate is NEXT in
+# line" and "an aborted run prints no more plates" true everywhere at once. Before it,
+# three callers each released a claim with their own ideas of position and run state,
+# and the retry insert lived in farm_policy beside its decisions.
+_REQUEUE_OWNER = ("services", "requeue.py")
+_QUEUE_BUILDER = ("services", "queue_builder.py")
+_LINEAGE_FIELD = "retry_of_id"
+
+
+def _called_attr(node: ast.Call) -> str | None:
+    func = node.func
+    return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+
+def _is_projection(value: ast.expr) -> bool:
+    """``item.retry_of_id`` handed on under its own name — a payload READING the chain
+    (the queue list's response, the run detail's units), not a row being given one."""
+    return isinstance(value, ast.Attribute) and value.attr == _LINEAGE_FIELD
+
+
+def _scan_lineage_writes(tree: ast.Module) -> list[int]:
+    """Every place a row is GIVEN a ``retry_of_id``: an attribute assignment, a keyword
+    argument, or a dict entry (a fields dict for a new row) — a projection excepted."""
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Attribute) and t.attr == _LINEAGE_FIELD for t in targets):
+                hits.append(node.lineno)
+        elif isinstance(node, ast.keyword) and node.arg == _LINEAGE_FIELD and not _is_projection(node.value):
+            hits.append(node.value.lineno)
+        elif isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                if isinstance(key, ast.Constant) and key.value == _LINEAGE_FIELD and not _is_projection(value):
+                    hits.append(key.lineno)
+    return hits
+
+
+def _is_queue_position(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "position"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "PrintQueueItem"
+    )
+
+
+def _scan_position_allocations(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every hand-rolled queue position: a ``max(PrintQueueItem.position)`` read, or a
+    ``PrintQueueItem(position=...)`` construction."""
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _called_attr(node)
+        if name == "max" and node.args and _is_queue_position(node.args[0]):
+            hits.append(("max(PrintQueueItem.position)", node.lineno))
+        elif name == "PrintQueueItem" and any(kw.arg == "position" for kw in node.keywords):
+            hits.append(("PrintQueueItem(position=...)", node.lineno))
+    return hits
+
+
+class TestRequeueOwnership:
+    """ONE owner puts a plate back, ONE owner numbers the queue. SOURCE pins, like their
+    neighbours: a second release site or a second max-plus-one is perfectly well-formed
+    code that every behaviour test passes — it just lands the plate somewhere else."""
+
+    def test_only_the_requeue_owner_releases_an_unstarted_claim(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{node.lineno}"
+            for parts, tree in _app_trees()
+            if parts != _REQUEUE_OWNER
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _called_attr(node) == "release_unstarted_claim"
+        ]
+        if strays:
+            pytest.fail(
+                "release_unstarted_claim is called outside services/requeue.py:\n"
+                + "\n".join(strays)
+                + "\n\nReturn an un-started claim through requeue.return_to_queue: it seats the row "
+                "NEXT in line and applies the run gate (a paused run stages it, an ended run "
+                "cancels it) — the storage transition alone does neither."
+            )
+
+    def test_only_the_requeue_owner_writes_lineage(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line}"
+            for parts, tree in _app_trees()
+            if parts != _REQUEUE_OWNER
+            for line in _scan_lineage_writes(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "A row is given a retry_of_id outside services/requeue.py:\n"
+                + "\n".join(strays)
+                + "\n\nA new attempt of a plate is requeue.requeue_attempt's: it is the one writer "
+                "of the chain (the idempotency guard and the generation index)."
+            )
+
+    def test_no_queue_position_is_allocated_outside_queue_builder(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {shape}"
+            for parts, tree in _app_trees()
+            if parts != _QUEUE_BUILDER
+            for shape, line in _scan_position_allocations(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "A queue position is hand-rolled outside services/queue_builder.py:\n"
+                + "\n".join(strays)
+                + "\n\nCreate rows through create_queue_rows / create_queue_items (or seat an "
+                "existing one with seat_at_head / seat_for_repin): the position SCOPE, the scope "
+                "lock and the head/tail rule live there and nowhere else."
+            )
+
+    def test_the_owners_still_do_it(self):
+        """The liveness half: pins that scan for strays pass on an empty tree too."""
+        trees = dict(_app_trees())
+        requeue_tree = trees[_REQUEUE_OWNER]
+        assert any(
+            isinstance(node, ast.Call) and _called_attr(node) == "release_unstarted_claim"
+            for node in ast.walk(requeue_tree)
+        )
+        assert _scan_lineage_writes(requeue_tree)
+        assert {shape for shape, _ in _scan_position_allocations(trees[_QUEUE_BUILDER])} == {
+            "max(PrintQueueItem.position)",
+            "PrintQueueItem(position=...)",
+        }
 
 
 def _scan_recovery_incident_constructions(py_file: Path) -> list[int]:
@@ -650,10 +880,9 @@ class TestIncidentResolutionOwnership:
                 "A new equipment-fault closer appeared outside the declared lanes:\n"
                 + "\n".join(strays)
                 + "\n\nThe family's closers live in spool_recovery / pause_recovery and select "
-                "their lane through incident_resolution's table; farm_policy (plate-vision "
-                "first-trip re-check) and service_hold.exit are the two DECLARED exceptions, "
-                "named in incident_resolution's module docstring. A third needs the same "
-                "declaration."
+                "their lane through incident_resolution's table; service_hold.exit is the one "
+                "DECLARED exception, named in incident_resolution's module docstring. A second "
+                "needs the same declaration."
             )
 
     def test_the_allowlisted_lanes_are_still_there(self):

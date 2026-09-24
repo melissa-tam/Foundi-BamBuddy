@@ -936,41 +936,171 @@ def lookup_description_any(attr: int | str, code: int | str) -> str | None:
     return lookup_full_code(full_code) or get_error_description(hms_short_code(attr, code))
 
 
+@dataclass(frozen=True)
+class PrinterMessage:
+    """One HMS message the printer showed, rendered once: its short code and its words.
+
+    THE shape every "what did the printer say" surface carries — a hold's recorded
+    ``printer_messages``, a refused plate's cause, the terminal's printer evidence — so
+    the catalog lookup happens here and nowhere else (the frontend holds no code→text
+    table). ``description`` is the vendor fault text, ``""`` when no catalog knows the
+    code: the wire contract is a string, and a missing text is still a named code.
+    """
+
+    short_code: str
+    description: str
+
+    def as_payload(self) -> dict[str, str]:
+        """The JSON-primitive wire dict (the WS lane dumps without an encoder)."""
+        return {"short_code": self.short_code, "description": self.description}
+
+    def as_text(self) -> str:
+        """``[MMMM_CCCC] text`` — the one display shape, bare ``[MMMM_CCCC]`` when unknown."""
+        return f"[{self.short_code}] {self.description}" if self.description else f"[{self.short_code}]"
+
+
+def printer_message_from_full_code(full_code: str) -> PrinterMessage | None:
+    """Render one stored full code — the lookup :func:`hms_error_payload` uses.
+
+    Both wire lanes decode back to the canonical short code: a 16-hex ``hms[]`` code is
+    ``attr`` (8) + ``code`` (8), so the short code is its first four and last four hex
+    digits; an 8-hex ``print_error`` code IS the 32-bit word, its first four and last
+    four. The description prefers the lossless full code against the vendored catalog
+    and falls back to the short-code table (:func:`lookup_description_any`). ``None``
+    for anything that is not one of those two shapes — a stored value nobody can decode
+    is not a message.
+    """
+    raw = (full_code or "").strip().upper()
+    if len(raw) not in (8, 16):
+        return None
+    try:
+        value = int(raw, 16)
+    except ValueError:
+        return None
+    if len(raw) == 16:
+        attr, code = value >> 32, value & 0xFFFFFFFF
+    else:
+        attr, code = value, value & 0xFFFF
+    return PrinterMessage(short_code=hms_short_code(attr, code), description=lookup_description_any(attr, code) or "")
+
+
+def printer_message_from_short_code(short_code: str) -> PrinterMessage | None:
+    """Render a bare ``MMMM_CCCC`` — the fallback for a row recorded before full codes were.
+
+    ``None`` for anything that is not that shape: an incident's ``code`` column also
+    holds non-HMS tokens (a lost-Z hold stores the kind that caused it), and a token is
+    not something the printer said.
+    """
+    short = (short_code or "").strip().upper()
+    head, sep, tail = short.partition("_")
+    if not sep or len(head) != 4 or len(tail) != 4:
+        return None
+    try:
+        int(head, 16)
+        int(tail, 16)
+    except ValueError:
+        return None
+    return PrinterMessage(short_code=short, description=get_error_description(short) or "")
+
+
+def unique_messages(messages) -> tuple[PrinterMessage, ...]:
+    """The first message for each short code, in order — two full codes naming one short
+    code (the same fault on two lanes) read once."""
+    seen: set[str] = set()
+    unique: list[PrinterMessage] = []
+    for message in messages or ():
+        if message.short_code in seen:
+            continue
+        seen.add(message.short_code)
+        unique.append(message)
+    return tuple(unique)
+
+
+def messages_from_full_codes(full_codes, *, fallback_short_codes=()) -> tuple[PrinterMessage, ...]:
+    """Render RECORDED full codes as the printer's words — THE reading of a stored record.
+
+    Full codes first (:func:`printer_message_from_full_code`); when none of them decode —
+    a record made before full codes were kept, or a wire entry that carried none — the
+    ``fallback_short_codes`` through the short-code table. De-duplicated
+    (:func:`unique_messages`). Read by the incident store's ``printer_messages`` and by
+    the plate-check page, so a hold and its page can never word one code differently.
+    """
+    messages = [m for m in (printer_message_from_full_code(code) for code in full_codes or ()) if m is not None]
+    if not messages:
+        messages = [
+            m for m in (printer_message_from_short_code(code) for code in fallback_short_codes or ()) if m is not None
+        ]
+    return unique_messages(messages)
+
+
+def full_codes_of(hms_errors, short_codes) -> tuple[str, ...]:
+    """The firmware full codes of the live entries whose short code is in ``short_codes``.
+
+    What an incident opener records (``printer_incident.hms_full_codes``): the printer's
+    OWN identifiers for the codes the lane acted on, read off the live ``HMSError`` list
+    at the moment the hold opens — after a stop or a ladder verb they are gone from the
+    wire. Sorted and de-duplicated; malformed entries and entries with no full code are
+    skipped (invariant 10: a record helper never raises into a callback).
+    """
+    wanted = {str(code).upper() for code in short_codes or ()}
+    found: set[str] = set()
+    for err in hms_errors or []:
+        try:
+            if hms_short_code(err.attr, err.code) not in wanted:
+                continue
+        except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the record
+            continue
+        full = (getattr(err, "full_code", "") or "").strip().upper()
+        if full:
+            found.add(full)
+    return tuple(sorted(found))
+
+
+def messages_from_payload(hms_errors: list[dict] | None) -> tuple[PrinterMessage, ...]:
+    """Render an MQTT ``hms_errors`` payload list (dict entries) as messages, in order.
+
+    Each entry has keys ``code`` ('0x4038', or the int the MQTT parser sometimes
+    leaves), ``attr`` (32-bit int), ``module``, ``severity``; the short code is
+    :func:`hms_short_code`'s — module from ``attr`` bits 16-31, error from ``code``
+    masked to 16 bits, so a full 32-bit ``hms[]`` code (e.g. 0x00030004) still renders
+    as the canonical shape. Malformed entries are skipped.
+    """
+    messages: list[PrinterMessage] = []
+    for err in hms_errors or []:
+        try:
+            raw_code = err.get("code", 0)
+            attr_int = int(err.get("attr", 0))
+            short_code = hms_short_code(attr_int, raw_code)
+            # Prefer the lossless full_code (via attr+code) against the vendored
+            # catalog, then fall back to the legacy 2-group table.
+            description = lookup_description_any(attr_int, raw_code)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        messages.append(PrinterMessage(short_code=short_code, description=description or ""))
+    return tuple(messages)
+
+
+def summary_of(messages) -> str | None:
+    """Join messages into the one display sentence — ``None`` when there are none."""
+    parts = [message.as_text() for message in messages or ()]
+    return "; ".join(parts) if parts else None
+
+
 def format_hms_error_summary(hms_errors: list[dict] | None) -> str | None:
     """Render an MQTT ``hms_errors`` payload list as human-readable fault text.
 
-    THE one "turn the terminal payload's HMS list into a sentence" implementation.
-    Each entry has keys ``code`` ('0x4038'), ``attr`` (32-bit int), ``module``,
-    ``severity``; the short code used for the lookup is ``MMMM_EEEE`` — module from
-    ``attr`` bits 16-31, error from the numeric part of ``code``. Display shape is
-    ``[MMMM_CCCC] text``, falling back to the bare short code when nothing on file
-    describes it, and malformed entries are skipped. Returns None for an empty list
-    (or one whose every entry is malformed) so callers can leave a field unset.
+    THE one "turn the terminal payload's HMS list into a sentence" implementation:
+    :func:`messages_from_payload` parses, :func:`summary_of` joins — the same two steps a
+    hold's RECORDED messages go through, so a live and a recorded reading of one code can
+    never render differently. Display shape is ``[MMMM_CCCC] text``, falling back to the
+    bare short code when nothing on file describes it. Returns None for an empty list (or
+    one whose every entry is malformed) so callers can leave a field unset.
 
     It lives here rather than in ``main`` since 2026-09-17: ``farm_policy`` names the
     codes in the "the printer rejected the eject file" page, and a service may never
-    import the monolith. ``main.on_print_complete``'s ``error_message`` is the other
-    caller — one implementation, two consumers.
+    import the monolith.
     """
-    if not hms_errors:
-        return None
-    parts: list[str] = []
-    for err in hms_errors:
-        try:
-            code_str = str(err.get("code", "")).replace("0x", "")
-            error_num = int(code_str, 16) if code_str else 0
-            attr_int = int(err.get("attr", 0))
-            # Mask to the low 16 bits so a full 32-bit hms[] code (e.g. 0x00030004)
-            # still renders as the canonical MMMM_CCCC shape, matching hms_short_code.
-            module_num = (attr_int >> 16) & 0xFFFF
-            short_code = f"{module_num:04X}_{error_num & 0xFFFF:04X}"
-        except (TypeError, ValueError):
-            continue
-        # Prefer the lossless full_code (via attr+code) against the vendored
-        # catalog, then fall back to the legacy 2-group table.
-        description = lookup_description_any(attr_int, err.get("code", 0))
-        parts.append(f"[{short_code}] {description}" if description else f"[{short_code}]")
-    return "; ".join(parts) if parts else None
+    return summary_of(messages_from_payload(hms_errors))
 
 
 # Firmware runout ``code`` words (low 32 bits) that carry a per-slot attribution

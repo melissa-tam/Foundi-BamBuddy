@@ -337,105 +337,81 @@ class TestNoteTerminal:
 
 
 # ---------------------------------------------------------------------------
-# 3. note_plate_detected
+# 3. A REFUSED plate (the printer's plate check paused the job; the job then ended)
 # ---------------------------------------------------------------------------
 
 
-class TestNotePlateDetected:
-    """The printer's own vision trip (``farm_policy`` calls it on both the unvouched and
-    the confirmed branch). The record it writes is always sourceless and always
-    escalation-only: there is no job identity behind a vision trip to sweep against."""
+class TestRefusedPlateTerminal:
+    """The one plate call per terminal, carrying the printer's refusal (2026-09-24).
 
-    _DETAIL = "plate_vision_confirmed:0500_808C"
+    ``note_plate_detected`` is DELETED with the lane that called it: the plate-check trip
+    no longer touches the plate (the job is PAUSED for a human), and a trip the operator
+    answers by STOPPING the job reaches the authority as that terminal's disposition — a
+    human-clear :class:`EscalationOnly` carrying a :class:`PlateRefusal`. The intents the
+    old class pinned move here.
+    """
 
-    @staticmethod
-    def _prior(prior: str | None) -> None:
-        """Put the plate into the state the trip is about to land on."""
-        if prior == "vision":
-            po.plate_occupancy.note_plate_detected(1, "plate_vision_unvouched:0500_806E")
-        elif prior == "declared":
-            _occupy(1)
-        elif prior == "cooldown":
-            po.plate_occupancy.note_terminal(1, _disposition(source="SUB-7", policy=po.CooldownEject(4, 2)))
-        elif prior == "foreign_auto":
-            po.plate_occupancy.hydrate_plate(1, None, po.ForeignAutoEject(profile_id=3, threshold_c=33.0))
+    _REFUSAL = po.PlateRefusal(messages=())
 
-    def test_it_raises_a_human_clear_gate_and_arms_the_policy(self):
+    def _refused(self, *, raise_gate: bool = True, deposited: bool = False, refusal=None) -> po.TerminalDisposition:
+        return _disposition(
+            source="JOB-7",
+            deposited=deposited,
+            policy=po.EscalationOnly(refusal=refusal if refusal is not None else self._REFUSAL),
+            raise_gate=raise_gate,
+        )
+
+    def test_it_raises_a_human_clear_gate_without_any_deposit(self):
+        """A job stopped at its pre-print check deposited nothing, and the plate is still
+        not fit to print on — the printer said so."""
         rec = _Recorder()
         rec.wire()
 
-        po.plate_occupancy.note_plate_detected(1, self._DETAIL)
+        po.plate_occupancy.note_terminal(1, self._refused())
 
         view = po.plate_occupancy.snapshot(1)
         assert view.plate_occupied is True
-        assert view.plate_source_subtask_id is None
-        assert view.plate_policy == po.EscalationOnly()
-        # A clear→occupied edge is not a release edge, so the scheduler is not kicked.
-        assert rec.calls == [("persist", ""), ("broadcast", ""), ("policy", "plate_detected")]
+        assert view.plate_policy == po.EscalationOnly(refusal=self._REFUSAL)
+        assert ("policy", "terminal") in rec.calls
 
-    @pytest.mark.parametrize(
-        ("prior", "rewrites"),
-        [
-            (None, True),
-            ("vision", False),
-            ("declared", False),
-            ("cooldown", True),
-            ("foreign_auto", True),
-        ],
-        ids=[
-            "clear_plate",
-            "an_earlier_vision_trip",
-            "an_operator_declaration",
-            "a_farm_unit_cooling_on_the_plate",
-            "a_foreign_plate_armed_to_auto_eject",
-        ],
-    )
-    def test_the_guard_suppresses_only_a_record_it_would_write_identically(self, prior, rewrites, wall_clock):
-        """Re-stamping ``since`` would lie about when the plate became occupied and churn
-        the fan-out, so a trip that would change nothing does nothing. Every OTHER prior
-        record is overwritten — including the two that carry a sweep plan."""
-        self._prior(prior)
-        since_before = po.plate_occupancy.snapshot(1).plate_since
-        wall_clock.advance(300)
-        rec = _Recorder()
-        rec.wire()
+    def test_an_ordinary_escalation_still_needs_a_deposit(self):
+        """The rule is the refusal, not the policy class: a plain escalation-only terminal
+        that deposited nothing still raises nothing."""
+        po.plate_occupancy.note_terminal(1, _disposition(deposited=False, policy=po.EscalationOnly()))
+        assert po.plate_occupancy.is_plate_occupied(1) is False
 
-        po.plate_occupancy.note_plate_detected(1, self._DETAIL)
+    def test_the_raise_guard_still_rides_the_disposition(self):
+        """``terminal_disposition`` forces it True for a refusal; the authority itself only
+        honours what the disposition says."""
+        po.plate_occupancy.note_terminal(1, self._refused(raise_gate=False))
+        assert po.plate_occupancy.is_plate_occupied(1) is False
 
-        view = po.plate_occupancy.snapshot(1)
-        assert view.plate_occupied is True
-        assert view.plate_source_subtask_id is None
-        assert view.plate_policy == po.EscalationOnly()
-        if rewrites:
-            assert view.plate_since == wall_clock.t
-            assert rec.calls == [("persist", ""), ("broadcast", ""), ("policy", "plate_detected")]
-        else:
-            assert view.plate_since == since_before
-            assert rec.calls == []
-
-    def test_a_trip_demotes_a_farm_owned_plate_to_human_clear(self):
-        """The gate keeps the part but LOSES the sweep identity. ``plate_source`` goes
-        None, so the matched-eject ladder in ``eject/manual.py`` — which pairs the plate
-        with the unit whose ``dispatch_subtask_id`` equals it — can no longer match, and
-        the plate needs a human. Pinned as CURRENT behaviour, not endorsed."""
+    def test_a_refusal_replaces_a_farm_owned_sweep_plan(self):
+        """A cooldown sweep armed for the plate is not what the printer's refusal calls
+        for — the newest terminal's disposition replaces it, and the sweep plan is gone."""
         po.plate_occupancy.note_terminal(1, _disposition(source="SUB-7", policy=po.CooldownEject(4, 2)))
-        assert po.plate_occupancy.plate_source(1) == "SUB-7"
 
-        po.plate_occupancy.note_plate_detected(1, self._DETAIL)
+        po.plate_occupancy.note_terminal(1, self._refused())
 
-        assert po.plate_occupancy.is_plate_occupied(1) is True
-        assert po.plate_occupancy.plate_source(1) is None
-        assert po.plate_occupancy.snapshot(1).plate_policy == po.EscalationOnly()
+        assert po.plate_occupancy.snapshot(1).plate_policy == po.EscalationOnly(refusal=self._REFUSAL)
 
-    def test_a_mid_job_trip_is_legal_and_settles_nobody_elses_claim(self, clock):
-        """The H2-series pre-print check fires MID-JOB, so the trip is legal from every
-        owner — it records the plate without consuming the lease the dispatch holds."""
+    def test_a_different_cause_is_a_different_policy(self):
+        """The cause rides the POLICY so the driver re-arms the watch when it changes — an
+        escalation armed for a generic gate must not keep paging the generic sentence."""
+        from backend.app.services.hms_errors import PrinterMessage
+
+        worded = po.PlateRefusal(messages=(PrinterMessage(short_code="0500_808C", description="Offset."),))
+        assert po.EscalationOnly(refusal=worded) != po.EscalationOnly()
+        assert po.EscalationOnly(refusal=worded) != po.EscalationOnly(refusal=self._REFUSAL)
+
+    def test_it_settles_nobody_elses_claim(self, clock):
+        """Legal from any owner; a terminal naming no leased unit leaves the lease alone."""
         lease = po.plate_occupancy.claim_for_dispatch(
             1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
         )
         assert isinstance(lease, po.DispatchLease)
 
-        po.plate_occupancy.note_plate_detected(1, "plate_vision_unvouched:0500_806E")
+        po.plate_occupancy.note_terminal(1, self._refused())
 
         view = po.plate_occupancy.snapshot(1, po.Evidence(live_state=RUNNING))
         assert view.plate_occupied is True

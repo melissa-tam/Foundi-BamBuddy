@@ -7143,14 +7143,20 @@ class BambuMQTTClient:
             print_error: Canonical hex identifier for the fault — 8 chars for the
                 32-bit `print_error` path, 16 chars for the 64-bit `hms[]` path
                 (HMSError.full_code). Carried through unchanged from the route.
-                Only the `idle_ignore` branch puts it on the wire; resume / stop
-                use BambuStudio's plain shape (verified against a live H2D, the
+                Only the `idle_ignore` branch puts it on the wire; resume uses
+                BambuStudio's plain shape (verified against a live H2D, the
                 `err`-bearing shape is silently rejected by the firmware).
             action: One of HMSAction's string values.
             job_id: The `subtask_id` snapshotted onto the HMSError at parse-time.
                 Preserved for symmetry with the catalog but no longer sent —
-                BambuStudio's actual resume/stop commands are plain and the
+                BambuStudio's actual resume command is plain and the
                 firmware doesn't echo `job_id` back on the response either.
+
+        ``STOP_PRINTING`` is deliberately NOT dispatched here (2026-09-24): an operator
+        stopping a print from the HMS dialog is the operator's Stop, whose one owner is
+        ``print_control.stop_as_operator`` (the stop AND the user-stopped mark) — the
+        route sends it there, and this dispatcher answers False for it like any other
+        action it does not own.
 
         Returns False when the MQTT client is offline or when `action` is unknown
         so the route surfaces it as a 4xx rather than a silent no-op.
@@ -7181,19 +7187,6 @@ class BambuMQTTClient:
                 {
                     "print": {
                         "command": "resume",
-                        "param": "",
-                        "sequence_id": "0",
-                    }
-                }
-            )
-
-        def hms_stop():
-            # Same as hms_resume — BambuStudio's actual shape is plain. The
-            # `err`-bearing variant is silently rejected; verified on the H2D.
-            publish(
-                {
-                    "print": {
-                        "command": "stop",
                         "param": "",
                         "sequence_id": "0",
                     }
@@ -7256,9 +7249,6 @@ class BambuMQTTClient:
                 | HMSAction.PROCEED
             ):
                 hms_resume()
-
-            case HMSAction.STOP_PRINTING:
-                hms_stop()
 
             case HMSAction.IGNORE_RESUME | HMSAction.NO_REMINDER_NEXT_TIME:
                 hms_ignore(persistent=False)

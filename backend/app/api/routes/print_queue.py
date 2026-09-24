@@ -43,7 +43,7 @@ from backend.app.services.dispatch_target import (
 )
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
-from backend.app.services.queue_builder import create_queue_items, renumber_pending
+from backend.app.services.queue_builder import create_queue_items, renumber_pending, seat_for_repin
 from backend.app.services.queue_transitions import cancel_pending_items
 from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
 from backend.app.utils.threemf_tools import (
@@ -734,8 +734,13 @@ async def bulk_update_queue_items(
         if not result.scalar_one_or_none():
             raise HTTPException(400, "Printer not found")
 
-    # Fetch all items
-    result = await db.execute(select(PrintQueueItem).where(PrintQueueItem.id.in_(data.item_ids)))
+    # Fetch all items — in queue order, so rows a re-pin moves into another scope keep
+    # their relative order at its tail.
+    result = await db.execute(
+        select(PrintQueueItem)
+        .where(PrintQueueItem.id.in_(data.item_ids))
+        .order_by(PrintQueueItem.position, PrintQueueItem.id)
+    )
     items = result.scalars().all()
 
     updated_count = 0
@@ -751,6 +756,10 @@ async def bulk_update_queue_items(
             skipped_count += 1
             continue
 
+        # A new pin moves the row into another position scope: seat it at that scope's
+        # tail before the edit lands (the same rule as PATCH /queue/{id}).
+        if "printer_id" in update_data:
+            await seat_for_repin(db, item, new_printer_id=update_data["printer_id"])
         for field, value in update_data.items():
             setattr(item, field, value)
         updated_count += 1
@@ -1120,6 +1129,10 @@ async def update_queue_item(
             json.dumps(update_data["nozzle_mapping"]) if update_data["nozzle_mapping"] else None
         )
 
+    # A new PIN moves the row into another position scope: it joins the tail of that
+    # scope (an operator edit, not a requeue) instead of carrying a number from the
+    # sequence it is leaving. Before the edit lands, so the allocation cannot count it.
+    await seat_for_repin(db, item, new_printer_id=new_printer_id)
     for field, value in update_data.items():
         setattr(item, field, value)
 
@@ -1382,9 +1395,11 @@ async def stop_queue_item(
     # stop_source stamp (guarded on status=='printing') is skipped — the item lands
     # 'cancelled' with stop_source NULL (prod item 219). Stamp it in the SAME
     # transition. This IS the queue-UI stop, i.e. classify_stop's 'operator_ui'
-    # verdict (membership in _user_stopped_printers wins), so the farm policy reads it
-    # as an operator stop, not a failure. Also NULL any stale hold token: a terminal
-    # unit must not keep a spool_jam_recovery_failed / print_paused_stalled reason.
+    # verdict. The printer's terminal still reaches the farm policy: the correlation
+    # owner (``farm_correlation.resolve_terminal_item`` with ``ui_stopped``) matches this
+    # ``cancelled`` row by its dispatch id, so the operator-stop hold and the fault
+    # requeue fire for it. Also NULL any stale hold token: a terminal unit must not keep
+    # a spool_jam_recovery_failed / print_paused_stalled reason.
     item.stop_source = "operator_ui"
     item.waiting_reason = None
     await db.commit()

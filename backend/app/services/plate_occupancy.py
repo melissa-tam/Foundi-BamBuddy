@@ -73,7 +73,12 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    # Annotation-only: the core stays stdlib-only at RUNTIME. The messages it stores are
+    # built by the one HMS renderer before they reach the authority.
+    from backend.app.services.hms_errors import PrinterMessage
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +136,6 @@ NotifyCause = Literal[
     "commit_dispatch",
     "release_dispatch",
     "terminal",
-    "plate_detected",
     "declare_occupied",
     "clear_plate",
     "operator_recover",
@@ -295,6 +299,24 @@ class ForeignAutoEject:
 
 
 @dataclass(frozen=True)
+class PlateRefusal:
+    """Why a plate is held: the printer's own plate check REFUSED it.
+
+    The cause behind a refused-plate gate (2026-09-24, 003-H2S): the printer's
+    pre-print plate check paused a job, and that job then ended without printing
+    (``farm_correlation`` verdict ``plate_refused``). ``messages`` are the printer's
+    words for the check, recorded on the hold row when it tripped — the stop that ended
+    the job wiped them off the printer, so this is the only place they survive.
+
+    MEMORY-ONLY by design: the plate record's durable mirror is the gate flag and the
+    source id, so after a restart the gate stands (fail closed) without its cause and
+    the escalation page falls back to the generic sentence.
+    """
+
+    messages: tuple[PrinterMessage, ...] = ()
+
+
+@dataclass(frozen=True)
 class EscalationOnly:
     """Nothing can be swept automatically; a human must clear the plate.
 
@@ -302,7 +324,15 @@ class EscalationOnly:
     policy fails to arm: an occupied plate is ALWAYS attached to some policy, and
     when the farm cannot verify what should happen next it escalates rather than
     going quiet.
+
+    ``refusal`` is set when the printer ITSELF refused the plate (:class:`PlateRefusal`).
+    It rides the POLICY rather than the record because it changes what the watch does —
+    the page's sentence names the printer's words — and a policy is what the driver
+    arms from: a gate whose cause changes is a different watch, so an escalation armed
+    for a generic gate is replaced when a refusal lands on the same plate.
     """
+
+    refusal: PlateRefusal | None = None
 
 
 OccupancyPolicy = CooldownEject | FirstArticleEject | ForeignAutoEject | EscalationOnly
@@ -820,6 +850,12 @@ class PlateOccupancy:
         ``set_awaiting_plate_clear(True, subtask)``: the newest deposit is the one
         an eject would sweep, so its identity must be the one the gate carries.
 
+        A REFUSED plate (an :class:`EscalationOnly` carrying a :class:`PlateRefusal`)
+        gates WITHOUT deposit evidence. The printer's own plate check said the plate is
+        wrong and the job it paused ended without printing, so the plate's state is the
+        printer's statement, not an inference from layer peaks — a job stopped at its
+        pre-print check deposits nothing and the plate is still not fit to print on.
+
         The lease is consumed only when the terminal names the unit that holds it;
         any other terminal (a foreign job, a stale echo) leaves the lease to its own
         timers rather than handing an unrelated print the power to un-claim a
@@ -834,7 +870,8 @@ class PlateOccupancy:
             record.lease = None
             changed = True
 
-        if disposition.evidence.deposited and disposition.raise_gate:
+        refused = isinstance(disposition.policy, EscalationOnly) and disposition.policy.refusal is not None
+        if (disposition.evidence.deposited or refused) and disposition.raise_gate:
             record.plate = PlateOccupied(
                 source_subtask_id=disposition.source_subtask_id,
                 policy=disposition.policy,
@@ -844,29 +881,6 @@ class PlateOccupancy:
 
         if changed:
             self._notify(printer_id, before, self._view(printer_id, None), "terminal")
-
-    def note_plate_detected(self, printer_id: int, source_detail: str) -> None:
-        """The printer itself reported something on the plate (the native vision check).
-
-        Legal from any owner because the trip fires MID-JOB: the H2-series pre-print
-        vision check pauses the job and the plate is occupied whatever the farm
-        believed. Only a human can clear that, so the policy is always
-        :class:`EscalationOnly` and the source id is None — there is no job identity
-        behind a vision trip to sweep against.
-
-        Idempotent when the plate already reads exactly that: the trip can re-fire
-        on repeated pushes, and re-stamping ``since`` would both churn the fan-out
-        and lie about when the plate became occupied.
-        """
-        record = self._record(printer_id)
-        plate = record.plate
-        if plate is not None and plate.source_subtask_id is None and isinstance(plate.policy, EscalationOnly):
-            return
-
-        before = self._view(printer_id, None)
-        record.plate = PlateOccupied(source_subtask_id=None, policy=EscalationOnly(), since=_now())
-        logger.info("[occupancy] p%d: plate detected by the printer (%s)", printer_id, source_detail)
-        self._notify(printer_id, before, self._view(printer_id, None), "plate_detected")
 
     # -- operator statements ------------------------------------------------
 

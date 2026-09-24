@@ -11,7 +11,9 @@ from backend.app.models.api_key import APIKey
 from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.print_control import stop_as_operator
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.queue_builder import create_queue_items
 
 logger = logging.getLogger(__name__)
 
@@ -83,19 +85,6 @@ async def webhook_add_to_queue(
     if not printer:
         raise HTTPException(status_code=404, detail="Printer not found")
 
-    # Get next position
-    result = await db.execute(
-        select(PrintQueueItem.position)
-        .where(
-            PrintQueueItem.printer_id == data.printer_id,
-            PrintQueueItem.status == "pending",
-        )
-        .order_by(PrintQueueItem.position.desc())
-        .limit(1)
-    )
-    max_position = result.scalar()
-    next_position = (max_position or 0) + 1
-
     # Parse scheduled time if provided
     scheduled_time = None
     if data.scheduled_time:
@@ -106,17 +95,21 @@ async def webhook_add_to_queue(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid scheduled_time format")
 
-    # Create queue item
-    queue_item = PrintQueueItem(
+    # The tail of the printer's position scope, through the ONE position rule (which
+    # also holds the scope lock until the request's commit).
+    (queue_item,) = await create_queue_items(
+        db,
+        count=1,
         printer_id=data.printer_id,
-        archive_id=data.archive_id,
-        project_id=data.project_id,
-        position=next_position,
-        scheduled_time=scheduled_time,
-        require_previous_success=data.require_previous_success,
-        auto_off_after=data.auto_off_after,
+        fields={
+            "printer_id": data.printer_id,
+            "archive_id": data.archive_id,
+            "project_id": data.project_id,
+            "scheduled_time": scheduled_time,
+            "require_previous_success": data.require_previous_success,
+            "auto_off_after": data.auto_off_after,
+        },
     )
-    db.add(queue_item)
     await db.flush()
     await db.refresh(queue_item)
 
@@ -205,18 +198,11 @@ async def webhook_stop_print(
     if status.state != "RUNNING":
         raise HTTPException(status_code=409, detail="No print in progress")
 
-    # printer_manager.stop_print is synchronous and returns a bool (True once the
-    # stop command is published, False when the MQTT session is gone). It was
-    # previously ``await``ed — awaiting a bool raises TypeError — and its result
-    # was discarded, so a dropped stop returned HTTP 200 "Print stopped". Capture
-    # the bool and fail loudly when the command was not delivered.
-    try:
-        stopped = printer_manager.stop_print(printer_id)
-    except Exception as e:
-        logger.error("Failed to stop print: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not stopped:
+    # An API client pressing Stop is an OPERATOR stop: ``print_control.stop_as_operator``
+    # is its one owner — the MQTT stop plus the user-stopped mark, so the terminal records
+    # a cancel rather than a failure. It never raises and answers whether the stop was
+    # DELIVERED; an undelivered stop is a 502, never a 200 "Print stopped".
+    if not stop_as_operator(printer_id):
         raise HTTPException(
             status_code=502,
             detail="printer MQTT session not connected — command not delivered",
@@ -245,11 +231,14 @@ async def webhook_cancel_print(
     if status.state not in ["RUNNING", "PAUSE"]:
         raise HTTPException(status_code=409, detail="No print to cancel")
 
-    try:
-        await printer_manager.cancel_print(printer_id)
-    except Exception as e:
-        logger.error("Failed to cancel print: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    # Cancel IS the operator's stop (a paused print included), through its one owner. It
+    # used to call ``printer_manager.cancel_print``, which does not exist, so every call
+    # answered 500 and cancelled nothing.
+    if not stop_as_operator(printer_id):
+        raise HTTPException(
+            status_code=502,
+            detail="printer MQTT session not connected — command not delivered",
+        )
 
     return {"message": "Print cancelled"}
 

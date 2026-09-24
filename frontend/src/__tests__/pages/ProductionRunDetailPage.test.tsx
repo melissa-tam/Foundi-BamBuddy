@@ -14,6 +14,7 @@ import { render } from '../utils';
 import { server } from '../mocks/server';
 import { ProductionRunDetailPage } from '../../pages/ProductionRunDetailPage';
 import type { ProductionRun, RunPrinterState, RunUnit } from '../../types/productionRuns';
+import en from '../../i18n/locales/en';
 
 function printerState(overrides: Partial<RunPrinterState> = {}): RunPrinterState {
   return {
@@ -195,7 +196,9 @@ describe('ProductionRunDetailPage', () => {
     expect(screen.getAllByText('Quarantined').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/device reports H2C, registered as H2S/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('Offline-stalled mid-print')).toBeInTheDocument();
-    expect(screen.getByText('Plate not empty (printer vision)')).toBeInTheDocument();
+    // An open plate_vision hold on this printer — asserted against the locale
+    // leaf, so the reason renders without pinning its wording.
+    expect(screen.getByText(en.productionRuns.detail.printerState.visionHold)).toBeInTheDocument();
     // Not-eligible panel lists the two blocked printers up front.
     expect(screen.getByText('Printers not participating')).toBeInTheDocument();
   });
@@ -276,6 +279,8 @@ describe('ProductionRunDetailPage', () => {
               // No human touched this printer, so it must not be attributed to
               // an operator — the lineage is what tells a reader whether a
               // plate was abandoned deliberately or re-checked by the farm.
+              // Stored history since 2026-09-24 (no writer remains); the label
+              // still renders it.
               unit({
                 id: 105,
                 status: 'cancelled',
@@ -309,15 +314,53 @@ describe('ProductionRunDetailPage', () => {
     expect(within(table).getAllByText('Stopped by operator')).toHaveLength(1);
     expect(within(table).getByText('Retry #1 of unit 101')).toBeInTheDocument();
     expect(within(table).getByText('HMS 0300_8017')).toBeInTheDocument();
-    // Copy changed in the 2026-09-04 wave: the farm now STOPS the print on the
-    // second trip, so the old "resume on the printer" instruction is false —
-    // the plate gate is human-clear-only.
+    // The plate-check waiting reason renders its mapped copy (the print is
+    // PAUSED for a human since 2026-09-24), never the humanized token.
     expect(
-      within(table).getByText(/plate check tripped twice/i),
+      within(table).getByText(en.productionRuns.detail.waiting.visionHold),
     ).toBeInTheDocument();
     // Unit ids render for cross-referencing.
     expect(within(table).getByText('#101')).toBeInTheDocument();
     expect(within(table).getByText('#104')).toBeInTheDocument();
+  });
+
+  it('attributes a plate-refused stop to the plate check, not to an operator', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () =>
+        HttpResponse.json(
+          detailRun({
+            units: [
+              // The printer's own plate check paused this print and it ended
+              // without printing. The lineage names the plate check, never the
+              // operator who may have pressed Stop on the paused job.
+              unit({ id: 107, status: 'cancelled', stop_source: 'plate_refused' }),
+              // Liveness pair: a genuine operator stop still reads as one.
+              unit({ id: 108, status: 'cancelled', stop_source: 'operator_ui' }),
+            ],
+          }),
+        ),
+      ),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    const table = await screen.findByRole('table');
+    const rowOf = (unitId: number): HTMLElement => {
+      const row = within(table)
+        .getAllByRole('row')
+        .find((r) => within(r).queryByRole('cell', { name: `#${unitId}` }));
+      if (!row) throw new Error(`no row for unit #${unitId}`);
+      return row;
+    };
+    const { stoppedAtPlateCheck, stoppedByOperator } = en.productionRuns.detail;
+
+    const refused = rowOf(107);
+    expect(within(refused).getByText(stoppedAtPlateCheck)).toBeInTheDocument();
+    expect(within(refused).queryByText(stoppedByOperator)).not.toBeInTheDocument();
+
+    const operator = rowOf(108);
+    expect(within(operator).getByText(stoppedByOperator)).toBeInTheDocument();
+    expect(within(operator).queryByText(stoppedAtPlateCheck)).not.toBeInTheDocument();
   });
 
   it('renders the first-article banner in the header when awaiting approval (Phase 4, F1)', async () => {

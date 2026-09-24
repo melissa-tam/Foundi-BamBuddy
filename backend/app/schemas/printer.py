@@ -175,6 +175,18 @@ class ServiceHoldState(BaseModel):
     since: str | None = None
 
 
+class PrinterMessageInfo(BaseModel):
+    """One HMS message the printer showed, as RECORDED by the farm.
+
+    Rendered by the backend's one catalog renderer (``hms_errors.PrinterMessage``), so
+    the frontend holds no code→text table. ``description`` is ``""`` when no catalog
+    knows the code.
+    """
+
+    short_code: str
+    description: str = ""
+
+
 class OpenIncidentState(BaseModel):
     """The printer's highest-precedence OPEN equipment-fault row, as the card reads it.
 
@@ -200,12 +212,20 @@ class OpenIncidentState(BaseModel):
     id: int
     kind: str
     status: str
+    #: the job the hold paused (the printer's ``subtask_id`` at open; ``""`` when it
+    #: named none) — read by the terminal classifier, declared so REST and the WS frame
+    #: carry the same projection; the card ignores it
+    job_id: str = ""
     slot_desc: str | None = None
     created_at: str | None = None
     operator_exits: bool = False
     #: a recovery driver task is live on this printer (projected from the incident
     #: store's liveness registry, never derived from ``status``)
     driver_live: bool = False
+    #: the printer's HMS messages RECORDED when this hold opened (empty for a code-less
+    #: hold) — always present on the wire; the card shows the ones the live
+    #: ``hms_errors`` no longer carries
+    printer_messages: list[PrinterMessageInfo] = []
 
 
 class ServiceHoldEnterResponse(BaseModel):
@@ -477,6 +497,14 @@ class EjectWatchInfo(BaseModel):
     deferred: bool = False
 
 
+class PlateRefusalInfo(BaseModel):
+    """Why the plate authority holds a REFUSED plate: the printer's plate check paused a
+    job that then ended without printing. ``messages`` are the printer's words for the
+    check — the stop wiped them off the printer."""
+
+    messages: list[PrinterMessageInfo] = []
+
+
 class PlateInfo(BaseModel):
     """The deposit standing on a printer's build plate, and what happens to it next."""
 
@@ -489,6 +517,10 @@ class PlateInfo(BaseModel):
     # this plate", and the unit/profile behind it is already on the queue surfaces.
     policy: str | None = None
     since: datetime | None = None
+    # Set when the gate holds a plate the printer's own plate check REFUSED; None for
+    # every other gate. Declared here for the C5 reason: the REST lane validates through
+    # this model while the WS lane dumps ``occupancy_payload``'s dict raw.
+    refusal: PlateRefusalInfo | None = None
 
 
 class PendingEjectInfo(BaseModel):
@@ -711,8 +743,8 @@ class RecoverResult(BaseModel):
 class ClearPlateResult(BaseModel):
     """What ``POST /printers/{id}/clear-plate`` did, in the same vocabulary.
 
-    The routine plate ack answers the ``operator`` class only — a confirmed plate-check
-    trip, a Z datum lost to a reboot — never a filament-path hold; ``incidents_closed``
+    The routine plate ack answers the ``operator`` class only — a Z datum lost to a
+    reboot — never a filament-path hold or a paused plate check; ``incidents_closed``
     is how the operator sees WHICH, instead of inferring it from a chip that did or did
     not go dark.
     """

@@ -28,10 +28,13 @@ from backend.app.models.printer_incident import (
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
     KIND_SERVICE_HOLD,
+    KIND_Z_REFERENCE_LOST,
     RESOLUTION_DECLARED,
+    RESOLUTION_JOB_PAUSE,
     RESOLUTION_OPERATOR,
     RESOLUTION_REPAIR,
     RESOLUTION_WIRE,
+    RESOLVE_JOB_ENDED_UNSEEN,
     RESOLVE_OBSERVED_RUNNING,
     RESOLVE_OPERATOR,
     RESOLVE_REARM,
@@ -39,11 +42,12 @@ from backend.app.models.printer_incident import (
     RESOLVE_REPAIR_OBSERVED,
     RESOLVE_TERMINAL,
     RESOLVE_WIRE_CLEAR,
+    RESOLVES_ON,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
     PrinterIncident,
 )
-from backend.app.services import incident_resolution
+from backend.app.services import incident_resolution, printer_incidents
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
 from backend.app.services.incident_resolution import (
     ClearedEvent,
@@ -64,7 +68,8 @@ _OCCASIONS = ("running_edge", "job_terminal", "sweep_tick", "startup", "plate_cl
 _KIND_BY_CLASS = {
     RESOLUTION_WIRE: (KIND_JAM, "0700_8006"),
     RESOLUTION_REPAIR: (KIND_PHYSICAL, "0700_8004"),
-    RESOLUTION_OPERATOR: (KIND_PLATE_VISION, "0500_808C"),
+    RESOLUTION_OPERATOR: (KIND_Z_REFERENCE_LOST, ""),
+    RESOLUTION_JOB_PAUSE: (KIND_PLATE_VISION, "0500_808C"),
     RESOLUTION_DECLARED: (KIND_SERVICE_HOLD, ""),
 }
 
@@ -129,11 +134,14 @@ def _permissive(occasion: str) -> Context:
 
     Deliberately maximal: every piece of evidence any cell could want is present, so a
     "stand" in the expectations below is the CLASS refusing the occasion, never this
-    fixture failing to supply something.
+    fixture failing to supply something. The printer is RUNNING the row's own job with
+    no eject owning it — the one reading every class that closes on the wire closes on
+    (a positive non-PAUSE state for ``wire``, a print through the path for ``repair``,
+    the paused job printing again for ``job_pause``).
     """
     after = _OPENED_AT + timedelta(seconds=30)
     return Context(
-        state=_state("IDLE"),
+        state=_state("RUNNING"),
         ledger=_ledger_with(load_at=after, running_at=after),
         driver_live=False,
         terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
@@ -158,6 +166,11 @@ _EXPECTED: dict[tuple[str, str], str | None] = {
     (RESOLUTION_OPERATOR, "sweep_tick"): None,
     (RESOLUTION_OPERATOR, "startup"): None,
     (RESOLUTION_OPERATOR, "plate_cleared"): RESOLVE_OPERATOR,
+    (RESOLUTION_JOB_PAUSE, "running_edge"): RESOLVE_OBSERVED_RUNNING,
+    (RESOLUTION_JOB_PAUSE, "job_terminal"): RESOLVE_TERMINAL,
+    (RESOLUTION_JOB_PAUSE, "sweep_tick"): RESOLVE_OBSERVED_RUNNING,
+    (RESOLUTION_JOB_PAUSE, "startup"): RESOLVE_REARM,
+    (RESOLUTION_JOB_PAUSE, "plate_cleared"): None,
     (RESOLUTION_DECLARED, "running_edge"): None,
     (RESOLUTION_DECLARED, "job_terminal"): None,
     (RESOLUTION_DECLARED, "sweep_tick"): None,
@@ -204,6 +217,168 @@ class TestEveryCell:
         for occasion in _OCCASIONS:
             verdict = resolve(_row(resolution), occasion, _permissive(occasion))
             assert verdict.dwell is (occasion == "sweep_tick" and verdict.close), (resolution, occasion)
+
+
+class TestRecoverAttributeMatchesTheTable:
+    """``closed_by_recover`` is a READ of the model's per-class ``RECOVER_ENDS``, never a
+    second hand-written reading of the rule table — and this pins the two to one answer.
+
+    The store may not import the rule table, so the attribute and the table's own
+    ``plate_cleared``-with-Recover verdict could drift silently; this walks EVERY
+    registered ``(kind, external)`` and asks both.
+    """
+
+    # A short code per (kind, external) whose taxonomy verdict puts the row on that
+    # hardware — asserted below, so a wrong pick fails loudly instead of testing the
+    # wrong cell.
+    _CODES = {
+        (KIND_JAM, False): "0700_8006",
+        (KIND_JAM, True): "07FF_8006",
+        ("runout", False): "0700_8011",
+        ("runout", True): "07FF_8011",
+        (KIND_PHYSICAL, False): "0700_8004",
+        (KIND_PHYSICAL, True): "07FF_8003",
+        ("power_loss", False): "0300_8007",
+        (KIND_PLATE_VISION, False): "0500_808C",
+        (KIND_Z_REFERENCE_LOST, False): "",
+        (KIND_SERVICE_HOLD, False): "",
+    }
+
+    def test_every_registered_row_is_covered(self):
+        assert set(self._CODES) == set(RESOLVES_ON)
+
+    @pytest.mark.parametrize(("kind", "external"), sorted(RESOLVES_ON))
+    def test_recover_ends_it_exactly_when_the_table_closes_it_on_recover(self, kind, external):
+        row = PrinterIncident(
+            id=1,
+            printer_id=7,
+            job_id=_JOB,
+            item_id=None,
+            kind=kind,
+            code=self._CODES[(kind, external)],
+            codes="",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+            created_at=_OPENED_AT,
+        )
+        assert printer_incidents.row_external(row) is external, "the fixture code names the wrong hardware"
+
+        verdict = resolve(row, "plate_cleared", _permissive("plate_cleared"))
+
+        assert verdict.close is printer_incidents.closed_by_recover(kind, external=external)
+
+
+class TestTheJobPauseLane:
+    """The printer paused ONE job to ask a human (its own plate check). The answer is that
+    job — resumed or stopped — and every cell is bound to the row's OWN job."""
+
+    def _ctx(self, *, live="RUNNING", job=_JOB, driver_live=False, terminal=None) -> Context:
+        state = _state(live)
+        state.subtask_id = job
+        return Context(state=state, ledger=MotionLedger(), driver_live=driver_live, terminal=terminal)
+
+    def test_the_paused_job_running_again_closes_it(self):
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "running_edge", self._ctx())
+        assert verdict.close is True
+        assert verdict.source == RESOLVE_OBSERVED_RUNNING
+
+    def test_another_jobs_running_edge_stands(self):
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "running_edge", self._ctx(job="other-job"))
+        assert verdict.close is False
+
+    def test_a_live_driver_defers_the_running_edge(self):
+        """The wire cell's rule: a RUNNING sample during a resume a driver published is
+        its reading, not the hold's answer."""
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "running_edge", self._ctx(driver_live=True))
+        assert verdict.close is False
+        assert "driver" in verdict.evidence
+
+    @pytest.mark.parametrize("status", ["completed", "failed", "aborted", "cancelled"])
+    def test_the_paused_jobs_terminal_closes_it_whatever_the_status(self, status):
+        """Resumed-and-finished or stopped: either way the job it asked about is over.
+        What happens to the plate is the terminal verdict's, captured before this ran."""
+        terminal = TerminalEvent(status=status, eject=False, job_id=_JOB)
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(live="FAILED", terminal=terminal))
+        assert verdict.close is True
+        assert verdict.source == RESOLVE_TERMINAL
+
+    def test_another_jobs_terminal_stands(self):
+        terminal = TerminalEvent(status="failed", eject=False, job_id="other-job")
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(terminal=terminal)).close is False
+
+    def test_an_eject_terminal_stands(self):
+        terminal = TerminalEvent(status="completed", eject=True, job_id=_JOB)
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(terminal=terminal)).close is False
+
+    @pytest.mark.parametrize("occasion", ["sweep_tick", "startup"])
+    def test_a_pause_of_the_same_job_is_this_holds_normal_reading(self, occasion):
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), occasion, self._ctx(live="PAUSE")).close is False
+
+    @pytest.mark.parametrize("live", ["", "UNKNOWN"])
+    def test_a_printer_that_says_nothing_is_not_evidence(self, live):
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live=live)).close is False
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live=live, job="other-job")).close is False
+
+    def test_a_disconnected_printer_is_not_evidence(self):
+        ctx = Context(state=None, ledger=MotionLedger(), driver_live=False)
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", ctx).close is False
+
+    @pytest.mark.parametrize("occasion", ["sweep_tick", "startup"])
+    def test_an_eject_owning_the_printer_is_not_the_answer(self, occasion):
+        """The shared "RUNNING and no eject owns it" reading — a sweep is not the paused job."""
+        plate_occupancy.hydrate_eject(7, PendingEject(purpose="production", run_id=None, queue_item_id=1))
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), occasion, self._ctx()).close is False
+
+    def test_the_sweep_waits_out_its_dwell_and_the_restart_does_not(self):
+        sweep = resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx())
+        startup = resolve(_row(RESOLUTION_JOB_PAUSE), "startup", self._ctx())
+        assert (sweep.close, sweep.dwell) == (True, True)
+        assert (startup.close, startup.dwell, startup.source) == (True, False, RESOLVE_REARM)
+
+    @pytest.mark.parametrize("recover", [True, False])
+    def test_neither_plate_verb_answers_a_paused_job(self, recover):
+        """ "The plate is clear" is not "resume the print"."""
+        ctx = Context(state=_state("PAUSE"), ledger=MotionLedger(), driver_live=False, cleared=ClearedEvent(recover))
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "plate_cleared", ctx).close is False
+
+
+class TestAJobPauseCannotOutliveItsJob:
+    """A job-pause row whose job ended without the farm seeing its terminal has no other
+    exit (no plate verb answers a job pause), so it would block dispatch and stand every
+    resume lane aside on its printer for good. The per-tick SWEEP closes it — after its
+    dwell, under its own token — on the printer's POSITIVE report that the job is over.
+    The startup rearm does not: the downtime reconcile needs the row open to classify a
+    job stopped during the outage as a refused plate."""
+
+    def _ctx(self, *, live, job=_JOB) -> Context:
+        state = _state(live)
+        state.subtask_id = job
+        return Context(state=state, ledger=MotionLedger(), driver_live=False)
+
+    @pytest.mark.parametrize("live", ["IDLE", "FINISH", "FAILED"])
+    def test_a_terminal_or_idle_printer_ends_it_after_the_dwell(self, live):
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live=live))
+
+        assert (verdict.close, verdict.dwell, verdict.source) == (True, True, RESOLVE_JOB_ENDED_UNSEEN)
+        assert live in verdict.evidence
+
+    @pytest.mark.parametrize("live", ["RUNNING", "PAUSE", "PREPARE", "IDLE"])
+    def test_another_job_on_the_printer_ends_it_after_the_dwell(self, live):
+        """A printer runs one job; another one means this one ended."""
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live=live, job="other-job"))
+
+        assert (verdict.close, verdict.dwell, verdict.source) == (True, True, RESOLVE_JOB_ENDED_UNSEEN)
+
+    def test_the_paused_job_running_again_keeps_its_own_token(self):
+        """The RUNNING-of-that-job close is unchanged: it is an ANSWER, not an unseen end."""
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live="RUNNING"))
+        assert (verdict.close, verdict.source) == (True, RESOLVE_OBSERVED_RUNNING)
+
+    @pytest.mark.parametrize("live", ["IDLE", "FINISH", "FAILED"])
+    def test_startup_still_closes_only_on_running(self, live):
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "startup", self._ctx(live=live)).close is False
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "startup", self._ctx(live=live, job="other-job")).close is False
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "startup", self._ctx(live="RUNNING")).close is True
 
 
 class TestTheWireLane:

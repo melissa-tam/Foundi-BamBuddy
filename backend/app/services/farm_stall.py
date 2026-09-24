@@ -594,9 +594,12 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
     one continuous dead shape, never an accumulation of glimpses), and ``dead`` seeds it
     and then, past :data:`_DEAD_CLAIM_DWELL_S`, releases.
 
-    The module's "never writes a terminal status" charter is intact — ``pending`` is
-    un-claiming, not an outcome. The unit goes back where it came from and the
-    scheduler re-dispatches it, so there is no new notification event: the
+    The module's "never writes a terminal status" charter is intact — un-claiming is
+    not an outcome, and the release is ``requeue.return_to_queue``'s: the unit goes back
+    to the queue NEXT in line and the scheduler re-dispatches it. The one terminal that
+    can follow is the RUN's rule, applied by that owner, never a stall verdict: a claim
+    returned under an aborted or completed run is cancelled there, because an ended
+    run must not print one more plate. There is no new notification event: the
     run-changed broadcast and the WARNING below are the operator surface.
 
     Injectable ``manager``/``now`` (epoch seconds — it drives the age and the dwell)
@@ -616,7 +619,7 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
 
     from backend.app.models.archive import PrintArchive
     from backend.app.services import printer_incidents
-    from backend.app.services.queue_transitions import release_unstarted_claim
+    from backend.app.services.requeue import return_to_queue
 
     try:
         await _reconcile_unowned_ejects(manager=manager, now=now)
@@ -691,15 +694,16 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
             if now - first < _DEAD_CLAIM_DWELL_S:
                 continue
 
-            if not await release_unstarted_claim(db, item_id=item.id):
+            outcome = await return_to_queue(db, item.id, cause="dead_claim")
+            if outcome == "moved_on":
                 # It moved between the query and the write — somebody else owns it.
                 _dead_claim_since.pop(item.id, None)
                 continue
             await db.commit()
             # The row claim and the PRINTER claim are two different things with two
             # different writers, and un-making a dispatch means dropping both: the
-            # conditional UPDATE above releases the queue row, this releases the
-            # occupancy lease that would otherwise hold the printer out of the queue.
+            # return above releases the queue row, this releases the occupancy lease
+            # that would otherwise hold the printer out of the queue.
             plate_occupancy.release_dispatch(pid, "dead dispatch claim")
             _dead_claim_since.pop(item.id, None)
             await _notify_run_changed(db, item)
@@ -708,10 +712,11 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
             # row, so the log line has to be enough to re-judge the decision afterwards.
             logger.warning(
                 "farm_stall: printer %s unit %s claimed 'printing' %.1f min ago but never started — "
-                "released to 'pending' for re-dispatch (verdict=%s, %s)",
+                "returned to the queue (%s) for re-dispatch (verdict=%s, %s)",
                 pid,
                 item.id,
                 (evidence.claim_age_s or 0.0) / 60.0,
+                outcome,
                 verdict,
                 evidence,
             )
@@ -924,10 +929,9 @@ _JAM_REMINDER_DETAIL = "Spool jam STILL not recovered — the printer is still P
 _RUNOUT_REMINDER_DETAIL = (
     "Filament runout STILL not resolved — the printer is still PAUSED awaiting a same-slot refill."
 )
-_PLATE_VISION_REMINDER_DETAIL = (
-    "The printer's plate check STILL reports the bed is not empty — the print was stopped. "
-    "Clear the bed, then Mark plate cleared."
-)
+# The printer's pre-print plate check PAUSED the job (2026-09-24: the farm no longer
+# stops it) — the operator fixes the plate and resumes, the same job continues.
+_PLATE_VISION_REMINDER_DETAIL = "Print paused at plate check. Fix the plate, then resume the print."
 _POWER_LOSS_REMINDER_REASON = "The farm could not answer the prompt; it is STILL waiting."
 _Z_REFERENCE_REMINDER_DETAIL = (
     "This printer STILL has a part on its plate after a restart — its Z reference is lost. "
@@ -993,7 +997,9 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
     KIND_POWER_LOSS: (
         "This printer is STILL held at its power-loss prompt and will take no work until the prompt is answered."
     ),
-    KIND_PLATE_VISION: _PLATE_VISION_REMINDER_DETAIL + " The printer is idle and will take no work until then.",
+    # Not paused, so "resume the print" would send the operator looking for a job that is
+    # not waiting: state only what is true — the hold stands and blocks work.
+    KIND_PLATE_VISION: "Plate check hold still open, but the printer is not paused. It takes no work while the hold stands.",
     KIND_Z_REFERENCE_LOST: _Z_REFERENCE_REMINDER_DETAIL,
 }
 

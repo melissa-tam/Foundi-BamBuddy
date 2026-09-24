@@ -7,8 +7,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import settings
@@ -56,7 +57,8 @@ from backend.app.services.printer_manager import (
     supports_drying,
     supports_drying_while_printing,
 )
-from backend.app.services.queue_transitions import claim_pending_for_dispatch, release_unstarted_claim
+from backend.app.services.queue_transitions import claim_pending_for_dispatch
+from backend.app.services.requeue import ReturnOutcome, return_to_queue
 from backend.app.services.smart_plug_manager import smart_plug_manager
 from backend.app.services.spool_selection import (
     DEFAULT_MIN_START_SPOOL_G,
@@ -109,6 +111,32 @@ ACTIVE_PRINT_STATES = _ACTIVE_PRINT_STATES
 # consecutive-failure streak until the whole fleet had quarantined itself overnight.
 # The frontend renders this token via ``utils/waitingReason.ts``.
 WAITING_REASON_LIBRARY_FILE_MISSING = "library_file_missing"
+
+
+def pending_queue_order(*, shortest_first: bool) -> tuple[ColumnElement[Any], ...]:
+    """THE order the scheduler reads its pending rows in — "next" as the dispatcher means it.
+
+    Both orderings group by ``printer_id`` with the NULL-printer rows (model pools,
+    printer-set pools and unassigned rows: the ONE shared position sequence) FIRST, and
+    say so: left implicit, SQLite sorts NULLs first and PostgreSQL last, so one queue
+    was served in two different orders. The list endpoint states the same placement.
+
+    Within a group the stored ``position`` decides — or, under shortest-job-first, a
+    starved row (``been_jumped``, which ``services/requeue.py`` also sets on every plate
+    it puts back) and then the shortest print — and the row ``id`` breaks every
+    remaining tie, so rows with equal positions cannot swap places between ticks.
+    """
+    if shortest_first:
+        return (
+            PrintQueueItem.printer_id.nulls_first(),
+            PrintQueueItem.target_model.asc(),
+            PrintQueueItem.been_jumped.desc(),
+            PrintQueueItem.print_time_seconds.asc().nullslast(),
+            PrintQueueItem.position.asc(),
+            PrintQueueItem.id.asc(),
+        )
+    return (PrintQueueItem.printer_id.nulls_first(), PrintQueueItem.position.asc(), PrintQueueItem.id.asc())
+
 
 # USB pre-flight: the H2 fleet reports USB presence (state.sdcard) ONLY inside a
 # full status report, which we must explicitly request (request_status_update →
@@ -480,28 +508,14 @@ class PrintScheduler:
             # Check if shortest-job-first scheduling is enabled
             sjf_enabled = await self._get_bool_setting(db, "queue_shortest_first")
 
-            # Get all pending items, ordered by printer and position (or SJF order)
-            if sjf_enabled:
-                # SJF: group by printer (and target_model for model-based jobs),
-                # then items already jumped get top priority (starvation guard),
-                # then sort by print_time ascending. Items with no print time go last.
-                result = await db.execute(
-                    select(PrintQueueItem)
-                    .where(PrintQueueItem.status == "pending")
-                    .order_by(
-                        PrintQueueItem.printer_id,
-                        PrintQueueItem.target_model,
-                        PrintQueueItem.been_jumped.desc(),
-                        PrintQueueItem.print_time_seconds.asc().nullslast(),
-                        PrintQueueItem.position,
-                    )
-                )
-            else:
-                result = await db.execute(
-                    select(PrintQueueItem)
-                    .where(PrintQueueItem.status == "pending")
-                    .order_by(PrintQueueItem.printer_id, PrintQueueItem.position)
-                )
+            # Get all pending items in dispatch order: by printer and position, or the
+            # SJF order (group by printer and target_model, jumped/requeued rows first,
+            # then shortest print, rows with no print time last).
+            result = await db.execute(
+                select(PrintQueueItem)
+                .where(PrintQueueItem.status == "pending")
+                .order_by(*pending_queue_order(shortest_first=sjf_enabled))
+            )
             items = list(result.scalars().all())
 
             # Prune the held-pool once-guard against the live pending set so it can't
@@ -3350,14 +3364,15 @@ class PrintScheduler:
         command — the 2026-08-30 01:06:57 shape on printer 4, where an operator declared
         the plate occupied mid-upload and the dispatch erased the declaration and printed
         onto it. Now the declaration REVOKES the lease, the commit refuses, and the
-        dispatch unwinds instead: the row goes back to ``pending`` for the next tick, the
+        dispatch unwinds instead: the row goes back to the queue NEXT in line (or is
+        staged / cancelled with its run — ``requeue.return_to_queue`` decides), the
         uploaded file is removed so it cannot be screen-started as a foreign print, the
         printer claim is dropped, and THE GATE IS LEFT STANDING — it is the operator's
         statement, and it outranks a dispatch that has not happened.
 
-        ``release_unstarted_claim`` remains the one writer of ``printing → pending``;
-        this calls it and ``release_dispatch``, which is the standing division between
-        the row claim and the printer claim.
+        ``requeue.return_to_queue`` un-claims the row (through ``release_unstarted_claim``,
+        the one writer of ``printing → pending``) and this calls ``release_dispatch``,
+        which is the standing division between the row claim and the printer claim.
 
         ``printer_id`` is the dispatch's own printer, handed down from ``_start_print``.
         It cannot be read off the row here: on a POOL row the release sends the unit
@@ -3366,16 +3381,12 @@ class PrintScheduler:
         progress event all name the printer this dispatch was ON.
         """
         removed = await self._cleanup_refused_upload(printer, remote_path, item.id, "a refused commit")
-        released = await release_unstarted_claim(db, item_id=item.id)
+        # ``return_to_queue`` reloads the row it moved into this session's identity map,
+        # so ``item`` reads the unwound state afterwards — every later read on this
+        # session (the caller's ``status == "printing"`` bookkeeping included) must not
+        # believe a dispatch that has just been un-made.
+        outcome = await return_to_queue(db, item.id, cause="refused_commit")
         await db.commit()
-        if released:
-            # The conditional UPDATE ran with ``synchronize_session=False`` and this
-            # fork's sessions do not expire on commit, so the in-memory row still reads
-            # 'printing' — the mirror image of the refresh the CLAIM does a few lines
-            # up. Without it every later read on this session (the caller's
-            # ``status == "printing"`` bookkeeping included) believes a dispatch that
-            # has just been unwound.
-            await db.refresh(item)
         plate_occupancy.release_dispatch(printer_id, f"commit refused ({refusal})")
         logger.warning(
             "Queue item %s: plate gate rose mid-dispatch on printer %s (%s) — dispatch refused, gate left "
@@ -3383,17 +3394,18 @@ class PrintScheduler:
             item.id,
             printer_id,
             refusal,
-            "returned to 'pending'" if released else "was already moved on",
+            "was already moved on" if outcome == "moved_on" else f"returned to the queue ({outcome})",
             remote_filename,
             "removed from" if removed else "COULD NOT BE REMOVED from",
         )
-        dispatch_progress.emit_queue_item_status(
-            item_id=item.id,
-            batch_id=item.batch_id,
-            printer_id=printer_id,
-            status="pending",
-            phase="assigned",
-        )
+        if outcome in ("returned", "staged"):
+            dispatch_progress.emit_queue_item_status(
+                item_id=item.id,
+                batch_id=item.batch_id,
+                printer_id=printer_id,
+                status="pending",
+                phase="assigned",
+            )
 
     def _claim_dispatch_lease(self, printer_id: int, unit_id: int) -> DispatchLease | str:
         """Claim ``printer_id`` for ``unit_id``'s dispatch, or the refusal that stopped it.
@@ -4403,30 +4415,27 @@ class PrintScheduler:
         # Drop the in-memory hold so the retry isn't blocked by it.
         plate_occupancy.release_dispatch(printer_id, "dispatch watchdog")
 
-        # Three outcomes from the revert attempt, each routed differently:
-        #   "reverted":          row flipped from printing -> pending, run recovery
-        #   "already_moved_on":  item.status != 'printing' (completed/cancelled by
+        # Three routes out of the revert attempt, each handled differently:
+        #   un-claimed (returned / staged / cancelled): the row left 'printing' because
+        #                        the print never started — run the MQTT recovery below.
+        #   "moved_on":          item.status != 'printing' (completed/cancelled by
         #                        on_print_complete or user). Skip recovery entirely
         #                        — the print clearly landed somewhere even if the
         #                        watchdog didn't see the active-state transition.
         #   "revert_failed":     SQLite contention exhausted retries. Still run
         #                        recovery so the MQTT session gets a fresh client_id
         #                        on the half-broken-session path.
-        async def _do_revert(db):
-            # ONE writer for "un-claim a printing row whose print never started":
-            # ``queue_transitions.release_unstarted_claim``. This used to be a
-            # hand-rolled ORM read-then-write of the identical transition, which is
-            # the exact shape that module exists to remove (a status read here, the
-            # print landing there, and a write that believes the read). The
-            # conditional UPDATE is also what makes the routing below honest: the
-            # bool IS "did this row move", so a row that raced to completed/cancelled
-            # can no longer be reported as reverted.
-            from backend.app.services.queue_transitions import release_unstarted_claim
-
-            released = await release_unstarted_claim(db, item_id=queue_item_id)
+        async def _do_revert(db: AsyncSession) -> ReturnOutcome:
+            # ONE owner of "put an un-started claim back": ``requeue.return_to_queue``
+            # (through ``queue_transitions.release_unstarted_claim``, the conditional
+            # storage transition). The conditional UPDATE is what makes the routing
+            # below honest: "moved_on" IS "the row did not move", so a row that raced
+            # to completed/cancelled can never be reported as reverted.
+            outcome = await return_to_queue(db, queue_item_id, cause="start_watchdog")
             await db.commit()
-            return "reverted" if released else "already_moved_on"
+            return outcome
 
+        revert_outcome: ReturnOutcome | Literal["revert_failed"]
         try:
             revert_outcome = await run_with_retry(_do_revert, label=f"watchdog revert item={queue_item_id}")
         except Exception as e:
@@ -4439,7 +4448,7 @@ class PrintScheduler:
             )
             revert_outcome = "revert_failed"
 
-        if revert_outcome == "already_moved_on":
+        if revert_outcome == "moved_on":
             # Preserves the pre-#1370 early-return: if on_print_complete (or any
             # other path) already moved the item past 'printing', don't run the
             # MQTT session-recovery logic below — a forced reconnect on a healthy
@@ -4447,27 +4456,29 @@ class PrintScheduler:
             return
 
         total_timeout = timeout + (phase_b_timeout if landed_on_subtask else 0.0)
-        if revert_outcome == "reverted":
+        if revert_outcome != "revert_failed":
             if landed_on_subtask:
                 logger.warning(
                     "Queue item %s: printer %d accepted project_file (subtask_id "
                     "advanced) but never transitioned to an active state within "
-                    "%.0fs — printer wedged post-acceptance; reverted to 'pending' "
-                    "for retry (#1678)",
+                    "%.0fs — printer wedged post-acceptance; returned to the queue "
+                    "(%s) for retry (#1678)",
                     queue_item_id,
                     printer_id,
                     total_timeout,
+                    revert_outcome,
                 )
             else:
                 logger.warning(
                     "Queue item %s: printer %d did not respond to print command within "
-                    "%.0fs (state still %s, subtask_id still %s) — reverted to 'pending' "
-                    "for retry (#967)",
+                    "%.0fs (state still %s, subtask_id still %s) — returned to the queue "
+                    "(%s) for retry (#967)",
                     queue_item_id,
                     printer_id,
                     timeout,
                     pre_state,
                     pre_subtask_id,
+                    revert_outcome,
                 )
 
         # Phase B was entered iff subtask_id advanced, which means the

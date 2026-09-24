@@ -61,7 +61,8 @@ export interface RunPrinterState {
   model_mismatch_reason: string | null;
   /** A unit on this printer is flagged printer_offline_stalled. */
   stalled: boolean;
-  /** The printer's own pre-print vision check found objects on the bed. */
+  /** An open `plate_vision` hold: the printer's own plate check paused a print
+   *  here, and a human fixes the plate and resumes (or stops). */
   vision_hold: boolean;
   /** Live per-printer filament deficit vs a representative pending unit of the
    *  run — this printer can't currently satisfy the plate's filament need. */
@@ -76,15 +77,34 @@ export interface RunPrinterState {
   capability_reason: string | null;
 }
 
+/**
+ * How a unit reached a terminal `cancelled` — `PrintQueueItem.stop_source`.
+ * Mirrors the backend's closed `farm_correlation.StopVerdict` Literal (the one
+ * origin of the live tokens) plus the one stored-history token no writer emits:
+ *
+ * - `operator_ui` / `operator_screen` — a human pressed Stop (queue UI / the
+ *   printer's touchscreen).
+ * - `plate_refused` — the printer's own plate check PAUSED the print and it
+ *   ended without printing (usually an operator stopping the paused print);
+ *   the plate is held and the unit requeued.
+ * - `farm_vision_abort` — HISTORY only: the farm's own stop on a plate-check
+ *   trip, 2026-09-04 → 2026-09-24; no writer remains.
+ * - `reconcile_unknown` — the downtime reconcile could not read this print's
+ *   outcome off the printer.
+ */
+export type UnitStopSource =
+  | 'operator_ui'
+  | 'operator_screen'
+  | 'plate_refused'
+  | 'farm_vision_abort'
+  | 'reconcile_unknown';
+
 /** One queue item of a run, as shown on the run detail page. */
 export interface RunUnit {
   id: number;
   status: 'pending' | 'printing' | 'completed' | 'failed' | 'skipped' | 'cancelled';
-  /** Who stopped it on purpose: 'operator_ui' / 'operator_screen' (a human),
-   *  'farm_vision_abort' (the farm, on a plate-check trip — 2026-09-04), or
-   *  'reconcile_unknown' (the downtime reconcile could not read this print's
-   *  outcome off the printer); else null. */
-  stop_source: string | null;
+  /** Who or what stopped it; null for a completion or a genuine failure. */
+  stop_source: UnitStopSource | null;
   waiting_reason: string | null;
   /** One-time deferred start (UTC ISO); future = held until then, null = ASAP. */
   scheduled_time: string | null;

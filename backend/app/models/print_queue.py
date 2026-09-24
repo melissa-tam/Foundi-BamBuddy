@@ -134,20 +134,20 @@ class PrintQueueItem(Base):
     #   'operator_ui'       Stop pressed in the Bambuddy queue UI;
     #   'operator_screen'   stopped on the printer's own touchscreen (detected from the
     #                       firmware's cancel-echo HMS codes);
-    #   'farm_vision_abort' the FARM stopped the print — the printer's pre-print plate
-    #                       check tripped and ``pause_recovery`` sent the stop. Written
-    #                       onto the ``printing`` row BEFORE the stop goes out, so the
-    #                       terminal HONOURS the mark however the firmware echoes it
-    #                       (the ``note_eject_runtime_exceeded`` contract).
+    #   'plate_refused'     the printer's own plate check PAUSED the job and it ended
+    #                       without printing (usually an operator stopping the paused
+    #                       print) — the plate is held for a human and the unit requeued;
+    #   'farm_vision_abort' HISTORY only (2026-09-04 → 2026-09-24): the retired lane that
+    #                       stopped a paused plate check itself. No writer remains; the
+    #                       run-detail lineage still renders stored rows;
     #   'reconcile_unknown' the DOWNTIME reconcile could not learn this print's outcome
     #                       (the printer came back IDLE, or echoing a different job).
     #                       Nobody stopped it and nothing failed — the farm simply never
     #                       saw how it ended, which is a hold for a human, not a silent
     #                       one-short run.
-    # NULL for a genuine failure or a normal completion. Drives the farm policy: an
-    # attributed operator stop takes NO auto-retry and does NOT count toward quarantine
-    # (Phase 3), while a farm abort REQUEUES the plate lineage-only
-    # (``farm_policy.on_farm_requeue``, W10).
+    # NULL for a genuine failure or a normal completion. LINEAGE and history only since
+    # 2026-09-24: the farm policy reads the verdict off the terminal's one classification
+    # (``terminal_outcome.TerminalOutcome``), never back off this column.
     stop_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Durable mirror of the in-memory PendingEject (services/eject/remote.py): the

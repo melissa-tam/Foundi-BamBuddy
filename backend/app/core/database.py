@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Protocol
 
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
@@ -113,6 +114,65 @@ async def run_with_retry(fn, *, max_attempts: int = 3, label: str = ""):
             )
             await asyncio.sleep(delay)
     raise last_exc  # unreachable, but keeps type checkers happy
+
+
+class _DriverConnection(Protocol):
+    """The one attribute :func:`hold_write_lock` reads off the raw DB-API connection.
+
+    ``sqlite3.Connection`` and ``aiosqlite.Connection`` both carry it, and it is the
+    engine's own answer (``sqlite3_get_autocommit``), not a flag kept beside it.
+    """
+
+    @property
+    def in_transaction(self) -> bool: ...
+
+
+async def hold_write_lock(db: AsyncSession) -> None:
+    """Make ``db``'s transaction hold the SQLite WRITE lock from this statement on.
+
+    Read-then-write inside one SQLite transaction is only safe if the transaction
+    holds the write lock BEFORE its first read. A deferred transaction that reads
+    first is a READ transaction pinned to that snapshot; if another connection then
+    commits, SQLite refuses to upgrade the stale snapshot to a writer and fails the
+    write at once with ``database is locked`` (SQLITE_BUSY_SNAPSHOT) — the busy
+    handler never runs, so ``busy_timeout`` does not help. That is what lost 20
+    requeues in production between 2026-09-06 and 09-24: a SAVEPOINT opened a
+    deferred transaction, ``SELECT max(position)`` pinned the snapshot, the plate
+    authority's persist task committed, and the retry's INSERT died. ``BEGIN
+    IMMEDIATE`` takes the lock up front instead, WAITING (under ``busy_timeout``)
+    for any current writer — so the read that follows sees the latest commit and no
+    other writer can land between it and the write.
+
+    Three cases, decided by the driver's own transaction state:
+
+    * **Not in a transaction** — issue ``BEGIN IMMEDIATE``. Under the driver's legacy
+      transaction control a ``SELECT`` never opens a transaction, so this is the
+      state after any number of reads. ``session.commit()`` / ``rollback()`` end it
+      exactly as they end the driver's implicit one (the driver issues COMMIT/ROLLBACK
+      whenever SQLite reports an open transaction).
+    * **Already in a transaction** — nothing to do. Legacy transaction control opens
+      one implicitly only before INSERT / UPDATE / DELETE / REPLACE, and such a
+      statement took the write lock when it ran. The one other way in is an explicit
+      SAVEPOINT; a caller that composes a position write inside a savepoint that has
+      already READ is back in the stale-snapshot shape above, which is why the retry
+      insert no longer opens one (the startup pool-cutover migration still does, and
+      is safe only because nothing else writes during boot).
+    * **Not SQLite** — nothing to do. PostgreSQL has row-level locking; the position
+      scope's own advisory lock (``queue_builder._lock_position_scope``) serialises
+      its writers there.
+
+    The dialect is read from the LIVE binding rather than the ``is_sqlite()`` settings
+    helper, because the test harness binds sessions to its own SQLite engine while
+    ``settings.database_url`` may name another database.
+    """
+    if db.get_bind().dialect.name != "sqlite":
+        return
+    connection = await db.connection()
+    raw = await connection.get_raw_connection()
+    driver: _DriverConnection = raw.driver_connection
+    if driver.in_transaction:
+        return
+    await connection.exec_driver_sql("BEGIN IMMEDIATE")
 
 
 async def close_all_connections():
@@ -3795,8 +3855,8 @@ async def run_migrations(conn):
     # bottom stop, G92 Z<z_travel>) is emitted for this model ONLY after the hardware
     # ladder flipped this flag through the geometry manager; default FALSE for every
     # model, so a deploy changes no eject motion anywhere (red line 2). hold_lift_mm —
-    # how far the bed rises off its bottom stop while a printer is held after a
-    # confirmed plate-check trip; 12.0 = the vendor's own "avoid end stop" lift in
+    # how far the bed rises off its bottom stop after the printer's plate check refused
+    # the plate and the paused job was stopped; 12.0 = the vendor's own "avoid end stop" lift in
     # the stock start G-code; the operator sets whatever clears their plate-release
     # aid (a hardware number — config/DB by red line 3, never code).
     await _safe_execute(
@@ -4439,6 +4499,14 @@ async def run_migrations(conn):
         conn,
         "CREATE INDEX IF NOT EXISTS ix_printer_incident_item_id ON printer_incident (item_id)",
     )
+    # Migration (2026-09-24, 003-H2S): the printer's OWN words for a hold — the firmware
+    # full HMS codes recorded when the row opened (``printer_incidents.open_new`` from
+    # every opener). A hold outlives the printer's dialog (a ladder verb, a stop or the
+    # next job clears it), and the operator must still read "align the build plate" on
+    # the card. Additive and nullable: a row opened before this column exists renders
+    # from its short ``code``. Idempotent ADD COLUMN (``_safe_execute`` swallows
+    # "duplicate column name" / "already exists"); VARCHAR is valid on both dialects.
+    await _safe_execute(conn, "ALTER TABLE printer_incident ADD COLUMN hms_full_codes VARCHAR(512)")
 
     # Migration (2026-09-23, 012-H2S shape 41): the recovery driver's STEP LEDGER, a 3NF
     # child of printer_incident. The wire cannot restate which verbs a driver already
@@ -5595,6 +5663,75 @@ async def run_migrations(conn):
                 "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a "
                 "later boot retries it",
                 _oor_repair_marker,
+            )
+
+    # One-time repair (2026-09-24, 003-H2S): close every OPEN ``plate_vision`` row the
+    # retired 2026-09-04 lane left behind. That lane opened the row and then STOPPED the
+    # print itself, so no open row of it describes a job that is still paused: each one's
+    # print is already over, and under the new ``job_pause`` class (closed only by its own
+    # job's resume or terminal) such a row would never close — it would block dispatch,
+    # page hourly and stand the power-loss and AMS resumes down on that printer for good.
+    # The plate gates those trips raised are the plate authority's and are NOT touched:
+    # whether a plate is clear stays the operator's call (Mark plate cleared).
+    #
+    # Shape B (durable settings marker) rather than a self-predicating UPDATE: after this
+    # deploy a NEW open plate_vision row is a genuine paused job, and a re-running
+    # predicate could not tell it from a legacy one. The marker INSERT rides the SAME
+    # savepoint as the closes, so the pair is all-or-nothing and a second boot is a no-op.
+    # Runs before the incident cache is rehydrated at startup, so no projection goes
+    # stale. One line per row, carrying its pre-image — the log is this repair's only
+    # rollback. Fully guarded: a repair that cannot run must never take startup down,
+    # and its rollback leaves the marker unwritten so a fixed build simply tries again.
+    _vision_repair_marker = "repair_open_plate_vision_20260924"
+    _vision_repair_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _vision_repair_marker})
+    ).scalar()
+    if not _vision_repair_done:
+        _vision_log_tag = f"[REPAIR] {_vision_repair_marker}:"
+        try:
+            _open_vision_rows = (
+                await conn.execute(
+                    text(
+                        "SELECT id, printer_id, job_id, item_id, status, created_at FROM printer_incident "
+                        "WHERE kind = 'plate_vision' AND resolved_at IS NULL ORDER BY id"
+                    )
+                )
+            ).fetchall()
+            async with conn.begin_nested():
+                for _v_id, _v_printer, _v_job, _v_item, _v_status, _v_created in _open_vision_rows:
+                    await conn.execute(
+                        text(
+                            "UPDATE printer_incident SET status = 'resolved', resolved_at = :now, "
+                            "resolve_source = :source WHERE id = :id AND resolved_at IS NULL"
+                        ),
+                        # ``resolve_source`` is VARCHAR(24): "legacy_vision_stop" (18) says
+                        # why — the retired lane stopped the print this row held.
+                        {"now": _dt.utcnow(), "source": "legacy_vision_stop", "id": _v_id},
+                    )
+                    logger.info(
+                        "%s incident %s closed (printer %s, job %r, item %s, was %s since %s): the retired "
+                        "lane stopped this print; its plate gate, if any, is left to the operator",
+                        _vision_log_tag,
+                        _v_id,
+                        _v_printer,
+                        _v_job,
+                        _v_item,
+                        _v_status,
+                        _v_created,
+                    )
+                await conn.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _vision_repair_marker},
+                )
+            logger.info("%s %d open plate_vision row(s) closed (one-time)", _vision_log_tag, len(_open_vision_rows))
+        except Exception:  # noqa: BLE001 — a repair must never take startup down for every install
+            logger.exception(
+                "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a later "
+                "boot retries it",
+                _vision_repair_marker,
             )
 
     # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds

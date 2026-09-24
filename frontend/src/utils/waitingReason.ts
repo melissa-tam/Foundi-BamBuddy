@@ -45,10 +45,11 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
     case 'print_paused_stalled':
       return t('productionRuns.detail.waiting.printPausedStalled');
     case 'plate_not_empty_printer_detected':
-      // The printer's own vision check tripped TWICE in the window: the farm
-      // stopped the print and raised a human-clear plate gate. Copy (not the
-      // key) changed in the 2026-09-04 wave — the print is stopped, not paused,
-      // so "resume on the printer" is no longer a thing an operator can do.
+      // The printer's own plate check tripped and PAUSED the print; the farm
+      // sends nothing and holds it for a human (a `plate_vision` hold). The
+      // operator fixes the plate and resumes — the same job continues. A Stop
+      // instead raises a human-clear plate gate on the card. (The 2026-09-04
+      // wave had the farm stop the print here; that was reverted 2026-09-24.)
       return t('productionRuns.detail.waiting.visionHold');
     case 'power_loss_hold':
       // The printer is sitting at the firmware's OWN power-loss prompt and the

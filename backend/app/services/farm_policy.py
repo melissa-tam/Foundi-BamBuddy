@@ -28,12 +28,11 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, get_args
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
@@ -41,52 +40,28 @@ from backend.app.models.farm_cycle_episode import KIND_EJECT
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
-from backend.app.models.printer_incident import (
-    FAULT_KINDS,
-    KIND_PLATE_VISION,
-    RESOLVE_TERMINAL,
-    STATUS_ESCALATED,
-    STATUS_RESOLVED,
-)
 from backend.app.models.sku import SkuFile
 from backend.app.schemas.settings import AppSettings
-from backend.app.services import farm_correlation, pause_recovery, printer_incidents
+from backend.app.services import farm_correlation, pause_recovery, requeue
 from backend.app.services.cycle_episodes import record_episode
-from backend.app.services.dispatch_target import DispatchTarget, target_of
+from backend.app.services.dispatch_target import DispatchTarget
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
 from backend.app.services.hms_errors import format_hms_error_summary
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.queue_builder import create_queue_items, requeue_fields
+from backend.app.services.queue_builder import create_queue_items
 from backend.app.services.sku_catalog import plate_units
 from backend.app.utils.printer_models import is_bedslinger_model
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from backend.app.services.terminal_outcome import TerminalOutcome
+
 logger = logging.getLogger(__name__)
 
 _TERMINAL_RUN_OUTCOMES = ("completed", "failed")
-
-# The verdicts ``classify_stop`` can produce, read back off the row it was persisted
-# on. One origin: the Literal in ``farm_correlation`` (a new verdict is registered
-# there and this set follows), never a second hand-written tuple.
-_STOP_VERDICTS: frozenset[str] = frozenset(get_args(farm_correlation.StopVerdict))
-
-# An operator stop while the printer carries an OPEN incident is "do this plate
-# again", not "cancel the work" — the operator stopped a print the machine was
-# already holding (jam, runout, physical, plate check, power loss). A plain operator
-# stop with no incident keeps today's semantics.
-_INCIDENT_REQUEUE_VERDICTS: frozenset[str] = frozenset({"operator_ui", "operator_screen"})
-
-# How far back a plate-check trip looks for the PREVIOUS trip on the same printer.
-# Derived from what the two ends of the window have to separate: a re-check
-# re-dispatches within minutes (the requeued unit takes the next scheduler tick and
-# its own start-gcode IS the re-check), so an hour comfortably contains two genuine
-# consecutive trips; and an unrelated trip a shift later must NOT be counted as the
-# second, because "twice in a row" is the whole evidence for calling a plate occupied.
-_VISION_RECHECK_WINDOW_S = 3600.0
 
 # The vendor's own pre-home Z primitive, from the stock H2S machine-start block's
 # ``;===== avoid end stop =====`` sequence (``G380 S2 Z32 F1200`` / ``G380 S2 Z-12
@@ -96,23 +71,6 @@ _VISION_RECHECK_WINDOW_S = 3600.0
 # figure, kept rather than re-derived: its only job is to reach the stop from wherever
 # the firmware parked the bed after the pause.
 VISION_HOLD_PROBE_MM = 32.0
-
-# How far a lineage walk will climb before giving up. A retry chain is bounded by the
-# per-unit cap in practice; the guard exists for a corrupted self-referencing chain,
-# and mirrors ``production_run.top_up_run``'s own walk guard.
-_LINEAGE_WALK_MAX = 1000
-
-# The operator sentence the CONFIRMED plate-check hold pages with. ``source_detail``
-# is rendered into the notification body (``notification_service.on_plate_not_empty``),
-# so it is a sentence and not a token. It replaces the pre-2026-09-04 copy, whose
-# closing instruction — "Resume on the printer screen" — became false the moment the
-# farm started STOPPING the print; and it carries the standing triage line, because
-# repeated trips on one printer are a statement about that printer's eject profile.
-_VISION_CONFIRMED_DETAIL = (
-    "Printer vision detected the plate is not empty on two consecutive starts — the farm stopped the print "
-    "and requeued the plate. Clear the bed, then Mark plate cleared. Repeated hits on one printer mean the "
-    "eject profile is not releasing parts: re-run that profile's hardware ladder."
-)
 
 
 def _hms_summary(hms_errors: list[dict] | None) -> str | None:
@@ -294,12 +252,22 @@ async def on_terminal(
     completed_subtask_id: str | None = None,
     completed_subtask_name: str | None = None,
     hms_errors: list[dict] | None = None,
+    outcome: TerminalOutcome | None = None,
 ) -> None:
     """React to a terminal print status. Non-farm prints are a no-op.
 
-    Called once from ``main.on_print_complete`` (the notification flow, where the
-    finish photo is available). Wraps each sub-action so a notification failure
-    can never abort a committed state change.
+    Called ONCE per terminal from ``main.on_print_complete``, as its own spawned task
+    with its own session — independent of the notification, which used to host it (and
+    whose failure could take the policy down with it). Wraps each sub-action so a
+    notification failure can never abort a committed state change.
+
+    ``outcome`` is the terminal's ONE classification (``terminal_outcome``), built before
+    any consumer mutated state; the disposition reads its VERDICT and the fault kinds it
+    captured, never the store after the terminal's own closers ran. ``final_status`` is
+    its ``recorded_status``. The other callers — the scheduler's dispatch-time failure
+    and the monitor's downtime eject reconciles — have no printer classification to hand
+    over and pass none: no verdict, no captured fault, which is exactly what those
+    terminals are.
 
     ``completed_subtask_id`` / ``completed_subtask_name`` are the terminal payload's
     subtask id + name, used to confirm that a terminal is really the server-dispatched
@@ -539,14 +507,18 @@ async def on_terminal(
                             await _maybe_pause_run_no_printers(db, batch)
                 return
 
-        # 2. A plate check the farm answered on a print it did NOT dispatch. There is
-        #    no queue item, so the item-based policy below can never see it — but the
-        #    hold, the gate, the page and the bed lift are owed all the same. Gated on
-        #    the DB-free projection first, so the ordinary terminal pays nothing.
-        if printer_id is not None and queue_item_id is None:
-            if printer_incidents.snapshot(printer_id, kind=KIND_PLATE_VISION) is not None:
-                await _on_plate_vision_terminal(db, batch=None, item=None, printer_id=printer_id)
-                return
+        # 2. A REFUSED plate: the printer's own plate check paused this job and it ended
+        #    without printing. The plate authority already holds the plate for a human
+        #    (the terminal's one plate call), so what is owed here is the one motion — the
+        #    bed lifted off the plate-release aid, where the firmware parked it for the
+        #    whole pause — farm unit or foreign print alike; a farm unit is then requeued
+        #    below.
+        if (
+            printer_id is not None
+            and outcome is not None
+            and outcome.verdict == farm_correlation.STOP_VERDICT_PLATE_REFUSED
+        ):
+            await _maybe_lift_held_bed(db, printer_id)
 
         # 3. Item-based policy.
         if queue_item_id is None:
@@ -571,16 +543,14 @@ async def on_terminal(
             await db.commit()
 
         # The DISPOSITION is decided ONCE, from why the print ended, and AHEAD of the
-        # ``final_status`` fork below. Two reasons it cannot ride the status instead:
-        # a first-article unit's no-deposit stop deliberately keeps ``failed`` (so a
-        # genuine FA failure still retries), which would route the farm's OWN abort
-        # into ``_on_item_failed`` plus a quarantine count for a plate the farm itself
-        # refused; and a dispatch-time failure arrives here as ``failed`` with no
-        # rewrite at all. ``completed`` is excluded: a stop that lost the race to a
-        # finishing print produced a part, and requeuing it would print an extra plate.
-        verdict = _stop_verdict(item)
-        if final_status != "completed" and await _requeues_gracefully(db, item, verdict):
-            await on_farm_requeue(db, batch, item, verdict=verdict)
+        # ``final_status`` fork below — the terminal's classification says it, not the
+        # status string: a dispatch-time failure arrives here as ``failed`` with no
+        # verdict at all, and a refused first article is recorded ``cancelled`` precisely
+        # so it never reaches ``_on_item_failed``. ``completed`` is excluded: a stop that
+        # lost the race to a finishing print produced a part, and requeuing it would
+        # print an extra plate.
+        if final_status != "completed" and _requeues_gracefully(outcome):
+            await on_farm_requeue(db, batch, item, outcome=outcome)
             return
 
         if final_status == "completed":
@@ -731,45 +701,16 @@ async def _on_item_failed(db: AsyncSession, batch: PrintBatch, item: PrintQueueI
         return
 
     retry_max = batch.retry_max_per_unit if batch.retry_max_per_unit is not None else 1
-    if await _genuine_failure_count(db, item) < retry_max:
+    # The cap counts the plate's GENUINE failures — the FAILED ancestors of its chain,
+    # not ``retry_count`` (the generation index every lineage-only requeue advances).
+    if await requeue.failed_ancestor_count(db, item) < retry_max:
         # A paused run keeps re-queuing failed units, but STAGED (manual_start=True)
         # so the retry can't dispatch while paused; resume's manual_start sweep
         # releases it (R1). An active run's retry dispatches as today.
-        await create_retry_if_absent(db, item, stage_manual=batch.status == "paused")
+        await requeue.requeue_attempt(item.id, cause="failed", stage_manual=batch.status == "paused")
     await maybe_quarantine_printer(db, batch, item)
     await _maybe_pause_run_no_printers(db, batch)
     await _maybe_pause_run_exhausted(db, batch)
-
-
-async def _genuine_failure_count(db: AsyncSession, item: PrintQueueItem) -> int:
-    """How many GENUINE failures this plate's lineage has already produced.
-
-    The cap ``farm_retry_max_per_unit`` bounds retries of a plate that FAILED — a
-    print that burned filament and produced nothing. It used to be read off
-    ``retry_count``, which is the chain's generation INDEX, so every requeue consumed
-    it: once the plate-check re-check and the fault-held operator stop started minting
-    lineage-only requeues (:func:`on_farm_requeue`), a plate the farm itself refused
-    would have spent the one retry a later genuine failure needs.
-
-    So the cap is DERIVED (no new column): walk the ``retry_of_id`` chain upward and
-    count the ancestors whose status is ``failed``. A lineage-only requeue's ancestor
-    is ``cancelled`` and contributes nothing, while a genuine failure contributes
-    exactly as it did before — the original attempt has 0 failed ancestors and gets its
-    retry, that retry has 1 and gets none. The walk is bounded by the chain length and
-    guarded against a corrupted self-referencing chain.
-    """
-    count = 0
-    cursor = item
-    for _ in range(_LINEAGE_WALK_MAX):
-        if cursor.retry_of_id is None:
-            break
-        parent = await db.get(PrintQueueItem, cursor.retry_of_id)
-        if parent is None:
-            break
-        if parent.status == "failed":
-            count += 1
-        cursor = parent
-    return count
 
 
 async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
@@ -817,55 +758,40 @@ async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueue
 # --------------------------------------------------------------------------- #
 # Graceful requeue — the third terminal disposition
 # --------------------------------------------------------------------------- #
-def _stop_verdict(item: PrintQueueItem) -> str | None:
-    """``classify_stop``'s verdict for this unit, read back off the row.
-
-    NOT a second classifier: ``farm_correlation.classify_stop`` decides, and
-    ``main.on_print_complete`` persists that decision onto ``stop_source`` before this
-    hook runs (the farm's own abort mark is stamped even earlier — by
-    ``pause_recovery.on_plate_vision_trip``, BEFORE the stop goes out, which is what
-    makes it survive a restart between the stop and the terminal). The column is where
-    the verdict reaches this module, so reading it here is reading the classification.
-
-    Anything outside the closed Literal answers ``None`` — an unrecognised value is a
-    row from an older build or a column somebody else wrote, and neither is a verdict
-    this policy may act on.
-    """
-    source = item.stop_source
-    return source if source in _STOP_VERDICTS else None
-
-
-async def _requeues_gracefully(db: AsyncSession, item: PrintQueueItem, verdict: str | None) -> bool:
+def _requeues_gracefully(outcome: TerminalOutcome | None) -> bool:
     """Does this terminal mean "do this plate again" rather than "it failed/was cancelled"?
 
-    Two routes, and only two:
+    Read off the terminal's ONE classification — its verdict and the fault kinds it
+    captured BEFORE any closer ran — never off the store afterwards. Two routes, and only
+    two:
 
-    * the FARM stopped the print — the pre-print plate check tripped and
-      ``pause_recovery`` sent the stop. Nothing was consumed and nothing failed;
-    * an OPERATOR stopped a print on a printer that carries an open EQUIPMENT FAULT.
-      The machine was already holding (jam, runout, physical fault, plate check, power
-      loss) and the human stopping it is finishing what the hold started — the plate
-      still has to be made. A plain operator stop with NO fault is unchanged: it
-      means "cancel this work", and keeps :func:`on_operator_stop`'s semantics
-      (cancelled, the run holds, RESUME tops the deficit back up).
+    * the printer REFUSED the plate (``plate_refused``): its own plate check paused the
+      job, and the job ended without printing. Nothing was consumed and nothing failed.
+    * an OPERATOR stopped a print while the printer held an open EQUIPMENT FAULT
+      (runout, jam, physical, power loss, …). The machine was already holding and the
+      human stopping it is finishing what the hold started — the plate still has to be
+      made. This is the 2026-09-11 ruling, and it depends on the capture: the terminal's
+      own closer ends a ``wire`` hold (runout / jam / power loss) at this very terminal,
+      so a store read here would find nothing, and in production it never fired. A plain
+      operator stop with NO fault is unchanged: it means "cancel this work", and keeps
+      :func:`on_operator_stop`'s semantics (cancelled, the run holds, RESUME tops the
+      deficit back up).
 
-    **A HOLD IS NOT A FAULT**, which is why the second route reads
-    :data:`FAULT_KINDS` and not every open row. A ``service_hold`` is the operator
-    saying "I am taking this machine" — nothing is broken and nothing was interrupted
-    by the equipment — so an operator who then presses Stop means exactly what they
-    would mean on a healthy printer: cancel this unit. Reading the un-narrowed "any
-    open incident" question instead would silently requeue the plate, and the run
-    would never hold for the RESUME that tops it back up. A real fault standing
-    BESIDE a hold still requeues: the fault is what the question is about.
+    **A HOLD IS NOT A FAULT**: ``faults_open`` is the ``FAULT_KINDS`` subset, so an
+    operator who stops a print on a printer whose only hold is maintenance mode keeps
+    the ordinary operator-stop disposition — nothing is broken and nothing was
+    interrupted by the equipment.
     """
-    if verdict == farm_correlation.STOP_SOURCE_FARM_VISION_ABORT:
+    if outcome is None:
+        return False
+    if outcome.verdict == farm_correlation.STOP_VERDICT_PLATE_REFUSED:
         return True
-    if verdict in _INCIDENT_REQUEUE_VERDICTS and item.printer_id is not None:
-        return await printer_incidents.get_open(db, item.printer_id, kinds=FAULT_KINDS) is not None
-    return False
+    return outcome.operator_stopped and bool(outcome.faults_open)
 
 
-async def on_farm_requeue(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem, *, verdict: str | None) -> None:
+async def on_farm_requeue(
+    db: AsyncSession, batch: PrintBatch, item: PrintQueueItem, *, outcome: TerminalOutcome | None
+) -> None:
     """The plate was REFUSED, not failed: queue it again with the same settings.
 
     The third disposition beside completed / failed / operator-stop, and deliberately
@@ -874,25 +800,27 @@ async def on_farm_requeue(db: AsyncSession, batch: PrintBatch, item: PrintQueueI
     - **lineage only.** The requeue carries ``retry_of_id`` / ``retry_count`` so the
       run-detail chain reads as one plate, but it never consumes
       ``farm_retry_max_per_unit``: the cap counts the FAILED ancestors of the chain
-      (:func:`_genuine_failure_count`), and this row is ``cancelled``. A plate that was
-      vision-re-checked once and then genuinely fails still gets its one retry.
+      (``requeue.failed_ancestor_count``), and this row is ``cancelled`` — a refused
+      first article included (``terminal_outcome`` records it so).
     - **not quarantine-counted.** ``cancelled`` is outside ``_TERMINAL_RUN_OUTCOMES``
-      by design, so ``recent_terminal_farm_items`` never sees it. The printer is held
-      by its incident where it deserves to be, which is the honest hold.
+      by design, so ``recent_terminal_farm_items`` never sees it.
     - **it does not pause the run.** Neither ``_maybe_pause_run_no_printers`` nor
       ``_maybe_pause_run_exhausted`` is evaluated: nothing was exhausted and no printer
-      became unavailable. When the requeue stays PINNED to the held printer the unit
-      simply waits ``pending`` on it, carrying the ``waiting_reason`` that projects the
-      hold, and the run stays ``active``.
-    - **the plate is left to the terminal's own deposit evidence**, exactly as
-      ``_on_item_failed`` leaves it — except on the confirmed plate-check path, which
-      raises a human-clear gate of its own (see :func:`_on_plate_vision_terminal`).
+      became unavailable.
+    - **the plate is the authority's.** A refused plate was gated by the terminal's one
+      plate call (``note_terminal`` with the refusal); a fault stop leaves the plate to
+      the terminal's own deposit evidence, exactly as ``_on_item_failed`` does. No
+      second plate write lives here.
 
-    The requeue's TARGET follows ``create_retry_if_absent``'s existing rule: a pool
-    unit returns to the pool (so the scheduler re-searches and may pick another
-    machine), a genuinely PINNED unit keeps its pin — operator intent outranks the
-    farm's preference, and the gate on a held printer is what stops it dispatching.
+    The requeue itself is ``requeue.requeue_attempt``'s: the plate lands NEXT in line
+    (the head of its scope), a pool unit returns to the pool (so the scheduler
+    re-searches and may pick another machine), and a genuinely PINNED unit keeps its
+    pin — the gate on the held printer is what stops it dispatching there. The source
+    row's terminal state is already COMMITTED (``main.on_print_complete`` writes it
+    before this task is spawned, and :func:`on_terminal` commits its hygiene first) —
+    the verb's own precondition.
     """
+    verdict = outcome.verdict if outcome is not None else None
     if batch.status in ("cancelled", "completed"):
         # Same rule as _on_item_failed: a terminal run must never mint a dispatchable
         # unit (R1/R2 — a cancelled run would silently print one more plate).
@@ -905,169 +833,31 @@ async def on_farm_requeue(db: AsyncSession, batch: PrintBatch, item: PrintQueueI
         )
         return
 
-    if verdict == farm_correlation.STOP_SOURCE_FARM_VISION_ABORT:
-        await _on_plate_vision_terminal(db, batch=batch, item=item, printer_id=item.printer_id)
-        return
-
-    retry = await create_retry_if_absent(db, item, stage_manual=batch.status == "paused")
+    refused = verdict == farm_correlation.STOP_VERDICT_PLATE_REFUSED
+    retry = await requeue.requeue_attempt(
+        item.id, cause="plate_check" if refused else "fault_stop", stage_manual=batch.status == "paused"
+    )
     logger.info(
-        "farm_policy: unit %s requeued as %s — operator stopped a print its printer was already holding "
-        "(%s); lineage only, no quarantine count, run %s stays %s",
+        "farm_policy: unit %s requeued as %s — %s; lineage only, no quarantine count, run %s stays %s",
         item.id,
-        retry.id if retry is not None else "already requeued",
-        verdict,
+        retry.item_id if retry is not None else "nothing (see the requeue line)",
+        "the printer's plate check refused the plate"
+        if refused
+        else f"operator stopped a print its printer was already holding ({verdict}, faults "
+        f"{sorted(outcome.faults_open) if outcome is not None else []})",
         batch.id,
         batch.status,
     )
 
 
-async def _on_plate_vision_terminal(
-    db: AsyncSession,
-    *,
-    batch: PrintBatch | None,
-    item: PrintQueueItem | None,
-    printer_id: int | None,
-) -> None:
-    """The post-terminal half of a plate-check trip: re-check once, then hold.
-
-    ``pause_recovery`` owns the trip itself (the incident, the abort mark, the stop);
-    everything from the terminal on is here, because only this lane can tell a FIRST
-    trip from a CONFIRMED one and only it owns the requeue.
-
-    **First trip in the window = a re-check.** The printer said the plate is not empty;
-    it may be right, and it may be a shadow, a smear or a plate marker it misread. The
-    cheapest way to find out is to print the plate again — the requeued job's OWN
-    start-gcode runs the same check, so the printer answers its own question within
-    minutes. The incident closes ``resolved``: nothing is held, nobody is paged.
-    The plate gate stays DOWN unless the farm cannot vouch for that second opinion —
-    see :func:`_farm_can_vouch_for_plate_check` and the deposit test below — in which
-    case the gate goes up (fail closed) and the requeue waits behind it.
-
-    **Second trip within the window = CONFIRMED.** Two independent starts agreeing is
-    the evidence; the incident is escalated into a human's hold (chip + hourly nag),
-    the human-clear plate gate goes up, one page goes out, the unit is requeued, and
-    the bed is lifted off its stop so the part is reachable. The gate is raised HERE,
-    after the terminal, and never before it: ``note_terminal`` would otherwise replace
-    it with a cooldown eject built for a part that is not there.
-
-    **A FOREIGN print is confirmed on its first trip.** There is no unit to requeue and
-    therefore no second opinion to buy — the print the farm stopped will not restart
-    itself — so the hold, the gate, the page and the lift are owed immediately.
-    """
-    if printer_id is None:
-        logger.info("farm_policy: plate-check terminal with no printer — nothing to decide")
-        return
-
-    # Its OWN row: since 2026-09-11 a printer can hold more than one incident, so an
-    # AMS fault standing beside the trip neither owns the plate nor pre-empts this
-    # decision (the "another kind owns the printer" stand-aside was an artifact of
-    # one-open-per-printer and is gone).
-    incident = await printer_incidents.get_open(db, printer_id, kinds={KIND_PLATE_VISION})
-    if incident is None and item is None:
-        return  # the foreign hold was already decided (idempotent re-entry)
-    if incident is not None and incident.status == STATUS_ESCALATED:
-        # The hold is already standing: this printer was confirmed on an earlier
-        # terminal and is waiting for a human. Re-deciding it would re-page and
-        # re-lift on every terminal the printer produces until the plate is cleared.
-        logger.info(
-            "farm_policy: printer %s already held for a confirmed plate check — terminal noted, nothing re-decided",
-            printer_id,
-        )
-        return
-
-    since = datetime.utcnow() - timedelta(seconds=_VISION_RECHECK_WINDOW_S)
-    trips = await printer_incidents.count_recent(db, printer_id, KIND_PLATE_VISION, since=since)
-    codes = (incident.codes if incident is not None else "") or KIND_PLATE_VISION
-
-    # A foreign print buys no second opinion; a farm unit does, once.
-    confirmed = item is None or trips >= 2
-
-    if not confirmed:
-        vouched = _farm_can_vouch_for_plate_check(printer_id)
-        deposited = plate_occupancy.is_plate_occupied(printer_id)
-        if vouched and not deposited:
-            if incident is not None:
-                await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_TERMINAL)
-            retry = await create_retry_if_absent(db, item, stage_manual=batch is not None and batch.status == "paused")
-            logger.info(
-                "farm_policy: printer %s plate check tripped once (%s) — unit %s requeued as %s for the "
-                "printer's own re-check; no gate, no page",
-                printer_id,
-                codes,
-                item.id,
-                retry.id if retry is not None else "already requeued",
-            )
-            return
-        # Cannot vouch for the second opinion: either the printer does not report its
-        # build-plate detector ON (so the requeued start may not re-check at all), or
-        # this terminal carried a DEPOSIT — which after a restart means "peaks unknown,
-        # fail closed", i.e. the farm does not know what is on that plate. Gate it for
-        # a human and send the plate somewhere else.
-        plate_occupancy.note_plate_detected(printer_id, f"plate_vision_unvouched:{codes}")
-        if incident is not None:
-            await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_TERMINAL)
-        retry = await create_retry_if_absent(db, item, stage_manual=batch is not None and batch.status == "paused")
-        logger.warning(
-            "farm_policy: printer %s plate check tripped once (%s) but the farm cannot vouch for a re-check "
-            "(detector_on=%s, deposit=%s) — human-clear gate raised, unit %s requeued as %s",
-            printer_id,
-            codes,
-            vouched,
-            deposited,
-            item.id,
-            retry.id if retry is not None else "already requeued",
-        )
-        return
-
-    # CONFIRMED.
-    if incident is not None:
-        await printer_incidents.mark_escalated(db, incident.id)
-    plate_occupancy.note_plate_detected(printer_id, f"plate_vision_confirmed:{codes}")
-    retry = None
-    if item is not None:
-        retry = await create_retry_if_absent(db, item, stage_manual=batch is not None and batch.status == "paused")
-    logger.warning(
-        "farm_policy: printer %s plate check CONFIRMED (%s, %d trip(s) in the window) — printer held for a "
-        "human, plate gated, unit %s",
-        printer_id,
-        codes,
-        trips,
-        f"{item.id} requeued as {retry.id}" if (item is not None and retry is not None) else "foreign print",
-    )
-    try:
-        from backend.app.services.eject.monitor import notify_plate_not_empty
-
-        await notify_plate_not_empty(printer_id, source_detail=_VISION_CONFIRMED_DETAIL)
-    except Exception:  # noqa: BLE001 — a page must never abort a committed hold
-        logger.warning("farm_policy: plate-check page failed for printer %s", printer_id, exc_info=True)
-    await _maybe_lift_held_bed(db, printer_id)
-
-
-def _farm_can_vouch_for_plate_check(printer_id: int) -> bool:
-    """Will the printer run its own plate check again on the requeued job?
-
-    The re-check disposition rests entirely on that: the requeued job's start-gcode IS
-    the second opinion, and it is only an opinion if the detector is on. The printer
-    reports it in ``xcam`` (``PrintOptions.buildplate_marker_detector``), so this is a
-    read of the live state and not an assumption.
-
-    Fails CLOSED in every unknown: no live state, no ``print_options``, or the flag
-    simply not reported all answer "cannot vouch", which costs a plate gate and a
-    human glance — the opposite mistake dispatches the next unit onto a plate the
-    printer has just said is occupied.
-    """
-    state = printer_manager.get_status(printer_id)
-    options = getattr(state, "print_options", None) if state is not None else None
-    return bool(getattr(options, "buildplate_marker_detector", False))
-
-
 async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
-    """Raise the bed off its bottom stop while a confirmed plate check holds the printer.
+    """Raise the bed off its bottom stop after the printer refused its plate.
 
     The firmware parks the bed at the BOTTOM of travel when its HMS pauses the job —
-    on this farm that is onto the operator's plate-release aid, where it will sit for
-    as long as the hold lasts, and where a part is awkward to reach. So the bed is
-    given a small clearance, once, at the moment the hold is raised.
+    on this farm that is onto the operator's plate-release aid, where it sits for the
+    whole plate-check pause and where the plate is awkward to reach once the job has
+    been stopped. So the bed is given a small clearance, once, at the refused plate's
+    terminal.
 
     It is the vendor's own sequence, and every line of it is load-bearing:
 
@@ -1121,72 +911,6 @@ async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
             logger.warning("farm_policy: held-bed lift command refused on printer %s", printer_id)
     except Exception:  # noqa: BLE001 — cosmetic lane: never raises into the terminal chain
         logger.warning("farm_policy: held-bed lift failed on printer %s", printer_id, exc_info=True)
-
-
-# --------------------------------------------------------------------------- #
-# Retry
-# --------------------------------------------------------------------------- #
-async def create_retry_if_absent(
-    db: AsyncSession, item: PrintQueueItem, *, stage_manual: bool = False
-) -> PrintQueueItem | None:
-    """Create exactly one requeue of ``item`` (idempotent via retry_of_id).
-
-    The new row carries the source unit's SETTINGS through the one allowlist,
-    ``queue_builder.requeue_fields`` — every print option and configuration column,
-    including the ``first_article`` flag (a failed first article is re-attempted as a
-    first article). Before that allowlist existed this function copied 16 columns and
-    silently reverted 19 to model defaults, so a retry printed with calibrations,
-    filament overrides and slot pins the operator had not chosen. ``stage_manual``
-    stages the requeue (``manual_start=True``) so it can't dispatch onto a paused run;
-    the resume sweep releases it.
-
-    LINEAGE is written here and never copied: ``retry_of_id`` (the DB-backed
-    idempotency guard) and ``retry_count`` (the generation index the run-detail chain
-    renders). ``retry_count`` is NOT the genuine-failure cap — the caller derives that
-    from the FAILED ancestors of the chain (:func:`_genuine_failure_count`), which is
-    what lets a lineage-only requeue (:func:`on_farm_requeue`) leave a unit's one retry
-    intact.
-
-    Rebalance (F7): the retry inherits the failed unit's TARGET, never its
-    ``printer_id``. A POOL unit's retry therefore returns to the pool
-    (``printer_id=None`` plus the pool's own columns) so the scheduler can pick a
-    healthy member and recompute its AMS mapping — the failed row's ``printer_id`` is
-    the attribution RECORD of where this attempt ran, and copying it would pin the
-    chain to the machine that just failed it. A genuinely PINNED unit keeps its pin
-    (operator intent; the failing printer's own quarantine→pause→recover path owns
-    that). The per-printer plate-clear gate is unaffected either way.
-    """
-    existing = await db.execute(select(PrintQueueItem.id).where(PrintQueueItem.retry_of_id == item.id))
-    if existing.first() is not None:
-        return None  # already retried this failure event
-
-    target = target_of(item)
-    fields = {
-        **requeue_fields(item),
-        "status": "pending",
-        "manual_start": stage_manual,
-        "retry_count": (item.retry_count or 0) + 1,
-        "retry_of_id": item.id,
-        # Spread LAST: all three target columns, so the retry can never wear a
-        # leftover column from a kind it does not claim.
-        **target.fields(),
-    }
-    try:
-        # SAVEPOINT (not a bare rollback): the unique-``retry_of_id`` violation of a
-        # race loser (R4) is contained to the savepoint, so the outer transaction and
-        # the loaded ``batch``/``item`` ORM state survive — the caller then still
-        # evaluates quarantine/pause. A full ``db.rollback()`` here would expire those
-        # objects and the caller's next attribute access would raise MissingGreenlet.
-        # Precedent: services/location_service.py:74-106.
-        async with db.begin_nested():
-            created = await create_queue_items(db, count=1, printer_id=target.printer_id, fields=fields)
-            await db.flush()
-        await db.commit()
-    except IntegrityError:
-        logger.info("farm_policy: retry for item %s lost the idempotency race (unique retry_of_id)", item.id)
-        return None
-    logger.info("farm_policy: created retry #%d for failed item %s", fields["retry_count"], item.id)
-    return created[0] if created else None
 
 
 # --------------------------------------------------------------------------- #
@@ -1327,10 +1051,11 @@ async def recover_printer(db: AsyncSession, printer_id: int) -> dict:
     plate_occupancy.operator_recover(printer_id)
     # A hold whose resolution IS the operator taking the part off the plate ends here
     # too — recover is the stronger form of the same statement the clear-plate route
-    # makes, and a confirmed plate-check or lost-Z hold left standing after it would
-    # keep the chip lit and the eject lane refusing on a printer a human just cleared.
-    # WHICH rows it answers is the rule table's, asked inside the lane: a hold the wire
-    # owns (a runout, say) is NOT answered by somebody clearing a plate.
+    # makes, and a lost-Z hold left standing after it would keep the chip lit and the
+    # eject lane refusing on a printer a human just cleared. WHICH rows it answers is the
+    # rule table's, asked inside the lane: a hold the wire owns (a runout, say) is NOT
+    # answered by somebody clearing a plate, and neither is a paused plate check (its
+    # answer is resuming or stopping the job).
     # ...and it reports WHAT it closed. A Recover whose only effect was ending an
     # equipment fault used to be indistinguishable from one that did nothing at all
     # (011-H2S 2026-09-17).

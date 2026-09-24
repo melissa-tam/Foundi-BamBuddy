@@ -9,6 +9,7 @@ import { render } from '../utils';
 import { PrintersPage } from '../../pages/PrintersPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
+import en from '../../i18n/locales/en';
 
 const mockPrinters = [
   {
@@ -696,7 +697,7 @@ describe('PrintersPage', () => {
 
     it('does not render the generic incident chip for the hold kind', async () => {
       serveOne(heldPrinter, {
-        open_incident: { id: 41, kind: 'service_hold', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false },
+        open_incident: { id: 41, kind: 'service_hold', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false, printer_messages: [] },
       });
       render(<PrintersPage />);
       await screen.findByRole('button', { name: /exit maintenance mode/i });
@@ -708,7 +709,7 @@ describe('PrintersPage', () => {
 
     it('still renders the chip for a fault kind', async () => {
       serveOne(heldPrinter, {
-        open_incident: { id: 42, kind: 'jam', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false },
+        open_incident: { id: 42, kind: 'jam', status: 'escalated', slot_desc: null, created_at: null, operator_exits: false, printer_messages: [] },
       });
       render(<PrintersPage />);
 
@@ -727,7 +728,7 @@ describe('PrintersPage', () => {
       state: 'FINISH',
       awaiting_plate_clear: true,
       occupancy: {
-        plate: { occupied: true, source_subtask_id: '123', policy: 'CooldownEject', since: null },
+        plate: { occupied: true, source_subtask_id: '123', policy: 'CooldownEject', since: null, refusal: null },
         eject: {
           purpose: 'production',
           started: true,
@@ -784,7 +785,7 @@ describe('PrintersPage', () => {
       state: 'IDLE',
       awaiting_plate_clear: false,
       occupancy: {
-        plate: { occupied: false, source_subtask_id: null, policy: null, since: null },
+        plate: { occupied: false, source_subtask_id: null, policy: null, since: null, refusal: null },
         eject: null,
         lease_age_s: null,
       },
@@ -795,6 +796,7 @@ describe('PrintersPage', () => {
         slot_desc: 'AMS A slot 3',
         created_at: '2026-09-17T09:43:00Z',
         operator_exits: operatorExits,
+        printer_messages: [],
       },
     });
 
@@ -870,6 +872,119 @@ describe('PrintersPage', () => {
       await user.click(within(dialog).getByRole('button', { name: 'Recover & resume' }));
 
       expect(await screen.findByText(/equipment fault closed/i)).toBeInTheDocument();
+    });
+  });
+
+  /**
+   * The printer's words survive on the hold (2026-09-24 ruling). A ladder verb,
+   * a stop or the next job can clear the printer's own dialog while the hold
+   * still stands, and 003-H2S's operator never saw "Detected build plate offset
+   * or debris" because the farm's stop wiped it. The hold carries what the
+   * printer said; the card shows a recorded message only once the live list no
+   * longer carries its code, and a refused plate names the check on its row.
+   * Copy is asserted through the `en` leaves, never restated here.
+   */
+  describe('printer messages on a hold', () => {
+    const PLATE_CHECK_TEXT = 'Detected build plate offset or debris';
+    const plateCheck = { short_code: '0500_808C', description: PLATE_CHECK_TEXT };
+
+    const heldBy = (kind: string, messages: Array<{ short_code: string; description: string }>) => ({
+      id: 327,
+      kind,
+      status: 'escalated',
+      slot_desc: null,
+      created_at: '2026-09-24T20:09:09Z',
+      operator_exits: false,
+      driver_live: false,
+      printer_messages: messages,
+    });
+
+    /** A live HMS entry as the status payload enriches it. */
+    const liveHms = (shortCode: string, description: string) => ({
+      code: '0x808c',
+      attr: 0x05008000,
+      module: 5,
+      severity: 2,
+      short_code: shortCode,
+      description,
+    });
+
+    const reportedLine = (text: string) => en.printers.holdMessage.reported.replace('{{message}}', text);
+    const refusalLine = (text: string) => en.printers.plateStatus.refusal.replace('{{message}}', text);
+
+    const serveStatus = (status: Record<string, unknown>) => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...mockPrinterStatus, ...status }),
+        ),
+      );
+    };
+
+    it('shows the recorded message under the chip once the printer no longer shows it', async () => {
+      serveStatus({ state: 'PAUSE', hms_errors: [], open_incident: heldBy('plate_vision', [plateCheck]) });
+      render(<PrintersPage />);
+
+      expect(await screen.findByText(reportedLine(PLATE_CHECK_TEXT))).toBeInTheDocument();
+      // "No longer shown on the printer" is supplementary: a focusable tooltip
+      // trigger carries it, never inline copy.
+      expect(screen.getByRole('button', { name: en.printers.holdMessage.notShown })).toBeInTheDocument();
+    });
+
+    it('adds no second line for a message the printer still shows live', async () => {
+      serveStatus({
+        state: 'PAUSE',
+        hms_errors: [liveHms('0500_808C', PLATE_CHECK_TEXT)],
+        open_incident: heldBy('plate_vision', [plateCheck]),
+      });
+      render(<PrintersPage />);
+
+      // The live HMS summary names it (and owns its verbs)…
+      expect(await screen.findByRole('button', { name: PLATE_CHECK_TEXT })).toBeInTheDocument();
+      // …so the hold's record stays out of the way.
+      expect(screen.queryByText(reportedLine(PLATE_CHECK_TEXT))).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: en.printers.holdMessage.notShown })).not.toBeInTheDocument();
+    });
+
+    it('keeps the record for every hold kind, deduped by code rather than by "anything live"', async () => {
+      const feed = { short_code: '0700_8001', description: 'AMS A Slot 1 failed to feed' };
+      // A jam hold whose feed message was cleared by a ladder verb, while an
+      // UNRELATED fault is live: only a matching code suppresses the record.
+      serveStatus({
+        state: 'PAUSE',
+        hms_errors: [liveHms('0500_808C', PLATE_CHECK_TEXT)],
+        open_incident: heldBy('jam', [feed]),
+      });
+      render(<PrintersPage />);
+
+      expect(await screen.findByText(reportedLine(feed.description))).toBeInTheDocument();
+    });
+
+    const refusedPlate = (refusal: { messages: Array<{ short_code: string; description: string }> } | null) => ({
+      state: 'IDLE',
+      awaiting_plate_clear: true,
+      occupancy: {
+        plate: { occupied: true, source_subtask_id: null, policy: 'EscalationOnly', since: null, refusal },
+        eject: null,
+        lease_age_s: null,
+      },
+    });
+
+    it('names the plate check on the plate row of a refused plate, beside Mark plate cleared', async () => {
+      serveStatus(refusedPlate({ messages: [plateCheck] }));
+      render(<PrintersPage />);
+
+      expect(await screen.findByText(refusalLine(PLATE_CHECK_TEXT))).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: en.printers.plateStatus.markCleared })).toBeInTheDocument();
+    });
+
+    it('shows no refusal line on a plate gate that carries no refusal', async () => {
+      serveStatus(refusedPlate(null));
+      render(<PrintersPage />);
+
+      await screen.findByRole('button', { name: en.printers.plateStatus.markCleared });
+      const refusalLead = en.printers.plateStatus.refusal.split('{{message}}')[0];
+      expect(screen.queryByText((text) => text.startsWith(refusalLead))).not.toBeInTheDocument();
     });
   });
 
