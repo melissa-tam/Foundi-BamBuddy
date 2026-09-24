@@ -75,6 +75,7 @@ was so the missing unit is simply re-dispatched once the plate is clear.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,6 +85,7 @@ from sqlalchemy import or_, select
 
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
+from backend.app.models.printer_incident import KIND_PLATE_VISION
 from backend.app.services.dispatch_target import target_of
 from backend.app.services.plate_occupancy import (
     CooldownEject,
@@ -91,6 +93,7 @@ from backend.app.services.plate_occupancy import (
     EscalationOnly,
     ForeignAutoEject,
     OccupancyPolicy,
+    PlateRefusal,
     TerminalDisposition,
     plate_occupancy,
 )
@@ -104,12 +107,20 @@ logger = logging.getLogger(__name__)
 
 Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 
-# The farm's own abort mark, written onto a ``printing`` row's ``stop_source`` BEFORE
-# the stop that produces the terminal. ONE origin for the literal: it is written by
-# ``pause_recovery.on_plate_vision_trip``, read back by :func:`classify_stop`, honoured
-# by the terminal handler and rendered in the run-detail lineage, and four spellings of
-# a durable marker is how one of them ends up not matching.
-STOP_SOURCE_FARM_VISION_ABORT = "farm_vision_abort"
+# "The printer's own plate check refused this plate." A non-completed terminal of the
+# very job an OPEN ``plate_vision`` hold paused: the printer said the plate is wrong,
+# paused the job at its pre-print check, and the job then ended without printing — the
+# operator stopped it (UI or screen), or the printer gave up on it. ONE origin for the
+# literal: :func:`classify_stop` produces it, ``terminal_outcome`` records the unit as
+# ``cancelled`` on it (a first article included — a refused plate is not a failure and
+# must not spend the plate's retry), :func:`terminal_disposition` hands the plate
+# authority a refused-plate gate, and ``farm_policy`` requeues the unit and lifts the bed.
+# 13 characters — inside ``print_queue.stop_source``'s VARCHAR(20).
+#
+# It REPLACED ``farm_vision_abort`` (2026-09-04 → 2026-09-24), the mark the farm stamped
+# on the row before STOPPING a paused print itself. Stored rows keep that token and the
+# run-detail lineage still renders it; nothing writes it any more.
+STOP_VERDICT_PLATE_REFUSED = "plate_refused"
 
 # "The farm never learned how this print ended." Stamped when the DOWNTIME reconcile
 # synthesises a terminal for a print whose outcome the wire cannot supply — the printer
@@ -131,7 +142,13 @@ PAYLOAD_KEY_OUTCOME_UNKNOWN = "outcome_unknown"
 # Why a terminal happened, as a CLOSED set. The disposition is selected from this
 # verdict once, ahead of the ``final_status`` fork, so a new reason for a print to end
 # has to be added here rather than sniffed out of a status string downstream.
-StopVerdict = Literal["farm_vision_abort", "operator_ui", "operator_screen", "reconcile_unknown"]
+StopVerdict = Literal["plate_refused", "operator_ui", "operator_screen", "reconcile_unknown"]
+
+# The two verdicts a HUMAN produced by pressing Stop — the UI button (membership) or
+# the printer's own screen (the cancel echo). One origin for "was this stop an
+# operator's", read by the terminal outcome's failure attribution and the farm policy's
+# fault-stop requeue.
+OPERATOR_STOP_VERDICTS: frozenset[str] = frozenset({"operator_ui", "operator_screen"})
 
 # ``WAITING_REASON_PLATE_VISION`` used to be defined here. Its ORIGIN moved to
 # ``printer_incidents`` (2026-09-04) when the plate check became an incident KIND: the
@@ -167,6 +184,7 @@ def terminal_disposition(
     source_subtask_id: str | None,
     evidence: DepositEvidence,
     raise_gate: bool,
+    refusal: PlateRefusal | None = None,
 ) -> TerminalDisposition:
     """Classify one terminal into the single value the occupancy authority consumes.
 
@@ -194,9 +212,23 @@ def terminal_disposition(
     ``require_plate_clear`` toggle, or farm involvement), carried through so a non-farm
     terminal on a toggle-off install still raises nothing — and so the authority never
     has to know what that guard is made of.
+
+    A REFUSED plate (``refusal`` set — the terminal's verdict is ``plate_refused``) tops
+    the ladder: a human-clear :class:`EscalationOnly` carrying the printer's words, and
+    the gate rises whatever the toggle says and whatever the deposit evidence reads.
+    Both guards exist to decide whether a FINISHED job's deposit should hold the plate;
+    here the printer itself said the plate is not fit to print on, so there is nothing
+    to infer and no install on which ignoring it is right. And the gate is SOURCELESS:
+    the job was stopped at its pre-print check, so there is no part of its to sweep
+    against — carrying its id would let the manual eject's matched lane pair the plate
+    with that unit and sweep what the printer refused.
     """
     policy: OccupancyPolicy
-    if verdict in AUTO_CLEAR_VERDICTS and item_id is not None and eject_profile_id is not None and not first_article:
+    if refusal is not None:
+        policy = EscalationOnly(refusal=refusal)
+        raise_gate = True
+        source_subtask_id = None
+    elif verdict in AUTO_CLEAR_VERDICTS and item_id is not None and eject_profile_id is not None and not first_article:
         policy = CooldownEject(unit_id=item_id, run_id=batch_id)
     else:
         policy = EscalationOnly()
@@ -304,7 +336,9 @@ async def _item_names(db: AsyncSession, item: PrintQueueItem) -> set[str]:
     return names
 
 
-async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict) -> TerminalResolution:
+async def resolve_terminal_item(
+    db: AsyncSession, printer_id: int, payload: dict, *, ui_stopped: bool = False
+) -> TerminalResolution:
     """Correlate a terminal MQTT status to the queue item that produced it.
 
     Candidates are the queue items on ``printer_id`` currently in ``printing``
@@ -312,6 +346,18 @@ async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict
     dispatched-name match → single no-id candidate (fallback) → id-present-but-no-
     match / zero-candidate-with-id (foreign) → nothing printing, no id (none). See
     the module docstring for the full verdict semantics.
+
+    **The queue page's Stop (2026-09-24).** ``POST /queue/{id}/stop`` commits the row
+    ``cancelled`` BEFORE the printer's terminal can arrive (it must: a printer that is
+    offline sends no terminal at all), so by the time this runs the row it stopped is
+    no longer ``printing`` — and the terminal of the farm's own dispatch used to resolve
+    FOREIGN: no operator-stop hold, no fault requeue, and a foreign-plate page for the
+    farm's own part. ``ui_stopped`` is the terminal's own evidence that the route acted
+    — the user-stopped mark ``print_control.stop_as_operator`` set, which the handler
+    consumes AT this terminal, so a duplicate terminal later cannot carry it. With it,
+    a ``cancelled`` row the operator's Stop wrote (``stop_source='operator_ui'``) is a
+    candidate for step (1) — id equality ONLY, the one identity that cannot be another
+    print's — and nothing else about the ladder changes.
     """
     result = await db.execute(
         select(PrintQueueItem)
@@ -321,6 +367,27 @@ async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict
     )
     candidates = list(result.scalars().all())
     payload_subtask = (payload.get("subtask_id") or "").strip() or None
+
+    if ui_stopped and payload_subtask is not None:
+        stopped = (
+            await db.execute(
+                select(PrintQueueItem)
+                .where(PrintQueueItem.printer_id == printer_id)
+                .where(PrintQueueItem.status == "cancelled")
+                .where(PrintQueueItem.stop_source == "operator_ui")
+                .where(PrintQueueItem.dispatch_subtask_id == payload_subtask)
+                .order_by(PrintQueueItem.completed_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if stopped is not None and not any(item.dispatch_subtask_id == payload_subtask for item in candidates):
+            logger.info(
+                "farm_correlation: printer %s terminal %r is the job the queue page stopped (item %s) — matched",
+                printer_id,
+                payload_subtask,
+                stopped.id,
+            )
+            return TerminalResolution(stopped, "matched")
 
     if not candidates:
         # Zero printing candidates. A terminal that STILL echoes a subtask_id is a
@@ -612,82 +679,61 @@ def classify_stop(
     printer_id: int,
     user_stopped_printer_ids: set[int],
     *,
-    item_stop_source: str | None = None,
+    open_incidents: Sequence[Mapping[str, object]] = (),
 ) -> StopVerdict | None:
     """THE classifier of "why did this terminal happen" — a closed set of verdicts.
 
+    ``open_incidents`` is the printer's OPEN holds as the incident store's DB-free
+    projection (``printer_incidents.snapshots``), read by the caller ONCE and BEFORE any
+    consumer of this terminal mutates state — above all before ``spool_recovery
+    .on_job_terminal`` closes the rows this terminal answers. A verdict computed after
+    that close would be computed over a printer that has already forgotten why the job
+    was held, which is how the 2026-09-11 "operator stop over an open fault requeues"
+    ruling went unhonoured in production.
+
     In precedence order:
 
-    - ``farm_vision_abort`` — the ``printing`` row ALREADY carries the farm's own
-      mark, written by ``pause_recovery.on_plate_vision_trip`` BEFORE it sent the
-      stop. Highest precedence, above BOTH operator signals.
+    - ``plate_refused``     — the terminal is NOT ``completed`` and names the job an open
+      ``plate_vision`` hold paused (same ``job_id``). The printer's own plate check
+      refused the plate and the job ended without printing. Highest precedence, above
+      both operator signals: the operator pressing Stop on a paused plate check is how
+      this verdict is USUALLY produced, and what it means for the plate and the unit is
+      the refusal, not the button.
     - ``operator_ui``       — ``printer_id`` is in ``user_stopped_printer_ids`` (Stop
-      was pressed in the Bambuddy queue UI).
+      was pressed in the Bambuddy UI).
     - ``operator_screen``   — the payload carries ``user_cancel_observed`` True: the
       firmware emitted a cancel-echo HMS code, i.e. the operator stopped the print
       on the printer's own touchscreen.
     - ``reconcile_unknown`` — LAST, and the only verdict no actor produced: the payload
       carries ``outcome_unknown``, the flag the downtime reconcile sets on the branch
       that could not learn how the print ended. It ranks below all three signals on
-      purpose — a reconciled terminal that DOES carry a mark or an echo has a real
+      purpose — a reconciled terminal that DOES carry a hold or an echo has a real
       cause, and the unknown is what is left when none of them speaks.
     - ``None``              — none of them (a genuine failure, or a normal finish).
-
-    The farm mark outranks the ECHO for a reason the design cannot afford to guess at:
-    an MQTT ``print.stop`` plausibly produces the same cancel-echo a touchscreen stop
-    does — unmeasured, so the mark must not depend on its absence — and relabelling the
-    farm's own abort ``operator_screen`` routes the unit into the operator-stop
-    disposition (cancelled, run holds, top-up on RESUME) instead of the requeue the
-    abort exists to produce. It outranks UI MEMBERSHIP too, which is the older rule
-    ("membership WINS") narrowed by one case: a human pressing Stop on a print the farm
-    is already aborting has not changed why the print ended, and the mark is on disk
-    while the membership is a process set.
 
     CAVEAT (observed live 2026-07-12, 007-H2C): H2C firmware emitted NO cancel-echo
     HMS on a touchscreen stop, so an H2C screen stop classifies as ``None`` — i.e.
     a genuine failure that feeds retry + quarantine accounting. Pending a deliberate
     wire-capture session hunting an alternative echo code on this firmware line,
-    prefer stopping H2C farm units from the Bambuddy UI (membership wins).
+    prefer stopping H2C farm units from the Bambuddy UI (membership wins). A screen
+    stop of a PAUSED plate check is unaffected: ``plate_refused`` needs no echo.
 
     Pure — no DB, no I/O — so it is directly unit-testable and callable before the
-    ``_user_stopped_printers`` set is mutated by the surrounding handler. The mark is
-    read for it by :func:`printing_stop_mark`, at the one call site, so the verdict is
-    decided ONCE and ahead of every status rewrite that keys off it.
+    ``_user_stopped_printers`` set is mutated by the surrounding handler.
     """
-    if item_stop_source == STOP_SOURCE_FARM_VISION_ABORT:
-        return STOP_SOURCE_FARM_VISION_ABORT
+    status = str(payload.get("status") or "")
+    job = (payload.get("subtask_id") or "").strip()
+    if status != "completed" and any(
+        incident.get("kind") == KIND_PLATE_VISION and str(incident.get("job_id") or "").strip() == job
+        for incident in open_incidents
+    ):
+        return STOP_VERDICT_PLATE_REFUSED
     if printer_id in user_stopped_printer_ids:
         return "operator_ui"
     if payload.get("user_cancel_observed"):
         return "operator_screen"
     if payload.get(PAYLOAD_KEY_OUTCOME_UNKNOWN):
         return STOP_SOURCE_RECONCILE_UNKNOWN
-    return None
-
-
-async def printing_stop_mark(db: AsyncSession, printer_id: int) -> str | None:
-    """The ``stop_source`` already stamped on whatever is ``printing`` on this printer.
-
-    The farm stamps its abort mark on the row BEFORE it sends the stop, so by the time
-    the terminal arrives the mark is on disk and this read is what makes it visible to
-    :func:`classify_stop`. Deliberately a bare read of the ``printing`` row rather than
-    a re-use of the terminal correlation: the verdict is needed AHEAD of that
-    correlation (every status rewrite keys off it), and "what did the farm already
-    decide about the job this printer is running" needs no identity matching to answer.
-
-    Newest first, and the first non-NULL mark wins — more than one ``printing`` row on
-    a printer is the ambiguous shape ``resolve_printing_item`` also refuses to guess
-    at, and a mark on any of them says the farm aborted this printer's job.
-    """
-    result = await db.execute(
-        select(PrintQueueItem.stop_source)
-        .where(PrintQueueItem.printer_id == printer_id)
-        .where(PrintQueueItem.status == "printing")
-        .order_by(PrintQueueItem.started_at.desc())
-    )
-    for mark in result.scalars().all():
-        if mark:
-            return mark
     return None
 
 
@@ -698,8 +744,8 @@ async def resolve_printing_farm_item(db: AsyncSession, printer_id: int) -> Print
     ``eject_profile_id``, or its batch carries a ``sku_file_id``. Distinct from
     :func:`resolve_printing_item`, which asks the IDENTITY question (which unit is this
     echoed job?) — this one asks the OWNERSHIP question (is the farm loop responsible
-    for what is on this printer?), which is what decides whether there is a row to
-    stamp and a unit to requeue.
+    for what is on this printer?), which is what decides whether a plate-check hold has
+    a unit to project its waiting reason onto.
 
     Extracted from the deleted ``on_native_plate_detection`` when the plate-vision
     reaction moved to ``pause_recovery``: the resolution was the reusable half of that

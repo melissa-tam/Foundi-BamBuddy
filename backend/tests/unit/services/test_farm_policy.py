@@ -4,6 +4,7 @@ import dataclasses
 import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from backend.app.models.printer_incident import (
     KIND_PLATE_VISION,
     KIND_RUNOUT,
     KIND_SERVICE_HOLD,
+    KIND_Z_REFERENCE_LOST,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
 )
@@ -35,6 +37,7 @@ from backend.app.services.plate_occupancy import (
     Evidence,
     FirstArticleEject,
     PendingEject,
+    PlateRefusal,
     plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
@@ -306,7 +309,7 @@ class TestRetryPolicy:
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=1)
         refused = await _mk_failed_item(db_session, batch, prof, printer_id=3, retry_count=0, pos=10)
         refused.status = "cancelled"
-        refused.stop_source = farm_correlation.STOP_SOURCE_FARM_VISION_ABORT
+        refused.stop_source = farm_correlation.STOP_VERDICT_PLATE_REFUSED
         await db_session.commit()
         requeued = await _mk_failed_item(
             db_session, batch, prof, printer_id=3, retry_count=1, pos=11, retry_of_id=refused.id
@@ -2747,6 +2750,7 @@ async def _mk_live_unit(db, batch, prof, *, printer_id=None, target_model=None, 
 
 
 async def _open_vision_incident(db, printer_id, *, item_id=None, codes="0500_806E"):
+    """A plate-check hold as the trip opens it: escalated, bound to the paused job."""
     return await printer_incidents.open_new(
         db,
         printer_id=printer_id,
@@ -2756,18 +2760,39 @@ async def _open_vision_incident(db, printer_id, *, item_id=None, codes="0500_806
         code=codes.split(",")[0],
         codes=codes,
         slot_global_tray=None,
-        status=STATUS_RECOVERING,
+        status=STATUS_ESCALATED,
     )
 
 
-def _vision_state(*, detector: bool):
-    """A live PrinterState stand-in carrying only what the vouch test reads."""
-    return SimpleNamespace(print_options=SimpleNamespace(buildplate_marker_detector=detector))
+def _outcome(verdict=None, *, recorded="cancelled", faults=frozenset(), refusal=None):
+    """The terminal's ONE classification, as ``main.on_print_complete`` hands it over.
+
+    Built directly so each case states exactly the captured facts it is about — the
+    verdict and the fault kinds open AT the terminal — and nothing the store happens to
+    hold afterwards.
+    """
+    from backend.app.services.terminal_outcome import TerminalOutcome
+
+    if verdict == farm_correlation.STOP_VERDICT_PLATE_REFUSED and refusal is None:
+        refusal = PlateRefusal(messages=())
+    return TerminalOutcome(
+        raw_status="failed" if recorded != "completed" else "completed",
+        recorded_status=recorded,
+        verdict=verdict,
+        faults_open=frozenset(faults),
+        failure_category=None,
+        printer_message=None,
+        plate_refusal=refusal,
+    )
 
 
 class TestGracefulRequeue:
-    """W10: a plate the farm REFUSED, or one an operator stopped on a held printer,
-    is queued again with its settings — lineage only, no quarantine, no run pause."""
+    """W10: a plate the printer REFUSED, or one an operator stopped on a fault-held
+    printer, is queued again with its settings — lineage only, no quarantine, no run pause.
+
+    Decided from the terminal's OUTCOME — its verdict and the faults it captured before
+    any closer ran — never from the store afterwards (2026-09-24).
+    """
 
     @pytest.fixture(autouse=True)
     def _clean_incidents(self):
@@ -2775,7 +2800,7 @@ class TestGracefulRequeue:
         yield
         printer_incidents._reset_state()
 
-    async def test_farm_vision_abort_requeues_without_quarantine_or_pause(self, db_session):
+    async def test_a_refused_plate_requeues_without_quarantine_or_pause(self, db_session):
         printer = await _mk_printer_row(db_session, "GRQ1")
         await _seed_hold_geometry(db_session)
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
@@ -2786,15 +2811,20 @@ class TestGracefulRequeue:
             printer_id=printer.id,
             status="cancelled",
             skip_filament_check=True,
-            stop_source=farm_correlation.STOP_SOURCE_FARM_VISION_ABORT,
+            stop_source=farm_correlation.STOP_VERDICT_PLATE_REFUSED,
         )
-        await _open_vision_incident(db_session, printer.id, item_id=item.id)
 
         with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
+            patch.object(farm_policy.printer_manager, "get_client", return_value=_ParkClient()),
             patch.object(farm_policy, "maybe_quarantine_printer", new_callable=AsyncMock) as quarantine,
         ):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                item.id,
+                "cancelled",
+                outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED),
+            )
 
         retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
         assert len(retries) == 1
@@ -2809,30 +2839,32 @@ class TestGracefulRequeue:
         # The cap is untouched: this chain has no FAILED ancestor.
         assert await requeue.failed_ancestor_count(db_session, retries[0]) == 0
 
-    async def test_first_article_farm_abort_reaches_the_requeue_not_the_failure_path(self, db_session):
-        """The precedence case: a first-article no-deposit stop keeps ``failed``.
-
-        The disposition is decided from the CLASSIFICATION, ahead of the status fork,
-        so the farm's own abort never routes an FA plate into ``_on_item_failed`` and
-        a quarantine count for a plate the farm itself refused.
-        """
+    async def test_a_refused_first_article_is_requeued_as_a_first_article(self, db_session):
+        """The builder records a refused first article ``cancelled`` (not the FA
+        no-deposit ``failed``), and the policy keys on the verdict ahead of the status
+        fork — so the plate never reaches ``_on_item_failed`` or a quarantine count."""
         printer = await _mk_printer_row(db_session, "GRQFA")
         await _seed_hold_geometry(db_session)
         batch, prof = await _mk_run(db_session, quantity=3, printer_ids=[printer.id], require_fa=True)
         fa = (await _items(db_session, batch.id))[0]
         fa.printer_id = printer.id
-        fa.status = "failed"  # the FA no-deposit shape main.py deliberately keeps
-        fa.stop_source = farm_correlation.STOP_SOURCE_FARM_VISION_ABORT
+        fa.status = "cancelled"
+        fa.stop_source = farm_correlation.STOP_VERDICT_PLATE_REFUSED
         fa.completed_at = datetime.now(timezone.utc)
         await db_session.commit()
-        await _open_vision_incident(db_session, printer.id, item_id=fa.id)
 
         with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
+            patch.object(farm_policy.printer_manager, "get_client", return_value=_ParkClient()),
             patch.object(farm_policy, "maybe_quarantine_printer", new_callable=AsyncMock) as quarantine,
             patch.object(farm_policy, "_on_item_failed", new_callable=AsyncMock) as failed_path,
         ):
-            await farm_policy.on_terminal(db_session, printer.id, fa.id, "failed")
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                fa.id,
+                "cancelled",
+                outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED),
+            )
 
         failed_path.assert_not_awaited()
         quarantine.assert_not_awaited()
@@ -2840,35 +2872,52 @@ class TestGracefulRequeue:
         assert len(retries) == 1
         assert retries[0].first_article is True  # re-attempted AS a first article
 
-    async def test_operator_stop_on_a_held_printer_requeues(self, db_session):
+    async def test_an_operator_stop_over_a_fault_captured_at_the_terminal_requeues(self, db_session):
+        """THE 2026-09-11 ruling, honoured from the captured fact: the terminal's own closer
+        has already ended the wire row (runout / jam / power loss) by the time the policy
+        runs — so the store is EMPTY here, exactly as it is in production."""
         printer = await _mk_printer_row(db_session, "GRQ2")
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
         item = await _mk_live_unit(
             db_session, batch, prof, printer_id=printer.id, status="cancelled", stop_source="operator_ui"
         )
-        # The printer was ALREADY holding when the operator pressed Stop.
-        assert (
-            await printer_incidents.open_new(
-                db_session,
-                printer_id=printer.id,
-                job_id="task-runout",
-                item_id=item.id,
-                kind=KIND_RUNOUT,
-                code="0700_8011",
-                codes="0700_8011",
-                slot_global_tray=None,
-                status=STATUS_ESCALATED,
-            )
-            is not None
-        )
+        assert await printer_incidents.get_open(db_session, printer.id) is None
 
-        await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+        await farm_policy.on_terminal(
+            db_session, printer.id, item.id, "cancelled", outcome=_outcome("operator_ui", faults={KIND_RUNOUT})
+        )
 
         retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
         assert len(retries) == 1
         await db_session.refresh(batch)
         assert batch.status == "active"
         assert batch.pause_reason is None  # NOT the operator-stop hold
+
+    async def test_a_fault_the_terminal_did_not_capture_is_not_read_off_the_store(self, db_session):
+        """The inverse: the decision is the captured fact, never a later store read."""
+        printer = await _mk_printer_row(db_session, "GRQ2b")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        item = await _mk_live_unit(
+            db_session, batch, prof, printer_id=printer.id, status="cancelled", stop_source="operator_ui"
+        )
+        await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="later-job",
+            item_id=None,
+            kind=KIND_RUNOUT,
+            code="0700_8011",
+            codes="0700_8011",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+        )
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
+            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled", outcome=_outcome("operator_ui"))
+
+        assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
+        await db_session.refresh(batch)
+        assert batch.pause_reason == "operator_stop"
 
     async def test_an_operator_stop_over_a_physical_hold_requeues_and_the_hold_survives(self, db_session):
         """The disposition change of the equipment-fault wave (2026-09-11): the unit
@@ -2894,7 +2943,9 @@ class TestGracefulRequeue:
             is not None
         )
 
-        await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+        await farm_policy.on_terminal(
+            db_session, printer.id, item.id, "cancelled", outcome=_outcome("operator_ui", faults={KIND_PHYSICAL})
+        )
 
         retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
         assert len(retries) == 1
@@ -2911,7 +2962,7 @@ class TestGracefulRequeue:
         )
 
         with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled", outcome=_outcome("operator_ui"))
 
         assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
         await db_session.refresh(batch)
@@ -2923,18 +2974,23 @@ class TestGracefulRequeue:
         this machine", not "the equipment is broken" — so an operator who then presses
         Stop means what they would mean on a healthy printer: cancel this unit.
 
-        Read through the un-narrowed "any open incident" question it silently requeued
-        instead, and the run never held for the RESUME that tops it back up. The gate is
-        ``FAULT_KINDS``, derived by subtraction from the store's own vocabularies."""
+        Built through the REAL capture (``open_holds_at_terminal`` over the store's
+        projection), because the narrowing to ``FAULT_KINDS`` lives there now."""
+        from backend.app.services.terminal_outcome import open_holds_at_terminal
+
         printer = await _mk_printer_row(db_session, "GRQSH")
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
         item = await _mk_live_unit(
             db_session, batch, prof, printer_id=printer.id, status="cancelled", stop_source="operator_ui"
         )
         assert await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD) is not None
+        captured = open_holds_at_terminal(printer_incidents.snapshots(printer.id))
+        assert captured == frozenset()
 
         with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+            await farm_policy.on_terminal(
+                db_session, printer.id, item.id, "cancelled", outcome=_outcome("operator_ui", faults=captured)
+            )
 
         assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
         await db_session.refresh(batch)
@@ -2945,6 +3001,8 @@ class TestGracefulRequeue:
     async def test_a_real_fault_beside_a_hold_still_requeues(self, db_session):
         """The other half of the narrowing: a fault standing BESIDE a hold is what the
         question is about, so the plate is still made again."""
+        from backend.app.services.terminal_outcome import open_holds_at_terminal
+
         printer = await _mk_printer_row(db_session, "GRQSH2")
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
         item = await _mk_live_unit(
@@ -2965,8 +3023,12 @@ class TestGracefulRequeue:
             )
             is not None
         )
+        captured = open_holds_at_terminal(printer_incidents.snapshots(printer.id))
+        assert captured == frozenset({KIND_RUNOUT})
 
-        await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+        await farm_policy.on_terminal(
+            db_session, printer.id, item.id, "cancelled", outcome=_outcome("operator_ui", faults=captured)
+        )
 
         retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
         assert len(retries) == 1
@@ -2977,17 +3039,15 @@ class TestGracefulRequeue:
         """A stop that lost the race to a finishing print produced a part."""
         printer = await _mk_printer_row(db_session, "GRQ4")
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
-        item = await _mk_live_unit(
-            db_session,
-            batch,
-            prof,
-            printer_id=printer.id,
-            status="completed",
-            stop_source=farm_correlation.STOP_SOURCE_FARM_VISION_ABORT,
-        )
-        await _open_vision_incident(db_session, printer.id, item_id=item.id)
+        item = await _mk_live_unit(db_session, batch, prof, printer_id=printer.id, status="completed")
 
-        await farm_policy.on_terminal(db_session, printer.id, item.id, "completed")
+        await farm_policy.on_terminal(
+            db_session,
+            printer.id,
+            item.id,
+            "completed",
+            outcome=_outcome("operator_ui", recorded="completed", faults={KIND_RUNOUT}),
+        )
 
         assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
 
@@ -3030,8 +3090,8 @@ class TestAnUnknownOutcomeHoldsTheRun:
 
         await db_session.refresh(batch)
         assert batch.pause_reason == "operator_stop"
-        # It is a recognised verdict, not an unknown string the policy must ignore.
-        assert farm_policy._stop_verdict(item) == farm_correlation.STOP_SOURCE_RECONCILE_UNKNOWN
+        # It is a recognised verdict of the closed set, not an unknown string.
+        assert farm_correlation.STOP_SOURCE_RECONCILE_UNKNOWN in get_args(farm_correlation.StopVerdict)
 
     async def test_an_unknown_outcome_over_a_fault_still_requeues(self, db_session):
         """Precedence is unchanged: the requeue question is asked first, and it is
@@ -3056,19 +3116,27 @@ class TestAnUnknownOutcomeHoldsTheRun:
         )
 
         with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                item.id,
+                "cancelled",
+                outcome=_outcome(farm_correlation.STOP_SOURCE_RECONCILE_UNKNOWN, faults={KIND_RUNOUT}),
+            )
 
         assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
         await db_session.refresh(batch)
         assert batch.pause_reason == "operator_stop"
 
 
-class TestPlateVisionTerminal:
-    """W9's post-terminal half: re-check once, then hold the printer for a human.
+class TestRefusedPlateTerminal:
+    """The post-terminal half of a REFUSED plate (2026-09-24): the printer's plate check
+    paused the job and the job then ended without printing.
 
-    ``pause_recovery`` owns the trip (incident, abort mark, stop). Everything from the
-    terminal on is decided here, because only this lane can tell a FIRST trip from a
-    CONFIRMED one — and only it owns the requeue.
+    The plate is the authority's — the terminal's one plate call already holds it for a
+    human with the printer's words — so the policy owes exactly two things: the bed lifted
+    off the plate-release aid (farm or foreign alike) and, for a farm unit, the requeue.
+    It opens, escalates and closes no incident, raises no gate and sends no page.
     """
 
     @pytest.fixture(autouse=True)
@@ -3077,7 +3145,7 @@ class TestPlateVisionTerminal:
         yield
         printer_incidents._reset_state()
 
-    async def _tripped_unit(self, db, printer, *, model_targeted=False):
+    async def _refused_unit(self, db, printer, *, model_targeted=False):
         batch, prof = await _mk_run(
             db,
             quantity=2,
@@ -3092,226 +3160,106 @@ class TestPlateVisionTerminal:
             printer_id=printer.id,
             target_model="H2S" if model_targeted else None,
             status="cancelled",
-            stop_source=farm_correlation.STOP_SOURCE_FARM_VISION_ABORT,
+            stop_source=farm_correlation.STOP_VERDICT_PLATE_REFUSED,
         )
         return batch, item
 
-    async def test_first_trip_requeues_for_the_printers_own_recheck(self, db_session):
-        """Vouched + no deposit: no gate, no page, incident resolved at the terminal."""
-        printer = await _mk_printer_row(db_session, "PV1")
-        await _seed_hold_geometry(db_session)
-        batch, item = await self._tripped_unit(db_session, printer)
-        incident = await _open_vision_incident(db_session, printer.id, item_id=item.id)
-        client = _ParkClient()
-
-        from backend.app.services.eject import monitor as monitor_mod
-
-        with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
-            patch.object(farm_policy.printer_manager, "get_client", return_value=client),
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as page,
-        ):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
-
-        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
-        assert len(retries) == 1
-        assert plate_occupancy.snapshot(printer.id).plate_occupied is False  # no gate
-        page.assert_not_awaited()
-        assert client.sent == []  # a re-check lifts its own bed at the next start
-        await db_session.refresh(incident)
-        assert incident.resolved_at is not None
-        assert incident.resolve_source == "terminal"
-
-    async def test_first_trip_gates_when_the_farm_cannot_vouch_for_the_recheck(self, db_session):
-        """Detector not reported ON: the requeued start may not check at all."""
-        printer = await _mk_printer_row(db_session, "PV2")
-        await _seed_hold_geometry(db_session)
-        batch, item = await self._tripped_unit(db_session, printer)
-        await _open_vision_incident(db_session, printer.id, item_id=item.id)
-
-        with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=False)),
-            patch.object(farm_policy.printer_manager, "get_client", return_value=_ParkClient()),
-        ):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
-
-        view = plate_occupancy.snapshot(printer.id)
-        assert view.plate_occupied is True
-        assert isinstance(view.plate_policy, EscalationOnly)
-        assert view.plate_source_subtask_id is None  # human-clear only
-        assert len([i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]) == 1
-
-    async def test_first_trip_gates_when_the_terminal_carried_a_deposit(self, db_session):
-        """Unreliable peaks after a restart read as a deposit — the farm cannot say
-        what is on that plate, so it fails closed even though the detector is on."""
-        printer = await _mk_printer_row(db_session, "PV3")
-        await _seed_hold_geometry(db_session)
-        batch, item = await self._tripped_unit(db_session, printer)
-        await _open_vision_incident(db_session, printer.id, item_id=item.id)
-        # What note_terminal would have armed for a deposit-bearing farm terminal.
-        plate_occupancy.hydrate_plate(printer.id, "SUB-D", CooldownEject(unit_id=item.id, run_id=batch.id))
-
-        with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
-            patch.object(farm_policy.printer_manager, "get_client", return_value=_ParkClient()),
-        ):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
-
-        view = plate_occupancy.snapshot(printer.id)
-        assert isinstance(view.plate_policy, EscalationOnly)  # never swept automatically
-        assert view.plate_source_subtask_id is None
-        assert len([i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]) == 1
-
-    async def test_second_trip_confirms_holds_gates_pages_and_lifts(self, db_session):
+    async def test_a_refused_farm_plate_is_lifted_and_requeued_to_its_pool(self, db_session):
         printer = await _mk_printer_row(db_session, "PV4")
         await _seed_hold_geometry(db_session, hold_lift=15.0)
-        batch, item = await self._tripped_unit(db_session, printer, model_targeted=True)
-        # The FIRST trip, already resolved at its own terminal (the re-check).
-        first = await _open_vision_incident(db_session, printer.id, item_id=item.id)
-        await printer_incidents.close(db_session, first.id, status="resolved", source="terminal")
-        second = await _open_vision_incident(db_session, printer.id, item_id=item.id)
+        batch, item = await self._refused_unit(db_session, printer, model_targeted=True)
         client = _ParkClient()
 
         from backend.app.services.eject import monitor as monitor_mod
 
         with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
             patch.object(farm_policy.printer_manager, "get_client", return_value=client),
             patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as page,
         ):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                item.id,
+                "cancelled",
+                outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED),
+            )
 
-        # The hold: escalated, chip lit, hourly nag armed — and NOT resolved.
-        await db_session.refresh(second)
-        assert second.status == "escalated"
-        assert second.resolved_at is None
-        # The gate, raised AFTER the terminal: human-clear only, never a CooldownEject
-        # built for a part that is not there.
-        view = plate_occupancy.snapshot(printer.id)
-        assert view.plate_occupied is True
-        assert isinstance(view.plate_policy, EscalationOnly)
-        assert view.plate_source_subtask_id is None
-        # One page, carrying the confirmed sentence.
-        page.assert_awaited_once()
-        assert page.await_args.kwargs["source_detail"] == farm_policy._VISION_CONFIRMED_DETAIL
         # The lift: guarded DOWN onto the stop, then up by the model's own figure.
         assert client.sent == ["M17\nG91\nG380 S2 Z32.0 F1200\nG380 S2 Z-15.0 F1200\nG90\nM400\nM18"]
-        # A model-targeted unit returns to the POOL rather than to the held printer.
+        # A model-targeted unit returns to the POOL rather than to the refused printer.
         retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
         assert len(retries) == 1
         assert retries[0].printer_id is None
         assert retries[0].target_model == "H2S"
+        # No second plate write and no page of its own: both are the authority's.
+        assert plate_occupancy.snapshot(printer.id).plate_occupied is False
+        page.assert_not_awaited()
 
-    async def test_a_foreign_trip_is_confirmed_on_its_first(self, db_session):
-        """No unit to requeue means no second opinion to buy."""
+    async def test_a_refused_foreign_plate_is_lifted_and_nothing_is_requeued(self, db_session):
+        """No unit — but the bed still sits on the aid for the human who fixes the plate."""
         printer = await _mk_printer_row(db_session, "PV5")
         await _seed_hold_geometry(db_session)
-        incident = await _open_vision_incident(db_session, printer.id, item_id=None)
         client = _ParkClient()
 
-        from backend.app.services.eject import monitor as monitor_mod
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=client):
+            await farm_policy.on_terminal(
+                db_session, printer.id, None, "cancelled", outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED)
+            )
 
-        with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
-            patch.object(farm_policy.printer_manager, "get_client", return_value=client),
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as page,
-        ):
-            await farm_policy.on_terminal(db_session, printer.id, None, "cancelled")
-
-        await db_session.refresh(incident)
-        assert incident.status == "escalated"
-        view = plate_occupancy.snapshot(printer.id)
-        assert view.plate_occupied is True and isinstance(view.plate_policy, EscalationOnly)
-        page.assert_awaited_once()
-        assert client.sent  # the bed is lifted for the human who has to reach the part
+        assert client.sent
 
     async def test_the_lift_is_skipped_on_a_bedslinger(self, db_session):
         """The gantry carries Z there — the same physics that refuses the bed-drop."""
         printer = await _mk_printer_row(db_session, "PV6", model="A1")
         await _seed_hold_geometry(db_session, model_key="A1", z_travel=250.0)
-        incident = await _open_vision_incident(db_session, printer.id, item_id=None)
         client = _ParkClient()
 
-        from backend.app.services.eject import monitor as monitor_mod
-
-        with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
-            patch.object(farm_policy.printer_manager, "get_client", return_value=client),
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
-        ):
-            await farm_policy.on_terminal(db_session, printer.id, None, "cancelled")
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=client):
+            await farm_policy.on_terminal(
+                db_session, printer.id, None, "cancelled", outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED)
+            )
 
         assert client.sent == []
-        await db_session.refresh(incident)
-        assert incident.status == "escalated"  # the hold still stands
 
-    async def test_an_unrelated_open_incident_does_not_pre_empt_the_plate_decision(self, db_session):
-        """Multi-alarm rule (2026-09-11): a runout standing beside the trip owns the AMS,
-        not the plate. The first trip is decided on its OWN row — requeued for the
-        printer's re-check — and the runout row is left exactly as it was. (Before
-        this, one-open-per-printer made the lane stand aside and the plate went
-        undecided.)"""
+    async def test_no_refusal_no_lift(self, db_session):
+        """An operator stop over a fault requeues, but the plate was not refused — the
+        bed stays where the firmware put it."""
         printer = await _mk_printer_row(db_session, "PV7")
         await _seed_hold_geometry(db_session)
-        batch, item = await self._tripped_unit(db_session, printer)
-        assert (
-            await printer_incidents.open_new(
-                db_session,
-                printer_id=printer.id,
-                job_id="task-jam",
-                item_id=item.id,
-                kind=KIND_RUNOUT,
-                code="0700_8011",
-                codes="0700_8011",
-                slot_global_tray=None,
-                status=STATUS_ESCALATED,
-            )
-            is not None
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        item = await _mk_live_unit(
+            db_session, batch, prof, printer_id=printer.id, status="cancelled", stop_source="operator_ui"
         )
-        incident = await _open_vision_incident(db_session, printer.id, item_id=item.id)
-        assert incident is not None  # beside the runout, not refused by it
         client = _ParkClient()
 
-        from backend.app.services.eject import monitor as monitor_mod
-
-        with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
-            patch.object(farm_policy.printer_manager, "get_client", return_value=client),
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
-        ):
-            await farm_policy.on_terminal(db_session, printer.id, item.id, "cancelled")
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=client):
+            await farm_policy.on_terminal(
+                db_session, printer.id, item.id, "cancelled", outcome=_outcome("operator_ui", faults={KIND_RUNOUT})
+            )
 
         assert client.sent == []
-        assert plate_occupancy.snapshot(printer.id).plate_occupied is False
         assert len([i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]) == 1
-        await db_session.refresh(incident)
-        assert incident.resolved_at is not None  # the trip's own row was decided
-        runout = await printer_incidents.get_open(db_session, printer.id, kinds={KIND_RUNOUT})
-        assert runout is not None and runout.status == STATUS_ESCALATED  # untouched
 
-    async def test_a_terminal_on_an_already_held_printer_re_decides_nothing(self, db_session):
-        """The hold stands until a human clears it — every later terminal is a no-op.
-
-        Without this the page and the bed lift would re-fire on every terminal the
-        printer produced while it waited.
-        """
+    async def test_the_policy_ends_no_incident_row(self, db_session):
+        """The plate-check hold is the rule table's: its job's terminal closes it through
+        ``spool_recovery.on_job_terminal``. The policy is not an incident closer any more
+        (``test_code_quality``'s allowlist no longer names it)."""
         printer = await _mk_printer_row(db_session, "PV8")
         await _seed_hold_geometry(db_session)
-        incident = await _open_vision_incident(db_session, printer.id, item_id=None)
-        await printer_incidents.mark_escalated(db_session, incident.id)
-        client = _ParkClient()
+        batch, item = await self._refused_unit(db_session, printer)
+        incident = await _open_vision_incident(db_session, printer.id, item_id=item.id)
 
-        from backend.app.services.eject import monitor as monitor_mod
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=_ParkClient()):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                item.id,
+                "cancelled",
+                outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED),
+            )
 
-        with (
-            patch.object(farm_policy.printer_manager, "get_status", return_value=_vision_state(detector=True)),
-            patch.object(farm_policy.printer_manager, "get_client", return_value=client),
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as page,
-        ):
-            await farm_policy.on_terminal(db_session, printer.id, None, "cancelled")
-
-        page.assert_not_awaited()
-        assert client.sent == []
+        await db_session.refresh(incident)
+        assert incident.resolved_at is None
 
 
 class TestRecoverClosesOperatorResolvedHolds:
@@ -3323,10 +3271,19 @@ class TestRecoverClosesOperatorResolvedHolds:
         yield
         printer_incidents._reset_state()
 
-    async def test_recover_closes_a_plate_vision_hold(self, db_session):
+    async def test_recover_closes_a_lost_z_hold(self, db_session):
         printer = await _mk_printer_row(db_session, "REC1")
-        incident = await _open_vision_incident(db_session, printer.id, item_id=None)
-        await printer_incidents.mark_escalated(db_session, incident.id)
+        incident = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="",
+            item_id=None,
+            kind=KIND_Z_REFERENCE_LOST,
+            code="power_loss",
+            codes="",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+        )
 
         await farm_policy.recover_printer(db_session, printer.id)
 
@@ -3334,6 +3291,17 @@ class TestRecoverClosesOperatorResolvedHolds:
         assert incident.resolved_at is not None
         assert incident.resolve_source == "operator"
         assert printer_incidents.snapshot(printer.id) is None  # the chip goes dark
+
+    async def test_recover_leaves_a_paused_plate_check_standing(self, db_session):
+        """``job_pause``: the answer is resuming or stopping the paused job — Recover is a
+        statement about the machine, not an answer to the printer's question."""
+        printer = await _mk_printer_row(db_session, "REC3")
+        incident = await _open_vision_incident(db_session, printer.id, item_id=None)
+
+        await farm_policy.recover_printer(db_session, printer.id)
+
+        await db_session.refresh(incident)
+        assert incident.resolved_at is None
 
     async def test_recover_leaves_a_wire_resolved_hold_standing(self, db_session):
         """A runout is not answered by somebody clearing a plate."""

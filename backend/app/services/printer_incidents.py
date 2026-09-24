@@ -85,6 +85,7 @@ from sqlalchemy.exc import IntegrityError
 from backend.app.models.printer_incident import (
     AMS_FAULT_KINDS,
     DECLARED_KINDS,
+    JOB_PAUSE_KINDS,
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
@@ -93,8 +94,7 @@ from backend.app.models.printer_incident import (
     KIND_RUNOUT,
     KIND_SERVICE_HOLD,
     KIND_Z_REFERENCE_LOST,
-    RESOLUTION_OPERATOR,
-    RESOLUTION_REPAIR,
+    RECOVER_ENDS,
     RESOLUTION_WIRE,
     RESOLVE_AUTO_RESUME,
     RESOLVE_DRIVER_SELF_HEAL,
@@ -108,6 +108,10 @@ from backend.app.models.printer_incident import (
     PrinterIncident,
 )
 from backend.app.models.printer_incident_step import PrinterIncidentStep, StepKind
+
+# ``hms_errors`` is a LEAF (it imports only the vendored catalogs), so the one message
+# renderer is imported at module level — no cycle can form through it.
+from backend.app.services.hms_errors import PrinterMessage, messages_from_full_codes
 
 if TYPE_CHECKING:
     import asyncio
@@ -130,6 +134,10 @@ RESOLVE_DRIVER_ENDED = "driver_ended"
 # docstring's lifecycle table), so the open/closed question is asked of that column
 # and never of this tuple.
 CLOSED_STATUSES: tuple[str, ...] = (STATUS_RESOLVED, STATUS_ABORTED)
+
+# ``printer_incident.hms_full_codes`` is VARCHAR(512); :func:`join_full_codes` bounds to
+# it at a code boundary.
+_HMS_FULL_CODES_MAX = 512
 
 # printer_id -> {incident_id -> the WS/REST projection of that OPEN row}. Rebuilt
 # from the DB at startup (:func:`rehydrate`) and maintained by every write below.
@@ -264,21 +272,12 @@ def resolution_class(kind: str, *, external: bool = False) -> str:
 def closed_by_recover(kind: str, *, external: bool = False) -> bool:
     """Does the operator's **Recover** verb end a hold of this kind on this hardware?
 
-    Pure over the same ``RESOLVES_ON`` table :func:`resolution_class` reads, stated
-    ONCE here so the rule table and the WIRE agree by construction. Two classes say
-    yes, for two different reasons, and both are the same statement from the operator's
-    side — "I went to the machine and dealt with it":
-
-    * ``operator`` — the evidence IS a human act (a part off the plate, a Z datum
-      re-established), so both plate verbs end it;
-    * ``repair`` — Recover means "an operator inspected this machine", which is the
-      third return-to-normal the class admits beside its two motion evidences. (A
-      ROUTINE clear-plate does not; this answers the weaker question "can Recover end
-      it", which is what the card needs to decide whether to offer the verb.)
-
-    ``wire`` says no — a runout hold is not answered by somebody clearing a plate —
-    and ``declared`` says no by definition: a hold a human declared ends only through
-    the verb that declared it.
+    A READ of the model's per-class ``RECOVER_ENDS`` attribute over the class
+    :func:`resolution_class` resolves — never a second hand-written reading of the rule
+    table. The attribute sits beside ``RESOLVES_ON`` with each class's reason, and a test
+    pins it cell-for-cell against ``incident_resolution``'s own ``plate_cleared``-with-
+    Recover verdict for every registered ``(kind, external)``: this store may not import
+    the rule table, so the pin is what keeps "can Recover end it" one answer.
 
     It exists because the printer card had to derive the affordance from the CLASS to
     know whether Recover applies, and the class vocabulary must not reach the wire:
@@ -286,7 +285,7 @@ def closed_by_recover(kind: str, *, external: bool = False) -> bool:
     2026-09-17 — a physical hold on an idle printer offered no Recover at all, because
     the card gated it on an occupancy claim the printer did not have).
     """
-    return resolution_class(kind, external=external) in (RESOLUTION_OPERATOR, RESOLUTION_REPAIR)
+    return RECOVER_ENDS[resolution_class(kind, external=external)]
 
 
 def runout_slot_desc(global_tray: int | None) -> str | None:
@@ -404,16 +403,57 @@ def _payload(incident: PrinterIncident) -> dict:
     cached copy would go stale the moment a driver spawned or exited. :func:`snapshot`
     adds it at read time (:func:`_with_liveness`).
 
+    ``printer_messages`` is ALWAYS present (an empty list for a code-less hold): the
+    printer's own words for this hold, rendered once (:func:`printer_messages_of`) and
+    cached with the row — they are a fact recorded at open, so the write-time cache can
+    never go stale on them. ``job_id`` rides along for the terminal classifier
+    (``farm_correlation.classify_stop``), which asks "is this terminal the job this hold
+    paused?" of this DB-free projection; the card ignores it.
+
     Only JSON PRIMITIVES: the WS lane serializes this dict with a bare ``json.dumps``.
     """
     return {
         "id": incident.id,
         "kind": incident.kind,
         "status": incident.status,
+        "job_id": incident.job_id or "",
         "slot_desc": slot_desc(incident),
         "created_at": incident.created_at.isoformat() if incident.created_at else None,
         "operator_exits": closed_by_recover(incident.kind, external=row_external(incident)),
+        "printer_messages": [message.as_payload() for message in printer_messages_of(incident)],
     }
+
+
+def printer_messages_of(incident: PrinterIncident) -> tuple[PrinterMessage, ...]:
+    """The printer's words for this hold, through the one catalog renderer.
+
+    The recorded full codes first (``hms_full_codes`` — the firmware's own identifiers,
+    full-code catalog lookup, short-code fallback). A row recorded before that column
+    existed falls back to its representative short ``code``; a code-less hold (a
+    declared hold, a lost Z frame) has none. De-duplicated by short code, in record
+    order, so two full codes naming one short code read once.
+    """
+    stored = [code for code in (incident.hms_full_codes or "").split(",") if code.strip()]
+    return messages_from_full_codes(stored, fallback_short_codes=[incident.code] if incident.code else [])
+
+
+def join_full_codes(full_codes) -> str | None:
+    """The ``hms_full_codes`` column value for a set of firmware full codes, or None.
+
+    Comma-joined in the order given, bounded to the column's 512 characters at a CODE
+    boundary (a truncated hex code would render as garbage); None for no codes, so a
+    code-less opener stores the honest NULL rather than an empty string.
+    """
+    joined = ""
+    for code in full_codes or ():
+        code = str(code).strip().upper()
+        if not code:
+            continue
+        candidate = f"{joined},{code}" if joined else code
+        if len(candidate) > _HMS_FULL_CODES_MAX:
+            break
+        joined = candidate
+    return joined or None
 
 
 def _precedence(kind: str | None) -> int:
@@ -497,10 +537,12 @@ def hold_blocks_dispatch(printer_id: int | None) -> bool:
     every terminal, so the wire read clean while filament was still physically stuck
     in the shared PTFE path, and the next unit dispatched into it. Three times.
 
-    EVERY open kind blocks, deliberately. A ``plate_vision`` or ``z_reference_lost``
-    row is already plate-gated, so this only makes the refusal legible rather than
-    changing it; a ``power_loss`` row means the firmware's prompt is still
-    unanswered, which is not a printer to put work on.
+    EVERY open kind blocks, deliberately. A ``plate_vision`` row is a job PAUSED at the
+    printer's plate check — no plate gate stands while it does (the gate rises only if
+    the job is then stopped), so this is what keeps work off the printer; a
+    ``z_reference_lost`` row is already plate-gated, so this only makes the refusal
+    legible; a ``power_loss`` row means the firmware's prompt is still unanswered,
+    which is not a printer to put work on.
     """
     if not printer_id:
         return False
@@ -525,6 +567,26 @@ def automation_held(printer_id: int | None) -> bool:
     joins every lane by registering in the model rather than by editing them.
     """
     return bool(open_kinds(printer_id) & DECLARED_KINDS)
+
+
+def job_pause_held(printer_id: int | None) -> bool:
+    """Is this printer's job PAUSED waiting on a human's answer? Pure, DB-free, sync.
+
+    THE one predicate every lane that RESUMES a job reads — the :func:`automation_held`
+    idiom, and for the same reason (it is asked from the ~1 Hz sampler's drivers and from
+    the AMS entry gate, neither of which may wait on the DB). True while an open row's
+    class is ``job_pause`` — today the printer's own pre-print plate check
+    (``plate_vision``): the printer said the plate is wrong and paused the job, and the
+    only answers are a human's — fix the plate and resume, or stop. A power-loss resume,
+    an AMS release lever or a refill auto-resume answering that pause instead would
+    restart the print onto the plate the printer just refused (2026-09-24, 003-H2S).
+
+    It is deliberately NOT :func:`automation_held`: a job pause stands the farm's
+    RESUMES down and nothing else — the printer still takes its HMS pages, its reminders
+    and its terminal. Membership in the model's derived ``JOB_PAUSE_KINDS`` is the whole
+    rule, so a second job-pause kind joins every lane by registering its class.
+    """
+    return bool(open_kinds(printer_id) & JOB_PAUSE_KINDS)
 
 
 def cached_kind(printer_id: int, incident_id: int) -> str | None:
@@ -685,33 +747,6 @@ async def count_resolved(db: AsyncSession, printer_id: int, job_id: str, kind: s
     )
 
 
-async def count_recent(db: AsyncSession, printer_id: int, kind: str, since: datetime) -> int:
-    """How many incidents of ``kind`` this PRINTER has opened since ``since``.
-
-    PRINTER-scoped and WINDOWED — the ``recovery_escalation`` 24 h-window shape, and
-    deliberately NOT :func:`count_resolved`'s shape, which is JOB-scoped. The
-    distinction is load-bearing for the plate-vision re-check: every requeue is a NEW
-    job, so a job-scoped count can never see the first trip and "has this printer just
-    tripped twice?" would always answer no. ``recent_terminal_farm_items`` is likewise
-    unusable there — it excludes ``cancelled`` by design, which is exactly what a
-    farm-stopped unit becomes.
-
-    Counts every incident opened in the window whatever its status: a trip that has
-    already RESOLVED (the re-check requeued and the incident closed at the terminal)
-    is precisely the first trip the second one must see.
-    """
-    return int(
-        await db.scalar(
-            select(sa_func.count())
-            .select_from(PrinterIncident)
-            .where(PrinterIncident.printer_id == printer_id)
-            .where(PrinterIncident.kind == kind)
-            .where(PrinterIncident.created_at >= since)
-        )
-        or 0
-    )
-
-
 async def open_new(
     db: AsyncSession,
     *,
@@ -722,6 +757,7 @@ async def open_new(
     code: str,
     codes: str,
     slot_global_tray: int | None,
+    hms_full_codes: Iterable[str] = (),
     status: str = STATUS_RECOVERING,
 ) -> PrinterIncident | None:
     """Create an open FAULT incident for this printer, or ``None`` when one owns it.
@@ -730,6 +766,11 @@ async def open_new(
     fingerprint and ``slot_global_tray`` the slot the firmware attributed. A kind with
     no fault behind it uses :func:`open_declared` instead of passing empty strings
     through here.
+
+    ``hms_full_codes`` are the firmware's full codes for the fault, read off the live
+    wire by the opener at the moment the hold opens (``hms_errors.full_codes_of``) — the
+    printer's own words, recorded because the printer will stop showing them long before
+    the hold ends. Every fault opener passes them; empty stores NULL.
 
     Two guards, deliberately both: a pre-check (the ordinary case, so the common path
     logs a reason instead of raising) and the partial unique indexes (the race). A
@@ -744,6 +785,7 @@ async def open_new(
         code=code,
         codes=codes,
         slot_global_tray=slot_global_tray,
+        hms_full_codes=join_full_codes(hms_full_codes),
         status=status,
     )
 
@@ -784,6 +826,7 @@ async def open_declared(
         code="",
         codes="",
         slot_global_tray=None,
+        hms_full_codes=None,
         status=status,
     )
 
@@ -798,6 +841,7 @@ async def _open_row(
     code: str,
     codes: str,
     slot_global_tray: int | None,
+    hms_full_codes: str | None,
     status: str,
 ) -> PrinterIncident | None:
     """The ONE open transition behind :func:`open_new` and :func:`open_declared`.
@@ -824,6 +868,7 @@ async def _open_row(
         code=code or "",
         codes=codes[:256],
         slot_global_tray=slot_global_tray,
+        hms_full_codes=hms_full_codes,
         status=status,
         created_at=now,
         escalated_at=now if status == STATUS_ESCALATED else None,
@@ -888,6 +933,7 @@ async def upgrade(
     code: str,
     codes: str,
     slot_global_tray: int | None,
+    hms_full_codes: Iterable[str] = (),
 ) -> PrinterIncident | None:
     """Re-classify an OPEN row onto a worse fault. ``None`` when it is gone or closed.
 
@@ -903,6 +949,10 @@ async def upgrade(
     the rule this depends on: the stored fault and the live one must name the same
     thing, or the aborted-close ledger and the wire sampler loop against each other.
 
+    The printer's recorded words (``hms_full_codes``) follow the live fingerprint for the
+    same reason: a row re-classified onto a physical fault must not keep showing the
+    milder fault's text under the new chip.
+
     The row keeps its ID, its ``created_at`` and its ``escalated_at``: it is the same
     equipment fault, better understood. A live recovery driver learns of the change
     through :func:`cached_kind` (the ``reclassified`` takeover token) and hands over
@@ -916,6 +966,7 @@ async def upgrade(
     incident.code = code or ""
     incident.codes = codes[:256]
     incident.slot_global_tray = slot_global_tray
+    incident.hms_full_codes = join_full_codes(hms_full_codes)
     await db.commit()
     _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident)
     logger.info(
@@ -1123,6 +1174,12 @@ def outcome_of(incident: PrinterIncident) -> str:
     the farm itself sent — the first-trip re-check that requeues without a page.
     Everything else that closed unpaged closed on evidence nobody produced (a wire
     edge, a job ending, a restart) and is counted honestly as neither.
+
+    The ``plate_vision`` / ``terminal`` arm is a RENDERER OF HISTORY only (2026-09-24):
+    it buckets the rows the retired 2026-09-04 lane closed at the terminal of its own
+    stop. No writer produces that shape any more — a plate-check hold opens ESCALATED, so
+    every close of one is ``human_resolved`` — and the arm stays so the ledger keeps
+    reading those rows the way it always did.
     """
     if incident.resolved_at is None:
         return OUTCOME_HELD if incident.status == STATUS_ESCALATED else OUTCOME_RECOVERING

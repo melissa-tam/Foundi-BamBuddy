@@ -561,3 +561,70 @@ class TestLoadCompletedEdge:
         self._sample(printer.id, tray_now=255, epoch=1)
         self._sample(printer.id, tray_now=1, epoch=2)
         assert incident_resolution.ledger.load_completed_at(printer.id) is None
+
+
+class TestAJobPauseCannotOutliveItsJob:
+    """The real closer (``sweep_open_incidents``) over a plate-check hold whose job ended
+    without the farm seeing its terminal: it waits out the dwell, then closes the row
+    under ``job_ended_unseen`` and drops the unit's projection — the row that otherwise
+    had no exit and blocked dispatch on its printer for good."""
+
+    async def _plate_check(self, db, printer_id, *, item_id=None):
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        return await _held(db, printer_id, kind=KIND_PLATE_VISION, code="0500_808C", item_id=item_id, job_id="task-1")
+
+    async def test_an_idle_printer_ends_the_hold_after_the_dwell(self, db_session, printer_factory, monkeypatch):
+        from backend.app.models.printer_incident import RESOLVE_JOB_ENDED_UNSEEN
+
+        printer = await printer_factory()
+        item = PrintQueueItem(
+            printer_id=printer.id,
+            status="printing",
+            position=1,
+            waiting_reason=printer_incidents.WAITING_REASON_PLATE_VISION,
+        )
+        db_session.add(item)
+        await db_session.commit()
+        await db_session.refresh(item)
+        await self._plate_check(db_session, printer.id, item_id=item.id)
+        _wire(monkeypatch, _state("IDLE"))
+
+        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0  # first sighting seeds the dwell
+        assert await spool_recovery.sweep_open_incidents(now=_DWELL - 1) == 0
+        assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 1
+
+        db_session.expunge_all()
+        from sqlalchemy import select
+
+        from backend.app.models.printer_incident import PrinterIncident
+
+        row = (
+            await db_session.execute(select(PrinterIncident).where(PrinterIncident.printer_id == printer.id))
+        ).scalar_one()
+        assert row.resolve_source == RESOLVE_JOB_ENDED_UNSEEN
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+        assert printer_incidents.job_pause_held(printer.id) is False
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is False
+
+    @pytest.mark.parametrize("live", ["PAUSE", "UNKNOWN", None])
+    async def test_a_paused_or_silent_printer_keeps_it(self, db_session, printer_factory, monkeypatch, live):
+        """PAUSE on the same job is the hold itself; a silent or absent printer says nothing."""
+        printer = await printer_factory()
+        await self._plate_check(db_session, printer.id)
+        _wire(monkeypatch, _state(live))
+
+        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
+        assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 0
+        assert await _row(db_session, printer.id) is not None
+
+    async def test_the_startup_rearm_leaves_it_for_the_reconcile(self, db_session, printer_factory, monkeypatch):
+        """No unseen-end close at startup: the downtime reconcile's synthesised terminal
+        classifies a job stopped during the outage as a refused plate only while the row
+        is still open."""
+        printer = await printer_factory()
+        await self._plate_check(db_session, printer.id)
+        _wire(monkeypatch, _state("IDLE"))
+
+        assert await spool_recovery.rearm_incidents_on_startup() == 0
+        assert await _row(db_session, printer.id) is not None

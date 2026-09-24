@@ -4,11 +4,12 @@ Two causes live here, and the split of duties is the same for both.
 
 **What this module owns.** DETECTION (a per-push wire sampler), the HOLD RECORD
 (a ``printer_incident`` row — never a process dict) and the DECISION: *answer the
-prompt*, *stop this print*, or *stand aside*. Nothing else. Everything that happens
-AFTER a terminal — the unit's disposition, the requeue, the plate gate, the held-bed
-lift, the second-trip read — belongs to ``farm_policy.on_terminal``, which already
-owns run/retry/quarantine and the one post-terminal motion. This lane never awaits a
-terminal it does not own and never imports ``main``.
+prompt*, *hold for a human*, or *stand aside*. Nothing else. Everything that happens
+AFTER a terminal — the terminal's classification, the plate gate, the requeue, the
+held-bed lift — belongs to ``terminal_outcome`` / the plate authority /
+``farm_policy.on_terminal``, which already own run/retry/quarantine and the one
+post-terminal motion. This lane never awaits a terminal it does not own, never stops a
+print and never imports ``main``.
 
 ``power_loss`` (2026-09-04 fleet outage)
     A power cut rebooted every printer while the server stayed up on its UPS. Each
@@ -20,13 +21,17 @@ terminal it does not own and never imports ``main``.
     the farm answers it: resume, confirm on the wire, and HOLD for a human only when
     the answer did not take.
 
-``plate_vision`` (operator requirement 2026-09-04)
-    The printer's own pre-print vision check trips (``_HMS_PLATE_OCCUPANCY_CODES``)
-    and the firmware PAUSEs the job at layer 0. The farm used to raise a human-clear
-    gate and leave the unit ``printing`` forever — 13 trips produced 22 operator stops
-    and 0 requeues. Now the lane STOPS the print so a terminal exists, having first
-    stamped the durable farm-abort mark on the row; the disposition (re-check requeue
-    vs confirmed hold) is decided at that terminal by ``farm_policy``.
+``plate_vision`` (user ruling 2026-09-24, restoring the pre-2026-09-04 behaviour)
+    The printer's own pre-print plate check trips (``_HMS_PLATE_OCCUPANCY_CODES``) and
+    the firmware PAUSEs the job. The printer is asking a human — "align the build
+    plate", "remove the debris" — and the farm leaves the question with them: the print
+    stays PAUSED with the printer's message on its screen, a ``job_pause`` hold records
+    it (the "Plate check" chip, the unit's waiting reason), and ONE page carries the
+    printer's own words. The human fixes the plate and resumes — the RUNNING edge of that
+    job ends the hold and the same job continues — or stops it, and the terminal's
+    verdict (``plate_refused``) gates the plate and requeues the unit. The 2026-09-04 lane
+    STOPPED the print instead; the stop wiped the printer's message within a second and
+    the requeue restarted into the same trip (003-H2S, 2026-09-24).
 
 Restart durability (F7)
     The only durable state is the incident row. Three things live in process memory
@@ -64,16 +69,18 @@ from backend.app.models.printer_incident import (
     KIND_POWER_LOSS,
     KIND_Z_REFERENCE_LOST,
     STATUS_ESCALATED,
-    STATUS_RECOVERING,
     STATUS_RESOLVED,
 )
 from backend.app.services import incident_resolution, printer_incidents
 from backend.app.services.hms_errors import (
     POWER_LOSS_PROMPT_CODES,
     POWER_LOSS_RESUME_FAILED_CODES,
+    full_codes_of,
+    messages_from_full_codes,
     power_loss_hold_active,
     power_loss_prompt_standing,
     power_loss_resume_failed,
+    summary_of,
 )
 from backend.app.services.incident_resolution import ClearedEvent, Context, ledger
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
@@ -116,10 +123,11 @@ _OUTAGE_BURST_MIN_PRINTERS = 3
 # (09:25:37-09:26:03); 120 s is ~4.6x that, which covers a slower rolling brown-out
 # without reaching across two unrelated single-printer events.
 _OUTAGE_BURST_WINDOW_S = 120.0
-# A ``stop_print`` that returns False on a vision trip is the same session-churn shape
-# as the resume above, but the printer is HERE and connected (it just paused itself),
-# so the retry is short.
-_VISION_STOP_RETRY_S = 5.0
+# The operator instruction that closes the plate-check page. The printer's own words
+# (rendered by the one HMS renderer) come first; this says what the farm is doing about
+# them — nothing — and what the human does. Sys-admin register: no exclamation, no
+# apology, the action named.
+_VISION_PAUSED_INSTRUCTION = "Print paused — fix the plate, then resume."
 
 
 # --- process memory (see the module docstring's restart-durability story) -----------
@@ -226,9 +234,8 @@ def note_status_push(printer_id: int, state) -> None:
             _maybe_arm_z_reference_hold(printer_id, anchor)
 
         if printer_incidents.automation_held(printer_id):
-            # MAINTENANCE MODE: the power-loss prompt and the plate-vision trip are the
-            # operator's to answer — they are standing at the screen. Nothing is resumed
-            # and nothing is stopped.
+            # MAINTENANCE MODE: the power-loss prompt is the operator's to answer — they
+            # are standing at the screen. Nothing is resumed.
             #
             # The wire sample above is still recorded, deliberately: the sampler's memory
             # stays current, so an edge that happened DURING the hold is consumed by the
@@ -288,7 +295,9 @@ async def _recover_power_loss(printer_id: int, observed_subtask: str | None) -> 
     (c) OPEN INCIDENT — another lane already owns this printer; open nothing, stand
         aside (F7). For a runout hold this is not a gap: the refill lane resumes on
         PRESENCE evidence, and that resume answers the power-loss prompt too (printer 8
-        proved it on 2026-09-04).
+        proved it on 2026-09-04). A JOB-PAUSE hold (the printer's plate check paused this
+        job) stands this lane aside too: resuming would restart the print onto the plate
+        the printer refused, and the answer is the human's.
     (d) RESUME — farm unit or FOREIGN print alike (operator ruling: parity). Success is
         a LOG LINE and a summary entry, with no durable record; failure is a HOLD.
     """
@@ -308,14 +317,28 @@ async def _recover_power_loss(printer_id: int, observed_subtask: str | None) -> 
             await _stop_interrupted_eject(printer_id)
             return
 
+        if printer_incidents.job_pause_held(printer_id):
+            # The printer paused this job to ask a HUMAN about the plate (its own
+            # pre-print check), and the power cut came during that pause. Answering the
+            # firmware's prompt with a resume would answer the plate question too — with
+            # the plate the printer just refused still on the bed. The one predicate every
+            # job-resuming lane reads; the human's resume answers both prompts at once.
+            logger.info(
+                "[pause-recovery] printer %s is held at a job pause (the printer's plate check) — standing "
+                "aside, the prompt is the operator's to answer",
+                printer_id,
+            )
+            _record(printer_id, "held_by_fault")
+            return
+
         from backend.app.core.database import async_session
 
         # The AMS-kind rows and this lane's OWN: a runout's refill lane answers the
         # prompt on its own (the printer-8 proof), a physical hold means the path is
         # still broken, and a standing ``power_loss`` row means this printer's resume
-        # was already refused or failed and a human owns the prompt. A plate-vision
-        # or lost-Z row is not a reason to leave a resumable print sitting on the
-        # firmware's prompt.
+        # was already refused or failed and a human owns the prompt. A lost-Z row is not
+        # a reason to leave a resumable print sitting on the firmware's prompt (the
+        # resumed print re-homes before it moves); a job-pause row is, and was read above.
         async with async_session() as db:
             incident = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS | {KIND_POWER_LOSS})
         if incident is not None:
@@ -454,6 +477,8 @@ async def _hold_power_loss(printer_id: int, observed_subtask: str | None, *, rea
     codes = sorted(POWER_LOSS_PROMPT_CODES)
     if power_loss_resume_failed(hms_list):
         codes += sorted(POWER_LOSS_RESUME_FAILED_CODES)
+    # The printer's own words for the prompt, recorded before a human's answer clears it.
+    full_codes = full_codes_of(hms_list, codes)
 
     async with async_session() as db:
         item = await _printing_farm_unit(db, printer_id, observed_subtask)
@@ -466,6 +491,7 @@ async def _hold_power_loss(printer_id: int, observed_subtask: str | None, *, rea
             code=sorted(POWER_LOSS_PROMPT_CODES)[0],
             codes=",".join(codes),
             slot_global_tray=None,
+            hms_full_codes=full_codes,
             status=STATUS_ESCALATED,
         )
         if incident is None:
@@ -658,53 +684,46 @@ async def _open_z_reference_hold(printer_id: int, *, cause: str) -> bool:
 
 
 async def on_plate_vision_trip(printer_id: int, codes: set[str]) -> bool:
-    """The printer's pre-print vision check tripped: record it, then STOP the print.
+    """The printer's pre-print plate check tripped: HOLD for a human. Send nothing.
 
-    True when the print was stopped (or the stop was attempted on a printer this lane
-    took ownership of); False when the lane stood aside.
+    True when this call opened the hold; False when the lane stood aside (a hold is
+    already standing for this printer) or failed.
 
-    Order is the contract. The farm-abort MARK goes onto the ``printing`` row BEFORE
-    the stop is sent — the same "stamp FIRST, the terminal HONOURS the mark" shape as
-    ``note_eject_runtime_exceeded`` — because the terminal that the stop produces is
-    the only place the unit's disposition can be decided, and an MQTT ``print.stop``
-    plausibly produces the firmware's cancel echo, which would otherwise relabel the
-    farm's own abort as an operator screen-stop.
+    The printer PAUSED the job and is showing the operator what is wrong with the plate.
+    The farm's whole act is to record that — and to leave the printer exactly as the
+    firmware put it, with its message on its screen:
 
-    ``printer_manager.stop_print`` deliberately, NOT ``mark_printer_stopped_by_user``:
-    the farm stopped this print, and claiming an operator did would defeat the mark
-    this function just wrote.
+    * a ``plate_vision`` row, opened ESCALATED (a human's from the instant it opens),
+      bound to the paused job (``job_id``) and carrying the printer's full codes
+      (``hms_full_codes``) so the card still shows its words after the dialog is gone.
+      Its class is ``job_pause``: the paused job's RUNNING edge ends it (the human fixed
+      the plate and resumed — the same job continues) and so does its terminal (the
+      human stopped it — the terminal's ``plate_refused`` verdict gates the plate and
+      requeues the unit). While it stands, no automatic lane resumes the job
+      (``printer_incidents.job_pause_held``) and the scheduler dispatches nothing onto
+      the printer (``hold_blocks_dispatch``);
+    * the unit's ``waiting_reason`` — the projection the power-loss hold writes the same
+      way (``waiting_reason_for``) — when a FARM unit is printing; a foreign print holds
+      the printer with ``item_id`` NULL exactly as every other hold does;
+    * ONE page, ``on_plate_not_empty``, in the printer's own words plus the instruction.
 
-    A FOREIGN print has no row to stamp; the incident IS the record (``item_id`` NULL,
-    ``code`` naming the tripped check) and the terminal path reads it from the
-    snapshot. Nothing here raises a plate gate or lifts the bed — both belong after the
-    terminal, in ``farm_policy.on_terminal``, which is the only lane that can tell a
-    first trip from a confirmed one.
+    NOTHING is sent to the printer. The 2026-09-04 lane stopped the print here; the stop
+    wiped the printer's message within a second, and the requeue restarted into the same
+    trip (003-H2S, 2026-09-24). ``test_pause_recovery`` pins by AST that this module
+    never calls ``stop_print``.
     """
     try:
         from backend.app.core.database import async_session
-        from backend.app.services.farm_correlation import (
-            STOP_SOURCE_FARM_VISION_ABORT,
-            resolve_printing_farm_item,
-        )
+        from backend.app.models.printer import Printer
+        from backend.app.services.farm_correlation import resolve_printing_farm_item
+        from backend.app.services.notification_service import notification_service
 
         state = printer_manager.get_status(printer_id)
-        subtask = (getattr(state, "subtask_id", None) or "").strip() or ""
+        subtask = (getattr(state, "subtask_id", None) or "").strip()
         ordered = sorted(codes)
+        full_codes = full_codes_of(getattr(state, "hms_errors", None) or [], ordered)
 
         async with async_session() as db:
-            # Its OWN kind only: an AMS fault standing beside a plate-check trip does
-            # not own the plate — the trip decides its own row (multi-alarm rule).
-            open_incident = await printer_incidents.get_open(db, printer_id, kinds={KIND_PLATE_VISION})
-            if open_incident is not None:
-                logger.info(
-                    "[pause-recovery] printer %s plate check tripped %s but an open %s incident already owns "
-                    "the printer — standing aside",
-                    printer_id,
-                    ordered,
-                    open_incident.kind,
-                )
-                return False
-
             item = await resolve_printing_farm_item(db, printer_id)
             incident = await printer_incidents.open_new(
                 db,
@@ -715,51 +734,47 @@ async def on_plate_vision_trip(printer_id: int, codes: set[str]) -> bool:
                 code=ordered[0] if ordered else "",
                 codes=",".join(ordered),
                 slot_global_tray=None,
-                status=STATUS_RECOVERING,
+                hms_full_codes=full_codes,
+                status=STATUS_ESCALATED,
             )
             if incident is None:
+                # One open row per printer per kind: the trip re-fires on repeated
+                # pushes, and a hold already standing IS this trip's record.
                 logger.info(
-                    "[pause-recovery] printer %s plate check tripped %s but its incident was opened by "
-                    "another actor — standing aside",
+                    "[pause-recovery] printer %s plate check tripped %s but a plate-check hold already stands — "
+                    "standing aside",
                     printer_id,
                     ordered,
                 )
                 return False
             if item is not None:
-                item.stop_source = STOP_SOURCE_FARM_VISION_ABORT
+                item.waiting_reason = printer_incidents.waiting_reason_for(KIND_PLATE_VISION)
                 await db.commit()
 
+            printer = await db.get(Printer, printer_id)
+            printer_name = printer.name if printer is not None else f"printer {printer_id}"
+            words = summary_of(messages_from_full_codes(full_codes, fallback_short_codes=ordered)) or ", ".join(ordered)
+            await notification_service.on_plate_not_empty(
+                printer_id,
+                printer_name,
+                db,
+                # The catalog's own sentences end in a period; the page adds exactly one.
+                source_detail=f"The printer reported: {words.rstrip('.')}. {_VISION_PAUSED_INSTRUCTION}",
+            )
+
         logger.warning(
-            "[pause-recovery] printer %s plate check tripped %s (%s) — stopping the print",
+            "[pause-recovery] printer %s plate check tripped %s (%s, job %s) — print left PAUSED for a human, "
+            "incident %s",
             printer_id,
             ordered,
             f"unit {item.id}" if item is not None else "foreign print",
+            subtask or "-",
+            incident.id,
         )
-        await _stop_for_vision(printer_id)
         return True
     except Exception:  # noqa: BLE001 — invariant 10: never crash the status flow
         logger.exception("[pause-recovery] plate-vision trip handling failed for printer %s", printer_id)
         return False
-
-
-async def _stop_for_vision(printer_id: int) -> bool:
-    """Send the stop, with ONE short retry on a send that did not go out."""
-    if printer_manager.stop_print(printer_id):
-        return True
-    logger.info(
-        "[pause-recovery] printer %s stop_print send returned False — one retry in %.0fs",
-        printer_id,
-        _VISION_STOP_RETRY_S,
-    )
-    await asyncio.sleep(_VISION_STOP_RETRY_S)
-    if printer_manager.stop_print(printer_id):
-        return True
-    logger.warning(
-        "[pause-recovery] printer %s did not accept the plate-check stop — the job stays PAUSEd and the "
-        "incident holds the printer for a human",
-        printer_id,
-    )
-    return False
 
 
 # --- entry point 3: the operator's clear --------------------------------------------
@@ -773,13 +788,14 @@ async def on_plate_cleared(printer_id: int, *, recover: bool = False) -> list[tu
     is :mod:`incident_resolution`'s table, per row — a printer can hold several, and
     the two verbs are different statements:
 
-    * ``operator`` rows (a confirmed plate-check trip, a lost Z frame) close on BOTH:
-      the evidence a human produces is the part coming off the plate;
+    * ``operator`` rows (a lost Z frame) close on BOTH: the evidence a human produces is
+      the part coming off the plate;
     * ``repair`` rows (an AMS physical fault) close on RECOVER only. Recover means
       "an operator inspected the machine" (it discards every stored belief about the
       plate too), which is exactly the third return-to-normal the repair class admits.
       A routine clear-plate says nothing about the filament path;
-    * ``wire`` and ``declared`` rows are never closed here.
+    * ``wire``, ``job_pause`` and ``declared`` rows are never closed here — a paused
+      plate check is answered by resuming or stopping its job, not by a plate act.
 
     It returns WHAT IT CLOSED rather than a bare boolean because both verbs report it
     to the operator (``incidents_closed``): a Recover that silently ended an equipment

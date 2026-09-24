@@ -1182,8 +1182,16 @@ class NotificationService:
                 variables["duration"] = self._format_duration(duration_seconds)
             if archive_data.get("actual_filament_grams"):
                 variables["filament_grams"] = f"{archive_data['actual_filament_grams']:.1f}"
-            if status == "failed" and archive_data.get("failure_reason"):
-                variables["reason"] = archive_data["failure_reason"]
+            # ``{reason}`` is the printer's OWN words for a print that ended without its
+            # part — stopped AND failed (``terminal_outcome.TerminalOutcome.printer_message``,
+            # rendered by the one HMS renderer; a refused plate's words come from its hold,
+            # because the stop wiped the printer's list). A failure the printer explained
+            # nothing about falls back to the archive's category, as before.
+            reason = archive_data.get("printer_message")
+            if not reason and status == "failed":
+                reason = archive_data.get("failure_reason")
+            if reason:
+                variables["reason"] = reason
             if archive_data.get("finish_photo_url"):
                 variables["finish_photo_url"] = archive_data["finish_photo_url"]
 

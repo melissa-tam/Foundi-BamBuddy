@@ -126,6 +126,49 @@ class TestNotificationService:
             call_args = mock_get.call_args
             assert call_args[0][1] == "on_print_complete"
 
+    async def _reason_for(self, service, mock_provider, mock_db, status, archive_data):
+        """The ``{reason}`` variable a print-complete page renders with."""
+        captured: dict = {}
+
+        async def capture_build(db, event_type, variables):
+            captured.update(variables)
+            return ("Test", "Test")
+
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock, return_value=[mock_provider]),
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", side_effect=capture_build),
+        ):
+            await service.on_print_complete(
+                printer_id=1, printer_name="Test", status=status, data={}, db=mock_db, archive_data=archive_data
+            )
+        return captured.get("reason")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["failed", "cancelled", "aborted"])
+    async def test_reason_is_the_printers_own_words_for_stopped_and_failed(
+        self, service, mock_provider, mock_db, status
+    ):
+        """2026-09-24: ``{reason}`` carries the terminal outcome's printer message for a
+        stopped print too, not only a failed one — a refused plate's page says what the
+        printer said about the plate."""
+        words = "[0500_808C] Detected build plate offset."
+        reason = await self._reason_for(
+            service, mock_provider, mock_db, status, {"printer_message": words, "failure_reason": "Layer shift"}
+        )
+        assert reason == words
+
+    @pytest.mark.asyncio
+    async def test_a_failure_the_printer_explained_nothing_about_falls_back_to_its_category(
+        self, service, mock_provider, mock_db
+    ):
+        assert await self._reason_for(service, mock_provider, mock_db, "failed", {"failure_reason": "Layer shift"}) == (
+            "Layer shift"
+        )
+        assert await self._reason_for(service, mock_provider, mock_db, "cancelled", {"failure_reason": "X"}) == (
+            "Unknown"
+        )
+
     @pytest.mark.asyncio
     async def test_on_print_complete_routes_failed_status(self, service, mock_provider, mock_db):
         """Verify failed status uses on_print_failed field."""

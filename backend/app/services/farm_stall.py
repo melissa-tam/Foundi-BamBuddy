@@ -929,10 +929,9 @@ _JAM_REMINDER_DETAIL = "Spool jam STILL not recovered — the printer is still P
 _RUNOUT_REMINDER_DETAIL = (
     "Filament runout STILL not resolved — the printer is still PAUSED awaiting a same-slot refill."
 )
-_PLATE_VISION_REMINDER_DETAIL = (
-    "The printer's plate check STILL reports the bed is not empty — the print was stopped. "
-    "Clear the bed, then Mark plate cleared."
-)
+# The printer's pre-print plate check PAUSED the job (2026-09-24: the farm no longer
+# stops it) — the operator fixes the plate and resumes, the same job continues.
+_PLATE_VISION_REMINDER_DETAIL = "Print paused at plate check. Fix the plate, then resume the print."
 _POWER_LOSS_REMINDER_REASON = "The farm could not answer the prompt; it is STILL waiting."
 _Z_REFERENCE_REMINDER_DETAIL = (
     "This printer STILL has a part on its plate after a restart — its Z reference is lost. "
@@ -998,7 +997,9 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
     KIND_POWER_LOSS: (
         "This printer is STILL held at its power-loss prompt and will take no work until the prompt is answered."
     ),
-    KIND_PLATE_VISION: _PLATE_VISION_REMINDER_DETAIL + " The printer is idle and will take no work until then.",
+    # Not paused, so "resume the print" would send the operator looking for a job that is
+    # not waiting: state only what is true — the hold stands and blocks work.
+    KIND_PLATE_VISION: "Plate check hold still open, but the printer is not paused. It takes no work while the hold stands.",
     KIND_Z_REFERENCE_LOST: _Z_REFERENCE_REMINDER_DETAIL,
 }
 

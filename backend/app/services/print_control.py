@@ -11,14 +11,18 @@ It exists because that pair had THREE hand-rolled call sites, each with its own
 spelling of the mark's lazy import and its own log line — and a fourth copy is how the
 mark eventually goes missing on the path that needs it most.
 
-**Two callers remain, and the set is CLOSED:** the printer-card route
-(``api/routes/printers.py``) and the queue-page route (``api/routes/print_queue.py``).
-Both are an operator pressing Stop. The third caller — the service-hold quiesce — was
-deleted on 2026-09-19 with the ruling that **no mode verb ends a print**: entering
-maintenance mode, or deactivating a printer, stands the FARM down, and a running print
-is the operator's, not the farm's. ``test_code_quality.TestOperatorStopOwnership``
-pins the two allowed callers by AST, so a future mode verb that reaches for this pair
-fails CI instead of silently cancelling somebody's plate.
+**The caller set is CLOSED, and every member is an operator pressing Stop:** the
+printer-card route and the printer's own HMS dialog "Stop printing"
+(``api/routes/printers.py``), the queue-page route (``api/routes/print_queue.py``) and
+the API clients' ``/stop`` and ``/cancel`` (``api/routes/webhook.py``). The HMS dialog and
+the webhook joined on 2026-09-24: each sent a bare ``print.stop`` WITHOUT the mark (and
+``/cancel`` called a method that does not exist), so a human's stop read as a failure.
+The service-hold quiesce was deleted on 2026-09-19 with the ruling that **no mode verb
+ends a print**: entering maintenance mode, or deactivating a printer, stands the FARM
+down, and a running print is the operator's, not the farm's.
+``test_code_quality.TestOperatorStopOwnership`` pins the callers by AST, so a future mode
+verb that reaches for this pair fails CI instead of silently cancelling somebody's plate
+— and a sibling pin allows a RAW ``stop_print`` only in this module and the eject lane.
 
 What it deliberately does NOT own: the queue row's transitions (status, ``stop_source``,
 ``error_message``), the smart-plug auto-off and the HTTP shapes. Those differ per

@@ -5,8 +5,9 @@ Drives the real entry points — the ~1 Hz sampler ``note_status_push``, the vis
 ``PrinterState`` mutated by a scripted ``FakeClient``, in the ``test_spool_recovery``
 idiom. Every branch of ``_recover_power_loss`` gets a case, in its own order; the
 lost-Z outage arm gets the burst / single-reconnect / laddered-model triple; and the
-vision lane pins the ordering contract that everything downstream rests on — the
-farm-abort mark is on disk BEFORE the stop goes out.
+vision lane pins the 2026-09-24 contract — a plate-check trip is a HOLD for a human, in
+the printer's own words, and the farm sends the printer NOTHING (AST-pinned: this module
+never calls ``stop_print``).
 """
 
 import asyncio
@@ -33,7 +34,7 @@ from backend.app.models.printer_incident import (
 from backend.app.models.printer_model_geometry import PrinterModelGeometry
 from backend.app.services import pause_recovery, printer_incidents
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
-from backend.app.services.plate_occupancy import EscalationOnly, PendingEject, plate_occupancy
+from backend.app.services.plate_occupancy import EscalationOnly, Evidence, PendingEject, plate_occupancy
 from backend.app.services.printer_incidents import WAITING_REASON_POWER_LOSS
 
 pytestmark = pytest.mark.asyncio
@@ -60,7 +61,6 @@ def _fast_timing(monkeypatch):
     monkeypatch.setattr(pause_recovery, "_POWER_LOSS_CONFIRM_S", 0.05)
     monkeypatch.setattr(pause_recovery, "_POWER_LOSS_POLL_S", 0.005)
     monkeypatch.setattr(pause_recovery, "_SUMMARY_WINDOW_S", 0.01)
-    monkeypatch.setattr(pause_recovery, "_VISION_STOP_RETRY_S", 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -243,6 +243,11 @@ async def _geometry(db, model_key="H2S", *, z_reference_validated=False):
     db.add(row)
     await db.commit()
     return row
+
+
+def _occupy_plate(printer_id):
+    """A part on the plate, by the operator's own statement (the short way)."""
+    assert plate_occupancy.declare_occupied(printer_id, Evidence()) is None
 
 
 async def _open_incidents(db, printer_id):
@@ -454,6 +459,50 @@ class TestOpenIncidentStandsAside:
         assert [r.kind for r in rows] == [KIND_RUNOUT]
         page.assert_not_awaited()
         assert pause_recovery._summary.held_by_fault == {9}
+
+
+class TestAJobPauseStandsThePowerLossDriverAside:
+    """No lane resumes a job a human must answer (2026-09-24). The printer's plate check
+    paused this job, and a power cut landed during that pause: answering the firmware's
+    prompt with a resume would answer the plate question too, onto the plate the printer
+    refused. Liveness-paired: the same prompt with NO job-pause hold still resumes."""
+
+    async def _plate_check_hold(self, db, printer_id):
+        await printer_incidents.open_new(
+            db,
+            printer_id=printer_id,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="0500_808C",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+        )
+
+    async def test_the_prompt_during_a_plate_check_pause_is_left_to_the_operator(self, monkeypatch, db_session):
+        await _printer(db_session, 60)
+        await self._plate_check_hold(db_session, 60)
+        state = _make_state(hms=[_prompt_hms(), _vision_hms()])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        await _drive(60, state)
+
+        assert client.calls == []
+        assert [r.kind for r in await _open_incidents(db_session, 60)] == [KIND_PLATE_VISION]
+        assert pause_recovery._summary.held_by_fault == {60}
+
+    async def test_without_a_job_pause_the_same_prompt_still_resumes(self, monkeypatch, db_session):
+        await _printer(db_session, 61)
+        state = _make_state(hms=[_prompt_hms()])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        await _drive(61, state)
+
+        assert client.calls == [("resume",)]
+        assert pause_recovery._summary.resumed == {61}
 
 
 # --- (d) resume -------------------------------------------------------------
@@ -702,7 +751,7 @@ class TestOutageBurst:
         anchor = time.time() - 300.0
         state = _make_state(gcode_state="IDLE", hms=[], epoch=2, disconnected_at=anchor)
         _wire(monkeypatch, state, None, fleet=self._fleet(anchor, 4))
-        plate_occupancy.note_plate_detected(22, "part on the plate")
+        _occupy_plate(22)
 
         pause_recovery.note_status_push(22, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(22, state)  # epoch advanced == the reconnect edge
@@ -722,7 +771,7 @@ class TestOutageBurst:
         anchor = time.time() - 300.0
         state = _make_state(gcode_state="IDLE", hms=[], epoch=2, disconnected_at=anchor)
         _wire(monkeypatch, state, None, fleet={23: state})
-        plate_occupancy.note_plate_detected(23, "part on the plate")
+        _occupy_plate(23)
 
         pause_recovery.note_status_push(23, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(23, state)
@@ -750,7 +799,7 @@ class TestOutageBurst:
         anchor = time.time() - 300.0
         state = _make_state(gcode_state="IDLE", hms=[], epoch=2, disconnected_at=anchor)
         _wire(monkeypatch, state, None, fleet=self._fleet(anchor, 4))
-        plate_occupancy.note_plate_detected(25, "part on the plate")
+        _occupy_plate(25)
 
         pause_recovery.note_status_push(25, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(25, state)
@@ -767,7 +816,7 @@ class TestOutageBurst:
         state = _make_state(gcode_state="PAUSE", epoch=2, disconnected_at=anchor)
         client = FakeClient(state)
         _wire(monkeypatch, state, client, fleet=self._fleet(anchor, 4))
-        plate_occupancy.note_plate_detected(26, "part on the plate")
+        _occupy_plate(26)
 
         pause_recovery.note_status_push(26, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         await _drive(26, state)
@@ -853,93 +902,109 @@ class TestSummary:
 
 
 class TestPlateVisionTrip:
-    async def test_the_mark_is_on_disk_before_the_stop_goes_out(self, monkeypatch, db_session, _own_sessions):
-        """The ordering contract every downstream decision rests on: the terminal the
-        stop produces must find the farm's abort already recorded."""
+    """The printer's plate check PAUSED the job and is asking a human. The farm records
+    it and sends NOTHING (user ruling 2026-09-24: the 2026-09-04 lane stopped the print,
+    which wiped the printer's message and restarted the job into the same trip)."""
+
+    _FULL = "050000000000808C"
+
+    async def test_the_trip_sends_nothing_to_the_printer(self, monkeypatch, db_session):
         await _printer(db_session, 32)
-        item = await _farm_item(db_session, 32)
+        await _farm_item(db_session, 32)
         state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
-        calls = _wire(monkeypatch, state, None)
-
-        seen = {}
-        real = pause_recovery._stop_for_vision
-
-        async def _spy_stop(pid):
-            async with _own_sessions() as db:
-                row = await db.get(PrintQueueItem, item.id)
-                seen["mark_at_stop"] = row.stop_source
-            return await real(pid)
-
-        monkeypatch.setattr(pause_recovery, "_stop_for_vision", _spy_stop)
+        client = FakeClient(state)
+        stops = _wire(monkeypatch, state, client)
+        _spy(monkeypatch, "on_plate_not_empty")
 
         assert await pause_recovery.on_plate_vision_trip(32, {"0500_808C"}) is True
 
-        assert seen["mark_at_stop"] == "farm_vision_abort"
-        assert calls == [("stop", 32)]
+        assert stops == []
+        assert client.calls == []
+        assert state.state == "PAUSE"
 
-    async def test_the_trip_opens_a_recovering_incident_bound_to_the_unit(self, monkeypatch, db_session):
+    async def test_the_trip_opens_an_escalated_hold_bound_to_the_job(self, monkeypatch, db_session):
         await _printer(db_session, 33)
         item = await _farm_item(db_session, 33)
         state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
         _wire(monkeypatch, state, None)
+        _spy(monkeypatch, "on_plate_not_empty")
 
         await pause_recovery.on_plate_vision_trip(33, {"0500_808C", "0500_806E"})
 
         rows = await _open_incidents(db_session, 33)
-        assert [(r.kind, r.status) for r in rows] == [(KIND_PLATE_VISION, STATUS_RECOVERING)]
+        assert [(r.kind, r.status) for r in rows] == [(KIND_PLATE_VISION, STATUS_ESCALATED)]
         assert rows[0].item_id == item.id
         assert rows[0].job_id == "task-1"
         assert rows[0].code == "0500_806E"  # sorted first
         assert rows[0].codes == "0500_806E,0500_808C"
+        # The printer's own identifier, recorded now — the operator's answer clears it.
+        assert rows[0].hms_full_codes == self._FULL
+        assert printer_incidents.job_pause_held(33) is True
 
-    async def test_a_foreign_trip_records_the_intent_on_the_incident(self, monkeypatch, db_session):
-        """No row to stamp — the incident IS the record, and item_id NULL is the
-        established foreign shape."""
+    async def test_the_unit_carries_the_holds_waiting_reason(self, monkeypatch, db_session):
+        """The same projection the power-loss hold writes (``waiting_reason_for``)."""
         await _printer(db_session, 34)
-        state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()], subtask="foreign-9")
-        calls = _wire(monkeypatch, state, None)
+        item = await _farm_item(db_session, 34)
+        state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
+        _wire(monkeypatch, state, None)
+        _spy(monkeypatch, "on_plate_not_empty")
 
-        assert await pause_recovery.on_plate_vision_trip(34, {"0500_808C"}) is True
+        await pause_recovery.on_plate_vision_trip(34, {"0500_808C"})
 
-        rows = await _open_incidents(db_session, 34)
-        assert [(r.kind, r.item_id, r.job_id) for r in rows] == [(KIND_PLATE_VISION, None, "foreign-9")]
-        assert calls == [("stop", 34)]
+        await db_session.refresh(item)
+        assert item.waiting_reason == "plate_not_empty_printer_detected"
+        assert item.status == "printing"
+        assert item.stop_source is None
 
-    async def test_a_refused_stop_is_retried_once(self, monkeypatch, db_session):
+    async def test_one_page_in_the_printers_own_words(self, monkeypatch, db_session):
         await _printer(db_session, 35)
         await _farm_item(db_session, 35)
         state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
         _wire(monkeypatch, state, None)
-        sends = []
-
-        def _stop(pid):
-            sends.append(pid)
-            return len(sends) > 1
-
-        monkeypatch.setattr(pause_recovery.printer_manager, "stop_print", _stop)
+        page = _spy(monkeypatch, "on_plate_not_empty")
 
         await pause_recovery.on_plate_vision_trip(35, {"0500_808C"})
 
-        assert sends == [35, 35]
+        page.assert_awaited_once()
+        detail = page.await_args.kwargs["source_detail"]
+        assert "Detected build plate offset" in detail
+        assert detail.endswith("Print paused — fix the plate, then resume.")
+
+    async def test_a_foreign_trip_holds_the_printer_the_same_way(self, monkeypatch, db_session):
+        """No unit to project onto — the hold IS the record (``item_id`` NULL)."""
+        await _printer(db_session, 36)
+        state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()], subtask="foreign-9")
+        stops = _wire(monkeypatch, state, None)
+        page = _spy(monkeypatch, "on_plate_not_empty")
+
+        assert await pause_recovery.on_plate_vision_trip(36, {"0500_808C"}) is True
+
+        rows = await _open_incidents(db_session, 36)
+        assert [(r.kind, r.item_id, r.job_id, r.status) for r in rows] == [
+            (KIND_PLATE_VISION, None, "foreign-9", STATUS_ESCALATED)
+        ]
+        assert stops == []
+        page.assert_awaited_once()
 
     async def test_the_lane_never_raises_a_plate_gate(self, monkeypatch, db_session):
-        """The gate belongs AFTER the terminal (farm_policy), which is the only lane
-        that can tell a first trip from a confirmed one — and raising it here lets
-        note_terminal replace it with a CooldownEject built for the wrong part."""
-        await _printer(db_session, 36)
-        await _farm_item(db_session, 36)
+        """The job is paused, not over: the gate belongs to the terminal of a STOPPED job
+        (the ``plate_refused`` verdict), never to the trip."""
+        await _printer(db_session, 37)
+        await _farm_item(db_session, 37)
         state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
         _wire(monkeypatch, state, None)
+        _spy(monkeypatch, "on_plate_not_empty")
 
-        await pause_recovery.on_plate_vision_trip(36, {"0500_808C"})
+        await pause_recovery.on_plate_vision_trip(37, {"0500_808C"})
 
-        assert plate_occupancy.is_plate_occupied(36) is False
+        assert plate_occupancy.is_plate_occupied(37) is False
 
-    async def test_an_open_plate_vision_row_makes_the_lane_stand_aside(self, monkeypatch, db_session):
-        await _printer(db_session, 37)
+    async def test_a_standing_hold_makes_the_lane_stand_aside(self, monkeypatch, db_session):
+        """The trip re-fires on repeated pushes; one hold, one page."""
+        await _printer(db_session, 38)
         await printer_incidents.open_new(
             db_session,
-            printer_id=37,
+            printer_id=38,
             job_id="task-1",
             item_id=None,
             kind=KIND_PLATE_VISION,
@@ -948,24 +1013,25 @@ class TestPlateVisionTrip:
             slot_global_tray=None,
             status=STATUS_ESCALATED,
         )
-        item = await _farm_item(db_session, 37)
+        await _farm_item(db_session, 38)
         state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
-        calls = _wire(monkeypatch, state, None)
+        stops = _wire(monkeypatch, state, None)
+        page = _spy(monkeypatch, "on_plate_not_empty")
 
-        assert await pause_recovery.on_plate_vision_trip(37, {"0500_808C"}) is False
+        assert await pause_recovery.on_plate_vision_trip(38, {"0500_808C"}) is False
 
-        assert calls == []
-        await db_session.refresh(item)
-        assert item.stop_source is None
+        assert stops == []
+        page.assert_not_awaited()
+        assert len(await _open_incidents(db_session, 38)) == 1
 
     async def test_an_ams_hold_beside_the_trip_does_not_own_the_plate(self, monkeypatch, db_session):
         """Multi-alarm rule (2026-09-11): an asset carries concurrent alarms. A runout
-        standing on this printer owns the AMS, not the plate — the trip decides its
-        own row beside it, and the stop still goes out."""
-        await _printer(db_session, 38)
+        standing on this printer owns the AMS, not the plate — the trip opens its own
+        row beside it."""
+        await _printer(db_session, 39)
         await printer_incidents.open_new(
             db_session,
-            printer_id=38,
+            printer_id=39,
             job_id="task-1",
             item_id=None,
             kind=KIND_RUNOUT,
@@ -974,16 +1040,15 @@ class TestPlateVisionTrip:
             slot_global_tray=None,
             status=STATUS_ESCALATED,
         )
-        item = await _farm_item(db_session, 38)
+        await _farm_item(db_session, 39)
         state = _make_state(gcode_state="PAUSE", hms=[_vision_hms()])
-        calls = _wire(monkeypatch, state, None)
+        stops = _wire(monkeypatch, state, None)
+        _spy(monkeypatch, "on_plate_not_empty")
 
-        assert await pause_recovery.on_plate_vision_trip(38, {"0500_808C"}) is True
+        assert await pause_recovery.on_plate_vision_trip(39, {"0500_808C"}) is True
 
-        assert calls == [("stop", 38)]
-        assert {row.kind for row in await _open_incidents(db_session, 38)} == {KIND_RUNOUT, KIND_PLATE_VISION}
-        await db_session.refresh(item)
-        assert item.stop_source is not None
+        assert stops == []
+        assert {row.kind for row in await _open_incidents(db_session, 39)} == {KIND_RUNOUT, KIND_PLATE_VISION}
 
     async def test_the_hook_never_raises(self, monkeypatch, caplog):
         monkeypatch.setattr(
@@ -996,10 +1061,49 @@ class TestPlateVisionTrip:
         assert "plate-vision trip handling failed" in caplog.text
 
 
+class TestThePauseLaneNeverStops:
+    """Module-scope AST pin (template: ``test_farm_policy.TestEscalationNeverStops``): the
+    invariant is "no stop is ever sent from this lane", not "not from this one branch", and
+    an AST walk is the only assertion that covers every path a future wave adds."""
+
+    async def test_the_pause_lane_sends_no_stop_anywhere(self):
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(pause_recovery))
+        called = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        }
+        forbidden = {"stop_print", "stop_as_operator", "mark_printer_stopped_by_user"}
+        assert called & forbidden == set(), f"pause_recovery must never stop a print: {called & forbidden}"
+
+
 # --- the operator's clear ---------------------------------------------------
 
 
 class TestOnPlateCleared:
+    async def test_a_paused_plate_check_is_not_answered_by_a_plate_act(self, db_session):
+        """``job_pause``: the answer is resuming or stopping the job — neither verb
+        (routine clear or Recover) ends it."""
+        await _printer(db_session, 44)
+        await printer_incidents.open_new(
+            db_session,
+            printer_id=44,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="0500_808C",
+            slot_global_tray=None,
+            status=STATUS_ESCALATED,
+        )
+
+        assert await pause_recovery.on_plate_cleared(44) == []
+        assert await pause_recovery.on_plate_cleared(44, recover=True) == []
+        assert (await printer_incidents.get_open(db_session, 44)) is not None
+
     async def test_it_closes_an_operator_resolved_hold(self, db_session):
         await _printer(db_session, 39)
         await printer_incidents.open_new(
@@ -1105,7 +1209,7 @@ class TestMaintenanceModeStandsAside:
         calls = _wire(
             monkeypatch, state, client, fleet={pid: _make_state(disconnected_at=anchor + pid) for pid in range(1, 5)}
         )
-        plate_occupancy.note_plate_detected(42, "part on the plate")
+        _occupy_plate(42)
 
         pause_recovery.note_status_push(42, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(42, state)  # the reconnect edge
@@ -1134,7 +1238,7 @@ class TestMaintenanceModeStandsAside:
         anchor = time.time() - 300.0
         after = _make_state(gcode_state="IDLE", hms=[], epoch=2, disconnected_at=anchor)
         _wire(monkeypatch, after, None, fleet={pid: _make_state(disconnected_at=anchor + pid) for pid in range(1, 5)})
-        plate_occupancy.note_plate_detected(43, "part on the plate")
+        _occupy_plate(43)
 
         pause_recovery.note_status_push(43, _make_state(gcode_state="IDLE", hms=[], epoch=1, disconnected_at=anchor))
         pause_recovery.note_status_push(43, after)  # the reconnect edge

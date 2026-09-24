@@ -483,75 +483,6 @@ _printer_offline_notify_tasks: dict[int, asyncio.Task] = {}
 _PRINTER_OFFLINE_NOTIFY_DEBOUNCE_SECONDS = 60.0
 
 
-# HMS short-code → human-readable failure reason. Used by _dispatch_archive_update
-# when status="failed" to label the print's failure_reason in archives.
-#
-# Earlier code matched on `module` alone (e.g. "any module 0x0C HMS → Layer shift"),
-# which is wrong on two counts:
-#   1. Real layer-shift codes live in module 0x03 (see Bambu wiki), not 0x0C.
-#   2. Module 0x0C is "Motion Controller" — broad category that also covers cameras
-#      and visual markers, AND the H2D firmware emits a 0x0C HMS (0C00_001B, not in
-#      the public wiki) as part of its user-cancel sequence. Matching on the module
-#      alone caused user-cancellations to be archived as "Layer shift" failures.
-# We now match by full short code only — anything not in this map leaves
-# failure_reason=None rather than guessing.
-_HMS_FAILURE_REASONS: dict[str, str] = {
-    # Layer shift / step loss
-    "0300_4057": "Layer shift",
-    "0300_4068": "Layer shift",
-    "0300_800C": "Layer shift",
-    # Filament runout (printer-side & per-AMS-slot)
-    "0300_8004": "Filament runout",
-    "0700_8011": "Filament runout",
-    "0701_8011": "Filament runout",
-    "0702_8011": "Filament runout",
-    "0703_8011": "Filament runout",
-    "0704_8011": "Filament runout",
-    "0705_8011": "Filament runout",
-    "0706_8011": "Filament runout",
-    "0707_8011": "Filament runout",
-    "07FF_8011": "Filament runout",
-    # Clogged nozzle / extruder
-    "0300_4006": "Clogged nozzle",
-    "0300_8016": "Clogged nozzle",
-    "0300_801C": "Clogged nozzle",
-    "0700_8003": "Clogged nozzle",
-    "0700_8007": "Clogged nozzle",
-    "0700_8013": "Clogged nozzle",
-    "0701_8003": "Clogged nozzle",
-    "0701_8007": "Clogged nozzle",
-    "0701_8013": "Clogged nozzle",
-    "0702_8003": "Clogged nozzle",
-}
-
-# Plate-occupancy vision faults (Phase 3.3): a unit that ultimately FAILs carrying
-# the printer's own pre-print plate check is attributed to "plate not empty
-# (printer vision)" instead of a generic failure. Sourced from the single frozenset
-# in services.bambu_mqtt so the set never drifts.
-for _occ_code in _HMS_PLATE_OCCUPANCY_CODES:
-    _HMS_FAILURE_REASONS.setdefault(_occ_code, "Plate not empty (printer vision)")
-
-
-def derive_failure_reason(status: str, hms_errors: list[dict] | None) -> str | None:
-    """Derive a human-readable failure_reason for an archived print.
-
-    Returns "User cancelled" for cancelled/aborted prints; for failed prints,
-    returns the first matching reason from _HMS_FAILURE_REASONS, or None when
-    no HMS code matches (don't guess — null is honest).
-    """
-    if status in ("aborted", "cancelled"):
-        return "User cancelled"
-    if status != "failed":
-        return None
-    from backend.app.services.hms_errors import hms_short_code
-
-    for err in hms_errors or []:
-        short_code = hms_short_code(err.get("attr", 0), err.get("code", 0))
-        if short_code in _HMS_FAILURE_REASONS:
-            return _HMS_FAILURE_REASONS[short_code]
-    return None
-
-
 # Track created_by_id for expected prints so the user email can be sent even when
 # the archive itself doesn't have created_by_id set (e.g. library-file-based prints).
 # {(printer_id, filename): created_by_id}
@@ -1332,20 +1263,17 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
             )
 
-        # Native plate-occupancy capture (Phase 3.3). The H2-series pre-print vision
-        # check (foreign-objects-on-heatbed / plate-marker) surfaces as an HMS code and
-        # PAUSEs the job on the printer. Since 2026-09-04 the reaction is the
-        # pause-recovery lane's: it records the trip as a printer_incident, stamps the
-        # farm-abort mark on the printing row and STOPS the print, so a terminal exists
-        # for farm_policy to decide a re-check requeue or a confirmed hold from. The
-        # lane used to leave the unit `printing` forever behind a human-clear gate — 13
-        # trips, 22 operator stops, 0 requeues.
+        # Native plate-occupancy capture (Phase 3.3). The H2-series pre-print plate
+        # check surfaces as an HMS code and PAUSEs the job on the printer. The reaction
+        # is the pause-recovery lane's: it records a ``job_pause`` hold (the chip, the
+        # unit's waiting reason, one page in the printer's own words) and sends NOTHING —
+        # the print stays paused with the printer's message on its screen for the human
+        # who fixes the plate and resumes (user ruling 2026-09-24).
         #
-        # Fire-and-forget, not awaited: the lane sends a stop and can sleep for its one
-        # retry, and the ~1 Hz status flow must not wait on either. Strong-referenced
-        # (spawn_background_task) for the same reason the runout hook above is — a
-        # weakly-held task can vanish mid-await with no traceback, and this one's
-        # failure mode is a print that was never stopped.
+        # Fire-and-forget, not awaited: the lane opens a row and pages, and the ~1 Hz
+        # status flow must not wait on either. Strong-referenced (spawn_background_task)
+        # for the same reason the runout hook above is — a weakly-held task can vanish
+        # mid-await with no traceback.
         _new_occupancy = edges.appeared_short & _HMS_PLATE_OCCUPANCY_CODES
         if _new_occupancy:
             try:
@@ -4141,6 +4069,47 @@ async def on_finish_photo_moment(printer_id: int, data: dict):
         producer_done.set()
 
 
+async def _finish_photo_notification_data(db, archive_id: int, finish_photo_filename: str) -> dict:
+    """``finish_photo_url`` + ``image_data`` for a captured finish photo — ONE builder.
+
+    Read by the print-complete notification and by the farm policy's first-article
+    pending page, which used to share them only because the policy ran INSIDE the
+    notification closure. ``image_data`` is omitted over 2.5 MB (provider attachment
+    limits) and on any read failure; the URL prefers ``external_url`` and falls back to
+    a relative path (which will not work for external services).
+    """
+    from pathlib import Path
+
+    from backend.app.api.routes.settings import get_setting
+    from backend.app.models.archive import PrintArchive
+
+    logger = logging.getLogger(__name__)
+    out: dict = {}
+    external_url = await get_setting(db, "external_url")
+    if external_url:
+        out["finish_photo_url"] = (
+            f"{external_url.rstrip('/')}/api/v1/archives/{archive_id}/photos/{finish_photo_filename}"
+        )
+    else:
+        out["finish_photo_url"] = f"/api/v1/archives/{archive_id}/photos/{finish_photo_filename}"
+
+    # Read finish photo bytes for image attachment (e.g. Pushover)
+    try:
+        archive = await db.get(PrintArchive, archive_id)
+        if archive is not None and archive.file_path:
+            photo_path = app_settings.base_dir / Path(archive.file_path).parent / "photos" / finish_photo_filename
+            if photo_path.exists():
+                photo_bytes = await asyncio.to_thread(photo_path.read_bytes)
+                if len(photo_bytes) <= 2_500_000:
+                    out["image_data"] = photo_bytes
+                    logger.info("[NOTIFY-BG] Loaded finish photo bytes: %s bytes", len(photo_bytes))
+                else:
+                    logger.warning("[NOTIFY-BG] Finish photo too large for attachment: %s bytes", len(photo_bytes))
+    except Exception as e:  # noqa: BLE001 — a photo read must never fail a notification
+        logger.warning("[NOTIFY-BG] Failed to read finish photo bytes: %s", e)
+    return out
+
+
 async def on_print_complete(printer_id: int, data: dict):
     """Handle print completion - update the archive status."""
     import time
@@ -4213,41 +4182,23 @@ async def on_print_complete(printer_id: int, data: dict):
     # Clear current print user tracking (Issue #206)
     printer_manager.clear_current_print_user(printer_id)
 
-    # If the user explicitly stopped this print from the queue UI the printer will
-    # report "failed" or "aborted" via MQTT.  Override that to "cancelled" so the
-    # correct "print stopped" notification/email is sent instead of a failure alert.
+    # The printer's own word for how the job ended, before any reading of it.
     _raw_status = data.get("status", "completed")
-    # Classify an operator stop (Phase 3.1) BEFORE the discard below mutates the
-    # membership set. 'operator_ui' = Stop pressed in the queue UI (member of
-    # _user_stopped_printers); 'operator_screen' = the firmware's cancel echo
-    # surfaced `user_cancel_observed` (stopped on the printer's touchscreen). The
-    # UI-stop is normalised to 'cancelled' here regardless of deposit (an explicit
-    # queue action); a SCREEN-stop WITH a deposit is normalised later, once the
-    # no-deposit classification is known (a no-deposit screen-stop is handled by the
-    # existing no-deposit path so a first article still retries).
-    #
-    # The FARM's own abort outranks both operator signals, so the mark it stamped on the
-    # printing row BEFORE sending its stop is read here — ahead of every status rewrite
-    # that keys off the verdict, because the disposition is decided ONCE from the
-    # classification. A read failure degrades to the two operator signals (today's
-    # behaviour) rather than taking the callback down.
-    from backend.app.services.farm_correlation import classify_stop, printing_stop_mark
+    # THE terminal's classification inputs, captured ONCE and BEFORE any consumer of this
+    # terminal mutates state (``services/terminal_outcome.py``). The printer's open holds
+    # are read off the incident store's DB-free projection HERE, ahead of
+    # ``spool_recovery.on_job_terminal`` below — which closes the wire rows this very
+    # terminal answers (runout / jam / power loss) and the plate-check hold of this job.
+    # A verdict read after that close is a verdict over a printer that has forgotten why
+    # the job was held: the 2026-09-11 "operator stop over an open fault requeues" ruling
+    # never fired in production for exactly that reason. The UI-stop membership is read
+    # before the discard below consumes it.
+    from backend.app.services import printer_incidents as _printer_incidents
+    from backend.app.services.farm_correlation import classify_stop
 
-    _farm_stop_mark = None
-    try:
-        async with async_session() as _mark_db:
-            _farm_stop_mark = await printing_stop_mark(_mark_db, printer_id)
-    except Exception as _fme:  # noqa: BLE001 — a mark read must never crash the callback
-        logger.warning("[CALLBACK] farm stop-mark read failed for printer %s: %s", printer_id, _fme)
-
-    _stop_source = classify_stop(data, printer_id, _user_stopped_printers, item_stop_source=_farm_stop_mark)
-    if _stop_source == "operator_ui" and _raw_status in ("failed", "aborted"):
-        logger.info(
-            "[CALLBACK] Overriding status '%s' -> 'cancelled' for printer %s (print was stopped from queue by user)",
-            _raw_status,
-            printer_id,
-        )
-        data = {**data, "status": "cancelled"}
+    _open_at_terminal = _printer_incidents.snapshots(printer_id)
+    _stop_source = classify_stop(data, printer_id, _user_stopped_printers, open_incidents=_open_at_terminal)
+    _ui_stopped = printer_id in _user_stopped_printers
     _user_stopped_printers.discard(printer_id)
 
     # Server-dispatched eject jobs (part-present sweep / FA remote eject) are
@@ -4283,12 +4234,9 @@ async def on_print_complete(printer_id: int, data: dict):
     #
     # Deliberately placed HERE rather than up with the per-print resets: the verdict
     # needs ``_is_eject_job`` (an eject sweep is filament-less, so its completion proves
-    # nothing) and the firmware's own ``subtask_id``. ``_raw_status`` is the value
-    # captured at its own site ABOVE, taken BEFORE the operator-UI rewrite rebound
-    # ``data["status"]`` from "failed" to "cancelled" — so what the rule table reads is
-    # the printer's own word, not the farm's reading of it. (``subtask_id`` is untouched
-    # by that rewrite.) Nothing between the old call position and this one touches
-    # incident state.
+    # nothing) and the firmware's own ``subtask_id``. ``_raw_status`` is the printer's own
+    # word, captured before any reading of it. And it runs AFTER the classification
+    # inputs above were captured — this is the closer that empties them.
     #
     # The farm unit's own waiting_reason hygiene stays farm_policy.on_terminal's job
     # (W4b), so the two never fight over one row.
@@ -4344,7 +4292,10 @@ async def on_print_complete(printer_id: int, data: dict):
             from backend.app.core.database import run_with_retry
 
             async def _do_resolve(db):
-                resolution = await resolve_terminal_item(db, printer_id, data)
+                # ``ui_stopped``: the terminal of a job the QUEUE PAGE stopped arrives after
+                # that route committed the row ``cancelled`` — the correlation owner matches
+                # it by its dispatch id instead of calling the farm's own print foreign.
+                resolution = await resolve_terminal_item(db, printer_id, data, ui_stopped=_ui_stopped)
                 item = resolution.item
                 raw_rpc = await get_setting(db, "require_plate_clear")
                 return {
@@ -4412,36 +4363,34 @@ async def on_print_complete(printer_id: int, data: dict):
 
     _evidence = DepositEvidence.from_terminal_payload(data, is_dry_run=_resolved_is_dry_run)
     no_deposit = not _evidence.deposited
-    # A NON-first-article no-deposit stop is benign — normalise the terminal status
-    # to "cancelled" (mirroring the _user_stopped_printers override above) so the
-    # queue records "cancelled" (not "failed"), farm_policy.on_terminal no-ops, and
-    # quarantine (keyed on "failed") excludes it. A first-article no-deposit stop
-    # deliberately keeps "failed" so the run still retries its first article.
-    if _stop_source == "farm_vision_abort" and _raw_status in ("failed", "aborted"):
-        # The FARM stopped this print (the pre-print plate check tripped and the lane
-        # sent print.stop). It is a stop, never a failure — including for a FIRST
-        # ARTICLE, whose no-deposit branch below deliberately keeps "failed" so a
-        # genuine failure still retries, and would otherwise route a farm abort into
-        # _on_item_failed plus a quarantine count for a plate the farm itself refused.
-        # The row already carries the mark; this only makes the recorded status agree
-        # with it.
-        data = {**data, "status": "cancelled"}
-    elif no_deposit and not _resolved_first_article and not _is_eject_job:
-        data = {**data, "status": "cancelled"}
-    elif _stop_source == "operator_screen" and not no_deposit and _raw_status in ("failed", "aborted"):
-        # A printer-screen stop that DID deposit a part (the no-deposit branch above
-        # handles the thermal-less case). Normalise to "cancelled" so it records a
-        # stop, not a failure, and farm_policy takes the no-retry / no-quarantine
-        # operator-stop path (Phase 3.1).
-        data = {**data, "status": "cancelled"}
-    elif _stop_source == farm_correlation.STOP_SOURCE_RECONCILE_UNKNOWN and _raw_status in ("failed", "aborted"):
-        # The downtime reconcile could not learn this print's outcome. It is NOT a
-        # failure — nothing was observed to fail — so it must not feed retry or
-        # quarantine accounting; normalising here is what makes ONE word describe this
-        # terminal everywhere (the archive row, the queue row, and the ``final_status``
-        # ``farm_policy.on_terminal`` forks on). Without it the policy saw ``aborted``,
-        # matched no branch at all, and the run quietly finished one plate short.
-        data = {**data, "status": "cancelled"}
+    # THE outcome of this terminal, built ONCE from the inputs captured above and handed
+    # to every sink below: the queue row, the plate authority, the archive and print log,
+    # the notification and the farm policy. Every status rewrite this handler used to do
+    # in place (an operator stop, a no-deposit stop, a refused plate — first article
+    # included — and the reconcile's unknown outcome) is the builder's, with its reason.
+    from backend.app.services.terminal_outcome import build_terminal_outcome
+
+    _outcome = build_terminal_outcome(
+        raw_status=_raw_status,
+        verdict=_stop_source,
+        open_incidents=_open_at_terminal,
+        job_id=data.get("subtask_id"),
+        evidence=_evidence,
+        first_article=_resolved_first_article,
+        is_eject=_is_eject_job,
+        hms_errors=data.get("hms_errors"),
+    )
+    if _outcome.recorded_status != _raw_status:
+        logger.info(
+            "[CALLBACK] printer %s terminal recorded '%s' (printer said '%s', verdict=%s)",
+            printer_id,
+            _outcome.recorded_status,
+            _raw_status,
+            _outcome.verdict,
+        )
+    # The upstream sinks (relay, archive, notification, smart plug, timelapse) read the
+    # payload's status; they read the OUTCOME's word through it.
+    data = {**data, "status": _outcome.recorded_status}
 
     # Raise the plate-clear gate for queued dispatch (#961). Any terminal status may
     # have left material on the bed: a user can cancel ten hours into a print, a
@@ -4487,9 +4436,22 @@ async def on_print_complete(printer_id: int, data: dict):
                     source_subtask_id=_payload_subtask,
                     evidence=_evidence,
                     raise_gate=_raise_gate,
+                    refusal=_outcome.plate_refusal,
                 ),
             )
-            if no_deposit:
+            if _outcome.plate_refusal is not None:
+                # The printer's plate check paused this job and it ended without printing:
+                # the authority holds the plate for a human whatever the deposit reads. It
+                # is NOT a foreign deposit to identify and sweep, even when the job was one
+                # the farm did not dispatch.
+                logger.warning(
+                    "[CALLBACK] printer %s: the printer's plate check refused the plate (%s, subtask=%s) — "
+                    "plate held for a human",
+                    printer_id,
+                    _final_status,
+                    _payload_subtask,
+                )
+            elif no_deposit:
                 logger.info(
                     "[CALLBACK] printer %s: no-deposit terminal (%s, layer=%s, peaks_reliable=%s) — not gating queue",
                     printer_id,
@@ -4833,7 +4795,6 @@ async def on_print_complete(printer_id: int, data: dict):
     try:
         from backend.app.core.database import run_with_retry
         from backend.app.models.print_queue import PrintQueueItem
-        from backend.app.services.farm_correlation import STOP_SOURCE_FARM_VISION_ABORT
 
         async def _update_queue_status(db):
             nonlocal queue_item_id, queue_status, queue_auto_off
@@ -4845,44 +4806,40 @@ async def on_print_complete(printer_id: int, data: dict):
             if not _attributed or _resolved_item_id is None:
                 return
             item = await db.get(PrintQueueItem, _resolved_item_id)
-            if item is not None and item.status == "printing":
-                queue_status = data.get("status", "completed")
-                # MQTT sends "aborted" for cancelled prints; normalise to
-                # "cancelled" so it matches the queue schema Literal.
-                if queue_status == "aborted":
-                    queue_status = "cancelled"
+            if item is None:
+                return
+            # The row the QUEUE PAGE's Stop already moved to ``cancelled`` (its route
+            # commits before the terminal can arrive): the correlation owner matched it by
+            # its dispatch id, so it is this terminal's row — its status and stop time are
+            # the route's, and the terminal adds what only the terminal knows (the
+            # verdict, the printer's words) and hands the unit to the farm policy.
+            queue_stopped = _ui_stopped and item.status == "cancelled" and item.stop_source == "operator_ui"
+            if item.status != "printing" and not queue_stopped:
+                return
+            # The outcome's word (never ``aborted`` — the builder records an unattributed
+            # abort as ``cancelled``, so the queue Literal and the policy fork agree).
+            queue_status = _outcome.recorded_status
+            if item.status == "printing":
                 item.status = queue_status
                 item.completed_at = datetime.now(timezone.utc)
-                # Attribute an operator stop on the resolved unit (Phase 3.1) so the
-                # farm policy skips retry/quarantine for it. Only for a 'cancelled'
-                # verdict with a classified source — a reconcile-synthesised abort
-                # carries no echo/membership → stop_source stays NULL (unknown).
-                #
-                # A FARM mark already on the row is never overwritten. It was stamped
-                # before the stop went out precisely so the terminal could HONOUR it,
-                # and the classifier above re-derives the same verdict from it — but the
-                # guard is the durable half of that contract and must not depend on the
-                # classification having succeeded.
-                if (
-                    queue_status == "cancelled"
-                    and _stop_source is not None
-                    and item.stop_source != STOP_SOURCE_FARM_VISION_ABORT
-                ):
-                    item.stop_source = _stop_source
-                if queue_status == "failed" and not item.error_message:
-                    from backend.app.services.hms_errors import format_hms_error_summary
+            # The terminal's verdict IS the unit's stop attribution (the closed
+            # ``StopVerdict`` set) — lineage and history only: the farm policy reads the
+            # verdict off the outcome, never off this column.
+            if queue_status == "cancelled" and _outcome.verdict is not None:
+                item.stop_source = _outcome.verdict
+            # The printer's own words for every terminal that ended without its part.
+            if queue_status != "completed" and _outcome.printer_message and not item.error_message:
+                item.error_message = _outcome.printer_message
 
-                    item.error_message = format_hms_error_summary(data.get("hms_errors") or [])
+            # Bump usage counters on the source library file so admins can
+            # sort by "last printed" and (eventually) auto-purge stale
+            # files — #1008.
+            await _bump_library_file_usage_if_completed(db, item, queue_status)
 
-                # Bump usage counters on the source library file so admins can
-                # sort by "last printed" and (eventually) auto-purge stale
-                # files — #1008.
-                await _bump_library_file_usage_if_completed(db, item, queue_status)
-
-                await db.commit()
-                queue_item_id = item.id
-                queue_auto_off = item.auto_off_after
-                logger.info("Updated queue item %s status to %s", item.id, queue_status)
+            await db.commit()
+            queue_item_id = item.id
+            queue_auto_off = item.auto_off_after
+            logger.info("Updated queue item %s status to %s", item.id, queue_status)
 
         await run_with_retry(_update_queue_status, label="queue status update")
 
@@ -5070,6 +5027,54 @@ async def on_print_complete(printer_id: int, data: dict):
 
     log_timing("Filament usage tracking")
 
+    # The finish-photo budget. When a timelapse was recording, photo sourcing polls the
+    # per-print timelapse for up to 60s (#1397) — extend the budget so the notification
+    # carries the correct bed-up photo instead of falling through to the live-cam grab.
+    # Adds ~30s of notification latency at worst on slow links.
+    photo_wait_timeout = 75 if data.get("timelapse_was_active") else 45
+
+    async def _run_farm_policy(photo: asyncio.Task | None) -> None:
+        """THE farm-policy hook for this terminal: ONE call, its own session, its own guard.
+
+        Spawned once per terminal from whichever archive path runs, and deliberately NOT
+        inside the notification closure that used to host it (twice — one per path): a
+        notification failure must never take the run's disposition down with it, and the
+        policy must never share a session with a lane that did not commit for it.
+
+        ``photo`` is the finish-photo task on the archive path. It is awaited only for a
+        COMPLETED unit, because the one policy act that uses it — the first-article
+        pending page — fires only on a completed unit; every other disposition (a
+        requeue, a refused plate's bed lift, a hold) runs at once. ``asyncio.wait`` never
+        cancels the task it waits on, so the notification's own wait keeps its photo.
+        """
+        finish_photo: str | None = None
+        if photo is not None and _outcome.recorded_status == "completed":
+            done, _pending = await asyncio.wait({photo}, timeout=photo_wait_timeout)
+            if photo in done and not photo.cancelled() and photo.exception() is None:
+                finish_photo = photo.result()
+        try:
+            from backend.app.services.farm_policy import on_terminal as farm_on_terminal
+
+            async with async_session() as db:
+                photo_data = (
+                    await _finish_photo_notification_data(db, archive_id, finish_photo)
+                    if finish_photo and archive_id
+                    else None
+                )
+                await farm_on_terminal(
+                    db,
+                    printer_id,
+                    queue_item_id,
+                    _outcome.recorded_status,
+                    archive_data=photo_data,
+                    completed_subtask_id=data.get("subtask_id"),
+                    completed_subtask_name=data.get("subtask_name"),
+                    hms_errors=data.get("hms_errors"),
+                    outcome=_outcome,
+                )
+        except Exception as farm_err:  # noqa: BLE001 — the policy must never crash the terminal chain
+            logger.warning("[FARM-POLICY] farm policy hook failed for printer %s: %s", printer_id, farm_err)
+
     if not archive_id:
         # An eject sweep never has an archive by construction — the WARNING is only
         # meaningful for an ordinary print whose archive we genuinely lost. The
@@ -5143,6 +5148,11 @@ async def on_print_complete(printer_id: int, data: dict):
                         if mqtt_remaining and isinstance(mqtt_remaining, (int, float)) and mqtt_remaining > 0:
                             no_archive_data["print_time_seconds"] = int(mqtt_remaining)
 
+                    # The printer's own words for a print that ended without its part —
+                    # the notification's ``{reason}`` (the terminal outcome's message).
+                    if _outcome.printer_message:
+                        no_archive_data = {**(no_archive_data or {}), "printer_message": _outcome.printer_message}
+
                     ps = data.get("status", "completed")
                     # Suppress the user-facing print notification for a server-dispatched
                     # eject sweep — it is farm plumbing, not a print the operator queued;
@@ -5160,26 +5170,6 @@ async def on_print_complete(printer_id: int, data: dict):
                             "[NOTIFY-BG] Suppressing print notification for eject job on printer %s", printer_id
                         )
 
-                    # Farm policy hook for the no-archive path (Phase 3): covers
-                    # remote first-article eject completions (dispatched without a
-                    # registered archive) plus any farm item that finished without
-                    # an archive. Mutually exclusive with the archive path above.
-                    try:
-                        from backend.app.services.farm_policy import on_terminal as farm_on_terminal
-
-                        await farm_on_terminal(
-                            db,
-                            printer_id,
-                            queue_item_id,
-                            ps,
-                            archive_data=no_archive_data,
-                            completed_subtask_id=data.get("subtask_id"),
-                            completed_subtask_name=data.get("subtask_name"),
-                            hms_errors=data.get("hms_errors"),
-                        )
-                    except Exception as farm_err:
-                        logger.warning("[NOTIFY-BG] farm policy hook (no-archive) failed: %s", farm_err)
-
                     # Send user-specific email if we have a created_by_id
                     if no_archive_data and no_archive_data.get("created_by_id"):
                         raw_filename = data.get("subtask_name") or data.get("filename", "Unknown")
@@ -5195,6 +5185,9 @@ async def on_print_complete(printer_id: int, data: dict):
                 logger.warning("[NOTIFY-BG] Failed to send notification without archive: %s", e, exc_info=True)
 
         spawn_background_task(_notify_no_archive(), name="notify-no-archive")
+        # The farm policy for the no-archive path (remote first-article eject completions,
+        # every eject sweep, any farm unit that finished without an archive).
+        spawn_background_task(_run_farm_policy(None), name=f"farm-policy-terminal-{printer_id}")
         return
 
     log_timing("Archive lookup")
@@ -5206,13 +5199,13 @@ async def on_print_complete(printer_id: int, data: dict):
             service = ArchiveService(db)
             status = data.get("status", "completed")
 
-            hms_errors = data.get("hms_errors", []) if status == "failed" else None
-            if hms_errors:
-                logger.info("[ARCHIVE] HMS errors at failure: %s", hms_errors)
-            failure_reason = derive_failure_reason(status, hms_errors)
+            # The printer's category for this terminal — the outcome's, built from the
+            # printer's evidence (a refused plate's codes come from its hold, because the
+            # stop wiped the live list) and never from the farm's rewritten status.
+            failure_reason = _outcome.failure_category
             if failure_reason:
                 logger.info("[ARCHIVE] failure_reason=%r (status=%s)", failure_reason, status)
-            elif status == "failed" and hms_errors:
+            elif status == "failed" and data.get("hms_errors"):
                 logger.info("[ARCHIVE] HMS errors present but none matched a known failure-reason short code")
 
             await service.update_archive_status(
@@ -5564,9 +5557,11 @@ async def on_print_complete(printer_id: int, data: dict):
             return None
 
     spawn_background_task(_background_energy_calculation(), name="background-energy-calc")
-    # Photo capture task - result will be used by notifications
+    # Photo capture task - result will be used by notifications and the farm policy
     photo_task = spawn_background_task(_background_finish_photo(), name="background-finish-photo")
     log_timing("Background tasks scheduled (energy, photo)")
+    # The farm policy for the archive path — the same ONE task the no-archive path spawns.
+    spawn_background_task(_run_farm_policy(photo_task), name=f"farm-policy-terminal-{printer_id}")
 
     # Also run smart plug, notifications, and maintenance as background tasks
     print_status = data.get("status", "completed")
@@ -5654,44 +5649,15 @@ async def on_print_complete(printer_id: int, data: dict):
                         # Pass usage tracker results for AMS slot info in notifications
                         if usage_results:
                             archive_data["usage_results"] = usage_results
+                        # The printer's own words for a print that ended without its part
+                        # — the notification's ``{reason}`` (the terminal outcome's message).
+                        if _outcome.printer_message:
+                            archive_data["printer_message"] = _outcome.printer_message
                         # Add finish photo URL and image bytes if available
                         if finish_photo_filename:
-                            from backend.app.api.routes.settings import get_setting
-
-                            external_url = await get_setting(db, "external_url")
-                            if external_url:
-                                external_url = external_url.rstrip("/")
-                                archive_data["finish_photo_url"] = (
-                                    f"{external_url}/api/v1/archives/{archive_id}/photos/{finish_photo_filename}"
-                                )
-                            else:
-                                # Fallback to relative URL (won't work for external services)
-                                archive_data["finish_photo_url"] = (
-                                    f"/api/v1/archives/{archive_id}/photos/{finish_photo_filename}"
-                                )
-
-                            # Read finish photo bytes for image attachment (e.g. Pushover)
-                            try:
-                                from pathlib import Path
-
-                                photo_path = (
-                                    app_settings.base_dir
-                                    / Path(archive.file_path).parent
-                                    / "photos"
-                                    / finish_photo_filename
-                                )
-                                if photo_path.exists():
-                                    photo_bytes = await asyncio.to_thread(photo_path.read_bytes)
-                                    if len(photo_bytes) <= 2_500_000:
-                                        archive_data["image_data"] = photo_bytes
-                                        logger.info("[NOTIFY-BG] Loaded finish photo bytes: %s bytes", len(photo_bytes))
-                                    else:
-                                        logger.warning(
-                                            f"[NOTIFY-BG] Finish photo too large for attachment: "
-                                            f"{len(photo_bytes)} bytes"
-                                        )
-                            except Exception as e:
-                                logger.warning("[NOTIFY-BG] Failed to read finish photo bytes: %s", e)
+                            archive_data.update(
+                                await _finish_photo_notification_data(db, archive_id, finish_photo_filename)
+                            )
 
                 # A server-dispatched eject sweep never takes the archive path (it
                 # creates no archive), but guard defensively so an eject can never
@@ -5701,26 +5667,6 @@ async def on_print_complete(printer_id: int, data: dict):
                     await notification_service.on_print_complete(
                         printer_id, printer_name, print_status, data, db, archive_data=archive_data
                     )
-
-                # Farm first-article + failure/quarantine policy (Phase 3). Single
-                # hook — all logic lives in services.farm_policy. Runs here (not at
-                # the earlier terminal-status site) so the finish photo captured for
-                # the notification is available to attach to first_article_pending.
-                try:
-                    from backend.app.services.farm_policy import on_terminal as farm_on_terminal
-
-                    await farm_on_terminal(
-                        db,
-                        printer_id,
-                        queue_item_id,
-                        print_status,
-                        archive_data=archive_data,
-                        completed_subtask_id=data.get("subtask_id"),
-                        completed_subtask_name=data.get("subtask_name"),
-                        hms_errors=data.get("hms_errors"),
-                    )
-                except Exception as farm_err:
-                    logger.warning("[NOTIFY-BG] farm policy hook failed: %s", farm_err)
 
                 # Send user-specific email notification
                 if archive_data:
@@ -5784,13 +5730,8 @@ async def on_print_complete(printer_id: int, data: dict):
     spawn_background_task(_background_smart_plug(), name="background-smart-plug")
     spawn_background_task(_background_maintenance_check(), name="background-maintenance-check")
 
-    # Notification task waits for photo capture to complete first (with timeout).
-    # When a timelapse was recording, photo sourcing polls the per-print
-    # timelapse for up to 60s (#1397) — extend the budget so the notification
-    # carries the correct bed-up photo instead of falling through to the
-    # live-cam grab. Adds ~30s of notification latency at worst on slow links.
-    photo_wait_timeout = 75 if data.get("timelapse_was_active") else 45
-
+    # Notification task waits for photo capture to complete first (with the timeout
+    # ``photo_wait_timeout`` set above, shared with the farm policy's own wait).
     async def _photo_then_notify():
         """Wait for photo capture, then send notification with photo URL."""
         finish_photo = None

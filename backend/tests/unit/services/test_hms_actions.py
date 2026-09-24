@@ -115,19 +115,22 @@ class TestExecuteHmsActionDispatch:
         # Same plain shape as RESUME_PRINTING — no err.
         assert "err" not in cmds[0]["print"]
 
-    def test_stop_is_plain_no_err_no_job_id(self, client):
-        # Same firmware silent-rejection class as resume — the `err` variant
-        # was confirmed broken on H2D-1 (PAUSE → PAUSE), the plain shape
-        # transitions to FAILED within ~2s.
-        client.execute_hms_action("03008070", HMSAction.STOP_PRINTING, job_id="task-1")
+    def test_stop_is_not_the_dialog_dispatchers_to_send(self, client):
+        """CHANGED 2026-09-24: an operator choosing "Stop printing" in the HMS dialog is
+        the operator's Stop, whose one owner is ``print_control.stop_as_operator`` (the
+        stop AND the user-stopped mark). The route sends it there; this dispatcher owns
+        no stop and answers False for it like any action it does not handle — sending
+        one here went out WITHOUT the mark, so the terminal read as a failure."""
+        assert client.execute_hms_action("03008070", HMSAction.STOP_PRINTING, job_id="task-1") is False
+        assert self._published_commands(client) == []
+
+    def test_the_one_stop_publisher_is_plain_no_err_no_job_id(self, client):
+        # The stop the operator verb sends. Same firmware silent-rejection class as
+        # resume — the `err` variant was confirmed broken on H2D-1 (PAUSE → PAUSE); the
+        # plain shape transitions to FAILED within ~2s.
+        assert client.stop_print() is True
         cmds = self._published_commands(client)
-        assert cmds[0] == {
-            "print": {
-                "command": "stop",
-                "param": "",
-                "sequence_id": "0",
-            }
-        }
+        assert cmds == [{"print": {"command": "stop", "sequence_id": "0"}}]
         assert "err" not in cmds[0]["print"]
         assert "job_id" not in cmds[0]["print"]
 

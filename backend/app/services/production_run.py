@@ -416,13 +416,11 @@ def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueIte
     for the never-connected case: a printer with no live status yet is *unknown*,
     not offline, so tests/startup don't spuriously report every printer blocked.
 
-    ``vision_hold`` is the one flag that does NOT come from a unit token, and since
-    2026-09-04 it cannot: a plate-check trip now STOPS the print, so the tripped unit
-    becomes ``cancelled`` and its ``waiting_reason`` is cleared at the terminal, while
-    the hold itself is printer-scoped and outlives the requeue. It is read from the
-    incident store's projection (``printer_incidents.snapshot`` — pure, DB-free, the
-    same source the printer card's chip renders), which is the row that actually holds
-    the printer.
+    ``vision_hold`` is the one flag that does NOT come from a unit token: the
+    plate-check hold is printer-scoped — a foreign print trips it too, with no unit to
+    project onto — so it is read from the incident store's projection
+    (``printer_incidents.snapshot`` — pure, DB-free, the same source the printer card's
+    chip renders), which is the row that actually holds the printer.
     """
     states: list[dict] = []
     any_blocked = False

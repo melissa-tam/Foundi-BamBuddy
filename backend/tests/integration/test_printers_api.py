@@ -2849,6 +2849,38 @@ class TestExecuteHMSActionAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_stop_printing_is_the_operators_stop(self, async_client: AsyncClient, printer_factory):
+        """The dialog's "Stop printing" is an operator pressing Stop: it goes through the
+        ONE owner (``print_control.stop_as_operator`` — the stop AND the user-stopped
+        mark), never the dialog dispatcher, which used to send it without the mark so the
+        terminal read as a genuine failure (2026-09-24)."""
+        printer = await printer_factory(name="Test Printer")
+
+        mock_client = MagicMock()
+        mock_client.state.state = "PAUSE"
+        mock_client.state.hms_errors = [object()]
+
+        def _stopped(_pid):
+            mock_client.state.state = "FAILED"
+            mock_client.state.hms_errors = []
+            return True
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
+            patch("backend.app.api.routes.printers.stop_as_operator", side_effect=_stopped) as operator_stop,
+        ):
+            mock_pm.get_client.return_value = mock_client
+
+            body = {"print_error": "0500808C", "action": "STOP_PRINTING", "job_id": "task-7"}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        operator_stop.assert_called_once_with(printer.id)
+        mock_client.execute_hms_action.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_execute_hms_action_dispatcher_failure(self, async_client: AsyncClient, printer_factory):
         """400 when the dispatcher returns False (unknown action, mid-flight disconnect)."""
         printer = await printer_factory(name="Test Printer")

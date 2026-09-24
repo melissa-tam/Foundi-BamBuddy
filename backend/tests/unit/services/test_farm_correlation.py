@@ -19,23 +19,24 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.dispatch_target import encode_printer_ids
 from backend.app.services.farm_correlation import (
-    STOP_SOURCE_FARM_VISION_ABORT,
+    STOP_VERDICT_PLATE_REFUSED,
     classify_stop,
     farm_work_slated_for,
     farm_work_targets_printer,
-    printing_stop_mark,
     resolve_active_plate_id,
     resolve_printing_farm_item,
     resolve_terminal_item,
     terminal_disposition,
     upgrade_to_foreign_auto_eject,
 )
+from backend.app.services.hms_errors import PrinterMessage
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     DepositEvidence,
     EscalationOnly,
     Evidence,
     ForeignAutoEject,
+    PlateRefusal,
     plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
@@ -268,6 +269,56 @@ class TestResolveTerminalItemVerdicts:
         assert res.item is None
 
 
+class TestQueuePageStopCorrelation:
+    """The QUEUE PAGE's Stop commits the row ``cancelled`` before the terminal arrives.
+
+    Its terminal used to resolve FOREIGN (zero ``printing`` rows, an echoed id): no
+    operator-stop hold, no fault requeue, and a foreign-plate page for the farm's own
+    part. ``ui_stopped`` — the route's own mark, consumed at this terminal — lets the
+    correlation owner match that row by its dispatch id.
+    """
+
+    async def _stopped(self, db, *, printer_id, subtask):
+        item = await _add_item(db, printer_id=printer_id, status="cancelled", dispatch_subtask_id=subtask)
+        item.stop_source = "operator_ui"
+        item.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+        return item
+
+    async def test_the_route_stopped_row_is_matched_by_its_dispatch_id(self, db_session):
+        item = await self._stopped(db_session, printer_id=70, subtask="SUB-Q")
+
+        res = await resolve_terminal_item(db_session, 70, {"subtask_id": "SUB-Q"}, ui_stopped=True)
+
+        assert res.verdict == "matched"
+        assert res.item.id == item.id
+
+    async def test_without_the_routes_mark_it_is_still_foreign(self, db_session):
+        """A later or duplicate terminal carries no mark (it was consumed at the first),
+        so an already-handled row is never re-matched."""
+        await self._stopped(db_session, printer_id=71, subtask="SUB-Q")
+
+        res = await resolve_terminal_item(db_session, 71, {"subtask_id": "SUB-Q"}, ui_stopped=False)
+
+        assert res.verdict == "foreign"
+
+    async def test_a_different_id_is_still_foreign(self, db_session):
+        await self._stopped(db_session, printer_id=72, subtask="SUB-Q")
+
+        res = await resolve_terminal_item(db_session, 72, {"subtask_id": "SCREEN-9"}, ui_stopped=True)
+
+        assert res.verdict == "foreign"
+
+    async def test_a_row_cancelled_by_anything_but_the_operators_stop_is_not_matched(self, db_session):
+        item = await _add_item(db_session, printer_id=73, status="cancelled", dispatch_subtask_id="SUB-Q")
+        item.stop_source = "reconcile_unknown"
+        await db_session.commit()
+
+        res = await resolve_terminal_item(db_session, 73, {"subtask_id": "SUB-Q"}, ui_stopped=True)
+
+        assert res.verdict == "foreign"
+
+
 class TestFarmWorkTargetsPrinter:
     """The helper that decides whether a printer has farm work bound to it."""
 
@@ -459,17 +510,24 @@ class TestClassifyStop:
         assert classify_stop({"outcome_unknown": True}, 1, set()) == "reconcile_unknown"
 
     @pytest.mark.parametrize(
-        "payload, membership, mark, expected",
+        "payload, membership, holds, expected",
         [
-            ({"outcome_unknown": True}, {1}, None, "operator_ui"),
-            ({"outcome_unknown": True, "user_cancel_observed": True}, set(), None, "operator_screen"),
-            ({"outcome_unknown": True}, set(), "farm_vision_abort", "farm_vision_abort"),
+            ({"outcome_unknown": True}, {1}, (), "operator_ui"),
+            ({"outcome_unknown": True, "user_cancel_observed": True}, set(), (), "operator_screen"),
+            (
+                {"outcome_unknown": True, "status": "aborted", "subtask_id": "JOB-1"},
+                set(),
+                ({"kind": "plate_vision", "job_id": "JOB-1"},),
+                "plate_refused",
+            ),
         ],
     )
-    def test_the_unknown_ranks_below_every_real_signal(self, payload, membership, mark, expected):
+    def test_the_unknown_ranks_below_every_real_signal(self, payload, membership, holds, expected):
         """It is what is LEFT when nothing speaks — a reconciled terminal that does
-        carry a mark or an echo has a real cause, and that cause decides."""
-        assert classify_stop(payload, 1, membership, item_stop_source=mark) == expected
+        carry a hold, an echo or a mark has a real cause, and that cause decides. (A
+        paused plate check stopped while the farm was down reconciles as a refused
+        plate: the reconcile echoes the job's own id.)"""
+        assert classify_stop(payload, 1, membership, open_incidents=holds) == expected
 
     def test_a_false_flag_is_not_a_verdict(self):
         assert classify_stop({"outcome_unknown": False}, 1, set()) is None
@@ -477,64 +535,51 @@ class TestClassifyStop:
     def test_false_echo_is_none(self):
         assert classify_stop({"user_cancel_observed": False}, 1, set()) is None
 
-    def test_the_farm_mark_outranks_the_cancel_echo(self):
-        """An MQTT ``print.stop`` plausibly produces the firmware's cancel echo — that
-        is unmeasured, so the mark must not depend on its absence. Relabelling the
-        farm's own abort ``operator_screen`` would route the unit into the operator-stop
-        disposition instead of the requeue the abort exists to produce."""
-        assert (
-            classify_stop({"user_cancel_observed": True}, 1, set(), item_stop_source="farm_vision_abort")
-            == "farm_vision_abort"
-        )
 
-    def test_the_farm_mark_outranks_ui_membership_too(self):
-        """The older rule was "membership WINS"; it is narrowed by exactly one case. A
-        human pressing Stop on a print the farm is already aborting has not changed why
-        the print ended — and the mark is on disk while the membership is a process
-        set."""
-        assert classify_stop({}, 1, {1}, item_stop_source="farm_vision_abort") == "farm_vision_abort"
+class TestClassifyStopPlateRefused:
+    """``plate_refused``: a non-completed terminal of the job an open plate-check hold paused.
 
-    def test_an_unrelated_mark_does_not_hijack_the_verdict(self):
-        """The precedence is keyed on the farm's OWN marker, not on "the row carries
-        some stop_source" — a stop_source left by an earlier terminal must not decide
-        this one."""
-        assert classify_stop({"user_cancel_observed": True}, 1, set(), item_stop_source="operator_ui") == (
-            "operator_screen"
-        )
+    The holds are the incident store's DB-free projection, captured BEFORE the terminal's
+    own closers ran — the classifier never asks the store after the fact.
+    """
 
-    def test_no_mark_is_the_pre_existing_behaviour(self):
-        assert classify_stop({}, 1, {1}, item_stop_source=None) == "operator_ui"
+    _HOLD = {"kind": "plate_vision", "job_id": "JOB-7", "printer_messages": []}
 
+    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
+    def test_the_paused_jobs_non_completed_terminal_is_a_refused_plate(self, status):
+        payload = {"status": status, "subtask_id": "JOB-7"}
+        assert classify_stop(payload, 1, set(), open_incidents=[self._HOLD]) == STOP_VERDICT_PLATE_REFUSED
 
-class TestPrintingStopMark:
-    """The read that makes the durable mark visible to the classifier."""
+    def test_it_outranks_the_operators_ui_stop(self):
+        """Pressing Stop on a paused plate check is how this verdict is USUALLY produced —
+        what it means for the plate and the unit is the refusal, not the button."""
+        payload = {"status": "failed", "subtask_id": "JOB-7"}
+        assert classify_stop(payload, 1, {1}, open_incidents=[self._HOLD]) == STOP_VERDICT_PLATE_REFUSED
 
-    async def test_it_returns_the_mark_on_the_printing_row(self, db_session):
-        item = await _add_item(db_session, printer_id=50)
-        item.stop_source = STOP_SOURCE_FARM_VISION_ABORT
-        await db_session.commit()
+    def test_it_outranks_the_screen_echo(self):
+        payload = {"status": "failed", "subtask_id": "JOB-7", "user_cancel_observed": True}
+        assert classify_stop(payload, 1, set(), open_incidents=[self._HOLD]) == STOP_VERDICT_PLATE_REFUSED
 
-        assert await printing_stop_mark(db_session, 50) == STOP_SOURCE_FARM_VISION_ABORT
+    def test_a_completed_terminal_is_never_a_refusal(self):
+        """The operator fixed the plate and resumed, and the job ran to the end — the
+        hold was answered, and the part exists."""
+        payload = {"status": "completed", "subtask_id": "JOB-7"}
+        assert classify_stop(payload, 1, set(), open_incidents=[self._HOLD]) is None
 
-    async def test_an_unmarked_printing_row_answers_none(self, db_session):
-        await _add_item(db_session, printer_id=51)
-        assert await printing_stop_mark(db_session, 51) is None
+    def test_another_jobs_terminal_is_not_this_holds_refusal(self):
+        """The hold paused JOB-7; an eject sweep (or any other job) ending says nothing about it."""
+        payload = {"status": "failed", "subtask_id": "EJECT-1"}
+        assert classify_stop(payload, 1, {1}, open_incidents=[self._HOLD]) == "operator_ui"
 
-    async def test_a_terminal_row_is_not_read(self, db_session):
-        """Only what is ``printing`` NOW can carry a mark about the terminal arriving
-        now; a cancelled row's stop_source is last cycle's answer."""
-        item = await _add_item(db_session, printer_id=52, status="cancelled")
-        item.stop_source = STOP_SOURCE_FARM_VISION_ABORT
-        await db_session.commit()
+    def test_a_fault_hold_of_the_same_job_is_not_a_refusal(self):
+        """Only the plate-check kind refuses a plate; a runout hold of the same job is a
+        fault, and the operator's stop over it keeps its own verdict."""
+        runout = {"kind": "runout", "job_id": "JOB-7"}
+        payload = {"status": "failed", "subtask_id": "JOB-7"}
+        assert classify_stop(payload, 1, {1}, open_incidents=[runout]) == "operator_ui"
 
-        assert await printing_stop_mark(db_session, 52) is None
-
-    async def test_it_only_reads_the_target_printer(self, db_session):
-        item = await _add_item(db_session, printer_id=53)
-        item.stop_source = STOP_SOURCE_FARM_VISION_ABORT
-        await db_session.commit()
-
-        assert await printing_stop_mark(db_session, 54) is None
+    def test_no_holds_is_the_pre_existing_behaviour(self):
+        assert classify_stop({"status": "failed", "subtask_id": "JOB-7"}, 1, {1}) == "operator_ui"
 
 
 class TestResolvePrintingFarmItem:
@@ -667,6 +712,27 @@ class TestTerminalDisposition:
         assert disposition.queue_item_id == 11
         assert disposition.source_subtask_id == "SUB-9"
         assert disposition.evidence is evidence
+
+    def test_a_refused_plate_is_a_human_clear_hold_carrying_the_printers_words(self):
+        """Tops the ladder: even an id-confirmed farm unit with an eject profile is NOT
+        swept — the printer said the plate is wrong."""
+        refusal = PlateRefusal(messages=(PrinterMessage(short_code="0500_808C", description="Detected offset."),))
+
+        disposition = _disposition(refusal=refusal)
+
+        assert disposition.policy == EscalationOnly(refusal=refusal)
+
+    def test_a_refused_plate_raises_the_gate_whatever_the_toggle_says(self):
+        """The toggle decides whether a finished job's DEPOSIT holds the plate; the printer
+        refusing the plate is not an inference from a deposit."""
+        refusal = PlateRefusal(messages=())
+        assert _disposition(refusal=refusal, raise_gate=False).raise_gate is True
+
+    def test_a_refused_plate_is_gated_sourceless(self):
+        """Nothing was printed, so the refused job's id must not become the plate's sweep
+        identity (the manual eject's matched lane would pair it with that unit)."""
+        disposition = _disposition(refusal=PlateRefusal(messages=()), source_subtask_id="SUB-9")
+        assert disposition.source_subtask_id is None
 
 
 class TestUpgradeToForeignAutoEject:

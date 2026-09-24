@@ -223,3 +223,45 @@ class TestWebhookCancelPrint:
                 headers={"X-API-Key": api_key_data},
             )
         assert resp.status_code == 409
+
+
+class TestWebhookStopsAreTheOperatorsStop:
+    """``/stop`` and ``/cancel`` are an API client pressing Stop — one owner,
+    ``print_control.stop_as_operator`` (the stop AND the user-stopped mark), so the
+    terminal records a cancel rather than a failure (2026-09-24). ``/cancel`` used to call
+    ``printer_manager.cancel_print``, which does not exist: every call answered 500."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize(("verb", "live"), [("stop", "RUNNING"), ("cancel", "RUNNING"), ("cancel", "PAUSE")])
+    async def test_it_sends_the_operator_stop(self, async_client: AsyncClient, api_key_data, printer_row, verb, live):
+        state = PrinterState(connected=True, state=live)
+        with (
+            patch("backend.app.api.routes.webhook.printer_manager.get_status", MagicMock(return_value=state)),
+            patch("backend.app.api.routes.webhook.stop_as_operator", MagicMock(return_value=True)) as operator_stop,
+        ):
+            resp = await async_client.post(
+                f"/api/v1/webhook/printer/{printer_row.id}/{verb}",
+                headers={"X-API-Key": api_key_data},
+            )
+
+        assert resp.status_code == 200
+        operator_stop.assert_called_once_with(printer_row.id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("verb", ["stop", "cancel"])
+    async def test_an_undelivered_stop_is_a_502_not_a_200(
+        self, async_client: AsyncClient, api_key_data, printer_row, verb
+    ):
+        state = PrinterState(connected=True, state="RUNNING")
+        with (
+            patch("backend.app.api.routes.webhook.printer_manager.get_status", MagicMock(return_value=state)),
+            patch("backend.app.api.routes.webhook.stop_as_operator", MagicMock(return_value=False)),
+        ):
+            resp = await async_client.post(
+                f"/api/v1/webhook/printer/{printer_row.id}/{verb}",
+                headers={"X-API-Key": api_key_data},
+            )
+
+        assert resp.status_code == 502

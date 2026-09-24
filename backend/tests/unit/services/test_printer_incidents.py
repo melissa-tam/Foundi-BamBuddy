@@ -379,6 +379,91 @@ class TestMigration:
         finally:
             await engine.dispose()
 
+    async def test_the_full_codes_column_is_added_to_an_existing_table(self, tmp_path):
+        """``hms_full_codes`` (2026-09-24) is additive and nullable, idempotent across boots."""
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        import backend.app.core.database as core_db
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'cols.db'}")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(core_db.Base.metadata.create_all)
+                await conn.execute(text("ALTER TABLE printer_incident DROP COLUMN hms_full_codes"))
+            for _boot in range(2):
+                async with engine.begin() as conn:
+                    await core_db.run_migrations(conn)
+            async with engine.connect() as conn:
+                columns = {r[1] for r in (await conn.execute(text("PRAGMA table_info('printer_incident')"))).all()}
+            assert "hms_full_codes" in columns
+        finally:
+            await engine.dispose()
+
+    async def test_the_legacy_open_plate_vision_rows_are_closed_once(self, tmp_path, caplog):
+        """The retired lane opened a ``plate_vision`` row and then STOPPED the print, so no
+        open row of it is a live job pause — and under ``job_pause`` it would never close.
+        The repair closes those, leaves every other kind alone, and (marker-keyed) never
+        touches a plate-check hold opened after it ran."""
+        from datetime import datetime
+
+        from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+        import backend.app.core.database as core_db
+        from backend.app.models.printer import Printer
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'repair.db'}")
+
+        def _row(kind, *, closed=False):
+            now = datetime.utcnow()
+            return PrinterIncident(
+                printer_id=1,
+                job_id="job",
+                kind=kind,
+                code="0500_808C" if kind == KIND_PLATE_VISION else "0700_8011",
+                codes="x",
+                status=STATUS_RESOLVED if closed else STATUS_ESCALATED,
+                created_at=now,
+                resolved_at=now if closed else None,
+            )
+
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(core_db.Base.metadata.create_all)
+            async with AsyncSession(engine, expire_on_commit=False) as s:
+                s.add(Printer(id=1, name="P", ip_address="1.1.1.1", access_code="x", serial_number="S1", model="H2S"))
+                legacy, runout, history = (
+                    _row(KIND_PLATE_VISION),
+                    _row(KIND_RUNOUT),
+                    _row(KIND_PLATE_VISION, closed=True),
+                )
+                s.add_all([legacy, runout, history])
+                await s.commit()
+                ids = (legacy.id, runout.id, history.id)
+
+            with caplog.at_level(logging.INFO):
+                async with engine.begin() as conn:
+                    await core_db.run_migrations(conn)
+            assert "repair_open_plate_vision_20260924" in caplog.text
+
+            async with AsyncSession(engine, expire_on_commit=False) as s:
+                fresh = _row(KIND_PLATE_VISION)  # a GENUINE paused plate check, after the deploy
+                s.add(fresh)
+                await s.commit()
+                fresh_id = fresh.id
+            async with engine.begin() as conn:
+                await core_db.run_migrations(conn)  # the next boot: marker says done
+
+            async with AsyncSession(engine, expire_on_commit=False) as s:
+                rows = {r.id: r for r in (await s.execute(select(PrinterIncident))).scalars().all()}
+            assert (rows[ids[0]].status, rows[ids[0]].resolve_source) == (STATUS_RESOLVED, "legacy_vision_stop")
+            assert rows[ids[0]].resolved_at is not None
+            assert rows[ids[1]].resolved_at is None  # an AMS hold is not the retired lane's
+            assert rows[ids[2]].resolve_source is None  # history untouched
+            assert rows[fresh_id].resolved_at is None  # never re-run over a live pause
+        finally:
+            await engine.dispose()
+
     async def test_an_old_single_column_index_is_re_keyed_once(self, tmp_path):
         """The 2026-09-11 re-key, against a database carrying the OLD shape.
 
@@ -615,15 +700,20 @@ class TestResolutionClass:
     close this?" any more.
     """
 
-    async def test_the_pause_cause_kinds_that_need_hands_are_operator_resolved(self):
-        from backend.app.models.printer_incident import (
-            KIND_PLATE_VISION,
-            KIND_Z_REFERENCE_LOST,
-            RESOLUTION_OPERATOR,
-        )
+    async def test_a_lost_z_frame_is_operator_resolved(self):
+        """The part coming off the plate after a reboot is the human act that ends it."""
+        from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST, RESOLUTION_OPERATOR
 
-        assert printer_incidents.resolution_class(KIND_PLATE_VISION) == RESOLUTION_OPERATOR
         assert printer_incidents.resolution_class(KIND_Z_REFERENCE_LOST) == RESOLUTION_OPERATOR
+
+    async def test_a_plate_check_trip_is_a_JOB_PAUSE(self):
+        """2026-09-24: the printer paused ONE job and is asking a human. Its answer is that
+        job — resumed or stopped — never a plate act (the retired lane made it
+        ``operator`` because the farm stopped the print itself)."""
+        from backend.app.models.printer_incident import JOB_PAUSE_KINDS, KIND_PLATE_VISION, RESOLUTION_JOB_PAUSE
+
+        assert printer_incidents.resolution_class(KIND_PLATE_VISION) == RESOLUTION_JOB_PAUSE
+        assert frozenset({KIND_PLATE_VISION}) == JOB_PAUSE_KINDS
 
     async def test_wire_resolved_kinds(self):
         """Power loss included: the prompt clearing IS a wire fact, so that hold closes
@@ -655,9 +745,9 @@ class TestResolutionClass:
     async def test_an_external_variant_falls_back_to_the_registered_kind(self):
         """The pause-cause kinds have no external row at all — asking for one must not
         raise, it must answer the kind's own rule."""
-        from backend.app.models.printer_incident import KIND_PLATE_VISION, RESOLUTION_OPERATOR
+        from backend.app.models.printer_incident import KIND_PLATE_VISION, RESOLUTION_JOB_PAUSE
 
-        assert printer_incidents.resolution_class(KIND_PLATE_VISION, external=True) == RESOLUTION_OPERATOR
+        assert printer_incidents.resolution_class(KIND_PLATE_VISION, external=True) == RESOLUTION_JOB_PAUSE
 
     async def test_a_service_hold_resolves_on_the_verb_that_opened_it(self):
         """The FOURTH class (2026-09-12). A declared hold has no fault behind it, so no
@@ -690,60 +780,135 @@ class TestResolutionClass:
         assert printer_incidents.row_external(holder) is True
 
 
-class TestCountRecent:
-    """``count_recent`` — PRINTER-scoped and windowed, unlike ``count_resolved``."""
+class TestJobPauseHeld:
+    """``job_pause_held`` — THE predicate every job-resuming lane reads (the
+    ``automation_held`` idiom): pure, DB-free, over the projection cache."""
 
-    async def test_counts_only_this_printer_and_kind_inside_the_window(self, db_session, printer_factory):
-        from datetime import datetime, timedelta
+    async def test_an_open_plate_check_hold_holds_the_printer(self, db_session, printer_factory):
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="0500_808C")
 
-        from backend.app.models.printer_incident import KIND_PLATE_VISION
+        assert printer_incidents.job_pause_held(printer.id) is True
 
-        one = await printer_factory()
-        two = await printer_factory()
-        now = datetime.utcnow()
-
-        inc = await _open(db_session, one.id, kind=KIND_PLATE_VISION, job_id="job-a")
-        await printer_incidents.close(db_session, inc.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
-        # A different printer, and a different kind on the same printer: neither counts.
-        await _open(db_session, two.id, kind=KIND_PLATE_VISION, job_id="job-a")
-        stale = await _open(db_session, one.id, kind=KIND_JAM, job_id="job-b", codes="jam:0700_8010")
-        await printer_incidents.close(db_session, stale.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
-
-        since = now - timedelta(hours=1)
-        assert await printer_incidents.count_recent(db_session, one.id, KIND_PLATE_VISION, since) == 1
-        assert await printer_incidents.count_recent(db_session, two.id, KIND_PLATE_VISION, since) == 1
-
-    async def test_a_resolved_incident_still_counts(self, db_session, printer_factory):
-        """The first trip is RESOLVED by the time the second happens — the requeue closed
-        it at the terminal — so a status filter would make the second trip invisible and
-        the printer would re-check forever."""
-        from datetime import datetime, timedelta
-
-        from backend.app.models.printer_incident import KIND_PLATE_VISION
+    async def test_a_fault_or_a_declared_hold_is_not_a_job_pause(self, db_session, printer_factory):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
 
         printer = await printer_factory()
-        first = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="job-1")
-        await printer_incidents.close(db_session, first.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
-        # The requeue is a NEW job — which is exactly why the job-scoped `count_resolved`
-        # cannot answer this question.
-        await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="job-2")
+        await _open(db_session, printer.id)  # a runout
+        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
 
-        since = datetime.utcnow() - timedelta(hours=1)
-        assert await printer_incidents.count_recent(db_session, printer.id, KIND_PLATE_VISION, since) == 2
-        assert await printer_incidents.count_resolved(db_session, printer.id, "job-2", KIND_PLATE_VISION) == 0
+        assert printer_incidents.job_pause_held(printer.id) is False
 
-    async def test_the_window_excludes_older_rows(self, db_session, printer_factory):
-        from datetime import datetime, timedelta
+    async def test_closing_the_hold_releases_the_lanes(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="0500_808C")
+        await printer_incidents.close(db_session, row.id, status=STATUS_RESOLVED, source=RESOLVE_OBSERVED_RUNNING)
 
-        from backend.app.models.printer_incident import KIND_PLATE_VISION
+        assert printer_incidents.job_pause_held(printer.id) is False
+
+    async def test_no_printer_is_never_held(self):
+        assert printer_incidents.job_pause_held(None) is False
+        assert printer_incidents.job_pause_held(0) is False
+
+
+class TestPrinterMessagesProjection:
+    """``printer_messages`` — the printer's OWN words for a hold, recorded at open and
+    rendered by the one catalog renderer; ALWAYS present on the projection (the shipped
+    frontend reads it unconditionally), JSON primitives only."""
+
+    _FULL = "0500080C0000808C"  # the hms[] lane's 16-hex identifier for 0500_808C
+
+    async def test_the_recorded_full_codes_render_the_printers_words(self, db_session, printer_factory):
+        import json
 
         printer = await printer_factory()
-        old = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="job-1")
-        old.created_at = datetime.utcnow() - timedelta(days=2)
-        await db_session.commit()
+        await _open(
+            db_session,
+            printer.id,
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="0500_808C",
+            hms_full_codes=[self._FULL],
+        )
 
-        since = datetime.utcnow() - timedelta(hours=1)
-        assert await printer_incidents.count_recent(db_session, printer.id, KIND_PLATE_VISION, since) == 0
+        payload = printer_incidents.snapshot(printer.id, kind=KIND_PLATE_VISION)
+
+        assert payload["printer_messages"] == [
+            {
+                "short_code": "0500_808C",
+                "description": (
+                    "Detected build plate offset. Please align the build plate with the heatbed, and then continue."
+                ),
+            }
+        ]
+        assert payload["job_id"] == "task-1"
+        json.dumps(payload)  # the WS lane has no encoder
+
+    async def test_the_codes_survive_on_disk_and_through_rehydrate(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(
+            db_session,
+            printer.id,
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="0500_808C",
+            hms_full_codes=[self._FULL],
+        )
+        assert row.hms_full_codes == self._FULL
+
+        printer_incidents._reset_state()
+        await printer_incidents.rehydrate(db_session)
+
+        payload = printer_incidents.snapshot(printer.id, kind=KIND_PLATE_VISION)
+        assert [m["short_code"] for m in payload["printer_messages"]] == ["0500_808C"]
+
+    async def test_a_legacy_row_falls_back_to_its_short_code(self, db_session, printer_factory):
+        """A row opened before the column existed renders from ``code``."""
+        printer = await printer_factory()
+        await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="0500_808C")
+
+        payload = printer_incidents.snapshot(printer.id, kind=KIND_PLATE_VISION)
+
+        assert payload["printer_messages"][0]["short_code"] == "0500_808C"
+        assert payload["printer_messages"][0]["description"].startswith("Detected build plate offset")
+
+    async def test_a_code_less_hold_projects_an_empty_list(self, db_session, printer_factory):
+        """Always present: a declared hold, and a lost-Z hold whose ``code`` is a kind
+        token rather than anything the printer said."""
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD, KIND_Z_REFERENCE_LOST
+
+        printer = await printer_factory()
+        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+        await _open(db_session, printer.id, kind=KIND_Z_REFERENCE_LOST, job_id="", code="power_loss", codes="")
+
+        for payload in printer_incidents.snapshots(printer.id):
+            assert payload["printer_messages"] == []
+
+    async def test_an_upgrade_carries_the_worse_faults_words(self, db_session, printer_factory):
+        """A row re-classified onto a physical fault must not keep the milder fault's text."""
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, code="0700_8006", codes="jam:x")
+
+        await printer_incidents.upgrade(
+            db_session,
+            row.id,
+            kind=KIND_PHYSICAL,
+            code="0700_8004",
+            codes="physical:y",
+            slot_global_tray=None,
+            hms_full_codes=["0700200000008004"],
+        )
+
+        payload = printer_incidents.snapshot(printer.id)
+        assert [m["short_code"] for m in payload["printer_messages"]] == ["0700_8004"]
+
+    async def test_the_column_value_is_bounded_at_a_code_boundary(self):
+        """VARCHAR(512): a truncated hex code would render as garbage, so the join stops
+        at the last whole code; no codes stores NULL, not an empty string."""
+        joined = printer_incidents.join_full_codes([self._FULL] * 40)
+        assert joined is not None and len(joined) <= 512
+        assert all(len(code) == 16 for code in joined.split(","))
+        assert printer_incidents.join_full_codes([]) is None
 
 
 class TestCachedKind:

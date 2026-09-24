@@ -1395,9 +1395,11 @@ async def stop_queue_item(
     # stop_source stamp (guarded on status=='printing') is skipped — the item lands
     # 'cancelled' with stop_source NULL (prod item 219). Stamp it in the SAME
     # transition. This IS the queue-UI stop, i.e. classify_stop's 'operator_ui'
-    # verdict (membership in _user_stopped_printers wins), so the farm policy reads it
-    # as an operator stop, not a failure. Also NULL any stale hold token: a terminal
-    # unit must not keep a spool_jam_recovery_failed / print_paused_stalled reason.
+    # verdict. The printer's terminal still reaches the farm policy: the correlation
+    # owner (``farm_correlation.resolve_terminal_item`` with ``ui_stopped``) matches this
+    # ``cancelled`` row by its dispatch id, so the operator-stop hold and the fault
+    # requeue fire for it. Also NULL any stale hold token: a terminal unit must not keep
+    # a spool_jam_recovery_failed / print_paused_stalled reason.
     item.stop_source = "operator_ui"
     item.waiting_reason = None
     await db.commit()
