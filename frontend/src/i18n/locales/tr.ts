@@ -172,6 +172,7 @@ export default {
       printerCol: 'Yazıcı',
       timeCol: 'Bitti / başladı',
       stoppedByOperator: 'Operatör tarafından durduruldu',
+      stoppedAtPlateCheck: 'Plaka kontrolünde durduruldu',
       stoppedByFarmVision: 'Çiftlik tarafından durduruldu: plaka kontrolü',
       stoppedByReconcileUnknown: 'Yeniden bağlantı sonrası sonuç bilinmiyor',
       firstArticleBadge: 'İlk parça',

@@ -172,6 +172,7 @@ export default {
       printerCol: 'Printer',
       timeCol: 'Finished / started',
       stoppedByOperator: 'Stopped by operator',
+      stoppedAtPlateCheck: 'Stopped at plate check',
       // History only: labels stored `farm_vision_abort` rows; nothing writes that token now.
       stoppedByFarmVision: 'Stopped by the farm: plate check',
       stoppedByReconcileUnknown: 'Outcome unknown after reconnect',

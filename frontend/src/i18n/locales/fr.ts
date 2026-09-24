@@ -172,6 +172,7 @@ export default {
       printerCol: 'Imprimante',
       timeCol: 'Terminée / démarrée',
       stoppedByOperator: 'Arrêtée par l\'opérateur',
+      stoppedAtPlateCheck: 'Arrêtée au contrôle du plateau',
       stoppedByFarmVision: 'Arrêtée par la ferme : contrôle du plateau',
       stoppedByReconcileUnknown: 'Résultat inconnu après reconnexion',
       firstArticleBadge: 'Première pièce',

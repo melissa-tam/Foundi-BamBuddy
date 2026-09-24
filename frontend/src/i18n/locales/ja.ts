@@ -172,6 +172,7 @@ export default {
       printerCol: 'プリンター',
       timeCol: '完了 / 開始',
       stoppedByOperator: 'オペレーターによる停止',
+      stoppedAtPlateCheck: 'プレート検査で停止',
       stoppedByFarmVision: 'ファームによる停止: プレート検査',
       stoppedByReconcileUnknown: '再接続後、結果不明',
       firstArticleBadge: '初品',

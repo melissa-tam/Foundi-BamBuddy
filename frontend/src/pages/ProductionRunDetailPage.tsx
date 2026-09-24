@@ -50,7 +50,7 @@ import { isScheduled } from '../utils/productionRuns';
 import { deriveFarmPhase } from '../utils/farmPhase';
 import { formatDateTime, formatRelativeTime, parseUTCDate } from '../utils/date';
 import { waitingReasonText } from '../utils/waitingReason';
-import type { RunPrinterState, RunUnit } from '../types/productionRuns';
+import type { RunPrinterState, RunUnit, UnitStopSource } from '../types/productionRuns';
 
 // ---------------------------------------------------------------------------
 // Unit status pill
@@ -185,10 +185,20 @@ interface StopSourceLabel {
   key: string;
 }
 
+const OPERATOR_STOP_LABEL: StopSourceLabel = {
+  icon: Hand,
+  key: 'productionRuns.detail.stoppedByOperator',
+};
+
 /**
- * THE `stop_source` → copy map. Two tokens are NOT a human and must never
- * render "Stopped by operator" — nobody touched the printer:
+ * THE `stop_source` → copy map, TOTAL over `UnitStopSource`: a new token is a
+ * compile error until it is given a label, never a silent fall-through to the
+ * operator label (how `plate_refused` first rendered "Stopped by operator").
+ * Only the two operator tokens carry the operator label:
  *
+ * - `plate_refused` — the printer's own plate check paused the print and it
+ *   ended without printing. The label names the plate check, not who pressed
+ *   Stop: the lineage question is why this plate went back in the queue.
  * - `farm_vision_abort` — the farm's own stop of a plate-check trip (the
  *   2026-09-04 wave). The farm no longer stops on a trip (the print stays paused
  *   for a human), so nothing writes this token now; the row renders STORED
@@ -196,26 +206,19 @@ interface StopSourceLabel {
  * - `reconcile_unknown` — the downtime reconcile found a print it could not
  *   read an outcome for (printer idle, or a subtask id that no longer matches),
  *   so the unit is cancelled with the outcome unknown and the run holds.
- *
- * Every other value (`operator_ui`, `operator_screen`) is an operator act and
- * falls through to the operator label.
  */
-const STOP_SOURCE_LABELS: Readonly<Record<string, StopSourceLabel>> = {
+const STOP_SOURCE_LABELS: Readonly<Record<UnitStopSource, StopSourceLabel>> = {
+  operator_ui: OPERATOR_STOP_LABEL,
+  operator_screen: OPERATOR_STOP_LABEL,
+  plate_refused: { icon: ScanEye, key: 'productionRuns.detail.stoppedAtPlateCheck' },
   farm_vision_abort: { icon: ScanEye, key: 'productionRuns.detail.stoppedByFarmVision' },
   reconcile_unknown: { icon: HelpCircle, key: 'productionRuns.detail.stoppedByReconcileUnknown' },
-};
-
-const OPERATOR_STOP_LABEL: StopSourceLabel = {
-  icon: Hand,
-  key: 'productionRuns.detail.stoppedByOperator',
 };
 
 function UnitRow({ unit }: { unit: RunUnit }) {
   const { t } = useTranslation();
   const waiting = waitingReasonText(unit.waiting_reason, t);
-  const stopLabel = unit.stop_source
-    ? (STOP_SOURCE_LABELS[unit.stop_source] ?? OPERATOR_STOP_LABEL)
-    : null;
+  const stopLabel = unit.stop_source ? STOP_SOURCE_LABELS[unit.stop_source] : null;
   const StopIcon = stopLabel?.icon;
   return (
     <tr className="border-b border-bambu-dark-tertiary/60 last:border-0">

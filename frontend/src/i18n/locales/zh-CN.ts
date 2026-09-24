@@ -172,6 +172,7 @@ export default {
       printerCol: '打印机',
       timeCol: '完成 / 开始',
       stoppedByOperator: '已由操作员停止',
+      stoppedAtPlateCheck: '已在打印板检测处停止',
       stoppedByFarmVision: '农场停止：打印板检测',
       stoppedByReconcileUnknown: '重新连接后结果未知',
       firstArticleBadge: '首件',

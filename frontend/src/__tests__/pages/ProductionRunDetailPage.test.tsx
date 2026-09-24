@@ -324,6 +324,45 @@ describe('ProductionRunDetailPage', () => {
     expect(within(table).getByText('#104')).toBeInTheDocument();
   });
 
+  it('attributes a plate-refused stop to the plate check, not to an operator', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () =>
+        HttpResponse.json(
+          detailRun({
+            units: [
+              // The printer's own plate check paused this print and it ended
+              // without printing. The lineage names the plate check, never the
+              // operator who may have pressed Stop on the paused job.
+              unit({ id: 107, status: 'cancelled', stop_source: 'plate_refused' }),
+              // Liveness pair: a genuine operator stop still reads as one.
+              unit({ id: 108, status: 'cancelled', stop_source: 'operator_ui' }),
+            ],
+          }),
+        ),
+      ),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    const table = await screen.findByRole('table');
+    const rowOf = (unitId: number): HTMLElement => {
+      const row = within(table)
+        .getAllByRole('row')
+        .find((r) => within(r).queryByRole('cell', { name: `#${unitId}` }));
+      if (!row) throw new Error(`no row for unit #${unitId}`);
+      return row;
+    };
+    const { stoppedAtPlateCheck, stoppedByOperator } = en.productionRuns.detail;
+
+    const refused = rowOf(107);
+    expect(within(refused).getByText(stoppedAtPlateCheck)).toBeInTheDocument();
+    expect(within(refused).queryByText(stoppedByOperator)).not.toBeInTheDocument();
+
+    const operator = rowOf(108);
+    expect(within(operator).getByText(stoppedByOperator)).toBeInTheDocument();
+    expect(within(operator).queryByText(stoppedAtPlateCheck)).not.toBeInTheDocument();
+  });
+
   it('renders the first-article banner in the header when awaiting approval (Phase 4, F1)', async () => {
     server.use(
       http.get('*/api/v1/production-runs/1', () =>

@@ -172,6 +172,7 @@ export default {
       printerCol: '프린터',
       timeCol: '완료 / 시작',
       stoppedByOperator: '운영자가 중지함',
+      stoppedAtPlateCheck: '플레이트 검사에서 중지됨',
       stoppedByFarmVision: '팜이 중지함: 플레이트 검사',
       stoppedByReconcileUnknown: '재연결 후 결과 불명',
       firstArticleBadge: '초도품',

@@ -172,6 +172,7 @@ export default {
       printerCol: 'Impressora',
       timeCol: 'Concluída / iniciada',
       stoppedByOperator: 'Parada pelo operador',
+      stoppedAtPlateCheck: 'Parada na verificação da placa',
       stoppedByFarmVision: 'Parada pela fazenda: verificação da placa',
       stoppedByReconcileUnknown: 'Resultado desconhecido após a reconexão',
       firstArticleBadge: 'Primeira peça',

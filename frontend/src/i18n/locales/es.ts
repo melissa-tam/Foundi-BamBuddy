@@ -172,6 +172,7 @@ export default {
       printerCol: 'Impresora',
       timeCol: 'Terminada / iniciada',
       stoppedByOperator: 'Detenida por el operador',
+      stoppedAtPlateCheck: 'Detenida en la comprobación de la cama',
       stoppedByFarmVision: 'Detenida por la granja: comprobación de la cama',
       stoppedByReconcileUnknown: 'Resultado desconocido tras la reconexión',
       firstArticleBadge: 'Primera pieza',

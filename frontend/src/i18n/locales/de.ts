@@ -172,6 +172,7 @@ export default {
       printerCol: 'Drucker',
       timeCol: 'Fertig / gestartet',
       stoppedByOperator: 'Vom Bediener gestoppt',
+      stoppedAtPlateCheck: 'Bei der Plattenprüfung gestoppt',
       stoppedByFarmVision: 'Von der Farm gestoppt: Plattenprüfung',
       stoppedByReconcileUnknown: 'Ergebnis nach Wiederverbindung unbekannt',
       firstArticleBadge: 'Erstmuster',
