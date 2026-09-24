@@ -697,9 +697,9 @@ class VirtualPrinterInstance:
             import json
 
             from backend.app.api.routes.settings import get_setting
-            from backend.app.models.print_queue import PrintQueueItem
             from backend.app.services.archive import ArchiveService
             from backend.app.services.filament_requirements import extract_filament_requirements
+            from backend.app.services.queue_builder import create_queue_rows
 
             async with self._session_factory() as db:
                 name_source = await get_setting(db, "virtual_printer_archive_name_source")
@@ -800,28 +800,6 @@ class VirtualPrinterInstance:
                     # below runs once and the existing behaviour is preserved.
                     plate_ids = self._extract_plate_ids(file_path)
 
-                    # Pick a base position the same way the manual /print-queue/
-                    # POST does, then hand consecutive positions to each plate
-                    # so a Send All keeps plate-order execution inside the
-                    # queue (#1733). Previously hardcoded to 1, which created
-                    # duplicate position=1 rows on every VP upload and made
-                    # queue execution order non-deterministic for any non-
-                    # empty queue.
-                    from sqlalchemy import func, select as _sql_select
-
-                    queue_scope = _sql_select(func.max(PrintQueueItem.position)).where(
-                        PrintQueueItem.status == "pending"
-                    )
-                    if self.target_printer_id is not None:
-                        queue_scope = queue_scope.where(PrintQueueItem.printer_id == self.target_printer_id)
-                    else:
-                        queue_scope = queue_scope.where(PrintQueueItem.printer_id.is_(None))
-                    try:
-                        max_pos_raw = (await db.execute(queue_scope)).scalar()
-                        max_pos = int(max_pos_raw) if max_pos_raw is not None else 0
-                    except (TypeError, ValueError):
-                        max_pos = 0
-
                     # Parse per-plate filament requirements (#1188). Each plate
                     # has its own filament set in `slice_info.config`, so the
                     # `required_filament_types` / `filament_overrides` columns
@@ -834,8 +812,13 @@ class VirtualPrinterInstance:
                     # force_color_match. filament_overrides only carries
                     # force_color_match=True when the per-VP setting is on, so
                     # upgraders keep the old behaviour by default.
-                    queue_item_ids: list[int] = []
-                    for offset, plate_id in enumerate(plate_ids, start=1):
+                    #
+                    # Every plate is parsed BEFORE any position is allocated: the
+                    # allocation takes the queue's scope lock (on SQLite, the database
+                    # write lock) and holds it until the commit below, so no file work
+                    # may run inside that window.
+                    plate_rows: list[dict[str, object]] = []
+                    for plate_id in plate_ids:
                         required_filament_types_json: str | None = None
                         filament_overrides_json: str | None = None
                         requirements = extract_filament_requirements(file_path, plate_id)
@@ -857,35 +840,40 @@ class VirtualPrinterInstance:
                                 if overrides:
                                     filament_overrides_json = json.dumps(overrides)
 
-                        queue_item = PrintQueueItem(
-                            printer_id=self.target_printer_id,
-                            target_model=target_model,
-                            archive_id=archive.id,
-                            plate_id=plate_id,
-                            position=max_pos + offset,
-                            status="pending",
-                            manual_start=not self.auto_dispatch,
-                            required_filament_types=required_filament_types_json,
-                            filament_overrides=filament_overrides_json,
-                            bed_levelling=bed_levelling,
-                            flow_cali=flow_cali,
-                            vibration_cali=vibration_cali,
-                            layer_inspect=layer_inspect,
-                            timelapse=timelapse,
-                            # Per-VP opt-in for auto-print G-code injection (#1516).
-                            # Default off; when on, the scheduler still no-ops unless
-                            # gcode_snippets are configured for the target model, so it's
-                            # effectively "inject when enabled AND snippets exist".
-                            gcode_injection=self.gcode_injection,
-                            # H2C rack-swap slicer pick (#1780). Captured above;
-                            # stamped on every plate so a multi-plate Send All keeps
-                            # the same nozzle pick across plates rather than only the
-                            # first one (mirrors the #1697 / #1188 per-plate loop fix).
-                            nozzle_mapping=nozzle_mapping_json,
+                        plate_rows.append(
+                            {
+                                "printer_id": self.target_printer_id,
+                                "target_model": target_model,
+                                "archive_id": archive.id,
+                                "plate_id": plate_id,
+                                "status": "pending",
+                                "manual_start": not self.auto_dispatch,
+                                "required_filament_types": required_filament_types_json,
+                                "filament_overrides": filament_overrides_json,
+                                "bed_levelling": bed_levelling,
+                                "flow_cali": flow_cali,
+                                "vibration_cali": vibration_cali,
+                                "layer_inspect": layer_inspect,
+                                "timelapse": timelapse,
+                                # Per-VP opt-in for auto-print G-code injection (#1516).
+                                # Default off; when on, the scheduler still no-ops unless
+                                # gcode_snippets are configured for the target model, so
+                                # it's effectively "inject when enabled AND snippets exist".
+                                "gcode_injection": self.gcode_injection,
+                                # H2C rack-swap slicer pick (#1780). Captured above;
+                                # stamped on every plate so a multi-plate Send All keeps
+                                # the same nozzle pick across plates rather than only the
+                                # first one (mirrors the #1697 / #1188 per-plate loop fix).
+                                "nozzle_mapping": nozzle_mapping_json,
+                            }
                         )
-                        db.add(queue_item)
-                        await db.flush()  # populate queue_item.id before logging
-                        queue_item_ids.append(queue_item.id)
+
+                    # The plates take ONE contiguous block at the tail of the target's
+                    # scope through the ONE position rule, in plate order, so a Send All
+                    # keeps plate-order execution inside the queue (#1733).
+                    queue_items = await create_queue_rows(db, printer_id=self.target_printer_id, rows=plate_rows)
+                    await db.flush()  # populate the ids before logging
+                    queue_item_ids = [queue_item.id for queue_item in queue_items]
                     await db.commit()
                     # Track the freshly-committed queue items so
                     # `on_print_command` can retroactively stamp slicer-side

@@ -335,6 +335,140 @@ class TestOperatorStopOwnership:
         assert senders == callers
 
 
+# --- Putting a plate back has ONE owner (operator ruling 2026-09-24) ----------------
+
+# ``services/requeue.py`` is THE owner of "put a plate back in the queue": every
+# automatic path that returns an un-started claim, mints a new attempt or tops up a
+# run goes through one of its verbs, which is what makes "a requeued plate is NEXT in
+# line" and "an aborted run prints no more plates" true everywhere at once. Before it,
+# three callers each released a claim with their own ideas of position and run state,
+# and the retry insert lived in farm_policy beside its decisions.
+_REQUEUE_OWNER = ("services", "requeue.py")
+_QUEUE_BUILDER = ("services", "queue_builder.py")
+_LINEAGE_FIELD = "retry_of_id"
+
+
+def _called_attr(node: ast.Call) -> str | None:
+    func = node.func
+    return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+
+def _is_projection(value: ast.expr) -> bool:
+    """``item.retry_of_id`` handed on under its own name — a payload READING the chain
+    (the queue list's response, the run detail's units), not a row being given one."""
+    return isinstance(value, ast.Attribute) and value.attr == _LINEAGE_FIELD
+
+
+def _scan_lineage_writes(tree: ast.Module) -> list[int]:
+    """Every place a row is GIVEN a ``retry_of_id``: an attribute assignment, a keyword
+    argument, or a dict entry (a fields dict for a new row) — a projection excepted."""
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Attribute) and t.attr == _LINEAGE_FIELD for t in targets):
+                hits.append(node.lineno)
+        elif isinstance(node, ast.keyword) and node.arg == _LINEAGE_FIELD and not _is_projection(node.value):
+            hits.append(node.value.lineno)
+        elif isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                if isinstance(key, ast.Constant) and key.value == _LINEAGE_FIELD and not _is_projection(value):
+                    hits.append(key.lineno)
+    return hits
+
+
+def _is_queue_position(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "position"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "PrintQueueItem"
+    )
+
+
+def _scan_position_allocations(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every hand-rolled queue position: a ``max(PrintQueueItem.position)`` read, or a
+    ``PrintQueueItem(position=...)`` construction."""
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _called_attr(node)
+        if name == "max" and node.args and _is_queue_position(node.args[0]):
+            hits.append(("max(PrintQueueItem.position)", node.lineno))
+        elif name == "PrintQueueItem" and any(kw.arg == "position" for kw in node.keywords):
+            hits.append(("PrintQueueItem(position=...)", node.lineno))
+    return hits
+
+
+class TestRequeueOwnership:
+    """ONE owner puts a plate back, ONE owner numbers the queue. SOURCE pins, like their
+    neighbours: a second release site or a second max-plus-one is perfectly well-formed
+    code that every behaviour test passes — it just lands the plate somewhere else."""
+
+    def test_only_the_requeue_owner_releases_an_unstarted_claim(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{node.lineno}"
+            for parts, tree in _app_trees()
+            if parts != _REQUEUE_OWNER
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _called_attr(node) == "release_unstarted_claim"
+        ]
+        if strays:
+            pytest.fail(
+                "release_unstarted_claim is called outside services/requeue.py:\n"
+                + "\n".join(strays)
+                + "\n\nReturn an un-started claim through requeue.return_to_queue: it seats the row "
+                "NEXT in line and applies the run gate (a paused run stages it, an ended run "
+                "cancels it) — the storage transition alone does neither."
+            )
+
+    def test_only_the_requeue_owner_writes_lineage(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line}"
+            for parts, tree in _app_trees()
+            if parts != _REQUEUE_OWNER
+            for line in _scan_lineage_writes(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "A row is given a retry_of_id outside services/requeue.py:\n"
+                + "\n".join(strays)
+                + "\n\nA new attempt of a plate is requeue.requeue_attempt's: it is the one writer "
+                "of the chain (the idempotency guard and the generation index)."
+            )
+
+    def test_no_queue_position_is_allocated_outside_queue_builder(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {shape}"
+            for parts, tree in _app_trees()
+            if parts != _QUEUE_BUILDER
+            for shape, line in _scan_position_allocations(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "A queue position is hand-rolled outside services/queue_builder.py:\n"
+                + "\n".join(strays)
+                + "\n\nCreate rows through create_queue_rows / create_queue_items (or seat an "
+                "existing one with seat_at_head / seat_for_repin): the position SCOPE, the scope "
+                "lock and the head/tail rule live there and nowhere else."
+            )
+
+    def test_the_owners_still_do_it(self):
+        """The liveness half: pins that scan for strays pass on an empty tree too."""
+        trees = dict(_app_trees())
+        requeue_tree = trees[_REQUEUE_OWNER]
+        assert any(
+            isinstance(node, ast.Call) and _called_attr(node) == "release_unstarted_claim"
+            for node in ast.walk(requeue_tree)
+        )
+        assert _scan_lineage_writes(requeue_tree)
+        assert {shape for shape, _ in _scan_position_allocations(trees[_QUEUE_BUILDER])} == {
+            "max(PrintQueueItem.position)",
+            "PrintQueueItem(position=...)",
+        }
+
+
 def _scan_recovery_incident_constructions(py_file: Path) -> list[int]:
     """Every CONSTRUCTION of ``RecoveryIncident``, however the module was imported.
 

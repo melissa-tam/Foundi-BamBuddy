@@ -1,10 +1,10 @@
 """Deficit-math tests for ``production_run.top_up_run`` (Phase 3.1).
 
 Top-up recomputes, from LIVE queue state, how many plate slots ended WITHOUT
-output (cancelled/stopped, or failed with an exhausted retry chain) and creates
-exactly that many replacement items — reusing the shared ``create_queue_items``
-builder. It is idempotent (never stores a counter), so a zero-deficit resume is a
-no-op and a double resume never double-creates. FK enforcement is off in the test
+output (cancelled/stopped, or failed with an exhausted retry chain) and has
+``requeue.mint_replacements`` create exactly that many lineage-free replacements,
+NEXT in line. It is idempotent (never stores a counter), so a zero-deficit resume is
+a no-op and a double resume never double-creates. FK enforcement is off in the test
 engine, so rows reference arbitrary ids without seeding parents.
 """
 
@@ -170,6 +170,38 @@ class TestTopUpRun:
         run = await _load_run(db_session, batch.id)
         created = await top_up_run(db_session, run)
         assert created == 0
+
+    async def test_the_replacement_is_next_in_line_and_lineage_free(self, db_session):
+        """Operator ruling 2026-09-24: a plate put back goes to the HEAD of its scope —
+        ahead of work already waiting there (here another run's unit on the same pin)
+        — and a replacement is a new PRIMARY of the plan, so it carries no lineage."""
+        batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)
+        await _add(db_session, batch, printer_id=3, status="completed", pos=1)
+        await _add(db_session, batch, printer_id=3, status="cancelled", pos=2)
+        other_run, _lib2, _prof2 = await _mk_run(db_session, quantity=1, printer_id=3)
+        waiting = await _add(db_session, other_run, printer_id=3, status="pending", pos=1)
+        await db_session.commit()
+
+        run = await _load_run(db_session, batch.id)
+        assert await top_up_run(db_session, run) == 1
+
+        db_session.expunge_all()
+        rows = (
+            (
+                await db_session.execute(
+                    select(PrintQueueItem)
+                    .where(PrintQueueItem.printer_id == 3, PrintQueueItem.status == "pending")
+                    .order_by(PrintQueueItem.position)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [(row.batch_id, row.position) for row in rows] == [(batch.id, 1), (other_run.id, 2)]
+        replacement = rows[0]
+        assert (replacement.retry_of_id, replacement.retry_count) == (None, 0)
+        assert replacement.been_jumped is True
+        assert waiting.id == rows[1].id
 
     async def test_idempotent_double_resume(self, db_session):
         batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)

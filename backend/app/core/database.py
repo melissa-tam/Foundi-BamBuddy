@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Protocol
 
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
@@ -113,6 +114,65 @@ async def run_with_retry(fn, *, max_attempts: int = 3, label: str = ""):
             )
             await asyncio.sleep(delay)
     raise last_exc  # unreachable, but keeps type checkers happy
+
+
+class _DriverConnection(Protocol):
+    """The one attribute :func:`hold_write_lock` reads off the raw DB-API connection.
+
+    ``sqlite3.Connection`` and ``aiosqlite.Connection`` both carry it, and it is the
+    engine's own answer (``sqlite3_get_autocommit``), not a flag kept beside it.
+    """
+
+    @property
+    def in_transaction(self) -> bool: ...
+
+
+async def hold_write_lock(db: AsyncSession) -> None:
+    """Make ``db``'s transaction hold the SQLite WRITE lock from this statement on.
+
+    Read-then-write inside one SQLite transaction is only safe if the transaction
+    holds the write lock BEFORE its first read. A deferred transaction that reads
+    first is a READ transaction pinned to that snapshot; if another connection then
+    commits, SQLite refuses to upgrade the stale snapshot to a writer and fails the
+    write at once with ``database is locked`` (SQLITE_BUSY_SNAPSHOT) — the busy
+    handler never runs, so ``busy_timeout`` does not help. That is what lost 20
+    requeues in production between 2026-09-06 and 09-24: a SAVEPOINT opened a
+    deferred transaction, ``SELECT max(position)`` pinned the snapshot, the plate
+    authority's persist task committed, and the retry's INSERT died. ``BEGIN
+    IMMEDIATE`` takes the lock up front instead, WAITING (under ``busy_timeout``)
+    for any current writer — so the read that follows sees the latest commit and no
+    other writer can land between it and the write.
+
+    Three cases, decided by the driver's own transaction state:
+
+    * **Not in a transaction** — issue ``BEGIN IMMEDIATE``. Under the driver's legacy
+      transaction control a ``SELECT`` never opens a transaction, so this is the
+      state after any number of reads. ``session.commit()`` / ``rollback()`` end it
+      exactly as they end the driver's implicit one (the driver issues COMMIT/ROLLBACK
+      whenever SQLite reports an open transaction).
+    * **Already in a transaction** — nothing to do. Legacy transaction control opens
+      one implicitly only before INSERT / UPDATE / DELETE / REPLACE, and such a
+      statement took the write lock when it ran. The one other way in is an explicit
+      SAVEPOINT; a caller that composes a position write inside a savepoint that has
+      already READ is back in the stale-snapshot shape above, which is why the retry
+      insert no longer opens one (the startup pool-cutover migration still does, and
+      is safe only because nothing else writes during boot).
+    * **Not SQLite** — nothing to do. PostgreSQL has row-level locking; the position
+      scope's own advisory lock (``queue_builder._lock_position_scope``) serialises
+      its writers there.
+
+    The dialect is read from the LIVE binding rather than the ``is_sqlite()`` settings
+    helper, because the test harness binds sessions to its own SQLite engine while
+    ``settings.database_url`` may name another database.
+    """
+    if db.get_bind().dialect.name != "sqlite":
+        return
+    connection = await db.connection()
+    raw = await connection.get_raw_connection()
+    driver: _DriverConnection = raw.driver_connection
+    if driver.in_transaction:
+        return
+    await connection.exec_driver_sql("BEGIN IMMEDIATE")
 
 
 async def close_all_connections():

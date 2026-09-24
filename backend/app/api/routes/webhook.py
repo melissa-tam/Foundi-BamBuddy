@@ -12,6 +12,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.queue_builder import create_queue_items
 
 logger = logging.getLogger(__name__)
 
@@ -83,19 +84,6 @@ async def webhook_add_to_queue(
     if not printer:
         raise HTTPException(status_code=404, detail="Printer not found")
 
-    # Get next position
-    result = await db.execute(
-        select(PrintQueueItem.position)
-        .where(
-            PrintQueueItem.printer_id == data.printer_id,
-            PrintQueueItem.status == "pending",
-        )
-        .order_by(PrintQueueItem.position.desc())
-        .limit(1)
-    )
-    max_position = result.scalar()
-    next_position = (max_position or 0) + 1
-
     # Parse scheduled time if provided
     scheduled_time = None
     if data.scheduled_time:
@@ -106,17 +94,21 @@ async def webhook_add_to_queue(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid scheduled_time format")
 
-    # Create queue item
-    queue_item = PrintQueueItem(
+    # The tail of the printer's position scope, through the ONE position rule (which
+    # also holds the scope lock until the request's commit).
+    (queue_item,) = await create_queue_items(
+        db,
+        count=1,
         printer_id=data.printer_id,
-        archive_id=data.archive_id,
-        project_id=data.project_id,
-        position=next_position,
-        scheduled_time=scheduled_time,
-        require_previous_success=data.require_previous_success,
-        auto_off_after=data.auto_off_after,
+        fields={
+            "printer_id": data.printer_id,
+            "archive_id": data.archive_id,
+            "project_id": data.project_id,
+            "scheduled_time": scheduled_time,
+            "require_previous_success": data.require_previous_success,
+            "auto_off_after": data.auto_off_after,
+        },
     )
-    db.add(queue_item)
     await db.flush()
     await db.refresh(queue_item)
 

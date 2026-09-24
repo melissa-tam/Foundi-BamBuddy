@@ -43,7 +43,7 @@ from backend.app.services.dispatch_target import (
 )
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
-from backend.app.services.queue_builder import create_queue_items, renumber_pending
+from backend.app.services.queue_builder import create_queue_items, renumber_pending, seat_for_repin
 from backend.app.services.queue_transitions import cancel_pending_items
 from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
 from backend.app.utils.threemf_tools import (
@@ -734,8 +734,13 @@ async def bulk_update_queue_items(
         if not result.scalar_one_or_none():
             raise HTTPException(400, "Printer not found")
 
-    # Fetch all items
-    result = await db.execute(select(PrintQueueItem).where(PrintQueueItem.id.in_(data.item_ids)))
+    # Fetch all items — in queue order, so rows a re-pin moves into another scope keep
+    # their relative order at its tail.
+    result = await db.execute(
+        select(PrintQueueItem)
+        .where(PrintQueueItem.id.in_(data.item_ids))
+        .order_by(PrintQueueItem.position, PrintQueueItem.id)
+    )
     items = result.scalars().all()
 
     updated_count = 0
@@ -751,6 +756,10 @@ async def bulk_update_queue_items(
             skipped_count += 1
             continue
 
+        # A new pin moves the row into another position scope: seat it at that scope's
+        # tail before the edit lands (the same rule as PATCH /queue/{id}).
+        if "printer_id" in update_data:
+            await seat_for_repin(db, item, new_printer_id=update_data["printer_id"])
         for field, value in update_data.items():
             setattr(item, field, value)
         updated_count += 1
@@ -1120,6 +1129,10 @@ async def update_queue_item(
             json.dumps(update_data["nozzle_mapping"]) if update_data["nozzle_mapping"] else None
         )
 
+    # A new PIN moves the row into another position scope: it joins the tail of that
+    # scope (an operator edit, not a requeue) instead of carrying a number from the
+    # sequence it is leaving. Before the edit lands, so the allocation cannot count it.
+    await seat_for_repin(db, item, new_printer_id=new_printer_id)
     for field, value in update_data.items():
         setattr(item, field, value)
 

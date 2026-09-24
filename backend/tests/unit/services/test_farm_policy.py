@@ -25,7 +25,7 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.models.printer_model_geometry import PrinterModelGeometry
 from backend.app.models.sku import Sku, SkuFile
-from backend.app.services import farm_correlation, farm_policy, printer_incidents
+from backend.app.services import farm_correlation, farm_policy, printer_incidents, requeue
 from backend.app.services.dispatch_target import decode_printer_ids, encode_printer_ids
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import (
@@ -55,6 +55,17 @@ def _clean_occupancy():
     plate_occupancy.reset_for_tests()
     yield
     plate_occupancy.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _own_sessions_on_the_test_engine(own_session_factory, monkeypatch):
+    """Services that open their OWN session reach it through ``core.database.async_session``:
+    ``requeue.requeue_attempt`` (every requeue is its own unit of work) and
+    ``pause_recovery.on_plate_cleared`` (a fire-and-forget entry point off the wire).
+    Point it at the test engine, so what they commit is what these tests read."""
+    from backend.app.core import database as core_db
+
+    monkeypatch.setattr(core_db, "async_session", own_session_factory)
 
 
 def _started_80s_ago() -> datetime:
@@ -246,11 +257,12 @@ class TestRetryPolicy:
         db_session.add(item)
         await db_session.commit()
 
-        created = await farm_policy.create_retry_if_absent(db_session, item)
+        created = await requeue.requeue_attempt(item.id, cause="failed", stage_manual=False)
         assert created is not None
         assert created.retry_count == 1
-        assert created.retry_of_id == item.id
-        assert created.status == "pending"
+        row = await db_session.get(PrintQueueItem, created.item_id)
+        assert row.retry_of_id == item.id
+        assert row.status == "pending"
 
     async def test_retry_is_idempotent(self, db_session):
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False)
@@ -268,8 +280,8 @@ class TestRetryPolicy:
         db_session.add(item)
         await db_session.commit()
 
-        first = await farm_policy.create_retry_if_absent(db_session, item)
-        second = await farm_policy.create_retry_if_absent(db_session, item)
+        first = await requeue.requeue_attempt(item.id, cause="failed", stage_manual=False)
+        second = await requeue.requeue_attempt(item.id, cause="failed", stage_manual=False)
         assert first is not None
         assert second is None  # exactly one retry per failure event
         retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
@@ -300,7 +312,7 @@ class TestRetryPolicy:
             db_session, batch, prof, printer_id=3, retry_count=1, pos=11, retry_of_id=refused.id
         )
 
-        assert await farm_policy._genuine_failure_count(db_session, requeued) == 0
+        assert await requeue.failed_ancestor_count(db_session, requeued) == 0
         await farm_policy._on_item_failed(db_session, batch, requeued)
         retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == requeued.id]
         assert len(retries) == 1
@@ -309,7 +321,7 @@ class TestRetryPolicy:
         retry.status = "failed"
         retry.completed_at = datetime.now(timezone.utc)
         await db_session.commit()
-        assert await farm_policy._genuine_failure_count(db_session, retry) == 1
+        assert await requeue.failed_ancestor_count(db_session, retry) == 1
 
     @pytest.mark.parametrize(
         ("retry_max", "minted"),
@@ -322,7 +334,7 @@ class TestRetryPolicy:
         prints each plate once and never retries, which is the whole point of the knob."""
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=retry_max)
         item = await _mk_failed_item(db_session, batch, prof, printer_id=3, retry_count=0, pos=40)
-        assert await farm_policy._genuine_failure_count(db_session, item) == 0
+        assert await requeue.failed_ancestor_count(db_session, item) == 0
 
         await farm_policy._on_item_failed(db_session, batch, item)
 
@@ -340,7 +352,7 @@ class TestRetryPolicy:
         item = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=50)
         for step in range(depth):
             item = await _mk_failed_item(db_session, batch, prof, printer_id=3, pos=51 + step, retry_of_id=item.id)
-        assert await farm_policy._genuine_failure_count(db_session, item) == depth
+        assert await requeue.failed_ancestor_count(db_session, item) == depth
 
         await farm_policy._on_item_failed(db_session, batch, item)
 
@@ -355,7 +367,7 @@ class TestRetryPolicy:
         item.retry_of_id = item.id
         await db_session.commit()
 
-        assert await farm_policy._genuine_failure_count(db_session, item) == farm_policy._LINEAGE_WALK_MAX
+        assert await requeue.failed_ancestor_count(db_session, item) == requeue._LINEAGE_WALK_MAX
 
     async def test_deleting_a_failed_ancestor_hands_the_retry_budget_back(self, db_session):
         """The cap is DERIVED from the surviving chain, and ``retry_of_id`` is
@@ -364,13 +376,13 @@ class TestRetryPolicy:
         behaviour: a plate can be re-retried by deleting its own history."""
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=1)
         retry = await _mk_exhausted_chain(db_session, batch, prof, printer_id=3, pos=70)
-        assert await farm_policy._genuine_failure_count(db_session, retry) == 1
+        assert await requeue.failed_ancestor_count(db_session, retry) == 1
 
         original = await db_session.get(PrintQueueItem, retry.retry_of_id)
         await db_session.delete(original)
         await db_session.commit()
 
-        assert await farm_policy._genuine_failure_count(db_session, retry) == 0
+        assert await requeue.failed_ancestor_count(db_session, retry) == 0
         await farm_policy._on_item_failed(db_session, batch, retry)
         assert len([i for i in await _items(db_session, batch.id) if i.retry_of_id == retry.id]) == 1
 
@@ -1108,18 +1120,20 @@ class TestRetryRebalance:
         batch, prof = await _mk_run(db_session, quantity=2, target_model="H2S", require_fa=False)
         item = await _mk_failed_item(db_session, batch, prof, printer_id=7, target_model="H2S", pos=1)
 
-        created = await farm_policy.create_retry_if_absent(db_session, item)
+        created = await requeue.requeue_attempt(item.id, cause="failed", stage_manual=False)
         assert created is not None
-        assert created.printer_id is None  # rebalanced off the failing printer
-        assert created.target_model == "H2S"  # model target preserved
+        row = await db_session.get(PrintQueueItem, created.item_id)
+        assert row.printer_id is None  # rebalanced off the failing printer
+        assert row.target_model == "H2S"  # model target preserved
 
     async def test_printer_pinned_retry_keeps_pin(self, db_session):
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[7], require_fa=False)
         item = await _mk_failed_item(db_session, batch, prof, printer_id=7, target_model=None, pos=1)
 
-        created = await farm_policy.create_retry_if_absent(db_session, item)
+        created = await requeue.requeue_attempt(item.id, cause="failed", stage_manual=False)
         assert created is not None
-        assert created.printer_id == 7  # operator-pinned run keeps its printer
+        row = await db_session.get(PrintQueueItem, created.item_id)
+        assert row.printer_id == 7  # operator-pinned run keeps its printer
 
     async def test_printer_pool_retry_returns_to_pool(self, db_session):
         """A printers-pool unit's retry goes back to the POOL, not to the printer
@@ -1137,11 +1151,12 @@ class TestRetryRebalance:
             pos=1,
         )
 
-        created = await farm_policy.create_retry_if_absent(db_session, item)
+        created = await requeue.requeue_attempt(item.id, cause="failed", stage_manual=False)
         assert created is not None
-        assert created.printer_id is None
-        assert decode_printer_ids(created.target_printer_ids) == {7, 9}
-        assert created.target_model is None
+        row = await db_session.get(PrintQueueItem, created.item_id)
+        assert row.printer_id is None
+        assert decode_printer_ids(row.target_printer_ids) == {7, 9}
+        assert row.target_model is None
 
 
 class TestRetryRaceLoser:
@@ -1185,11 +1200,12 @@ class TestRetryRaceLoser:
 
         raiser = AsyncMock(side_effect=IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed")))
         try:
-            with patch.object(farm_policy, "create_queue_items", new=raiser):
+            with patch.object(requeue, "create_queue_items", new=raiser):
                 # Direct call: the loser returns None (no duplicate retry).
-                created = await farm_policy.create_retry_if_absent(db_session, failing)
+                created = await requeue.requeue_attempt(failing.id, cause="failed", stage_manual=False)
                 assert created is None
-                # Session still usable after the rollback — a fresh query works.
+                # The caller's session is untouched by the loser's own rollback — the
+                # requeue is its own unit of work — so a fresh query works.
                 still = await _items(db_session, batch.id)
                 assert any(i.id == failing.id for i in still)
                 # And the whole failure path still reaches quarantine evaluation.
@@ -2791,7 +2807,7 @@ class TestGracefulRequeue:
         assert batch.status == "active"
         assert batch.pause_reason is None
         # The cap is untouched: this chain has no FAILED ancestor.
-        assert await farm_policy._genuine_failure_count(db_session, retries[0]) == 0
+        assert await requeue.failed_ancestor_count(db_session, retries[0]) == 0
 
     async def test_first_article_farm_abort_reaches_the_requeue_not_the_failure_path(self, db_session):
         """The precedence case: a first-article no-deposit stop keeps ``failed``.
@@ -3306,20 +3322,6 @@ class TestRecoverClosesOperatorResolvedHolds:
         printer_incidents._reset_state()
         yield
         printer_incidents._reset_state()
-
-    @pytest.fixture(autouse=True)
-    def _lane_session(self, test_engine, monkeypatch):
-        """``pause_recovery.on_plate_cleared`` opens its OWN session — it is also a
-        fire-and-forget entry point off the wire, so it cannot borrow a caller's.
-        Point ``async_session`` at the test engine, the shape ``own_session_factory``
-        documents."""
-        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-        from backend.app.core import database as core_db
-
-        monkeypatch.setattr(
-            core_db, "async_session", async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-        )
 
     async def test_recover_closes_a_plate_vision_hold(self, db_session):
         printer = await _mk_printer_row(db_session, "REC1")

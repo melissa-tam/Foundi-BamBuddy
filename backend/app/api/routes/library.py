@@ -32,7 +32,6 @@ from backend.app.core.permissions import Permission
 from backend.app.core.tasks import spawn_background_task
 from backend.app.models.archive import PrintArchive
 from backend.app.models.library import LibraryFile, LibraryFileTag, LibraryFolder
-from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.project import Project
 from backend.app.models.user import User
 from backend.app.schemas.library import (
@@ -66,6 +65,7 @@ from backend.app.schemas.slicer import SliceRequest, SliceResponse
 from backend.app.services.archive import ThreeMFParser
 from backend.app.services.library_trash import library_trash_service
 from backend.app.services.plate_thumbnail import inject_plate_thumbnails_if_missing
+from backend.app.services.queue_builder import create_queue_rows
 from backend.app.services.stl_thumbnail import MIN_USABLE_STL_BYTES, generate_stl_thumbnail
 from backend.app.utils.filename import InvalidFilenameError, validate_print_filename
 from backend.app.utils.threemf_tools import (
@@ -2515,10 +2515,10 @@ async def add_files_to_queue(
     result = await db.execute(LibraryFile.active().where(LibraryFile.id.in_(request.file_ids)))
     files = {f.id: f for f in result.scalars().all()}
 
-    # Get max position for queue ordering
-    pos_result = await db.execute(select(func.coalesce(func.max(PrintQueueItem.position), 0)))
-    max_position = pos_result.scalar() or 0
-
+    # Validate every file BEFORE any position is allocated: the allocation takes the
+    # queue's scope lock (on SQLite, the database write lock) and holds it until the
+    # commit, so no disk check may run inside that window.
+    queueable: list[LibraryFile] = []
     for file_id in request.file_ids:
         lib_file = files.get(file_id)
 
@@ -2546,30 +2546,26 @@ async def add_files_to_queue(
                     AddToQueueError(file_id=file_id, filename=lib_file.filename, error="File not found on disk")
                 )
                 continue
-
-            # Create queue item referencing library file (archive created at print start)
-            max_position += 1
-            queue_item = PrintQueueItem(
-                printer_id=None,  # Unassigned
-                library_file_id=file_id,
-                position=max_position,
-                status="pending",
-            )
-            db.add(queue_item)
-
-            await db.flush()  # Get queue_item.id
-
-            added.append(
-                AddToQueueResult(
-                    file_id=file_id,
-                    filename=lib_file.filename,
-                    queue_item_id=queue_item.id,
-                )
-            )
-
         except Exception as e:
             logger.exception("Error adding file %s to queue", file_id)
             errors.append(AddToQueueError(file_id=file_id, filename=lib_file.filename, error=str(e)))
+            continue
+
+        queueable.append(lib_file)
+
+    # One queue item per file, referencing the library file (the archive is created at
+    # print start), UNASSIGNED — so they take one contiguous block at the tail of the
+    # shared NULL-printer position scope, in request order, through the ONE position rule.
+    queue_items = await create_queue_rows(
+        db,
+        printer_id=None,
+        rows=[{"printer_id": None, "library_file_id": f.id, "status": "pending"} for f in queueable],
+    )
+    await db.flush()  # Get the queue item ids
+    added.extend(
+        AddToQueueResult(file_id=lib_file.id, filename=lib_file.filename, queue_item_id=queue_item.id)
+        for lib_file, queue_item in zip(queueable, queue_items, strict=True)
+    )
 
     await db.commit()
 

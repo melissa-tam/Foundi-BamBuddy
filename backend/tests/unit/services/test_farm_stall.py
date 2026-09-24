@@ -897,6 +897,42 @@ class TestDeadDispatchClaims:
         assert after.ams_mapping is None  # a decided mapping must never survive as a "pin"
         assert after.waiting_reason is None
 
+    async def test_a_released_claim_is_next_in_line(self, db_session):
+        """Operator ruling 2026-09-24: a plate put back goes to the HEAD of its scope —
+        the release is ``requeue.return_to_queue``'s, not a stale number kept from the
+        claim."""
+        item = await _add_claim(db_session, 24, pos=9)
+        waiting = PrintQueueItem(printer_id=24, status="pending", plate_id=1, position=1)
+        db_session.add(waiting)
+        await db_session.commit()
+        mgr = _FakeManager({24: True}, {24: _FakeState("IDLE")})
+
+        await _mature(db_session, mgr)
+
+        db_session.expunge_all()
+        after = await db_session.get(PrintQueueItem, item.id)
+        assert (after.status, after.position, after.been_jumped) == ("pending", 1, True)
+        assert (await db_session.get(PrintQueueItem, waiting.id)).position == 2
+
+    async def test_a_dead_claim_of_an_aborted_run_is_cancelled_not_redispatched(self, db_session):
+        """An abort cancels only PENDING rows; a claim released after it must not print
+        one more plate for a run the operator ended."""
+        from backend.app.models.print_batch import PrintBatch
+
+        run = PrintBatch(name="run", quantity=2, status="cancelled")
+        db_session.add(run)
+        await db_session.commit()
+        item = await _add_claim(db_session, 25)
+        item.batch_id = run.id
+        await db_session.commit()
+        mgr = _FakeManager({25: True}, {25: _FakeState("IDLE")})
+
+        await _mature(db_session, mgr)
+
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).status == "cancelled"
+        assert 25 not in await _busy_printer_ids(db_session)
+
     async def test_released_claim_frees_the_printer_for_dispatch(self, db_session):
         """LIVENESS — the CONSEQUENCE, not the row. "The status changed" and "the
         printer can take work again" are the cured-storm/starved-deadlock trap: this

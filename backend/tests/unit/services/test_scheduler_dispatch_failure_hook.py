@@ -82,7 +82,11 @@ class TestFailQueueItemHook:
         assert item.error_message == "boom"
         assert item.completed_at is not None
 
-    async def test_dispatch_failure_on_farm_item_mints_retry(self, db_session):
+    async def test_dispatch_failure_on_farm_item_mints_retry(self, db_session, own_session_factory, monkeypatch):
+        from backend.app.core import database as core_db
+
+        # The requeue is its own unit of work: its session must be on the test engine.
+        monkeypatch.setattr(core_db, "async_session", own_session_factory)
         printer = await _mk_printer(db_session, "DF1")
         batch, prof = await _mk_farm_batch(db_session, retry_max=1)
         item = PrintQueueItem(
@@ -94,18 +98,23 @@ class TestFailQueueItemHook:
             position=1,
             retry_count=0,
         )
-        db_session.add(item)
+        waiting = PrintQueueItem(printer_id=printer.id, status="pending", plate_id=1, position=1)
+        db_session.add_all([item, waiting])
         await db_session.commit()
 
         # Real farm_policy.on_terminal — end-to-end retry minting.
         await scheduler._fail_queue_item(db_session, item, "Failed to upload file to printer")
 
+        db_session.expunge_all()
         r = await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.retry_of_id == item.id))
         retries = list(r.scalars().all())
         assert len(retries) == 1
         assert retries[0].status == "pending"
         assert retries[0].retry_count == 1
         assert retries[0].printer_id == printer.id  # printer-pinned run keeps the pin
+        # Next in line: ahead of the unit that was already waiting on the printer.
+        assert retries[0].position == 1
+        assert (await db_session.get(PrintQueueItem, waiting.id)).position == 2
 
     async def test_clears_stale_waiting_reason_on_failure(self, db_session):
         """W4b: a dispatch-time failure NULLs a stale hold token in the SAME update
