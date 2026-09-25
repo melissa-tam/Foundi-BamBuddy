@@ -256,11 +256,32 @@ describe('useEjectPlate — bed_hot opens the hot confirm', () => {
     await waitFor(() => expect(screen.getByTestId('hot')).toHaveTextContent('closed'));
   });
 
-  it('toasts instead of re-opening the confirm when the temps are unusable', async () => {
+  // With shop air unknown and no chamber reading the server has no limit to
+  // quote (`threshold_c` null), but the bed reading is what the confirm is
+  // about — the operator still gets the confirm, never a dead-end toast.
+  it('opens the confirm with no limit when the server quotes none', async () => {
+    const calls = refuseWith({ code: 'bed_hot', bed_c: 41.2, threshold_c: null });
+    const user = await clickDoor();
+
+    await waitFor(() => expect(screen.getByTestId('hot')).toHaveTextContent('41.2/null'));
+    expect(screen.queryByText('Failed to send command')).not.toBeInTheDocument();
+
+    server.use(
+      http.post('/api/v1/printers/:id/eject', async ({ request }) => {
+        calls.push((await request.json()) as EjectBody);
+        return HttpResponse.json({ mode: 'dispatched', queue_item_id: null });
+      }),
+    );
+    await user.click(screen.getByRole('button', { name: 'confirm-hot' }));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls[1].allow_hot).toBe(true);
+  });
+
+  it('toasts instead of opening the confirm when the bed reading is unusable', async () => {
     refuseWith({ code: 'bed_hot', bed_c: null, threshold_c: null });
     await clickDoor();
-    // No usable temps to show — falls through to the generic failure rather
-    // than opening a confirm that cannot state the numbers.
+    // No bed temperature to show — falls through to the generic failure rather
+    // than opening a confirm that cannot state what it is confirming.
     expect(await screen.findByText('Failed to send command')).toBeInTheDocument();
     expect(screen.getByTestId('hot')).toHaveTextContent('closed');
   });

@@ -52,6 +52,7 @@ from backend.app.services.eject.geometry import ModelGeometry, get_geometry
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
+from backend.app.utils.machine_start_gcode import EXEC_BLOCK_START_MARKER
 from backend.app.utils.printer_models import canon_model, full_home_lines
 from backend.app.utils.threemf_tools import read_plate_gcode_header
 
@@ -59,7 +60,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/eject-profiles", tags=["eject-profiles"])
 
-_EXEC_BLOCK_START = "; EXECUTABLE_BLOCK_START"
 _DUPLICATE_NAME = "An eject profile with that name already exists"
 
 
@@ -153,7 +153,7 @@ def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str, g
                 # The header + config comment block sits at the very top of the
                 # file; 2 MB comfortably covers it before EXECUTABLE_BLOCK_START.
                 prefix = fh.read(2 * 1024 * 1024).decode("utf-8", errors="ignore")
-            idx = prefix.find(_EXEC_BLOCK_START)
+            idx = prefix.find(EXEC_BLOCK_START_MARKER)
             if idx != -1:
                 line_end = prefix.find("\n", idx)
                 head = prefix[: len(prefix) if line_end == -1 else line_end + 1]
@@ -176,7 +176,7 @@ def _build_dryrun_gcode(source_path: Path, plate_index: int, eject_block: str, g
         return head + body
     # No executable-block markers found up top — ship a minimal standalone file
     # (the eject block's epilogue still ends the job FINISH).
-    return _EXEC_BLOCK_START + "\n" + body
+    return EXEC_BLOCK_START_MARKER + "\n" + body
 
 
 @router.get("", response_model=list[EjectProfileResponse])

@@ -605,12 +605,6 @@ class AppSettings(BaseModel):
         le=20,
         description="Default consecutive farm failures on one printer that trip quarantine",
     )
-    farm_cooldown_warn_floor_c: int = Field(
-        default=30,
-        ge=15,
-        le=50,
-        description="Warn when an eject cooldown target is at/below this °C — at/below shop ambient the M190 R wait never completes",
-    )
     farm_offline_stall_minutes: int = Field(
         default=30,
         ge=5,
@@ -648,8 +642,18 @@ class AppSettings(BaseModel):
         ge=0.0,
         le=50.0,
         description="When cooling plateaus, eject instead of quarantining if the bed has settled within this many "
-        "°C of the release threshold (bed equilibrated at ambient). Above threshold+margin the bed is genuinely "
-        "stuck hot and the printer is quarantined with NO eject.",
+        "°C of its OWN chamber air (bed equilibrated). A plateaued bed still hotter than its own air by more than "
+        "this is genuinely stuck hot and the printer is quarantined with NO eject.",
+    )
+    # THE one eject-line input (user ruling 2026-09-25): the line is MEASURED shop air plus
+    # this margin (``services/eject/shop_air``). It replaced the per-profile
+    # ``cooldown_temp_c``, the per-run override and the warn floor that policed them.
+    farm_cooldown_margin_c: float = Field(
+        default=2.0,
+        ge=0.5,
+        le=10.0,
+        description="The eject line and the chamber-fan step-down sit this far (°C) above measured shop air; "
+        "a bed also releases once within this far of its own chamber air.",
     )
     # Cooldown fans — two lanes (auxiliary + chamber exhaust), each with its own
     # on/off switch and its own speed.
@@ -742,6 +746,18 @@ class AppSettings(BaseModel):
         description="Rewrite the sliced file's start-block prime line at dispatch so the prime is extruded into "
         "the purge chute instead of onto the plate's front lip; a file whose start block is not recognised "
         "dispatches unmodified",
+    )
+    farm_plate_blowoff_enabled: bool = Field(
+        default=True,
+        description="Insert a full-speed auxiliary-fan pulse into the sliced file's start block at dispatch, just "
+        "before bed leveling, so the fan blows stray filament off the plate; a file whose start block is not "
+        "recognised, or that selects the heating airduct mode, dispatches without it",
+    )
+    farm_plate_blowoff_seconds: int = Field(
+        default=10,
+        ge=3,
+        le=60,
+        description="How long the auxiliary fan blows across the plate before bed leveling (seconds, 3-60)",
     )
 
     # Reused-tag auto re-spool (peel a spent Bambu RFID tag onto a fresh
@@ -904,13 +920,13 @@ class AppSettingsUpdate(BaseModel):
     forecast_global_lead_time_days: int | None = Field(default=None, ge=0)
     farm_retry_max_per_unit: int | None = Field(default=None, ge=0, le=10)
     farm_escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
-    farm_cooldown_warn_floor_c: int | None = Field(default=None, ge=15, le=50)
     farm_offline_stall_minutes: int | None = Field(default=None, ge=5, le=720)
     farm_pause_stall_minutes: int | None = Field(default=None, ge=5, le=720)
     farm_cooldown_stall_window_minutes: int | None = Field(default=None, ge=0, le=180)
     farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
     farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)
     farm_cooldown_plateau_eject_margin_c: float | None = Field(default=None, ge=0.0, le=50.0)
+    farm_cooldown_margin_c: float | None = Field(default=None, ge=0.5, le=10.0)
     farm_cooldown_aux_fan_enabled: bool | None = None
     # The speeds are 1..100 on INPUT: 0 is refused because the ``_enabled`` switch is
     # the off. (AppSettings keeps ge=0 so a legacy stored 0 can still be PROJECTED —
@@ -926,6 +942,8 @@ class AppSettingsUpdate(BaseModel):
     farm_idle_park_enabled: bool | None = None
     farm_idle_park_percent: int | None = Field(default=None, ge=10, le=95)
     farm_chute_prime_enabled: bool | None = None
+    farm_plate_blowoff_enabled: bool | None = None
+    farm_plate_blowoff_seconds: int | None = Field(default=None, ge=3, le=60)
     respool_prompt_threshold_g: int | None = Field(default=None, ge=0, le=1000)
     respool_last_brand: str | None = None
 

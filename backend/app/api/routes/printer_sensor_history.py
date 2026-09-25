@@ -10,12 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
-from backend.app.models.printer_sensor_history import PrinterSensorHistory
+from backend.app.models.printer_sensor_history import SENSOR_KINDS, PrinterSensorHistory
 from backend.app.models.user import User
+from backend.app.services.eject import shop_air
 
 router = APIRouter(prefix="/printer-sensor-history", tags=["printer-sensor-history"])
 
-VALID_KINDS = {"nozzle", "nozzle_2", "bed", "chamber"}
+VALID_KINDS = set(SENSOR_KINDS)
 
 
 class HeaterHistoryPoint(BaseModel):
@@ -135,6 +136,8 @@ async def delete_old_history(
             )
         )
     )
+    # The shop-air samples derived from this printer's history never outlive it.
+    await shop_air.prune(db, before=cutoff.replace(tzinfo=None), printer_id=printer_id)
     await db.commit()
 
     return {"deleted": count, "message": f"Deleted {count} records older than {days} days"}

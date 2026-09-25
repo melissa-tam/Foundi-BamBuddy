@@ -1,13 +1,15 @@
 """Helpers for the (server-dispatched) auto-eject pipeline.
 
 The eject sweep is a SEPARATE motion-only job now — print files dispatch
-unmodified and never carry an injected eject block. This module keeps the two
-pure, reusable pieces that survived that move:
+unmodified and never carry an injected eject block. This module keeps the
+pure, reusable piece that survived that move:
 
 - :func:`build_part_present_eject_file` — build a standalone, motion-only
   eject-only ``.gcode.3mf`` (the file the shared remote dispatcher uploads).
-- :func:`resolve_cooldown_override` — the run-level cooldown-release override the
-  eject MONITOR reads for its server-side release threshold.
+
+The run-level cooldown override that used to live here is gone with the per-profile
+threshold (2026-09-25): the eject line is measured shop air plus one margin
+(``services/eject/shop_air``).
 """
 
 from __future__ import annotations
@@ -17,9 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
-
-from backend.app.models.print_batch import PrintBatch
 from backend.app.services.eject.build_cache import EjectBuildError, get_or_build_eject_file
 from backend.app.services.eject.donor import read_max_z
 from backend.app.services.eject.generator import (
@@ -31,8 +30,6 @@ from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.threemf_tools import list_gcode_plate_ids
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
-
     from backend.app.models.eject_profile import EjectProfile
     from backend.app.services.eject.geometry import ModelGeometry
 
@@ -116,24 +113,6 @@ def _absent_plate_reason(source_path: Path, plate_id: int) -> str | None:
     if plate_id in plates:
         return None
     return f"donor {source_path.name} has no plate {plate_id} (G-code plates: {plates or 'none'})"
-
-
-async def resolve_cooldown_override(db: AsyncSession, batch_id: int | None) -> float | None:
-    """Return the run-level cooldown override for ``batch_id``, or ``None``.
-
-    Farm production runs may override the eject cooldown gate per-run; the value
-    lives on the run's :class:`PrintBatch` (``cooldown_temp_c_override``). When
-    set it supersedes the profile's ``cooldown_temp_c`` for the eject block's
-    ``M190 R`` threshold — the single source of truth shared by dispatch (block
-    generation + validation) and the cooldown monitor's release threshold, so the
-    in-file wait and the server-side gate never disagree. Returns ``None`` when
-    the item has no batch or the run set no override (caller falls back to the
-    profile value).
-    """
-    if batch_id is None:
-        return None
-    result = await db.execute(select(PrintBatch.cooldown_temp_c_override).where(PrintBatch.id == batch_id))
-    return result.scalar_one_or_none()
 
 
 async def build_part_present_eject_file(

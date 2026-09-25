@@ -5,14 +5,25 @@ deltas at print complete to update spool weight_used and last_used.
 
 Primary tracking uses 3MF slicer estimates (precise per-filament data).
 AMS remain% delta is the fallback for trays not covered by 3MF data.
+
+**A charge follows the terminal's OWN evidence** (2026-09-25). What a terminal is charged for —
+the whole plate, a share scaled by its peaks, or nothing — is the terminal outcome's
+``charge`` basis (``terminal_outcome.ChargeBasis``), decided once; how far the job ran and which
+trays fed it is its terminal payload (:class:`JobEvidence`). Neither is ever read off the live
+printer: by the time a terminal is processed the printer can be running ANOTHER job, and
+production 2026-09-16 → 24 charged ~7.2 kg over 32 phantom charges scaled by the next job's live
+progress. The live printer is read once per charge, for its HARDWARE description only (see
+:func:`on_print_complete`). The usage session is keyed to its job and only that job's terminal
+consumes it (:func:`_take_session`).
 """
 
 import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from time import monotonic
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,8 +31,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
+from backend.app.services import job_identity
 from backend.app.services.tray_fields import normalized_tag_uid, normalized_tray_uuid
 from backend.app.utils.tag_normalization import tag_matches_row
+
+if TYPE_CHECKING:
+    from backend.app.models.print_queue import PrintQueueItem
+    from backend.app.services.terminal_outcome import ChargeBasis
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +83,9 @@ async def ams_weight_sync_allowed(db: AsyncSession, printer_id: int, state) -> b
     if not live_state or live_state == "UNKNOWN" or live_state in _ACTIVE_PRINT_GCODE_STATES:
         return False
 
-    from backend.app.models.archive import PrintArchive
+    from backend.app.services.print_binding import live_print_archive
 
-    result = await db.execute(
-        select(PrintArchive.id)
-        .where(PrintArchive.printer_id == printer_id)
-        .where(PrintArchive.status == "printing")
-        .limit(1)
-    )
-    return result.scalar_one_or_none() is None
+    return await live_print_archive(db, printer_id) is None
 
 
 # ── Tagged-ledger DECREASE reconcile (W6) ────────────────────────────────────
@@ -356,6 +366,57 @@ def _decode_mqtt_mapping(mapping_raw: list | None) -> list[int] | None:
     return result
 
 
+def _int_or(value: object, default: int) -> int:
+    """``value`` when it is a real int (never a bool), else ``default``."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _float_or(value: object, default: float) -> float:
+    """``value`` as a float when it is a real number (never a bool), else ``default``."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
+
+@dataclass(frozen=True, slots=True)
+class JobEvidence:
+    """The ENDING job's own consumption evidence, read once off its terminal payload.
+
+    The charge path's only source for how far the job ran and which trays fed it. The producer is
+    ``bambu_mqtt`` — the peaks (``last_progress`` / ``last_layer_num``) from the client's per-job
+    tracking, the rest through ``bambu_mqtt.job_consumption_evidence`` — snapshotted at the moment
+    the terminal fired, so none of it can describe the job the printer runs by the time the charge
+    is computed. A key the payload lacks (a synthesis that has none, an older client) reads as
+    "not observed": no progress, no layers, no tray switches, no tray (-1), no mapping — never a
+    guess filled in from the live printer.
+    """
+
+    last_progress: float = 0.0
+    last_layer_num: int = 0
+    total_layers: int = 0
+    tray_change_log: tuple[tuple[int, int], ...] = ()
+    tray_now: int = -1
+    last_loaded_tray: int = -1
+    # The printer-reported ``mapping``, decoded to global tray ids (``_decode_mqtt_mapping``).
+    mqtt_mapping: tuple[int, ...] | None = None
+
+    @classmethod
+    def from_payload(cls, data: Mapping[str, object]) -> "JobEvidence":
+        changes: list[tuple[int, int]] = []
+        for change in data.get("tray_change_log") or ():
+            if isinstance(change, (tuple, list)) and change and isinstance(change[0], int):
+                changes.append((change[0], _int_or(change[1], 0) if len(change) >= 2 else 0))
+        raw_mapping = data.get("mqtt_mapping")
+        decoded = _decode_mqtt_mapping(raw_mapping if isinstance(raw_mapping, list) else None)
+        return cls(
+            last_progress=_float_or(data.get("last_progress"), 0.0),
+            last_layer_num=_int_or(data.get("last_layer_num"), 0),
+            total_layers=_int_or(data.get("total_layers"), 0),
+            tray_change_log=tuple(changes),
+            tray_now=_int_or(data.get("tray_now"), -1),
+            last_loaded_tray=_int_or(data.get("last_loaded_tray"), -1),
+            mqtt_mapping=tuple(decoded) if decoded else None,
+        )
+
+
 def _spool_color_to_hex(rgba: str | None) -> str | None:
     """Normalise a ``Spool.rgba`` value (``RRGGBBAA`` hex, no ``#``) to the
     ``#RRGGBB`` form archives store in ``filament_color``.
@@ -508,9 +569,21 @@ def _global_tray_to_ams_key(global_tray_id: int) -> tuple[int, int]:
     return (global_tray_id // 4, global_tray_id % 4)
 
 
+def _has_right_external_holder(hardware: Mapping | None) -> bool:
+    """Does this printer have a second (right-hand) external holder — ``vt_tray`` id 255 (H2-series)?
+
+    A HARDWARE fact, so it is read off the live ``raw_data``: it decides whether a job's
+    ``tray_now == 255`` names that holder or the legacy "nothing loaded".
+    """
+    vt_tray = (hardware or {}).get("vt_tray") or []
+    if isinstance(vt_tray, dict):
+        vt_tray = [vt_tray]
+    return any(isinstance(vt, dict) and int(vt.get("id", 0)) == 255 for vt in vt_tray)
+
+
 def _print_feeder_keys(
-    ams_mapping: list[int] | None,
-    state=None,
+    ams_mapping: Sequence[int] | None,
+    tray_change_log: Sequence[tuple[int, int]] = (),
     extra_global_tray: int | None = None,
     *,
     witnesses: Witnesses = "all",
@@ -519,10 +592,10 @@ def _print_feeder_keys(
 
     Three independent witnesses, unioned because each is blind where another sees:
     the dispatch ``ams_mapping`` (the decided slots, durable on the queue item), the
-    ``tray_change_log`` (every slot the job switched to mid-print, incl. a firmware
-    auto-refill's backup) and one caller-supplied global tray — print-start's
-    ``tray_now`` for the remain%-delta fallback, the job's ``last_loaded_tray`` for a
-    terminal that has no session left.
+    job's ``tray_change_log`` off its terminal payload (every slot the job switched to
+    mid-print, incl. a firmware auto-refill's backup) and one caller-supplied global
+    tray — print-start's ``tray_now`` for the remain%-delta fallback, the job's
+    ``last_loaded_tray`` for a terminal that has no session left.
 
     One origin because two consumers ask the same question for opposite reasons: the
     fallback needs it to NOT charge a slot the print never touched (#1269), and the
@@ -549,11 +622,9 @@ def _print_feeder_keys(
             keys.add(_global_tray_to_ams_key(gid))
     if witnesses == "dispatch_only":
         return keys
-    for change in getattr(state, "tray_change_log", None) or []:
-        if isinstance(change, (tuple, list)) and len(change) >= 1:
-            gid = change[0]
-            if isinstance(gid, int) and gid >= 0:
-                keys.add(_global_tray_to_ams_key(gid))
+    for gid, _layer in tray_change_log:
+        if gid >= 0:
+            keys.add(_global_tray_to_ams_key(gid))
     if isinstance(extra_global_tray, int) and extra_global_tray >= 0:
         keys.add(_global_tray_to_ams_key(extra_global_tray))
     return keys
@@ -622,9 +693,15 @@ def _assign_segments_to_slots(
 
 @dataclass
 class PrintSession:
+    """What print start captured for ONE job's charge — keyed to that job, consumed by its terminal alone."""
+
     printer_id: int
     print_name: str
     started_at: datetime
+    # The job this session measures: the subtask id the printer echoed at print start, else the
+    # dispatched unit's own id (``adopt_dispatched_unit``). None = the job named no id (a LAN /
+    # screen start) — ``job_identity.same_job`` reads that as ``unknown``, never as another job.
+    job_id: str | None = None
     tray_remain_start: dict[tuple[int, int], int] = field(default_factory=dict)
     # tray_now at print start (correct value, unlike at completion where it's 255)
     tray_now_at_start: int = -1
@@ -639,8 +716,70 @@ class PrintSession:
     plate_id: int | None = None
 
 
-# Module-level storage, keyed by printer_id
+# Module-level storage, keyed by printer_id — one printer runs one job, so it holds at most the
+# session of the job it started last. WHICH job that is lives on the session (``job_id``): a
+# terminal consumes it only through :func:`_take_session`, and the ONE writer beside print start is
+# :func:`adopt_dispatched_unit`. Nothing outside this module reads it.
 _active_sessions: dict[int, PrintSession] = {}
+
+
+def adopt_dispatched_unit(printer_id: int, unit: "PrintQueueItem") -> None:
+    """Fill the open usage session with the dispatched unit's durable decisions.
+
+    The session opens at print start, before the print is bound to its archive and unit, so it
+    may lack the AMS mapping (the MQTT request-topic subscription fails on P1S/A1), the plate, and
+    — when the printer's first echo carried no subtask id yet — the job it measures. Every print the
+    farm dispatched gets the unit's decision; a value the session already caught is never
+    overwritten, and a unit that names ANOTHER job than the session's contributes nothing.
+    """
+    session = _active_sessions.get(printer_id)
+    if session is None:
+        return
+    if job_identity.same_job(unit.dispatch_subtask_id, session.job_id) == "other":
+        logger.warning(
+            "[UsageTracker] printer %s: dispatched unit %s names job %r but the open usage session measures %r "
+            "— not adopting its mapping or plate",
+            printer_id,
+            unit.id,
+            unit.dispatch_subtask_id,
+            session.job_id,
+        )
+        return
+    if session.job_id is None:
+        session.job_id = job_identity.job_id(unit.dispatch_subtask_id)
+    stored_map = _parse_ams_mapping(unit.ams_mapping)
+    if stored_map and not session.ams_mapping:
+        session.ams_mapping = stored_map
+        logger.info("[UsageTracker] printer %s: adopted the unit's ams_mapping %s", printer_id, stored_map)
+    if unit.plate_id is not None and session.plate_id is None:
+        session.plate_id = unit.plate_id
+        logger.info("[UsageTracker] printer %s: adopted the unit's plate_id %s", printer_id, unit.plate_id)
+
+
+def _take_session(printer_id: int, terminal_job: str | None) -> "PrintSession | None":
+    """The usage session THIS terminal consumes, popped — or None, leaving any other job's in place.
+
+    A session belongs to the job it was opened for, so only that job's terminal may use and pop it.
+    A terminal naming ANOTHER job (``job_identity.same_job`` answers ``other``) is not this
+    session's end: the printer is running the session's job right now, and taking it would lose
+    that job's print-start snapshot (remain%, tray, spool assignments) before its own terminal
+    arrives — which is what the downtime reconcile's replay used to do to the running print.
+    ``unknown`` (either side names no job) is consumed: an absent id is not evidence of another job,
+    and a LAN or screen start names none on either side.
+    """
+    session = _active_sessions.get(printer_id)
+    if session is None:
+        return None
+    if job_identity.same_job(terminal_job, session.job_id) == "other":
+        logger.info(
+            "[UsageTracker] printer %s: terminal for job %r leaves the open usage session of job %r in place",
+            printer_id,
+            terminal_job,
+            session.job_id,
+        )
+        return None
+    return _active_sessions.pop(printer_id)
+
 
 # Queue-item statuses a completion-time run-context lookup accepts. The scheduler
 # flips the queue item to a terminal status (main.py) BEFORE usage tracking runs,
@@ -681,8 +820,9 @@ async def _resolve_run_context(
     1. the live session's captured values (the print-start truth — one path);
     2. the queue item whose ``dispatch_subtask_id`` equals the terminal payload's
        ``subtask_id`` (the id Bambuddy minted for this exact dispatch), any status;
-    3. the queue item linked to this ``archive_id`` (accepting any terminal status
-       the scheduler may already have stamped — see ``_RUN_CONTEXT_STATUSES``);
+    3. the queue item whose attempt this ``archive_id`` records (by job identity —
+       ``_resolve_run_item``; accepting any terminal status the scheduler may already
+       have stamped — see ``_RUN_CONTEXT_STATUSES``);
     4. the ARCHIVE's own ``plate_id``, stamped at print start from the printer's
        ``gcode_file`` echo.
 
@@ -766,14 +906,18 @@ async def _resolve_run_item(db: AsyncSession, subtask_id: str | None, archive_id
     1. the item whose ``dispatch_subtask_id`` equals the terminal payload's
        ``subtask_id`` — the id Bambuddy minted for this exact dispatch, accepted at
        any status because the scheduler may already have stamped the row terminal;
-    2. the item linked to this ``archive_id`` (the id-less path: a firmware that
-       resets ``subtask_id`` on cancel, or a pre-stamping row). Reprints reuse the
-       archive, so the most recently started matching row wins.
+    2. the unit whose attempt this ``archive_id`` RECORDS (the id-less path: a
+       firmware that resets ``subtask_id`` on cancel). The archive carries the job's
+       id from the moment its print was bound, so the terminal's missing echo is
+       recovered from the record — ``print_binding.unit_of_print_archive``. Never the
+       unit whose ``archive_id`` this is: that link is the DONOR, shared by a unit and
+       every retry of it, and the terminal hands a retry's OWN attempt row.
 
     Returns None for every print the farm did not dispatch, which is what keeps the
     foreign/screen-print lanes on their own (guessing) path.
     """
     from backend.app.models.print_queue import PrintQueueItem
+    from backend.app.services.print_binding import unit_of_print_archive
 
     if subtask_id:
         result = await db.execute(
@@ -786,13 +930,7 @@ async def _resolve_run_item(db: AsyncSession, subtask_id: str | None, archive_id
             return item
 
     if archive_id:
-        result = await db.execute(
-            select(PrintQueueItem)
-            .where(PrintQueueItem.archive_id == archive_id)
-            .where(PrintQueueItem.status.in_(_RUN_CONTEXT_STATUSES))
-            .order_by(PrintQueueItem.started_at.desc())
-        )
-        return result.scalars().first()
+        return await unit_of_print_archive(db, archive_id, statuses=_RUN_CONTEXT_STATUSES)
 
     return None
 
@@ -973,6 +1111,7 @@ async def on_print_start(printer_id: int, data: dict, printer_manager, db: Async
         printer_id=printer_id,
         print_name=print_name,
         started_at=datetime.now(timezone.utc),
+        job_id=job_identity.job_id(data.get("subtask_id")),
         tray_remain_start=tray_remain_start,
         tray_now_at_start=tray_now_at_start,
         spool_assignments=spool_assignments,
@@ -997,14 +1136,33 @@ async def on_print_complete(
     data: dict,
     printer_manager,
     db: AsyncSession,
+    *,
+    charge: "ChargeBasis",
     archive_id: int | None = None,
     ams_mapping: list[int] | None = None,
 ) -> list[dict]:
-    """Compute consumption deltas and update spool weight_used/last_used.
+    """Charge the job that ended — by its outcome's ``charge`` basis, from its terminal payload.
+
+    ``charge`` is ``TerminalOutcome.charge`` (``terminal_outcome._charge_basis`` decides it, once):
+    ``full`` charges the whole plate, ``partial`` scales it by the payload's own peaks, ``none``
+    charges nothing. ``data`` is the terminal payload; everything about the JOB — how far it ran,
+    which trays fed it, the printer's reported mapping — is read from it (:class:`JobEvidence`),
+    never from the live printer.
 
     Uses two tracking strategies in priority order:
     1. 3MF per-filament estimates (primary) — precise slicer data for all spools
     2. AMS remain% delta (fallback) — only for trays not already handled by 3MF
+
+    The ONE live read (``printer_manager.get_status``) is the printer's HARDWARE description, which
+    no terminal payload carries and no other job can change the meaning of:
+
+    * which AMS trays exist and what each holds — the 3MF colour match (mapping tier 4) and the
+      position default over the LOADED trays (``build_ams_tray_lookup``);
+    * whether the printer has a right-hand external holder (``vt_tray`` id 255, H2-series), which
+      decides whether the payload's ``tray_now == 255`` names a feeder or "nothing loaded";
+    * for the remain%-delta fallback, each tray's remain NOW — for a real terminal, the job's end
+      state. It runs only with this job's own session (:func:`_take_session`) and never for a
+      ``none`` basis, and it charges only trays the job's evidence says it fed.
 
     Returns a list of dicts describing what was logged (for WebSocket broadcast).
     """
@@ -1013,10 +1171,29 @@ async def on_print_complete(
     from backend.app.api.routes.settings import get_setting
     from backend.app.models.spool_usage_history import SpoolUsageHistory
 
-    session = _active_sessions.pop(printer_id, None)
+    # The echoed job id — the session's key (a job's terminal consumes only its OWN session) and
+    # the dispatched unit's (tiers of the run context and the donor fallback below).
+    terminal_job = job_identity.job_id(data.get("subtask_id"))
+    session = _take_session(printer_id, terminal_job)
     status = data.get("status", "completed")
     results = []
     handled_trays: set[tuple[int, int]] = set()
+
+    if charge == "none":
+        # Nothing measured this job (the reconcile's unknown outcome, or a job this client joined
+        # mid-way and read no peak of) — its session, if it had one, is consumed above and nothing is
+        # charged. For a tagged roll the increase-only AMS weight sync restores the grams from the
+        # wire; an over-charge would never heal (doctrine rule 8).
+        logger.info(
+            "[UsageTracker] printer %s archive %s: charge basis 'none' (%s, job %r) — nothing charged",
+            printer_id,
+            archive_id,
+            status,
+            terminal_job,
+        )
+        return results
+
+    evidence = JobEvidence.from_payload(data)
 
     # Idempotency guard: a completion can be delivered more than once for the same
     # run — the reconcile synthesis racing the real MQTT terminal, or a manual
@@ -1024,7 +1201,7 @@ async def on_print_complete(
     # archive's started_at (reset to now on every reprint, main.py): a usage-history
     # row created at/after started_at means THIS run already finalized. Reprints
     # reset started_at, so their older rows fall before it and never block a fresh
-    # finalize. The pop above must still happen so the (now-stale) session is cleared.
+    # finalize. The take above must still happen so the (now-stale) session is cleared.
     if archive_id:
         from sqlalchemy import func
 
@@ -1052,7 +1229,7 @@ async def on_print_complete(
     default_filament_cost = float(default_cost_str) if default_cost_str else 0.0
 
     # Resolve the printed plate + AMS mapping from the most durable source (live
-    # session → dispatch_subtask_id-matched queue item → archive-linked queue item)
+    # session → dispatch_subtask_id-matched queue item → the unit this archive records)
     # so multi-plate 3MF usage stays plate-scoped even when the session did not
     # survive to completion (restart mid-print / reconcile synthesis).
     resolved_plate_id, resolved_ams_mapping = await _resolve_run_context(db, printer_id, data, archive_id, session)
@@ -1063,23 +1240,30 @@ async def on_print_complete(
         ams_mapping = resolved_ams_mapping
 
     logger.info(
-        "[UsageTracker] on_print_complete: printer=%d, archive=%s, session=%s, ams_mapping=%s",
+        "[UsageTracker] on_print_complete: printer=%d, archive=%s, session=%s, ams_mapping=%s, charge=%s",
         printer_id,
         archive_id,
         "yes" if session else "no",
         ams_mapping,
+        charge,
+    )
+    # The job's own evidence, as the terminal captured it — the record a charge is built from.
+    logger.info(
+        "[UsageTracker] PRINT COMPLETE printer %d: progress=%s, layer=%s/%s, mapping=%s, tray_now=%s, "
+        "last_loaded_tray=%s, tray_change_log=%s",
+        printer_id,
+        evidence.last_progress,
+        evidence.last_layer_num,
+        evidence.total_layers,
+        evidence.mqtt_mapping,
+        evidence.tray_now,
+        evidence.last_loaded_tray,
+        list(evidence.tray_change_log),
     )
 
-    # --- Diagnostic logging: dump mapping-related MQTT fields at print completion ---
-    state = printer_manager.get_status(printer_id)
-    if state and state.raw_data:
-        logger.info(
-            "[UsageTracker] PRINT COMPLETE printer %d: mapping=%s, tray_now=%s, last_loaded_tray=%s",
-            printer_id,
-            state.raw_data.get("mapping"),
-            state.tray_now,
-            getattr(state, "last_loaded_tray", "N/A"),
-        )
+    # The printer's HARDWARE description — the one live read (see the docstring for each use).
+    live = printer_manager.get_status(printer_id)
+    hardware: Mapping = (getattr(live, "raw_data", None) or {}) if live is not None else {}
 
     # --- Path 1 (PRIMARY): 3MF per-filament estimates ---
     print_name = (
@@ -1100,35 +1284,35 @@ async def on_print_complete(
     # file when neither the archive nor a same-named copy yields one — so it is also
     # a reason to ENTER that lane with no archive at all (auto-archive off): a farm
     # dispatch is chargeable from the file it was dispatched with, always.
-    terminal_subtask = (data.get("subtask_id") or "").strip() or None
-
-    if archive_id or threemf_path or terminal_subtask:
+    if archive_id or threemf_path or terminal_job:
         threemf_results = await _track_from_3mf(
             printer_id,
             archive_id,
             status,
             print_name,
             handled_trays,
-            printer_manager,
             db,
+            charge=charge,
+            evidence=evidence,
+            hardware=hardware,
             ams_mapping=ams_mapping,
             tray_now_at_start=session.tray_now_at_start if session else -1,
-            last_progress=data.get("last_progress", 0.0),
-            last_layer_num=data.get("last_layer_num", 0),
             default_filament_cost=default_filament_cost,
             spool_assignments=session.spool_assignments if session else None,
             print_started_at=session.started_at if session else None,
             threemf_path=threemf_path,
             plate_id=resolved_plate_id,
-            subtask_id=terminal_subtask,
+            subtask_id=terminal_job,
         )
         results.extend(threemf_results)
 
     # --- Path 2 (FALLBACK): AMS remain% delta (only for trays not handled by 3MF) ---
+    # The session's print-start remain% against the remain NOW: for a real terminal the live remain
+    # IS the job's end state, and the session is this job's own (``_take_session``), so the delta is
+    # this job's consumption. Never reached on a ``none`` basis (returned above).
     if session and session.tray_remain_start:
-        state = printer_manager.get_status(printer_id)
-        if state and state.raw_data:
-            ams_raw = state.raw_data.get("ams", [])
+        if hardware:
+            ams_raw = hardware.get("ams", [])
             ams_data = (
                 ams_raw.get("ams", []) if isinstance(ams_raw, dict) else ams_raw if isinstance(ams_raw, list) else []
             )
@@ -1137,7 +1321,7 @@ async def on_print_complete(
             # Without this guard, swapping a spool in an UNUSED slot mid-print
             # makes that slot's remain% drop to 0, which the fallback below
             # would otherwise charge to the originally-assigned spool.
-            print_used_keys = _print_feeder_keys(ams_mapping, state, session.tray_now_at_start)
+            print_used_keys = _print_feeder_keys(ams_mapping, evidence.tray_change_log, session.tray_now_at_start)
 
             # Collect all trays to check: AMS trays + VT (external) trays
             # Each entry: (ams_id_for_assignment, tray_id_for_assignment, current_remain, label)
@@ -1151,7 +1335,7 @@ async def on_print_complete(
                     trays_to_check.append((ams_id, tray_id, remain, f"AMS{ams_id}-T{tray_id}"))
 
             # VT (external) trays — same remain% delta logic
-            vt_tray_raw = state.raw_data.get("vt_tray") or []
+            vt_tray_raw = hardware.get("vt_tray") or []
             if isinstance(vt_tray_raw, dict):
                 vt_tray_raw = [vt_tray_raw]
             for vt in vt_tray_raw:
@@ -1328,9 +1512,9 @@ async def on_print_complete(
                 status=status,
                 print_name=print_name,
                 ams_mapping=ams_mapping,
-                subtask_id=terminal_subtask,
-                state=state,
-                last_loaded_tray=getattr(state, "last_loaded_tray", None),
+                subtask_id=terminal_job,
+                tray_change_log=evidence.tray_change_log,
+                last_loaded_tray=evidence.last_loaded_tray,
             )
         except Exception:  # noqa: BLE001 — a guard that breaks the thing it guards is worse than the silence
             logger.exception("[UsageTracker] zero-gram check failed for printer %s archive %s", printer_id, archive_id)
@@ -1347,10 +1531,13 @@ async def _warn_zero_gram_tagless_charge(
     print_name: str,
     ams_mapping: list[int] | None,
     subtask_id: str | None = None,
-    state=None,
+    tray_change_log: Sequence[tuple[int, int]] = (),
     last_loaded_tray: int | None = None,
 ) -> None:
     """WARN + notify when a completed print charged 0 g on a tagless feeder (C6).
+
+    ``tray_change_log`` and ``last_loaded_tray`` are the ENDING job's own (its terminal payload,
+    ``JobEvidence``) — the live printer's would name the next job's feeder.
 
     **Why this cannot be left to fail loudly on its own.** For a TAGGED roll two
     independent gram sources exist — the slicer 3MF and the AMS remain%-delta — so
@@ -1458,7 +1645,7 @@ async def _warn_zero_gram_tagless_charge(
     lost_its_3mf = await _archive_lost_its_3mf(db, archive_id)
     undispatched = lost_its_3mf and (await _resolve_run_item(db, subtask_id, archive_id)) is None
     witnesses: Witnesses = "all" if undispatched else "dispatch_only"
-    feeder_keys = _print_feeder_keys(ams_mapping, state, last_loaded_tray, witnesses=witnesses)
+    feeder_keys = _print_feeder_keys(ams_mapping, tray_change_log, last_loaded_tray, witnesses=witnesses)
     ams_keys = sorted(key for key in feeder_keys if key[0] != 255)
     if not ams_keys:
         logger.info(
@@ -1762,12 +1949,13 @@ async def _track_from_3mf(
     status: str,
     print_name: str,
     handled_trays: set[tuple[int, int]],
-    printer_manager,
     db: AsyncSession,
+    *,
+    charge: "ChargeBasis",
+    evidence: JobEvidence = JobEvidence(),
+    hardware: Mapping | None = None,
     ams_mapping: list[int] | None = None,
     tray_now_at_start: int = -1,
-    last_progress: float = 0.0,
-    last_layer_num: int = 0,
     default_filament_cost: float = 0.0,
     spool_assignments: dict[tuple[int, int], int] | None = None,
     print_started_at: datetime | None = None,
@@ -1778,8 +1966,13 @@ async def _track_from_3mf(
     """Track usage from 3MF per-filament slicer data (primary path).
 
     Uses slicer-estimated filament weight for all spools (BL and non-BL).
-    For partial prints (failed/aborted), tries per-layer gcode data first,
-    then falls back to linear scaling by progress.
+    ``charge`` is the outcome's basis: ``full`` charges the plate's slicer grams; ``partial``
+    tries per-layer gcode data at the payload's ``last_layer_num`` first, then falls back to
+    linear scaling by its ``last_progress``. ``evidence`` is the ending job's own record (its
+    terminal payload) and ``hardware`` the live printer's hardware description (``raw_data``) —
+    see :func:`on_print_complete` for why each is read where.
+
+    ``status`` is the recorded status, stamped on the usage-history rows; it decides nothing here.
 
     When archive_id is None (auto-archive disabled), a pre-resolved threemf_path
     can be provided to still track filament usage from slicer data.
@@ -1799,17 +1992,17 @@ async def _track_from_3mf(
 
     Slot-to-tray mapping priority:
     1. Stored ams_mapping from print command (reprints/direct prints)
-    2. MQTT mapping field from printer state (universal, all print sources)
+    2. MQTT mapping field from the terminal payload (universal, all print sources)
     3. Queue item ams_mapping (for queue-initiated prints)
-    4. tray_now from printer state (for single-filament non-queue prints)
-    5. Position-based default using sorted available tray IDs (handles external spools)
-    6. Default mapping: slot_id - 1 = global_tray_id (last resort)
+    4. Color match of the 3MF filaments against the trays loaded now (hardware)
+    5. tray_now — at print start, else the payload's (single-filament non-queue prints)
+    6. Position-based default using sorted available tray IDs (handles external spools)
+    7. Default mapping: slot_id - 1 = global_tray_id (last resort)
     """
     from pathlib import Path
 
     from backend.app.core.config import settings as app_settings
     from backend.app.models.archive import PrintArchive
-    from backend.app.models.print_queue import PrintQueueItem
     from backend.app.utils.threemf_tools import count_plates_in_slice_info, extract_filament_usage_from_3mf
 
     file_path: Path | None = threemf_path
@@ -1949,25 +2142,21 @@ async def _track_from_3mf(
     if slot_to_tray:
         mapping_source = "print_cmd"
 
-    # 2. Try MQTT mapping field from printer state (universal, all print sources)
-    if not slot_to_tray:
-        state = printer_manager.get_status(printer_id)
-        raw_data = getattr(state, "raw_data", None) if state else None
-        if raw_data:
-            mqtt_mapping = raw_data.get("mapping")
-            decoded = _decode_mqtt_mapping(mqtt_mapping)
-            if decoded:
-                slot_to_tray = decoded
-                mapping_source = "mqtt"
+    # 2. The printer's reported MQTT mapping, as the TERMINAL captured it (universal, all print
+    #    sources) — never the live field, which by now can be the next job's.
+    if not slot_to_tray and evidence.mqtt_mapping:
+        slot_to_tray = list(evidence.mqtt_mapping)
+        mapping_source = "mqtt"
 
-    # 3. Try queue item ams_mapping (queue-initiated prints store the exact mapping)
+    # 3. Try queue item ams_mapping (queue-initiated prints store the exact mapping) —
+    #    the unit whose attempt THIS archive records, by job identity. The unit's own
+    #    ``archive_id`` is its donor, shared with every retry of it: matching on it
+    #    missed a retry's own attempt row and raised MultipleResultsFound over the
+    #    shared donor of a first attempt.
     if not slot_to_tray and archive_id:
-        queue_result = await db.execute(
-            select(PrintQueueItem)
-            .where(PrintQueueItem.archive_id == archive_id)
-            .where(PrintQueueItem.status.in_(_RUN_CONTEXT_STATUSES))
-        )
-        queue_item = queue_result.scalar_one_or_none()
+        from backend.app.services.print_binding import unit_of_print_archive
+
+        queue_item = await unit_of_print_archive(db, archive_id, statuses=_RUN_CONTEXT_STATUSES)
         if queue_item and queue_item.ams_mapping:
             try:
                 slot_to_tray = json.loads(queue_item.ams_mapping)
@@ -1975,15 +2164,13 @@ async def _track_from_3mf(
             except (json.JSONDecodeError, TypeError):
                 pass
 
-    # 4. Color-match 3MF filament slots to AMS trays (for printers without mapping field)
-    if not slot_to_tray:
-        state = printer_manager.get_status(printer_id)
-        raw_data = getattr(state, "raw_data", None) if state else None
-        if raw_data:
-            matched = _match_slots_by_color(filament_usage, raw_data.get("ams"))
-            if matched:
-                slot_to_tray = matched
-                mapping_source = "color_match"
+    # 4. Color-match 3MF filament slots to AMS trays (for printers without mapping field). The
+    #    trays' colours are HARDWARE — what is loaded, not how far any job ran.
+    if not slot_to_tray and hardware:
+        matched = _match_slots_by_color(filament_usage, hardware.get("ams"))
+        if matched:
+            slot_to_tray = matched
+            mapping_source = "color_match"
 
     logger.info(
         "[UsageTracker] 3MF: slot_to_tray=%s (source: %s)",
@@ -2000,23 +2187,17 @@ async def _track_from_3mf(
     #    sibling tray rather than dumping its whole share on the print-start
     #    mapped slot (#006). Segments are grouped per slot first (a colour's own
     #    home tray + the backups that stood in for it); a lone single-filament
-    #    print with no resolved mapping and no split falls back to live tray_now.
+    #    print with no resolved mapping and no split falls back to the job's tray_now.
+    #    Every input is the JOB's (its terminal payload), never the live printer's.
     nonzero_slots = [u for u in filament_usage if u.get("used_g", 0) > 0]
     nonzero_slot_ids = [u.get("slot_id", 0) for u in nonzero_slots]
     tray_now_override: int | None = None
 
-    split_state = printer_manager.get_status(printer_id)
-    _raw_log = getattr(split_state, "tray_change_log", None)
-    tray_changes: list[tuple[int, int]] = list(_raw_log) if isinstance(_raw_log, (list, tuple)) else []
-    _raw_total = getattr(split_state, "total_layers", 0)
-    split_total_layers = _raw_total if isinstance(_raw_total, int) else 0
+    tray_changes = list(evidence.tray_change_log)
+    split_total_layers = evidence.total_layers
 
     slot_segments = _assign_segments_to_slots(tray_changes, slot_to_tray, nonzero_slot_ids)
     any_split = any(len({t for t, _ in (slot_segments.get(sid) or [])}) > 1 for sid in nonzero_slot_ids)
-
-    # `state` keeps its original single-filament meaning for the tray_now
-    # fallback below and downstream partial-scaling references.
-    state = split_state if len(nonzero_slots) == 1 else None
 
     if any_split:
         logger.info(
@@ -2028,47 +2209,43 @@ async def _track_from_3mf(
         if 0 <= tray_now_at_start <= 254:
             tray_now_override = tray_now_at_start
             logger.info("[UsageTracker] 3MF: using tray_now_at_start=%d (single-filament fallback)", tray_now_at_start)
-        elif state and 0 <= state.tray_now <= 254:
-            tray_now_override = state.tray_now
-            logger.info("[UsageTracker] 3MF: using current tray_now=%d", state.tray_now)
-        elif state and 0 <= state.last_loaded_tray <= 253:
-            tray_now_override = state.last_loaded_tray
-            logger.info("[UsageTracker] 3MF: using last_loaded_tray=%d (post-retract fallback)", state.last_loaded_tray)
-        elif state and state.tray_now == 255:
-            # 255 = "no filament" on legacy printers, but valid 2nd external spool on H2-series
-            vt_tray = state.raw_data.get("vt_tray") or []
-            if any(int(vt.get("id", 0)) == 255 for vt in vt_tray if isinstance(vt, dict)):
-                tray_now_override = state.tray_now
-                logger.info("[UsageTracker] 3MF: using tray_now=255 (H2-series external spool)")
+        elif 0 <= evidence.tray_now <= 254:
+            tray_now_override = evidence.tray_now
+            logger.info("[UsageTracker] 3MF: using the terminal's tray_now=%d", evidence.tray_now)
+        elif 0 <= evidence.last_loaded_tray <= 253:
+            tray_now_override = evidence.last_loaded_tray
+            logger.info(
+                "[UsageTracker] 3MF: using last_loaded_tray=%d (post-retract fallback)", evidence.last_loaded_tray
+            )
+        elif evidence.tray_now == 255 and _has_right_external_holder(hardware):
+            # 255 = "no filament" on legacy printers, but valid 2nd external spool on H2-series. Which
+            # one it is here is a HARDWARE question — does this printer have a vt_tray id 255 at all.
+            tray_now_override = evidence.tray_now
+            logger.info("[UsageTracker] 3MF: using tray_now=255 (H2-series external spool)")
         if tray_now_override is None:
             logger.info(
-                "[UsageTracker] 3MF: no valid tray_now (at_start=%d, current=%s, last_loaded=%s)",
+                "[UsageTracker] 3MF: no valid tray_now (at_start=%d, terminal=%s, last_loaded=%s)",
                 tray_now_at_start,
-                state.tray_now if state else "N/A",
-                state.last_loaded_tray if state else "N/A",
+                evidence.tray_now,
+                evidence.last_loaded_tray,
             )
 
-    # Scale factor for partial prints (failed/aborted)
-    if status == "completed":
+    # Scale factor: the whole plate, or the job's own last progress (the firmware resets the live
+    # percent on a cancel; the payload carries the last valid one it read for THIS job).
+    if charge == "full":
         scale = 1.0
     else:
-        state = printer_manager.get_status(printer_id)
-        progress = state.progress if state else 0
-        # Firmware resets progress to 0 on cancel — use last valid progress captured during print
-        if progress <= 0 and last_progress > 0:
-            progress = last_progress
-            logger.info("[UsageTracker] 3MF: using last_progress=%.1f (firmware reset current to 0)", last_progress)
-        scale = max(0.0, min(progress / 100.0, 1.0))
+        scale = max(0.0, min(evidence.last_progress / 100.0, 1.0))
+        logger.info(
+            "[UsageTracker] 3MF: partial charge — the terminal's last_progress=%.1f, last_layer_num=%d",
+            evidence.last_progress,
+            evidence.last_layer_num,
+        )
 
-    # Per-layer gcode accuracy for partial prints
+    # Per-layer gcode accuracy for partial prints, at the job's own last layer
     layer_grams: dict[int, float] | None = None
-    if status != "completed":
-        state = printer_manager.get_status(printer_id)
-        current_layer = state.layer_num if state else 0
-        # Firmware resets layer_num to 0 on cancel — use last valid layer captured during print
-        if current_layer <= 0 and last_layer_num > 0:
-            current_layer = last_layer_num
-            logger.info("[UsageTracker] 3MF: using last_layer_num=%d (firmware reset current to 0)", last_layer_num)
+    if charge != "full":
+        current_layer = evidence.last_layer_num
         if current_layer > 0:
             try:
                 from backend.app.utils.threemf_tools import (
@@ -2164,7 +2341,7 @@ async def _track_from_3mf(
                     # fed from spool 1 then spool 2, all 260 g credited to
                     # spool 2 even though spool 1 had given up its 180 g).
                     seg_end_layer = this_slot_segments[seg_idx + 1][1]
-                    denom = split_total_layers or last_layer_num
+                    denom = split_total_layers or evidence.last_layer_num
                     if denom > 0:
                         segment_grams = total_weight * (seg_end_layer - seg_start_layer) / denom
                     else:
@@ -2289,16 +2466,14 @@ async def _track_from_3mf(
             # never gets recorded. vt_tray entries are already filtered the
             # same way inside `build_ams_tray_lookup` (line 174 checks
             # `tray_type`), so this just mirrors that for the AMS side.
-            if global_tray_id is None:
-                _state = printer_manager.get_status(printer_id)
-                _raw = getattr(_state, "raw_data", None) if _state else None
-                if _raw:
-                    from backend.app.services.spoolman_tracking import build_ams_tray_lookup
+            # Which trays are LOADED is hardware, read live (see on_print_complete).
+            if global_tray_id is None and hardware:
+                from backend.app.services.spoolman_tracking import build_ams_tray_lookup
 
-                    _lookup = build_ams_tray_lookup(_raw)
-                    available_trays = sorted(gid for gid, info in _lookup.items() if info.get("tray_type"))
-                    if slot_id <= len(available_trays):
-                        global_tray_id = available_trays[slot_id - 1]
+                _lookup = build_ams_tray_lookup(hardware)
+                available_trays = sorted(gid for gid, info in _lookup.items() if info.get("tray_type"))
+                if slot_id <= len(available_trays):
+                    global_tray_id = available_trays[slot_id - 1]
             # Final fallback: slot_id - 1 (legacy, works for pure AMS without external spools)
             if global_tray_id is None:
                 global_tray_id = slot_id - 1

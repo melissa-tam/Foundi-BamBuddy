@@ -182,7 +182,9 @@ export interface EjectDialogState {
 /** Open hot-bed confirm. Null when closed. */
 export interface EjectHotConfirmState {
   bedC: number;
-  thresholdC: number;
+  /** The limit the bed missed; null when the server had neither an eject line
+   *  (shop air unknown) nor a chamber reading to judge the bed by. */
+  thresholdC: number | null;
   ejectProfileId: number | null;
   declareOccupied: boolean;
   maxZHeightMm: number | null;
@@ -347,9 +349,11 @@ export function useEjectPlate(printerId: number): UseEjectPlate {
         // hot-bed confirm, which carries the operator's profile and height back
         // into the re-call. Never on the already-confirmed hot leg.
         if (error.code === 'bed_hot' && !vars.allowHot) {
+          // The bed reading is what the confirm is about; a missing limit is
+          // its own confirm body, never a reason to drop the confirm.
           const bedC = parseTemp(error.detail.bed_c);
           const thresholdC = parseTemp(error.detail.threshold_c);
-          if (bedC !== null && thresholdC !== null) {
+          if (bedC !== null) {
             closeDialog();
             setHotConfirm({
               bedC,

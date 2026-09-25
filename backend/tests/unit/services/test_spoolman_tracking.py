@@ -408,3 +408,109 @@ class TestApplySpoolColorsToArchive:
             slot_colors={1: "000000"},
         )
         db.commit.assert_not_awaited()
+
+
+class _Session:
+    """``async with`` shim over one db double — ``async_session()``'s shape."""
+
+    def __init__(self, db):
+        self._db = db
+
+    async def __aenter__(self):
+        return self._db
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+def _another_jobs_live_printer():
+    """The live printer as a late terminal finds it: running ANOTHER job at layer 190 of 200."""
+    printer_manager = MagicMock()
+    printer_manager.get_status.return_value = SimpleNamespace(raw_data={}, layer_num=190, total_layers=200, progress=95)
+    return printer_manager
+
+
+class TestTheSpoolmanChargeFollowsTheTerminalsOwnEvidence:
+    """The Spoolman lane of the charge — the same class as the internal ledger's 2026-09-16 → 24
+    phantom (~7.2 kg over 32 charges scaled by the next job's live progress): a partial report is
+    scaled by the ENDING job's own evidence, and the lane runs on the terminal outcome's basis."""
+
+    @pytest.mark.asyncio
+    async def test_a_partial_report_scales_by_the_payloads_layers_never_the_live_printers(self):
+        """Layer 40 of 100 of a 100 g plate is 40 g — the live printer's 190/200 would say 95 g."""
+        from backend.app.services.spoolman_tracking import _report_partial_usage
+        from backend.app.services.usage_tracker import JobEvidence
+
+        tracking = SimpleNamespace(
+            archive_id=7,
+            filament_usage=[{"slot_id": 1, "used_g": 100.0}],
+            layer_usage=None,
+            filament_properties=None,
+            ams_trays={},
+            slot_to_tray=None,
+            tray_remain_start={},
+        )
+        live = _another_jobs_live_printer()
+        report = AsyncMock(return_value=1)
+
+        with (
+            patch("backend.app.api.routes.settings.get_setting", AsyncMock(return_value="true")),
+            patch("backend.app.services.spoolman_tracking._get_spoolman_client_with_fallback", AsyncMock()),
+            patch("backend.app.services.spoolman_tracking._get_printer_serial", AsyncMock(return_value="serial")),
+            patch("backend.app.services.spoolman_tracking._report_spool_usage_for_slots", report),
+            patch("backend.app.services.printer_manager.printer_manager", live),
+        ):
+            await _report_partial_usage(1, tracking, JobEvidence(last_layer_num=40, total_layers=100))
+
+        assert report.await_args.args[1] == [(1, 40.0)]
+        live.get_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_none_basis_reports_nothing_and_still_retires_the_row(self):
+        from backend.app.services import spoolman_tracking
+
+        db = AsyncMock()
+        found = MagicMock()
+        found.scalar_one_or_none.return_value = SimpleNamespace(archive_id=7)
+        db.execute = AsyncMock(side_effect=[found, MagicMock()])
+        partial = AsyncMock()
+
+        with patch.object(spoolman_tracking, "_report_partial_usage", partial):
+            await spoolman_tracking.cleanup_tracking(1, 7, db, evidence=None)
+
+        partial.assert_not_awaited()
+        assert db.execute.await_count == 2  # the lookup, then the delete
+        db.commit.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("charge", "reports_the_plate", "evidence"),
+        [
+            pytest.param("full", True, None, id="full_reports_the_whole_plate"),
+            pytest.param("partial", False, (40, 100, 20.0), id="partial_hands_over_the_payloads_evidence"),
+            pytest.param("none", False, None, id="none_hands_over_nothing"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_the_job_phase_runs_the_lane_on_the_outcomes_basis(self, charge, reports_the_plate, evidence):
+        from backend.app.services import job_terminal, spoolman_tracking
+
+        payload = {"status": "cancelled", "last_layer_num": 40, "total_layers": 100, "last_progress": 20.0}
+        outcome = SimpleNamespace(charge=charge)
+        report_usage, cleanup = AsyncMock(), AsyncMock()
+
+        with (
+            patch.object(spoolman_tracking, "report_usage", report_usage),
+            patch.object(spoolman_tracking, "cleanup_tracking", cleanup),
+            patch.object(job_terminal._database, "async_session", lambda: _Session(AsyncMock())),
+        ):
+            await job_terminal._charge_spoolman(1, payload, outcome, archive_id=7)
+
+        assert report_usage.await_count == (1 if reports_the_plate else 0)
+        if reports_the_plate:
+            cleanup.assert_not_awaited()
+            return
+        handed = cleanup.await_args.kwargs["evidence"]
+        if evidence is None:
+            assert handed is None
+        else:
+            assert (handed.last_layer_num, handed.total_layers, handed.last_progress) == evidence

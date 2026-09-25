@@ -139,18 +139,27 @@ async def _locate(printer, subtask_name, filename, *, cached=None, available=Non
             p.stop()
 
 
-def _settled_printer_manager(last_loaded_tray: int = 0, mapping: list[int] | None = None) -> MagicMock:
-    """printer_manager stand-in for a finished print."""
+def _settled_payload(last_loaded_tray: int = 0, mapping: list[int] | None = None) -> dict:
+    """The finished job's own consumption evidence, as its terminal payload carries it — the charge
+    reads THIS, never the live printer. ``mapping`` is the printer's reported ``mapping`` field as the
+    terminal captured it (``mqtt_mapping``)."""
+    payload = {
+        "last_progress": 100,
+        "last_layer_num": 88,
+        "total_layers": 88,
+        "tray_now": 255,
+        "last_loaded_tray": last_loaded_tray,
+        "tray_change_log": [],
+    }
+    if mapping is not None:
+        payload["mqtt_mapping"] = mapping
+    return payload
+
+
+def _live_printer() -> MagicMock:
+    """printer_manager stand-in after the print: the live printer's hardware only, no AMS reported."""
     pm = MagicMock()
-    pm.get_status.return_value = SimpleNamespace(
-        raw_data={"mapping": mapping} if mapping is not None else {},
-        progress=100,
-        layer_num=88,
-        tray_now=255,
-        last_loaded_tray=last_loaded_tray,
-        tray_change_log=[],
-        total_layers=88,
-    )
+    pm.get_status.return_value = SimpleNamespace(raw_data={})
     return pm
 
 
@@ -239,7 +248,9 @@ async def test_a_single_plate_upload_for_another_plate_is_still_refused(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_the_multi_plate_file_charges_the_running_plates_grams(db_session, printer_factory, tmp_path, monkeypatch):
+async def test_the_multi_plate_file_charges_the_running_plates_grams(
+    db_session, printer_factory, tmp_path, monkeypatch
+):
     """B1's whole point: accepted AND priced at plate 3 — not zero, not the sum.
 
     ``419.63`` (the four plates added up) is the over-charge the plate scoping
@@ -261,8 +272,9 @@ async def test_the_multi_plate_file_charges_the_running_plates_grams(db_session,
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -413,8 +425,9 @@ async def test_the_library_rescue_finds_the_spliced_file_by_print_identity(
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -451,8 +464,9 @@ async def test_the_library_rescue_refuses_a_different_ladder_cut(db_session, pri
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -468,7 +482,13 @@ async def test_the_library_rescue_refuses_a_different_ladder_cut(db_session, pri
 
 
 def _start_harness(printer, *, added):
-    """Patch bundle driving ``main.on_print_start`` down to the no-3MF fallback."""
+    """Patch bundle driving ``main.on_print_start`` down to the no-3MF fallback.
+
+    A foreign print: the binding owner (``print_binding``, tested over a real database in
+    ``test_print_binding``) answers ``CreateNeeded`` with no unit and binds what the create branch
+    builds — the stamp these tests pin is the create branch's.
+    """
+    from backend.app.services import print_binding
 
     def execute_router(stmt, *_args, **_kwargs):
         sql = str(stmt).lower()
@@ -506,6 +526,8 @@ def _start_harness(printer, *, added):
         patch("backend.app.main.maybe_schedule_foreign_3mf_retry", new=AsyncMock(return_value=False)),
         patch("backend.app.main._store_spoolman_print_data", new=AsyncMock()),
         patch("backend.app.main._capture_timelapse_baseline_at_start", new=AsyncMock()),
+        patch.object(print_binding, "attach", AsyncMock(return_value=print_binding.CreateNeeded(None))),
+        patch.object(print_binding, "bind_created", AsyncMock(return_value=True)),
     ]
 
 
@@ -528,18 +550,14 @@ async def test_a_foreign_print_start_stamps_the_plate_from_the_gcode_echo():
     is the row that most needs the plate stored — by completion the echo is gone
     and no queue item can answer for a print the farm did not dispatch.
     """
-    from backend.app.main import _active_prints, _expected_prints, on_print_start
+    from backend.app.main import on_print_start
     from backend.app.models.archive import PrintArchive
     from backend.app.services.foreign_archive import ThreeMFLookup
 
-    _expected_prints.clear()
-    _active_prints.clear()
     printer = _foreign_printer()
 
     added: list[object] = []
-    miss = ThreeMFLookup(
-        local_path=None, filename=None, subtask_name=SPLICED_ECHO, expected_plate=RUNNING_PLATE
-    )
+    miss = ThreeMFLookup(local_path=None, filename=None, subtask_name=SPLICED_ECHO, expected_plate=RUNNING_PLATE)
     patches = _start_harness(printer, added=added)
 
     with patch("backend.app.main.locate_3mf_for_print", new=AsyncMock(return_value=miss)):
@@ -557,7 +575,6 @@ async def test_a_foreign_print_start_stamps_the_plate_from_the_gcode_echo():
         finally:
             for p in reversed(patches):
                 p.stop()
-    _active_prints.clear()
 
     archives = [obj for obj in added if isinstance(obj, PrintArchive)]
     assert len(archives) == 1, "the fallback archive is still created"
@@ -574,11 +591,9 @@ async def test_a_captured_foreign_print_start_also_stamps_the_plate(tmp_path):
     never exists — so the archive row is the only place the plate can survive to
     completion here too.
     """
-    from backend.app.main import _active_prints, _expected_prints, on_print_start
+    from backend.app.main import on_print_start
     from backend.app.services.foreign_archive import ThreeMFLookup
 
-    _expected_prints.clear()
-    _active_prints.clear()
     captured = _multi_plate_3mf(tmp_path / "captured" / "ladder.3mf", PLATE_GRAMS)
     hit = ThreeMFLookup(
         local_path=captured, filename=SPLICED_FILE, subtask_name=SPLICED_ECHO, expected_plate=RUNNING_PLATE
@@ -616,7 +631,6 @@ async def test_a_captured_foreign_print_start_also_stamps_the_plate(tmp_path):
         finally:
             for p in reversed(patches):
                 p.stop()
-    _active_prints.clear()
 
     assert stub_archive.plate_id == RUNNING_PLATE, "the real-archive path stamps the plate too"
 
@@ -647,8 +661,9 @@ async def test_completion_with_no_session_and_no_queue_item_charges_the_stamped_
     with caplog.at_level(logging.INFO, logger="backend.app.services.usage_tracker"):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(mapping=[0]),
+            data={**_settled_payload(mapping=[0]), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -684,8 +699,9 @@ async def test_an_unstamped_foreign_completion_still_refuses_a_multi_plate_file(
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -720,8 +736,9 @@ async def test_a_stamped_plate_the_file_does_not_contain_refuses_to_charge(
     with caplog.at_level(logging.WARNING, logger="backend.app.services.usage_tracker"):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(mapping=[0]),
+            data={**_settled_payload(mapping=[0]), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -802,8 +819,9 @@ async def test_a_lost_foreign_print_on_a_tagless_feeder_warns_and_pages(
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={**_settled_payload(last_loaded_tray=0), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -844,8 +862,13 @@ async def test_an_eject_sweep_completion_stays_silent(db_session, printer_factor
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_name": "eject_production_item890"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={
+                **_settled_payload(last_loaded_tray=0),
+                "status": "completed",
+                "subtask_name": "eject_production_item890",
+            },
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=None,
         )
@@ -905,8 +928,9 @@ async def test_a_farm_dispatched_dry_run_that_lost_its_3mf_stays_silent(
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "DRYRUN-733"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={**_settled_payload(last_loaded_tray=0), "status": "completed", "subtask_id": "DRYRUN-733"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -949,8 +973,9 @@ async def test_a_captured_foreign_print_that_charges_zero_does_not_widen_the_wit
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={**_settled_payload(last_loaded_tray=0), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )

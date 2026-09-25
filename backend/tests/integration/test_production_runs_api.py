@@ -105,6 +105,32 @@ class TestProductionRunCreate:
         assert body["sku_code"] == "SKU007.01"
         assert body["status"] == "active"
 
+    async def test_create_ignores_a_stale_cooldown_override(self, async_client, db_session, tmp_path):
+        """There is ONE eject line (2026-09-25, measured shop air + one margin): a run no
+        longer carries a cooldown override. A client still sending one gets its run and the
+        field is not echoed. (The physical column is absent on a fresh schema; on a
+        migrated one it stays unread — ``unit/test_shop_air_migrations.py``.)"""
+        from backend.app.models.print_batch import PrintBatch
+
+        eject = await _make_eject_profile(async_client, name="ep-stale-override")
+        _, file_link_id = await _make_sku_with_file(async_client, db_session, tmp_path, code="SKU099.01")
+        resp = await async_client.post(
+            "/api/v1/production-runs",
+            json={
+                "sku_file_id": file_link_id,
+                "target_units": 1,
+                "target_model": "H2S",
+                "eject_profile_id": eject,
+                "cooldown_temp_c_override": 34.5,
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert "cooldown_temp_c_override" not in body
+        batch = await db_session.get(PrintBatch, body["id"])
+        assert batch is not None
+        assert not hasattr(batch, "cooldown_temp_c_override")
+
     async def test_overproduction_plates_math(self, async_client, db_session, tmp_path):
         eject = await _make_eject_profile(async_client, name="ep-over")
         _, file_link_id = await _make_sku_with_file(

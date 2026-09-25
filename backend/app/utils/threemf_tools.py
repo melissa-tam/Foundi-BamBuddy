@@ -17,6 +17,8 @@ from pathlib import Path
 
 import defusedxml.ElementTree as ET
 
+from backend.app.utils.machine_start_gcode import START_GCODE_END_MARKER
+
 logger = logging.getLogger(__name__)
 
 # Default filament properties
@@ -626,7 +628,6 @@ _HEADER_PLACEHOLDER_ALIASES = {
 
 _HEADER_KEY_RE = re.compile(r"^;\s*([^:]+?)\s*:\s*(.+?)\s*$")
 _PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
-_START_GCODE_END_MARKER = "; MACHINE_START_GCODE_END"
 _EXECUTABLE_BLOCK_END_MARKER = "; EXECUTABLE_BLOCK_END"
 _MACHINE_END_GCODE_START_MARKER = "; MACHINE_END_GCODE_START"
 
@@ -689,11 +690,11 @@ def _inject_start_at_marker(content: str, snippet: str) -> str:
     the same place a slicer-side custom-start-gcode would. Falls back to
     prepending if the marker isn't present (older files / non-Bambu slicers).
     """
-    marker_idx = content.find(_START_GCODE_END_MARKER)
+    marker_idx = content.find(START_GCODE_END_MARKER)
     if marker_idx == -1:
         logger.warning(
             "G-code injection: '%s' not found, prepending start snippet to whole file",
-            _START_GCODE_END_MARKER,
+            START_GCODE_END_MARKER,
         )
         return snippet.rstrip("\n") + "\n" + content
     line_start = content.rfind("\n", 0, marker_idx)
@@ -1149,7 +1150,7 @@ def read_plate_gcode_start_block(source_path: Path, plate_id: int, max_bytes: in
     plate's block), when the marker is not found within ``max_bytes``, or when the
     container cannot be read.
     """
-    marker = _START_GCODE_END_MARKER.encode("utf-8")
+    marker = START_GCODE_END_MARKER.encode("utf-8")
     try:
         with zipfile.ZipFile(source_path, "r") as zf:
             target = _find_target_gcode_name(zf.namelist(), plate_id)

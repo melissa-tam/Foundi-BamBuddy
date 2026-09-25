@@ -234,7 +234,7 @@ class TestCooldownHook:
             hold_z=2.0 if hold == "sent" else None,
             max_z=50.1,
             fans=(),
-            release_threshold_c=33.0,
+            release_line_c=33.0,
             started_at=time.monotonic() - elapsed_s,
             outcome=outcome,  # type: ignore[arg-type]
         )

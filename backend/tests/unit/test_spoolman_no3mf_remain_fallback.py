@@ -394,12 +394,15 @@ class TestPartialUsageRemainDelta:
         client.get_spool = AsyncMock(return_value={"id": 7, "filament": {"weight": 1000.0}})
         client.use_spool = AsyncMock()
 
+        from backend.app.services.usage_tracker import JobEvidence
+
+        # The live printer: the trays' remain% at the end (hardware, the job's end state).
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "tray_uuid": "AAAA", "remain": 70}]}]},
-            layer_num=42,
-            total_layers=100,
         )
+        # How far the job ran — its own terminal payload: layer 42 of 100.
+        evidence = JobEvidence(last_layer_num=42, total_layers=100)
 
         with (
             patch("backend.app.api.routes.settings.get_setting", AsyncMock(return_value="true")),
@@ -417,7 +420,7 @@ class TestPartialUsageRemainDelta:
             ),
             patch("backend.app.services.printer_manager.printer_manager", printer_manager),
         ):
-            await _report_partial_usage(printer_id=1, tracking=tracking)
+            await _report_partial_usage(printer_id=1, tracking=tracking, evidence=evidence)
 
         client.use_spool.assert_awaited_once_with(7, 200.0)
 

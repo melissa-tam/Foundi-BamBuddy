@@ -259,8 +259,8 @@ _INCIDENT_CLOSERS = {
 
 # --- The operator stop, and who may send one (2026-09-19) --------------------------
 
-# WHO may call ``print_control.stop_as_operator``. The pair it sends (MQTT ``print.stop``
-# plus the user-stopped mark) MEANS "a human pressed Stop", and the whole terminal
+# WHO may call ``print_control.stop_as_operator``. The pair it sends (the durable stop
+# request on the running unit, then MQTT ``print.stop``) MEANS "a human pressed Stop", and the whole terminal
 # disposition downstream is built on that meaning: the unit lands ``cancelled`` with a
 # ``stop_source``, the run holds, RESUME tops the deficit back up. Every caller is a Stop
 # an operator can actually press:
@@ -268,7 +268,7 @@ _INCIDENT_CLOSERS = {
 #                                     dialog "Stop printing" (2026-09-24);
 #   * ``api/routes/print_queue.py`` — the queue page's stop;
 #   * ``api/routes/webhook.py``     — an API client's ``/stop`` and ``/cancel`` (2026-09-24:
-#                                     both used to send a bare stop with no mark — and
+#                                     both used to send a bare stop with no request — and
 #                                     ``/cancel`` called a method that does not exist).
 # The third caller used to be ``service_hold.quiesce``, and deleting it IS the 2026-09-19
 # ruling: **no mode verb ends a print.** Entering maintenance mode or deactivating a
@@ -283,15 +283,15 @@ _OPERATOR_STOP_CALLERS = {
     ("api", "routes", "webhook.py"),
 }
 
-# WHO may send a RAW ``stop_print`` — the MQTT ``print.stop`` WITHOUT the operator mark.
+# WHO may send a RAW ``stop_print`` — the MQTT ``print.stop`` WITHOUT the operator's request.
 # A bare stop is the FARM ending a job it owns, and there are exactly two such acts:
-#   * ``print_control``   — the operator verb itself (the stop, then the mark);
+#   * ``print_control``   — the operator verb itself (the request, then the stop);
 #   * ``eject/remote``    — the eject lane's kill of its OWN sweep (the runtime watchdog,
 #                           the start deadline, the re-drive).
 # ``printer_manager`` is the per-printer facade that forwards to the client.
 # ``pause_recovery``'s plate-check stop is gone (2026-09-24: the printer's plate check
 # PAUSES the job for a human, and the farm sends nothing), and so is every route's bare
-# stop — an operator's stop goes through ``print_control`` so it carries its mark.
+# stop — an operator's stop goes through ``print_control`` so it carries its request.
 _RAW_STOP_CALLERS = {
     ("services", "print_control.py"),
     ("services", "eject", "remote.py"),
@@ -351,8 +351,8 @@ class TestRawStopOwnership:
             pytest.fail(
                 "A raw stop_print is sent outside the allowlisted lanes:\n"
                 + "\n".join(strays)
-                + "\n\nAn operator's stop goes through print_control.stop_as_operator (it carries the "
-                "user-stopped mark, so the terminal records a cancel). A farm lane that must end its own "
+                + "\n\nAn operator's stop goes through print_control.stop_as_operator (it records the "
+                "durable stop request, so the terminal records a cancel). A farm lane that must end its own "
                 "job is a decision to argue in the diff, and belongs in the allowlist with its reason."
             )
 
@@ -429,6 +429,80 @@ class TestOperatorStopOwnership:
         callers = _OPERATOR_STOP_CALLERS - {("services", "print_control.py")}
         senders = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_operator_stops(f)}
         assert senders == callers
+
+
+# --- The operator's stop REQUEST is durable and has one writer (2026-09-25) -------------
+
+# ``print_queue.operator_stop_requested_at`` is the ONE store of "an operator asked this
+# unit's print to stop". It replaced ``main._user_stopped_printers``, a process-memory set a
+# restart emptied — after a deploy the farm's own stopped job resolved FOREIGN. Written
+# (non-NULL) only by ``queue_transitions.stamp_operator_stop``, called only by the verb; set
+# NULL only where a unit is RE-ARMED (the dead-claim release, the skipped-unit restore).
+_STOP_REQUEST_COLUMN = "operator_stop_requested_at"
+_STOP_REQUEST_WRITER = ("services", "queue_transitions.py")
+_STOP_REQUEST_CLEARERS = {("services", "queue_transitions.py"), ("api", "routes", "print_queue.py")}
+# The names of the deleted process-memory mark: none may come back as a second store.
+_DELETED_STOP_MARK = {"_user_stopped_printers", "mark_printer_stopped_by_user", "printer_stopped_by_user"}
+
+
+def _stop_request_writes(tree: ast.Module) -> list[tuple[bool, int]]:
+    """Every write of the request column: ``(is_a_clear, line)``. A keyword argument (the
+    ``update().values(...)`` shape) or an attribute assignment (the ORM shape)."""
+    writes: list[tuple[bool, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == _STOP_REQUEST_COLUMN:
+                    writes.append((isinstance(kw.value, ast.Constant) and kw.value.value is None, node.lineno))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr == _STOP_REQUEST_COLUMN:
+                    writes.append((isinstance(node.value, ast.Constant) and node.value.value is None, node.lineno))
+    return writes
+
+
+class TestOperatorStopRequestOwnership:
+    """ONE store, ONE writer, ONE caller. SOURCE pins: a second store (a process set again) or
+    a second writer is well-formed code every seeded test passes — until a restart."""
+
+    def test_only_the_transitions_owner_writes_a_request_and_only_re_arm_writers_clear_one(self):
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for is_clear, line in _stop_request_writes(tree):
+                allowed = _STOP_REQUEST_CLEARERS if is_clear else {_STOP_REQUEST_WRITER}
+                if parts not in allowed:
+                    strays.append(f"  - {'/'.join(parts)}:{line} {'clears' if is_clear else 'writes'} the request")
+        assert not strays, "operator_stop_requested_at written outside its owners:\n" + "\n".join(strays)
+
+    def test_the_writers_and_clearers_are_still_there(self):
+        """The liveness half."""
+        writers = {parts for parts, tree in _app_trees() if any(not c for c, _ in _stop_request_writes(tree))}
+        clearers = {parts for parts, tree in _app_trees() if any(c for c, _ in _stop_request_writes(tree))}
+        assert (writers, clearers) == ({_STOP_REQUEST_WRITER}, _STOP_REQUEST_CLEARERS)
+
+    def test_only_the_operator_verb_stamps_a_request(self):
+        callers = {
+            parts
+            for parts, tree in _app_trees()
+            if parts != _STOP_REQUEST_WRITER
+            and any(isinstance(n, ast.Call) and _called_attr(n) == "stamp_operator_stop" for n in ast.walk(tree))
+        }
+        assert callers == {("services", "print_control.py")}
+
+    def test_the_process_memory_mark_is_gone(self):
+        """Its names may not return — not as a set, not as its mark/read functions."""
+        hits = [
+            f"  - {'/'.join(parts)}:{node.lineno} {name}"
+            for parts, tree in _app_trees()
+            for node in ast.walk(tree)
+            for name in (
+                getattr(node, "id", None),
+                getattr(node, "attr", None),
+                getattr(node, "name", None),
+            )
+            if name in _DELETED_STOP_MARK
+        ]
+        assert not hits, "the deleted in-memory stop mark is back:\n" + "\n".join(hits)
 
 
 # --- Putting a plate back has ONE owner (operator ruling 2026-09-24) ----------------
@@ -565,6 +639,399 @@ class TestRequeueOwnership:
         }
 
 
+_BINDING_OWNER = ("services", "print_binding.py")
+# The one-shot repair of the 2026-09 replay damage and the migrations that run it write archive
+# status as DATA REPAIR, at boot, before any binding exists — not as print binding.
+_ARCHIVE_STATUS_EXEMPT = frozenset({_BINDING_OWNER, ("services", "foreign_replay_repair.py"), ("core", "database.py")})
+# Names DELETED with the process-memory binding (2026-09-25). A reappearance is the leak coming back.
+_DELETED_BINDING_NAMES = (
+    "_active_prints",
+    "_expected_prints",
+    "_expected_print_creators",
+    "_expected_print_registered_at",
+    "_print_ams_mappings",
+    "_print_plate_ids",
+    "register_expected_print",
+    "_evict_stale_expected_prints",
+    "_expected_prints_cleanup_task",
+    "_expected_prints_cleanup_loop",
+    "start_expected_prints_cleanup",
+    "stop_expected_prints_cleanup",
+    "_EXPECTED_PRINT_TTL_SECONDS",
+    "_EXPECTED_PRINT_CLEANUP_INTERVAL",
+    "_get_start_plate_id",
+    "update_archive_status",
+)
+
+
+def _is_print_archive_attr(node: ast.expr, attr: str) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "PrintArchive"
+    )
+
+
+def _updates_print_archive(expr: ast.expr) -> bool:
+    """Is ``expr`` a statement chain built from ``update(PrintArchive)``?"""
+    node: ast.expr = expr
+    while True:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "update"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "PrintArchive"
+            ):
+                return True
+            node = func
+        elif isinstance(node, ast.Attribute):
+            node = node.value
+        else:
+            return False
+
+
+def _is_printing(value: ast.expr | None) -> bool:
+    return isinstance(value, ast.Constant) and value.value == "printing"
+
+
+def _scan_archive_live_status(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every read or write of an archive's ``printing`` status: the comparison, the ``in_`` list,
+    the construction, the Core update and any attribute assignment of the literal."""
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and _is_print_archive_attr(node.left, "status"):
+            if any(_is_printing(c) for c in node.comparators):
+                hits.append(("PrintArchive.status == 'printing'", node.lineno))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "in_" and _is_print_archive_attr(func.value, "status"):
+                listed = [e for a in node.args if isinstance(a, (ast.List, ast.Tuple, ast.Set)) for e in a.elts]
+                if any(_is_printing(e) for e in listed):
+                    hits.append(("PrintArchive.status.in_([... 'printing' ...])", node.lineno))
+            constructs = isinstance(func, ast.Name) and func.id == "PrintArchive"
+            core_update = (
+                isinstance(func, ast.Attribute) and func.attr == "values" and _updates_print_archive(func.value)
+            )
+            if (constructs or core_update) and any(k.arg == "status" and _is_printing(k.value) for k in node.keywords):
+                hits.append(
+                    ("PrintArchive(status='printing')" if constructs else ".values(status='printing')", node.lineno)
+                )
+        elif isinstance(node, ast.Assign) and _is_printing(node.value):
+            if any(isinstance(t, ast.Attribute) and t.attr == "status" for t in node.targets):
+                hits.append(("<row>.status = 'printing'", node.lineno))
+    return hits
+
+
+def _scan_archive_started_at_writes(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every write of an archive's ``started_at``: the construction keyword, the Core update, and an
+    assignment onto an ``*archive*``-named row."""
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            constructs = isinstance(func, ast.Name) and func.id == "PrintArchive"
+            core_update = (
+                isinstance(func, ast.Attribute) and func.attr == "values" and _updates_print_archive(func.value)
+            )
+            if (constructs or core_update) and any(k.arg == "started_at" for k in node.keywords):
+                hits.append(("PrintArchive(started_at=...)" if constructs else ".values(started_at=...)", node.lineno))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "started_at"
+                    and isinstance(target.value, ast.Name)
+                    and "archive" in target.value.id.lower()
+                ):
+                    hits.append((f"{target.value.id}.started_at = ...", node.lineno))
+    return hits
+
+
+class TestArchiveBindingOwnership:
+    """ONE owner binds a print to its archive — ``services/print_binding.py``. SOURCE pins, like
+    their neighbours: a second writer of ``status='printing'`` / ``started_at`` is well-formed code
+    that every behaviour test passes, and it is precisely what makes ``started_at IS NULL`` stop
+    meaning "never printed" — the adopt's whole precondition — and a name-keyed registry the way
+    every print in flight across a restart leaked its archive (RC1, 2026-09-23)."""
+
+    def test_no_archive_printing_status_outside_the_binding_owner(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {shape}"
+            for parts, tree in _app_trees()
+            if parts not in _ARCHIVE_STATUS_EXEMPT
+            for shape, line in _scan_archive_live_status(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "An archive's 'printing' status is read or written outside services/print_binding.py:\n"
+                + "\n".join(strays)
+                + "\n\nBind a print with print_binding.attach / bind_created, close it with close_archive, "
+                "and read the live print with live_print_archive / printers_with_live_print / "
+                "count_live_prints."
+            )
+
+    def test_no_archive_started_at_write_outside_the_binding_owner(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {shape}"
+            for parts, tree in _app_trees()
+            if parts not in _ARCHIVE_STATUS_EXEMPT
+            for shape, line in _scan_archive_started_at_writes(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "An archive's started_at is written outside services/print_binding.py:\n"
+                + "\n".join(strays)
+                + "\n\nstarted_at is stamped only when a print is BOUND to the row; that is what lets the "
+                "adopt read started_at IS NULL as 'never printed'."
+            )
+
+    def test_the_deleted_process_memory_binding_stays_deleted(self):
+        import re
+
+        pattern = re.compile(r"\b(" + "|".join(map(re.escape, _DELETED_BINDING_NAMES)) + r")\b")
+        strays = [
+            f"  - {f.relative_to(BACKEND_DIR).as_posix()}:{number} {match.group(1)}"
+            for f in get_python_files(BACKEND_DIR)
+            for number, line in enumerate(f.read_text(encoding="utf-8").splitlines(), start=1)
+            if (match := pattern.search(line))
+        ]
+        if strays:
+            pytest.fail(
+                "A name of the deleted process-memory print binding reappears in backend/app:\n"
+                + "\n".join(strays)
+                + "\n\nA print's archive is found by job id in the database (print_binding); a registry "
+                "keyed by names is empty after every restart."
+            )
+
+    def test_the_owner_still_does_it(self):
+        """The liveness half: pins that scan for strays pass on an empty tree too."""
+        owner = dict(_app_trees())[_BINDING_OWNER]
+        assert {shape for shape, _ in _scan_archive_live_status(owner)} >= {
+            "PrintArchive.status == 'printing'",
+            ".values(status='printing')",
+        }
+        assert {shape for shape, _ in _scan_archive_started_at_writes(owner)} == {".values(started_at=...)"}
+
+
+# --- One archive per print ATTEMPT (2026-09-25) ------------------------------------------------
+#
+# A unit's ``archive_id`` (and its ``archive`` relationship) names the DONOR — the bytes and names it
+# prints FROM, which a retry inherits from its parent — never its own print record. The record is
+# ``print_binding.print_archive_of`` (and back, ``unit_of_print_archive``), by job identity.
+
+# Names a queue unit is bound to where this codebase reads its archive link. A receiver named
+# otherwise is not scanned; these are the spellings a new reader reaches for.
+_QUEUE_UNIT_RECEIVERS = frozenset(
+    {"PrintQueueItem", "item", "unit", "fa_item", "queue_item", "i", "it", "retry", "parent"}
+)
+_QUEUE_UNIT_LINKS = frozenset({"archive_id", "archive"})
+
+# Every reader of a unit's archive link, and the donor question it asks. A reader that wants the
+# unit's OWN print (its photo, its outcome, its charge context) belongs on print_archive_of instead.
+_DONOR_READERS: dict[tuple[str, str], str] = {
+    ("api/routes/print_queue.py", "_enrich_response"): "queue row display: source name, thumbnail, slicer data",
+    ("api/routes/print_queue.py", "add_to_queue"): "the new unit's source file name (relay + notification)",
+    ("api/routes/print_queue.py", "get_queue_item"): "eager-loads the source for _enrich_response",
+    ("api/routes/print_queue.py", "list_queue"): "eager-loads the source for _enrich_response",
+    ("api/routes/print_queue.py", "start_queue_item"): "eager-loads the source for the filament pre-check",
+    ("api/routes/webhook.py", "webhook_add_to_queue"): "echoes the source archive the caller queued",
+    ("api/routes/webhook.py", "webhook_get_queue_status"): "echoes each unit's source archive",
+    ("services/archive.py", "ArchiveService.soft_delete_archive"): "delete scope: the units printing FROM it",
+    ("services/archive.py", "archive_delete_impact"): "delete guard: the units printing FROM it",
+    ("services/eject/manual.py", "_farm_dispatched_names"): "the farm file-name corpus (source names)",
+    ("services/farm_correlation.py", "_item_names"): "the names a unit was dispatched under",
+    ("services/farm_correlation.py", "resolve_item_donor"): "THE donor resolver: the bytes a unit printed from",
+    ("services/farm_stall.py", "_job_name"): "a label for the stalled job (source name)",
+    ("services/filament_deficit.py", "_resolve_source_3mf"): "the source 3MF the deficit is computed from",
+    ("services/filament_deficit.py", "compute_deficit_for_queue_item"): "eager-loads the source 3MF",
+    ("services/print_binding.py", "_adopt"): "the adopt: binds the donor only while it never recorded a print",
+    ("services/print_binding.py", "adoptable_dispatch"): "the adopt's pre-check, same rule",
+    ("services/print_binding.py", "attach"): "the adopt step of the print-start binding",
+    ("services/job_terminal.py", "_dispatched_filename"): (
+        "the file name a live unit's dispatch was uploaded under — the path a stale job's cleanup keeps"
+    ),
+    ("services/print_scheduler.py", "PrintScheduler._get_filament_requirements"): "dispatch read: the source file",
+    ("services/print_scheduler.py", "PrintScheduler._get_job_name"): "dispatch read: the source name",
+    ("services/print_scheduler.py", "PrintScheduler._start_print"): "dispatch read: the bytes to upload",
+    ("services/print_scheduler.py", "PrintScheduler.check_queue"): "a log line naming each pending unit's source",
+    ("services/usb_storage.py", "_in_use_remote_names"): "file names on the printer's USB a live unit prints from",
+    ("services/user_deletion.py", "_destroy_owned_items"): "delete scope: the units printing FROM the user's archives",
+    ("services/user_deletion.py", "delete_impact"): "delete forecast over the same scope",
+}
+# Receivers that share a unit's name but are another model.
+_NOT_QUEUE_UNITS: dict[tuple[str, str], str] = {
+    ("api/routes/projects.py", "create_bom_item"): "item is a ProjectBOMItem",
+    ("api/routes/projects.py", "list_bom_items"): "item is a ProjectBOMItem",
+    ("api/routes/projects.py", "update_bom_item"): "item is a ProjectBOMItem",
+}
+
+# Attributes that carry a printer job id. Comparing two of them is the job-identity question, which
+# has three answers — ``job_identity.same_job``.
+_JOB_ID_ATTRS = frozenset({"subtask_id", "dispatch_subtask_id", "dispatch_subtask", "live_subtask"})
+_JOB_IDENTITY_OWNERS = frozenset(
+    {
+        ("services", "job_identity.py"),
+        ("services", "print_binding.py"),
+        ("services", "farm_correlation.py"),
+        ("services", "foreign_replay_repair.py"),
+    }
+)
+# Comparisons outside the owners, each a SQL filter or a question that is not "same job?".
+_JOB_ID_COMPARISONS: dict[tuple[str, str], str] = {
+    ("services/eject/donor.py", "GateSubtaskArchive.resolve"): "SQL filter: the archive a plate gate's stamp names",
+    ("services/eject/manual.py", "_resolve_manual_eject_item"): (
+        "the plate gate's stamp → its unit: a SQL filter plus a guard over two farm-minted ids "
+        "(eject/* is outside the 2026-09-25 capsule; print_binding.print_archive_of is the adoption path)"
+    ),
+    ("services/spool_recovery.py", "_resolve_farm_item"): "SQL filter: the unit an echoed job id names",
+    ("services/usage_tracker.py", "_resolve_run_item"): "SQL filter: tier 1, the unit the terminal's echo names",
+    ("services/print_scheduler.py", "PrintScheduler._watchdog_print_start"): (
+        "change detection of the printer's OWN echo across the dispatch (did it flip?), not two jobs compared"
+    ),
+}
+
+
+def _scopes(tree: ast.Module) -> list[tuple[str, ast.AST]]:
+    """Every node with the qualified name of the def/class it sits in (``<module>`` at top level)."""
+    out: list[tuple[str, ast.AST]] = []
+
+    def walk(node: ast.AST, stack: tuple[str, ...]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                walk(child, (*stack, child.name))
+            else:
+                out.append((".".join(stack) or "<module>", child))
+                walk(child, stack)
+
+    walk(tree, ())
+    return out
+
+
+def _scan_queue_unit_archive_reads(py_file: Path) -> list[tuple[str, int]]:
+    """``(qualname, line)`` of every READ of a queue unit's ``archive_id`` / ``archive`` link.
+
+    Only modules that name ``PrintQueueItem`` are scanned: a module that never names the model does
+    not hold its rows under these receivers."""
+    text = py_file.read_text(encoding="utf-8")
+    if "PrintQueueItem" not in text:
+        return []
+    return [
+        (qual, node.lineno)
+        for qual, node in _scopes(ast.parse(text))
+        if isinstance(node, ast.Attribute)
+        and node.attr in _QUEUE_UNIT_LINKS
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in _QUEUE_UNIT_RECEIVERS
+    ]
+
+
+def _names_job_id(node: ast.expr) -> bool:
+    """Does this comparison operand spell a job id — the attribute itself, through a method chain
+    (``x.subtask_id.strip()``) or an ``or`` default (``(x.subtask_id or "")``)? A call to a FUNCTION
+    (``same_job(...)``) is the adopted form and does not count."""
+    if isinstance(node, ast.Attribute) and node.attr in _JOB_ID_ATTRS:
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return _names_job_id(node.func.value)
+    if isinstance(node, ast.BoolOp):
+        return any(_names_job_id(value) for value in node.values)
+    return False
+
+
+def _scan_job_id_comparisons(tree: ast.Module) -> list[tuple[str, int]]:
+    """``(qualname, line)`` of every ``==`` / ``!=`` whose operand is a job id."""
+    return [
+        (qual, node.lineno)
+        for qual, node in _scopes(tree)
+        if isinstance(node, ast.Compare)
+        and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops)
+        and any(_names_job_id(operand) for operand in (node.left, *node.comparators))
+    ]
+
+
+class TestPrintRecordResolution:
+    """One archive per print ATTEMPT (user ruling 2026-09-25). SOURCE pins, like their neighbours:
+    a unit's ``archive_id`` read as its print record is well-formed code every seeded test passes —
+    until the unit is a retry, whose ``archive_id`` is its FAILED parent's printed record (the
+    first-article approval showed the ancestor's photo; the usage context missed the retry and
+    raised ``MultipleResultsFound`` over the shared donor). And job identity has three answers, so a
+    second spelling of the comparison is how an id-less echo quietly becomes "the same job"."""
+
+    def test_a_unit_archive_link_is_read_only_as_the_donor(self):
+        known = _DONOR_READERS.keys() | _NOT_QUEUE_UNITS.keys()
+        strays = [
+            f"  - {'/'.join(_relative_parts(py_file))}:{line} ({qual})"
+            for py_file in get_python_files(BACKEND_DIR)
+            for qual, line in _scan_queue_unit_archive_reads(py_file)
+            if ("/".join(_relative_parts(py_file)), qual) not in known
+        ]
+        if strays:
+            pytest.fail(
+                "A queue unit's archive_id / archive is read by a function not on the donor allowlist:\n"
+                + "\n".join(strays)
+                + "\n\nThat link is the DONOR — the bytes the unit prints from, its parent's record for a "
+                "retry. The unit's own print is print_binding.print_archive_of(unit) (and back, "
+                "unit_of_print_archive). A genuine donor read goes on _DONOR_READERS with its reason."
+            )
+
+    def test_the_donor_allowlist_names_only_live_readers(self):
+        """The liveness half: an allowlist entry whose reader is gone would excuse the next one."""
+        live = {
+            ("/".join(_relative_parts(py_file)), qual)
+            for py_file in get_python_files(BACKEND_DIR)
+            for qual, _ in _scan_queue_unit_archive_reads(py_file)
+        }
+        stale = sorted((_DONOR_READERS.keys() | _NOT_QUEUE_UNITS.keys()) - live)
+        assert not stale, f"allowlisted archive-link readers that no longer read it: {stale}"
+
+    def test_job_identity_is_not_re_spelled(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} ({qual})"
+            for parts, tree in _app_trees()
+            if parts not in _JOB_IDENTITY_OWNERS
+            for qual, line in _scan_job_id_comparisons(tree)
+            if ("/".join(parts), qual) not in _JOB_ID_COMPARISONS
+        ]
+        if strays:
+            pytest.fail(
+                "A job id is compared with == / != outside the job-identity owners:\n"
+                + "\n".join(strays)
+                + "\n\nAsk job_identity.same_job (same / other / unknown) and decide what 'unknown' means "
+                "at the call site. A SQL filter goes on _JOB_ID_COMPARISONS with its reason."
+            )
+
+    def test_the_identity_allowlist_names_only_live_comparisons(self):
+        live = {
+            ("/".join(parts), qual)
+            for parts, tree in _app_trees()
+            if parts not in _JOB_IDENTITY_OWNERS
+            for qual, _ in _scan_job_id_comparisons(tree)
+        }
+        stale = sorted(_JOB_ID_COMPARISONS.keys() - live)
+        assert not stale, f"allowlisted job-id comparisons that no longer compare: {stale}"
+
+    def test_the_adopted_sites_ask_the_owner(self):
+        """The liveness half of the migration: the sites this wave moved really call the owner."""
+        from backend.app.services import dispatch_claim, incident_resolution, plate_occupancy_store, production_run
+
+        assert "print_archive_of" in _source_of(production_run.build_run_response)
+        assert "same_job" in _source_of(incident_resolution._same_job)  # noqa: SLF001
+        assert "same_job" in _source_of(dispatch_claim.judge)
+        assert "same_job" in _source_of(plate_occupancy_store._startup_policy)  # noqa: SLF001
+
+
+def _source_of(obj: object) -> str:
+    import inspect
+
+    return inspect.getsource(obj)
+
+
 def _scan_recovery_incident_constructions(py_file: Path) -> list[int]:
     """Every CONSTRUCTION of ``RecoveryIncident``, however the module was imported.
 
@@ -620,6 +1087,179 @@ class TestRecoveryIncidentOwnership:
             line for py_file in get_python_files(BACKEND_DIR) for line in _scan_recovery_incident_constructions(py_file)
         ]
         assert start <= line < start + len(source), "the one construction must live inside _build_incident"
+
+
+# --- A unit's END has ONE writer (2026-09-25) ---------------------------------------------------
+#
+# ``queue_transitions.record_unit_terminal`` ends a running unit (``printing`` → terminal), in one
+# conditional statement; ``fail_unclaimed_dispatch`` and ``annotate_stopped_unit`` are its two narrow
+# siblings there. Before it, the terminal callback, the queue page's Stop and the scheduler's
+# dispatch failure each wrote the row from an ORM copy read earlier — and the downtime reconcile
+# synthesised a fourth end for a unit a real terminal might already have ended (RC3).
+
+_UNIT_TERMINAL_OWNER = ("services", "queue_transitions.py")
+_UNIT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "skipped"})
+# Every ``<x>.status = <terminal word or computed value>`` outside the owner, keyed by file, enclosing
+# function and target — and why it is NOT a queue unit's end. A second end-writer for a unit is a
+# decision to argue in the diff, not an entry to add.
+_STATUS_WRITES_NOT_A_UNIT_END: dict[tuple[str, str, str], str] = {
+    ("api/routes/inventory.py", "update_shopping_list_status", "item.status"): "a ShoppingListItem",
+    ("api/routes/print_log.py", "update_print_log_entry", "entry.status"): "a PrintLogEntry (the log's own edit)",
+    ("api/routes/print_queue.py", "cancel_batch", "batch.status"): (
+        "a PrintBatch; its pending units end through queue_transitions.cancel_pending_items"
+    ),
+    ("api/routes/projects.py", "update_project", "project.status"): "a Project",
+    ("services/farm_policy.py", "_maybe_complete_run", "batch.status"): "a PrintBatch — the RUN completes",
+    ("services/firmware_update.py", "FirmwareUpdateService.start_upload", "state.status"): "a firmware upload",
+    ("services/firmware_update.py", "FirmwareUpdateService._do_upload", "state.status"): "a firmware upload",
+    ("services/github_backup.py", "GitHubBackupService.run_backup", "log.status"): "a backup log row",
+    ("services/print_scheduler.py", "PrintScheduler.check_queue", "item.status"): (
+        "upstream's require_previous_success SKIP: a PENDING unit the scheduler's own tick holds, skipped "
+        "before it ever printed — pending → skipped, not a running unit's end (the pending-side "
+        "transitions' race — an operator cancel landing in the tick — is not closed here)"
+    ),
+    ("services/printer_incidents.py", "mark_escalated", "incident.status"): "a PrinterIncident",
+    ("services/printer_incidents.py", "close", "incident.status"): "a PrinterIncident",
+    ("services/production_run.py", "transition_run", "run.status"): "a PrintBatch (run lifecycle)",
+    ("services/slice_dispatch.py", "SliceDispatchService._run_job", "job.status"): "a slice job",
+}
+# The lanes that END a running unit — each through the owner, and no other.
+_UNIT_TERMINAL_CALLERS = frozenset(
+    {
+        ("services", "job_terminal.py"),  # the real terminal (main) and the reconcile's superseded phase
+        ("services", "print_scheduler.py"),  # _fail_queue_item, the print-command failure after the claim
+        ("api", "routes", "print_queue.py"),  # the queue page's Stop
+    }
+)
+
+
+def _is_unit_end_value(value: ast.expr | None) -> bool:
+    """A terminal word, or a value computed at run time (which may be one)."""
+    if value is None:
+        return False
+    if isinstance(value, ast.Constant):
+        return isinstance(value.value, str) and value.value in _UNIT_TERMINAL_STATUSES
+    return True
+
+
+def _updates_queue_item(expr: ast.expr) -> bool:
+    """Is ``expr`` a statement chain built from ``update(PrintQueueItem)``?"""
+    node: ast.expr = expr
+    while True:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "update"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "PrintQueueItem"
+            ):
+                return True
+            node = func
+        elif isinstance(node, ast.Attribute):
+            node = node.value
+        else:
+            return False
+
+
+def _scan_unit_end_writes(tree: ast.Module) -> list[tuple[str, str, int]]:
+    """``(qualname, shape, line)`` of every write that could END a queue unit: a ``.status``
+    assignment of a terminal word or a computed value, a ``update(PrintQueueItem).values(status=…)``,
+    a ``PrintQueueItem(status=<terminal>)`` construction, a ``setattr(…, "status", …)``."""
+    hits: list[tuple[str, str, int]] = []
+    for qual, node in _scopes(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                    pairs = list(zip(target.elts, node.value.elts, strict=False))
+                else:
+                    pairs = [(target, node.value)]
+                for tgt, value in pairs:
+                    if isinstance(tgt, ast.Attribute) and tgt.attr == "status" and _is_unit_end_value(value):
+                        hits.append((qual, ast.unparse(tgt), node.lineno))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "values" and _updates_queue_item(func.value):
+                if any(k.arg == "status" and _is_unit_end_value(k.value) for k in node.keywords):
+                    hits.append((qual, "update(PrintQueueItem).values(status=...)", node.lineno))
+            elif isinstance(func, ast.Name) and func.id == "PrintQueueItem":
+                if any(
+                    k.arg == "status" and isinstance(k.value, ast.Constant) and k.value.value in _UNIT_TERMINAL_STATUSES
+                    for k in node.keywords
+                ):
+                    hits.append((qual, "PrintQueueItem(status=<terminal>)", node.lineno))
+            elif (
+                isinstance(func, ast.Name)
+                and func.id == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "status"
+            ):
+                hits.append((qual, 'setattr(..., "status", ...)', node.lineno))
+    return hits
+
+
+class TestUnitTerminalOwnership:
+    """ONE writer of a unit's END. SOURCE pins, like their neighbours: a second end-writer is
+    well-formed code every seeded test passes — until it races the first, and a unit ends twice
+    (the stop over the printer's own outcome) or a stale record ends a unit a real terminal already
+    ended."""
+
+    def test_no_unit_is_ended_outside_the_queue_transitions_owner(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} ({qual}) {shape}"
+            for parts, tree in _app_trees()
+            if parts != _UNIT_TERMINAL_OWNER
+            for qual, shape, line in _scan_unit_end_writes(tree)
+            if ("/".join(parts), qual, shape) not in _STATUS_WRITES_NOT_A_UNIT_END
+        ]
+        if strays:
+            pytest.fail(
+                "A status that can END a queue unit is written outside services/queue_transitions.py:\n"
+                + "\n".join(strays)
+                + "\n\nEnd a running unit through queue_transitions.record_unit_terminal (conditional on "
+                "'printing', once); a dispatch that failed before its claim through fail_unclaimed_dispatch. "
+                "A write that is not a queue unit's end goes on _STATUS_WRITES_NOT_A_UNIT_END with its reason."
+            )
+
+    def test_the_allowlist_names_only_live_writes(self):
+        """The liveness half: an entry whose write is gone would excuse the next one."""
+        live = {
+            ("/".join(parts), qual, shape)
+            for parts, tree in _app_trees()
+            if parts != _UNIT_TERMINAL_OWNER
+            for qual, shape, _ in _scan_unit_end_writes(tree)
+        }
+        stale = sorted(_STATUS_WRITES_NOT_A_UNIT_END.keys() - live)
+        assert not stale, f"allowlisted status writes that no longer write: {stale}"
+
+    def test_every_lane_that_ends_a_running_unit_calls_the_owner(self):
+        """The real terminal (through job_terminal), the queue page's Stop and the scheduler's
+        dispatch failure all end the unit through ``record_unit_terminal`` — and nothing else calls it."""
+        callers = {
+            parts
+            for parts, tree in _app_trees()
+            if parts != _UNIT_TERMINAL_OWNER
+            and any(
+                isinstance(node, ast.Call) and _called_attr(node) == "record_unit_terminal" for node in ast.walk(tree)
+            )
+        }
+        assert callers == _UNIT_TERMINAL_CALLERS
+
+    def test_the_callers_are_the_lanes_that_end_a_unit(self):
+        """The same, per function: the lanes are the ones the ruling names, not merely their modules."""
+        from backend.app import main
+        from backend.app.api.routes import print_queue
+        from backend.app.services import job_terminal
+        from backend.app.services.print_scheduler import PrintScheduler
+
+        assert "record_unit_terminal" in _source_of(print_queue.stop_queue_item)
+        assert "record_unit_terminal" in _source_of(PrintScheduler._fail_queue_item)  # noqa: SLF001
+        assert "record_unit_terminal" in _source_of(job_terminal.record_unit_outcome)
+        assert "job_terminal.record_unit_outcome" in _source_of(main.on_print_complete)
+        assert "record_unit_outcome" in _source_of(job_terminal.close_superseded)
 
 
 # --- The recovery driver's single owners (2026-09-23, the wedge release ladder) -------
@@ -994,14 +1634,16 @@ class TestDerivedCacheOwnership:
 
 # The question "what does the printer actually receive" has ONE owner:
 # ``services/dispatch_file.py``. It builds the transform stack (the chute-prime rewrite,
-# then the upstream per-model snippets), DERIVES the cache key from that stack, and hands
-# ``print_scheduler._start_print`` a verdict. Two things are pinned here:
+# the plate blow-off, then the upstream per-model snippets), DERIVES the cache key from
+# that stack, and hands ``print_scheduler._start_print`` a verdict. Two things are pinned
+# here:
 #
-#   * the two transform entry points — ``chute_prime.rewrite_head`` and
-#     ``threemf_tools.apply_gcode_snippets`` — are called from the seam and nowhere else;
-#   * the two settings keys that SELECT them are spelled only by the seam that reads them
-#     and by the two modules that define the setting (the schema twin, the PUT coercion
-#     whitelist).
+#   * the three transform entry points — ``chute_prime.rewrite_head``,
+#     ``plate_blowoff.insert_blowoff`` and ``threemf_tools.apply_gcode_snippets`` — are called
+#     from the seam and nowhere else;
+#   * the settings keys that SELECT and SHAPE them are spelled only by the seam that reads
+#     them and by the two modules that define the setting (the schema twin, the PUT
+#     coercion whitelists).
 #
 # The failure this catches is a second rewrite site: a perfectly working injection added
 # back into the scheduler, a route or a recovery lane. Every behaviour test would pass —
@@ -1009,14 +1651,19 @@ class TestDerivedCacheOwnership:
 # turned off still serves chute-primed files out of the cache.
 _DISPATCH_SEAM = ("services", "dispatch_file.py")
 
-_DISPATCH_TRANSFORM_CALLS = {"rewrite_head", "apply_gcode_snippets"}
+_DISPATCH_TRANSFORM_CALLS = {"rewrite_head", "insert_blowoff", "apply_gcode_snippets"}
 
-_DISPATCH_SETTING_KEYS = {"farm_chute_prime_enabled", "gcode_snippets"}
+_DISPATCH_SETTING_KEYS = {
+    "farm_chute_prime_enabled",
+    "farm_plate_blowoff_enabled",
+    "farm_plate_blowoff_seconds",
+    "gcode_snippets",
+}
 
 _DISPATCH_SETTING_SPELLERS = {
     _DISPATCH_SEAM,
     ("schemas", "settings.py"),  # defines the typed field + its update twin
-    ("api", "routes", "settings.py"),  # the boolean-coercion whitelist
+    ("api", "routes", "settings.py"),  # the bool / int coercion whitelists
 }
 
 # What ``print_scheduler`` may no longer import from ``threemf_tools``: it does not
@@ -1088,14 +1735,17 @@ class TestDispatchFileOwnership:
                 "print_scheduler reached back into threemf_tools for an injection symbol:\n" + "\n".join(strays)
             )
 
-    def test_the_seam_still_owns_both_transforms_and_both_keys(self):
+    def test_the_seam_still_owns_every_transform_and_every_key(self):
         """The liveness half: an ownership pin whose owner has moved away polices nothing,
         and the scan above would then pass on a codebase with no seam at all."""
         seam = BACKEND_DIR.joinpath(*_DISPATCH_SEAM)
         assert seam.exists(), f"{'/'.join(_DISPATCH_SEAM)} is gone — the seam moved without this pin"
 
         found = {symbol for symbol, _ in _scan_dispatch_decisions(seam)}
-        for expected in ("rewrite_head()", "apply_gcode_snippets()", '"farm_chute_prime_enabled"', '"gcode_snippets"'):
+        expected_symbols = {f"{name}()" for name in _DISPATCH_TRANSFORM_CALLS} | {
+            f'"{key}"' for key in _DISPATCH_SETTING_KEYS
+        }
+        for expected in sorted(expected_symbols):
             assert expected in found, f"{'/'.join(_DISPATCH_SEAM)} no longer uses {expected}"
 
 
@@ -1459,7 +2109,7 @@ class TestModuleImports:
         IMPORTANT: We must NOT ``del sys.modules[name]`` to force a fresh
         import here. ``backend.app.main`` is a stateful module — re-importing
         it builds NEW module-level dicts (_timelapse_baselines,
-        _expected_prints, _active_prints, …) and re-runs ``root_logger.
+        _stage22_finish_frames, _bed_cool_waiters, …) and re-runs ``root_logger.
         addHandler(console_handler)``. Any test that already bound those
         names via ``from backend.app.main import _timelapse_baselines`` now
         holds a stale reference, while production code resolves the symbol
@@ -1524,3 +2174,352 @@ class TestLogErrorPatterns:
             client._process_message(msg)
 
         assert not capture_logs.has_errors(), f"Errors during MQTT processing:\n{capture_logs.format_errors()}"
+
+
+# --------------------------------------------------------------------------- #
+# The eject line has ONE owner (2026-09-25, services/eject/shop_air)
+# --------------------------------------------------------------------------- #
+_SHOP_AIR_OWNER = ("services", "eject", "shop_air.py")
+_SHOP_AIR_MIGRATION = ("core", "database.py")
+# The one-value ruling deleted these: the per-profile threshold, the per-run override, the
+# warn floor that policed a hand-typed line, and the two resolvers that read them.
+_DELETED_EJECT_LINE_NAMES = frozenset(
+    {
+        "cooldown_temp_c",
+        "cooldown_temp_c_override",
+        "farm_cooldown_warn_floor_c",
+        "resolve_cooldown_override",
+        "_resolve_eject_threshold",
+    }
+)
+# What only the owner may DEFINE: the qualification, the estimate, the line, the predicate.
+_SHOP_AIR_OWNED_DEFS = frozenset(
+    {"qualify", "estimate", "day_curve", "eject_line_c", "release_ok", "release_limit", "own_air_c", "current_line"}
+)
+# The readers, and the owner verbs each must reach THROUGH the module (liveness half).
+_SHOP_AIR_READERS: dict[tuple[str, ...], frozenset[str]] = {
+    ("services", "eject", "monitor.py"): frozenset({"arm_line", "release_ok", "own_air_c"}),
+    ("services", "eject", "manual.py"): frozenset({"current_line", "release_ok", "own_air_c"}),
+    ("services", "farm_policy.py"): frozenset({"current_line", "release_ok", "own_air_c"}),
+    ("main.py",): frozenset({"current_line", "note_reading", "prune"}),
+    ("api", "routes", "shop_air.py"): frozenset({"current_line"}),
+}
+_SHOP_AIR_VERBS = frozenset({"arm_line", "current_line", "release_ok", "release_limit", "own_air_c", "eject_line_c"})
+
+
+def _is_bare_string_statement(node: ast.AST) -> bool:
+    """A docstring (or any bare string statement): prose, where the rule is explained."""
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+
+def _scan_deleted_eject_line_names(py_file: Path) -> list[tuple[str, int]]:
+    """Every CODE reference to a deleted name — attribute, name, keyword, def, or a string
+    (SQL, a settings key) — skipping docstrings, which are where the history is told."""
+    import re
+
+    pattern = re.compile(r"\b(" + "|".join(sorted(_DELETED_EJECT_LINE_NAMES)) + r")\b")
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    prose = {id(node.value) for node in ast.walk(tree) if _is_bare_string_statement(node)}
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        name = None
+        if isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.Name):
+            name = node.id
+        elif isinstance(node, ast.keyword):
+            name = node.arg
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.alias):
+            name = node.asname or node.name.rsplit(".", 1)[-1]
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in prose:
+            match = pattern.search(node.value)
+            name = match.group(1) if match else None
+        if name in _DELETED_EJECT_LINE_NAMES:
+            hits.append((name, getattr(node, "lineno", 0)))
+    return hits
+
+
+def _shop_air_aliases(tree: ast.Module) -> set[str]:
+    """The local names a module binds to the shop_air MODULE (``import … as``, any scope)."""
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "backend.app.services.eject":
+            aliases |= {alias.asname or alias.name for alias in node.names if alias.name == "shop_air"}
+        elif isinstance(node, ast.Import):
+            aliases |= {
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "backend.app.services.eject.shop_air" and alias.asname
+            }
+    return aliases
+
+
+def _shop_air_calls(tree: ast.Module) -> tuple[set[str], list[tuple[str, int]]]:
+    """(owner verbs reached THROUGH the module, owner verbs imported or called bare)."""
+    aliases = _shop_air_aliases(tree)
+    through: set[str] = set()
+    bare: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            through.add(node.attr)
+        elif isinstance(node, ast.ImportFrom) and node.module == "backend.app.services.eject.shop_air":
+            bare += [(alias.name, node.lineno) for alias in node.names if alias.name in _SHOP_AIR_VERBS]
+    return through, bare
+
+
+def _scan_shop_air_sample_writes(py_file: Path) -> list[tuple[str, int]]:
+    """ORM constructions of a sample, Core writes of its table, and raw SQL writing it."""
+    import re
+
+    raw = re.compile(r"(insert\s+into|delete\s+from|update)\s+shop_air_sample\b", re.IGNORECASE)
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = _called_name(node.func)
+            if name == "ShopAirSample":
+                hits.append(("ShopAirSample()", node.lineno))
+            elif name in _TABLE_WRITE_VERBS and node.args and _called_name(node.args[0]) == "ShopAirSample":
+                hits.append((f"{name}(ShopAirSample)", node.lineno))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and raw.search(node.value):
+            hits.append(("raw SQL", node.lineno))
+    return hits
+
+
+class TestEjectLineOwnership:
+    """ONE eject line: measured shop air + one margin, owned by ``services/eject/shop_air``.
+
+    User ruling 2026-09-25: the per-profile ``cooldown_temp_c`` (33 °C on all three production
+    profiles), the per-run override and the warn floor that policed them are deleted — one
+    value, measured. These pins keep a second copy from growing back: no code names the
+    deleted fields, nothing but the owner derives a line or judges a release, every reader
+    reaches the owner by name, and the sample cache has one writer.
+    """
+
+    def test_nothing_references_the_deleted_fields_or_setting(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts == _SHOP_AIR_MIGRATION:
+                continue  # the expand/contract migration must name the physical columns
+            strays += [f"  - {'/'.join(parts)}:{line} {name}" for name, line in _scan_deleted_eject_line_names(py_file)]
+        if strays:
+            pytest.fail(
+                "A deleted eject-line name is back in backend/app:\n"
+                + "\n".join(strays)
+                + "\n\nThere is ONE eject line — measured shop air + farm_cooldown_margin_c — and it is "
+                "services/eject/shop_air's. The profile's cooldown_temp_c, the run override and the warn floor "
+                "were deleted by user ruling (2026-09-25); the physical columns stay only for the rollback build."
+            )
+
+    def test_the_deletion_scan_is_live(self):
+        """The migration still names the physical column it relaxes — proof the scan sees it."""
+        found = {name for name, _ in _scan_deleted_eject_line_names(BACKEND_DIR.joinpath(*_SHOP_AIR_MIGRATION))}
+        assert {"cooldown_temp_c", "farm_cooldown_warn_floor_c"} <= found
+
+    def test_only_the_owner_defines_the_line_and_the_predicate(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts == _SHOP_AIR_OWNER:
+                continue
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            strays += [
+                f"  - {'/'.join(parts)}:{node.lineno} def {node.name}"
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _SHOP_AIR_OWNED_DEFS
+            ]
+        if strays:
+            pytest.fail(
+                "A second definition of the eject line or its release predicate appeared:\n"
+                + "\n".join(strays)
+                + "\n\nThe qualification, the estimate, the line and release_ok live in services/eject/shop_air "
+                "alone; a reader imports them, it never re-derives them."
+            )
+        owner = ast.parse(BACKEND_DIR.joinpath(*_SHOP_AIR_OWNER).read_text(encoding="utf-8"))
+        defined = {n.name for n in ast.walk(owner) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        assert defined >= _SHOP_AIR_OWNED_DEFS, "the owner no longer defines what this pin protects"
+
+    def test_every_reader_reaches_the_owner_by_name(self):
+        """The watch, the manual and FA gates, the foreign page and the recorder reach the
+        line and the predicate through the ``shop_air`` module — never a bare import — so
+        every call site names its owner, and each still does (the liveness half)."""
+        problems: list[str] = []
+        for parts, verbs in _SHOP_AIR_READERS.items():
+            tree = ast.parse(BACKEND_DIR.joinpath(*parts).read_text(encoding="utf-8"))
+            through, _ = _shop_air_calls(tree)
+            missing = verbs - through
+            if missing:
+                problems.append(f"  - {'/'.join(parts)} no longer reaches shop_air.{sorted(missing)}")
+        for py_file in get_python_files(BACKEND_DIR):
+            _, bare = _shop_air_calls(ast.parse(py_file.read_text(encoding="utf-8")))
+            problems += [f"  - {'/'.join(_relative_parts(py_file))}:{line} imports {name} bare" for name, line in bare]
+        if problems:
+            pytest.fail("\n".join(problems))
+
+    def test_no_reader_carries_a_temperature_of_its_own(self):
+        """The foreign lane lost its threshold end to end; the watch and the prep take the
+        LINE (None when shop air is unknown), never a per-plate number."""
+        import dataclasses
+        import inspect
+
+        from backend.app.services.eject import cooldown_prep, monitor
+        from backend.app.services.eject.manual import ForeignFarmFile
+        from backend.app.services.farm_correlation import upgrade_to_foreign_auto_eject
+        from backend.app.services.plate_occupancy import ForeignAutoEject
+
+        assert [f.name for f in dataclasses.fields(ForeignAutoEject)] == ["profile_id"]
+        assert [f.name for f in dataclasses.fields(ForeignFarmFile)] == ["profile_id", "print_name"]
+        assert list(inspect.signature(upgrade_to_foreign_auto_eject).parameters) == ["printer_id", "profile_id"]
+        assert list(inspect.signature(monitor.watch_bed_and_clear).parameters)[1] == "line_c"
+        assert "release_line_c" in inspect.signature(cooldown_prep.begin).parameters
+        assert not hasattr(monitor.EjectCooldownMonitor, "active_watch")
+
+    def test_the_sample_cache_has_one_writer(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts == _SHOP_AIR_OWNER:
+                continue
+            strays += [f"  - {'/'.join(parts)}:{line} {what}" for what, line in _scan_shop_air_sample_writes(py_file)]
+        if strays:
+            pytest.fail(
+                "shop_air_sample is written outside its owner:\n"
+                + "\n".join(strays)
+                + "\n\nIt is a derived cache over printer_sensor_history, written ONLY by services/eject/shop_air "
+                "(note_reading live, backfill at bootstrap — the migration calls backfill, it never writes rows). "
+                "A second writer is a second qualification rule."
+            )
+        owner = {what for what, _ in _scan_shop_air_sample_writes(BACKEND_DIR.joinpath(*_SHOP_AIR_OWNER))}
+        assert {"ShopAirSample()", "insert(ShopAirSample)", "delete(ShopAirSample)"} <= owner
+
+
+# --- The filament charge's one path (2026-09-25) ---------------------------------------------
+
+_USAGE_TRACKER = ("services", "usage_tracker.py")
+_USAGE_TRACKER_MODULE = "backend.app.services.usage_tracker"
+_SPOOLMAN_TRACKING = ("services", "spoolman_tracking.py")
+# A job's consumption fields, as a live PrinterState names them.
+_JOB_FIELDS = frozenset({"progress", "layer_num", "total_layers", "tray_now", "last_loaded_tray", "tray_change_log"})
+# Every function that turns a terminal into grams, in both inventories and the print log.
+_CHARGE_FUNCTIONS: dict[tuple[str, ...], set[str]] = {
+    _USAGE_TRACKER: {"on_print_complete", "_track_from_3mf"},
+    _SPOOLMAN_TRACKING: {"cleanup_tracking", "_report_partial_usage", "report_usage"},
+    ("services", "job_terminal.py"): {
+        "charge_usage",
+        "_charge_spoolman",
+        "write_run_log",
+        "compute_run_filament_grams",
+    },
+}
+
+
+class TestUsageChargeOwnership:
+    """A charge follows the terminal's OWN evidence, through ONE path (2026-09-25).
+
+    Production 2026-09-16 → 24 charged ~7.2 kg over 32 phantom charges: a terminal processed while
+    the printer ran another job was scaled by the LIVE printer's progress, and popped the running
+    job's usage session. The behaviour tests pin the charge; these pin the SHAPE that keeps a second
+    reading from growing back — each failure they catch is a well-formed live read that every
+    behaviour test with a self-consistent mock passes."""
+
+    def test_the_charge_has_one_caller_on_the_outcomes_basis(self):
+        """``usage_tracker.on_print_complete`` is reached only through ``job_terminal.charge_usage`` —
+        the job phase's (f) — which hands it the outcome's basis. A second caller is a second charge
+        path, and the lane that decided nothing about the basis is the one that would guess."""
+        callers: list[tuple[str, int]] = []
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                imported = (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == _USAGE_TRACKER_MODULE
+                    and any(alias.name == "on_print_complete" for alias in node.names)
+                )
+                called = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "on_print_complete"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "usage_tracker"
+                )
+                if imported or called:
+                    callers.append(("/".join(parts), node.lineno))
+        assert [path for path, _ in callers] == ["services/job_terminal.py"], callers
+
+        from backend.app.services import job_terminal
+
+        assert "charge=outcome.charge" in _source_of(job_terminal.charge_usage)
+
+    def test_the_charge_path_reads_the_live_printer_once_and_only_for_its_hardware(self):
+        """Every ``get_status`` in the tracker is the print-START snapshot or the ONE hardware read of
+        ``on_print_complete``; the 3MF lane takes no printer manager at all — how far the job ran and
+        which trays fed it is ``JobEvidence``, off the terminal payload."""
+        tree = ast.parse(BACKEND_DIR.joinpath(*_USAGE_TRACKER).read_text(encoding="utf-8"))
+        reads = sorted(
+            qual for qual, node in _scopes(tree) if isinstance(node, ast.Call) and _called_attr(node) == "get_status"
+        )
+        assert reads == ["on_print_complete", "on_print_start"], reads
+
+        track = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_track_from_3mf")
+        params = {arg.arg for arg in (*track.args.args, *track.args.kwonlyargs)}
+        assert "printer_manager" not in params
+        assert {"charge", "evidence", "hardware"} <= params
+
+    def test_the_spoolman_lane_reads_the_live_printer_only_for_its_hardware(self):
+        """The Spoolman lane's live reads are the print-START snapshot (``store_print_data``) and the
+        trays' remain% at the end (``report_usage`` Path 2, the no-3MF branch of
+        ``_report_partial_usage``) — never a layer or a progress: those are ``JobEvidence``."""
+        tree = ast.parse(BACKEND_DIR.joinpath(*_SPOOLMAN_TRACKING).read_text(encoding="utf-8"))
+        reads = sorted(
+            qual for qual, node in _scopes(tree) if isinstance(node, ast.Call) and _called_attr(node) == "get_status"
+        )
+        assert reads == ["_report_partial_usage", "report_usage", "store_print_data"], reads
+
+    def test_a_charge_reads_the_jobs_own_fields_only_off_its_evidence(self):
+        """How far a job ran and which trays fed it is read, in every charge function of both
+        inventories, off ``JobEvidence`` alone — an attribute named like one of the job's fields on
+        anything else (a live state, a ``_m`` of the moment) is the 2026-09-16 → 24 phantom's shape."""
+        strays: list[tuple[str, str, int]] = []
+        for parts, functions in _CHARGE_FUNCTIONS.items():
+            tree = ast.parse(BACKEND_DIR.joinpath(*parts).read_text(encoding="utf-8"))
+            defs = [
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in functions
+            ]
+            assert {d.name for d in defs} == functions, f"a pinned charge function was renamed in {parts}"
+            for fn in defs:
+                for node in ast.walk(fn):
+                    if (
+                        isinstance(node, ast.Attribute)
+                        and node.attr in _JOB_FIELDS
+                        and not (isinstance(node.value, ast.Name) and node.value.id == "evidence")
+                    ):
+                        strays.append(("/".join(parts), fn.name, node.lineno))
+        assert not strays, strays
+
+    def test_only_the_tracker_touches_its_usage_sessions(self):
+        """A session is keyed to its job and consumed only by that job's terminal (``_take_session``);
+        the one writer beside print start is ``adopt_dispatched_unit``. A module reaching into
+        ``_active_sessions`` is a second writer that knows nothing about the job it touches."""
+        strays: list[tuple[str, int]] = []
+        for parts, tree in _app_trees():
+            if parts == _USAGE_TRACKER:
+                continue
+            for node in ast.walk(tree):
+                imported = (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == _USAGE_TRACKER_MODULE
+                    and any(alias.name == "_active_sessions" for alias in node.names)
+                )
+                reached = (
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "_active_sessions"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "usage_tracker"
+                )
+                if imported or reached:
+                    strays.append(("/".join(parts), node.lineno))
+        assert not strays, strays

@@ -146,3 +146,86 @@ class TestThePrintersEvidence:
         hold = {"kind": "plate_vision", "job_id": _JOB, "printer_messages": [_VISION_WORDS]}
         assert _build("completed", holds=[hold]).plate_refusal is None
         assert _build("failed", "operator_ui", holds=[hold]).plate_refusal is None
+
+
+def _charge(raw, verdict=None, *, reliable=True, layer=10, progress=40.0, dry_run=False):
+    return build_terminal_outcome(
+        raw_status=raw,
+        verdict=verdict,
+        open_incidents=(),
+        job_id=_JOB,
+        evidence=DepositEvidence(
+            final_status=raw,
+            is_dry_run=dry_run,
+            peaks_reliable=reliable,
+            last_layer_num=layer,
+            last_progress=progress,
+        ),
+        first_article=False,
+        is_eject=False,
+        hms_errors=None,
+    ).charge
+
+
+class TestChargeBasis:
+    """What the job that ended is charged for — decided ONCE, from THIS terminal's evidence.
+
+    Never from the live printer: by the time a terminal is processed the printer can be running
+    another job (2026-09-16 → 24: ~7.2 kg over 32 phantom charges scaled by the next job's live
+    progress). The ledger heals in one direction only (doctrine rule 8) — the increase-only wire
+    sync restores an under-charge on a tagged roll, nothing restores an over-charge — so a job
+    nobody measured is charged nothing."""
+
+    @pytest.mark.parametrize("verdict", [None, "operator_ui", "operator_screen"])
+    def test_a_finish_charges_the_whole_plate(self, verdict):
+        assert _charge("completed", verdict) == "full"
+
+    def test_a_finish_charges_the_whole_plate_whatever_its_peaks_say(self):
+        """A restart-attached client reads no peaks — the printer still said the job ran to its end."""
+        assert _charge("completed", reliable=False, layer=0, progress=0) == "full"
+
+    def test_a_dry_runs_finish_is_still_the_printers_word(self):
+        """Recorded ``cancelled`` (it deposited nothing), yet nothing is un-extruded by a rewrite: the
+        motion-only file declares zero grams, so ``full`` charges zero."""
+        assert _charge("completed", dry_run=True) == "full"
+
+    def test_the_reconciles_unknown_outcome_charges_nothing(self):
+        assert _charge("aborted", "reconcile_unknown", reliable=False, layer=0, progress=0) == "none"
+
+    def test_the_unknown_outcome_charges_nothing_even_with_a_peak_in_hand(self):
+        """The ``ended`` synthesis carries the live progress of the SAME job; the IDLE branch does not,
+        and whatever it carried, nobody observed how the job ended."""
+        assert _charge("aborted", "reconcile_unknown", reliable=False, progress=60.0) == "none"
+
+    @pytest.mark.parametrize(
+        ("raw", "verdict"),
+        [("failed", None), ("failed", "operator_ui"), ("aborted", "operator_screen"), ("failed", "plate_refused")],
+    )
+    def test_any_other_end_with_measured_peaks_is_partial(self, raw, verdict):
+        assert _charge(raw, verdict) == "partial"
+
+    def test_a_measured_zero_is_a_partial_charge_of_nothing(self):
+        """A job stopped before its first layer: the peaks WERE measured, and they say zero."""
+        assert _charge("failed", layer=0, progress=0) == "partial"
+
+    def test_unmeasured_peaks_with_nothing_read_charge_nothing(self):
+        """A client that joined mid-job and read no peak before the end has nothing to scale by —
+        and a guess could only ever over-charge a ledger that never heals downward."""
+        assert _charge("failed", reliable=False, layer=0, progress=0) == "none"
+        assert _charge("aborted", reliable=False, layer=None, progress=None) == "none"
+
+    @pytest.mark.parametrize(("layer", "progress"), [(0, 35.0), (80, 0)])
+    def test_a_peak_read_after_an_attach_still_measures_this_job(self, layer, progress):
+        """The firmware's percent and layer are ABSOLUTE: a non-zero reading taken after the attach is
+        this job's (the attach cleared the predecessor's) — only its zero means nothing."""
+        assert _charge("failed", reliable=False, layer=layer, progress=progress) == "partial"
+
+    def test_the_unobserved_job_phase_outcome_charges_nothing_by_construction(self):
+        """The reconcile's ``superseded`` job phase builds its outcome through the one builder under
+        ``reconcile_unknown`` — so the job phase has no charge to make, and makes none."""
+        from types import SimpleNamespace
+
+        from backend.app.services.job_terminal import unobserved_outcome
+
+        outcome = unobserved_outcome(SimpleNamespace(subtask_id="J1"), SimpleNamespace(first_article=False))
+        assert outcome.charge == "none"

@@ -87,7 +87,6 @@ interface NumericFieldMeta {
 }
 
 const NUMERIC_FIELDS: NumericFieldMeta[] = [
-  { key: 'cooldown_temp_c', i18n: 'cooldownTemp', min: 15, max: 60, step: 0.5 },
   { key: 'clearance_mm', i18n: 'clearance', min: 0, max: 100, step: 0.1 },
   { key: 'z_offset_mm', i18n: 'zOffset', min: 0.4, max: 20, step: 0.1 },
   { key: 'descent_steps', i18n: 'descentSteps', min: 1, max: 50, step: 1 },
@@ -192,11 +191,10 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
 
   // Geometry-derived validation bounds (Phase 2): registry rows give the bed
   // width and part-height ceiling; the GET envelope carries the server's
-  // minimum sweep-band width so it is never hardcoded here. Settings give the
-  // cooldown ambient-trap warn floor. All checks degrade to no-ops while the
-  // queries are unavailable — the backend re-validates authoritatively.
+  // minimum sweep-band width so it is never hardcoded here. All checks degrade
+  // to no-ops while the query is unavailable — the backend re-validates
+  // authoritatively.
   const { data: geoData } = useModelGeometries();
-  const { data: appSettings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
   const geometries = geoData?.geometries;
   const maxBedX =
     geometries && geometries.length > 0 ? Math.max(...geometries.map((g) => g.bed_x)) : null;
@@ -225,19 +223,12 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
     return null;
   })();
 
-  // Non-blocking warnings: a profile taller than every registered model's
-  // ceiling can never dispatch; a cooldown threshold below the warn floor
-  // risks the ambient trap (a wait that can never complete).
+  // Non-blocking warning: a profile taller than every registered model's
+  // ceiling can never dispatch.
   const heightWarning = (() => {
     const h = Number(values.max_part_height_mm);
     if (!Number.isFinite(h) || maxCeiling == null || h <= maxCeiling) return null;
     return t('ejectProfiles.geometry.heightExceedsCeiling', { max: maxCeiling });
-  })();
-  const cooldownFloor = appSettings?.farm_cooldown_warn_floor_c;
-  const cooldownWarning = (() => {
-    const c = Number(values.cooldown_temp_c);
-    if (!Number.isFinite(c) || cooldownFloor == null || c >= cooldownFloor) return null;
-    return t('ejectProfiles.geometry.cooldownAmbientTrap', { floor: cooldownFloor });
   })();
   // Bed-drop needs a per-model Z travel; warn (non-blocking — the backend is
   // authoritative and fails closed) when the assist is on but any registry row
@@ -398,11 +389,6 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
                       }
                       className={inputClass}
                     />
-                    {f.key === 'cooldown_temp_c' && cooldownWarning && (
-                      <p role="note" className="text-xs text-yellow-300 mt-1">
-                        {cooldownWarning}
-                      </p>
-                    )}
                     {f.key === 'max_part_height_mm' && heightWarning && (
                       <p role="note" className="text-xs text-yellow-300 mt-1">
                         {heightWarning}
@@ -1938,7 +1924,6 @@ export function EjectProfilesPage() {
               <thead className="text-bambu-gray text-left border-b border-bambu-dark-tertiary">
                 <tr>
                   <th className="py-3 px-4 font-medium">{t('ejectProfiles.fields.name')}</th>
-                  <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.cooldownTemp')}</th>
                   <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.passes')}</th>
                   <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.ejectSpeed')}</th>
                   <th className="py-3 px-4 font-medium text-right">{t('ejectProfiles.columns.maxHeight')}</th>
@@ -1949,7 +1934,6 @@ export function EjectProfilesPage() {
                 {list.map((p) => (
                   <tr key={p.id} className="border-b border-bambu-dark-tertiary last:border-b-0">
                     <td className="py-3 px-4 text-white font-medium">{p.name}</td>
-                    <td className="py-3 px-4 text-bambu-gray text-right">{p.cooldown_temp_c}</td>
                     <td className="py-3 px-4 text-bambu-gray text-right">{p.x_passes}</td>
                     <td className="py-3 px-4 text-bambu-gray text-right">{p.eject_speed_mm_min}</td>
                     <td className="py-3 px-4 text-bambu-gray text-right">{p.max_part_height_mm}</td>

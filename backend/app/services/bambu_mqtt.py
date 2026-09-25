@@ -134,6 +134,13 @@ _AMS_MOTION_ECHO_COMMANDS = frozenset({"ams_change_filament", "ams_control"})
 # write lane can never grow the state without limit.
 _COMMAND_ACK_KEEP = 64
 
+# The `gcode_state`s of a job in setup or in progress — "part of an active job". The one
+# definition behind both job-lifecycle edges in `_update_state`: entering PREPARE/SLICING
+# from OUTSIDE this set is the next job's boundary, and entering PAUSE from outside it is
+# a job this client never saw begin (the attach). PAUSE belongs here: a paused job is
+# still the same job.
+_ACTIVE_JOB_STATES = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
+
 
 @dataclass(frozen=True)
 class CommandAck:
@@ -586,6 +593,23 @@ class PrinterState:
     # APPEARANCE of a code that is not standing, and re-seeding there would suppress a
     # genuine fault that fired during a network blip.
     connection_epoch: int = 0
+    # The `connection_epoch` whose FIRST fresh status report has been APPLIED to this
+    # state; None from `_on_connect` until that report lands. The transport's answer to
+    # "does this state describe THIS session yet?": nothing is reset on a disconnect, and
+    # `_on_connect` broadcasts the CACHED previous-session state before the pushall it
+    # requests has round-tripped — so a consumer gated on "connected and a state is
+    # known" judges a new session on the old session's job. A consumer that must judge
+    # the live printer (the reconnect reconcile) waits for
+    # `report_epoch == connection_epoch` instead.
+    #
+    # "A report" = a push that carried `gcode_state` — the lifecycle signal the judges
+    # read, present in the answer to the connect-time pushall at the latest. It is NOT
+    # `_report_messages_since_connect > 0`: that counter also counts version replies and
+    # command echoes, which say nothing about the job. Stamped at the END of
+    # `_update_state`, so a reader that sees the stamp sees the whole report and the job
+    # lifecycle it drove. Read it together with `connected`: a dropped session keeps its
+    # stamp until the next `_on_connect` clears it.
+    report_epoch: int | None = None
     # WALL-CLOCK (time.time(), NOT monotonic — it is reported to humans as an outage
     # duration and must survive being formatted into a notification) of the moment this
     # printer's session was last observed to END; None = never disconnected in this
@@ -744,6 +768,38 @@ class PrinterState:
     # NONE of them) — absent report ⇒ never a model mismatch ⇒ zero behaviour
     # change. Reconciled against the registered Printer.model on the connected edge.
     reported_model: str | None = None
+
+
+def job_consumption_evidence(state: PrinterState) -> dict[str, object]:
+    """The per-job consumption evidence a terminal payload carries — read off ``state`` NOW.
+
+    A consumer of a terminal must never read the live printer for these: by the time it runs,
+    the printer can describe ANOTHER job (2026-09-16 → 24, ~7.2 kg went out over 32 phantom
+    charges read off the live printer while it ran the next print). So the terminal captures them
+    at the moment it fires, and every value is a SNAPSHOT, never a reference — the client keeps
+    mutating its state for the next job. ONE spelling of the key set, for both producers: the MQTT
+    client's terminal and the downtime reconcile's ``ended`` synthesis (``print_reconcile``), which
+    reads a state it has proven describes the SAME job (the subtask id matched). The consumer is
+    ``usage_tracker.JobEvidence.from_payload``.
+
+    * ``total_layers`` — the job's slicer layer count, the per-tray split's denominator, kept
+      across the firmware's end-of-print 0 (#1771);
+    * ``tray_change_log`` — every ``(global_tray_id, layer)`` the job switched to, the per-tray
+      split's segments, seeded at an observed print start and cleared at an attach;
+    * ``tray_now`` — the tray fed at the terminal (often 255 by now: unloaded, or Ext-R on H2);
+    * ``last_loaded_tray`` — the last real tray this job fed (-1 = none observed);
+    * ``mqtt_mapping`` — the printer-reported ``mapping`` field (slicer slot → snow-encoded tray),
+      verbatim; decode with ``usage_tracker._decode_mqtt_mapping``. None when the printer never
+      reported one. Not the payload's ``ams_mapping``, which is the request-topic capture of the
+      print command.
+    """
+    return {
+        "total_layers": state.total_layers,
+        "tray_change_log": list(state.tray_change_log),
+        "tray_now": state.tray_now,
+        "last_loaded_tray": state.last_loaded_tray,
+        "mqtt_mapping": copy.deepcopy((state.raw_data or {}).get("mapping")),
+    }
 
 
 # Stage name mapping from BambuStudio DeviceManager.cpp
@@ -926,7 +982,10 @@ class BambuMQTTClient:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._previous_gcode_state: str | None = None
         self._previous_gcode_file: str | None = None
-        self._was_running: bool = False  # Track if we've seen RUNNING state for current print
+        # This client is tracking an active job: set by an observed print start or by the
+        # ATTACH (first RUNNING or PAUSE push with a file — see _update_state), cleared by
+        # the job's terminal and by the next job boundary.
+        self._was_running: bool = False
         self._completion_triggered: bool = False  # Prevent duplicate completion triggers
         self._timelapse_during_print: bool = False  # Track if timelapse was active during this print
         # #1721: one-shot guard so the end-of-print stage-22 detector
@@ -945,7 +1004,8 @@ class BambuMQTTClient:
         # layers → nothing on the plate": no gate, no eject, and the next unit dispatched
         # onto the finished part. False therefore means "do not read these peaks as
         # measurement" — absence of measurement is not measurement of absence — and only
-        # a print start observed HERE (below) may set it True.
+        # a print start observed HERE (below) may set it True. Every attach sets it False,
+        # so a job adopted after one this client DID watch never inherits that job's True.
         self._peaks_reliable: bool = False
         # Stale-predecessor gate for the two "last valid" captures above. The firmware
         # keeps republishing the PREVIOUS job's layer/percent for the seconds a new job
@@ -1325,6 +1385,11 @@ class BambuMQTTClient:
             # is what a printer reboot looks like from this side. Consumers that remember
             # a per-printer wire sample compare this counter and RE-SEED when it moves.
             self.state.connection_epoch += 1
+            # ...and none of this session's reports has landed yet: every field below is
+            # the previous session's cache until the pushall answer is applied (see
+            # PrinterState.report_epoch). Cleared BEFORE the broadcast at the end of this
+            # method, which carries that cache.
+            self.state.report_epoch = None
             self._stale_reconnecting = False  # Clear stale-reconnect flag on successful connect
             # Reset per-connection warning state so warnings fire once per (re)connection
             self._ams_version_warned = set()
@@ -4397,7 +4462,9 @@ class BambuMQTTClient:
             and self._previous_gcode_state is not None  # #1304: skip on first push after Bambuddy startup
             and self._previous_gcode_state != "RUNNING"
             and current_file
-            and not self._was_running  # Prevent duplicates when resuming from PAUSE
+            # A resume from PAUSE is not a start — including the resume of a job this client
+            # first met PAUSEd, which the attach below already tracks.
+            and not self._was_running
         )
         # Also detect if file changed while running (new print started)
         is_file_change = (
@@ -4418,32 +4485,64 @@ class BambuMQTTClient:
         # already_triggered=True"). The printer had rejected an eject file at setup and no
         # terminal ever reached the farm. PAUSE is deliberately in the "active" set beside
         # RUNNING — a paused job is still the same job.
-        if self.state.state in ("PREPARE", "SLICING") and self._previous_gcode_state not in (
-            "PREPARE",
-            "SLICING",
-            "RUNNING",
-            "PAUSE",
-        ):
+        if self.state.state in ("PREPARE", "SLICING") and self._previous_gcode_state not in _ACTIVE_JOB_STATES:
             self._completion_triggered = False
             self._was_running = False
 
-        # Track RUNNING state for more robust completion detection
-        running_first_observed = False
+        # ATTACH — the first observation of an ACTIVE job carrying a file, RUNNING or PAUSE,
+        # is where this client starts tracking it. When it coincides with a print start
+        # (is_new_print / is_file_change) the start block below owns the job's baseline and
+        # on_print_running_observed stays quiet (no double capture). Otherwise this is the
+        # restart-recovery attach: Bambuddy came up mid-job, the #1304 first-push guard kept
+        # on_print_start quiet, and main.py adopts the job through on_print_running_observed
+        # (#1485 follow-up) — ONCE, because `_was_running` then holds for the rest of the job.
+        #
+        # PAUSE attaches as well as RUNNING. Attaching on RUNNING alone lost every job this
+        # client first met paused: its resume (PAUSE→RUNNING while not tracking) passed
+        # is_new_print and fired a FALSE PRINT START — wiping the pause's own hms_errors and
+        # tray_change_log, re-snapshotting usage, sending a start notification — and a stop
+        # from the pause (PAUSE→IDLE) fired NO terminal, because that arm needs
+        # `_was_running`. The 2026-09-24 plate-check restore made long PAUSEs routine (a
+        # vision trip holds the job for a human), so a deploy landing during one is now the
+        # likely shape, not a corner; the firmware's power-loss prompt (0300_8007) waits in
+        # PAUSE too.
+        #
+        # PAUSE attaches only when entered from OUTSIDE an active job (`_ACTIVE_JOB_STATES`;
+        # a first push has no previous state at all): that job began unseen. A PAUSE
+        # reached from inside one — after PREPARE/SLICING, or a second PAUSE push of that
+        # same hold — belongs to a job whose setup this client watched, so its first
+        # RUNNING is its genuine start and must stay one; attaching there would swallow
+        # the PRINT START of a job seen to begin.
+        job_first_observed = False
+        if (
+            current_file
+            and not self._was_running
+            and (
+                self.state.state == "RUNNING"
+                or (self.state.state == "PAUSE" and self._previous_gcode_state not in _ACTIVE_JOB_STATES)
+            )
+        ):
+            logger.debug("[%s] Now tracking %s job %s", self.serial_number, self.state.state, current_file)
+            # Check if timelapse was enabled in the same message (xcam parsed before this)
+            if self.state.timelapse:
+                self._timelapse_during_print = True
+                logger.debug("[%s] Timelapse detected when the job was first observed", self.serial_number)
+            job_first_observed = True
+            self._was_running = True
+            self._completion_triggered = False
+            if not (is_new_print or is_file_change):
+                # This client never saw the job start, so it holds no measurement of it —
+                # and must not pass off a PREVIOUS job's as one. A client attaching on its
+                # first push holds none of these yet (all four writes are no-ops there);
+                # they make an attach after a job this client DID watch (a reconnect gap in
+                # which the next job started) equal to that. The peaks and the tray-change
+                # log are the terminal payload's consumption evidence: a charge built on
+                # the predecessor's would bill this job for that one's filament.
+                self._peaks_reliable = False
+                self._last_valid_progress = 0.0
+                self._last_valid_layer_num = 0
+                self.state.tray_change_log.clear()
         if self.state.state == "RUNNING" and current_file:
-            if not self._was_running:
-                logger.debug("[%s] Now tracking RUNNING state for %s", self.serial_number, current_file)
-                # Check if timelapse was enabled in the same message (xcam parsed before this)
-                if self.state.timelapse:
-                    self._timelapse_during_print = True
-                    logger.debug("[%s] Timelapse detected when entering RUNNING state", self.serial_number)
-                # Mark this as the first RUNNING observation of the session.
-                # If is_new_print also fires below, on_print_start handles
-                # baseline capture and we suppress on_print_running_observed
-                # to avoid double-capture. If is_new_print does NOT fire
-                # (Bambuddy started mid-print — the #1304 guard suppressed
-                # it), main.py needs this hook to catch the restart-recovery
-                # case (#1485 follow-up).
-                running_first_observed = True
             self._was_running = True
             self._completion_triggered = False
 
@@ -4497,8 +4596,8 @@ class BambuMQTTClient:
             self._last_valid_layer_num = 0
             # This client watched THIS job start, so from here its peaks measure this
             # job and a zero reading at the terminal is a real zero (see the flag's
-            # rationale at __init__). Set only here: the restart-recovery attach below
-            # deliberately leaves it False, which is the whole point of the flag.
+            # rationale at __init__). Set only here: the restart-recovery attach above
+            # deliberately sets it False, which is the whole point of the flag.
             self._peaks_reliable = True
             # A new print starts fresh: any operator-cancel echo belonged to the
             # PREVIOUS print (Phase 3.1). Clear so it can't leak into this print's
@@ -4539,15 +4638,15 @@ class BambuMQTTClient:
                     "ams_mapping": self._captured_ams_mapping,
                 }
             )
-        elif running_first_observed and self.on_print_running_observed:
+        elif job_first_observed and self.on_print_running_observed:
             # Restart-recovery hook (#1485 follow-up): Bambuddy started mid-
-            # print, so the #1304 first-push guard suppressed on_print_start,
-            # but we still need main.py to capture a fresh timelapse baseline
-            # before the printer uploads the in-flight MP4. Same payload
-            # shape as on_print_start so the consumer can reuse fields.
+            # print (RUNNING or PAUSEd), so the #1304 first-push guard suppressed
+            # on_print_start, but we still need main.py to capture a fresh
+            # timelapse baseline before the printer uploads the in-flight MP4.
+            # Same payload shape as on_print_start so the consumer can reuse fields.
             logger.info(
-                f"[{self.serial_number}] RUNNING observed without PRINT START "
-                f"(restart-recovery) - file: {current_file}, subtask: {self.state.subtask_name}"
+                f"[{self.serial_number}] {self.state.state} observed without PRINT START "
+                f"(restart-recovery attach) - file: {current_file}, subtask: {self.state.subtask_name}"
             )
             self.on_print_running_observed(
                 {
@@ -4589,11 +4688,13 @@ class BambuMQTTClient:
         # operator screen-stop of a PAUSEd print has silently gone unrecorded until now.
         #
         # ``_was_running`` guards the PAUSE arm only: IDLE from PAUSE is a terminal
-        # exactly when there WAS a job (the flag is set on the first RUNNING push with
-        # a file and cleared when a completion fires), and without it a printer sitting
-        # PAUSE→IDLE with nothing loaded would fabricate a terminal. The RUNNING arm is
-        # deliberately left unguarded — it is today's behaviour, and adding the flag
-        # there would DROP terminals on the rare RUNNING push that carried no filename.
+        # exactly when there WAS a job (the flag is set by a print start or by the attach
+        # — the first RUNNING or PAUSE push with a file, so a job first met PAUSEd after a
+        # restart ends here too — and cleared when a completion fires), and without it a
+        # printer sitting PAUSE→IDLE with nothing loaded would fabricate a terminal. The
+        # RUNNING arm is deliberately left unguarded — it is today's behaviour, and adding
+        # the flag there would DROP terminals on the rare RUNNING push that carried no
+        # filename.
         if (
             self.state.state == "IDLE"
             and not self._completion_triggered
@@ -4684,6 +4785,10 @@ class BambuMQTTClient:
                     "timelapse_was_active": timelapse_was_active,
                     "hms_errors": hms_errors_data,
                     "ams_mapping": self._captured_ams_mapping,
+                    # ---- The job's consumption evidence — a consumer must never read the
+                    # live printer for these (``job_consumption_evidence`` says why, and
+                    # owns the per-job key set it shares with the reconcile's synthesis).
+                    #
                     # Last valid progress/layer before firmware reset (for partial usage tracking)
                     "last_progress": self._last_valid_progress,
                     "last_layer_num": self._last_valid_layer_num,
@@ -4692,6 +4797,7 @@ class BambuMQTTClient:
                     # recovery), so a consumer deciding "did this leave a part on the
                     # plate?" must fail closed instead of trusting a zero.
                     "peaks_reliable": self._peaks_reliable,
+                    **job_consumption_evidence(self.state),
                     # Operator-cancel echo seen during this print (Phase 3.1): lets the
                     # terminal-status handler classify a screen-stop and skip retry /
                     # quarantine for it. False on a genuine failure or normal finish.
@@ -4703,6 +4809,12 @@ class BambuMQTTClient:
         self._previous_gcode_state = self.state.state
         if current_file:
             self._previous_gcode_file = current_file
+
+        # This session's report has now been APPLIED (PrinterState.report_epoch). Stamped
+        # last so a reader that sees it sees the whole report and the lifecycle it drove,
+        # and before the broadcast so a consumer gated on it fires on this very push.
+        if "gcode_state" in data:
+            self.state.report_epoch = self.state.connection_epoch
 
         if self.on_state_change:
             self.on_state_change(self.state)
@@ -7154,7 +7266,7 @@ class BambuMQTTClient:
 
         ``STOP_PRINTING`` is deliberately NOT dispatched here (2026-09-24): an operator
         stopping a print from the HMS dialog is the operator's Stop, whose one owner is
-        ``print_control.stop_as_operator`` (the stop AND the user-stopped mark) — the
+        ``print_control.stop_as_operator`` (the durable stop request AND the stop) — the
         route sends it there, and this dispatcher answers False for it like any other
         action it does not own.
 

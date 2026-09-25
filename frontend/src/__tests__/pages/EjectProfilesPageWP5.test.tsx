@@ -22,7 +22,6 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     id: 1,
     name: 'Fast sweep',
-    cooldown_temp_c: 28,
     clearance_mm: 10,
     z_offset_mm: 0.4,
     descent_steps: 4,
@@ -95,7 +94,6 @@ describe('EjectProfilesPage dry-run allow_unvalidated', () => {
       http.get('*/api/v1/model-geometry', () =>
         geometryList([geoRow(), geoRow({ model_key: 'H2C', validated: false })]),
       ),
-      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
       http.get('*/api/v1/printers/', () => HttpResponse.json(printers)),
       http.get('*/api/v1/library/files', () =>
         HttpResponse.json([{ id: 5, filename: 'unit.gcode.3mf', file_type: 'gcode.3mf', file_size: 1 }]),
@@ -190,7 +188,6 @@ describe('EjectProfilesPage dry-run printer auto-select', () => {
       http.get('*/api/v1/model-geometry', () =>
         geometryList([geoRow(), geoRow({ model_key: 'H2C', validated: false })]),
       ),
-      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
       http.get('*/api/v1/printers/', () => HttpResponse.json(printerList)),
       http.get('*/api/v1/library/files', () =>
         HttpResponse.json([{ id: 5, filename: 'unit.gcode.3mf', file_type: 'gcode.3mf', file_size: 1 }]),
@@ -255,7 +252,6 @@ describe('EjectProfilesPage geometry manager', () => {
   it('renders a row per model with a null-Z em-dash tooltip and the bedslinger badge', async () => {
     server.use(
       http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
-      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
       http.get('*/api/v1/model-geometry', () =>
         geometryList([
           geoRow(),
@@ -283,7 +279,6 @@ describe('EjectProfilesPage geometry manager', () => {
         HttpResponse.json({ auth_enabled: true, requires_setup: false }),
       ),
       http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
-      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
       http.get('*/api/v1/model-geometry', () => geometryList([geoRow()])),
     );
 
@@ -302,7 +297,6 @@ describe('EjectProfilesPage geometry manager', () => {
     let putBody: Record<string, unknown> | null = null;
     server.use(
       http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
-      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
       http.get('*/api/v1/model-geometry', () =>
         geometryList([geoRow({ model_key: 'H2C', validated: false, z_travel_mm: 325 })]),
       ),
@@ -341,7 +335,6 @@ describe('EjectProfilesPage geometry manager', () => {
     let putBody: Record<string, unknown> | null = null;
     server.use(
       http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
-      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
       http.get('*/api/v1/model-geometry', () => geometryList([geoRow()])),
       http.put('*/api/v1/model-geometry/:modelKey', async ({ request }) => {
         putBody = (await request.json()) as Record<string, unknown>;
@@ -376,7 +369,6 @@ describe('EjectProfilesPage geometry manager', () => {
     let putBody: Record<string, unknown> | null = null;
     server.use(
       http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
-      http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
       http.get('*/api/v1/model-geometry', () => geometryList([geoRow()])),
       http.put('*/api/v1/model-geometry/:modelKey', async ({ request }) => {
         putBody = (await request.json()) as Record<string, unknown>;

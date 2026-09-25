@@ -275,6 +275,18 @@ export const handlers = [
     return HttpResponse.json(body);
   }),
 
+  // Shop air (Settings → Farm → Eject cooldown readout): no at-rest sample yet.
+  http.get('/api/v1/shop-air', () =>
+    HttpResponse.json({
+      value_c: null,
+      as_of: null,
+      basis: 'unknown',
+      printers: 0,
+      margin_c: 2,
+      eject_line_c: null,
+    }),
+  ),
+
   // ========================================================================
   // Auth
   // ========================================================================

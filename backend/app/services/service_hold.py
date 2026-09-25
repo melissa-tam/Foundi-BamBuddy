@@ -166,7 +166,7 @@ async def quiesce(printer_id: int, *, cause: str) -> QuiesceReport:
     lease_revoked = False
 
     try:
-        if eject_cooldown_monitor.active_watch(printer_id) is not None:
+        if eject_cooldown_monitor.cooling_watch(printer_id) is not None:
             # One INFO line so a triage log over ``[service-hold]`` says what happened to
             # the plate: nothing was cancelled, and the fans an operator can hear are
             # running on purpose.

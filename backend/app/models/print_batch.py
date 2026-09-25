@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.core.database import Base
@@ -39,9 +39,9 @@ class PrintBatch(Base):
     sku_file_id: Mapped[int | None] = mapped_column(ForeignKey("sku_files.id", ondelete="SET NULL"), nullable=True)
     # Operator's target finished-unit count. NULL for non-farm legacy batches.
     target_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Optional per-run cooldown temperature override (°C) applied to the eject
-    # block generation for this run's items, superseding the profile's value.
-    cooldown_temp_c_override: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # No per-run cooldown override (2026-09-25, user ruling: ONE value — the eject line is
+    # measured shop air plus one margin, ``services/eject/shop_air``). The physical
+    # ``cooldown_temp_c_override`` column stays, unread, for the rollback build.
 
     # --- Farm first-article + failure policy (Phase 3) ------------------------
     # When True, the run holds after the first plate (first_article=True item)

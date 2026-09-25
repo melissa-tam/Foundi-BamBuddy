@@ -2,7 +2,7 @@
  * Production runs page (farm production, Phase 2).
  *
  * Starts runs (SKU → file/plate → target units → printer strategy → eject
- * profile + optional cooldown override) and renders live progress with
+ * profile) and renders live progress with
  * plates/units bars, status badges, humane ETA, and pause/resume/abort
  * controls (abort behind a required confirmation).
  *
@@ -123,7 +123,6 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [printerIds, setPrinterIds] = useState<number[]>([]);
   const [ejectProfileId, setEjectProfileId] = useState<number | null>(null);
-  const [cooldownOverride, setCooldownOverride] = useState<string>('');
   const [requireFirstArticle, setRequireFirstArticle] = useState(false);
   const [retriesPerPlate, setRetriesPerPlate] = useState<string>(String(RETRY_FALLBACK));
   const [escalateFailures, setEscalateFailures] = useState<string>(String(ESCALATE_FALLBACK));
@@ -185,7 +184,6 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
     setMode(initial.mode);
     setPrinterIds(initial.printerIds);
     setEjectProfileId(initial.ejectProfileId);
-    setCooldownOverride(initial.cooldownOverride != null ? String(initial.cooldownOverride) : '');
     setRequireFirstArticle(initial.requireFirstArticle);
     setRetriesPerPlate(String(initial.retryMaxPerUnit));
     setEscalateFailures(String(initial.escalateConsecutiveFailures));
@@ -232,7 +230,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
     setSelectedModel(fileModel && models.includes(fileModel) ? fileModel : (models[0] ?? null));
   }, [fileModel, models]);
 
-  // The eject profile the cooldown override would supersede (Phase 4.3i).
+  // The chosen eject profile, named in the collapsed Advanced summary.
   const selectedEjectProfile = useMemo(
     () => (ejectProfiles ?? []).find((p) => p.id === ejectProfileId) ?? null,
     [ejectProfiles, ejectProfileId],
@@ -269,9 +267,6 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
         }`,
       );
     }
-    if (cooldownOverride.trim() !== '') {
-      parts.push(`${t('productionRuns.fields.cooldownOverride')}: ${cooldownOverride.trim()}`);
-    }
     if (clampInt(retriesPerPlate, RETRY_MIN, RETRY_MAX, RETRY_FALLBACK) !== retryDefault) {
       parts.push(`${t('productionRuns.firstArticle.retriesLabel')}: ${retriesPerPlate}`);
     }
@@ -284,7 +279,6 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
     ejectProfileId,
     selectedSku,
     selectedEjectProfile,
-    cooldownOverride,
     retriesPerPlate,
     escalateFailures,
     retryDefault,
@@ -336,13 +330,10 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
     if (!scheduleValid) invalid = true;
     if (invalid) return;
 
-    const cooldown = cooldownOverride.trim() === '' ? null : Number(cooldownOverride);
     const payload: ProductionRunCreate = {
       sku_file_id: fileId!,
       target_units: Math.floor(targetNum),
       eject_profile_id: ejectProfileId,
-      cooldown_temp_c_override:
-        cooldown != null && Number.isFinite(cooldown) ? cooldown : null,
       require_first_article: requireFirstArticle,
       retry_max_per_unit: clampInt(retriesPerPlate, RETRY_MIN, RETRY_MAX, RETRY_FALLBACK),
       escalate_consecutive_failures: clampInt(
@@ -627,7 +618,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
               />
             </fieldset>
 
-            {/* Advanced overrides — collapsed by default (eject/cooldown/retry
+            {/* Advanced overrides — collapsed by default (eject/retry
                 policy is rarely changed). When collapsed, any non-default value
                 is surfaced in a one-line summary so an override is never hidden. */}
             <div>
@@ -651,7 +642,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
 
               {advancedOpen && (
                 <div id="run-advanced-section" className="mt-3 space-y-4">
-                  {/* Eject profile override + cooldown override */}
+                  {/* Eject profile override */}
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div>
                       <label htmlFor="run-eject" className="block text-sm text-bambu-gray mb-1">
@@ -673,33 +664,6 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
                           </option>
                         ))}
                       </select>
-                    </div>
-                    <div>
-                      <label htmlFor="run-cooldown" className="block text-sm text-bambu-gray mb-1">
-                        {t('productionRuns.fields.cooldownOverride')}
-                      </label>
-                      <input
-                        id="run-cooldown"
-                        type="number"
-                        inputMode="decimal"
-                        min={15}
-                        max={60}
-                        step={0.5}
-                        placeholder={t('productionRuns.fields.cooldownPlaceholder')}
-                        value={cooldownOverride}
-                        onChange={(e) => setCooldownOverride(e.target.value)}
-                        className={inputClass}
-                        aria-describedby={selectedEjectProfile ? 'run-cooldown-default' : undefined}
-                      />
-                      {/* Phase 4.3i: show what an override would replace, from the
-                          already-fetched profiles list. */}
-                      {selectedEjectProfile && (
-                        <p id="run-cooldown-default" className="text-xs text-bambu-gray mt-1">
-                          {t('productionRuns.fields.cooldownProfileDefault', {
-                            value: selectedEjectProfile.cooldown_temp_c,
-                          })}
-                        </p>
-                      )}
                     </div>
                   </div>
 
@@ -1164,7 +1128,6 @@ export function ProductionRunsPage() {
           : run.printers.map((p) => p.id),
       targetModel: run.target_model ?? null,
       ejectProfileId: run.eject_profile_id,
-      cooldownOverride: run.cooldown_temp_c_override,
       requireFirstArticle: run.require_first_article,
       retryMaxPerUnit: run.retry_max_per_unit,
       escalateConsecutiveFailures: run.escalate_consecutive_failures,

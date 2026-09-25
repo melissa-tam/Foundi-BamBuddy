@@ -36,7 +36,7 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.services import farm_policy, pause_recovery, print_control, printer_incidents, service_hold
 from backend.app.services.dispatch_kick import dispatch_kick
-from backend.app.services.eject import cooldown_prep, monitor as monitor_mod, remote as eject_remote
+from backend.app.services.eject import cooldown_prep, monitor as monitor_mod, remote as eject_remote, shop_air
 from backend.app.services.eject.monitor import CooldownWatchSettings, eject_cooldown_monitor
 from backend.app.services.plate_occupancy import (
     CooldownEject,
@@ -292,8 +292,13 @@ class TestEnteringKeepsTheCooldown:
         monkeypatch.setattr(cooldown_prep, "printer_manager", manager)
         monkeypatch.setattr(monitor_mod, "printer_manager", manager)
 
-        async def _threshold(queue_item_id, *, for_first_article=False):
-            return 33.0
+        async def _releasable(queue_item_id, *, for_first_article=False):
+            return True
+
+        async def _arm_line():
+            return shop_air.EjectLine(
+                shop=shop_air.ShopAir(value_c=31.0, as_of=None, basis="fresh", printers=3), margin_c=2.0, line_c=33.0
+            )
 
         async def _settings():
             return _watch_settings()
@@ -301,7 +306,8 @@ class TestEnteringKeepsTheCooldown:
         async def _never_releases(printer_id, threshold, **kwargs):
             await asyncio.Event().wait()  # the bed never reaches the line in this test
 
-        monkeypatch.setattr(monitor_mod, "_resolve_eject_threshold", _threshold)
+        monkeypatch.setattr(monitor_mod, "_unit_releasable", _releasable)
+        monkeypatch.setattr(monitor_mod.shop_air, "arm_line", _arm_line)
         monkeypatch.setattr(monitor_mod, "_resolve_stall_settings", _settings)
         monkeypatch.setattr(monitor_mod, "watch_bed_and_clear", _never_releases)
         plate_occupancy.configure(policy_driver=eject_cooldown_monitor.on_occupancy_change)
@@ -442,17 +448,20 @@ class TestQuiesceLeavesTheJobRunning:
     way to take a printer without losing the plate on it.
 
     Pinned as the absence of BOTH halves of the operator stop (the wire ``print.stop``
-    and the user-stopped mark), over every state the plate authority calls a job, while
+    and the durable stop request), over every state the plate authority calls a job, while
     the steps that genuinely ARE the farm's still run.
     """
 
     @pytest.fixture()
     def _marks(self, monkeypatch):
-        """Record the user-stopped mark ``print_control`` sets through ``main``."""
-        import backend.app.main as main_mod
-
+        """Record the operator stop REQUEST ``print_control`` writes (its one writer)."""
         marked: list[int] = []
-        monkeypatch.setattr(main_mod, "mark_printer_stopped_by_user", marked.append)
+
+        async def _stamp(_db, item_id, *, requested_at):
+            marked.append(item_id)
+            return True
+
+        monkeypatch.setattr(print_control, "stamp_operator_stop", _stamp)
         return marked
 
     @pytest.mark.parametrize("live", ["RUNNING", "PAUSE", "PREPARE", "SLICING", "IDLE", "FINISH", "FAILED", None])
@@ -465,7 +474,7 @@ class TestQuiesceLeavesTheJobRunning:
         verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
 
         assert manager.stopped == []
-        # The mark is the half that would relabel the terminal a CANCEL. Neither half
+        # The request is the half that would relabel the terminal a CANCEL. Neither half
         # is sent: the print reaches its own terminal through the ordinary lanes.
         assert _marks == []
         assert verdict.held is True
@@ -558,7 +567,7 @@ class TestQuiesceNeverRaises:
         def _boom(printer_id):
             raise RuntimeError("no wire")
 
-        monkeypatch.setattr(eject_cooldown_monitor, "active_watch", _boom)
+        monkeypatch.setattr(eject_cooldown_monitor, "cooling_watch", _boom)
         lease = plate_occupancy.claim_for_dispatch(
             printer.id,
             unit_id=1,

@@ -47,7 +47,7 @@ import { useProductionRunDetail } from '../hooks/useProductionRunDetail';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { isScheduled } from '../utils/productionRuns';
-import { deriveFarmPhase } from '../utils/farmPhase';
+import { coolingLabel, deriveFarmPhase } from '../utils/farmPhase';
 import { formatDateTime, formatRelativeTime, parseUTCDate } from '../utils/date';
 import { waitingReasonText } from '../utils/waitingReason';
 import type { RunPrinterState, RunUnit, UnitStopSource } from '../types/productionRuns';
@@ -127,9 +127,8 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
     // Never claim "cooling" for a printer we cannot observe — mirror the
     // printer card, which shows no phase pill while disconnected.
     if (state.connected) {
-      phaseText = t(phase.held ? 'printers.phase.coolingHeld' : 'printers.phase.cooling', {
-        threshold: Math.round(phase.threshold),
-      });
+      const cooling = coolingLabel(phase);
+      phaseText = t(cooling.key, { threshold: cooling.threshold });
     }
   } else if (phase?.kind === 'awaitingPlateClear') phaseText = t('printers.phase.awaitingPlateClear');
 

@@ -175,7 +175,14 @@ from backend.app.models.printer_incident import (
 from backend.app.models.printer_incident_step import STEP_KIND_COMMAND, STEP_KIND_LEVER, PrinterIncidentStep
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import ams_command, incident_resolution, printer_incidents, spool_respool, tray_fields
+from backend.app.services import (
+    ams_command,
+    farm_correlation,
+    incident_resolution,
+    printer_incidents,
+    spool_respool,
+    tray_fields,
+)
 from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, ams_mid_filament_change
 from backend.app.services.hms_errors import (
     AmsFaultClass,
@@ -2938,25 +2945,30 @@ def _success_reading(
             assert_never(position.kind)
 
 
-def _operator_stopped(printer_id: int, st, *, published_at: float) -> bool:
-    """Did the OPERATOR stop this print since the verb went out? Two witnesses, either one
-    sufficient:
+async def _operator_stopped(incident: RecoveryIncident, st, *, published_at: float) -> bool:
+    """Did the OPERATOR stop this print? Read at the terminal inside a verb's window. Two
+    witnesses, either one sufficient:
 
-    * the queue UI's Stop — ``main``'s user-stop mark, set BEFORE the stop is sent (read
-      through a CALL-TIME import: ``main`` imports this module, the ``print_control``
-      pattern);
     * the touchscreen's Stop — the firmware's cancel echo, which the client stamps as
       ``PrinterState.user_cancel_seen_at`` (wall clock, ``time.time()``; cleared at the next
       print start). Only a stamp NEWER than the verb's publish counts: an older one is an
       echo this verb's window did not produce. The H2C emits no cancel echo (a screen
-      stop there classifies as a genuine failure), so this witness is H2S-family only.
+      stop there classifies as a genuine failure), so this witness is H2S-family only;
+    * the Bambuddy UI's Stop — the DURABLE stop request on the job's unit
+      (``farm_correlation.operator_stop_requested``, the terminal classifier's own reader),
+      which ``print_control.stop_as_operator`` commits BEFORE the stop is sent. It is a fact
+      about THIS job, not an instant: a Stop pressed before the verb went out ended the same
+      print, and the request is never dropped by the terminal's own callback, so no poll can
+      miss it. A FOREIGN print has no unit and so no request — its UI stop is read from the
+      echo alone.
     """
-    from backend.app.main import printer_stopped_by_user
-
-    if printer_stopped_by_user(printer_id):
-        return True
     cancel_at = getattr(st, "user_cancel_seen_at", None)
-    return cancel_at is not None and cancel_at > published_at
+    if cancel_at is not None and cancel_at > published_at:
+        return True
+    from backend.app.core.database import async_session
+
+    async with async_session() as db:
+        return await farm_correlation.operator_stop_requested(db, incident.printer_id, incident.job_id)
 
 
 # The reader's two arms that publish ``print.pause`` (:func:`_read_after`): tier 3's
@@ -2979,9 +2991,9 @@ def _terminal_read(
 
     FINISH is the print COMPLETING right after the verb: read like RUNNING, with the
     feeder the window last SAW fed standing in for a live one the end-of-print unload
-    already emptied. Any other terminal is the operator's Stop when their mark says so
-    (today's ``job_ended`` abort), and otherwise the driver's own verb ended the print —
-    ``ended``, which the driver records itself.
+    already emptied. Any other terminal is the operator's Stop when a Stop witness says so
+    (:func:`_operator_stopped` — today's ``job_ended`` abort), and otherwise the driver's own
+    verb ended the print — ``ended``, which the driver records itself.
     """
     if live == "FINISH":
         fed = position if position.kind in ("jammed", "other") else last_fed
@@ -3031,25 +3043,24 @@ async def _watch_lever(
     deadline = _now() + incident.settings.step_timeout_s
     left = False
     saw_running = False
-    stopped = False
     last_fed: FeederPosition | None = None
     holding: tuple[Literal["self_healed", "swapped"], float] | None = None
     while True:
         at_deadline = _now() >= deadline
         st = _get_state(pid)
-        # Latched: ``main`` drops the UI mark at the terminal's own callback, which can run
-        # between two polls — a mark seen once inside the window is the operator's.
-        stopped = stopped or _operator_stopped(pid, st, published_at=published_at)
         live = _live_state(st)
         position = _feeder_position(st, jammed, pid)
         if position.kind in ("jammed", "other"):
             last_fed = position
         if live not in ("", "UNKNOWN") and live not in _DRIVER_STATES:
+            # Asked AT the terminal, once: both witnesses are durable for the job's life (the
+            # request on the unit row, the echo stamp until the next print starts), so nothing
+            # a poll could miss has to be latched between polls.
             return _terminal_read(
                 incident,
                 lever,
                 live,
-                stopped=stopped,
+                stopped=await _operator_stopped(incident, st, published_at=published_at),
                 quiet=incident_resolution.path_quiet(st),
                 position=position,
                 last_fed=last_fed,
@@ -3101,7 +3112,7 @@ async def _watch_lever(
         await asyncio.sleep(_POLL_INTERVAL_S)
 
 
-def _paused_read(
+async def _paused_read(
     incident: RecoveryIncident, lever: Lever, *, landed: bool, published_at: float, budgeted: bool
 ) -> LeverRead:
     """What the reader's own pause brought back. Landed → the PAUSE reading; otherwise a
@@ -3117,7 +3128,7 @@ def _paused_read(
             incident,
             lever,
             live,
-            stopped=_operator_stopped(pid, st, published_at=published_at),
+            stopped=await _operator_stopped(incident, st, published_at=published_at),
             quiet=incident_resolution.path_quiet(st),
             position=position,
             last_fed=None,
@@ -3153,10 +3164,10 @@ async def _read_after(
     and ``moved``. The contract's resume after a load is not one — it is not noted, and
     its jammed-feeder reading is not a success (:func:`_success_reading`).
 
-    A terminal inside the window is the OPERATOR's when a Stop witness post-dates the
-    publish (:func:`_operator_stopped`: the queue UI's mark, or the firmware's cancel echo
-    stamped after ``published_at``, the wall-clock instant recorded immediately before
-    the publish) — the ``job_ended`` abort, never ``ended``. KNOWN GAP: the H2C emits NO
+    A terminal inside the window is the OPERATOR's when a Stop witness says so
+    (:func:`_operator_stopped`: the durable UI stop request on the job's unit, or the
+    firmware's cancel echo stamped after ``published_at``, the wall-clock instant recorded
+    immediately before the publish) — the ``job_ended`` abort, never ``ended``. KNOWN GAP: the H2C emits NO
     cancel echo on a screen stop (a screen stop there classifies as a genuine failure), so
     on that model a touchscreen Stop inside a lever window still reads ``ended``, and the
     driver closes the row as its own and pages ``wedge_ended_print``.
@@ -3202,7 +3213,7 @@ async def _read_after(
                 landed = client.pause_print() and await printer_manager.await_state(
                     pid, {"PAUSE"}, incident.settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
                 )
-                read = _paused_read(incident, lever, landed=landed, published_at=published_at, budgeted=budgeted)
+                read = await _paused_read(incident, lever, landed=landed, published_at=published_at, budgeted=budgeted)
             case _:
                 assert_never(watched)
     if seq is not None:

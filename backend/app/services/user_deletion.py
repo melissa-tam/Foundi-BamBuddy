@@ -130,6 +130,7 @@ from backend.app.services.archive import (
     resolve_archive_dir_for_delete,
 )
 from backend.app.services.library_trash import owned_paths
+from backend.app.services.print_binding import live_print_clause, uncounted_live_records
 from backend.app.services.queue_transitions import (
     delete_user_items_unless_printing,
     live_prints_blocking,
@@ -250,9 +251,11 @@ async def delete_impact(db: AsyncSession, *, user_id: int) -> UserDeleteImpact:
     ``library_files`` deliberately does NOT filter ``deleted_at`` — the delete
     destroys trashed rows too, and the old ``items-count`` endpoint's filter was
     the specific reason the dialog under-reported. ``currently_printing`` is the
-    refusal forecast: ``live_prints_blocking`` over all four scopes at once, the
-    same question the guard answers, so a dialog that shows zero and a delete that
-    409s cannot disagree about what ``printing`` means.
+    refusal forecast: ``live_prints_blocking`` over all four scopes at once, plus the
+    user's archives that are themselves a live print's record
+    (``print_binding.uncounted_live_records`` — the rows phase 4 keeps), the same
+    questions the guard answers, so a dialog that shows zero and a delete that 409s
+    cannot disagree about what ``printing`` means.
 
     It IS a forecast and not a guarantee. A unit that dispatches between this call
     and the delete makes the delete refuse anyway — which is the correct outcome
@@ -263,23 +266,25 @@ async def delete_impact(db: AsyncSession, *, user_id: int) -> UserDeleteImpact:
     library_file_ids = _owned_ids(LibraryFile, user_id)
     batch_ids = _owned_ids(PrintBatch, user_id)
 
+    printing_units = await live_prints_blocking(
+        db,
+        scope=(
+            (PrintQueueItem.created_by_id == user_id)
+            | PrintQueueItem.archive_id.in_(archive_ids)
+            | PrintQueueItem.library_file_id.in_(library_file_ids)
+            | PrintQueueItem.batch_id.in_(batch_ids)
+        ),
+    )
+    # The user's archives that ARE a live print's record — the row phase 4 keeps — once each.
+    live_records = await uncounted_live_records(db, PrintArchive.created_by_id == user_id, printing_units)
+
     return UserDeleteImpact(
         archives=await _count(db, PrintArchive, PrintArchive.created_by_id == user_id),
         library_files=await _count(db, LibraryFile, LibraryFile.created_by_id == user_id),
         queue_items=await _count(db, PrintQueueItem, PrintQueueItem.created_by_id == user_id),
         production_runs=await _count(db, PrintBatch, PrintBatch.created_by_id == user_id),
         dependent_skus=await _count_distinct(db, SkuFile.sku_id, SkuFile.library_file_id.in_(library_file_ids)),
-        currently_printing=len(
-            await live_prints_blocking(
-                db,
-                scope=(
-                    (PrintQueueItem.created_by_id == user_id)
-                    | PrintQueueItem.archive_id.in_(archive_ids)
-                    | PrintQueueItem.library_file_id.in_(library_file_ids)
-                    | PrintQueueItem.batch_id.in_(batch_ids)
-                ),
-            )
-        ),
+        currently_printing=len(printing_units) + len(live_records),
     )
 
 
@@ -322,15 +327,23 @@ async def _destroy_owned_items(db: AsyncSession, user_id: int) -> list[Path]:
 
     # --- Phase 4: the parent deletes, each guarded by its own correlated NOT
     # EXISTS. Set-based, one statement per table, and a row a live print is
-    # running off is simply not matched — then read back, because what the
-    # statement DECLINED to touch is the guard's own verdict.
+    # running off is simply not matched — nor an archive that IS a live print's
+    # record (a retry's attempt row is no unit's archive_id, so the NOT EXISTS
+    # never sees it) — then read back, because what the statement DECLINED to
+    # touch is the guard's own verdict.
     refused: dict[str, list[int]] = {}
-    for label, model, scope, ref_col in (
-        ("archives", PrintArchive, PrintArchive.created_by_id == user_id, PrintQueueItem.archive_id),
-        ("library files", LibraryFile, LibraryFile.created_by_id == user_id, PrintQueueItem.library_file_id),
-        ("batches", PrintBatch, PrintBatch.created_by_id == user_id, PrintQueueItem.batch_id),
+    for label, model, scope, ref_col, live in (
+        (
+            "archives",
+            PrintArchive,
+            PrintArchive.created_by_id == user_id,
+            PrintQueueItem.archive_id,
+            live_print_clause(),
+        ),
+        ("library files", LibraryFile, LibraryFile.created_by_id == user_id, PrintQueueItem.library_file_id, None),
+        ("batches", PrintBatch, PrintBatch.created_by_id == user_id, PrintQueueItem.batch_id, None),
     ):
-        _deleted, survivors = await _delete_backing_rows_unless_printing(db, model, scope, ref_col)
+        _deleted, survivors = await _delete_backing_rows_unless_printing(db, model, scope, ref_col, live=live)
         if survivors:
             refused[label] = survivors
 
@@ -455,8 +468,14 @@ async def _delete_backing_rows_unless_printing(
     model: type[_BackingRow],
     scope: ColumnElement[bool],
     ref_col: InstrumentedAttribute[int | None],
+    *,
+    live: ColumnElement[bool] | None,
 ) -> tuple[int, list[int]]:
-    """``DELETE FROM <model> WHERE <scope> AND NOT EXISTS (printing item via ref_col)``.
+    """``DELETE FROM <model> WHERE <scope> AND NOT EXISTS (printing item via ref_col) AND NOT <live>``.
+
+    ``live`` marks a row that is ITSELF a print in progress (an archive's live status,
+    ``print_binding.live_print_clause``) — kept out of the DELETE's WHERE, never out of
+    ``scope``, so it is read back as a survivor and refuses like any other.
 
     One statement per table, evaluated by the database — the parent-row mirror of
     ``queue_transitions._delete_unless_printing``, and correct under concurrency
@@ -476,11 +495,9 @@ async def _delete_backing_rows_unless_printing(
     this scope by a route the module did not anticipate fails safe rather than
     being quietly left behind while the rest of the estate is destroyed around it.
     """
+    guards = [~printing_items_referencing(ref_col)] + ([~live] if live is not None else [])
     result = await db.execute(
-        delete(model)
-        .where(scope, ~printing_items_referencing(ref_col))
-        .returning(model.id)
-        .execution_options(synchronize_session=False)
+        delete(model).where(scope, *guards).returning(model.id).execution_options(synchronize_session=False)
     )
     deleted = [row[0] for row in result.all()]
 

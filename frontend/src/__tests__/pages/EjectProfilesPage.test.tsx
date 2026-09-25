@@ -21,7 +21,6 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     id: 1,
     name: 'Fast sweep',
-    cooldown_temp_c: 28,
     clearance_mm: 10,
     z_offset_mm: 0.4,
     descent_steps: 4,
@@ -123,7 +122,9 @@ describe('EjectProfilesPage', () => {
       emptyLibraryFiles,
       http.post('*/api/v1/eject-profiles', async ({ request }) => {
         const body = (await request.json()) as Record<string, unknown>;
-        expect(body).toMatchObject({ name: 'Gentle sweep', cooldown_temp_c: 28 });
+        expect(body).toMatchObject({ name: 'Gentle sweep', clearance_mm: 10 });
+        // The eject line is shop air + the Settings margin — no per-profile value.
+        expect(body).not.toHaveProperty('cooldown_temp_c');
         created = true;
         return HttpResponse.json(profile({ id: 7, name: 'Gentle sweep' }), { status: 201 });
       }),

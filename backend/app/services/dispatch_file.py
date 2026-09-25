@@ -16,26 +16,36 @@ ONE repack, and returns a verdict:
 * ``unmodified`` with ``path=None``, meaning upload the durable source itself,
 * ``build_failed`` with ``path=None``, same instruction, different reason.
 
-Today's two steps, in this order:
+Today's three steps, in this order:
 
 1. **chute prime** (:mod:`backend.app.services.chute_prime`) — relocates the slicer's
    start-block prime bead off the plate's front lip and into the purge chute. FIRST,
    because it swaps a byte PREFIX of the member and therefore must see the file's own
    head, not one a later step has already edited.
-2. **snippets** — the upstream per-model start/end G-code injection (#422), per-job via
+2. **plate blow-off** (:mod:`backend.app.services.plate_blowoff`) — inserts a full-speed
+   auxiliary-fan pulse immediately before the start block's bed-leveling banner, so the
+   fan clears stray filament off the plate. It edits the member it is HANDED — chute
+   prime's splice already in it — and never a head of its own read from the source, so
+   the two steps cannot disagree about which bytes they saw. Its insert sits ABOVE the
+   nozzle-load section chute prime rewrites, so neither step moves the other's anchor.
+3. **snippets** — the upstream per-model start/end G-code injection (#422), per-job via
    ``PrintQueueItem.gcode_injection`` and per-model via the ``gcode_snippets`` setting.
 
 **The cache key is DERIVED from the stack**, never assembled beside it. That is the
-rollback lever, not a tidiness point: turning ``farm_chute_prime_enabled`` off removes
-the step, which removes its fingerprint, which changes the key — so the very next
-dispatch of a file that was chute-primed an hour ago CANNOT be served the primed
-artifact out of the cache. A key assembled separately from the steps would let the
-switch move the code path and not the bytes, which is the worst possible rollback.
+rollback lever, not a tidiness point: turning ``farm_chute_prime_enabled`` (or
+``farm_plate_blowoff_enabled``) off removes the step, which removes its fingerprint,
+which changes the key — so the very next dispatch of a file that was rewritten an hour
+ago CANNOT be served the rewritten artifact out of the cache. A key assembled separately
+from the steps would let the switch move the code path and not the bytes, which is the
+worst possible rollback. The blow-off's fingerprint carries its pulse length as well, so
+a new ``farm_plate_blowoff_seconds`` re-derives rather than replaying the old dwell.
 
-**There is deliberately no refusal memo.** A refusal is decided from the bounded start
-block alone (``threemf_tools.read_plate_gcode_start_block`` — tens of KB, not the
-hundreds-of-MB member), so re-deciding it per dispatch costs one small read. A memo
-would be a second cache with its own invalidation rules beside one that already works.
+**There is deliberately no refusal memo.** The chute prime's refusal is decided from the
+bounded start block alone (``threemf_tools.read_plate_gcode_start_block`` — tens of KB,
+not the hundreds-of-MB member), so re-deciding it per dispatch costs one small read. The
+blow-off decides inside the build, on the member it is handed, so its verdict is carried
+by the cached artifact itself. A memo would be a second cache with its own invalidation
+rules beside one that already works.
 
 **The durable and archive copies stay the ORIGINAL bytes.** Only the upload is derived.
 Eject donors, reprints, retries and the operator's own re-slices therefore all start
@@ -45,7 +55,7 @@ re-deriving rather than by a migration nobody would run.
 Operator ruling (2026-09-19): a file whose start block this fleet's recipe does not
 recognise DISPATCHES UNMODIFIED with a warning. It never holds the queue and never
 raises — hence the one boundary ``except`` at the bottom of this module: a bug in a
-transform costs the farm a chute prime, not a print.
+transform costs the farm its start-block edits, not a print.
 """
 
 from __future__ import annotations
@@ -57,12 +67,13 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.schemas.settings import AppSettings
-from backend.app.services import chute_prime, derived_3mf_cache
+from backend.app.services import chute_prime, derived_3mf_cache, plate_blowoff
 from backend.app.utils.threemf_tools import (
     apply_gcode_snippets,
     read_plate_gcode_start_block,
@@ -85,6 +96,17 @@ _MAX_BYTES = 1024 * 1024 * 1024
 #: production log answers "what did the rewrite do to today's dispatches".
 _LOG = "[chute-prime]"
 
+#: The same, for the plate blow-off's verdicts.
+_BLOWOFF_LOG = "[plate-blowoff]"
+
+#: The seam's own prefix, for what no single step owns: the stack's build failing, or the
+#: seam itself raising. Each step's verdicts stay under that step's prefix.
+_SEAM_LOG = "[dispatch-file]"
+
+#: The pulse length validated EXACTLY as the settings API validates it — through the
+#: schema's own field (type, ``ge``, ``le``) — so its range has one declared origin.
+_BLOWOFF_SECONDS: TypeAdapter[int] = TypeAdapter(Annotated[int, AppSettings.model_fields["farm_plate_blowoff_seconds"]])
+
 
 @dataclass(frozen=True)
 class DispatchFile:
@@ -106,35 +128,66 @@ class DispatchFile:
 class _Step:
     """One transform in the stack: what it is, and what it does.
 
-    ``fingerprint`` identifies the transform AND its inputs (a recipe version, a hash of
-    the resolved snippets) — it is the step's whole contribution to the cache key, so a
-    step whose behaviour changes without its fingerprint changing serves stale bytes.
-    ``apply`` is pure over the plate G-code member and may raise: the cache turns a
-    raising builder into ``BuildFailed`` with a traceback.
+    ``fingerprint`` identifies the transform AND its inputs (a recipe version, a pulse
+    length, a hash of the resolved snippets) — it is the step's whole contribution to the
+    cache key, so a step whose behaviour changes without its fingerprint changing serves
+    stale bytes. ``apply`` is a deterministic ``bytes -> bytes`` over the plate G-code
+    member — the same member always gives the same bytes; it may log its own verdict, and
+    it may raise: the cache turns a raising builder into ``BuildFailed`` with a traceback.
     """
 
     fingerprint: str
     apply: Callable[[bytes], bytes]
 
 
-async def _chute_prime_enabled(db: AsyncSession) -> bool:
-    """The kill switch, read HERE and nowhere else.
+async def _switch_on(db: AsyncSession, key: str, log: str) -> bool:
+    """A step's kill switch, read HERE and nowhere else.
 
     Schema default first, DB override on top, schema default again on a read failure —
-    the house idiom (``eject/monitor._cooldown_watch_settings``). A settings-store
+    the house idiom (``eject/monitor._resolve_stall_settings``). A settings-store
     failure must not decide the feature: the recipe either applies or it does not, and
     "the DB blinked" is not an argument for either.
     """
     from backend.app.api.routes.settings import get_setting
 
-    enabled = bool(AppSettings.model_fields["farm_chute_prime_enabled"].default)
+    enabled = bool(AppSettings.model_fields[key].default)
     try:
-        raw = await get_setting(db, "farm_chute_prime_enabled")
+        raw = await get_setting(db, key)
         if raw is not None:
             enabled = raw.strip().lower() == "true"
     except Exception:  # noqa: BLE001 — a settings read failure falls back to the schema
-        logger.exception("%s settings read failed — using the schema default (%s)", _LOG, enabled)
+        logger.exception("%s settings read failed — using the schema default (%s)", log, enabled)
     return enabled
+
+
+async def _plate_blowoff_seconds(db: AsyncSession) -> int:
+    """The blow-off's pulse length, read HERE and nowhere else.
+
+    The switch's contract, plus one arm: a stored value the schema would refuse is the
+    schema default and a WARNING. The PUT route validates against the same field, so such
+    a value only arrives by editing the settings table by hand — and a hand-typed dwell
+    outside the range the operator can choose must not hold every print's start.
+    """
+    from backend.app.api.routes.settings import get_setting
+
+    seconds = int(AppSettings.model_fields["farm_plate_blowoff_seconds"].default)
+    try:
+        raw = await get_setting(db, "farm_plate_blowoff_seconds")
+    except Exception:  # noqa: BLE001 — a settings read failure falls back to the schema
+        logger.exception("%s settings read failed — using the schema default (%s s)", _BLOWOFF_LOG, seconds)
+        return seconds
+    if raw is None:
+        return seconds
+    try:
+        return _BLOWOFF_SECONDS.validate_python(raw.strip())
+    except ValidationError:
+        logger.warning(
+            "%s stored farm_plate_blowoff_seconds %r is outside the schema — using the default (%s s)",
+            _BLOWOFF_LOG,
+            raw,
+            seconds,
+        )
+        return seconds
 
 
 async def _chute_prime_step(db: AsyncSession, source_path: Path, plate_id: int, item_id: int) -> _Step | None:
@@ -145,7 +198,7 @@ async def _chute_prime_step(db: AsyncSession, source_path: Path, plate_id: int, 
     rewritten head back over the member's prefix, which is only valid for the exact
     bytes the rewrite saw — hence the ``startswith`` assertion.
     """
-    if not await _chute_prime_enabled(db):
+    if not await _switch_on(db, "farm_chute_prime_enabled", _LOG):
         return None
 
     head = await asyncio.to_thread(read_plate_gcode_start_block, source_path, plate_id)
@@ -199,6 +252,60 @@ async def _chute_prime_step(db: AsyncSession, source_path: Path, plate_id: int, 
         return rewritten_head + member[len(head) :]
 
     return _Step(chute_prime.RECIPE_VERSION, _apply)
+
+
+async def _plate_blowoff_step(db: AsyncSession, source_path: Path, plate_id: int, item_id: int) -> _Step | None:
+    """The plate blow-off step, or None when its switch is off.
+
+    Unlike the chute prime, nothing is decided up front: ``apply`` rewrites the member
+    the stack HANDS it, so the verdict is reached — and logged — inside the BUILD. That
+    is once per derived artifact, not once per dispatch: a cache hit replays bytes whose
+    verdict was logged when they were built. A refusal hands back the member unchanged,
+    so the file ships with exactly what the earlier steps made of it.
+
+    The fingerprint carries the recipe AND the pulse length, because both change the
+    bytes.
+    """
+    if not await _switch_on(db, "farm_plate_blowoff_enabled", _BLOWOFF_LOG):
+        return None
+    seconds = await _plate_blowoff_seconds(db)
+
+    def _apply(member: bytes) -> bytes:
+        outcome = plate_blowoff.insert_blowoff(member, seconds=seconds)
+        if isinstance(outcome, plate_blowoff.Refused):
+            logger.warning(
+                "%s item %s: no blow-off for plate %s of %s — dispatching without it (%s: %s)",
+                _BLOWOFF_LOG,
+                item_id,
+                plate_id,
+                source_path.name,
+                outcome.reason,
+                outcome.detail,
+            )
+            return member
+        if isinstance(outcome, plate_blowoff.AlreadyRewritten):
+            # Reachable in production for the same reason as the chute prime's: a
+            # screen-restarted job is archived from the printer-resident copy.
+            logger.debug(
+                "%s item %s: plate %s of %s already carries a blow-off",
+                _BLOWOFF_LOG,
+                item_id,
+                plate_id,
+                source_path.name,
+            )
+            return member
+        logger.info(
+            "%s item %s: %s s aux-fan blow-off inserted before bed leveling (line %s) in plate %s of %s",
+            _BLOWOFF_LOG,
+            item_id,
+            seconds,
+            outcome.anchor_line,
+            plate_id,
+            source_path.name,
+        )
+        return outcome.text.encode("utf-8")
+
+    return _Step(f"{plate_blowoff.RECIPE_VERSION}:{seconds}s", _apply)
 
 
 async def _snippet_step(db: AsyncSession, item_id: int, printer_model: str | None) -> _Step | None:
@@ -271,6 +378,9 @@ async def build_dispatch_file(
         prime = await _chute_prime_step(db, source_path, plate_id, item_id)
         if prime is not None:
             steps.append(prime)
+        blowoff = await _plate_blowoff_step(db, source_path, plate_id, item_id)
+        if blowoff is not None:
+            steps.append(blowoff)
         if gcode_injection:
             snippets = await _snippet_step(db, item_id, printer_model)
             if snippets is not None:
@@ -292,7 +402,7 @@ async def build_dispatch_file(
         if isinstance(result, derived_3mf_cache.BuildFailed):
             logger.error(
                 "%s item %s: derived file build FAILED for plate %s of %s (%s) — uploading the original",
-                _LOG,
+                _SEAM_LOG,
                 item_id,
                 plate_id,
                 source_path.name,
@@ -303,7 +413,7 @@ async def build_dispatch_file(
     except Exception:  # noqa: BLE001 — the seam never raises into dispatch
         logger.exception(
             "%s item %s: dispatch-file build raised for plate %s of %s — uploading the original",
-            _LOG,
+            _SEAM_LOG,
             item_id,
             plate_id,
             source_path,

@@ -519,6 +519,103 @@ class TestDeleteImpact:
         }
 
 
+class TestALiveAttemptRecordRefuses:
+    """One archive per print ATTEMPT (2026-09-25): a retry prints into its OWN archive row, which is
+    no unit's ``archive_id`` — the retry's donor is its parent's record. So the NOT EXISTS over
+    printing units never saw it, and a user delete destroyed the live record of a print still on the
+    plate. The row's own live status keeps it out of the DELETE, and the forecast counts it."""
+
+    @staticmethod
+    async def _seed_retry_printing_into(session_factory, *, record_status: str = "printing") -> tuple[int, int]:
+        """The departing user owns the RETRY's attempt record; the parent's record (the donor) and
+        the retry unit are another operator's — nothing else ties the print to this user."""
+        from backend.app.models.printer import Printer
+
+        async with session_factory() as db:
+            user_id, other_id = await _two_users(db)
+            printer = Printer(name="P1", serial_number="H2S-1", ip_address="10.0.0.9", access_code="0", model="H2S")
+            db.add(printer)
+            await db.flush()
+            donor = await _archive(db, owner=other_id)
+            donor.printer_id, donor.subtask_id, donor.status = printer.id, "PARENT-1", "failed"
+            record = await _archive(db, owner=user_id)
+            record.printer_id, record.subtask_id, record.status = printer.id, "RETRY-1", record_status
+            await db.flush()
+            db.add(
+                PrintQueueItem(
+                    status=record_status,
+                    position=0,
+                    created_by_id=other_id,
+                    printer_id=printer.id,
+                    archive_id=donor.id,
+                    dispatch_subtask_id="RETRY-1",
+                )
+            )
+            await db.commit()
+            return user_id, record.id
+
+    async def test_the_live_record_survives_and_refuses(self, session_factory, estate):
+        user_id, record_id = await self._seed_retry_printing_into(session_factory)
+
+        async with session_factory() as db:
+            with pytest.raises(HTTPException) as refusal:
+                await delete_user(db, user=await _load_user(db, user_id), delete_items=True)
+
+        assert refusal.value.status_code == 409
+        assert refusal.value.detail["code"] == "user_has_printing_units"
+        async with session_factory() as db:
+            stored = await db.get(PrintArchive, record_id)
+            assert (stored.status, stored.created_by_id) == ("printing", user_id)
+        assert user_id in await _surviving_ids(session_factory, User)
+
+    async def test_the_forecast_counts_it(self, session_factory, estate):
+        user_id, _ = await self._seed_retry_printing_into(session_factory)
+
+        async with session_factory() as db:
+            impact = await delete_impact(db, user_id=user_id)
+
+        assert (impact.archives, impact.currently_printing) == (1, 1)
+
+    async def test_an_adopted_first_attempt_is_one_print_not_two(self, session_factory, estate):
+        """A first attempt adopts its dispatch copy: the live record IS the printing unit's donor.
+        The donor-linked unit and the record are the same print — forecast once."""
+        from backend.app.models.printer import Printer
+
+        async with session_factory() as db:
+            user_id, other_id = await _two_users(db)
+            printer = Printer(name="P1", serial_number="H2S-1", ip_address="10.0.0.9", access_code="0", model="H2S")
+            db.add(printer)
+            await db.flush()
+            record = await _archive(db, owner=user_id)
+            record.printer_id, record.subtask_id, record.status = printer.id, "FIRST-1", "printing"
+            await db.flush()
+            db.add(
+                PrintQueueItem(
+                    status="printing",
+                    position=0,
+                    created_by_id=other_id,
+                    printer_id=printer.id,
+                    archive_id=record.id,
+                    dispatch_subtask_id="FIRST-1",
+                )
+            )
+            await db.commit()
+
+        async with session_factory() as db:
+            assert (await delete_impact(db, user_id=user_id)).currently_printing == 1
+
+    async def test_a_finished_record_deletes(self, session_factory, estate):
+        """The liveness pair: the guard keeps a LIVE record only — once the retry finished, the
+        user delete takes its record like any other archive."""
+        user_id, record_id = await self._seed_retry_printing_into(session_factory, record_status="completed")
+
+        async with session_factory() as db:
+            assert (await delete_impact(db, user_id=user_id)).currently_printing == 0
+        await _delete(session_factory, user_id)
+
+        assert record_id not in await _surviving_ids(session_factory, PrintArchive)
+
+
 class TestDispatchAfterTheRequestsLoad:
     """A dispatch committed by a SECOND session after the request loaded the user.
 

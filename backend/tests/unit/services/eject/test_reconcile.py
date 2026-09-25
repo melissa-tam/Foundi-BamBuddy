@@ -640,6 +640,7 @@ class TestTheConnectedEdgeTrigger:
 
         state = _state([], layer_num=layer)
         state.connection_epoch = epoch
+        state.report_epoch = epoch  # the epoch's first fresh report
         return state
 
     async def test_it_fires_once_per_connection_epoch(self, monkeypatch):

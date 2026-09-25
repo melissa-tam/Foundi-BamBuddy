@@ -237,6 +237,30 @@ describe('ProductionRunDetailPage', () => {
     expect(screen.getAllByText('Nozzle 0.4 != required 0.6').length).toBeGreaterThanOrEqual(1);
   });
 
+  // A cooldown watch armed while shop air was unknown quotes no eject line:
+  // the chip names the plateau, the same wording the printer card uses.
+  it('names the plateau for a printer cooling without an eject line', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () =>
+        HttpResponse.json(
+          detailRun({ printer_states: [printerState({ awaiting_plate_clear: true })] }),
+        ),
+      ),
+      http.get('*/api/v1/printers/:id/status', () =>
+        HttpResponse.json({
+          connected: true,
+          state: 'FINISH',
+          temperatures: { bed: 45 },
+          eject_watch: { threshold_c: null, hold_z: null, deferred: false },
+        }),
+      ),
+    );
+    renderDetail();
+
+    expect(await screen.findByText(en.printers.phase.coolingToPlateau)).toBeInTheDocument();
+    expect(screen.queryByText(en.printers.phase.awaitingPlateClear)).not.toBeInTheDocument();
+  });
+
   it('renders no not-eligible panel when every targeted printer is eligible', async () => {
     server.use(
       http.get('*/api/v1/production-runs/1', () => HttpResponse.json(detailRun())),

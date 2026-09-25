@@ -660,7 +660,7 @@ async def _stamp_stop_and_page(
     plate_occupancy.note_eject_runtime_exceeded(printer_id, datetime.now(timezone.utc), stage)
     logger.warning("eject.remote: %s — %s; stopping the eject job mid-flight", situation, diagnostic)
 
-    # Deliberately NOT via mark_printer_stopped_by_user: this is not an operator
+    # Deliberately NOT via print_control.stop_as_operator: this is not an operator
     # stop, and nothing downstream may read the echoed status as intent. The mark
     # — not whatever terminal the printer reports — drives terminal handling.
     delivered = printer_manager.stop_print(printer_id)

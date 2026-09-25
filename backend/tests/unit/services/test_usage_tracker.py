@@ -16,6 +16,7 @@ import pytest
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import usage_tracker as usage_tracker_module
 from backend.app.services.usage_tracker import (
+    JobEvidence,
     PrintSession,
     _active_sessions,
     _archive_colors_from_spools,
@@ -60,12 +61,12 @@ def _make_assignment(*, spool_id=1, printer_id=1, ams_id=0, tray_id=0, created_a
     return assignment
 
 
-def _make_printer_state(ams_data, progress=0, layer_num=0, tray_now=255):
-    """Create a mock printer state with AMS data."""
+def _make_printer_state(ams_data, tray_now=255):
+    """The live printer: its AMS trays (the HARDWARE a terminal may read live) and the tray it
+    feeds now, which only print START reads — a terminal's job evidence rides its payload
+    (:func:`_terminal_payload`), never this state."""
     state = MagicMock()
     state.raw_data = {"ams": ams_data}
-    state.progress = progress
-    state.layer_num = layer_num
     state.tray_now = tray_now
     return state
 
@@ -75,6 +76,22 @@ def _make_printer_manager(state=None):
     pm = MagicMock()
     pm.get_status.return_value = state
     return pm
+
+
+def _terminal_payload(
+    tray_change_log=(), *, total_layers=100, progress=100.0, layer_num=100, tray_now=0, last_loaded_tray=0
+):
+    """The ending job's own consumption evidence, keyed as the MQTT terminal payload carries it
+    (``bambu_mqtt``: the peaks + ``job_consumption_evidence``). The charge reads THIS, never the
+    live printer."""
+    return {
+        "last_progress": progress,
+        "last_layer_num": layer_num,
+        "total_layers": total_layers,
+        "tray_change_log": list(tray_change_log),
+        "tray_now": tray_now,
+        "last_loaded_tray": last_loaded_tray,
+    }
 
 
 def _write_3mf_with_plates(path, plates: dict[int, list[tuple]]):
@@ -168,18 +185,18 @@ def _resolve_db_plan(plan):
     return answers, spools
 
 
-async def _run_track_from_3mf(*, db_answers, state, filament_usage, handled_trays, extra_patches=(), **kwargs):
+async def _run_track_from_3mf(
+    *, db_answers, payload, filament_usage, handled_trays, hardware=None, extra_patches=(), **kwargs
+):
     """Drive `_track_from_3mf` over one mocked print.
 
-    Owns the scaffold every caller shares -- the printer-manager stand-in, the
-    sequential DB double and the 3MF extraction patch -- so a test body is only
-    its inputs and its assertion. ``extra_patches`` names further
-    ``utils.threemf_tools`` functions to stub, as (name, patch-kwargs) pairs.
-    Callers needing the settings path to resolve must request the
-    ``existing_3mf_path`` fixture.
+    Owns the scaffold every caller shares -- the job's evidence read off its terminal
+    ``payload``, the sequential DB double and the 3MF extraction patch -- so a test body is
+    only its inputs and its assertion. ``hardware`` is the live printer's ``raw_data``.
+    ``extra_patches`` names further ``utils.threemf_tools`` functions to stub, as
+    (name, patch-kwargs) pairs. Callers needing the settings path to resolve must request
+    the ``existing_3mf_path`` fixture.
     """
-    printer_manager = MagicMock()
-    printer_manager.get_status.return_value = state
     with ExitStack() as stack:
         stack.enter_context(
             patch(
@@ -192,8 +209,9 @@ async def _run_track_from_3mf(*, db_answers, state, filament_usage, handled_tray
         return await _track_from_3mf(
             printer_id=1,
             handled_trays=handled_trays,
-            printer_manager=printer_manager,
             db=_mock_db_sequential(db_answers),
+            evidence=JobEvidence.from_payload(payload),
+            hardware=hardware,
             **kwargs,
         )
 
@@ -338,7 +356,7 @@ class TestOnPrintCompleteAMSDelta:
             ]
         )
 
-        results = await on_print_complete(1, {"status": "completed"}, pm, db)
+        results = await on_print_complete(1, {"status": "completed"}, pm, db, charge="full")
 
         assert len(results) == 1
         assert results[0]["weight_used"] == 100.0
@@ -362,7 +380,7 @@ class TestOnPrintCompleteAMSDelta:
         pm = _make_printer_manager(_make_printer_state(ams_data))
         db = AsyncMock()
 
-        results = await on_print_complete(1, {"status": "completed"}, pm, db)
+        results = await on_print_complete(1, {"status": "completed"}, pm, db, charge="full")
 
         assert results == []
         db.commit.assert_not_called()
@@ -373,7 +391,7 @@ class TestOnPrintCompleteAMSDelta:
         pm = _make_printer_manager()
         db = AsyncMock()
 
-        results = await on_print_complete(1, {"status": "completed"}, pm, db)
+        results = await on_print_complete(1, {"status": "completed"}, pm, db, charge="full")
 
         assert results == []
 
@@ -409,9 +427,9 @@ class TestOnPrintCompleteAMSDelta:
                 ],
             }
         ]
-        state = _make_printer_state(ams_data, tray_now=3)
-        state.tray_change_log = [(3, 0)]  # only T3 was loaded during the print
-        pm = _make_printer_manager(state)
+        pm = _make_printer_manager(_make_printer_state(ams_data))
+        # only T3 was loaded during the print — the job's own change log, off its terminal
+        payload = {"status": "completed", "tray_change_log": [(3, 0)]}
 
         # Only T3 should reach the spool lookup; T1 and T2 must be filtered
         # out before any DB query is issued for them.
@@ -427,7 +445,7 @@ class TestOnPrintCompleteAMSDelta:
             ]
         )
 
-        results = await on_print_complete(1, {"status": "completed"}, pm, db)
+        results = await on_print_complete(1, payload, pm, db, charge="full")
 
         # Only T3 should be charged. T1 (spool 27 in the report) and T2
         # (spool 24) must NOT appear in the results.
@@ -458,7 +476,7 @@ class TestTrackFrom3MF:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 25.5, "type": "PLA", "color": "#FF0000"}]
 
         with (
@@ -470,7 +488,8 @@ class TestTrackFrom3MF:
                 status="completed",
                 print_name="test_print",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
@@ -499,7 +518,7 @@ class TestTrackFrom3MF:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 50.0, "type": "PLA", "color": ""}]
 
         with (
@@ -511,7 +530,8 @@ class TestTrackFrom3MF:
                 status="completed",
                 print_name="test",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
@@ -534,7 +554,7 @@ class TestTrackFrom3MF:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 50.0, "type": "PLA", "color": ""}]
 
         with (
@@ -546,7 +566,8 @@ class TestTrackFrom3MF:
                 status="completed",
                 print_name="test",
                 handled_trays={(0, 0)},  # slot_id=1 → ams_id=0, tray_id=0
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
@@ -572,7 +593,7 @@ class TestTrackFrom3MF:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=4))
+        evidence = JobEvidence(tray_now=4)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 5, "used_g": 30.0, "type": "PETG", "color": ""}]
 
         with (
@@ -584,7 +605,8 @@ class TestTrackFrom3MF:
                 status="completed",
                 print_name="test",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
@@ -638,7 +660,7 @@ class TestTaglessAmsAutoSpools:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PETG", "color": "#000000"}]
 
         with (
@@ -650,7 +672,8 @@ class TestTaglessAmsAutoSpools:
                 status="completed",
                 print_name="tagless_print",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
@@ -680,9 +703,8 @@ class TestTaglessAmsAutoSpools:
 
         # Tagless tray reports remain=-1 (firmware unknown) at completion.
         ams_data = [{"id": 0, "tray": [{"id": 0, "remain": -1}]}]
-        state = _make_printer_state(ams_data, tray_now=0)
-        state.tray_change_log = [(0, 0)]
-        pm = _make_printer_manager(state)
+        pm = _make_printer_manager(_make_printer_state(ams_data))
+        payload = {"status": "completed", **_terminal_payload([(0, 0)], tray_now=0, last_loaded_tray=0)}
 
         db = AsyncMock()
         # Only the two _find_3mf_by_filename searches may hit the DB; the
@@ -695,7 +717,7 @@ class TestTaglessAmsAutoSpools:
         # test is about, and asserted below so its firing is covered rather than
         # merely tolerated.
         with patch.object(usage_tracker_module, "_warn_zero_gram_tagless_charge", AsyncMock()) as zero_gram_guard:
-            results = await on_print_complete(1, {"status": "completed"}, pm, db)
+            results = await on_print_complete(1, payload, pm, db, charge="full")
 
         assert results == []
         db.commit.assert_not_called()
@@ -775,7 +797,7 @@ class TestSpoolAssignmentSnapshot:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 15.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
@@ -787,7 +809,8 @@ class TestSpoolAssignmentSnapshot:
                 status="completed",
                 print_name="Test",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 spool_assignments={(0, 0): 42},
             )
@@ -815,7 +838,7 @@ class TestSpoolAssignmentSnapshot:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": "#FF0000"}]
 
         with (
@@ -827,7 +850,8 @@ class TestSpoolAssignmentSnapshot:
                 status="completed",
                 print_name="Test",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 spool_assignments=None,
             )
@@ -868,6 +892,7 @@ class TestSpoolAssignmentSnapshot:
             printer_id=1,
             data={"status": "completed"},
             printer_manager=pm,
+            charge="full",
             db=db,
             archive_id=None,
         )
@@ -909,6 +934,7 @@ class TestSpoolAssignmentSnapshot:
             printer_id=1,
             data={"status": "completed"},
             printer_manager=pm,
+            charge="full",
             db=db,
             archive_id=None,
         )
@@ -940,12 +966,7 @@ class TestSpoolAssignmentSnapshot:
             spool_assignments={(0, 0): 8},  # Snapshot from print start
         )
 
-        pm = _make_printer_manager(
-            _make_printer_state(
-                [{"id": 0, "tray": [{"id": 0, "remain": 75}]}],
-                tray_now=0,
-            )
-        )
+        pm = _make_printer_manager(_make_printer_state([{"id": 0, "tray": [{"id": 0, "remain": 75}]}]))
 
         filament_usage = [{"slot_id": 1, "used_g": 14.2, "type": "PLA", "color": "#FF0000"}]
 
@@ -977,8 +998,9 @@ class TestSpoolAssignmentSnapshot:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=pm,
+                charge="full",
                 db=db,
                 archive_id=100,
             )
@@ -1115,7 +1137,7 @@ class TestArchiveFilamentColorRewrite:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 25.5, "type": "PETG", "color": "#161616"}]
 
         with (
@@ -1127,7 +1149,8 @@ class TestArchiveFilamentColorRewrite:
                 status="completed",
                 print_name="test_print",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
@@ -1157,7 +1180,7 @@ class TestArchiveFilamentColorRewrite:
             ]
         )
 
-        pm = _make_printer_manager(_make_printer_state([], tray_now=0))
+        evidence = JobEvidence(tray_now=0)  # the tray the terminal payload names
         filament_usage = [{"slot_id": 1, "used_g": 25.5, "type": "PETG", "color": "#161616"}]
 
         with (
@@ -1169,29 +1192,12 @@ class TestArchiveFilamentColorRewrite:
                 status="completed",
                 print_name="test_print",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
         assert archive.filament_color == "#161616"
-
-
-def _split_state(tray_change_log, *, total_layers=100, progress=100, layer_num=100, tray_now=0, last_loaded_tray=0):
-    """Printer state carrying a REAL tray_change_log list for split tests.
-
-    ``_make_printer_state`` returns a bare MagicMock whose ``tray_change_log`` is
-    an auto-attr (not a list), which the tracker's isinstance guard treats as
-    empty — good for the no-split cases but useless when a split is the point.
-    """
-    return SimpleNamespace(
-        raw_data={},
-        tray_change_log=list(tray_change_log),
-        total_layers=total_layers,
-        progress=progress,
-        layer_num=layer_num,
-        tray_now=tray_now,
-        last_loaded_tray=last_loaded_tray,
-    )
 
 
 class TestAssignSegmentsToSlots:
@@ -1255,7 +1261,7 @@ class TestMultiFeederSplitAllPaths:
             ]
         )
 
-        pm = _make_printer_manager(_split_state([(0, 0), (1, 40)], tray_now=1, last_loaded_tray=1))
+        evidence = JobEvidence.from_payload(_terminal_payload([(0, 0), (1, 40)], tray_now=1, last_loaded_tray=1))
         filament_usage = [{"slot_id": 1, "used_g": 100.0, "type": "PLA", "color": ""}]
 
         with (
@@ -1268,7 +1274,8 @@ class TestMultiFeederSplitAllPaths:
                 status="completed",
                 print_name="backup",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 ams_mapping=[0],  # slicer said tray0 — but the printer fed tray1 too
             )
@@ -1302,7 +1309,7 @@ class TestMultiFeederSplitAllPaths:
             ]
         )
 
-        pm = _make_printer_manager(_split_state([(2, 0)], tray_now=2, last_loaded_tray=2))
+        evidence = JobEvidence.from_payload(_terminal_payload([(2, 0)], tray_now=2, last_loaded_tray=2))
         filament_usage = [{"slot_id": 1, "used_g": 55.0, "type": "PLA", "color": ""}]
 
         with (
@@ -1314,7 +1321,8 @@ class TestMultiFeederSplitAllPaths:
                 status="completed",
                 print_name="single",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 ams_mapping=[2],
             )
@@ -1358,7 +1366,9 @@ class TestMultiFeederSplitAllPaths:
             ]
         )
 
-        pm = _make_printer_manager(_split_state([(0, 0), (1, 20), (0, 40), (3, 60)], tray_now=3, last_loaded_tray=3))
+        evidence = JobEvidence.from_payload(
+            _terminal_payload([(0, 0), (1, 20), (0, 40), (3, 60)], tray_now=3, last_loaded_tray=3)
+        )
         filament_usage = [
             {"slot_id": 1, "used_g": 60.0, "type": "PLA", "color": "#FF0000"},
             {"slot_id": 2, "used_g": 40.0, "type": "PLA", "color": "#00FF00"},
@@ -1374,7 +1384,8 @@ class TestMultiFeederSplitAllPaths:
                 status="completed",
                 print_name="twocolor",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 ams_mapping=[0, 1],  # slot1→tray0, slot2→tray1
             )
@@ -1431,7 +1442,7 @@ class TestForeignPrintCharging:
         )
 
         # tray_now_at_start feeds the single-filament fallback; no queue mapping.
-        pm = _make_printer_manager(_split_state([(0, 0)], tray_now=0, last_loaded_tray=0))
+        evidence = JobEvidence.from_payload(_terminal_payload([(0, 0)], tray_now=0, last_loaded_tray=0))
         filament_usage = [{"slot_id": 1, "used_g": 33.0, "type": "PLA", "color": ""}]
 
         with (
@@ -1443,7 +1454,8 @@ class TestForeignPrintCharging:
                 status="completed",
                 print_name="foreign_lan_print",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 ams_mapping=None,  # foreign print: nothing dispatched it
                 tray_now_at_start=0,
@@ -1478,7 +1490,7 @@ class TestForeignPrintCharging:
             ]
         )
 
-        pm = _make_printer_manager(_split_state([(0, 0), (1, 25)], tray_now=1, last_loaded_tray=1))
+        evidence = JobEvidence.from_payload(_terminal_payload([(0, 0), (1, 25)], tray_now=1, last_loaded_tray=1))
         filament_usage = [{"slot_id": 1, "used_g": 80.0, "type": "PLA", "color": ""}]
 
         with (
@@ -1491,7 +1503,8 @@ class TestForeignPrintCharging:
                 status="completed",
                 print_name="foreign_backup",
                 handled_trays=set(),
-                printer_manager=pm,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 ams_mapping=None,
             )
@@ -1547,14 +1560,15 @@ class TestForeignPrintCharging:
             ]
         )
 
-        pm = _make_printer_manager(_split_state([(0, 0)], tray_now=0, last_loaded_tray=0))
+        pm = _make_printer_manager()
+        payload = {"status": "completed", **_terminal_payload([(0, 0)], tray_now=0, last_loaded_tray=0)}
         filament_usage = [{"slot_id": 1, "used_g": 30.0, "type": "PLA", "color": ""}]
 
         with (
             patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
             patch("backend.app.utils.threemf_tools.count_plates_in_slice_info", return_value=1),
         ):
-            results = await on_print_complete(1, {"status": "completed"}, pm, db, archive_id=100)
+            results = await on_print_complete(1, payload, pm, db, archive_id=100, charge="full")
 
         # The foreign print WAS charged.
         assert len(results) == 1
@@ -1600,9 +1614,10 @@ class TestIdempotencyGuard:
                 MagicMock(scalar=MagicMock(return_value=1)),
             ]
         )
-        pm = _make_printer_manager(_split_state([(0, 0)]))
+        pm = _make_printer_manager()
+        payload = {"status": "completed", **_terminal_payload([(0, 0)])}
 
-        results = await on_print_complete(1, {"status": "completed"}, pm, db, archive_id=100)
+        results = await on_print_complete(1, payload, pm, db, archive_id=100, charge="full")
 
         assert results == []
         db.commit.assert_not_called()
@@ -1643,13 +1658,10 @@ class TestOnPrintComplete:
             tray_remain_start={(0, 0): 80},
         )
 
-        # Mock printer state: tray_now=0 (AMS0-T0), single filament
+        # The live printer: its AMS (hardware). The job fed AMS0-T0, single filament — its terminal says.
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # db returns: guard(archive.started_at, usage-count), then archive,
@@ -1670,8 +1682,9 @@ class TestOnPrintComplete:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -1697,8 +1710,6 @@ class TestOnPrintComplete:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            tray_now=0,
-            last_loaded_tray=-1,
         )
 
         # Pad 2 Nones for _find_3mf_by_filename DB queries (library + archive search),
@@ -1707,8 +1718,9 @@ class TestOnPrintComplete:
 
         results = await on_print_complete(
             printer_id=1,
-            data={"status": "completed"},
+            data={"status": "completed", "tray_now": 0, "last_loaded_tray": -1},
             printer_manager=printer_manager,
+            charge="full",
             db=db,
             archive_id=None,
         )
@@ -1733,13 +1745,10 @@ class TestOnPrintComplete:
             tray_remain_start={(0, 0): 80},
         )
 
-        # tray_now=0 matches the single filament slot
+        # The live printer: its AMS (hardware). The job's tray_now=0 matches the single filament slot.
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # db returns: guard(archive.started_at, usage-count), then archive,
@@ -1760,8 +1769,9 @@ class TestOnPrintComplete:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -1790,7 +1800,7 @@ class TestTrackFrom3mfSlotResolution:
             pytest.param(
                 {
                     "db": [("archive", 10), None, ("assign", 2, 1, 3), ("spool", 2)],
-                    "state": {"progress": 100, "layer_num": 50, "tray_now": 7},
+                    "payload": {"last_progress": 100, "last_layer_num": 50, "tray_now": 7},
                     # slot_id 12 would default-map to AMS2-T3; tray_now says AMS1-T3
                     "usage": [{"slot_id": 12, "used_g": 10.6, "type": "PLA", "color": "#FF0000"}],
                     "kwargs": {"archive_id": 10},
@@ -1803,7 +1813,7 @@ class TestTrackFrom3mfSlotResolution:
                 {
                     "db": [("archive", 10), None, ("assign", 1, 0, 0), ("spool", 1), None],
                     # tray_now names ONE tray, which cannot speak for two filaments
-                    "state": {"progress": 100, "layer_num": 50, "tray_now": 4},
+                    "payload": {"last_progress": 100, "last_layer_num": 50, "tray_now": 4},
                     "usage": [
                         {"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""},
                         {"slot_id": 2, "used_g": 5.0, "type": "PETG", "color": ""},
@@ -1816,7 +1826,7 @@ class TestTrackFrom3mfSlotResolution:
             pytest.param(
                 {
                     "db": [("archive", 20), ("queue", "[7, -1, -1, -1]"), ("assign", 5, 1, 3), ("spool", 5)],
-                    "state": {"progress": 100, "layer_num": 50, "tray_now": 7},
+                    "payload": {"last_progress": 100, "last_layer_num": 50, "tray_now": 7},
                     "usage": [{"slot_id": 1, "used_g": 25.0, "type": "PETG", "color": ""}],
                     "kwargs": {"archive_id": 20},
                     "expect": [{"spool_id": 5, "ams_id": 1, "tray_id": 3, "weight_used": 25.0}],
@@ -1833,7 +1843,7 @@ class TestTrackFrom3mfSlotResolution:
                         ("assign", 2, 1, 2),
                         ("spool", 2),
                     ],
-                    "state": {"progress": 100, "layer_num": 50, "tray_now": 6},
+                    "payload": {"last_progress": 100, "last_layer_num": 50, "tray_now": 6},
                     "usage": [
                         {"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""},
                         {"slot_id": 2, "used_g": 5.0, "type": "PETG", "color": ""},
@@ -1850,9 +1860,9 @@ class TestTrackFrom3mfSlotResolution:
                 {
                     # no queue answer in the plan: a print-command mapping skips that query
                     "db": [("archive", 50), ("assign", 10, 2, 1), ("spool", 10)],
-                    "state": {
-                        "progress": 100,
-                        "layer_num": 50,
+                    "payload": {
+                        "last_progress": 100,
+                        "last_layer_num": 50,
                         "tray_now": 0,
                         "last_loaded_tray": 0,
                     },
@@ -1866,9 +1876,9 @@ class TestTrackFrom3mfSlotResolution:
             pytest.param(
                 {
                     "db": [("archive", 70), None, ("assign", 3, 1, 1), ("spool", 3)],
-                    "state": {
-                        "progress": 100,
-                        "layer_num": 50,
+                    "payload": {
+                        "last_progress": 100,
+                        "last_layer_num": 50,
                         "tray_now": 255,
                         "last_loaded_tray": 9,
                     },
@@ -1882,9 +1892,9 @@ class TestTrackFrom3mfSlotResolution:
                 {
                     "db": [("archive", 60), None, ("assign", 11, 2, 1), ("spool", 11)],
                     # H2D shape: nothing loaded now and nothing loaded at start
-                    "state": {
-                        "progress": 100,
-                        "layer_num": 50,
+                    "payload": {
+                        "last_progress": 100,
+                        "last_layer_num": 50,
                         "tray_now": 255,
                         "last_loaded_tray": 9,
                     },
@@ -1903,9 +1913,10 @@ class TestTrackFrom3mfSlotResolution:
 
         results = await _run_track_from_3mf(
             db_answers=answers,
-            state=SimpleNamespace(**case["state"]),
+            payload=case["payload"],
             filament_usage=case["usage"],
             handled_trays=handled,
+            charge="full",
             status="completed",
             print_name="Test",
             **case["kwargs"],
@@ -1930,7 +1941,8 @@ class TestTrackFrom3mfScaling:
         [
             pytest.param(
                 {
-                    "state": {"progress": 100, "layer_num": 50, "tray_now": 0},
+                    "payload": {"last_progress": 100, "last_layer_num": 50, "tray_now": 0},
+                    "charge": "full",
                     "status": "completed",
                     "used_g": 20.0,
                     "extra_patches": (),
@@ -1940,7 +1952,8 @@ class TestTrackFrom3mfScaling:
             ),
             pytest.param(
                 {
-                    "state": {"progress": 50, "layer_num": 25, "tray_now": 0},
+                    "payload": {"last_progress": 50, "last_layer_num": 25, "tray_now": 0},
+                    "charge": "partial",
                     "status": "failed",
                     "used_g": 20.0,
                     "extra_patches": _NO_LAYER_DATA,
@@ -1951,7 +1964,8 @@ class TestTrackFrom3mfScaling:
             ),
             pytest.param(
                 {
-                    "state": {"progress": 50, "layer_num": 25, "tray_now": 0},
+                    "payload": {"last_progress": 50, "last_layer_num": 25, "tray_now": 0},
+                    "charge": "partial",
                     "status": "failed",
                     "used_g": 100.0,
                     "extra_patches": _NO_LAYER_DATA,
@@ -1963,7 +1977,8 @@ class TestTrackFrom3mfScaling:
             ),
             pytest.param(
                 {
-                    "state": {"progress": 50, "layer_num": 25, "tray_now": 0},
+                    "payload": {"last_progress": 50, "last_layer_num": 25, "tray_now": 0},
+                    "charge": "partial",
                     "status": "failed",
                     "used_g": 20.0,
                     "extra_patches": (
@@ -1992,11 +2007,12 @@ class TestTrackFrom3mfScaling:
 
         results = await _run_track_from_3mf(
             db_answers=answers,
-            state=SimpleNamespace(**case["state"]),
+            payload=case["payload"],
             filament_usage=[{"slot_id": 1, "used_g": case["used_g"], "type": "PLA", "color": ""}],
             handled_trays=handled,
             extra_patches=case["extra_patches"],
             archive_id=10,
+            charge=case["charge"],
             status=case["status"],
             print_name="Benchy",
         )
@@ -2029,10 +2045,11 @@ class TestTrackFrom3mfBindingAdjudication:
 
         results = await _run_track_from_3mf(
             db_answers=answers,
-            state=SimpleNamespace(progress=100, layer_num=50, tray_now=0),
+            payload={"tray_now": 0},
             filament_usage=[{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""}],
             handled_trays=set(),
             archive_id=80,
+            charge="full",
             status="completed",
             print_name="MidPrintReassign",
             spool_assignments={(0, 0): 1},
@@ -2051,10 +2068,11 @@ class TestTrackFrom3mfBindingAdjudication:
 
         results = await _run_track_from_3mf(
             db_answers=answers,
-            state=SimpleNamespace(progress=100, layer_num=50, tray_now=0),
+            payload={"tray_now": 0},
             filament_usage=[{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""}],
             handled_trays=set(),
             archive_id=81,
+            charge="full",
             status="completed",
             print_name="SnapshotPreserved",
             spool_assignments={(0, 0): 1},
@@ -2095,7 +2113,7 @@ class TestTrayChangeSplit:
                         ("assign", 20, 0, 1),
                         ("spool", 20),
                     ],
-                    "state": {
+                    "payload": {
                         "tray_now": 1,
                         "last_loaded_tray": 1,
                         "total_layers": 100,
@@ -2123,7 +2141,7 @@ class TestTrayChangeSplit:
                         ("assign", 3, 0, 2),
                         ("spool", 3),
                     ],
-                    "state": {
+                    "payload": {
                         "tray_now": 2,
                         "last_loaded_tray": 2,
                         "total_layers": 100,
@@ -2143,7 +2161,7 @@ class TestTrayChangeSplit:
                 {
                     # a print-command mapping skips the queue query, so no queue answer
                     "db": [("archive", 200), ("assign", 10, 0, 0), ("spool", 10), ("assign", 20, 0, 1), ("spool", 20)],
-                    "state": {
+                    "payload": {
                         "tray_now": 1,
                         "last_loaded_tray": 1,
                         "total_layers": 100,
@@ -2160,7 +2178,7 @@ class TestTrayChangeSplit:
             pytest.param(
                 {
                     "db": [("archive", 104), None, None, ("assign", 20, 0, 3), ("spool", 20)],
-                    "state": {
+                    "payload": {
                         "tray_now": 3,
                         "last_loaded_tray": 3,
                         "total_layers": 100,
@@ -2183,16 +2201,17 @@ class TestTrayChangeSplit:
                         ("assign", 20, 0, 1),
                         ("spool", 20),
                     ],
-                    # P1S shape: the firmware zeroed both layer counters at print end
-                    "state": {
-                        "layer_num": 0,
+                    # P1S shape: the firmware zeroed total_layer_num at print end; the payload's
+                    # last_layer_num is the job's last valid layer, captured before the reset
+                    "payload": {
+                        "last_layer_num": 260,
                         "tray_now": 1,
                         "last_loaded_tray": 1,
                         "total_layers": 0,
                         "tray_change_log": [(0, 0), (1, 180)],
                     },
                     "used_g": 260.0,
-                    "kwargs": {"archive_id": 171, "last_layer_num": 260},
+                    "kwargs": {"archive_id": 171},
                     "expect": [
                         {"ams_id": 0, "tray_id": 0, "weight_used": 180.0},
                         {"ams_id": 0, "tray_id": 1, "weight_used": 80.0},
@@ -2210,8 +2229,8 @@ class TestTrayChangeSplit:
                         ("assign", 20, 0, 1),
                         ("spool", 20),
                     ],
-                    "state": {
-                        "layer_num": 0,
+                    "payload": {
+                        "last_layer_num": 0,
                         "tray_now": 1,
                         "last_loaded_tray": 1,
                         "total_layers": 0,
@@ -2219,7 +2238,7 @@ class TestTrayChangeSplit:
                     },
                     "used_g": 60.0,
                     # no denominator survives from either source
-                    "kwargs": {"archive_id": 172, "last_layer_num": 0},
+                    "kwargs": {"archive_id": 172},
                     "expect": [{"weight_used": 30.0}, {"weight_used": 30.0}],
                 },
                 id="no_denominator_at_all_splits_equally_rather_than_concentrating",
@@ -2227,7 +2246,7 @@ class TestTrayChangeSplit:
             pytest.param(
                 {
                     "db": [("archive", 102), None, ("assign", 1, 0, 2), ("spool", 1)],
-                    "state": {"tray_now": 2, "last_loaded_tray": 2, "total_layers": 100, "tray_change_log": [(2, 0)]},
+                    "payload": {"tray_now": 2, "last_loaded_tray": 2, "total_layers": 100, "tray_change_log": [(2, 0)]},
                     "used_g": 15.0,
                     "kwargs": {"archive_id": 102, "tray_now_at_start": 2},
                     "no_layer_stub": True,
@@ -2239,7 +2258,7 @@ class TestTrayChangeSplit:
                 {
                     "db": [("archive", 103), None, ("assign", 1, 0, 0), ("spool", 1)],
                     # an empty log is a restart mid-print, not evidence of a switch
-                    "state": {"tray_now": 0, "last_loaded_tray": 0, "total_layers": 100, "tray_change_log": []},
+                    "payload": {"tray_now": 0, "last_loaded_tray": 0, "total_layers": 100, "tray_change_log": []},
                     "used_g": 10.0,
                     "kwargs": {"archive_id": 103, "tray_now_at_start": 0},
                     "no_layer_stub": True,
@@ -2253,15 +2272,16 @@ class TestTrayChangeSplit:
     async def test_segment_charging(self, case, existing_3mf_path):
         handled: set[tuple[int, int]] = set()
         answers, _ = _resolve_db_plan(case["db"])
-        state = {"progress": 100, "layer_num": 100}
-        state.update(case["state"])
+        payload = {"last_progress": 100, "last_layer_num": 100}
+        payload.update(case["payload"])
 
         results = await _run_track_from_3mf(
             db_answers=answers,
-            state=SimpleNamespace(**state),
+            payload=payload,
             filament_usage=[{"slot_id": 1, "used_g": case["used_g"], "type": "PLA", "color": ""}],
             handled_trays=handled,
             extra_patches=() if case.get("no_layer_stub") else _NO_LAYER_DATA,
+            charge="full",
             status="completed",
             print_name="Segment split",
             **case["kwargs"],
@@ -2291,14 +2311,7 @@ class TestTrayChangeSplit:
 
         results = await _run_track_from_3mf(
             db_answers=answers,
-            state=SimpleNamespace(
-                progress=100,
-                layer_num=100,
-                tray_now=0,
-                last_loaded_tray=0,
-                total_layers=100,
-                tray_change_log=[(1, 0), (0, 60)],
-            ),
+            payload=_terminal_payload([(1, 0), (0, 60)]),
             filament_usage=[{"slot_id": 1, "used_g": 30.0, "type": "PLA", "color": ""}],
             handled_trays=handled,
             extra_patches=(
@@ -2317,6 +2330,7 @@ class TestTrayChangeSplit:
                 ("mm_to_grams", {"side_effect": lambda mm, d, dens: round(mm * 0.003, 1)}),
             ),
             archive_id=100,
+            charge="full",
             status="completed",
             print_name="Runout Test",
         )
@@ -2532,13 +2546,10 @@ class TestMqttMappingIntegration:
             ]
         )
 
-        # MQTT mapping: slot0→AMS0-T1(1), slot1→AMS0-T0(0), slots2-5→unmapped, slot6→AMS128-T0(32768)
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"mapping": [1, 0, 65535, 65535, 65535, 65535, 32768]},
-            progress=100,
-            layer_num=50,
-            tray_now=255,
+        # MQTT mapping, as the TERMINAL captured it: slot0→AMS0-T1(1), slot1→AMS0-T0(0),
+        # slots2-5→unmapped, slot6→AMS128-T0(32768)
+        evidence = JobEvidence.from_payload(
+            {"mqtt_mapping": [1, 0, 65535, 65535, 65535, 65535, 32768], "tray_now": 255}
         )
 
         # 3MF slots 1, 2, 7 (1-based) → indices 0, 1, 6 in mapping
@@ -2561,7 +2572,8 @@ class TestMqttMappingIntegration:
                 status="completed",
                 print_name="Cube + Cube + Cube",
                 handled_trays=handled_trays,
-                printer_manager=printer_manager,
+                charge="full",
+                evidence=evidence,
                 db=db,
             )
 
@@ -2595,13 +2607,8 @@ class TestMqttMappingIntegration:
         # db: archive, assignment, spool (no queue lookup when ams_mapping provided)
         db = _mock_db_sequential([archive, assignment, spool])
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"mapping": [0, 65535]},  # MQTT says slot 0 → AMS0-T0
-            progress=100,
-            layer_num=50,
-            tray_now=255,
-        )
+        # the terminal's MQTT mapping says slot 0 → AMS0-T0
+        evidence = JobEvidence.from_payload({"mqtt_mapping": [0, 65535], "tray_now": 255})
 
         filament_usage = [{"slot_id": 1, "used_g": 10.0, "type": "PLA", "color": ""}]
         handled_trays: set[tuple[int, int]] = set()
@@ -2618,7 +2625,8 @@ class TestMqttMappingIntegration:
                 status="completed",
                 print_name="Test",
                 handled_trays=handled_trays,
-                printer_manager=printer_manager,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 ams_mapping=[2],  # Print cmd says slot 0 → AMS0-T2 (overrides MQTT)
             )
@@ -2654,29 +2662,23 @@ class TestPositionBasedFallbackEmptyAmsSlot:
         db = _mock_db_sequential([archive, None, assignment, spool])
 
         # AMS reports 4 physical tray slots but slot 3 has no spool (empty
-        # tray_type); external spool is loaded in vt_tray.
-        # No `mapping` field on the state — forces fallback through path 5.
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={
-                "ams": [
-                    {
-                        "id": 0,
-                        "tray": [
-                            {"id": 0, "tray_type": "PLA"},
-                            {"id": 1, "tray_type": "PETG"},
-                            {"id": 2, "tray_type": "ABS"},
-                            {"id": 3, "tray_type": ""},  # empty slot
-                        ],
-                    }
-                ],
-                "vt_tray": [{"id": 254, "tray_type": "PLA"}],
-            },
-            progress=100,
-            layer_num=50,
-            tray_now=254,
-            tray_change_log=[],
-        )
+        # tray_type); external spool is loaded in vt_tray — the live HARDWARE.
+        # The job's terminal names no mapping and no feeder, which forces the
+        # position-based default over the loaded trays.
+        hardware = {
+            "ams": [
+                {
+                    "id": 0,
+                    "tray": [
+                        {"id": 0, "tray_type": "PLA"},
+                        {"id": 1, "tray_type": "PETG"},
+                        {"id": 2, "tray_type": "ABS"},
+                        {"id": 3, "tray_type": ""},  # empty slot
+                    ],
+                }
+            ],
+            "vt_tray": [{"id": 254, "tray_type": "PLA"}],
+        }
 
         # 3MF has 4 dense filament slots — slot 4 is the external. Only slot 4
         # has weight (other slots came from AMS spools handled separately).
@@ -2695,7 +2697,8 @@ class TestPositionBasedFallbackEmptyAmsSlot:
                 status="completed",
                 print_name="External + AMS print",
                 handled_trays=handled_trays,
-                printer_manager=printer_manager,
+                charge="full",
+                hardware=hardware,
                 db=db,
             )
 
@@ -2719,27 +2722,20 @@ class TestPositionBasedFallbackEmptyAmsSlot:
 
         db = _mock_db_sequential([archive, None, assignment, spool])
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={
-                "ams": [
-                    {
-                        "id": 0,
-                        "tray": [
-                            {"id": 0, "tray_type": "PLA"},
-                            {"id": 1, "tray_type": "PETG"},
-                            {"id": 2, "tray_type": "ABS"},
-                            {"id": 3, "tray_type": "TPU"},
-                        ],
-                    }
-                ],
-                "vt_tray": [{"id": 254, "tray_type": "PLA"}],
-            },
-            progress=100,
-            layer_num=50,
-            tray_now=254,
-            tray_change_log=[],
-        )
+        hardware = {
+            "ams": [
+                {
+                    "id": 0,
+                    "tray": [
+                        {"id": 0, "tray_type": "PLA"},
+                        {"id": 1, "tray_type": "PETG"},
+                        {"id": 2, "tray_type": "ABS"},
+                        {"id": 3, "tray_type": "TPU"},
+                    ],
+                }
+            ],
+            "vt_tray": [{"id": 254, "tray_type": "PLA"}],
+        }
 
         # 5 filaments, slot 5 = external. available_trays = [0,1,2,3,254] →
         # slot_id=5 → available_trays[4] = 254.
@@ -2758,7 +2754,8 @@ class TestPositionBasedFallbackEmptyAmsSlot:
                 status="completed",
                 print_name="Dense AMS + external",
                 handled_trays=handled_trays,
-                printer_manager=printer_manager,
+                charge="full",
+                hardware=hardware,
                 db=db,
             )
 
@@ -3036,13 +3033,7 @@ class TestTrackFrom3mfWithPreresolvedPath:
         # DB: 1st call = assignment lookup (live), 2nd = spool lookup
         db = _mock_db_sequential([assignment, spool])
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"ams": [{"id": 0, "tray": []}]},
-            tray_now=255,
-            last_loaded_tray=3,
-            tray_change_log=[],
-        )
+        evidence = JobEvidence.from_payload({"tray_now": 255, "last_loaded_tray": 3, "tray_change_log": []})
 
         filament_usage = [{"slot_id": 1, "used_g": 5.0, "type": "PETG", "color": "#FFFFFF"}]
 
@@ -3058,7 +3049,8 @@ class TestTrackFrom3mfWithPreresolvedPath:
                 status="completed",
                 print_name="BMCU-BADGE",
                 handled_trays=set(),
-                printer_manager=printer_manager,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 ams_mapping=[3, -1, -1, -1],
                 threemf_path=existing_3mf_path,
@@ -3076,13 +3068,7 @@ class TestTrackFrom3mfWithPreresolvedPath:
 
         db = _mock_db_sequential([assignment, spool])
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"ams": [{"id": 0, "tray": []}]},
-            tray_now=0,
-            last_loaded_tray=0,
-            tray_change_log=[],
-        )
+        evidence = JobEvidence.from_payload({"tray_now": 0, "last_loaded_tray": 0, "tray_change_log": []})
 
         filament_usage = [{"slot_id": 1, "used_g": 2.0, "type": "PLA", "color": "#FF0000"}]
 
@@ -3099,7 +3085,8 @@ class TestTrackFrom3mfWithPreresolvedPath:
                 status="completed",
                 print_name="Test",
                 handled_trays=set(),
-                printer_manager=printer_manager,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 tray_now_at_start=0,
                 threemf_path=existing_3mf_path,
@@ -3121,13 +3108,7 @@ class TestTrackFrom3mfPlateId:
 
         db = _mock_db_sequential([assignment, spool])
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"ams": [{"id": 0, "tray": []}]},
-            tray_now=0,
-            last_loaded_tray=0,
-            tray_change_log=[],
-        )
+        evidence = JobEvidence.from_payload({"tray_now": 0, "last_loaded_tray": 0, "tray_change_log": []})
 
         extract_mock = MagicMock(return_value=[{"slot_id": 1, "used_g": 190.0, "type": "PETG", "color": "#888888"}])
 
@@ -3140,7 +3121,8 @@ class TestTrackFrom3mfPlateId:
                 status="completed",
                 print_name="GridfinityLid",
                 handled_trays=set(),
-                printer_manager=printer_manager,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 tray_now_at_start=0,
                 threemf_path=existing_3mf_path,
@@ -3158,13 +3140,7 @@ class TestTrackFrom3mfPlateId:
 
         db = _mock_db_sequential([assignment, spool])
 
-        printer_manager = MagicMock()
-        printer_manager.get_status.return_value = SimpleNamespace(
-            raw_data={"ams": [{"id": 0, "tray": []}]},
-            tray_now=0,
-            last_loaded_tray=0,
-            tray_change_log=[],
-        )
+        evidence = JobEvidence.from_payload({"tray_now": 0, "last_loaded_tray": 0, "tray_change_log": []})
 
         extract_mock = MagicMock(return_value=[{"slot_id": 1, "used_g": 5.0, "type": "PLA", "color": "#FF0000"}])
 
@@ -3178,7 +3154,8 @@ class TestTrackFrom3mfPlateId:
                 status="completed",
                 print_name="DirectPrint",
                 handled_trays=set(),
-                printer_manager=printer_manager,
+                charge="full",
+                evidence=evidence,
                 db=db,
                 tray_now_at_start=0,
                 threemf_path=existing_3mf_path,
@@ -3314,18 +3291,14 @@ async def _seed_completion(
 
 
 def _completion_pm():
-    """Mock printer_manager for a settled completed print (no live mapping)."""
+    """Mock printer_manager for a settled completed print: no live hardware worth reading."""
     pm = MagicMock()
-    pm.get_status.return_value = SimpleNamespace(
-        raw_data={},
-        progress=100,
-        layer_num=1,
-        tray_now=0,
-        last_loaded_tray=0,
-        tray_change_log=[],
-        total_layers=1,
-    )
+    pm.get_status.return_value = SimpleNamespace(raw_data={})
     return pm
+
+
+# The ending job's evidence as its terminal carried it: one layer, fed from AMS0-T0, no switch.
+_COMPLETION_EVIDENCE = _terminal_payload(total_layers=1, layer_num=1, tray_now=0, last_loaded_tray=0)
 
 
 async def _count_history(db) -> int:
@@ -3368,8 +3341,9 @@ class TestUsageIntegrityIntegration:
 
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "ST-SUB-1"},
+            data={**_COMPLETION_EVIDENCE, "status": "completed", "subtask_id": "ST-SUB-1"},
             printer_manager=_completion_pm(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -3413,6 +3387,7 @@ class TestUsageIntegrityIntegration:
                 "_reconciled": True,
             },
             printer_manager=_completion_pm(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -3443,8 +3418,9 @@ class TestUsageIntegrityIntegration:
 
         first = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "ST-DUP"},
+            data={**_COMPLETION_EVIDENCE, "status": "completed", "subtask_id": "ST-DUP"},
             printer_manager=_completion_pm(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -3455,8 +3431,9 @@ class TestUsageIntegrityIntegration:
 
         second = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "ST-DUP"},
+            data={**_COMPLETION_EVIDENCE, "status": "completed", "subtask_id": "ST-DUP"},
             printer_manager=_completion_pm(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -3503,8 +3480,9 @@ class TestUsageIntegrityIntegration:
 
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "ST-RE"},
+            data={**_COMPLETION_EVIDENCE, "status": "completed", "subtask_id": "ST-RE"},
             printer_manager=_completion_pm(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -3537,8 +3515,9 @@ class TestUsageIntegrityIntegration:
         with caplog.at_level(logging.WARNING, logger="backend.app.services.usage_tracker"):
             results = await on_print_complete(
                 printer_id=printer.id,
-                data={"status": "completed"},  # no subtask_id → unresolvable
+                data={**_COMPLETION_EVIDENCE, "status": "completed"},  # no subtask_id → unresolvable
                 printer_manager=_completion_pm(),
+                charge="full",
                 db=db_session,
                 archive_id=archive.id,
             )
@@ -3548,6 +3527,140 @@ class TestUsageIntegrityIntegration:
         assert await _count_history(db_session) == 0
         assert spool.weight_used == 0.0
         assert any("plates but the printed plate is unknown" in r.message for r in caplog.records)
+
+    @staticmethod
+    async def _seed_retry_of(db, printer_id: int, *, record_archive, retry_job: str, retry_plate: int):
+        """A failed parent and its retry, both carrying the parent's printed archive as the DONOR,
+        with ``record_archive`` stamped as the retry's own attempt (one archive per attempt)."""
+        from backend.app.models.archive import PrintArchive
+        from backend.app.models.print_queue import PrintQueueItem
+
+        donor = PrintArchive(
+            printer_id=printer_id,
+            filename="donor.gcode.3mf",
+            file_path="archives/donor/donor.gcode.3mf",
+            file_size=1,
+            status="failed",
+            subtask_id="PARENT-1",
+        )
+        db.add(donor)
+        await db.flush()
+        parent = PrintQueueItem(
+            printer_id=printer_id,
+            archive_id=donor.id,
+            status="failed",
+            plate_id=2,  # the WRONG plate for this print, so a donor-link match is visible
+            ams_mapping="[4]",
+            dispatch_subtask_id="PARENT-1",
+            started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        )
+        retry = PrintQueueItem(
+            printer_id=printer_id,
+            archive_id=donor.id,
+            status="completed",
+            plate_id=retry_plate,
+            ams_mapping="[0]",
+            dispatch_subtask_id=retry_job,
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        )
+        db.add_all([parent, retry])
+        record_archive.subtask_id = retry_job
+        await db.commit()
+        return parent, retry
+
+    @pytest.mark.asyncio
+    async def test_an_id_less_terminal_of_a_retry_resolves_the_retry_by_its_record(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """A retry prints into its OWN archive row; the donor link (``archive_id``) is its parent's.
+        A terminal whose echo carries no id (firmware reset on cancel) is tied back to the retry
+        through the record's job id — the retry's plate is charged, not the whole file and not the
+        parent's plate."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        # Plate 1 = 50 g (the retry's), plate 2 = 999 g (the parent's).
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 50.0, "PLA", "#FF0000")], 2: [(1, 999.0, "PLA", "#00FF00")]},
+            with_queue_item=False,
+        )
+        await self._seed_retry_of(db_session, printer.id, record_archive=archive, retry_job="RETRY-1", retry_plate=1)
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={**_COMPLETION_EVIDENCE, "status": "completed"},  # the echo named no job
+            printer_manager=_completion_pm(),
+            charge="full",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert sum(r["weight_used"] for r in results) == pytest.approx(50.0, abs=0.1)
+        assert spool.weight_used == pytest.approx(50.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_the_queue_mapping_tier_reads_the_attempts_unit_over_a_shared_donor(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """The 3MF lane's queue-mapping tier (no print-command mapping, no MQTT mapping) finds the
+        unit THIS archive records. Keyed on the donor link it raised MultipleResultsFound as soon as a
+        unit and its retry shared the donor — here the record is the first attempt's adopted copy, so
+        parent and retry both point at it."""
+        from backend.app.core.config import settings as app_settings
+        from backend.app.models.print_queue import PrintQueueItem
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 30.0, "PLA", "#FF0000")]},
+            assign_ams_id=1,
+            assign_tray_id=2,
+            with_queue_item=False,
+        )
+        archive.subtask_id = "FIRST-1"
+        first = PrintQueueItem(
+            printer_id=printer.id,
+            archive_id=archive.id,  # adopted: donor AND record
+            status="failed",
+            ams_mapping="[6]",  # slicer slot 1 -> global tray 6 -> AMS1-T2
+            dispatch_subtask_id="FIRST-1",
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+        )
+        retry = PrintQueueItem(
+            printer_id=printer.id,
+            archive_id=archive.id,  # the donor it inherited
+            status="printing",
+            ams_mapping="[0]",
+            dispatch_subtask_id="RETRY-2",
+            started_at=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first, retry])
+        await db_session.commit()
+        # A live session that captured no mapping: the charge must reach the queue-mapping tier.
+        _active_sessions[printer.id] = PrintSession(
+            printer_id=printer.id, print_name="SeededPrint", started_at=datetime.now(timezone.utc), plate_id=1
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={**_COMPLETION_EVIDENCE, "status": "completed"},
+            printer_manager=_completion_pm(),
+            charge="full",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert [(r["ams_id"], r["tray_id"]) for r in results] == [(1, 2)], "the FIRST attempt's mapping"
+        assert spool.weight_used == pytest.approx(30.0, abs=0.1)
 
     @pytest.mark.asyncio
     async def test_single_plate_no_session_tracks_full(self, db_session, printer_factory, tmp_path, monkeypatch):
@@ -3568,8 +3681,9 @@ class TestUsageIntegrityIntegration:
 
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "ST-ONE"},
+            data={**_COMPLETION_EVIDENCE, "status": "completed", "subtask_id": "ST-ONE"},
             printer_manager=_completion_pm(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -3577,6 +3691,369 @@ class TestUsageIntegrityIntegration:
         await db_session.refresh(spool)
         assert len(results) == 1
         assert spool.weight_used == pytest.approx(42.0, abs=0.1)
+
+
+def _another_jobs_live_printer(**hardware):
+    """The live printer as a late terminal finds it: running ANOTHER job, far along.
+
+    Every job field here belongs to the running job — 95 %, layer 190/200, feeding AMS0-T3, its
+    own ``mapping`` (slot 1 → AMS0-T3) and change log. A charge that reads any of it is the
+    2026-09-16 → 24 phantom (~7.2 kg over 32 charges)."""
+    pm = MagicMock()
+    pm.get_status.return_value = SimpleNamespace(
+        raw_data={"mapping": [3], **hardware},
+        progress=95.0,
+        layer_num=190,
+        total_layers=200,
+        tray_now=3,
+        last_loaded_tray=3,
+        tray_change_log=[(3, 0)],
+    )
+    return pm
+
+
+async def _bind_second_roll(db, printer_id: int, *, ams_id: int, tray_id: int):
+    from backend.app.models.spool import Spool
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    spool = Spool(material="PLA", label_weight=1000, weight_used=0.0)
+    db.add(spool)
+    await db.commit()
+    await db.refresh(spool)
+    db.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id))
+    await db.commit()
+    return spool
+
+
+class TestTheChargeFollowsTheTerminalsOwnEvidence:
+    """A charge is built from the terminal's OWN evidence — its outcome's basis and its payload —
+    never the live printer's, which by the time a terminal is processed can describe another job."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_partial_charge_scales_by_the_payloads_peaks_never_the_live_printers(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """THE regression. A stopped job's terminal, processed while the printer runs the next job
+        at 95 %: the job reached 20 % of a 100 g plate, so 20 g — the live printer would say 95 g."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 100.0, "PLA", "#FF0000")]},
+            queue_plate_id=1,
+            subtask="ST-STOPPED",
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={
+                **_terminal_payload(progress=20.0, layer_num=40, tray_now=0, last_loaded_tray=0),
+                "status": "cancelled",
+                "subtask_id": "ST-STOPPED",
+                "peaks_reliable": True,
+            },
+            printer_manager=_another_jobs_live_printer(),
+            charge="partial",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert [(r["ams_id"], r["tray_id"], r["weight_used"]) for r in results] == [(0, 0, 20.0)]
+        assert spool.weight_used == pytest.approx(20.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_the_mapping_is_the_one_the_terminal_captured_never_the_live_field(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """A foreign print (no unit, no command mapping) is charged through the printer's reported
+        mapping — the one its OWN terminal captured (slot 1 → AMS0-T0), not the running job's live
+        field (slot 1 → AMS0-T3, where no roll of this job was ever bound)."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 100.0, "PLA", "#FF0000")]},
+            with_queue_item=False,
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={**_terminal_payload(tray_now=255, last_loaded_tray=-1), "status": "completed", "mqtt_mapping": [0]},
+            printer_manager=_another_jobs_live_printer(),
+            charge="full",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert [(r["ams_id"], r["tray_id"], r["weight_used"]) for r in results] == [(0, 0, 100.0)]
+        assert spool.weight_used == pytest.approx(100.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_a_finish_charges_the_whole_plate_whatever_the_live_printer_reads(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 100.0, "PLA", "#FF0000")]},
+            queue_plate_id=1,
+            subtask="ST-DONE",
+        )
+        live = _another_jobs_live_printer()
+        live.get_status.return_value.progress = 5.0  # the next job has barely begun
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={**_COMPLETION_EVIDENCE, "status": "completed", "subtask_id": "ST-DONE"},
+            printer_manager=live,
+            charge="full",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert sum(r["weight_used"] for r in results) == pytest.approx(100.0, abs=0.1)
+        assert spool.weight_used == pytest.approx(100.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_the_tray_split_reads_the_payloads_log_after_the_live_state_was_reset(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """The job's AMS backup switched T0 → T1 at layer 40 of 100. By the time the terminal is
+        charged, the next job has started and the client cleared its change log and layer count —
+        the split still lands 40 g / 60 g, from the log the terminal carried."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, home, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 100.0, "PLA", "#FF0000")]},
+            queue_plate_id=1,
+            subtask="ST-SPLIT",
+        )
+        backup = await _bind_second_roll(db_session, printer.id, ams_id=0, tray_id=1)
+        live = MagicMock()
+        live.get_status.return_value = SimpleNamespace(
+            raw_data={},
+            progress=1.0,
+            layer_num=1,
+            total_layers=0,
+            tray_now=255,
+            last_loaded_tray=-1,
+            tray_change_log=[],
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={
+                **_terminal_payload([(0, 0), (1, 40)], total_layers=100, tray_now=1, last_loaded_tray=1),
+                "status": "completed",
+                "subtask_id": "ST-SPLIT",
+            },
+            printer_manager=live,
+            charge="full",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(home)
+        await db_session.refresh(backup)
+        assert sorted((r["tray_id"], r["weight_used"]) for r in results) == [(0, 40.0), (1, 60.0)]
+        assert (home.weight_used, backup.weight_used) == (pytest.approx(40.0), pytest.approx(60.0))
+
+    @pytest.mark.asyncio
+    async def test_a_none_basis_charges_nothing_and_consumes_its_own_session(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """The reconcile's unknown outcome: a 3MF, a session with a real remain% drop and a unit
+        mapping are all in hand, and none of them is a measurement of how the job ended."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 100.0, "PLA", "#FF0000")]},
+            queue_plate_id=1,
+            subtask="ST-UNKNOWN",
+        )
+        _active_sessions[printer.id] = PrintSession(
+            printer_id=printer.id,
+            print_name="SeededPrint",
+            started_at=datetime.now(timezone.utc),
+            job_id="ST-UNKNOWN",
+            tray_remain_start={(0, 0): 90},
+            spool_assignments={(0, 0): spool.id},
+        )
+        live = _make_printer_manager(_make_printer_state([{"id": 0, "tray": [{"id": 0, "remain": 40}]}]))
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "cancelled", "subtask_id": "ST-UNKNOWN", "peaks_reliable": False, "outcome_unknown": True},
+            printer_manager=live,
+            charge="none",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert results == []
+        assert spool.weight_used == 0.0
+        assert await _count_history(db_session) == 0
+        assert printer.id not in _active_sessions, "the ending job's session is consumed, not left to go stale"
+
+
+class TestTheUsageSessionIsKeyedToItsJob:
+    """A usage session measures ONE job, and only that job's terminal consumes it."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sessions(self):
+        _active_sessions.clear()
+        yield
+        _active_sessions.clear()
+
+    @pytest.mark.asyncio
+    async def test_another_jobs_terminal_leaves_the_running_jobs_session_alone(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """A late terminal of a stopped job, while the printer runs job RUN: the running job's
+        print-start remain% (90 %) against the live remain (40 %) would be a 500 g phantom charged to
+        the stopped job, and the running job would lose its snapshot before its own terminal."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 100.0, "PLA", "#FF0000")]},
+            queue_plate_id=1,
+            subtask="ST-STALE",
+        )
+        running = PrintSession(
+            printer_id=printer.id,
+            print_name="running",
+            started_at=datetime.now(timezone.utc),
+            job_id="ST-RUN",
+            tray_remain_start={(0, 0): 90},
+            spool_assignments={(0, 0): spool.id},
+        )
+        _active_sessions[printer.id] = running
+        live = _make_printer_manager(_make_printer_state([{"id": 0, "tray": [{"id": 0, "remain": 40}]}]))
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={
+                **_terminal_payload(progress=0.0, layer_num=0),
+                "status": "cancelled",
+                "subtask_id": "ST-STALE",
+                "peaks_reliable": True,
+            },
+            printer_manager=live,
+            charge="partial",
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert results == []
+        assert spool.weight_used == 0.0
+        assert _active_sessions[printer.id] is running
+
+    @pytest.mark.parametrize(
+        ("session_job", "terminal_job"),
+        [
+            pytest.param("ST-A", "ST-A", id="the_same_job"),
+            pytest.param(None, None, id="an_id_less_job_on_both_sides_is_unknown_not_other"),
+            pytest.param("ST-A", "", id="an_empty_echo_is_unknown_not_other"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_its_own_terminal_consumes_it(self, session_job, terminal_job):
+        _active_sessions[1] = PrintSession(
+            printer_id=1, print_name="p", started_at=datetime.now(timezone.utc), job_id=session_job
+        )
+
+        await on_print_complete(
+            1, {"status": "cancelled", "subtask_id": terminal_job}, _make_printer_manager(), AsyncMock(), charge="none"
+        )
+
+        assert 1 not in _active_sessions
+
+    @pytest.mark.parametrize(
+        ("echo", "expected"),
+        [("ST-42", "ST-42"), (" ST-42 ", "ST-42"), ("0", None), ("", None), (None, None)],
+    )
+    @pytest.mark.asyncio
+    async def test_print_start_records_the_echoed_job(self, echo, expected):
+        pm = _make_printer_manager(_make_printer_state([{"id": 0, "tray": [{"id": 0, "remain": 80}]}]))
+
+        await on_print_start(1, {"subtask_name": "p", "subtask_id": echo}, pm)
+
+        assert _active_sessions[1].job_id == expected
+
+    def test_the_dispatched_unit_names_a_job_the_first_echo_did_not(self):
+        _active_sessions[1] = PrintSession(printer_id=1, print_name="p", started_at=datetime.now(timezone.utc))
+        unit = SimpleNamespace(id=5, dispatch_subtask_id="ST-77", ams_mapping="[2]", plate_id=3)
+
+        usage_tracker_module.adopt_dispatched_unit(1, unit)
+
+        session = _active_sessions[1]
+        assert (session.job_id, session.ams_mapping, session.plate_id) == ("ST-77", [2], 3)
+
+    def test_a_unit_of_another_job_contributes_nothing(self):
+        _active_sessions[1] = PrintSession(
+            printer_id=1, print_name="p", started_at=datetime.now(timezone.utc), job_id="ST-RUN"
+        )
+        unit = SimpleNamespace(id=5, dispatch_subtask_id="ST-OTHER", ams_mapping="[2]", plate_id=3)
+
+        usage_tracker_module.adopt_dispatched_unit(1, unit)
+
+        session = _active_sessions[1]
+        assert (session.job_id, session.ams_mapping, session.plate_id) == ("ST-RUN", None, None)
+
+    def test_what_the_session_already_caught_is_never_overwritten(self):
+        _active_sessions[1] = PrintSession(
+            printer_id=1,
+            print_name="p",
+            started_at=datetime.now(timezone.utc),
+            job_id="ST-77",
+            ams_mapping=[0],
+            plate_id=1,
+        )
+        unit = SimpleNamespace(id=5, dispatch_subtask_id="ST-77", ams_mapping="[2]", plate_id=3)
+
+        usage_tracker_module.adopt_dispatched_unit(1, unit)
+
+        session = _active_sessions[1]
+        assert (session.job_id, session.ams_mapping, session.plate_id) == ("ST-77", [0], 1)
 
 
 class TestAmsWeightSyncAllowed:

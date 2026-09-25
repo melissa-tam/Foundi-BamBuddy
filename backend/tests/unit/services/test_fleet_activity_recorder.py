@@ -31,6 +31,7 @@ from backend.app.models.printer_observation_span import (
     PrinterObservationSpan,
 )
 from backend.app.services import fleet_activity
+from backend.app.services.eject.monitor import CoolingWatch
 from backend.app.services.fleet_activity import (
     FleetActivityRecorder,
     Observation,
@@ -481,7 +482,8 @@ def _stub_accessors(
     statuses: dict[int, SimpleNamespace],
     eject_present: bool = False,
     plate_occupied: bool = False,
-    active_watch: float | None = None,
+    cooling: bool = False,
+    line_c: float | None = 33.0,
     deferred: bool = False,
     quarantined: bool = False,
     model_mismatch: bool = False,
@@ -500,7 +502,11 @@ def _stub_accessors(
         "current_view",
         lambda pid: SimpleNamespace(eject_present=eject_present, plate_occupied=plate_occupied),
     )
-    monkeypatch.setattr(fleet_activity.eject_cooldown_monitor, "active_watch", lambda pid: active_watch)
+    monkeypatch.setattr(
+        fleet_activity.eject_cooldown_monitor,
+        "cooling_watch",
+        lambda pid: CoolingWatch(line_c=line_c) if cooling else None,
+    )
     monkeypatch.setattr(fleet_activity.eject_cooldown_monitor, "deferred", lambda pid: deferred)
     monkeypatch.setattr(fleet_activity.usb_storage, "usb_present", lambda pid: usb_present)
 
@@ -588,22 +594,28 @@ class TestGatherObservationReadings:
         assert observation.plate_phase == PLATE_PHASE_EJECTING
 
     async def test_an_armed_watch_reads_cooling(self, monkeypatch):
-        _stub_accessors(monkeypatch, statuses={7: _status()}, active_watch=33.0, plate_occupied=True)
+        _stub_accessors(monkeypatch, statuses={7: _status()}, cooling=True, plate_occupied=True)
+        observation = gather_observation(7, True, uptime_s=PAST_GRACE)
+        assert observation is not None
+        assert observation.plate_phase == PLATE_PHASE_COOLING
+
+    async def test_a_cooling_watch_with_no_eject_line_still_reads_cooling(self, monkeypatch):
+        """Shop air unknown at arm leaves the watch with no line to quote — it is still a
+        bed on its way down, never an idle held plate."""
+        _stub_accessors(monkeypatch, statuses={7: _status()}, cooling=True, line_c=None, plate_occupied=True)
         observation = gather_observation(7, True, uptime_s=PAST_GRACE)
         assert observation is not None
         assert observation.plate_phase == PLATE_PHASE_COOLING
 
     async def test_a_deferred_watch_reads_held(self, monkeypatch):
         """Cooled, fans retired, the eject withheld under a hold — the thermal work is over."""
-        _stub_accessors(monkeypatch, statuses={7: _status()}, active_watch=33.0, deferred=True, plate_occupied=True)
+        _stub_accessors(monkeypatch, statuses={7: _status()}, cooling=True, deferred=True, plate_occupied=True)
         observation = gather_observation(7, True, uptime_s=PAST_GRACE)
         assert observation is not None
         assert observation.plate_phase == PLATE_PHASE_HELD
 
     async def test_ejecting_outranks_cooling_which_outranks_held(self, monkeypatch):
-        _stub_accessors(
-            monkeypatch, statuses={7: _status()}, eject_present=True, active_watch=33.0, plate_occupied=True
-        )
+        _stub_accessors(monkeypatch, statuses={7: _status()}, eject_present=True, cooling=True, plate_occupied=True)
         observation = gather_observation(7, True, uptime_s=PAST_GRACE)
         assert observation is not None
         assert observation.plate_phase == PLATE_PHASE_EJECTING

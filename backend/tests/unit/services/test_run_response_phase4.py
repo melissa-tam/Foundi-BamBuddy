@@ -487,11 +487,32 @@ class TestBuildFarmPrinterContexts:
         assert p2.id not in by_pid  # completed run excluded
 
 
-async def _mk_archive(db, photos):
-    arch = PrintArchive(filename="fa.gcode.3mf", file_path="/tmp/fa.gcode.3mf", file_size=1, photos=photos)
+async def _mk_archive(db, photos, *, printer_id=None, job=None, status="completed"):
+    """An archive row. With ``printer_id`` + ``job`` it is a print's ATTEMPT record, bound the
+    way ``print_binding`` binds one (``subtask_id`` = the unit's dispatch id, on its printer)."""
+    arch = PrintArchive(
+        filename="fa.gcode.3mf",
+        file_path="/tmp/fa.gcode.3mf",
+        file_size=1,
+        photos=photos,
+        printer_id=printer_id,
+        subtask_id=job,
+        status=status,
+    )
     db.add(arch)
     await db.flush()
     return arch
+
+
+async def _add_fa_attempt(db, batch, printer, photos, *, job="FA-1", status="completed", **kw):
+    """A first-article unit and the record of its print. A first attempt ADOPTS its dispatch copy,
+    so the record is also the unit's ``archive_id`` (its donor) unless ``archive_id`` says else."""
+    arch = await _mk_archive(db, photos, printer_id=printer.id, job=job, status=status)
+    kw.setdefault("archive_id", arch.id)
+    unit = await _add(
+        db, batch, printer_id=printer.id, status=status, first_article=True, dispatch_subtask_id=job, **kw
+    )
+    return arch, unit
 
 
 class TestFirstArticlePhoto:
@@ -500,13 +521,14 @@ class TestFirstArticlePhoto:
     Only ``awaiting_approval`` / ``rejected`` runs carry the finish-photo URL +
     the producing printer; the newest ``finish_*`` archive photo is selected,
     mirroring main.py (the capture path appends the fresh finish photo LAST).
+    The photo is the FA unit's OWN attempt record (``print_binding.print_archive_of``),
+    never its ``archive_id`` — that is the donor, a requeued FA's failed ancestor.
     """
 
     async def test_awaiting_approval_picks_finish_photo_and_printer(self, db_session):
         batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
         p = await _mk_printer(db_session)
-        arch = await _mk_archive(db_session, ["foo.jpg", "finish_1.jpg"])
-        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        arch, _ = await _add_fa_attempt(db_session, batch, p, ["foo.jpg", "finish_1.jpg"])
         await db_session.commit()
         run = await _load_run(db_session, batch.id)
 
@@ -519,8 +541,10 @@ class TestFirstArticlePhoto:
     async def test_multiple_finish_photos_pick_newest(self, db_session):
         batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
         p = await _mk_printer(db_session)
-        arch = await _mk_archive(
+        await _add_fa_attempt(
             db_session,
+            batch,
+            p,
             [
                 "thumb.png",
                 "finish_20260706_100000_aaaa.jpg",
@@ -528,7 +552,6 @@ class TestFirstArticlePhoto:
                 "finish_20260706_120000_bbbb.jpg",
             ],
         )
-        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
         await db_session.commit()
         run = await _load_run(db_session, batch.id)
 
@@ -539,8 +562,7 @@ class TestFirstArticlePhoto:
     async def test_no_finish_photo_yields_null_url_but_keeps_printer(self, db_session):
         batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
         p = await _mk_printer(db_session)
-        arch = await _mk_archive(db_session, ["foo.jpg", "thumb.png"])
-        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        await _add_fa_attempt(db_session, batch, p, ["foo.jpg", "thumb.png"])
         await db_session.commit()
         run = await _load_run(db_session, batch.id)
 
@@ -552,8 +574,7 @@ class TestFirstArticlePhoto:
     async def test_rejected_state_populates_fields(self, db_session):
         batch = await _mk_run(db_session, quantity=2, fa_state="rejected")
         p = await _mk_printer(db_session)
-        arch = await _mk_archive(db_session, ["finish_x.jpg"])
-        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        arch, _ = await _add_fa_attempt(db_session, batch, p, ["finish_x.jpg"])
         await db_session.commit()
         run = await _load_run(db_session, batch.id)
 
@@ -567,8 +588,7 @@ class TestFirstArticlePhoto:
         # inspection payload is suppressed (nothing left to approve).
         batch = await _mk_run(db_session, quantity=2, fa_state="approved")
         p = await _mk_printer(db_session)
-        arch = await _mk_archive(db_session, ["finish_x.jpg"])
-        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=arch.id)
+        await _add_fa_attempt(db_session, batch, p, ["finish_x.jpg"])
         await db_session.commit()
         run = await _load_run(db_session, batch.id)
 
@@ -576,6 +596,44 @@ class TestFirstArticlePhoto:
         assert resp["first_article_photo_url"] is None
         assert resp["first_article_printer_id"] is None
         assert resp["first_article_printer_name"] is None
+
+    async def test_a_requeued_first_article_shows_its_own_attempt(self, db_session):
+        """The requeued FA (a failure retry here; a refused plate and a fault stop requeue the same
+        way) carries its FAILED ancestor's printed archive as its donor. The approval must show the
+        part the retry printed — its own attempt record — never the ancestor's failed part."""
+        batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
+        p = await _mk_printer(db_session)
+        ancestor_arch, ancestor = await _add_fa_attempt(
+            db_session, batch, p, ["finish_failed_part.jpg"], job="FA-1", status="failed"
+        )
+        retry_arch, _ = await _add_fa_attempt(
+            db_session,
+            batch,
+            p,
+            ["finish_retry_part.jpg"],
+            job="FA-2",
+            archive_id=ancestor_arch.id,  # the donor: the ancestor's printed record
+            retry_of_id=ancestor.id,
+            pos=2,
+        )
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["first_article_photo_url"] == f"/api/v1/archives/{retry_arch.id}/photos/finish_retry_part.jpg"
+
+    async def test_a_first_article_with_no_bound_record_shows_no_photo(self, db_session):
+        """No dispatch id → no attempt record. The donor's photos are never read as this unit's."""
+        batch = await _mk_run(db_session, quantity=2, fa_state="awaiting_approval")
+        p = await _mk_printer(db_session)
+        donor = await _mk_archive(db_session, ["finish_someone_elses.jpg"])
+        await _add(db_session, batch, printer_id=p.id, status="completed", first_article=True, archive_id=donor.id)
+        await db_session.commit()
+        run = await _load_run(db_session, batch.id)
+
+        resp = await build_run_response(db_session, run)
+        assert resp["first_article_photo_url"] is None
+        assert resp["first_article_printer_id"] == p.id
 
     async def test_no_fa_gate_yields_all_null(self, db_session):
         batch = await _mk_run(db_session, quantity=2)  # first_article_state None
@@ -849,14 +907,13 @@ class TestPrinterEligibility:
 class TestRunAgainPrefillFields:
     """build_run_response surfaces the "Run again" prefill fields (Phase 5, F9):
     eject_profile_id + target_model derived from the items (first non-null,
-    uniform per run) and cooldown_temp_c_override from the batch column. Present
-    on BOTH the list and detail shapes so a terminal run card can reopen the
-    dialog pre-filled. FK enforcement is off in the test engine, so a bare
-    eject_profile_id needs no real profile row."""
+    uniform per run). Present on BOTH the list and detail shapes so a terminal run
+    card can reopen the dialog pre-filled. FK enforcement is off in the test engine,
+    so a bare eject_profile_id needs no real profile row. There is no cooldown
+    override to prefill any more (2026-09-25: the eject line is measured shop air)."""
 
-    async def test_specific_printer_run_derives_eject_and_cooldown_no_model(self, db_session):
+    async def test_specific_printer_run_derives_eject_no_model(self, db_session):
         batch = await _mk_run(db_session, quantity=2)
-        batch.cooldown_temp_c_override = 34.5
         p = await _mk_printer(db_session)
         await _add(db_session, batch, printer_id=p.id, status="pending", eject_profile_id=7, pos=1)
         await _add(db_session, batch, printer_id=p.id, status="pending", eject_profile_id=7, pos=2)
@@ -865,7 +922,7 @@ class TestRunAgainPrefillFields:
 
         resp = await build_run_response(db_session, run)
         assert resp["eject_profile_id"] == 7
-        assert resp["cooldown_temp_c_override"] == 34.5
+        assert "cooldown_temp_c_override" not in resp  # one value: the line is shop_air's
         assert resp["target_model"] is None  # specific-printer run
 
     async def test_model_run_derives_target_model(self, db_session):
@@ -879,14 +936,13 @@ class TestRunAgainPrefillFields:
         assert resp["eject_profile_id"] == 3
 
     async def test_prefill_fields_null_when_absent(self, db_session):
-        batch = await _mk_run(db_session, quantity=1)  # no cooldown override
+        batch = await _mk_run(db_session, quantity=1)
         await _add(db_session, batch, status="pending")  # no eject profile / target_model
         await db_session.commit()
         run = await _load_run(db_session, batch.id)
 
         resp = await build_run_response(db_session, run)
         assert resp["eject_profile_id"] is None
-        assert resp["cooldown_temp_c_override"] is None
         assert resp["target_model"] is None
 
 

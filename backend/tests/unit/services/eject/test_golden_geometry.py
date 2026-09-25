@@ -64,7 +64,6 @@ H2C_GEOMETRY_Z_REFERENCED = replace(H2C_GEOMETRY, z_reference_validated=True)
 
 _DEFAULTS = {
     "name": "default",
-    "cooldown_temp_c": 28.0,
     "clearance_mm": 10.0,
     "z_offset_mm": 0.4,
     "descent_steps": 4,

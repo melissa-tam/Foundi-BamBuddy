@@ -6,8 +6,8 @@ report zeros for a print that is physically three-quarters done — on 2026-08-2
 such prints finished ``completed`` and were each classified "produced zero layers →
 nothing on the plate": no plate gate, no eject, and the next unit dispatched onto the
 finished part. These tests pin the flag's whole lifecycle: False at birth, True only on
-an observed start edge, and False through the restart-recovery attach that the #1304
-first-push guard routes to ``on_print_running_observed``.
+an observed start edge, and False through every restart-recovery attach — RUNNING or
+PAUSE — that the #1304 first-push guard routes to ``on_print_running_observed``.
 """
 
 from __future__ import annotations
@@ -76,6 +76,32 @@ class TestPeaksReliableLifecycle:
         mqtt_client._process_message(_print_push("PREPARE"))
         assert mqtt_client._peaks_reliable is False
 
+    def test_a_pause_attach_and_its_resume_leave_it_false(self, mqtt_client):
+        """Bambuddy started during a PAUSE (a plate-check hold, a runout): the attach
+        happens on the PAUSE, and the resume after it is not a start — so nothing ever
+        claims this client measured the job."""
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_running_observed = lambda data: None
+
+        mqtt_client._process_message(_print_push("PAUSE"))
+        mqtt_client._process_message(_print_push("RUNNING"))
+
+        assert mqtt_client._peaks_reliable is False
+
+    def test_an_attach_after_an_observed_job_resets_it(self, mqtt_client):
+        """The flag is otherwise never cleared, so a job first met PAUSEd after one this
+        client DID watch start (a reconnect gap) would inherit that job's True."""
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_running_observed = lambda data: None
+        mqtt_client.on_print_complete = lambda data: None
+        for state in ("IDLE", "PREPARE", "RUNNING", "FINISH"):
+            mqtt_client._process_message(_print_push(state))
+        assert mqtt_client._peaks_reliable is True
+
+        mqtt_client._process_message(_print_push("PAUSE", gcode_file="/data/Metadata/plate_2.gcode"))
+
+        assert mqtt_client._peaks_reliable is False
+
 
 class TestPeaksReliableInCompletionPayload:
     def test_payload_carries_true_after_an_observed_start(self, mqtt_client):
@@ -105,6 +131,18 @@ class TestPeaksReliableInCompletionPayload:
         mqtt_client._process_message(_print_push("FINISH"))
 
         assert payload["status"] == "completed"
+        assert payload["peaks_reliable"] is False
+
+    def test_payload_carries_false_after_a_pause_attach_is_stopped(self, mqtt_client):
+        """The stop of a job first met PAUSEd is a terminal now — and a fail-closed one."""
+        payload: dict = {}
+        mqtt_client.on_print_running_observed = lambda data: None
+        mqtt_client.on_print_complete = lambda data: payload.update(data)
+
+        mqtt_client._process_message(_print_push("PAUSE"))
+        mqtt_client._process_message(_print_push("IDLE"))
+
+        assert payload["status"] == "aborted"
         assert payload["peaks_reliable"] is False
 
     def test_deposit_evidence_reads_the_payload_key(self, mqtt_client):

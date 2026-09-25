@@ -51,6 +51,7 @@ from backend.app.services.bambu_ftp import (
     with_ftp_retry,
 )
 from backend.app.services.farm_correlation import DispatchDonor, resolve_terminal_item
+from backend.app.services.job_identity import job_id, same_job
 from backend.app.services.printer_manager import parse_plate_id, printer_manager
 from backend.app.utils.filename import print_identity_key
 
@@ -545,6 +546,30 @@ async def _retry_capture(
     )
 
 
+def _live_state_is_this_job(live_subtask_id: str | None, archive_subtask_id: str | None) -> bool:
+    """May a capture re-derive this archive's file names from the printer's LIVE state?
+
+    Only when the live job IS the archive's (``job_identity.same_job`` → ``same``). A
+    ``printing`` archive is not proof that the printer still runs its job: a leaked or stale
+    archive stays ``printing`` while the printer runs the next one, and names read from that
+    job would capture ITS 3MF onto this row — the next print's slicer data and grams charged
+    to the wrong run. ``other`` therefore keeps the names the start callback captured.
+
+    ``unknown`` (either side names no job) keeps the pre-id behaviour ONLY for an archive that
+    has no id of its own — a row whose start echo carried none, where the live state is the
+    only enrichment there will ever be and nothing identifies it better. An archive that DOES
+    name its job but meets a live state naming none (an idle printer, a start echo not yet
+    enriched) is not re-derived: an absent id is not evidence of the same job either.
+    """
+    match same_job(live_subtask_id, archive_subtask_id):
+        case "same":
+            return True
+        case "other":
+            return False
+        case "unknown":
+            return job_id(archive_subtask_id) is None
+
+
 async def _attempt_capture(
     printer_id: int,
     archive_id: int,
@@ -570,15 +595,14 @@ async def _attempt_capture(
 
         # Re-derive from the live printer state: the enriched subtask_name /
         # gcode_file often only arrive after the start callback, and they are what
-        # names the file on disk. Only while this print still runs — once the row
-        # is terminal the live state may describe the NEXT job, whose 3MF must
-        # never be charged to this one.
+        # names the file on disk. Only when the live state describes THIS archive's
+        # job (``_live_state_is_this_job``) — otherwise it may be the NEXT job,
+        # whose 3MF must never be charged to this one.
         live_subtask, live_filename = subtask_name, filename
-        if archive.status == "printing":
-            state = printer_manager.get_status(printer_id)
-            if state is not None:
-                live_subtask = getattr(state, "subtask_name", None) or subtask_name
-                live_filename = getattr(state, "gcode_file", None) or filename
+        state = printer_manager.get_status(printer_id) if archive.status == "printing" else None
+        if state is not None and _live_state_is_this_job(getattr(state, "subtask_id", None), archive.subtask_id):
+            live_subtask = getattr(state, "subtask_name", None) or subtask_name
+            live_filename = getattr(state, "gcode_file", None) or filename
 
         logger.info(
             "[FOREIGN-3MF] printer %s archive %s: capture attempt %d (subtask=%r, file=%r)",

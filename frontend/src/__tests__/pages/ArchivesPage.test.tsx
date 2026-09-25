@@ -3,11 +3,12 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { screen, waitFor, fireEvent } from '@testing-library/react';
+import { screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { render } from '../utils';
 import { ArchivesPage } from '../../pages/ArchivesPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
+import i18n from '../../i18n';
 
 const mockArchives = [
   {
@@ -100,6 +101,65 @@ describe('ArchivesPage', () => {
         return HttpResponse.json({ success: true });
       })
     );
+  });
+
+  // The delete pre-flight (#1734) disables the confirm whenever a live print
+  // stands in the way — and that print can be the archive's OWN record (a
+  // retry prints into its own archive, which no queue unit links), so the
+  // reason must show even with zero related queue items.
+  describe('delete confirm', () => {
+    const impact = (related_queue_items: number, currently_printing: number) =>
+      server.use(
+        http.get('/api/v1/archives/:id/delete-impact', () =>
+          HttpResponse.json({ related_queue_items, currently_printing }),
+        ),
+      );
+
+    const openDeleteConfirm = async () => {
+      render(<ArchivesPage />);
+      await screen.findByText('Benchy');
+      fireEvent.click(screen.getAllByTitle(i18n.t('archives.card.delete'))[0]);
+      return screen.findByRole('dialog');
+    };
+
+    it('names the live print it records when no queue item links the archive', async () => {
+      impact(0, 1);
+      const dialog = await openDeleteConfirm();
+
+      const reason = await within(dialog).findByRole('alert');
+      expect(reason).toHaveTextContent(i18n.t('archives.modal.deleteBlockedByLivePrint'));
+      expect(
+        within(dialog).getByRole('button', { name: i18n.t('archives.modal.deleteButton') }),
+      ).toBeDisabled();
+    });
+
+    it('names the printing queue items when linked units are mid-print', async () => {
+      impact(2, 1);
+      const dialog = await openDeleteConfirm();
+
+      const reason = await within(dialog).findByRole('alert');
+      expect(reason).toHaveTextContent(
+        i18n.t('archives.modal.deleteBlockedByPrinting', { count: 1 }),
+      );
+      expect(
+        within(dialog).getByRole('button', { name: i18n.t('archives.modal.deleteButton') }),
+      ).toBeDisabled();
+    });
+
+    it('warns about the linked queue items without blocking when nothing prints', async () => {
+      impact(2, 0);
+      const dialog = await openDeleteConfirm();
+
+      expect(
+        await within(dialog).findByText(
+          i18n.t('archives.modal.deleteQueueItemsWarning', { count: 2 }),
+        ),
+      ).toBeInTheDocument();
+      expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
+      expect(
+        within(dialog).getByRole('button', { name: i18n.t('archives.modal.deleteButton') }),
+      ).toBeEnabled();
+    });
   });
 
   describe('rendering', () => {

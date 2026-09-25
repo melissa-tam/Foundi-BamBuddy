@@ -136,9 +136,6 @@ class TestCostCalculation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # db returns: archive, queue_item(None), assignment, spool
@@ -159,8 +156,9 @@ class TestCostCalculation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -190,9 +188,6 @@ class TestCostCalculation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # db returns: archive, queue_item(None), assignment, spool
@@ -213,8 +208,9 @@ class TestCostCalculation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -244,9 +240,6 @@ class TestCostCalculation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # db returns: archive, queue_item(None), assignment, spool
@@ -266,8 +259,9 @@ class TestCostCalculation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -290,13 +284,9 @@ class TestCostCalculation:
             tray_now_at_start=0,
         )
 
-        # Failed at 50% progress
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=50,
-            layer_num=25,
-            tray_now=0,
         )
 
         # db returns: archive, queue_item(None), assignment, spool
@@ -321,8 +311,10 @@ class TestCostCalculation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "failed", "last_progress": 50.0},
+                # Failed at 50% progress, layer 25 — the job's own peaks, off its terminal
+                data={"status": "failed", "last_progress": 50.0, "last_layer_num": 25, "peaks_reliable": True},
                 printer_manager=printer_manager,
+                charge="partial",
                 db=db,
                 archive_id=10,
             )
@@ -349,8 +341,6 @@ class TestCostCalculation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            tray_now=0,
-            last_loaded_tray=-1,
         )
 
         # Pad 2 Nones for _find_3mf_by_filename DB queries (library + archive search),
@@ -360,8 +350,9 @@ class TestCostCalculation:
         with patch("backend.app.api.routes.settings.get_setting", return_value="15.0"):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=None,  # No archive = AMS fallback
             )
@@ -393,9 +384,6 @@ class TestCostCalculation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}, {"id": 1, "remain": 80}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # Mock slot-to-tray mapping: slot 1 -> tray 0, slot 2 -> tray 1
@@ -423,8 +411,9 @@ class TestCostCalculation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
                 ams_mapping=ams_mapping,
@@ -491,9 +480,6 @@ class TestCostAggregation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # Build mock db that returns proper scalars for the aggregation queries
@@ -545,8 +531,9 @@ class TestCostAggregation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -579,9 +566,6 @@ class TestCostAggregation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # 20g at 25/kg = 0.50
@@ -627,8 +611,9 @@ class TestCostAggregation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -662,9 +647,6 @@ class TestCostAggregation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         responses = [
@@ -707,8 +689,9 @@ class TestCostAggregation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -745,9 +728,6 @@ class TestCostAggregation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         responses = [
@@ -787,8 +767,9 @@ class TestCostAggregation:
         ):
             results = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=10,
             )
@@ -809,9 +790,6 @@ class TestCostAggregation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # No session here, so _resolve_run_context queries twice: the archive-linked
@@ -825,8 +803,9 @@ class TestCostAggregation:
         ):
             results_new = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed"},
+                data={"status": "completed", "tray_now": 0},  # the job fed AMS0-T0 (its terminal says)
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=20,
             )
@@ -853,9 +832,6 @@ class TestCostAggregation:
         printer_manager = MagicMock()
         printer_manager.get_status.return_value = SimpleNamespace(
             raw_data={"ams": [{"id": 0, "tray": [{"id": 0, "remain": 70}]}]},
-            progress=100,
-            layer_num=50,
-            tray_now=0,
         )
 
         # Pad 2 Nones for _find_3mf_by_filename DB queries (library + archive search),
@@ -868,8 +844,14 @@ class TestCostAggregation:
         ):
             results_old = await on_print_complete(
                 printer_id=1,
-                data={"status": "completed", "subtask_name": legacy_print_name, "filename": legacy_print_name},
+                data={
+                    "status": "completed",
+                    "subtask_name": legacy_print_name,
+                    "filename": legacy_print_name,
+                    "tray_now": 0,
+                },
                 printer_manager=printer_manager,
+                charge="full",
                 db=db,
                 archive_id=None,
             )

@@ -2059,115 +2059,82 @@ class TestAbortedStatusNormalisation:
 
         return _create_queue_item
 
-    @pytest.mark.asyncio
-    @pytest.mark.integration
-    async def test_on_print_complete_normalises_aborted_to_cancelled(self, queue_item_factory, db_session):
-        """Verify the completion handler maps 'aborted' → 'cancelled' for queue items."""
+    @staticmethod
+    async def _terminal(maker, printer_id: int, status: str, *, layer: int, progress: float) -> None:
+        """One real terminal through ``main.on_print_complete`` over the test engine (the harness
+        mocks only the transports). The unit is correlated by the fallback rule — the sole printing
+        unit, no echoed id — and ended through the ONE writer of a unit's end."""
         import asyncio
-        from unittest.mock import AsyncMock, MagicMock, patch
 
-        item = await queue_item_factory(status="printing")
-
-        # Build a mock session whose execute returns our item
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [item]
-
-        mock_session = AsyncMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-        mock_session.execute = AsyncMock(return_value=mock_result)
-        mock_session.commit = AsyncMock()
-        # Terminal correlation (Phase 1) resolves the finished item by
-        # subtask/name before touching it, and the status update re-fetches it
-        # by id. Model-aware ``db.get``: the real queue item for PrintQueueItem,
-        # None for archive/library lookups — a bare AsyncMock here would leak
-        # coroutine-attribute mocks into the name normaliser and crash the
-        # correlation instead.
-        from backend.app.models.print_queue import PrintQueueItem as _PQI
-
-        async def _model_aware_get(model, pk, *a, **k):
-            return item if (model is _PQI and pk == item.id) else None
-
-        mock_session.get = AsyncMock(side_effect=_model_aware_get)
+        from backend.app.main import on_print_complete
+        from backend.tests._fixtures.print_callbacks import drain_new_tasks, print_callbacks
 
         tasks_before = set(asyncio.all_tasks())
-
-        with (
-            patch("backend.app.main.async_session", return_value=mock_session),
-            patch("backend.app.core.database.async_session", return_value=mock_session),
-            patch("backend.app.main.ws_manager") as mock_ws,
-            patch("backend.app.main.mqtt_relay") as mock_relay,
-            patch("backend.app.main.notification_service") as mock_notif,
-            patch("backend.app.main.smart_plug_manager") as mock_plug,
-            patch("backend.app.main.printer_manager") as mock_pm,
-        ):
-            mock_ws.send_print_complete = AsyncMock()
-            mock_ws.broadcast = AsyncMock()
-            mock_relay.on_print_complete = AsyncMock()
-            mock_relay.on_queue_job_completed = AsyncMock()
-            mock_notif.on_print_complete = AsyncMock()
-            mock_plug.on_print_complete = AsyncMock()
-            mock_pm.get_printer.return_value = None
-
-            from backend.app.main import on_print_complete
-
+        with print_callbacks(maker):
             await on_print_complete(
-                item.printer_id,
+                printer_id,
                 {
-                    "status": "aborted",
+                    "status": status,
                     "filename": "test.gcode",
                     "subtask_name": "Test",
                     "timelapse_was_active": False,
-                    # Deposit evidence: without layer/progress peaks the Phase-3
-                    # no-deposit path would normalise the status instead of the
-                    # aborted→cancelled mapping under test here.
-                    "last_layer_num": 42,
-                    "last_progress": 37.0,
+                    "peaks_reliable": True,
+                    "last_layer_num": layer,
+                    "last_progress": progress,
                 },
             )
-
-            # Cancel background tasks before leaving mock context
-            for task in asyncio.all_tasks() - tasks_before:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-        # The item status should be normalised to 'cancelled', not 'aborted'
-        assert item.status == "cancelled"
+            await drain_new_tasks(tasks_before)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_startup_fixup_converts_aborted_to_cancelled(self, queue_item_factory, db_session):
-        """Verify the startup fixup converts existing 'aborted' rows to 'cancelled'."""
+    async def test_on_print_complete_normalises_aborted_to_cancelled(self, queue_item_factory, own_session_factory):
+        """Verify the completion handler maps 'aborted' → 'cancelled' for queue items."""
+        from backend.app.models.print_queue import PrintQueueItem
+
+        item = await queue_item_factory(status="printing")
+
+        # Deposit evidence: without layer/progress peaks the Phase-3 no-deposit path would
+        # normalise the status instead of the aborted→cancelled mapping under test here.
+        await self._terminal(own_session_factory, item.printer_id, "aborted", layer=42, progress=37.0)
+
+        async with own_session_factory() as s:
+            row = await s.get(PrintQueueItem, item.id)
+        # The item status should be normalised to 'cancelled', not 'aborted'
+        assert row.status == "cancelled"
+        assert row.completed_at is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_startup_fixup_converts_aborted_to_cancelled(self, queue_item_factory, db_session, test_engine):
+        """The one-shot repair of units an earlier build left 'aborted' — a migration now, run by
+        ``run_migrations``; idempotent (a second run matches nothing)."""
         from sqlalchemy import select
 
+        from backend.app.core.database import _migrate_aborted_queue_items_to_cancelled
         from backend.app.models.print_queue import PrintQueueItem
 
         # Create items with various statuses including 'aborted'
         item_aborted = await queue_item_factory(status="pending")
         item_pending = await queue_item_factory(status="pending")
 
-        # Manually set the invalid status
+        # Manually set the invalid status (and a stale hold token the repair must clear)
         item_aborted.status = "aborted"
+        item_aborted.waiting_reason = "printer_offline_stalled"
         db_session.add(item_aborted)
         await db_session.commit()
 
-        # Run the fixup query (same logic as lifespan)
-        result = await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.status == "aborted"))
-        aborted_items = result.scalars().all()
-        for i in aborted_items:
-            i.status = "cancelled"
-        await db_session.commit()
+        for _ in range(2):
+            async with test_engine.begin() as conn:
+                await _migrate_aborted_queue_items_to_cancelled(conn)
 
         # Verify: no more 'aborted' items
         result = await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.status == "aborted"))
         assert len(result.scalars().all()) == 0
 
-        # The previously aborted item should now be 'cancelled'
+        # The previously aborted item should now be 'cancelled', its hold token cleared
         await db_session.refresh(item_aborted)
         assert item_aborted.status == "cancelled"
+        assert item_aborted.waiting_reason is None
 
         # The pending item should be unchanged
         await db_session.refresh(item_pending)
@@ -2175,82 +2142,25 @@ class TestAbortedStatusNormalisation:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_completed_status_passes_through_unchanged(self, queue_item_factory, db_session):
+    async def test_completed_status_passes_through_unchanged(self, queue_item_factory, own_session_factory):
         """Verify normal statuses like 'completed' are not affected by normalisation."""
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock, patch
+        from backend.app.models.print_queue import PrintQueueItem
 
         item = await queue_item_factory(status="printing")
 
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [item]
+        # Deposit evidence: a completed print with zero layers AND zero progress is
+        # (correctly) normalised to 'cancelled' by the Phase-3 no-deposit path — this
+        # test asserts the pass-through of a REAL completed print.
+        await self._terminal(own_session_factory, item.printer_id, "completed", layer=100, progress=100.0)
 
-        mock_session = AsyncMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-        mock_session.execute = AsyncMock(return_value=mock_result)
-        mock_session.commit = AsyncMock()
-        # See the aborted-normalisation test above: model-aware db.get keeps
-        # the Phase-1 terminal correlation on its fallback attribution path
-        # while the status update can still re-fetch the queue item by id.
-        from backend.app.models.print_queue import PrintQueueItem as _PQI
-
-        async def _model_aware_get(model, pk, *a, **k):
-            return item if (model is _PQI and pk == item.id) else None
-
-        mock_session.get = AsyncMock(side_effect=_model_aware_get)
-
-        tasks_before = set(asyncio.all_tasks())
-
-        with (
-            patch("backend.app.main.async_session", return_value=mock_session),
-            patch("backend.app.core.database.async_session", return_value=mock_session),
-            patch("backend.app.main.ws_manager") as mock_ws,
-            patch("backend.app.main.mqtt_relay") as mock_relay,
-            patch("backend.app.main.notification_service") as mock_notif,
-            patch("backend.app.main.smart_plug_manager") as mock_plug,
-            patch("backend.app.main.printer_manager") as mock_pm,
-        ):
-            mock_ws.send_print_complete = AsyncMock()
-            mock_ws.broadcast = AsyncMock()
-            mock_relay.on_print_complete = AsyncMock()
-            mock_relay.on_queue_job_completed = AsyncMock()
-            mock_notif.on_print_complete = AsyncMock()
-            mock_plug.on_print_complete = AsyncMock()
-            mock_pm.get_printer.return_value = None
-
-            from backend.app.main import on_print_complete
-
-            await on_print_complete(
-                item.printer_id,
-                {
-                    "status": "completed",
-                    "filename": "test.gcode",
-                    "subtask_name": "Test",
-                    "timelapse_was_active": False,
-                    # Deposit evidence: a completed print with zero layers AND
-                    # zero progress is (correctly) normalised to 'cancelled' by
-                    # the Phase-3 no-deposit path — this test asserts the
-                    # pass-through of a REAL completed print.
-                    "last_layer_num": 100,
-                    "last_progress": 100.0,
-                },
-            )
-
-            # Cancel background tasks before leaving mock context
-            for task in asyncio.all_tasks() - tasks_before:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-        assert item.status == "completed"
+        async with own_session_factory() as s:
+            row = await s.get(PrintQueueItem, item.id)
+        assert row.status == "completed"
 
     # ========================================================================
     # Library file usage tracking on print completion (#1008)
     #
-    # These exercise the _bump_library_file_usage_if_completed helper directly
+    # These exercise job_terminal.bump_library_file_usage_if_completed directly
     # rather than invoking the whole on_print_complete handler — that path
     # spawns background asyncio tasks (notifications, MQTT relay, smart-plug)
     # that are expensive to mock and have nothing to do with the bump logic.
@@ -2262,9 +2172,9 @@ class TestAbortedStatusNormalisation:
         """Successful completion increments print_count and stamps last_printed_at."""
         from datetime import datetime, timezone
 
-        from backend.app.main import _bump_library_file_usage_if_completed
         from backend.app.models.library import LibraryFile
         from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.job_terminal import bump_library_file_usage_if_completed
 
         printer = await printer_factory()
         lib_file = LibraryFile(
@@ -2287,7 +2197,7 @@ class TestAbortedStatusNormalisation:
         )
 
         before = datetime.now(timezone.utc).replace(tzinfo=None)
-        await _bump_library_file_usage_if_completed(db_session, item, "completed")
+        await bump_library_file_usage_if_completed(db_session, item, "completed")
         await db_session.commit()
         await db_session.refresh(lib_file)
 
@@ -2299,9 +2209,9 @@ class TestAbortedStatusNormalisation:
     @pytest.mark.integration
     async def test_bump_library_file_usage_repeated_prints_increment_count(self, printer_factory, db_session):
         """Each successful completion bumps print_count cumulatively."""
-        from backend.app.main import _bump_library_file_usage_if_completed
         from backend.app.models.library import LibraryFile
         from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.job_terminal import bump_library_file_usage_if_completed
 
         printer = await printer_factory()
         lib_file = LibraryFile(
@@ -2323,7 +2233,7 @@ class TestAbortedStatusNormalisation:
         )
 
         for _ in range(3):
-            await _bump_library_file_usage_if_completed(db_session, item, "completed")
+            await bump_library_file_usage_if_completed(db_session, item, "completed")
 
         await db_session.commit()
         await db_session.refresh(lib_file)
@@ -2334,9 +2244,9 @@ class TestAbortedStatusNormalisation:
     @pytest.mark.parametrize("terminal_status", ["failed", "cancelled"])
     async def test_bump_library_file_usage_skips_non_completed(self, printer_factory, db_session, terminal_status):
         """Failed and cancelled prints must NOT count as usage."""
-        from backend.app.main import _bump_library_file_usage_if_completed
         from backend.app.models.library import LibraryFile
         from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.job_terminal import bump_library_file_usage_if_completed
 
         printer = await printer_factory()
         lib_file = LibraryFile(
@@ -2358,7 +2268,7 @@ class TestAbortedStatusNormalisation:
             position=1,
         )
 
-        await _bump_library_file_usage_if_completed(db_session, item, terminal_status)
+        await bump_library_file_usage_if_completed(db_session, item, terminal_status)
         await db_session.commit()
         await db_session.refresh(lib_file)
 
@@ -2371,8 +2281,8 @@ class TestAbortedStatusNormalisation:
         self, printer_factory, archive_factory, db_session
     ):
         """Queue items without library_file_id (e.g. archive reprints) are a no-op."""
-        from backend.app.main import _bump_library_file_usage_if_completed
         from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.job_terminal import bump_library_file_usage_if_completed
 
         printer = await printer_factory()
         archive = await archive_factory()
@@ -2385,7 +2295,7 @@ class TestAbortedStatusNormalisation:
         )
 
         # Must not raise.
-        await _bump_library_file_usage_if_completed(db_session, item, "completed")
+        await bump_library_file_usage_if_completed(db_session, item, "completed")
 
     # ========================================================================
     # Batch quantity tests

@@ -1416,12 +1416,16 @@ class NotificationService:
     ):
         """Handle plate not empty event — the plate may be occupied before/at print.
 
-        ``source_detail`` disambiguates the three sources that raise this one event
-        with an honest, source-specific sentence (Phase 3.3):
-          - ``printer_vision``  — the printer's own pre-print HMS plate check,
-          - ``camera_cv``       — Bambuddy's OpenCV pre-print camera diff,
-          - ``cooldown_timeout``— the eject cooldown watch's 90-min escalation
-            (which actually means "bed never cooled", not "objects on the plate").
+        ``source_detail`` is the CALLER's full sentence saying why this one event fired
+        (Phase 3.3), rendered verbatim — prose, never a source token. Today's callers:
+          - ``main`` — Bambuddy's OpenCV pre-print camera diff;
+          - ``pause_recovery`` — the printer's own plate check paused the job: its
+            reported words plus the operator instruction;
+          - ``eject.monitor.escalation_sentence`` — a plate only a human may clear (a
+            refused plate, a farm part whose eject never ran, a foreign part);
+          - ``farm_stall`` — the reminder of an open plate-vision hold.
+        A cooldown that has not released is NOT this event: it pages through
+        :meth:`on_cooldown_escalation`.
 
         Rendering tolerates an OLDER install whose seeded ``plate_not_empty`` body
         predates the ``{source_detail}`` placeholder (seeds are insert-if-absent, so
@@ -2111,7 +2115,8 @@ class NotificationService:
         printer_name: str,
         subtask_name: str,
         db: AsyncSession,
-        auto_eject_temp_c: float | None = None,
+        auto_eject: bool = False,
+        eject_line_c: float | None = None,
     ):
         """Fire when a printer finishes a job Bambuddy did not dispatch (foreign print).
 
@@ -2120,10 +2125,12 @@ class NotificationService:
         a print Bambuddy never sent). Alerts the operator to clear the plate so
         dispatch can resume.
 
-        When ``auto_eject_temp_c`` is set the foreign plate was positively identified
-        as the farm's OWN file (2026-07-18 auto-eject decision): the message says so
-        and names the cooldown target °C, so the operator knows the farm will clear it
-        automatically once the bed cools rather than waiting on a manual sweep.
+        When ``auto_eject`` is set the foreign plate was positively identified as the
+        farm's OWN file (2026-07-18 auto-eject decision): the message says so, so the
+        operator knows the farm will clear it automatically once the bed cools rather
+        than waiting on a manual sweep. ``eject_line_c`` is the measured eject line the
+        watch arms with (``shop_air``) and is quoted when known; None means shop air is
+        unknown, and the message says the bed releases on its own air instead.
         """
         providers = await self._get_providers_for_event(db, "on_foreign_job_detected", printer_id)
         if not providers:
@@ -2135,15 +2142,21 @@ class NotificationService:
         }
 
         title, message = await self._build_message_from_template(db, "foreign_job_detected", variables)
-        if auto_eject_temp_c is not None:
+        if auto_eject:
             # Appended to the rendered body so it reaches EVERY provider (providers send
             # the final string directly — only webhook/email additionally read variables).
+            cools_to = (
+                f"cools to {eject_line_c:.0f}°C"
+                if eject_line_c is not None
+                else "cools to its own chamber air (no shop-air reading yet)"
+            )
             auto_note = (
                 f"The farm recognised this as one of its own files and will automatically eject it once the "
-                f"bed cools to {auto_eject_temp_c:.0f}°C. No action needed unless it does not clear."
+                f"bed {cools_to}. No action needed unless it does not clear."
             )
             message = f"{message}\n\n{auto_note}"
-            variables["auto_eject_temp_c"] = f"{auto_eject_temp_c:.0f}"
+            if eject_line_c is not None:
+                variables["auto_eject_temp_c"] = f"{eject_line_c:.0f}"
         await self._send_to_providers(
             providers,
             title,
@@ -2652,17 +2665,18 @@ class NotificationService:
         printer_name: str,
         *,
         bed_c: float | None,
-        threshold_c: float,
+        line_c: float | None,
         max_hold_minutes: int,
         db: AsyncSession,
     ):
         """Fire when a post-print eject cooldown is running long.
 
         Distinct from ``plate_not_empty`` (which means "objects on the plate"):
-        the bed simply has not reached the release threshold yet. The ``detail``
-        states the live bed, the target, and what happens next — a forced eject at
-        the max-hold cap, or, when the cap is disabled, that none is set. Built
-        here so the template stays a simple ``{printer}: {detail}``.
+        the bed simply has not been released yet. The ``detail`` states the live bed,
+        the eject line (measured shop air + margin; None when shop air is unknown, and
+        the detail then says so), and what happens next — a forced eject at the
+        max-hold cap, or, when the cap is disabled, that none is set. Built here so the
+        template stays a simple ``{printer}: {detail}``.
         """
         providers = await self._get_providers_for_event(db, "on_cooldown_escalation", printer_id)
         if not providers:
@@ -2673,7 +2687,8 @@ class NotificationService:
             cap_txt = f"forced eject at the {max_hold_minutes}-minute cap"
         else:
             cap_txt = "no forced-eject cap is set"
-        detail = f"Still cooling: bed {bed_txt} °C, target {threshold_c:.0f} °C — {cap_txt}."
+        line_txt = f"eject line {line_c:.0f} °C" if line_c is not None else "no eject line (shop air unknown)"
+        detail = f"Still cooling: bed {bed_txt} °C, {line_txt} — {cap_txt}."
 
         variables = {
             "printer": printer_name,

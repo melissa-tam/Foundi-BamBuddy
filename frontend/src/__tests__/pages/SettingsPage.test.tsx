@@ -11,6 +11,7 @@ import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
 import { SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, SIDEBAR_ORDER_KEY } from '../../utils/sidebarLayout';
 import { setAuthToken } from '../../api/client';
+import i18n from '../../i18n';
 
 const mockSettings = {
   auto_archive: true,
@@ -1319,6 +1320,217 @@ describe('SettingsPage', () => {
       // Leaving the field drops the draft and shows the stored target.
       fireEvent.blur(partTop);
       expect(partTop.value).toBe('-35');
+    });
+  });
+
+  // The eject line is MEASURED shop air plus ONE margin; the hand-typed warn
+  // floor is gone. The print-start plate blow-off sits beside chute prime.
+  // Copy is resolved through the live i18n instance (labels, not prose).
+  describe('Farm tab — shop air, margin and plate blow-off', () => {
+    const openFarmTab = async (user: ReturnType<typeof userEvent.setup>) => {
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+    };
+
+    const captureSave = () => {
+      const bodies: Record<string, unknown>[] = [];
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          bodies.push(body);
+          return HttpResponse.json({ ...mockSettings, ...body });
+        }),
+      );
+      return bodies;
+    };
+
+    it('leads the Eject cooldown card with the shop-air readout', async () => {
+      server.use(
+        http.get('/api/v1/shop-air', () =>
+          HttpResponse.json({
+            value_c: 25.8,
+            as_of: new Date(Date.now() - 5 * 60_000).toISOString(),
+            basis: 'fresh',
+            printers: 3,
+            margin_c: 2,
+            eject_line_c: 27.8,
+          }),
+        ),
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const shopAir = await screen.findByRole('definition', {
+        name: i18n.t('settings.shopAir.label'),
+      });
+      await waitFor(() => expect(shopAir).toHaveTextContent('25.8 °C'));
+      expect(
+        screen.getByRole('definition', { name: i18n.t('settings.shopAir.ejectLine') }),
+      ).toHaveTextContent('27.8 °C');
+
+      // First in the card: every control of the cooldown card — the margin
+      // included — comes after the readout.
+      const card = document.getElementById('card-farm-cooldown')!;
+      expect(card).toContainElement(shopAir);
+      const controls = [
+        ...within(card).getAllByRole('spinbutton'),
+        ...within(card).getAllByRole('checkbox'),
+      ];
+      expect(controls).toContain(within(card).getByLabelText(i18n.t('settings.farmCooldownMargin')));
+      for (const control of controls) {
+        expect(shopAir.compareDocumentPosition(control) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+    });
+
+    it('round-trips the margin above shop air, in half degrees', async () => {
+      const bodies = captureSave();
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const margin = (await screen.findByLabelText(
+        i18n.t('settings.farmCooldownMargin'),
+      )) as HTMLInputElement;
+      // mockSettings omits the key: the backend default shows.
+      expect(margin.value).toBe('2');
+      expect(margin).toHaveAttribute('min', '0.5');
+      expect(margin).toHaveAttribute('max', '10');
+      expect(margin).toHaveAttribute('step', '0.5');
+
+      fireEvent.change(margin, { target: { value: '2.5' } });
+      await waitFor(
+        () => expect(bodies.at(-1)?.farm_cooldown_margin_c).toBe(2.5),
+        { timeout: 5000 },
+      );
+    });
+
+    it('re-reads the shop air after a save, so the line follows the margin', async () => {
+      // One ordered log of both endpoints: the proof is a shop-air read AFTER
+      // the save, not merely a second read (the poll could supply that).
+      const events: string[] = [];
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          events.push('save');
+          return HttpResponse.json({ ...mockSettings, ...body });
+        }),
+        http.get('/api/v1/shop-air', () => {
+          events.push('shop-air');
+          return HttpResponse.json({
+            value_c: 25,
+            as_of: new Date().toISOString(),
+            basis: 'fresh',
+            printers: 3,
+            margin_c: 2,
+            eject_line_c: 27,
+          });
+        }),
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      await waitFor(() => expect(events).toContain('shop-air'));
+      fireEvent.change(await screen.findByLabelText(i18n.t('settings.farmCooldownMargin')), {
+        target: { value: '3' },
+      });
+      await waitFor(
+        () => {
+          const saved = events.indexOf('save');
+          expect(saved).toBeGreaterThanOrEqual(0);
+          expect(events.slice(saved + 1)).toContain('shop-air');
+        },
+        { timeout: 5000 },
+      );
+    });
+
+    it('has no warn floor and never saves one', async () => {
+      const bodies = captureSave();
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      await screen.findByLabelText(i18n.t('settings.farmCooldownMargin'));
+      expect(screen.queryByLabelText(/warn floor/i)).not.toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(i18n.t('settings.farmCooldownMargin')), {
+        target: { value: '3' },
+      });
+      await waitFor(() => expect(bodies.length).toBeGreaterThan(0), { timeout: 5000 });
+      expect(bodies.at(-1)).not.toHaveProperty('farm_cooldown_warn_floor_c');
+    });
+
+    it('renders the plate blow-off on by default, saves the off state and disables its time', async () => {
+      const bodies = captureSave();
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const toggle = (await screen.findByRole('checkbox', {
+        name: i18n.t('settings.farmPlateBlowoffEnabled'),
+      })) as HTMLInputElement;
+      const seconds = screen.getByLabelText(
+        i18n.t('settings.farmPlateBlowoffSeconds'),
+      ) as HTMLInputElement;
+      // mockSettings omits both keys: the backend defaults show.
+      expect(toggle.checked).toBe(true);
+      expect(seconds.value).toBe('10');
+      expect(seconds.disabled).toBe(false);
+      expect(seconds).toHaveAttribute('min', '3');
+      expect(seconds).toHaveAttribute('max', '60');
+
+      await user.click(toggle);
+      await waitFor(
+        () => expect(bodies.at(-1)?.farm_plate_blowoff_enabled).toBe(false),
+        { timeout: 5000 },
+      );
+      // The time is meaningless while the blow-off is off.
+      expect(seconds.disabled).toBe(true);
+    });
+
+    it('round-trips the blow-off time and clamps it to 3–60', async () => {
+      const bodies = captureSave();
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const seconds = (await screen.findByLabelText(
+        i18n.t('settings.farmPlateBlowoffSeconds'),
+      )) as HTMLInputElement;
+      fireEvent.change(seconds, { target: { value: '90' } });
+      expect(seconds.value).toBe('60');
+      fireEvent.change(seconds, { target: { value: '15' } });
+      await waitFor(
+        () => expect(bodies.at(-1)?.farm_plate_blowoff_seconds).toBe(15),
+        { timeout: 5000 },
+      );
+    });
+
+    it('keeps the blow-off mechanism in a tooltip, not inline', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const hintText = i18n.t('settings.farmPlateBlowoffEnabledHelp');
+      const hint = await screen.findByRole('button', { name: hintText });
+      expect(screen.queryByText(hintText)).not.toBeInTheDocument();
+      await user.click(hint);
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(hintText);
+    });
+
+    it('cross-tab search finds the blow-off under Farm Production', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      const searchBox = await waitFor(() => screen.getByPlaceholderText(/Search settings/));
+      await user.type(searchBox, 'blowoff');
+
+      await waitFor(() => {
+        expect(screen.getByText('Farm Production')).toBeInTheDocument();
+      });
     });
   });
 

@@ -25,7 +25,6 @@ import { EjectProfilesPage } from '../../pages/EjectProfilesPage';
 const SOURCE = {
   id: 7,
   name: 'H2C tuned',
-  cooldown_temp_c: 33,
   clearance_mm: 12,
   z_offset_mm: 0.6,
   descent_steps: 6,
@@ -52,7 +51,6 @@ const SOURCE = {
 // with the "(copy)" name. This is the phantom-assignment contract.
 const EXPECTED_COPY_PAYLOAD = {
   name: 'H2C tuned (copy)',
-  cooldown_temp_c: 33,
   clearance_mm: 12,
   z_offset_mm: 0.6,
   descent_steps: 6,
@@ -100,7 +98,6 @@ function primeBase() {
   server.use(
     http.get('*/api/v1/eject-profiles', () => HttpResponse.json([SOURCE])),
     http.get('*/api/v1/model-geometry', () => geometryList()),
-    http.get('*/api/v1/settings/', () => HttpResponse.json({ farm_cooldown_warn_floor_c: 30 })),
     http.get('*/api/v1/library/files', () => HttpResponse.json([])),
   );
 }
@@ -131,8 +128,8 @@ describe('EjectProfilesPage duplicate action', () => {
     expect(within(dialog).getByLabelText('Name')).toHaveValue('H2C tuned (copy)');
 
     // Spot-check that numeric machine fields are seeded from the source row,
-    // not from the form defaults (cooldown default is 28, x_passes default 11).
-    expect(within(dialog).getByLabelText('Cooldown temperature (°C)')).toHaveValue(33);
+    // not from the form defaults (clearance default is 10, x_passes default 11).
+    expect(within(dialog).getByLabelText('Clearance (mm)')).toHaveValue(12);
     expect(within(dialog).getByLabelText('X passes')).toHaveValue(9);
   });
 

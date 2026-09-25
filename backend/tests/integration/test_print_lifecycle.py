@@ -452,9 +452,10 @@ class TestPlateClearGate:
         # 3. Not the farm's own file → the plate keeps the ESCALATION-ONLY policy it was
         #    raised under: neither the queue-bound cooldown nor a foreign auto-eject.
         assert isinstance(_plate_policy(pid), EscalationOnly)
-        # 4. Foreign notification fired WITHOUT an auto-eject temperature (not the farm's file).
+        # 4. Foreign notification fired WITHOUT an auto-eject note (not the farm's file).
         env.notif.on_foreign_job_detected.assert_awaited()
-        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") is None
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject") is False
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("eject_line_c") is None
 
     @pytest.mark.asyncio
     async def test_foreign_terminal_not_gated_when_toggle_off_and_no_farm(self, test_engine):
@@ -500,17 +501,22 @@ class TestPlateClearGate:
     @pytest.mark.asyncio
     async def test_foreign_terminal_farm_file_arms_auto_eject(self, test_engine):
         """F5: a FOREIGN completion positively identified as the farm's OWN file arms
-        the AUTO foreign-eject watch (NOT escalation-only) and the notification names
-        the cooldown target. The farm queue stays untouched; the gate is still raised.
+        the AUTO foreign-eject watch (NOT escalation-only) and the notification quotes
+        the eject line from its one owner (``shop_air`` — the policy carries no temperature
+        since 2026-09-25). The farm queue stays untouched; the gate is still raised.
         Identification itself is unit-tested in test_manual; here the main.py wiring is
         exercised with identify_farm_file_foreign patched to a positive result."""
         from contextlib import ExitStack
         from unittest.mock import AsyncMock
 
         from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.eject import shop_air
         from backend.app.services.eject.manual import ForeignFarmFile
 
         tasks_before = set(asyncio.all_tasks())
+        line = shop_air.EjectLine(
+            shop=shop_air.ShopAir(value_c=28.0, as_of=None, basis="fresh", printers=3), margin_c=2.0, line_c=30.0
+        )
 
         with ExitStack() as stack:
             env = self._setup_mocks(stack, test_engine)
@@ -518,9 +524,10 @@ class TestPlateClearGate:
             stack.enter_context(
                 patch(
                     "backend.app.services.eject.manual.identify_farm_file_foreign",
-                    AsyncMock(return_value=ForeignFarmFile(profile_id=7, threshold_c=33.0, print_name="Farm Widget")),
+                    AsyncMock(return_value=ForeignFarmFile(profile_id=7, print_name="Farm Widget")),
                 )
             )
+            stack.enter_context(patch.object(shop_air, "current_line", AsyncMock(return_value=line)))
 
             from backend.app.main import on_print_complete
 
@@ -549,11 +556,12 @@ class TestPlateClearGate:
         assert _occupancy().is_plate_occupied(pid)
         assert _occupancy().plate_source(pid) == "FOREIGN-9"
         # The escalation hold the gate went up under was UPGRADED to the AUTO foreign
-        # eject with the identified profile + threshold — not the queue-bound cooldown.
-        assert _plate_policy(pid) == ForeignAutoEject(profile_id=7, threshold_c=33.0)
-        # Notification fired naming the cooldown target °C.
+        # eject with the identified profile — and no temperature of its own.
+        assert _plate_policy(pid) == ForeignAutoEject(profile_id=7)
+        # Notification fired quoting the OWNER's eject line.
         env.notif.on_foreign_job_detected.assert_awaited()
-        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") == 33.0
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject") is True
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("eject_line_c") == 30.0
 
     @pytest.mark.asyncio
     async def test_genuine_foreign_terminal_still_calls_resolver(self, test_engine):
@@ -789,7 +797,7 @@ class TestPlateCheckHoldEndToEnd(_PlateCheckJourney):
 
             await pause_recovery.on_plate_vision_trip(printer_id, {"0500_808C"})
             # The operator presses Stop in the UI (the stop wipes the printer's HMS list).
-            stop_as_operator(printer_id)
+            await stop_as_operator(printer_id)
             paused.state, paused.hms_errors = "FAILED", []
             await self._terminal(printer_id, subtask=self._SUBTASK)
             await self._settle(tasks_before)
@@ -955,7 +963,7 @@ class TestOperatorStopOverAFaultRequeues(_PlateCheckJourney):
                     status="escalated",
                 )
 
-            stop_as_operator(printer_id)
+            await stop_as_operator(printer_id)
             await self._terminal(printer_id, subtask="SUB-R", deposited=True)
             await self._settle(tasks_before)
 
@@ -1030,12 +1038,10 @@ class TestQueuePageStopReachesThePolicy(_PlateCheckJourney):
     @pytest.mark.asyncio
     async def test_the_queue_page_stop_takes_the_operator_stop_disposition(self, test_engine):
         from contextlib import ExitStack
-        from datetime import datetime, timezone
 
         from backend.app.models.print_batch import PrintBatch
-        from backend.app.models.print_queue import PrintQueueItem
         from backend.app.services import farm_policy
-        from backend.app.services.print_control import stop_as_operator
+        from backend.app.services.printer_manager import printer_manager
 
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
@@ -1043,17 +1049,12 @@ class TestQueuePageStopReachesThePolicy(_PlateCheckJourney):
             stopped_page = stack.enter_context(
                 patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
             )
+            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
             printer_id, item_id, batch_id = await self._seed_farm_unit(mocks.maker, serial="QPS-1", subtask="SUB-Q")
 
-            # Exactly what the route does: the operator verb, then the row committed
-            # ``cancelled`` / ``operator_ui`` before the printer answers.
-            stop_as_operator(printer_id)
-            async with mocks.maker() as s:
-                item = await s.get(PrintQueueItem, item_id)
-                item.status = "cancelled"
-                item.stop_source = "operator_ui"
-                item.completed_at = datetime.now(timezone.utc)
-                await s.commit()
+            # The REAL route: the operator's request, then the row committed ``cancelled`` /
+            # ``operator_ui`` before the printer answers.
+            await _DurableStop.queue_page_stop(mocks.maker, item_id)
 
             await self._terminal(printer_id, subtask="SUB-Q", deposited=True)
             await self._settle(tasks_before)
@@ -1065,6 +1066,229 @@ class TestQueuePageStopReachesThePolicy(_PlateCheckJourney):
             mocks.notif.on_foreign_job_detected.assert_not_awaited()
             # The farm's own deposit, not a foreign one.
             assert _occupancy().snapshot(printer_id).plate_source_subtask_id == "SUB-Q"
+
+
+class _DurableStop(_PlateCheckJourney):
+    """Shared scaffold for the durable operator stop (§6, 2026-09-25)."""
+
+    @staticmethod
+    async def queue_page_stop(maker, item_id):
+        """``POST /queue/{id}/stop`` through its REAL handler (auth resolved as a full admin)."""
+        from backend.app.api.routes.print_queue import stop_queue_item
+
+        async with maker() as s:
+            await stop_queue_item(item_id, db=s, auth_result=(None, True))
+
+    @staticmethod
+    def restart():
+        """What a deploy's restart leaves behind: NO process state — the incident stores, the
+        recovery drivers and the plate authority's in-memory records are gone, and nothing in
+        process memory remembers that anybody pressed Stop. Only the database survives."""
+        _PlateCheckJourney._reset_process_state()
+        _occupancy().reset_for_tests()
+
+    @staticmethod
+    def spy_policy(stack):
+        """The farm policy runs for real; record every terminal's ONE classification and every
+        UNIT disposition (``on_unit_terminal`` with a unit)."""
+        from backend.app.services import farm_policy
+
+        outcomes: list = []
+        dispositions: list[int] = []
+        real_terminal, real_unit = farm_policy.on_terminal, farm_policy.on_unit_terminal
+
+        async def _terminal(*args, **kwargs):
+            outcomes.append(kwargs.get("outcome"))
+            return await real_terminal(*args, **kwargs)
+
+        async def _unit(db, item_or_id, *args, **kwargs):
+            if item_or_id is not None:
+                dispositions.append(getattr(item_or_id, "id", item_or_id))
+            return await real_unit(db, item_or_id, *args, **kwargs)
+
+        stack.enter_context(patch.object(farm_policy, "on_terminal", _terminal))
+        stack.enter_context(patch.object(farm_policy, "on_unit_terminal", _unit))
+        return outcomes, dispositions
+
+
+class TestOperatorStopIsDurable(_DurableStop):
+    """§6 (2026-09-25): the operator's Stop lives on the unit row, not in process memory.
+
+    The in-memory ``main._user_stopped_printers`` set was empty after a restart (a deploy), so
+    the terminal of a job an operator had stopped read as no stop: the farm's own queue-stopped
+    job resolved FOREIGN (a foreign page, a human-clear gate, no operator-stop hold, the run one
+    plate short), and a printer-card stop recorded a genuine FAILURE. Driven through the real
+    route / verb, the real ``on_print_complete`` and the real ``farm_policy``."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        self._reset_process_state()
+        yield
+        self._reset_process_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", ["failed", "aborted"])
+    async def test_a_queue_page_stop_whose_terminal_lands_after_a_restart_is_the_operators(self, test_engine, raw):
+        from contextlib import ExitStack
+
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services import farm_policy
+        from backend.app.services.printer_manager import printer_manager
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            stopped_page = stack.enter_context(
+                patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
+            )
+            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            outcomes, dispositions = self.spy_policy(stack)
+            printer_id, item_id, batch_id = await self._seed_farm_unit(
+                mocks.maker, serial=f"DRQ-{raw}", subtask="SUB-RQ"
+            )
+
+            await self.queue_page_stop(mocks.maker, item_id)
+            self.restart()
+            await self._terminal(printer_id, subtask="SUB-RQ", status=raw, deposited=True)
+            await self._settle(tasks_before)
+
+            (outcome,) = outcomes
+            assert (outcome.verdict, outcome.recorded_status) == ("operator_ui", "cancelled")
+            assert dispositions == [item_id]  # the unit is MATCHED, not foreign
+            async with mocks.maker() as s:
+                item = await s.get(PrintQueueItem, item_id)
+                assert (item.status, item.stop_source) == ("cancelled", "operator_ui")
+                assert item.operator_stop_requested_at is not None
+                assert item.stop_answered_at is not None
+                batch = await s.get(PrintBatch, batch_id)
+                assert (batch.status, batch.pause_reason) == ("active", "operator_stop")  # the run HOLDS
+            stopped_page.assert_awaited_once()
+            # No foreign lane at all: no foreign-job page, and the gate is the farm's own
+            # deposit keyed to its job (the unit matched above), not a foreign plate's.
+            mocks.notif.on_foreign_job_detected.assert_not_awaited()
+            assert _occupancy().snapshot(printer_id).plate_source_subtask_id == "SUB-RQ"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", ["failed", "aborted"])
+    async def test_a_printer_card_stop_whose_terminal_lands_after_a_restart_is_the_operators(self, test_engine, raw):
+        from contextlib import ExitStack
+
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services import farm_policy
+        from backend.app.services.print_control import stop_as_operator
+        from backend.app.services.printer_manager import printer_manager
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            stopped_page = stack.enter_context(
+                patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
+            )
+            running = self._state(gcode_state="RUNNING", subtask="SUB-RC")
+            stack.enter_context(patch.object(printer_manager, "get_status", return_value=running))
+            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            outcomes, dispositions = self.spy_policy(stack)
+            printer_id, item_id, batch_id = await self._seed_farm_unit(
+                mocks.maker, serial=f"DRC-{raw}", subtask="SUB-RC"
+            )
+
+            assert await stop_as_operator(printer_id) is True  # the printer card's Stop
+            self.restart()
+            await self._terminal(printer_id, subtask="SUB-RC", status=raw, deposited=True)
+            await self._settle(tasks_before)
+
+            (outcome,) = outcomes
+            assert (outcome.verdict, outcome.recorded_status) == ("operator_ui", "cancelled")
+            assert dispositions == [item_id]
+            async with mocks.maker() as s:
+                item = await s.get(PrintQueueItem, item_id)
+                assert (item.status, item.stop_source) == ("cancelled", "operator_ui")  # never a FAILURE
+                batch = await s.get(PrintBatch, batch_id)
+                assert batch.pause_reason == "operator_stop"
+            stopped_page.assert_awaited_once()
+            mocks.notif.on_foreign_job_detected.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_stop_whose_print_never_started_does_not_classify_the_re_dispatch(self, test_engine):
+        """The stop was pressed on a claim whose print never started; the dead-claim release
+        (the ONE printing → pending writer) clears the request, so the SAME row's next
+        dispatch — a genuine failure — is a failure, not the operator's stop."""
+        from contextlib import ExitStack
+        from datetime import datetime, timezone
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.print_control import stop_as_operator
+        from backend.app.services.printer_manager import printer_manager
+        from backend.app.services.queue_transitions import claim_pending_for_dispatch, release_unstarted_claim
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            idle = self._state(gcode_state="IDLE", subtask=None)
+            stack.enter_context(patch.object(printer_manager, "get_status", return_value=idle))
+            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            outcomes, _dispositions = self.spy_policy(stack)
+            printer_id, item_id, _batch = await self._seed_farm_unit(mocks.maker, serial="DST-1", subtask="SUB-DEAD")
+
+            await stop_as_operator(printer_id)  # the sole printing unit carries the request
+            async with mocks.maker() as s:
+                assert (await s.get(PrintQueueItem, item_id)).operator_stop_requested_at is not None
+                assert await release_unstarted_claim(s, item_id=item_id)  # the claim was dead
+                await s.commit()
+            async with mocks.maker() as s:  # the re-dispatch of the same row, under a new id
+                assert await claim_pending_for_dispatch(
+                    s, item_id=item_id, started_at=datetime.now(timezone.utc), ams_mapping=None, printer_id=printer_id
+                )
+                (await s.get(PrintQueueItem, item_id)).dispatch_subtask_id = "SUB-NEW"
+                await s.commit()
+
+            await self._terminal(printer_id, subtask="SUB-NEW", status="failed", deposited=True)
+            await self._settle(tasks_before)
+
+            (outcome,) = outcomes
+            assert outcome.verdict is None
+            assert outcome.recorded_status == "failed"
+            async with mocks.maker() as s:
+                item = await s.get(PrintQueueItem, item_id)
+                assert (item.status, item.stop_source, item.operator_stop_requested_at) == ("failed", None, None)
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_terminal_for_a_queue_stopped_job_disposes_the_unit_once(self, test_engine):
+        """Nothing in process memory marks the first terminal any more: the row's own answer
+        (``stop_answered_at``) does, so the second terminal still resolves to the farm's unit
+        (never FOREIGN) and is owed nothing for it — one hold, one page."""
+        from contextlib import ExitStack
+
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.services import farm_policy
+        from backend.app.services.printer_manager import printer_manager
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            stopped_page = stack.enter_context(
+                patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
+            )
+            stack.enter_context(patch.object(printer_manager, "stop_print", return_value=True))
+            outcomes, dispositions = self.spy_policy(stack)
+            printer_id, item_id, batch_id = await self._seed_farm_unit(mocks.maker, serial="DUP-1", subtask="SUB-DQ")
+
+            await self.queue_page_stop(mocks.maker, item_id)
+            await self._terminal(printer_id, subtask="SUB-DQ", deposited=True)
+            await self._settle(tasks_before)
+            self.restart()
+            await self._terminal(printer_id, subtask="SUB-DQ", deposited=True)
+            await self._settle(tasks_before)
+
+            assert [o.verdict for o in outcomes] == ["operator_ui", "operator_ui"]
+            assert dispositions == [item_id]  # ONE disposition for the unit
+            stopped_page.assert_awaited_once()  # ONE page
+            mocks.notif.on_foreign_job_detected.assert_not_awaited()  # and never a foreign one
+            async with mocks.maker() as s:
+                batch = await s.get(PrintBatch, batch_id)
+                assert batch.pause_reason == "operator_stop"
 
 
 class TestReconciledUnknownOutcome:

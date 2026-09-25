@@ -57,7 +57,11 @@ from backend.app.services.printer_manager import (
     supports_drying,
     supports_drying_while_printing,
 )
-from backend.app.services.queue_transitions import claim_pending_for_dispatch
+from backend.app.services.queue_transitions import (
+    claim_pending_for_dispatch,
+    fail_unclaimed_dispatch,
+    record_unit_terminal,
+)
 from backend.app.services.requeue import ReturnOutcome, return_to_queue
 from backend.app.services.smart_plug_manager import smart_plug_manager
 from backend.app.services.spool_selection import (
@@ -3295,17 +3299,40 @@ class PrintScheduler:
         none, and two printers each failing once would never quarantine either.
         Defaults to the row's own value so the call sites outside ``_start_print``
         (which fail an item that is already attributed) need not repeat it.
+
+        The write is the queue-transition owner's, by the row's lifecycle: every site
+        but the print-command failure fires BEFORE the claim, on a ``pending`` row
+        (``fail_unclaimed_dispatch``); the print-command failure fires after it, on the
+        row the claim made ``printing`` (``record_unit_terminal``, the one writer of a
+        unit's end — the claim already recorded the printer). Both are conditional, and
+        both clear ``waiting_reason`` in the same statement (W4b). A row another actor
+        moved first — an operator cancel landing while the scheduler decided — is not
+        this dispatch's failure: nothing is written over it and no policy runs for it.
         """
         printer_id = printer_id if printer_id is not None else item.printer_id
-        item.status = "failed"
-        item.error_message = error_message
-        item.completed_at = datetime.now(timezone.utc)
-        # Terminal-transition hygiene (W4b): NULL any stale hold token in the SAME
-        # update that sets the terminal status, so a dispatch-time failure can't
-        # leave e.g. a capability-block waiting_reason on a now-failed row.
-        item.waiting_reason = None
-        item.printer_id = printer_id
+        now = datetime.now(timezone.utc)
+        if item.status == "printing":
+            failed = await record_unit_terminal(
+                db, item.id, status="failed", completed_at=now, error_message=error_message
+            )
+        else:
+            failed = await fail_unclaimed_dispatch(
+                db, item.id, printer_id=printer_id, error_message=error_message, completed_at=now
+            )
         await db.commit()
+        if not failed:
+            current = await db.scalar(select(PrintQueueItem.status).where(PrintQueueItem.id == item.id))
+            logger.warning(
+                "Queue item %s: dispatch failure (%s) not recorded — the row left %r before the write (now %r)",
+                item.id,
+                error_message,
+                item.status,
+                current,
+            )
+            return
+        # The UPDATE ran with ``synchronize_session=False``; readers below (and the caller)
+        # see the row the database now holds.
+        await db.refresh(item)
         # Dispatch-progress telemetry: EVERY dispatch-time failure funnels through
         # here, so a single emit covers all failure paths (C4-backend).
         dispatch_progress.emit_queue_item_status(
@@ -4013,19 +4040,9 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
-        # Register as expected print so we don't create a duplicate archive
-        # Only applicable for archive-based prints
-        if archive:
-            from backend.app.main import register_expected_print
-
-            register_expected_print(
-                printer_id,
-                remote_filename,
-                archive.id,
-                ams_mapping=ams_mapping,
-                created_by_id=item.created_by_id,
-                plate_id=item.plate_id,
-            )
+        # No print-start registration: the print's archive is found at start by its job id —
+        # ``print_binding.attach`` reads this unit's ``dispatch_subtask_id``, ``archive_id``,
+        # ``ams_mapping`` and ``plate_id`` straight off the row the claim below commits.
 
         # Propagate the queue item's owner into printer_manager so the
         # print-complete callback can credit the user in the PrintLogEntry

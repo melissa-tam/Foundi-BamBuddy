@@ -172,7 +172,7 @@ import { getAmsLabel, getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, ge
 import { slotPresence } from '../utils/spoolBindingStatus';
 import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
-import { deriveFarmPhase } from '../utils/farmPhase';
+import { coolingLabel, deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { wasFeedingTrayId, slotRanOut } from '../utils/slotStatus';
 import { amsCommandToast, type AmsCommand } from '../utils/amsCommand';
@@ -2301,17 +2301,14 @@ function PrinterCard({
       if (phase?.kind === 'cooling') {
         // A HELD plate (hold_z) keeps the toolhead parked at the chute for the
         // whole wait — that constraint is the operator's, so it rides a tooltip
-        // on the pill rather than the pill's own one-line label.
-        return phase.held
-          ? {
-              label: t('printers.phase.coolingHeld', { threshold: Math.round(phase.threshold) }),
-              className: 'bg-blue-500/20 text-blue-400',
-              title: t('printers.phase.coolingHeldHint'),
-            }
-          : {
-              label: t('printers.phase.cooling', { threshold: Math.round(phase.threshold) }),
-              className: 'bg-blue-500/20 text-blue-400',
-            };
+        // on the pill rather than the pill's own one-line label. The label
+        // itself (eject line or plateau) is `coolingLabel`'s choice.
+        const cooling = coolingLabel(phase);
+        return {
+          label: t(cooling.key, { threshold: cooling.threshold }),
+          className: 'bg-blue-500/20 text-blue-400',
+          ...(phase.held ? { title: t('printers.phase.coolingHeldHint') } : {}),
+        };
       }
       return {
         label: t('printers.plateStatus.notCleared'),
@@ -7125,17 +7122,24 @@ function PrinterCard({
       )}
 
       {/* W2 hot-bed eject confirmation: the backend refused the eject because
-          the bed is above the release threshold; the operator explicitly
-          confirms sweeping while hot, and we re-call with allow_hot=true.
-          Mirrors the recover-confirm's Esc/click-outside/Enter semantics via
-          the shared ConfirmModal. */}
+          the bed is above the release threshold — or because nothing (no eject
+          line, no chamber reading) says it is cool enough; the operator
+          explicitly confirms sweeping while hot, and we re-call with
+          allow_hot=true. Mirrors the recover-confirm's Esc/click-outside/Enter
+          semantics via the shared ConfirmModal. */}
       {ejectPlate.hotConfirm && (
         <ConfirmModal
           title={t('printers.eject.confirmTitle')}
-          message={t('printers.eject.confirmBody', {
-            bed: Math.round(ejectPlate.hotConfirm.bedC),
-            threshold: Math.round(ejectPlate.hotConfirm.thresholdC),
-          })}
+          message={
+            ejectPlate.hotConfirm.thresholdC === null
+              ? t('printers.eject.confirmBodyNoLine', {
+                  bed: Math.round(ejectPlate.hotConfirm.bedC),
+                })
+              : t('printers.eject.confirmBody', {
+                  bed: Math.round(ejectPlate.hotConfirm.bedC),
+                  threshold: Math.round(ejectPlate.hotConfirm.thresholdC),
+                })
+          }
           confirmText={t('printers.eject.confirm')}
           cancelText={t('printers.eject.cancel')}
           variant="danger"

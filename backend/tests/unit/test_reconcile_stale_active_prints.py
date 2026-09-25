@@ -1,467 +1,737 @@
-"""Tests for the connected-edge reconciliation that recovers from missed
-PRINT COMPLETE events (#1542 follow-up).
+"""The downtime reconcile (#1542 follow-up; rebuilt 2026-09-25 for RC3).
 
-Background: the PRINT COMPLETE MQTT callback is purely reactive to a single
-state transition (RUNNING → IDLE / FINISH / FAILED). When the printer
-finishes during an MQTT disconnect window — typical on the A1 line with
-unstable MQTT keepalives — Bambuddy never observes the transition. If a
-smart plug then cuts power between completion and the next reconnect, the
-firmware auto-replays whatever's still on the SD card and produces a ghost
-print on next power-up. Reporter (#1542 second case) saw this hit 4 out of
-4 of his A1s.
+Background: the PRINT COMPLETE callback reacts to one state transition. A print that ends during an
+MQTT disconnect window — or across a Bambuddy restart — is never observed ending, and its archive
+stays ``printing``. Once per MQTT session, on the session's first FRESH report, ``main``'s
+connected-edge hook asks the binding owner what became of the printer's live archive
+(``services/print_reconcile``).
 
-These tests cover:
-  * `_is_active_archive_stale` — the pure decision function for whether an
-    archive in `status="printing"` should be reconciled given the printer's
-    current state.
-  * `reconcile_stale_active_prints` — the orchestrator that queries the DB,
-    runs the decision function, and synthesises `on_print_complete` for
-    each stale archive.
-  * the DEPOSIT reading of those synthesised payloads — see
-    `TestReconciledTerminalsGateThePlate` for the 2026-08-29 restart-recovery
-    incident that changed it.
+RC3 (production 2026-09-16 → 09-24): the old reconcile replayed such an archive as a PRINTER
+terminal even while the printer ran ANOTHER job — a plate gate raised mid-print, a foreign-job page,
+~7.2 kg of phantom filament charged from the live job's progress, the running job's usage session
+popped. These tests pin the rebuilt shape:
+
+* ``judge`` — the pure verdict table, every live-state × freshness × identity × run-unit cell;
+* the evidence it is fed and the payload the ``ended`` verdict synthesises (the 2026-08-29
+  deposit pins moved here from the old synthesiser);
+* the reconcile THROUGH ``main.reconcile_stale_active_prints`` (the hook's body) and the REAL
+  ``main.on_print_complete`` over the test database (``_fixtures/print_callbacks``): superseded,
+  ended, ended-unattributed and observed, each with what it must NOT do.
+
+The hook's trigger (the cached-state broadcast does not fire it, the first fresh report does, once
+per session) is pinned in ``test_printer_offline_notification.TestReconcileOncePerSession``.
 """
 
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import func, select
 
-from backend.app.main import _is_active_archive_stale
-from backend.app.services.plate_occupancy import DepositEvidence, plate_occupancy
+from backend.app.services.bambu_mqtt import job_consumption_evidence
+from backend.app.services.plate_occupancy import (
+    CooldownEject,
+    DepositEvidence,
+    EscalationOnly,
+    PendingEject,
+    plate_occupancy,
+)
+from backend.app.services.print_reconcile import ArchiveEvidence, ended_payload, evidence_of, judge
+from backend.tests._fixtures.print_callbacks import (
+    STORAGE_HASH_FILENAME,
+    archive_row,
+    drain_new_tasks,
+    live_state,
+    print_callbacks,
+    seed_archive,
+    seed_printer,
+)
+
+EARLIER = datetime.now(timezone.utc) - timedelta(hours=5)
+
+# ---------------------------------------------------------------------------
+# The judge — a table
+# ---------------------------------------------------------------------------
+
+_STATES = {
+    "active": ("PREPARE", "SLICING", "RUNNING", "PAUSE"),
+    "ended": ("IDLE", "FINISH", "FAILED"),
+    "unknown": ("", "UNKNOWN", "OFFLINE"),
+}
+# (live_job, archive_job) per identity. ``unknown`` is either side naming no job — "" and "0" are
+# the printer's two words for that, None the archive's.
+_IDENTITIES = {
+    "same": (("J1", "J1"),),
+    "other": (("J2", "J1"),),
+    "unknown": (("", "J1"), ("0", "J1"), (None, "J1"), ("J1", None)),
+}
+# The run unit: none, or still printing (both "not ended"), or ended.
+_UNIT = {False: (None,), True: ("completed", "failed", "cancelled", "skipped")}
+
+# THE table: (state group, fresh, identity, run unit ended) -> verdict. Written out cell by cell so
+# the precedence is read here, not re-derived.
+_EXPECTED: dict[tuple[str, bool, str, bool], str] = {
+    # A state that is not this session's is no evidence — whatever else it says.
+    **{("active", False, i, u): "running" for i in _IDENTITIES for u in (False, True)},
+    **{("ended", False, i, u): "running" for i in _IDENTITIES for u in (False, True)},
+    **{("unknown", f, i, u): "running" for f in (False, True) for i in _IDENTITIES for u in (False, True)},
+    # Active on this job, or on one it cannot compare: leave it to its own terminal — ahead of observed.
+    ("active", True, "same", False): "running",
+    ("active", True, "same", True): "running",
+    ("active", True, "unknown", False): "running",
+    ("active", True, "unknown", True): "running",
+    # Active on ANOTHER job: over, outcome unknown — unless the run already recorded its end.
+    ("active", True, "other", False): "superseded",
+    ("active", True, "other", True): "observed",
+    # Ended, naming this job: the full terminal — unless the run already recorded its end.
+    ("ended", True, "same", False): "ended",
+    ("ended", True, "same", True): "observed",
+    # Ended, naming another job or none: the plate held source-less + the superseded job phase.
+    ("ended", True, "other", False): "ended_unattributed",
+    ("ended", True, "other", True): "observed",
+    ("ended", True, "unknown", False): "ended_unattributed",
+    ("ended", True, "unknown", True): "observed",
+}
 
 
-@pytest.fixture(autouse=True)
-def _clean_occupancy_authority():
-    """Isolate the module-singleton occupancy authority.
+def _cells():
+    for (group, fresh, identity, unit_ended), verdict in _EXPECTED.items():
+        for state in _STATES[group]:
+            for live_job, archive_job in _IDENTITIES[identity]:
+                for unit_status in _UNIT[unit_ended]:
+                    yield pytest.param(
+                        ArchiveEvidence(
+                            live_state=state,
+                            live_fresh=fresh,
+                            live_job=live_job,
+                            archive_job=archive_job,
+                            run_unit_status=unit_status,
+                        ),
+                        verdict,
+                        id=f"{state or 'EMPTY'}-{'fresh' if fresh else 'stale'}-{identity}-{live_job}/{archive_job}-{unit_status}",
+                    )
 
-    The synthesised terminals below are read by ``DepositEvidence`` to decide whether
-    the plate gate goes up, so no record (and no injected callable) may leak between
-    tests or in from another module.
-    """
-    plate_occupancy.reset_for_tests()
-    yield
-    plate_occupancy.reset_for_tests()
+
+def test_the_table_covers_every_cell():
+    """Every (group, freshness, identity, unit) combination has a written verdict."""
+    assert len(_EXPECTED) == len(_STATES) * 2 * len(_IDENTITIES) * 2
 
 
-def _state(
-    state: str,
-    *,
-    subtask_id: str = "",
-    subtask_name: str = "",
-    connected: bool = True,
-    progress: float = 0.0,
-    layer_num: int = 0,
-) -> SimpleNamespace:
-    """Minimal PrinterState stub for the pure decision function."""
-    return SimpleNamespace(
-        state=state,
-        subtask_id=subtask_id,
-        subtask_name=subtask_name,
-        connected=connected,
-        progress=progress,
-        layer_num=layer_num,
-        raw_data={},
+@pytest.mark.parametrize(("evidence", "verdict"), list(_cells()))
+def test_judge(evidence, verdict):
+    assert judge(evidence) == verdict
+
+
+class TestEvidence:
+    """What the judge is fed: the state upper-cased, freshness from THIS session's first report,
+    and the run unit's status only once it ended."""
+
+    @staticmethod
+    def _state(**overrides):
+        fields = {
+            "connected": True,
+            "connection_epoch": 3,
+            "report_epoch": 3,
+            "state": "running",
+            "subtask_id": "J2",
+        }
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
+
+    @staticmethod
+    def _archive(subtask_id="J1"):
+        return SimpleNamespace(subtask_id=subtask_id)
+
+    def test_the_state_is_upper_cased_and_the_ids_carried_raw(self):
+        ev = evidence_of(self._state(), self._archive(), None)
+        assert (ev.live_state, ev.live_job, ev.archive_job, ev.live_fresh) == ("RUNNING", "J2", "J1", True)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"connected": False},
+            {"report_epoch": None},  # _on_connect cleared it: the cached broadcast
+            {"report_epoch": 2},  # the previous session's report
+        ],
+        ids=["disconnected", "no-report-yet", "previous-session"],
     )
+    def test_a_state_that_is_not_this_sessions_is_not_fresh(self, overrides):
+        assert evidence_of(self._state(**overrides), self._archive(), None).live_fresh is False
 
-
-def _archive(
-    subtask_id: str | None = "ABC123", filename: str = "ghost.3mf", print_name: str = "ghost"
-) -> SimpleNamespace:
-    """Minimal PrintArchive stub — only the fields the decision function reads."""
-    return SimpleNamespace(
-        id=42,
-        subtask_id=subtask_id,
-        filename=filename,
-        print_name=print_name,
+    @pytest.mark.parametrize(
+        ("unit", "status"),
+        [
+            (None, None),
+            (SimpleNamespace(status="printing"), None),
+            (SimpleNamespace(status="completed"), "completed"),
+            (SimpleNamespace(status="cancelled"), "cancelled"),
+        ],
     )
+    def test_the_run_unit_counts_only_once_it_ended(self, unit, status):
+        assert evidence_of(self._state(), self._archive(), unit).run_unit_status == status
 
 
-class TestIsActiveArchiveStale:
-    """Decision function — covers all three stale triggers + the
-    intentionally-conservative no-op cases."""
-
-    # Trigger 1: printer is in a terminal state.
-    @pytest.mark.parametrize("terminal_state", ["IDLE", "FINISH", "FAILED", "idle", "finish", "failed"])
-    def test_terminal_state_marks_stale(self, terminal_state):
-        archive = _archive(subtask_id="ABC123")
-        state = _state(terminal_state, subtask_id="ABC123", subtask_name="ghost")
-        is_stale, reason = _is_active_archive_stale(archive, state)
-        assert is_stale is True
-        assert terminal_state.upper() in reason
-
-    # Trigger 2: printer is running a different subtask_id.
-    def test_subtask_id_changed_marks_stale(self):
-        archive = _archive(subtask_id="OLD_ID")
-        state = _state("RUNNING", subtask_id="NEW_ID", subtask_name="something")
-        is_stale, reason = _is_active_archive_stale(archive, state)
-        assert is_stale is True
-        assert "subtask_id" in reason
-        assert "OLD_ID" in reason
-        assert "NEW_ID" in reason
-
-    # Trigger 3: printer is running but doesn't know what it's running.
-    def test_empty_subtask_name_marks_stale(self):
-        archive = _archive(subtask_id="ABC123")
-        state = _state("RUNNING", subtask_id="", subtask_name="")
-        is_stale, reason = _is_active_archive_stale(archive, state)
-        assert is_stale is True
-        assert "empty" in reason.lower() or "subtask_name" in reason
-
-    # Healthy case: same subtask_id, running.
-    def test_matching_running_print_not_stale(self):
-        archive = _archive(subtask_id="ABC123")
-        state = _state("RUNNING", subtask_id="ABC123", subtask_name="ghost")
-        is_stale, _ = _is_active_archive_stale(archive, state)
-        assert is_stale is False
-
-    # PAUSE is not a stale signal — the print is paused, not ended.
-    def test_paused_print_with_matching_subtask_not_stale(self):
-        archive = _archive(subtask_id="ABC123")
-        state = _state("PAUSE", subtask_id="ABC123", subtask_name="ghost")
-        is_stale, _ = _is_active_archive_stale(archive, state)
-        assert is_stale is False
-
-    # PREPARE / SLICING are not stale either — pre-print phases.
-    @pytest.mark.parametrize("pre_running_state", ["PREPARE", "SLICING"])
-    def test_pre_running_states_with_matching_subtask_not_stale(self, pre_running_state):
-        archive = _archive(subtask_id="ABC123")
-        state = _state(pre_running_state, subtask_id="ABC123", subtask_name="ghost")
-        is_stale, _ = _is_active_archive_stale(archive, state)
-        assert is_stale is False
-
-    # Missing subtask_id on the archive side: don't have evidence either
-    # way, fall through to the empty-subtask_name check.
-    def test_archive_with_no_subtask_id_falls_to_subtask_name_check(self):
-        archive = _archive(subtask_id=None)
-        state = _state("RUNNING", subtask_id="ANYTHING", subtask_name="something")
-        # Subtask_name is populated → not stale, no false positive.
-        is_stale, _ = _is_active_archive_stale(archive, state)
-        assert is_stale is False
-
-    # Missing subtask_id on both sides: still triggers the empty-subtask_name
-    # branch if the printer doesn't know what it's running.
-    def test_both_subtask_ids_missing_running_with_empty_name_stale(self):
-        archive = _archive(subtask_id=None)
-        state = _state("RUNNING", subtask_id="", subtask_name="")
-        is_stale, _ = _is_active_archive_stale(archive, state)
-        assert is_stale is True
-
-    # IDLE wins over PRINT-STATE checks — the terminal-state branch fires
-    # first regardless of what the subtask fields look like.
-    def test_idle_state_overrides_matching_subtask(self):
-        archive = _archive(subtask_id="ABC123")
-        state = _state("IDLE", subtask_id="ABC123", subtask_name="ghost")
-        is_stale, reason = _is_active_archive_stale(archive, state)
-        assert is_stale is True
-        assert "IDLE" in reason
-
-    # #1679: defensive pre-push guard. Even if reconcile gets called against
-    # a PrinterState that's still on construction defaults (state="unknown"
-    # / empty / None, subtask_name=""), the function must NOT report stale —
-    # otherwise the reactive PRINT COMPLETE later creates a duplicate
-    # archive and filament gets double-counted. The on_printer_status_change
-    # caller is the primary fix (gates the reconcile spawn on real state),
-    # but this guard is belt-and-braces for any future caller.
-    @pytest.mark.parametrize("degenerate_state", ["unknown", "UNKNOWN", "Unknown", "", None])
-    def test_pre_push_state_returns_not_stale_even_with_empty_subtask(self, degenerate_state):
-        archive = _archive(subtask_id="ABC123")
-        state = _state(degenerate_state, subtask_id="", subtask_name="")
-        is_stale, _ = _is_active_archive_stale(archive, state)
-        assert is_stale is False, (
-            f"state.state={degenerate_state!r} means MQTT hasn't pushed real data yet; "
-            "treating an in-flight archive as stale here causes the #1679 "
-            "duplicate-archive + filament-double-count regression"
-        )
+# ---------------------------------------------------------------------------
+# The terminal an ``ended`` verdict synthesises (the deposit pins of 2026-08-29)
+# ---------------------------------------------------------------------------
 
 
-class TestReconcileStaleActivePrints:
-    """Orchestrator-level tests — mock the printer manager + DB session so
-    we can drive the decision flow end-to-end without standing up real
-    fixtures.
+def _ended_state(state: str, *, progress: float = 0.0, layer: int = 0, **job_fields):
+    fields = {"total_layers": 0, "tray_change_log": [], "tray_now": 255, "last_loaded_tray": -1, "raw_data": {}}
+    fields.update(job_fields)
+    return SimpleNamespace(state=state, subtask_id="ARCHIVE_ID", progress=progress, layer_num=layer, **fields)
 
-    These cover:
-      * No printer status (disconnected) → no-op, no on_print_complete fired.
-      * No active archives → no-op.
-      * Stale archive → synthesised on_print_complete called with status
-        ``"aborted"`` and the `_reconciled: True` marker so downstream code
-        can distinguish synthetic from real completions.
-      * Non-stale archive → on_print_complete NOT called (no false positive
-        on a healthy in-flight print).
-      * Exception inside on_print_complete must NOT block reconciliation
-        for subsequent archives or crash the caller.
-    """
 
-    @pytest.mark.asyncio
-    async def test_no_status_skips_reconciliation(self):
-        from backend.app.main import reconcile_stale_active_prints
+_GHOST = SimpleNamespace(filename="ghost.3mf", print_name="ghost", subtask_id="ARCHIVE_ID")
 
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = None
-            count = await reconcile_stale_active_prints(printer_id=1)
-        assert count == 0
 
-    @pytest.mark.asyncio
-    async def test_disconnected_status_skips_reconciliation(self):
-        from backend.app.main import reconcile_stale_active_prints
+class TestEndedPayload:
+    """FINISH / FAILED of THIS job is real evidence; IDLE says only that it ended. Both are reported
+    as un-measured (``peaks_reliable: False``) — nobody observed this print's peaks."""
 
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("RUNNING", connected=False)
-            count = await reconcile_stale_active_prints(printer_id=1)
-        # Disconnected state would be making decisions against cached state —
-        # the connected-edge handler in on_printer_status_change is the only
-        # place that should drive reconciliation.
-        assert count == 0
-
-    @pytest.mark.asyncio
-    async def test_no_active_archives_returns_zero(self):
-        from backend.app.main import reconcile_stale_active_prints
-
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("IDLE")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                count = await reconcile_stale_active_prints(printer_id=1)
-        assert count == 0
-
-    @pytest.mark.asyncio
-    async def test_stale_archive_synthesises_aborted_completion(self):
-        from backend.app.main import reconcile_stale_active_prints
-
-        stale = _archive(subtask_id="OLD_ID", filename="ghost.3mf", print_name="ghost")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("IDLE", subtask_id="", subtask_name="")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
-        assert count == 1
-        mock_complete.assert_awaited_once()
-        # Verify the synthesised payload shape.
-        args, kwargs = mock_complete.call_args
-        assert args[0] == 1
-        payload = args[1]
-        assert payload["status"] == "aborted"
-        assert payload["filename"] == "ghost.3mf"
-        assert payload["_reconciled"] is True
-        # NOBODY observed this print's layer/progress peaks — see
-        # TestReconciledTerminalsGateThePlate for what that now means.
-        assert payload["peaks_reliable"] is False
-        # ...and NOBODY observed how it ended either. This branch SAYS so, and the one
-        # classifier turns the flag into the ``reconcile_unknown`` verdict, so the run
-        # holds for a human instead of quietly finishing one plate short (2026-09-19).
-        assert payload["outcome_unknown"] is True
-
-    @pytest.mark.asyncio
-    async def test_non_stale_archive_does_not_synthesise(self):
-        from backend.app.main import reconcile_stale_active_prints
-
-        healthy = _archive(subtask_id="ABC123")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("RUNNING", subtask_id="ABC123", subtask_name="ghost")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(
-                    return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [healthy]))
-                )
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
-        assert count == 0
-        mock_complete.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_finish_matching_subtask_synthesises_completed_with_real_evidence(self):
-        """Phase 3.4: live FINISH + subtask matching THIS archive → synthesise the
-        TRUE 'completed' with real progress/layers/subtask so the normal terminal
-        path (correlation → gate → monitor → farm_policy) runs on real evidence."""
-        from backend.app.main import reconcile_stale_active_prints
-
-        stale = _archive(subtask_id="MATCH", filename="done.3mf", print_name="done")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state(
-                "FINISH", subtask_id="MATCH", subtask_name="done", progress=100.0, layer_num=250
-            )
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
-        assert count == 1
-        payload = mock_complete.call_args[0][1]
+    def test_finish_synthesises_completed_with_the_live_evidence(self):
+        payload = ended_payload(_ended_state("FINISH", progress=100.0, layer=250), _GHOST)
         assert payload["status"] == "completed"
-        assert payload["subtask_id"] == "MATCH"
-        assert payload["last_progress"] == 100.0
-        assert payload["last_layer_num"] == 250
-        assert payload["_reconciled"] is True
-        # The figures are the LIVE state's, not peaks this process tracked, so they
-        # are reported honestly as un-measured.
+        assert payload["subtask_id"] == "ARCHIVE_ID"
+        assert (payload["last_progress"], payload["last_layer_num"]) == (100.0, 250)
         assert payload["peaks_reliable"] is False
+        assert payload["_reconciled"] is True
 
-    @pytest.mark.asyncio
-    async def test_failed_matching_subtask_synthesises_failed(self):
-        from backend.app.main import reconcile_stale_active_prints
-
-        stale = _archive(subtask_id="MATCH", filename="bad.3mf", print_name="bad")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state(
-                "FAILED", subtask_id="MATCH", subtask_name="bad", progress=42.0, layer_num=88
-            )
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
-        assert count == 1
-        payload = mock_complete.call_args[0][1]
+    def test_failed_synthesises_failed(self):
+        payload = ended_payload(_ended_state("FAILED", progress=42.0, layer=88), _GHOST)
         assert payload["status"] == "failed"
         assert payload["last_layer_num"] == 88
-        assert payload["peaks_reliable"] is False
 
-    @pytest.mark.asyncio
-    async def test_finish_mismatched_subtask_keeps_aborted(self):
-        """A live FINISH whose subtask does NOT match this archive is not proof of
-        THIS print's outcome → keep today's conservative 'aborted' (no progress)."""
-        from backend.app.main import reconcile_stale_active_prints
+    @pytest.mark.parametrize("state", ["FINISH", "FAILED"])
+    def test_the_jobs_consumption_evidence_rides_in_the_mqtt_terminals_own_keys(self, state):
+        """``ended`` means the live job IS this archive's (the ids matched), so its live record is this
+        job's evidence — carried in the payload, because the charge never reads the live printer. A
+        snapshot, never a reference: the client keeps mutating its state."""
+        live = _ended_state(
+            state,
+            progress=42.0,
+            layer=88,
+            total_layers=200,
+            tray_change_log=[(0, 0), (1, 60)],
+            tray_now=1,
+            last_loaded_tray=1,
+            raw_data={"mapping": [0, 65535]},
+        )
 
-        stale = _archive(subtask_id="ARCHIVE_ID", filename="ghost.3mf", print_name="ghost")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state(
-                "FINISH", subtask_id="DIFFERENT", subtask_name="other", progress=100.0, layer_num=200
-            )
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
-        assert count == 1
-        payload = mock_complete.call_args[0][1]
+        payload = ended_payload(live, _GHOST)
+
+        assert {key: payload[key] for key in job_consumption_evidence(live)} == {
+            "total_layers": 200,
+            "tray_change_log": [(0, 0), (1, 60)],
+            "tray_now": 1,
+            "last_loaded_tray": 1,
+            "mqtt_mapping": [0, 65535],
+        }
+        live.tray_change_log.append((2, 90))
+        assert payload["tray_change_log"] == [(0, 0), (1, 60)]
+
+    def test_idle_synthesises_an_unknown_outcome(self):
+        """The one classifier turns ``outcome_unknown`` into ``reconcile_unknown`` — the run HOLDS for
+        a human instead of finishing one plate short (2026-09-19)."""
+        payload = ended_payload(_ended_state("IDLE", tray_change_log=[(0, 0)], tray_now=0), _GHOST)
         assert payload["status"] == "aborted"
-        assert "last_progress" not in payload  # conservative — no fabricated evidence
+        assert payload["outcome_unknown"] is True
+        assert payload["subtask_id"] == "ARCHIVE_ID"
+        assert "last_progress" not in payload  # no fabricated evidence
+        assert "tray_change_log" not in payload and "mqtt_mapping" not in payload  # nothing to charge from
         assert payload["peaks_reliable"] is False
-
-    @pytest.mark.asyncio
-    async def test_on_print_complete_failure_does_not_block_rest(self):
-        """An exception during one archive's synthesis must not abort
-        reconciliation for the other archives — and must not propagate to
-        the caller (the connected-edge handler is a hot path)."""
-        from backend.app.main import reconcile_stale_active_prints
-
-        a1 = _archive(subtask_id="A", filename="a.3mf")
-        a1.id = 1
-        a2 = _archive(subtask_id="B", filename="b.3mf")
-        a2.id = 2
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("IDLE")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [a1, a2])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                # First call raises, second call must still happen.
-                mock_complete = AsyncMock(side_effect=[RuntimeError("boom"), None])
-                with patch("backend.app.main.on_print_complete", new=mock_complete):
-                    count = await reconcile_stale_active_prints(printer_id=1)
-        # Only the second archive is recorded as reconciled (first raised).
-        assert count == 1
-        assert mock_complete.await_count == 2
 
 
 class TestReconciledTerminalsGateThePlate:
     """The 2026-08-29 → 08-30 restart-recovery cascade, pinned at its source.
 
-    **This is a deliberate BEHAVIOUR FLIP, not a regression.** A reconciled terminal
-    is synthesised for a print NOBODY observed: either it finished inside an MQTT
-    disconnect window, or the client that would have tracked it was born mid-print.
-    Either way the layer/progress peaks live in PROCESS MEMORY and are not a
-    measurement of this job, which every reconcile payload now says outright with
-    ``peaks_reliable: False``.
-
-    Before the occupancy cut-over the ``aborted`` shape carried no progress or layer
-    keys at all, and the deposit test read those absent keys as zeros — "this print
-    produced nothing, so the plate is empty". That fabricated a measurement out of an
-    absence, and on the night of 2026-08-29 it cost the farm six plates across
-    printers 1-6: six prints that physically FINISHED were classified "no-deposit —
-    not gating queue", so no gate went up, no eject was armed, each unit recorded
-    ``cancelled`` though it had completed, and the next unit dispatched onto the
-    finished part 1-5 seconds later.
-
-    ``DepositEvidence`` now fails closed on unreliable peaks, so a reconciled
-    terminal GATES the plate and a human decides. The cost of the new behaviour is a
-    plate-clear click after a downtime reconcile; the cost of the old one was
-    printing into a finished part.
+    A reconciled terminal is synthesised for a print NOBODY observed, so its peaks are not a
+    measurement of the job. The ``aborted`` shape once read its ABSENT peaks as zeros — "nothing on
+    the plate" — and six physically FINISHED prints on printers 1-6 went ungated, recorded
+    ``cancelled``, with the next unit dispatched onto each finished part. ``DepositEvidence`` fails
+    closed on unreliable peaks, so a reconciled terminal GATES the plate and a human decides.
     """
 
-    @staticmethod
-    async def _reconciled_payload(live_state) -> dict:
-        """Run one reconcile pass and hand back the payload it synthesised."""
-        from backend.app.main import reconcile_stale_active_prints
-
-        stale = _archive(subtask_id="ARCHIVE_ID", filename="ghost.3mf", print_name="ghost")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = live_state
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    await reconcile_stale_active_prints(printer_id=1)
-        return mock_complete.call_args[0][1]
-
-    @pytest.mark.asyncio
-    async def test_the_aborted_shape_now_deposits_and_gates_the_plate(self):
-        """THE incident pin. An IDLE printer with an archive still reading ``printing``
-        is the restart-recovery shape, and its ``aborted`` synthesis used to read as
-        "nothing on the plate"."""
-        payload = await self._reconciled_payload(_state("IDLE", subtask_id="", subtask_name=""))
-
-        assert payload["status"] == "aborted"
-        assert payload["peaks_reliable"] is False
-        assert "last_layer_num" not in payload  # no fabricated evidence, either way
-
-        evidence = DepositEvidence.from_terminal_payload(payload, is_dry_run=False)
-
+    def test_the_aborted_shape_deposits_and_gates_the_plate(self):
+        evidence = DepositEvidence.from_terminal_payload(ended_payload(_ended_state("IDLE"), _GHOST), is_dry_run=False)
         assert evidence.deposited is True, (
-            "an unobserved terminal must gate the plate — reading its absent peaks as "
-            "zeros is the 2026-08-29 cascade (six ungated plates, six units recorded "
-            "cancelled though they physically completed)"
+            "an unobserved terminal must gate the plate — reading its absent peaks as zeros is the "
+            "2026-08-29 cascade (six ungated plates, six units recorded cancelled though they completed)"
         )
 
-    @pytest.mark.asyncio
-    async def test_a_reconciled_finish_deposits_on_the_completed_limb(self):
-        """A print the printer itself says it finished deposits regardless of peaks —
-        this is the limb that would have gated all six of that night's plates."""
-        payload = await self._reconciled_payload(
-            _state("FINISH", subtask_id="ARCHIVE_ID", subtask_name="ghost", progress=100.0, layer_num=250)
-        )
-
-        assert payload["status"] == "completed"
-        assert payload["peaks_reliable"] is False
-
+    @pytest.mark.parametrize("state", ["FINISH", "FAILED"])
+    def test_a_reconciled_finish_or_failure_deposits(self, state):
+        payload = ended_payload(_ended_state(state, progress=42.0, layer=88), _GHOST)
         assert DepositEvidence.from_terminal_payload(payload, is_dry_run=False).deposited is True
 
-    @pytest.mark.asyncio
-    async def test_a_reconciled_failure_deposits_too(self):
-        """A FAILED print stopped part-way has a partial part on the bed. With the
-        peaks un-measured there is nothing that could say otherwise."""
-        payload = await self._reconciled_payload(
-            _state("FAILED", subtask_id="ARCHIVE_ID", subtask_name="ghost", progress=42.0, layer_num=88)
-        )
-
-        assert payload["status"] == "failed"
-        assert DepositEvidence.from_terminal_payload(payload, is_dry_run=False).deposited is True
-
-    @pytest.mark.asyncio
-    async def test_a_reconciled_dry_run_still_never_deposits(self):
-        """The one exemption the fix did NOT widen: the eject dry-run file is
-        motion-only by design, so a dry run that ended during downtime must not gate
-        a plate it could not have put anything on."""
-        payload = await self._reconciled_payload(_state("IDLE", subtask_id="", subtask_name=""))
-
+    def test_a_reconciled_dry_run_still_never_deposits(self):
+        """The one exemption the fix did NOT widen: the eject dry-run file is motion-only by design."""
+        payload = ended_payload(_ended_state("IDLE"), _GHOST)
         assert DepositEvidence.from_terminal_payload(payload, is_dry_run=True).deposited is False
+
+
+# ---------------------------------------------------------------------------
+# Through main's hook and the real terminal
+# ---------------------------------------------------------------------------
+
+
+async def _seed_farm_unit(
+    maker,
+    printer_id: int,
+    *,
+    dispatch: str,
+    status: str = "printing",
+    eject_profile_id: int | None = None,
+    completed_at: datetime | None = None,
+    archive_id: int | None = None,
+) -> tuple[int, int]:
+    """A FARM unit (its run carries a ``sku_file_id``) dispatched as ``dispatch``; (unit, run) ids."""
+    from backend.app.models.print_batch import PrintBatch
+    from backend.app.models.print_queue import PrintQueueItem
+
+    async with maker() as s:
+        batch = PrintBatch(name="run", sku_file_id=1, status="active")
+        s.add(batch)
+        await s.commit()
+        unit = PrintQueueItem(
+            printer_id=printer_id,
+            batch_id=batch.id,
+            archive_id=archive_id,
+            status=status,
+            dispatch_subtask_id=dispatch,
+            eject_profile_id=eject_profile_id,
+            started_at=EARLIER,
+            completed_at=completed_at,
+        )
+        s.add(unit)
+        await s.commit()
+        return unit.id, batch.id
+
+
+async def _row(maker, model, ident):
+    async with maker() as s:
+        return await s.get(model, ident)
+
+
+async def _log_statuses(maker, archive_id: int) -> list[str]:
+    from backend.app.models.print_log import PrintLogEntry
+
+    async with maker() as s:
+        rows = await s.execute(select(PrintLogEntry.status).where(PrintLogEntry.archive_id == archive_id))
+        return [status for (status,) in rows.all()]
+
+
+async def _log_grams(maker, archive_id: int) -> list[float | None]:
+    from backend.app.models.print_log import PrintLogEntry
+
+    async with maker() as s:
+        rows = await s.execute(select(PrintLogEntry.filament_used_grams).where(PrintLogEntry.archive_id == archive_id))
+        return [grams for (grams,) in rows.all()]
+
+
+async def _set_archive_grams(maker, archive_id: int, grams: float) -> None:
+    """The slicer estimate the archive carries — what a print-log row may scale."""
+    from backend.app.models.archive import PrintArchive
+
+    async with maker() as s:
+        archive = await s.get(PrintArchive, archive_id)
+        archive.filament_used_grams = grams
+        await s.commit()
+
+
+class _Reconnect:
+    """One reconnect of ``printer_id`` onto ``state``: ``main``'s hook body, the real terminal it may
+    run, and spies on the lanes the verdicts must (not) reach.
+
+    ``usage`` spies the filament charge (``usage_tracker.on_print_complete``, the lane the phantom
+    7.2 kg came through); ``on_terminal`` / ``on_unit_terminal`` spy the farm policy's two entries
+    (``wraps`` — the real policy still runs); ``deletes`` records the file cleanup."""
+
+    def __init__(self, maker, state):
+        self.maker = maker
+        self.state = state
+
+    async def run(self, printer_id: int) -> int:
+        from backend.app.main import reconcile_stale_active_prints
+        from backend.app.services import farm_policy
+        from backend.app.services.bambu_ftp import DeleteResult
+
+        tasks_before = set(asyncio.all_tasks())
+        with (
+            print_callbacks(self.maker, status=self.state) as mocks,
+            patch("backend.app.services.usage_tracker.on_print_complete", new=AsyncMock(return_value=[])) as usage,
+            patch(
+                "backend.app.services.bambu_ftp.delete_file_async",
+                new=AsyncMock(return_value=DeleteResult.DELETED),
+            ) as deletes,
+            patch.object(farm_policy, "on_terminal", wraps=farm_policy.on_terminal) as on_terminal,
+            patch.object(farm_policy, "on_unit_terminal", wraps=farm_policy.on_unit_terminal) as on_unit_terminal,
+            patch.object(farm_policy.notification_service, "on_run_unit_stopped", new=AsyncMock()),
+        ):
+            count = await reconcile_stale_active_prints(printer_id)
+            await drain_new_tasks(tasks_before)
+        self.mocks, self.usage, self.deletes = mocks, usage, deletes
+        self.on_terminal, self.on_unit_terminal = on_terminal, on_unit_terminal
+        return count
+
+    @property
+    def deleted_paths(self) -> list[str]:
+        return [call.args[2] for call in self.deletes.await_args_list]
+
+
+@pytest.fixture
+def running_job_session():
+    """The RUNNING job's usage session, seeded — what the old replay popped."""
+    from backend.app.services import usage_tracker
+
+    sessions: list[int] = []
+
+    def _seed(printer_id: int):
+        session = usage_tracker.PrintSession(
+            printer_id=printer_id, print_name="the running job", started_at=datetime.now(timezone.utc)
+        )
+        usage_tracker._active_sessions[printer_id] = session
+        sessions.append(printer_id)
+        return session
+
+    yield _seed
+    for printer_id in sessions:
+        usage_tracker._active_sessions.pop(printer_id, None)
+
+
+@pytest.mark.asyncio
+class TestSuperseded:
+    """(a) Archive A printing job 1 while the printer RUNS job 2 with no archive — the RC3 shape."""
+
+    async def test_the_record_ends_unknown_and_the_running_job_is_untouched(
+        self, own_session_factory, running_job_session
+    ):
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.print_binding import SUPERSEDED_REASON
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        unit_id, run_id = await _seed_farm_unit(maker, pid, dispatch="J1", eject_profile_id=7)
+        session = running_job_session(pid)
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING", subtask_name="Other_Job"))
+        assert await reconnect.run(pid) == 1
+
+        archive = await archive_row(maker, archive_id)
+        assert (archive.status, archive.failure_reason) == ("cancelled", SUPERSEDED_REASON)
+        assert archive.completed_at is not None
+        assert await _log_statuses(maker, archive_id) == ["cancelled"]
+        # The unit: ended cancelled / reconcile_unknown, and its run HOLDS (the operator-stop disposition).
+        unit = await _row(maker, PrintQueueItem, unit_id)
+        assert (unit.status, unit.stop_source) == ("cancelled", "reconcile_unknown")
+        assert unit.completed_at is not None
+        assert (await _row(maker, PrintBatch, run_id)).pause_reason == "operator_stop"
+        reconnect.on_unit_terminal.assert_awaited_once()
+        # ...and NOTHING of the printer's: no gate, no charge, no foreign page, no printer step, the
+        # running job's usage session in place.
+        assert plate_occupancy.is_plate_occupied(pid) is False
+        reconnect.usage.assert_not_awaited()
+        reconnect.mocks.ws.send_print_complete.assert_not_awaited()  # no terminal ran
+        reconnect.mocks.notif.on_foreign_job_detected.assert_not_awaited()
+        reconnect.on_terminal.assert_not_awaited()
+        from backend.app.services import usage_tracker
+
+        assert usage_tracker._active_sessions.get(pid) is session
+        # The job's uploaded file is removed (#1542) — its storage-hash upload path first.
+        assert reconnect.deleted_paths[0] == f"/{STORAGE_HASH_FILENAME}"
+
+    async def test_the_running_jobs_own_upload_is_kept(self, own_session_factory):
+        """A farm runs one file N times: the stale job and the running one share ONE upload path, and
+        deleting "the stale job's file" would delete the running job's. The live job's paths are kept;
+        the stale job's name fallbacks still go."""
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        donor = await seed_archive(maker, printer_id=None, status="completed")  # the run's shared bytes
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _seed_farm_unit(maker, pid, dispatch="J1", archive_id=donor)
+        await _seed_farm_unit(maker, pid, dispatch="J2", archive_id=donor)  # the running job
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING", subtask_name="Other_Job"))
+        assert await reconnect.run(pid) == 1
+
+        assert (await archive_row(maker, archive_id)).status == "cancelled"
+        assert f"/{STORAGE_HASH_FILENAME}" not in reconnect.deleted_paths
+        assert reconnect.deleted_paths == ["/Fast_Half_Shell.3mf", "/Fast_Half_Shell.gcode"]
+
+    async def test_a_pending_eject_on_the_printer_is_never_touched(self, own_session_factory):
+        """The reviewer's case: ``on_terminal``'s step 1 would resolve the printer's pending eject
+        ``unverified`` and quarantine it after a restart. The superseded path runs ONLY the unit half."""
+        from backend.app.models.printer import Printer
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        unit_id, run_id = await _seed_farm_unit(maker, pid, dispatch="J1", eject_profile_id=7)
+        plate_occupancy.hydrate_plate(pid, "J0", EscalationOnly())
+        plate_occupancy.hydrate_eject(pid, PendingEject("production", run_id, 559, hydrated=True))
+        before = plate_occupancy.eject_identity(pid)
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="EJECT-7", state="RUNNING"))
+        assert await reconnect.run(pid) == 1
+
+        reconnect.on_unit_terminal.assert_awaited_once()
+        reconnect.on_terminal.assert_not_awaited()
+        assert plate_occupancy.eject_identity(pid) == before
+        assert plate_occupancy.plate_source(pid) == "J0"
+        assert (await _row(maker, Printer, pid)).quarantined is False
+
+
+@pytest.mark.asyncio
+class TestEnded:
+    """(b) The printer ENDED this job: the full terminal, bound to the archive by id — the liveness
+    pair of the superseded row (the reconcile still closes what it should, both phases)."""
+
+    async def test_finish_of_this_job_is_the_true_terminal(self, own_session_factory):
+        from backend.app.models.print_queue import PrintQueueItem
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        unit_id, _run = await _seed_farm_unit(maker, pid, dispatch="J1", eject_profile_id=7)
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J1", state="FINISH", progress=100.0))
+        assert await reconnect.run(pid) == 1
+
+        assert (await archive_row(maker, archive_id)).status == "completed"
+        assert await _log_statuses(maker, archive_id) == ["completed"]
+        assert (await _row(maker, PrintQueueItem, unit_id)).status == "completed"
+        # Both phases: the plate is gated and the cooldown eject is armed for THIS unit, and the
+        # terminal charges (it is the job's own FINISH).
+        assert plate_occupancy.is_plate_occupied(pid) is True
+        assert plate_occupancy.snapshot(pid).plate_policy == CooldownEject(unit_id=unit_id, run_id=_run)
+        reconnect.usage.assert_awaited_once()
+        assert reconnect.usage.await_args.kwargs["charge"] == "full"  # the printer said FINISH of THIS job
+        reconnect.on_terminal.assert_awaited_once()
+
+    async def test_idle_on_this_job_is_an_unknown_outcome_that_holds_the_run(self, own_session_factory):
+        from backend.app.models.print_queue import PrintQueueItem
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        unit_id, _run = await _seed_farm_unit(maker, pid, dispatch="J1")
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J1", state="IDLE", progress=0.0))
+        assert await reconnect.run(pid) == 1
+
+        assert (await archive_row(maker, archive_id)).status == "cancelled"
+        unit = await _row(maker, PrintQueueItem, unit_id)
+        assert (unit.status, unit.stop_source) == ("cancelled", "reconcile_unknown")
+        assert plate_occupancy.is_plate_occupied(pid) is True  # fail-closed: nobody measured the deposit
+        # ...and nobody measured its filament either: the one charge path runs on a ``none`` basis —
+        # it consumes the job's usage session and charges nothing.
+        reconnect.usage.assert_awaited_once()
+        assert reconnect.usage.await_args.kwargs["charge"] == "none"
+
+
+@pytest.mark.asyncio
+class TestEndedUnattributed:
+    """(c) The printer ended a job it cannot name as this archive's: the plate is held for a human,
+    SOURCE-LESS — the part there may be another job's — and the archive takes the superseded job phase."""
+
+    @pytest.mark.parametrize("live_job", ["J9", ""], ids=["another-job", "no-job"])
+    async def test_the_plate_is_held_sourceless_and_the_record_ends_unknown(self, own_session_factory, live_job):
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.print_binding import SUPERSEDED_REASON
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        unit_id, run_id = await _seed_farm_unit(maker, pid, dispatch="J1", eject_profile_id=7)
+
+        reconnect = _Reconnect(maker, live_state(subtask_id=live_job, state="IDLE", progress=0.0))
+        assert await reconnect.run(pid) == 1
+
+        view = plate_occupancy.snapshot(pid)
+        assert view.plate_occupied is True
+        assert view.plate_source_subtask_id is None
+        assert isinstance(view.plate_policy, EscalationOnly) and view.plate_policy.refusal is None
+        archive = await archive_row(maker, archive_id)
+        # "Superseded" is said only when the printer names ANOTHER job.
+        assert (archive.status, archive.failure_reason) == ("cancelled", SUPERSEDED_REASON if live_job else None)
+        unit = await _row(maker, PrintQueueItem, unit_id)
+        assert (unit.status, unit.stop_source) == ("cancelled", "reconcile_unknown")
+        assert (await _row(maker, PrintBatch, run_id)).pause_reason == "operator_stop"
+        reconnect.usage.assert_not_awaited()
+        reconnect.on_terminal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestObserved:
+    """(d) The run already recorded how it ended (the legacy leak: its terminal could not find the
+    archive). The record takes the unit's outcome — whatever the printer does now."""
+
+    @pytest.mark.parametrize(("state", "live_job"), [("IDLE", "J1"), ("RUNNING", "J2")], ids=["ended", "running-other"])
+    async def test_the_record_takes_the_units_outcome_and_nothing_else_moves(
+        self, own_session_factory, state, live_job
+    ):
+        from backend.app.models.print_queue import PrintQueueItem
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        ended_at = datetime(2026, 9, 24, 21, 30)
+        unit_id, _run = await _seed_farm_unit(maker, pid, dispatch="J1", status="completed", completed_at=ended_at)
+        before = await _row(maker, PrintQueueItem, unit_id)
+
+        reconnect = _Reconnect(maker, live_state(subtask_id=live_job, state=state))
+        assert await reconnect.run(pid) == 1
+
+        archive = await archive_row(maker, archive_id)
+        assert (archive.status, archive.completed_at) == ("completed", ended_at)
+        assert await _log_statuses(maker, archive_id) == ["completed"]
+        after = await _row(maker, PrintQueueItem, unit_id)
+        assert (after.status, after.completed_at, after.stop_source) == (
+            before.status,
+            before.completed_at,
+            before.stop_source,
+        )
+        reconnect.usage.assert_not_awaited()
+        reconnect.on_terminal.assert_not_awaited()
+        reconnect.on_unit_terminal.assert_not_awaited()
+        assert plate_occupancy.is_plate_occupied(pid) is False
+        assert reconnect.deleted_paths == []
+
+    async def test_a_run_that_already_has_its_row_gets_no_second(self, own_session_factory):
+        from backend.app.models.print_log import PrintLogEntry
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _seed_farm_unit(maker, pid, dispatch="J1", status="completed", completed_at=datetime(2026, 9, 24, 21))
+        async with maker() as s:
+            s.add(PrintLogEntry(archive_id=archive_id, status="completed", printer_id=pid))
+            await s.commit()
+
+        assert await _Reconnect(maker, live_state(subtask_id="J1", state="IDLE")).run(pid) == 1
+
+        async with maker() as s:
+            count = await s.scalar(select(func.count(PrintLogEntry.id)).where(PrintLogEntry.archive_id == archive_id))
+        assert count == 1
+
+
+@pytest.mark.asyncio
+class TestNothingToDo:
+    """The reconcile leaves alone what it cannot judge, and never breaks the status flow."""
+
+    async def test_no_status_or_a_disconnected_printer_is_a_no_op(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        disconnected = live_state(subtask_id="J2", state="IDLE")
+        disconnected.connected = False
+
+        for status in (None, disconnected):
+            assert await _Reconnect(maker, status).run(pid) == 0
+        assert (await archive_row(maker, archive_id)).status == "printing"
+
+    async def test_no_live_archive_is_a_no_op(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        assert await _Reconnect(maker, live_state(state="IDLE")).run(pid) == 0
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            live_state(subtask_id="J1", state="RUNNING"),
+            live_state(subtask_id="J1", state="PAUSE"),
+            live_state(subtask_id="", state="RUNNING"),
+            live_state(subtask_id="J2", state="IDLE", fresh=False),  # the previous session's cache
+        ],
+        ids=["running-same", "paused-same", "running-unknown", "stale-cache"],
+    )
+    async def test_a_print_that_may_still_run_is_left_alone(self, own_session_factory, state):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+
+        reconnect = _Reconnect(maker, state)
+        assert await reconnect.run(pid) == 0
+
+        assert (await archive_row(maker, archive_id)).status == "printing"
+        assert plate_occupancy.is_plate_occupied(pid) is False
+        reconnect.usage.assert_not_awaited()
+
+    async def test_a_failure_does_not_propagate_and_the_record_stays_live(self, own_session_factory):
+        """The connected edge is a hot path; the next session retries."""
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+
+        with patch(
+            "backend.app.services.job_terminal.close_superseded", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            assert await _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING")).run(pid) == 0
+
+        assert (await archive_row(maker, archive_id)).status == "printing"
+
+
+@pytest.mark.asyncio
+class TestTheRunLogFollowsTheChargeBasis:
+    """The print-log row's grams (Stats, the accounting feed) follow the SAME basis the spool is
+    charged on — the job's own evidence, never a key the payload does not carry: ``main`` used to
+    scale a partial run by ``data["progress"]``, which no terminal payload has, so every stopped
+    print logged no grams. Every lane that writes a run's row is covered: the real terminal, and the
+    reconcile's ``observed`` / ``superseded`` job phase."""
+
+    async def test_a_reconciled_failure_logs_the_share_its_own_progress_measured(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1")
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J1", state="FAILED", progress=25.0))
+        assert await reconnect.run(pid) == 1
+
+        assert reconnect.usage.await_args.kwargs["charge"] == "partial"
+        assert await _log_grams(maker, archive_id) == [20.0]
+
+    async def test_an_unknown_outcome_logs_no_grams(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1")
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J1", state="IDLE", progress=0.0))
+        assert await reconnect.run(pid) == 1
+
+        assert await _log_grams(maker, archive_id) == [None]
+
+    async def test_a_superseded_run_logs_no_grams(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1")
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING", progress=95.0))
+        assert await reconnect.run(pid) == 1
+
+        assert await _log_grams(maker, archive_id) == [None]  # never the running job's 95 %
+
+    @pytest.mark.parametrize(("unit_status", "grams"), [("completed", 80.0), ("failed", None), ("cancelled", None)])
+    async def test_an_observed_run_logs_the_plate_only_when_it_completed(self, own_session_factory, unit_status, grams):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1", status=unit_status, completed_at=datetime.now(timezone.utc))
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING", progress=95.0))
+        assert await reconnect.run(pid) == 1
+
+        assert await _log_grams(maker, archive_id) == [grams]

@@ -59,6 +59,7 @@ def _state(hms: list, layer_num: int = 0, tray_now: int = 255) -> SimpleNamespac
     return SimpleNamespace(
         connected=True,
         connection_epoch=1,
+        report_epoch=1,  # this session's first report applied
         disconnected_at=None,
         state="IDLE",
         progress=0,

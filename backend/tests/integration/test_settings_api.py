@@ -126,6 +126,42 @@ class TestSettingsAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_update_farm_plate_blowoff(self, async_client: AsyncClient):
+        """The blow-off switch and its pulse length round-trip TYPED through the bool and
+        int coercion whitelists — without them a stored ``"false"`` reads back truthy and
+        a stored ``"25"`` reads back a string, and dispatch would go on blowing with the
+        wrong setting.
+
+        Defaults: ON at 10 s. A file the recipe does not recognise, or one in heating
+        airduct mode, dispatches without the pulse, so the feature is safe to ship armed.
+        """
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_plate_blowoff_enabled"] is True
+        assert response.json()["farm_plate_blowoff_seconds"] == 10
+
+        response = await async_client.put(
+            "/api/v1/settings/", json={"farm_plate_blowoff_enabled": False, "farm_plate_blowoff_seconds": 25}
+        )
+        assert response.status_code == 200
+        assert response.json()["farm_plate_blowoff_enabled"] is False
+        assert response.json()["farm_plate_blowoff_seconds"] == 25
+
+        # Persisted read-back through the bool + int parse whitelists.
+        response = await async_client.get("/api/v1/settings/")
+        assert response.json()["farm_plate_blowoff_enabled"] is False
+        assert response.json()["farm_plate_blowoff_seconds"] == 25
+
+        # Bounds are enforced by the schema (3-60), inclusive at both ends.
+        for accepted in (3, 60):
+            response = await async_client.put("/api/v1/settings/", json={"farm_plate_blowoff_seconds": accepted})
+            assert response.status_code == 200
+            assert response.json()["farm_plate_blowoff_seconds"] == accepted
+        for refused in (2, 61):
+            response = await async_client.put("/api/v1/settings/", json={"farm_plate_blowoff_seconds": refused})
+            assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_get_farm_cooldown_fan_defaults(self, async_client: AsyncClient):
         """Both cooldown fan lanes default ON at their shipped speeds when nothing has
         ever been written — the operator gets cooling without configuring anything.

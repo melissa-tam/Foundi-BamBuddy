@@ -334,15 +334,19 @@ class TestDeactivateQuiescesFirst:
         goes out. The printer keeps printing from its own USB storage; the queue row is
         resolved by the reconcile that runs when it is re-activated.
         """
-        import backend.app.main as main_mod
         from backend.app.services import print_control
 
         printer = await printer_factory(is_active=True)
         stopped: list[int] = []
         marked: list[int] = []
+
+        async def _stamp(_db, item_id, *, requested_at):
+            marked.append(item_id)
+            return True
+
         monkeypatch.setattr(printer_manager, "get_status", lambda pid: SimpleNamespace(state="RUNNING"))
         monkeypatch.setattr(print_control.printer_manager, "stop_print", lambda pid: stopped.append(pid) or True)
-        monkeypatch.setattr(main_mod, "mark_printer_stopped_by_user", marked.append)
+        monkeypatch.setattr(print_control, "stamp_operator_stop", _stamp)
         monkeypatch.setattr(printer_manager, "disconnect_printer", lambda pid: None)
 
         response = await async_client.patch(f"/api/v1/printers/{printer.id}", json={"is_active": False})

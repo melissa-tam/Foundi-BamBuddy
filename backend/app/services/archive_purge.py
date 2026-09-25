@@ -16,13 +16,14 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core import database as _database
 from backend.app.models.archive import PrintArchive
 from backend.app.models.settings import Settings
 from backend.app.services.archive import ArchiveService
+from backend.app.services.print_binding import live_print_clause
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,18 @@ def _last_activity_expr():
         PrintArchive.started_at,
         PrintArchive.created_at,
     )
+
+
+def _purge_eligible(cutoff: datetime) -> ColumnElement[bool]:
+    """An archive the age purge may take — ONE clause for the preview and the purge.
+
+    Last activity before ``cutoff``, and never a LIVE print (``print_binding`` owns what live
+    means): a live record's last activity is its start, so a print running longer than the
+    retention — or one whose terminal the farm has not seen yet — would otherwise be purged
+    mid-run, taking the files its charge and finish photo need. The single-archive delete route
+    refuses the same row (``archive.archive_delete_impact``).
+    """
+    return and_(_last_activity_expr() < cutoff, ~live_print_clause())
 
 
 class ArchivePurgeService:
@@ -202,7 +215,7 @@ class ArchivePurgeService:
         now = datetime.now(timezone.utc)
         cutoff = _age_cutoff(now, older_than_days)
         last_activity = _last_activity_expr()
-        clause = last_activity < cutoff
+        clause = _purge_eligible(cutoff)
 
         count_stmt = select(func.count(PrintArchive.id)).where(clause)
         size_stmt = select(func.coalesce(func.sum(PrintArchive.file_size), 0)).where(clause)
@@ -262,7 +275,7 @@ class ArchivePurgeService:
         # a repeat sweeper run keeps re-touching the same rows. Hard-delete
         # mode doesn't filter — already-soft-deleted rows are eligible for
         # promotion to hard-delete when the user opts in.
-        select_stmt = select(PrintArchive.id).where(_last_activity_expr() < cutoff)
+        select_stmt = select(PrintArchive.id).where(_purge_eligible(cutoff))
         if not purge_stats:
             select_stmt = select_stmt.where(PrintArchive.deleted_at.is_(None))
         id_result = await db.execute(select_stmt)

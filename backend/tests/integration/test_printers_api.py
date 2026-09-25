@@ -1019,7 +1019,7 @@ class TestPrintersAPI:
         from unittest.mock import MagicMock, patch
 
         from backend.app.services.bambu_mqtt import PrinterState
-        from backend.app.services.eject.monitor import eject_cooldown_monitor
+        from backend.app.services.eject.monitor import CoolingWatch, eject_cooldown_monitor
 
         printer = await printer_factory()
 
@@ -1029,7 +1029,7 @@ class TestPrintersAPI:
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch.object(eject_cooldown_monitor, "active_watch", return_value=33.0),
+            patch.object(eject_cooldown_monitor, "cooling_watch", return_value=CoolingWatch(line_c=33.0)),
             patch.object(eject_cooldown_monitor, "hold_z", return_value=2.0),
             patch.object(eject_cooldown_monitor, "deferred", return_value=True),
         ):
@@ -1045,10 +1045,26 @@ class TestPrintersAPI:
         # a field missing from the model would flip that phase between the two lanes.
         assert response.json()["eject_watch"] == {"threshold_c": 33.0, "hold_z": 2.0, "deferred": True}
 
+        # A cooling watch armed while shop air was UNKNOWN has no line: the REST lane must
+        # carry the null through the schema (``threshold_c: float | None``), not 500.
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch.object(eject_cooldown_monitor, "cooling_watch", return_value=CoolingWatch(line_c=None)),
+            patch.object(eject_cooldown_monitor, "hold_z", return_value=None),
+            patch.object(eject_cooldown_monitor, "deferred", return_value=False),
+        ):
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=True)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+        assert response.status_code == 200
+        assert response.json()["eject_watch"] == {"threshold_c": None, "hold_z": None, "deferred": False}
+
         # Unarmed watch → null (mirrors _eject_watch_payload returning None).
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch.object(eject_cooldown_monitor, "active_watch", return_value=None),
+            patch.object(eject_cooldown_monitor, "cooling_watch", return_value=None),
         ):
             mock_pm.get_status = MagicMock(return_value=state)
             mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
@@ -1057,6 +1073,44 @@ class TestPrintersAPI:
             response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
         assert response.status_code == 200
         assert response.json()["eject_watch"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("echo", "names_record"),
+        [("LIVE-1", True), ("", True), ("OTHER-9", False)],
+        ids=["same-job", "id-less-echo", "another-job"],
+    )
+    async def test_status_names_the_live_print_record_of_the_running_job(
+        self, async_client: AsyncClient, printer_factory, archive_factory, db_session, echo, names_record
+    ):
+        """``current_archive_id`` is the printer's LIVE print record (print_binding), provided it
+        records the job the printer names: an id-less echo (screen restart) is still that one live
+        print, while ANOTHER job's echo means the live row is a print whose terminal the farm never
+        saw — never shown under the running job. A finished attempt of the same job id is not live."""
+        from unittest.mock import MagicMock, patch
+
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        printer = await printer_factory()
+        await archive_factory(printer.id, status="completed", subtask_id="LIVE-1")
+        live = await archive_factory(printer.id, status="printing", subtask_id="LIVE-1", with_run=False)
+        live_id = live.id
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "RUNNING"
+        state.subtask_id = echo
+
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_status = MagicMock(return_value=state)
+            mock_pm.is_awaiting_plate_clear = MagicMock(return_value=False)
+            mock_pm.is_model_mismatch = MagicMock(return_value=False)
+            mock_pm.model_mismatch_reason = MagicMock(return_value=None)
+            response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["current_archive_id"] == (live_id if names_record else None)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1641,24 +1695,25 @@ class TestPrintControlAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_stop_print_success(self, async_client: AsyncClient, printer_factory):
+    async def test_stop_print_success(self, async_client: AsyncClient, printer_factory, db_session):
         """Verify successful stop print request.
 
-        The stop and the user-stopped MARK are one act, owned by ``print_control`` since
-        2026-09-12 (three callers needed the pair — this route, the queue-page stop and
-        the service-hold quiesce), so the route's collaborator is that service and the
-        mark is part of what "stopped" means here.
+        The stop REQUEST and the stop are one act, owned by ``print_control`` since
+        2026-09-12, so the route's collaborator is that service and the request — durable
+        on the running unit since 2026-09-25, so a terminal after a restart still reads it
+        — is part of what "stopped" means here.
         """
-        import backend.app.main as main_module
+        from backend.app.models.print_queue import PrintQueueItem
         from backend.app.services import print_control
 
         printer = await printer_factory(name="Printing Printer")
-        marked: list[int] = []
+        unit = PrintQueueItem(printer_id=printer.id, status="printing", dispatch_subtask_id="SUB-1", position=1)
+        db_session.add(unit)
+        await db_session.commit()
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
             patch.object(print_control.printer_manager, "stop_print", MagicMock(return_value=True)) as stop,
-            patch.object(main_module, "mark_printer_stopped_by_user", marked.append),
         ):
             mock_pm.get_client.return_value = MagicMock()  # connected
 
@@ -1667,14 +1722,14 @@ class TestPrintControlAPI:
             assert response.status_code == 200
             assert response.json()["success"] is True
             stop.assert_called_once_with(printer.id)
-            assert marked == [printer.id]
+        await db_session.refresh(unit)
+        assert unit.operator_stop_requested_at is not None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_stop_print_undelivered_is_502(self, async_client: AsyncClient, printer_factory):
         """A connected printer whose publish did not land is still a failed stop: the
         route keeps its own 502, and the service reports the delivery, not the route."""
-        import backend.app.main as main_module
         from backend.app.services import print_control
 
         printer = await printer_factory(name="Wedged Printer")
@@ -1682,7 +1737,6 @@ class TestPrintControlAPI:
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
             patch.object(print_control.printer_manager, "stop_print", MagicMock(return_value=False)),
-            patch.object(main_module, "mark_printer_stopped_by_user", MagicMock()),
         ):
             mock_pm.get_client.return_value = MagicMock()
 
@@ -2851,8 +2905,8 @@ class TestExecuteHMSActionAPI:
     @pytest.mark.integration
     async def test_stop_printing_is_the_operators_stop(self, async_client: AsyncClient, printer_factory):
         """The dialog's "Stop printing" is an operator pressing Stop: it goes through the
-        ONE owner (``print_control.stop_as_operator`` — the stop AND the user-stopped
-        mark), never the dialog dispatcher, which used to send it without the mark so the
+        ONE owner (``print_control.stop_as_operator`` — the durable stop request AND the
+        stop), never the dialog dispatcher, which used to send it without the request so the
         terminal read as a genuine failure (2026-09-24)."""
         printer = await printer_factory(name="Test Printer")
 
@@ -2868,7 +2922,9 @@ class TestExecuteHMSActionAPI:
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
             patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
-            patch("backend.app.api.routes.printers.stop_as_operator", side_effect=_stopped) as operator_stop,
+            patch(
+                "backend.app.api.routes.printers.stop_as_operator", new_callable=AsyncMock, side_effect=_stopped
+            ) as operator_stop,
         ):
             mock_pm.get_client.return_value = mock_client
 
@@ -2876,7 +2932,7 @@ class TestExecuteHMSActionAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
         assert response.status_code == 200
-        operator_stop.assert_called_once_with(printer.id)
+        operator_stop.assert_awaited_once_with(printer.id)
         mock_client.execute_hms_action.assert_not_called()
 
     @pytest.mark.asyncio

@@ -38,7 +38,7 @@ from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
-from backend.app.services.eject import donor as donor_mod, manual, remote as eject_remote
+from backend.app.services.eject import donor as donor_mod, manual, remote as eject_remote, shop_air
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     EscalationOnly,
@@ -125,6 +125,30 @@ async def _armed_printer(db, name, *, gate="SUB-1", bed_item_kwargs=None):
 def _claim_eject(printer_id, pending):
     """Claim the (already gated) plate for a LIVE eject — the in-flight shape."""
     assert plate_occupancy.claim_for_eject(printer_id, pending, Evidence()) is None
+
+
+def _releasable():
+    """The unit carries a usable eject profile — the monitor's eligibility read."""
+    return patch.object(manual, "_unit_releasable", AsyncMock(return_value=True))
+
+
+def _line_at(line_c: float | None, *, margin_c: float = 2.0):
+    """Pin the owner's CURRENT eject line (None = shop air unknown) for the hot-bed gate."""
+    shop = (
+        shop_air.ShopAir.unknown()
+        if line_c is None
+        else shop_air.ShopAir(value_c=line_c - margin_c, as_of=None, basis="fresh", printers=3)
+    )
+    line = shop_air.EjectLine(shop=shop, margin_c=margin_c, line_c=line_c)
+    return patch.object(manual.shop_air, "current_line", AsyncMock(return_value=line))
+
+
+@pytest.fixture(autouse=True)
+def _eject_line():
+    """Every manual eject here judges its bed against a 30 °C eject line unless the test
+    says otherwise — the line itself is ``shop_air``'s, pinned in ``test_shop_air.py``."""
+    with _line_at(30.0):
+        yield
 
 
 def _connected(status):
@@ -291,7 +315,7 @@ class TestManualEjectPreconditions:
         with (
             c1,
             c2,
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
         ):
             verdict = await manual.manual_eject(db_session, printer.id)
@@ -472,7 +496,7 @@ class TestManualEjectThermal:
     async def test_bed_hot_carries_temps(self, db_session):
         printer, _item = await _armed_printer(db_session, "HOT")
         c1, c2 = _connected(_state("FINISH", bed=50.0))
-        with c1, c2, patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)):
+        with c1, c2, _releasable():
             verdict = await manual.manual_eject(db_session, printer.id, allow_hot=False)
         assert verdict.outcome == "bed_hot"
         assert verdict.bed_c == 50.0
@@ -486,7 +510,7 @@ class TestManualEjectThermal:
             c1,
             c2,
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True),
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
         ):
             verdict = await manual.manual_eject(db_session, printer.id, allow_hot=True)
         assert verdict.outcome == "released_watch"
@@ -498,7 +522,7 @@ class TestManualEjectThermal:
         # a missing reading (the frontend would render Number(null) → "0 °C").
         printer, _item = await _armed_printer(db_session, "NOBED")
         c1, c2 = _connected(_state("FINISH", bed=None))
-        with c1, c2, patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)):
+        with c1, c2, _releasable():
             verdict = await manual.manual_eject(db_session, printer.id, allow_hot=False)
         assert verdict.outcome == "refused"
         assert verdict.reason == "bed_unreadable"
@@ -511,11 +535,80 @@ class TestManualEjectThermal:
             c1,
             c2,
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True),
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
         ):
             verdict = await manual.manual_eject(db_session, printer.id, allow_hot=True)
         assert verdict.outcome == "released_watch"
         assert verdict.queue_item_id == item.id
+
+
+class TestManualEjectReleasePredicate:
+    """ "Eject now" judges the bed by THE release predicate the cooldown watch uses —
+    ``shop_air.release_ok`` over the live bed, the printer's own chamber air and the
+    current eject line — so the manual gate and the automatic release cannot disagree
+    about what is cool enough (2026-09-25)."""
+
+    @staticmethod
+    def _air(bed, chamber):
+        return SimpleNamespace(state="FINISH", connected=True, temperatures={"bed": bed, "chamber": chamber})
+
+    async def test_a_bed_within_margin_of_its_own_air_passes_a_low_line(self, db_session):
+        """Line 26 (a cold fleet estimate), own air 29 + margin 2 = 31: a 31 °C bed goes."""
+        printer, item = await _armed_printer(db_session, "OWNAIR")
+        c1, c2 = _connected(self._air(31.0, 29.0))
+        with (
+            c1,
+            c2,
+            _releasable(),
+            _line_at(26.0),
+            patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True),
+        ):
+            verdict = await manual.manual_eject(db_session, printer.id)
+        assert verdict.outcome == "released_watch"
+        assert verdict.queue_item_id == item.id
+
+    async def test_a_bed_above_both_terms_is_hot_and_reports_the_limit_it_missed(self, db_session):
+        """32 °C against max(line 26, own air 29 + 2 = 31): hot, and the confirm quotes 31."""
+        printer, _item = await _armed_printer(db_session, "OWNHOT")
+        c1, c2 = _connected(self._air(32.0, 29.0))
+        with c1, c2, _releasable(), _line_at(26.0):
+            verdict = await manual.manual_eject(db_session, printer.id)
+        assert verdict.outcome == "bed_hot"
+        assert verdict.bed_c == 32.0
+        assert verdict.threshold_c == 31.0
+
+    async def test_no_line_and_no_chamber_reading_is_hot_with_no_limit(self, db_session):
+        """Shop air unknown on a printer reporting no chamber: the predicate cannot judge,
+        so the operator is asked — with the bed, and NO invented threshold."""
+        printer, _item = await _armed_printer(db_session, "NOJUDGE")
+        c1, c2 = _connected(_state("FINISH", bed=26.0))
+        with c1, c2, _releasable(), _line_at(None):
+            verdict = await manual.manual_eject(db_session, printer.id)
+        assert verdict.outcome == "bed_hot"
+        assert verdict.bed_c == 26.0
+        assert verdict.threshold_c is None
+
+    async def test_the_confirm_lane_uses_the_same_predicate(self, db_session):
+        """The operator-confirm lane (a plate with no sweepable unit) is gated by the same
+        predicate: a 35 °C bed against a 30 °C line and 28 °C own air is hot at 30."""
+        printer = await _mk_printer(db_session, "CFMHOT", gate=None)
+        prof = EjectProfile(name="cfmhot-ep")
+        db_session.add(prof)
+        await db_session.commit()
+        _gate_up(printer.id, gate=None)
+        donor = SimpleNamespace(path=Path("x.3mf"), tmp_path=None, plate_id=1, max_z=10.0, print_name="p")
+        c1, c2 = _connected(self._air(35.0, 28.0))
+        with (
+            c1,
+            c2,
+            patch.object(manual, "resolve_donor", AsyncMock(return_value=donor)),
+            patch.object(manual, "release_donor"),
+            patch.object(manual.eject_remote, "dispatch_foreign_eject", AsyncMock()) as dispatch,
+        ):
+            verdict = await manual.manual_eject(db_session, printer.id, eject_profile_id=prof.id, declare_occupied=True)
+        assert verdict.outcome == "bed_hot"
+        assert verdict.threshold_c == 30.0
+        dispatch.assert_not_called()
 
 
 class TestManualEjectExecution:
@@ -530,7 +623,7 @@ class TestManualEjectExecution:
             c1,
             c2,
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True) as req,
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
         ):
             verdict = await manual.manual_eject(db_session, printer.id)
@@ -550,7 +643,7 @@ class TestManualEjectExecution:
             c1,
             c2,
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=False),
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
         ):
             verdict = await manual.manual_eject(db_session, printer.id)
@@ -575,7 +668,7 @@ class TestManualEjectExecution:
             c2,
             patch.object(manual.printer_incidents, "automation_held", return_value=True),
             patch.object(manual.eject_cooldown_monitor, "request_release_now", return_value=True) as req,
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
         ):
             verdict = await manual.manual_eject(db_session, printer.id)
@@ -597,7 +690,7 @@ class TestManualEjectExecution:
             c1,
             c2,
             patch.object(manual.printer_incidents, "automation_held", return_value=True),
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", AsyncMock(side_effect=boom)),
             pytest.raises(eject_remote.EjectDispatchError),
         ):
@@ -613,7 +706,7 @@ class TestManualEjectExecution:
         with (
             c1,
             c2,
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", dispatch),
         ):
             verdict = await manual.manual_eject(db_session, printer.id)
@@ -722,7 +815,7 @@ class TestManualEjectForeignPlate:
         source = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "FGH", gate="SUB-F")
-            prof = EjectProfile(name="fgh-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="fgh-ep")
             db_session.add(prof)
             await db_session.flush()
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
@@ -854,7 +947,7 @@ class TestManualEjectLastFarmItemFallback:
         source = _make_source_3mf()  # plate_1, max_z 18.0mm
         try:
             printer = await _mk_printer(db_session, "FBLIB", gate=gate)
-            prof = EjectProfile(name="fblib-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="fblib-ep")
             db_session.add(prof)
             await db_session.flush()
             lf = await _mk_ondisk_library_file(db_session, filename="Farm Widget.gcode.3mf", file_path=str(source))
@@ -895,7 +988,7 @@ class TestManualEjectLastFarmItemFallback:
         source_lib = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "FBARCH", gate="")
-            prof = EjectProfile(name="fbarch-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="fbarch-ep")
             db_session.add(prof)
             await db_session.flush()
             # Archive donor (subtask "OTHER" → the strict gate tier never finds it).
@@ -1025,7 +1118,7 @@ class TestManualEjectFarmUnitConfirm:
         source = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "FUDISP", gate="SUB-1")
-            prof = EjectProfile(name="fudisp-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="fudisp-ep")
             db_session.add(prof)
             await db_session.flush()
             await _mk_item(db_session, printer_id=printer.id, dispatch_subtask="SUB-1", eject_profile_id=None)
@@ -1072,7 +1165,7 @@ class TestManualEjectContainerDonor:
         container = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "CNTNOH", gate=None)
-            prof = EjectProfile(name="cntnoh-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="cntnoh-ep")
             db_session.add(prof)
             await db_session.flush()
             await _mk_ondisk_library_file(
@@ -1095,7 +1188,7 @@ class TestManualEjectContainerDonor:
         container = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "CNTOK", gate=None)
-            prof = EjectProfile(name="cntok-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="cntok-ep")
             db_session.add(prof)
             await db_session.flush()
             await _mk_ondisk_library_file(
@@ -1215,7 +1308,7 @@ class TestManualEjectDeclareOccupied:
         source = _make_source_3mf()  # plate_1, max_z 18.0mm
         try:
             printer = await _mk_printer(db_session, "DCDON", gate=None)
-            prof = EjectProfile(name="dcdon-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="dcdon-ep")
             db_session.add(prof)
             await db_session.flush()
             lf = await _mk_ondisk_library_file(db_session, filename="Farm Widget.gcode.3mf", file_path=str(source))
@@ -1246,7 +1339,7 @@ class TestManualEjectDeclareOccupied:
         source = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "DCCFM", gate="SUB-F")
-            prof = EjectProfile(name="dccfm-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="dccfm-ep")
             db_session.add(prof)
             await db_session.flush()
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
@@ -1280,7 +1373,7 @@ class TestManualEjectDeclareOccupied:
         with (
             c1,
             c2,
-            patch.object(manual, "_resolve_eject_threshold", AsyncMock(return_value=30.0)),
+            _releasable(),
             patch.object(manual.eject_remote, "dispatch_part_present_eject", farm_known_dispatch),
         ):
             verdict = await manual.manual_eject(db_session, printer.id, declare_occupied=True)
@@ -1298,7 +1391,7 @@ class TestManualEjectHeightOverride:
         source = _make_source_3mf()  # the donor header says 18.0mm
         try:
             printer = await _mk_printer(db_session, "HOVR", gate="SUB-F")
-            prof = EjectProfile(name="hovr-ep", cooldown_temp_c=30.0)
+            prof = EjectProfile(name="hovr-ep")
             db_session.add(prof)
             await db_session.flush()
             await _mk_archive(db_session, printer_id=printer.id, subtask="SUB-F", file_path=str(source))
@@ -1369,11 +1462,11 @@ class TestIdentifyFarmFileForeign:
     name match (canonicalised) AND validated geometry AND a suggested profile AND a
     STRICT-tier donor whose height is within that profile's guard. Any miss → None."""
 
-    async def test_positive_identification_returns_profile_and_threshold(self, db_session, seed_geometry):
+    async def test_positive_identification_returns_the_profile_and_no_temperature(self, db_session, seed_geometry):
         source = _make_source_3mf()  # plate max_z 18.0mm, within the 42mm guard
         try:
             printer = await _mk_printer(db_session, "IDN", gate="SUB-F")  # H2S → validated
-            prof = EjectProfile(name="idn-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+            prof = EjectProfile(name="idn-ep", max_part_height_mm=42.0)
             db_session.add(prof)
             await db_session.flush()
             lf = await _mk_library_file(db_session, "Farm Widget.gcode.3mf")  # SPACED display name
@@ -1387,7 +1480,7 @@ class TestIdentifyFarmFileForeign:
             )
             assert result is not None
             assert result.profile_id == prof.id
-            assert result.threshold_c == 30.0
+            assert not hasattr(result, "threshold_c")  # the line is shop_air's, never the plate's
             assert result.print_name == "Foreign Widget"
         finally:
             source.unlink(missing_ok=True)
@@ -1400,7 +1493,7 @@ class TestIdentifyFarmFileForeign:
         source = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "IDSPL", gate="SUB-F")  # H2S -> validated
-            prof = EjectProfile(name="idspl-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+            prof = EjectProfile(name="idspl-ep", max_part_height_mm=42.0)
             db_session.add(prof)
             await db_session.flush()
             lf = await _mk_library_file(db_session, "Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
@@ -1416,7 +1509,7 @@ class TestIdentifyFarmFileForeign:
             )
             assert result is not None
             assert result.profile_id == prof.id
-            assert result.threshold_c == 30.0
+            assert not hasattr(result, "threshold_c")  # the line is shop_air's, never the plate's
         finally:
             source.unlink(missing_ok=True)
 
@@ -1426,7 +1519,7 @@ class TestIdentifyFarmFileForeign:
         source = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "IDSPLN", gate="SUB-F")
-            prof = EjectProfile(name="idspln-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+            prof = EjectProfile(name="idspln-ep", max_part_height_mm=42.0)
             db_session.add(prof)
             await db_session.flush()
             lf = await _mk_library_file(db_session, "Rotary_tool_top_surfaces_PCO-M12-2525.gcode_L1-90_spliced.3mf")
@@ -1529,7 +1622,7 @@ class TestIdentifyFarmFileForeign:
         source = _make_source_3mf()
         try:
             printer = await _mk_printer(db_session, "IDWEAK", gate=None)
-            prof = EjectProfile(name="idweak-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+            prof = EjectProfile(name="idweak-ep", max_part_height_mm=42.0)
             db_session.add(prof)
             await db_session.flush()
             lf = await _mk_ondisk_library_file(db_session, filename="Farm Widget.gcode.3mf", file_path=str(source))
@@ -1596,7 +1689,7 @@ class TestForeignDonorCache:
 
     async def test_prompt_deposits_and_confirm_consumes_no_second_fetch(self, db_session):
         printer = await self._fetching_printer(db_session, "D1A")
-        prof = EjectProfile(name="d1a-ep", cooldown_temp_c=30.0)
+        prof = EjectProfile(name="d1a-ep")
         db_session.add(prof)
         await db_session.flush()
         await db_session.commit()
@@ -1625,7 +1718,7 @@ class TestForeignDonorCache:
 
     async def test_expired_entry_is_unlinked_and_refetched(self, db_session):
         printer = await self._fetching_printer(db_session, "D1B")
-        prof = EjectProfile(name="d1b-ep", cooldown_temp_c=30.0)
+        prof = EjectProfile(name="d1b-ep")
         db_session.add(prof)
         await db_session.flush()
         await db_session.commit()
@@ -1653,7 +1746,7 @@ class TestForeignDonorCache:
 
     async def test_different_gate_does_not_consume_stale_donor(self, db_session):
         printer = await self._fetching_printer(db_session, "D1C", gate="SUB-A", filename="a.gcode.3mf")
-        prof = EjectProfile(name="d1c-ep", cooldown_temp_c=30.0)
+        prof = EjectProfile(name="d1c-ep")
         db_session.add(prof)
         await db_session.flush()
         await db_session.commit()
@@ -1683,7 +1776,7 @@ class TestForeignDonorCache:
         import contextlib
 
         printer = await _mk_printer(db_session, "D1D", gate="SUB-F")  # H2S → validated
-        prof = EjectProfile(name="d1d-ep", cooldown_temp_c=30.0, max_part_height_mm=42.0)
+        prof = EjectProfile(name="d1d-ep", max_part_height_mm=42.0)
         db_session.add(prof)
         await db_session.flush()
         lf = await _mk_library_file(db_session, "Farm Widget.gcode.3mf")

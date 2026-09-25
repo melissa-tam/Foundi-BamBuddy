@@ -1208,23 +1208,39 @@ async def delete_related_queue_items(db: AsyncSession, scope: ColumnElement[bool
     return result.rowcount or 0
 
 
-async def count_related_queue_items(db: AsyncSession, archive_id: int) -> tuple[int, int]:
-    """Return ``(total, printing)`` queue items linked to *archive_id*.
+@dataclass(frozen=True)
+class ArchiveDeleteImpact:
+    """What deleting one archive would take with it, counted now (#1734).
 
-    Used by the archive GET response so the frontend delete-confirm modal
-    can surface how much the deletion will wipe out, and by the delete
-    route so it can 409 when a related row is currently printing (#1734).
+    ``related_queue_items`` — the queue rows the delete cascades: the units that print FROM this
+    archive (``PrintQueueItem.archive_id``, the donor link).
 
-    The ``printing`` half is NOT a second count query: it is the length of
-    ``queue_transitions.live_prints_blocking``, the one origin for "which live
-    prints stand in the way of this delete?". The archive route's 409 and the
-    user delete's wholesale refusal must be answering the same question — a
-    private COUNT here is how the two would quietly come to disagree about what
-    ``printing`` means.
+    ``currently_printing`` — the prints the delete would pull out from under a printer, and the
+    delete route's 409 whenever it is non-zero: the related units mid-print, plus the print this
+    archive itself RECORDS when it is live (``print_binding.uncounted_live_records``). One archive
+    per attempt makes the second a separate question — a retry prints into a new row that is no
+    unit's donor — and a soft delete of it mid-print purges the files that print's charge and finish
+    photo still need. A first attempt adopts its own dispatch copy, so there the live record IS a
+    related unit's print and counts once.
+    """
+
+    related_queue_items: int
+    currently_printing: int
+
+
+async def archive_delete_impact(db: AsyncSession, archive_id: int) -> ArchiveDeleteImpact:
+    """THE archive-delete guard's evidence: the delete-impact pre-flight reports it and the delete
+    route refuses on it, so the modal that disables its confirm button and the 409 cannot disagree.
+
+    The related-units half is NOT a second count query: it is ``queue_transitions
+    .live_prints_blocking``, the one origin for "which live prints stand in the way of this delete?"
+    — the archive route's 409 and the user delete's wholesale refusal must answer the same question.
+    The live-record half is ``print_binding``'s, the owner of which archive records which print.
     """
     from sqlalchemy import func as sa_func, select as sa_select
 
     from backend.app.models.print_queue import PrintQueueItem
+    from backend.app.services.print_binding import uncounted_live_records
     from backend.app.services.queue_transitions import live_prints_blocking
 
     total = (
@@ -1232,8 +1248,11 @@ async def count_related_queue_items(db: AsyncSession, archive_id: int) -> tuple[
             sa_select(sa_func.count()).select_from(PrintQueueItem).where(PrintQueueItem.archive_id == archive_id)
         )
     ).scalar_one()
-    printing = await live_prints_blocking(db, scope=PrintQueueItem.archive_id == archive_id)
-    return int(total or 0), len(printing)
+    printing_units = await live_prints_blocking(db, scope=PrintQueueItem.archive_id == archive_id)
+    own_live_print = await uncounted_live_records(db, PrintArchive.id == archive_id, printing_units)
+    return ArchiveDeleteImpact(
+        related_queue_items=int(total or 0), currently_printing=len(printing_units) + len(own_live_print)
+    )
 
 
 @dataclass(frozen=True)
@@ -1726,9 +1745,12 @@ class ArchiveService:
             return None
         metadata = ingested.metadata
 
-        # Determine status and timestamps
+        # Determine status and timestamps. A LIVE print is never created here: ``status='printing'``
+        # and ``started_at`` belong to ``services/print_binding`` (``bind_created`` turns the row the
+        # print start creates into the printer's live print), so a caller asking for one is a bug.
         status = print_data.get("status", "completed") if print_data else "archived"
-        started_at = datetime.now(timezone.utc) if status == "printing" else None
+        if status == "printing":
+            raise ValueError("archive_print creates a non-printing row; print_binding.bind_created binds a live print")
         completed_at = datetime.now(timezone.utc) if status in ("completed", "failed", "archived") else None
 
         # Create archive record — identity fields here, everything the file
@@ -1742,7 +1764,6 @@ class ArchiveService:
                 else (metadata.get("print_name") or ingested.display_stem)
             ),
             status=status,
-            started_at=started_at,
             completed_at=completed_at,
             extra_data=metadata,
             created_by_id=created_by_id,
@@ -1767,27 +1788,6 @@ class ArchiveService:
             .where(PrintArchive.id == archive_id)
         )
         return result.scalar_one_or_none()
-
-    async def update_archive_status(
-        self,
-        archive_id: int,
-        status: str,
-        completed_at: datetime | None = None,
-        failure_reason: str | None = None,
-    ) -> bool:
-        """Update the status of an archive."""
-        archive = await self.get_archive(archive_id)
-        if not archive:
-            return False
-
-        archive.status = status
-        if completed_at:
-            archive.completed_at = completed_at
-        if failure_reason:
-            archive.failure_reason = failure_reason
-
-        await self.db.commit()
-        return True
 
     async def list_archives(
         self,

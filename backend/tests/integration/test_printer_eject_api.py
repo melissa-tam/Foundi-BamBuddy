@@ -174,6 +174,19 @@ class TestBedHot:
         # log line had nothing to read.
         assert "50.0" in detail["message"] and "33.0" in detail["message"]
 
+    async def test_bed_hot_with_nothing_to_judge_by_carries_a_null_limit(self, async_client, printer_factory):
+        """Shop air unknown and no chamber reading: the predicate cannot judge, the confirm
+        is asked with the bed alone — ``threshold_c`` null, and a message that says why
+        rather than a formatted None (2026-09-25)."""
+        printer = await printer_factory(name="EJRHN", model="H2S")
+        r, _ = await _post(async_client, printer.id, EjectVerdict.bed_hot(26.0, None))
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert detail["code"] == "bed_hot"
+        assert detail["bed_c"] == 26.0
+        assert detail["threshold_c"] is None
+        assert "no shop-air or chamber reading" in detail["message"]
+
 
 class TestRefusalMessageTotality:
     """``_REFUSAL_MESSAGES`` is TOTAL over the refusal vocabulary, and holds nothing else.

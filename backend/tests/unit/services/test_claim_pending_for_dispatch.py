@@ -111,7 +111,6 @@ def _dispatch_env(*, upload=None, delete=None):
         stack.enter_context(patch.object(ps_module, "cache_3mf_download", MagicMock()))
         stack.enter_context(patch.object(ps_module.notification_service, "on_queue_job_started", AsyncMock()))
         stack.enter_context(patch.object(ps_module.notification_service, "on_queue_job_failed", AsyncMock()))
-        stack.enter_context(patch("backend.app.main.register_expected_print", MagicMock()))
         stack.enter_context(patch.object(scheduler, "_power_off_if_needed", AsyncMock()))
         yield SimpleNamespace(start=start, upload=upload_mock, delete=delete_mock)
 

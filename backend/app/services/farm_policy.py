@@ -519,8 +519,42 @@ async def on_terminal(
             and outcome.verdict == farm_correlation.STOP_VERDICT_PLATE_REFUSED
         ):
             await _maybe_lift_held_bed(db, printer_id)
+    except Exception:  # noqa: BLE001 — policy must never crash the callback chain
+        logger.exception("farm_policy.on_terminal failed for item=%s status=%s", queue_item_id, final_status)
+        return
 
-        # 3. Item-based policy.
+    # 3. The unit's disposition — its own function, because the downtime reconcile runs it
+    #    WITHOUT the two printer steps above (see :func:`on_unit_terminal`).
+    await on_unit_terminal(db, queue_item_id, final_status, outcome=outcome, archive_data=archive_data)
+
+
+async def on_unit_terminal(
+    db: AsyncSession,
+    item_or_id: PrintQueueItem | int | None,
+    final_status: str,
+    *,
+    outcome: TerminalOutcome | None = None,
+    archive_data: dict | None = None,
+) -> None:
+    """The UNIT half of a terminal: a farm unit's disposition, and nothing about its printer.
+
+    :func:`on_terminal` is two things: the PRINTER's steps (resolve a pending eject, lift
+    the bed off a refused plate — both act on the machine) and then this. They are split
+    because the downtime reconcile's ``superseded`` verdict (``print_reconcile``) owes a
+    unit its disposition while its printer demonstrably runs ANOTHER job: step 1 there
+    would resolve that job's pending eject ``unverified`` and quarantine the printer after
+    a restart, and step 2 would send G-code to a printer mid-print — the RC3 shape
+    (2026-09-25), a stale record acted on as the running job's terminal. So the reconcile
+    calls ONLY this; ``on_terminal`` calls it after its own printer steps; one
+    implementation of the disposition either way.
+
+    ``final_status`` is the terminal's recorded word and drives the fork; ``outcome`` is its
+    ONE classification when the caller has one (see :func:`on_terminal`). Non-farm units
+    are a no-op. Guarded like its caller: a disposition failure is logged, never raised
+    into the terminal chain.
+    """
+    queue_item_id = item_or_id.id if isinstance(item_or_id, PrintQueueItem) else item_or_id
+    try:
         if queue_item_id is None:
             return
         item = await db.get(PrintQueueItem, queue_item_id)
@@ -533,11 +567,11 @@ async def on_terminal(
         # Terminal-transition hygiene (W4b): a farm unit reaching a terminal status
         # must not keep a stale hold token. The 2026-07-20 incident left completed/
         # cancelled rows flagged spool_jam_recovery_failed / printer_offline_stalled /
-        # print_paused_stalled forever. This hook is the single reaction point for
-        # EVERY farm terminal that flows through main.on_print_complete (archive +
-        # no-archive paths) and the scheduler dispatch-failure path
-        # (print_scheduler._fail_queue_item), so clearing here covers them all. Only
-        # touches this exact unit — a still-printing sibling keeps its own reason.
+        # print_paused_stalled forever. The unit's END writers (``queue_transitions``)
+        # clear it in the statement that ends the row; this catches a token another lane
+        # wrote AFTER that statement from a copy it read while the unit was still printing
+        # (the stall and recovery lanes write the column through the ORM). Only touches
+        # this exact unit — a still-printing sibling keeps its own reason.
         if item.waiting_reason is not None:
             item.waiting_reason = None
             await db.commit()
@@ -574,7 +608,7 @@ async def on_terminal(
             # depends on the stamp having been written.)
             await on_operator_stop(db, batch, item)
     except Exception:  # noqa: BLE001 — policy must never crash the callback chain
-        logger.exception("farm_policy.on_terminal failed for item=%s status=%s", queue_item_id, final_status)
+        logger.exception("farm_policy.on_unit_terminal failed for item=%s status=%s", queue_item_id, final_status)
 
 
 # --------------------------------------------------------------------------- #
@@ -1406,23 +1440,27 @@ async def _finalize_remote_eject(db: AsyncSession, run_id: int, printer_id: int)
 
 
 async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: PrintQueueItem | None) -> None:
-    """FA path: eject the first-article plate, honouring the cooldown threshold.
+    """FA path: eject the first-article plate, honouring the cooldown release.
 
     The eject file is MOTION-ONLY — the thermal wait that used to live in its
     G-code is now server policy — so an approval that lands while the bed is
-    still hot must NOT sweep immediately. Live bed already at/below the unit's
-    release threshold (the common case: the bed cooled during inspection) →
-    dispatch NOW through the shared ``eject_remote.dispatch_part_present_eject``
-    (dispatch errors surface to the operator as 409/502, exactly as before).
-    Bed still hot or unreadable → arm the FA cooldown watch, which dispatches
-    the same eject when the threshold is reached (plateau/cap policy applies);
-    the run stays ``awaiting_approval`` and the UI shows the cooldown phase.
+    still hot must NOT sweep immediately. The live bed judged by THE release
+    predicate (``shop_air.release_ok`` over the bed, its own chamber air and the
+    measured eject line — the same one the cooldown watch uses) says it may go
+    (the common case: the bed cooled during inspection) → dispatch NOW through the
+    shared ``eject_remote.dispatch_part_present_eject`` (dispatch errors surface to
+    the operator as 409/502, exactly as before). Bed still hot or unreadable → arm
+    the FA cooldown watch, which dispatches the same eject on the same predicate
+    (plateau/cap policy applies); the run stays ``awaiting_approval`` and the UI
+    shows the cooldown phase. A unit with no usable eject profile is dispatched
+    directly, and the dispatcher's own refusal reaches the operator.
 
     The plate-clear gate is NOT dropped here: it clears when the eject job's
     terminal arrives (``_finalize_remote_eject`` via ``on_terminal`` step 1).
     An unfinished eject is simply re-approvable, never a half state.
     """
-    from backend.app.services.eject.monitor import _resolve_eject_threshold
+    from backend.app.services.eject import shop_air
+    from backend.app.services.eject.monitor import _unit_releasable
 
     if fa_item is None or fa_item.printer_id is None:
         raise HTTPException(status_code=409, detail="First-article printer is unknown; cannot eject remotely")
@@ -1431,11 +1469,18 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
         # just exit "stale" with the operator none the wiser.
         raise HTTPException(status_code=409, detail="Printer is not connected; cannot eject remotely")
 
-    threshold = await _resolve_eject_threshold(fa_item.id, for_first_article=True)
+    releasable = await _unit_releasable(fa_item.id, for_first_article=True)
+    line = await shop_air.current_line(db)
     state = printer_manager.get_status(fa_item.printer_id)
-    bed = state.temperatures.get("bed") if state and getattr(state, "connected", False) else None
+    readable = state is not None and getattr(state, "connected", False)
+    bed = state.temperatures.get("bed") if readable else None
+    chamber = (
+        shop_air.own_air_c(state.temperatures, model=printer_manager.get_model(fa_item.printer_id))
+        if readable
+        else None
+    )
 
-    if threshold is not None and (bed is None or bed > threshold):
+    if releasable and not shop_air.release_ok(bed, chamber, line.line_c, line.margin_c):
         # Arm the deferred sweep by SWAPPING THE PLATE'S POLICY, not by spawning a
         # watch: the plate is what the FA part sits on, so the FA eject is a property
         # of that plate and the policy driver arms the watch off it. A re-approve while
@@ -1444,10 +1489,12 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
         refusal = plate_occupancy.set_policy(fa_item.printer_id, FirstArticleEject(unit_id=fa_item.id, run_id=run.id))
         if refusal is None:
             logger.info(
-                "farm_policy: FA eject for run %s deferred — bed %s > release %.1f°C; cooldown watch armed",
+                "farm_policy: FA eject for run %s deferred — bed %s not released (line %s, chamber %s); "
+                "cooldown watch armed",
                 run.id,
                 f"{bed:.1f}°C" if bed is not None else "unreadable",
-                threshold,
+                f"{line.line_c:.1f}°C" if line.line_c is not None else "unknown",
+                f"{chamber:.1f}°C" if chamber is not None else "none",
             )
             return
         # ``not_occupied``: the plate this approval would sweep is not gated (an

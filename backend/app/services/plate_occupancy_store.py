@@ -53,6 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.tasks import spawn_background_task
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.job_identity import same_job
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     EscalationOnly,
@@ -260,8 +261,7 @@ async def _startup_policy(
     cooldown_rearmable = (
         item is not None
         and should_rearm(True, item.status, item.eject_profile_id, bool(item.first_article))
-        and bool(gate_subtask_id)
-        and item.dispatch_subtask_id == gate_subtask_id
+        and same_job(gate_subtask_id, item.dispatch_subtask_id) == "same"
     )
     if cooldown_rearmable and item is not None:
         logger.info("[occupancy-store] p%s gate cooldown-re-armed from unit %s", printer_id, item.id)

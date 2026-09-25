@@ -98,7 +98,10 @@ CARRIED_COLUMNS: frozenset[str] = frozenset(
 #    a copy of the old attempt's starvation history), and the rest are the old
 #    attempt's residue: ``waiting_reason`` / ``error_message`` /
 #    ``dispatch_subtask_id`` / ``stop_source`` / ``eject_dispatched_at`` /
-#    ``filament_short``.
+#    ``filament_short``, and the old attempt's operator Stop — its request
+#    (``operator_stop_requested_at``) and the terminal's answer to it
+#    (``stop_answered_at``): carried, the request would classify the NEW attempt's
+#    terminal as a stop nobody asked of it.
 #    ``cleanup_library_after_dispatch`` is state too, and dangerous state: it is the
 #    Direct-Print lane's own "this upload is transient, delete it after dispatch"
 #    stamp, and copying it onto a requeue would arm a second deletion of a file the
@@ -121,6 +124,8 @@ NOT_CARRIED_COLUMNS: frozenset[str] = frozenset(
         "error_message",
         "dispatch_subtask_id",
         "stop_source",
+        "operator_stop_requested_at",
+        "stop_answered_at",
         "eject_dispatched_at",
         "been_jumped",
         "filament_short",

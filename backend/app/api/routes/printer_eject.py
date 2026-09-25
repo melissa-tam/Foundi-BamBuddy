@@ -91,16 +91,21 @@ def _http_error(verdict: EjectVerdict) -> HTTPException:
 
     if verdict.outcome == "bed_hot":
         bed_c = verdict.bed_c
+        # The limit the bed missed; None when there is neither an eject line (shop air
+        # unknown) nor a chamber reading to judge the bed by.
         threshold_c = verdict.threshold_c
+        message = (
+            f"Bed is {bed_c:.1f}°C, above the {threshold_c:.1f}°C eject threshold — confirm to eject hot"
+            if threshold_c is not None
+            else f"Bed is {bed_c:.1f}°C; no shop-air or chamber reading to judge it by — confirm to eject hot"
+        )
         return HTTPException(
             status_code=409,
             detail={
                 "code": "bed_hot",
                 "bed_c": bed_c,
                 "threshold_c": threshold_c,
-                "message": (
-                    f"Bed is {bed_c:.1f}°C, above the {threshold_c:.1f}°C eject threshold — confirm to eject hot"
-                ),
+                "message": message,
             },
         )
 
@@ -151,7 +156,8 @@ async def eject_now(
     409 ``foreign_plate`` (with ``origin``/``print_name``/``max_z_height_mm``/
     ``suggested_eject_profile_id``) is NOT a failure: it is the eject asking for the part
     height and the sweep profile, and the UI re-calls with both to dispatch. 409
-    ``bed_hot`` carries ``bed_c``/``threshold_c`` for the hot-bed confirm. Every other
+    ``bed_hot`` carries ``bed_c``/``threshold_c`` for the hot-bed confirm (``threshold_c``
+    null when neither an eject line nor a chamber reading exists). Every other
     refusal carries a stable ``code`` plus an actionable ``message``; 404 for an unknown
     printer or eject profile.
 

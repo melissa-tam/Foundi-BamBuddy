@@ -153,18 +153,27 @@ def _locate_lane(cached: Path | None, available: dict[str, bytes]):
     return patches, lane
 
 
-def _settled_printer_manager(last_loaded_tray: int = 0) -> MagicMock:
-    """printer_manager stand-in for a finished print — no live AMS mapping left."""
+def _settled_payload(last_loaded_tray: int = 0, mapping: list[int] | None = None) -> dict:
+    """The finished job's own consumption evidence, as its terminal payload carries it — the charge
+    reads THIS, never the live printer. ``mapping`` is the printer's reported ``mapping`` field as the
+    terminal captured it (``mqtt_mapping``)."""
+    payload = {
+        "last_progress": 100,
+        "last_layer_num": 88,
+        "total_layers": 88,
+        "tray_now": 255,
+        "last_loaded_tray": last_loaded_tray,
+        "tray_change_log": [],
+    }
+    if mapping is not None:
+        payload["mqtt_mapping"] = mapping
+    return payload
+
+
+def _live_printer() -> MagicMock:
+    """printer_manager stand-in after the print: the live printer's hardware only, no AMS reported."""
     pm = MagicMock()
-    pm.get_status.return_value = SimpleNamespace(
-        raw_data={},
-        progress=100,
-        layer_num=88,
-        tray_now=255,
-        last_loaded_tray=last_loaded_tray,
-        tray_change_log=[],
-        total_layers=88,
-    )
+    pm.get_status.return_value = SimpleNamespace(raw_data={})
     return pm
 
 
@@ -207,8 +216,14 @@ async def _seed_farm_item(
     return item
 
 
-async def _seed_archive(db, printer_id: int, *, file_path: str = "", print_name: str = "plate_3"):
-    """The archive row on_print_start writes. ``file_path=""`` is the incident's."""
+async def _seed_archive(
+    db, printer_id: int, *, file_path: str = "", print_name: str = "plate_3", status: str = "printing"
+):
+    """The archive row on_print_start writes. ``file_path=""`` is the incident's.
+
+    ``status="printing"`` is the running print's record — ONE per printer (the binding owner's
+    ``ux_print_archives_live_printer``); a donor container that is not a live print is ``archived``.
+    """
     from backend.app.models.archive import PrintArchive
 
     archive = PrintArchive(
@@ -217,8 +232,8 @@ async def _seed_archive(db, printer_id: int, *, file_path: str = "", print_name:
         file_path=file_path,
         file_size=0,
         print_name=print_name,
-        status="printing",
-        started_at=datetime.now(timezone.utc) - timedelta(hours=5),
+        status=status,
+        started_at=datetime.now(timezone.utc) - timedelta(hours=5) if status == "printing" else None,
     )
     db.add(archive)
     await db.commit()
@@ -383,8 +398,9 @@ async def test_donor_resolved_print_charges_the_dispatched_plates_grams(
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "FARM-815"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-815"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -438,8 +454,9 @@ async def test_donor_lookup_through_to_the_charge(db_session, printer_factory, t
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "FARM-815"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-815"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -481,8 +498,9 @@ async def test_zero_gram_completion_on_a_tagless_feeder_warns_and_notifies(
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "FARM-810"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-810"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -514,18 +532,26 @@ async def test_zero_gram_page_is_deduped_per_printer(db_session, printer_factory
     await _seed_tagless_spool(db_session, printer.id)
     await _seed_farm_item(db_session, printer.id, "FARM-1")
 
+    from backend.app.services.print_binding import close_archive
+
     notify = AsyncMock()
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         for index in range(3):
             archive = await _seed_archive(db_session, printer.id)
             await on_print_complete(
                 printer_id=printer.id,
-                data={"status": "completed", "subtask_id": "FARM-1"},
-                printer_manager=_settled_printer_manager(),
+                data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-1"},
+                printer_manager=_live_printer(),
+                charge="full",
                 db=db_session,
                 archive_id=archive.id,
             )
             assert notify.await_count == 1, f"page {index + 1} must ride the per-printer dedup window"
+            # Each print's terminal closes its record before the printer runs the next one.
+            assert await close_archive(
+                db_session, archive.id, status="completed", completed_at=datetime.now(timezone.utc)
+            )
+            await db_session.commit()
 
 
 @pytest.mark.asyncio
@@ -556,8 +582,9 @@ async def test_a_tagged_feeder_charging_zero_does_not_page(db_session, printer_f
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "FARM-2"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-2"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -585,8 +612,9 @@ async def test_a_cancelled_print_charging_zero_does_not_page(db_session, printer
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         await on_print_complete(
             printer_id=printer.id,
-            data={"status": "cancelled"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "cancelled"},
+            printer_manager=_live_printer(),
+            charge="partial",
             db=db_session,
             archive_id=archive.id,
         )
@@ -630,17 +658,17 @@ async def test_a_motion_only_job_with_no_ams_mapping_does_not_page(db_session, p
     await db_session.commit()
     archive = await _seed_archive(db_session, printer.id)
 
-    # The production roll is STILL LOADED — every observational witness points at it.
-    pm = _settled_printer_manager(last_loaded_tray=0)
-    pm.get_status.return_value.tray_now = 0
-    pm.get_status.return_value.tray_change_log = [(0, 0)]
+    # The production roll is STILL LOADED — every observational witness the job's terminal
+    # carries points at it.
+    payload = {**_settled_payload(last_loaded_tray=0), "tray_now": 0, "tray_change_log": [(0, 0)]}
 
     notify = AsyncMock()
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "EJECT-9"},
-            printer_manager=pm,
+            data={**payload, "status": "completed", "subtask_id": "EJECT-9"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -917,14 +945,21 @@ async def test_a_unit_without_a_plate_takes_the_containers_own_answer(
     single = _container(tmp_path / "archive" / "1" / "one_plate.3mf", [1])
     many = _container(tmp_path / "archive" / "2" / "four_plate.3mf", [1, 2, 3, 4])
 
-    single_archive = await _seed_archive(db_session, printer.id, file_path=str(single.relative_to(tmp_path)))
+    # Donor containers (dispatch copies), not live prints.
+    single_archive = await _seed_archive(
+        db_session, printer.id, file_path=str(single.relative_to(tmp_path)), status="archived"
+    )
     plateless = await _seed_farm_item(db_session, printer.id, "FARM-2202", plate_id=None)
     plateless.archive_id = single_archive.id
-    many_archive = await _seed_archive(db_session, printer.id, file_path=str(many.relative_to(tmp_path)))
+    many_archive = await _seed_archive(
+        db_session, printer.id, file_path=str(many.relative_to(tmp_path)), status="archived"
+    )
     many_archive.filename = "four_plate.gcode.3mf"  # no plate hint in the name
     ambiguous = await _seed_farm_item(db_session, printer.id, "FARM-2203", plate_id=None)
     ambiguous.archive_id = many_archive.id
-    hinted_archive = await _seed_archive(db_session, printer.id, file_path=str(many.relative_to(tmp_path)))
+    hinted_archive = await _seed_archive(
+        db_session, printer.id, file_path=str(many.relative_to(tmp_path)), status="archived"
+    )
     hinted_archive.filename = "four_plate_plate_2.gcode.3mf"
     hinted = await _seed_farm_item(db_session, printer.id, "FARM-2204", plate_id=None)
     hinted.archive_id = hinted_archive.id
@@ -984,8 +1019,9 @@ async def test_a_completed_print_with_no_archive_file_charges_from_the_dispatch_
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "FARM-783"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-783"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -1036,8 +1072,9 @@ async def test_the_fallback_stands_down_when_the_donor_bytes_are_gone(
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "FARM-784"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-784"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -1083,8 +1120,9 @@ async def test_a_foreign_print_with_no_archive_file_still_skips(
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "STUDIO-77"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "STUDIO-77"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -1114,13 +1152,13 @@ def test_feeder_witness_selection_is_named_at_the_call_site():
     """
     from backend.app.services.usage_tracker import _print_feeder_keys
 
-    state = SimpleNamespace(tray_change_log=[(1, 12)])
+    tray_change_log = [(1, 12)]  # the job's own, off its terminal payload
 
-    assert _print_feeder_keys([0], state, 2) == {(0, 0), (0, 1), (0, 2)}, "the union is still the default"
-    assert _print_feeder_keys([0], state, 2, witnesses="dispatch_only") == {(0, 0)}, (
+    assert _print_feeder_keys([0], tray_change_log, 2) == {(0, 0), (0, 1), (0, 2)}, "the union is still the default"
+    assert _print_feeder_keys([0], tray_change_log, 2, witnesses="dispatch_only") == {(0, 0)}, (
         "an eject inherits the previous print's loaded tray — only the mapping may name its feeder"
     )
-    assert _print_feeder_keys(None, state, 2, witnesses="dispatch_only") == set(), (
+    assert _print_feeder_keys(None, tray_change_log, 2, witnesses="dispatch_only") == set(), (
         "a job that decided no AMS slot names no feeder at all"
     )
 
@@ -1156,8 +1194,9 @@ async def test_the_warning_names_every_tagless_feeder_while_the_page_stays_one(
     ):
         await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "FARM-790"},
-            printer_manager=_settled_printer_manager(),
+            data={**_settled_payload(), "status": "completed", "subtask_id": "FARM-790"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )

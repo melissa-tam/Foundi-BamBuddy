@@ -1076,7 +1076,7 @@ class TestThePauseLaneNeverStops:
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
         }
-        forbidden = {"stop_print", "stop_as_operator", "mark_printer_stopped_by_user"}
+        forbidden = {"stop_print", "stop_as_operator", "stamp_operator_stop"}
         assert called & forbidden == set(), f"pause_recovery must never stop a print: {called & forbidden}"
 
 

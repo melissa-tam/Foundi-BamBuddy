@@ -25,6 +25,7 @@ import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
 import { render } from '../utils';
 import { server } from '../mocks/server';
+import i18n from '../../i18n';
 import { PrintersPage } from '../../pages/PrintersPage';
 
 /** Wire shape of the eject request body (client.ts always sends all four). */
@@ -220,6 +221,34 @@ describe('door 2 — the expanded card\'s raised-gate banner', () => {
     expect(ejectCalls[1].allow_hot).toBe(true);
   });
 
+  // Shop air unknown and no chamber reading: the server has no limit to quote.
+  // The confirm still opens, states the bed, and claims no threshold.
+  it('opens the hot-bed confirm without a limit when the bed_hot 409 quotes none', async () => {
+    mount(statusFinish());
+    server.use(
+      http.post('/api/v1/printers/:id/eject', async ({ request }) => {
+        const body = (await request.json()) as { allow_hot: boolean };
+        if (!body.allow_hot) {
+          return HttpResponse.json(
+            { detail: { code: 'bed_hot', bed_c: 41, threshold_c: null } },
+            { status: 409 },
+          );
+        }
+        return HttpResponse.json({ mode: 'dispatched' });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<PrintersPage />);
+    await user.click(await screen.findByRole('button', { name: EJECT_ACTION }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(
+      within(dialog).getByText(i18n.t('printers.eject.confirmBodyNoLine', { bed: 41 })),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByText(/release threshold/i)).not.toBeInTheDocument();
+  });
+
   it('opens the eject dialog on a foreign_plate 409 with the suggested profile preselected, then ejects with it', async () => {
     mount(statusFinish());
     server.use(
@@ -285,6 +314,25 @@ describe('door 2 — the expanded card\'s raised-gate banner', () => {
 
     expect(await screen.findByText('Cooling to 33°C')).toBeInTheDocument();
     expect(screen.queryByText(/plate raised/)).not.toBeInTheDocument();
+  });
+
+  // A watch armed while shop air was unknown quotes no line. The card still
+  // says the plate is cooling (never "not cleared"), naming the plateau it
+  // releases at instead of a temperature nobody measured.
+  it('names the plateau on the cooling pill when the watch has no eject line', async () => {
+    mount(statusFinish({ eject_watch: { threshold_c: null, hold_z: null, deferred: false } }));
+    render(<PrintersPage />);
+
+    expect(await screen.findByText(i18n.t('printers.phase.coolingToPlateau'))).toBeInTheDocument();
+    expect(screen.queryByText(i18n.t('printers.plateStatus.notCleared'))).not.toBeInTheDocument();
+  });
+
+  it('keeps the do-not-jog tooltip on a held plateau pill', async () => {
+    mount(statusFinish({ eject_watch: { threshold_c: null, hold_z: 2, deferred: false } }));
+    render(<PrintersPage />);
+
+    const pill = await screen.findByTitle(i18n.t('printers.phase.coolingHeldHint'));
+    expect(pill).toHaveTextContent(i18n.t('printers.phase.coolingToPlateauHeld'));
   });
 
   // A cooldown that finished under maintenance mode is NOT cooling any more: the

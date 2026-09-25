@@ -23,6 +23,7 @@ from backend.app.services.farm_correlation import (
     classify_stop,
     farm_work_slated_for,
     farm_work_targets_printer,
+    operator_stop_requested,
     resolve_active_plate_id,
     resolve_printing_farm_item,
     resolve_terminal_item,
@@ -274,8 +275,9 @@ class TestQueuePageStopCorrelation:
 
     Its terminal used to resolve FOREIGN (zero ``printing`` rows, an echoed id): no
     operator-stop hold, no fault requeue, and a foreign-plate page for the farm's own
-    part. ``ui_stopped`` — the route's own mark, consumed at this terminal — lets the
-    correlation owner match that row by its dispatch id.
+    part. The row the route wrote is the evidence, matched by its dispatch id — with no
+    process state at all, so a terminal that lands after a restart matches it too
+    (2026-09-25: the in-memory mark this used to require was empty after a deploy).
     """
 
     async def _stopped(self, db, *, printer_id, subtask):
@@ -288,24 +290,28 @@ class TestQueuePageStopCorrelation:
     async def test_the_route_stopped_row_is_matched_by_its_dispatch_id(self, db_session):
         item = await self._stopped(db_session, printer_id=70, subtask="SUB-Q")
 
-        res = await resolve_terminal_item(db_session, 70, {"subtask_id": "SUB-Q"}, ui_stopped=True)
+        res = await resolve_terminal_item(db_session, 70, {"subtask_id": "SUB-Q"})
 
         assert res.verdict == "matched"
         assert res.item.id == item.id
 
-    async def test_without_the_routes_mark_it_is_still_foreign(self, db_session):
-        """A later or duplicate terminal carries no mark (it was consumed at the first),
-        so an already-handled row is never re-matched."""
-        await self._stopped(db_session, printer_id=71, subtask="SUB-Q")
+    async def test_an_already_answered_row_still_resolves_to_its_unit(self, db_session):
+        """A duplicate terminal for the same stopped job is the farm's own, never FOREIGN (a
+        foreign page and a human-clear gate for the farm's part). It is owed nothing for the
+        UNIT — the annotation is conditional (``annotate_stopped_unit``) — which is where
+        the once lives, not here."""
+        item = await self._stopped(db_session, printer_id=71, subtask="SUB-Q")
+        item.stop_answered_at = datetime.now(timezone.utc)
+        await db_session.commit()
 
-        res = await resolve_terminal_item(db_session, 71, {"subtask_id": "SUB-Q"}, ui_stopped=False)
+        res = await resolve_terminal_item(db_session, 71, {"subtask_id": "SUB-Q"})
 
-        assert res.verdict == "foreign"
+        assert (res.verdict, res.item.id) == ("matched", item.id)
 
     async def test_a_different_id_is_still_foreign(self, db_session):
         await self._stopped(db_session, printer_id=72, subtask="SUB-Q")
 
-        res = await resolve_terminal_item(db_session, 72, {"subtask_id": "SCREEN-9"}, ui_stopped=True)
+        res = await resolve_terminal_item(db_session, 72, {"subtask_id": "SCREEN-9"})
 
         assert res.verdict == "foreign"
 
@@ -314,9 +320,61 @@ class TestQueuePageStopCorrelation:
         item.stop_source = "reconcile_unknown"
         await db_session.commit()
 
-        res = await resolve_terminal_item(db_session, 73, {"subtask_id": "SUB-Q"}, ui_stopped=True)
+        res = await resolve_terminal_item(db_session, 73, {"subtask_id": "SUB-Q"})
 
         assert res.verdict == "foreign"
+
+
+class TestOperatorStopRequested:
+    """THE reader of the durable stop request: this job's unit, by dispatch id, in ANY status;
+    the sole printing unit for a job that echoes no id. Row state only — nothing a restart
+    can empty."""
+
+    async def _unit(self, db, *, printer_id, subtask, status="printing", stamped=True):
+        item = await _add_item(db, printer_id=printer_id, status=status, dispatch_subtask_id=subtask)
+        if stamped:
+            item.operator_stop_requested_at = datetime.now(timezone.utc)
+        await db.commit()
+        return item
+
+    @pytest.mark.parametrize("status", ["printing", "cancelled", "failed", "completed"])
+    async def test_the_jobs_unit_carries_the_request_in_any_status(self, db_session, status):
+        """``printing`` for a card / dialog / API stop, ``cancelled`` for the queue page's own
+        end, any end for a duplicate terminal."""
+        await self._unit(db_session, printer_id=80, subtask="SUB-S", status=status)
+
+        assert await operator_stop_requested(db_session, 80, "SUB-S") is True
+
+    async def test_an_unstamped_unit_is_no_stop(self, db_session):
+        await self._unit(db_session, printer_id=81, subtask="SUB-S", stamped=False)
+
+        assert await operator_stop_requested(db_session, 81, "SUB-S") is False
+
+    async def test_a_foreign_job_has_no_unit_and_so_no_request(self, db_session):
+        """The farm's stamped unit on this printer is NOT the job that ended: a UI stop of a
+        foreign print is classified from the printer's echo, like a screen stop."""
+        await self._unit(db_session, printer_id=82, subtask="SUB-S")
+
+        assert await operator_stop_requested(db_session, 82, "SCREEN-1") is False
+
+    async def test_another_printers_unit_is_not_this_jobs(self, db_session):
+        await self._unit(db_session, printer_id=83, subtask="SUB-S")
+
+        assert await operator_stop_requested(db_session, 84, "SUB-S") is False
+
+    @pytest.mark.parametrize("echo", [None, "", "  "])
+    async def test_a_job_with_no_id_reads_the_sole_printing_unit(self, db_session, echo):
+        """The ladder's fallback: a terminal with no id is attributed to the sole printing unit."""
+        await self._unit(db_session, printer_id=85, subtask="SUB-S")
+
+        assert await operator_stop_requested(db_session, 85, echo) is True
+
+    async def test_a_job_with_no_id_over_two_printing_units_is_no_stop(self, db_session):
+        """Ambiguity attributes nothing — the same rule the fallback verdict applies."""
+        await self._unit(db_session, printer_id=86, subtask="SUB-S")
+        await self._unit(db_session, printer_id=86, subtask="SUB-T")
+
+        assert await operator_stop_requested(db_session, 86, None) is False
 
 
 class TestFarmWorkTargetsPrinter:
@@ -483,57 +541,58 @@ class TestResolveActivePlateId:
 
 
 class TestClassifyStop:
-    """Pure operator-stop classification (Phase 3.1) — no DB, no I/O."""
+    """Pure operator-stop classification (Phase 3.1) — no DB, no I/O. The UI stop is the
+    terminal's unit's DURABLE request, read by the caller (:class:`TestOperatorStopRequested`)."""
 
-    def test_ui_membership(self):
-        assert classify_stop({}, 1, {1}) == "operator_ui"
+    def test_the_units_stop_request_is_the_ui_stop(self):
+        assert classify_stop({}, operator_stop_requested=True) == "operator_ui"
 
     def test_screen_echo(self):
-        assert classify_stop({"user_cancel_observed": True}, 1, set()) == "operator_screen"
+        assert classify_stop({"user_cancel_observed": True}, operator_stop_requested=False) == "operator_screen"
 
     def test_ui_wins_over_screen(self):
-        # Both signals present → UI membership wins.
-        assert classify_stop({"user_cancel_observed": True}, 1, {1}) == "operator_ui"
+        # Both signals present → the unit's durable stop request wins.
+        assert classify_stop({"user_cancel_observed": True}, operator_stop_requested=True) == "operator_ui"
 
     def test_neither_is_none(self):
-        assert classify_stop({}, 1, set()) is None
+        assert classify_stop({}, operator_stop_requested=False) is None
 
     def test_no_echo_key_is_none(self):
         # A terminal carrying neither operator signal nor an unknown-outcome flag.
-        assert classify_stop({"status": "aborted"}, 1, {2, 3}) is None
+        assert classify_stop({"status": "aborted"}, operator_stop_requested=False) is None
 
     def test_the_reconcile_flag_is_its_own_verdict(self):
         """The only verdict no ACTOR produced: the downtime reconcile could not learn
         the outcome, and an unknown outcome is not a completed one. Before it existed,
         such a terminal classified ``None`` and the disposition fork skipped it, so the
         run finished one plate short in silence."""
-        assert classify_stop({"outcome_unknown": True}, 1, set()) == "reconcile_unknown"
+        assert classify_stop({"outcome_unknown": True}, operator_stop_requested=False) == "reconcile_unknown"
 
     @pytest.mark.parametrize(
-        "payload, membership, holds, expected",
+        "payload, requested, holds, expected",
         [
-            ({"outcome_unknown": True}, {1}, (), "operator_ui"),
-            ({"outcome_unknown": True, "user_cancel_observed": True}, set(), (), "operator_screen"),
+            ({"outcome_unknown": True}, True, (), "operator_ui"),
+            ({"outcome_unknown": True, "user_cancel_observed": True}, False, (), "operator_screen"),
             (
                 {"outcome_unknown": True, "status": "aborted", "subtask_id": "JOB-1"},
-                set(),
+                False,
                 ({"kind": "plate_vision", "job_id": "JOB-1"},),
                 "plate_refused",
             ),
         ],
     )
-    def test_the_unknown_ranks_below_every_real_signal(self, payload, membership, holds, expected):
+    def test_the_unknown_ranks_below_every_real_signal(self, payload, requested, holds, expected):
         """It is what is LEFT when nothing speaks — a reconciled terminal that does
-        carry a hold, an echo or a mark has a real cause, and that cause decides. (A
+        carry a hold, an echo or a stop request has a real cause, and that cause decides. (A
         paused plate check stopped while the farm was down reconciles as a refused
         plate: the reconcile echoes the job's own id.)"""
-        assert classify_stop(payload, 1, membership, open_incidents=holds) == expected
+        assert classify_stop(payload, operator_stop_requested=requested, open_incidents=holds) == expected
 
     def test_a_false_flag_is_not_a_verdict(self):
-        assert classify_stop({"outcome_unknown": False}, 1, set()) is None
+        assert classify_stop({"outcome_unknown": False}, operator_stop_requested=False) is None
 
     def test_false_echo_is_none(self):
-        assert classify_stop({"user_cancel_observed": False}, 1, set()) is None
+        assert classify_stop({"user_cancel_observed": False}, operator_stop_requested=False) is None
 
 
 class TestClassifyStopPlateRefused:
@@ -548,38 +607,47 @@ class TestClassifyStopPlateRefused:
     @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
     def test_the_paused_jobs_non_completed_terminal_is_a_refused_plate(self, status):
         payload = {"status": status, "subtask_id": "JOB-7"}
-        assert classify_stop(payload, 1, set(), open_incidents=[self._HOLD]) == STOP_VERDICT_PLATE_REFUSED
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._HOLD])
+            == STOP_VERDICT_PLATE_REFUSED
+        )
 
     def test_it_outranks_the_operators_ui_stop(self):
         """Pressing Stop on a paused plate check is how this verdict is USUALLY produced —
         what it means for the plate and the unit is the refusal, not the button."""
         payload = {"status": "failed", "subtask_id": "JOB-7"}
-        assert classify_stop(payload, 1, {1}, open_incidents=[self._HOLD]) == STOP_VERDICT_PLATE_REFUSED
+        assert (
+            classify_stop(payload, operator_stop_requested=True, open_incidents=[self._HOLD])
+            == STOP_VERDICT_PLATE_REFUSED
+        )
 
     def test_it_outranks_the_screen_echo(self):
         payload = {"status": "failed", "subtask_id": "JOB-7", "user_cancel_observed": True}
-        assert classify_stop(payload, 1, set(), open_incidents=[self._HOLD]) == STOP_VERDICT_PLATE_REFUSED
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._HOLD])
+            == STOP_VERDICT_PLATE_REFUSED
+        )
 
     def test_a_completed_terminal_is_never_a_refusal(self):
         """The operator fixed the plate and resumed, and the job ran to the end — the
         hold was answered, and the part exists."""
         payload = {"status": "completed", "subtask_id": "JOB-7"}
-        assert classify_stop(payload, 1, set(), open_incidents=[self._HOLD]) is None
+        assert classify_stop(payload, operator_stop_requested=False, open_incidents=[self._HOLD]) is None
 
     def test_another_jobs_terminal_is_not_this_holds_refusal(self):
         """The hold paused JOB-7; an eject sweep (or any other job) ending says nothing about it."""
         payload = {"status": "failed", "subtask_id": "EJECT-1"}
-        assert classify_stop(payload, 1, {1}, open_incidents=[self._HOLD]) == "operator_ui"
+        assert classify_stop(payload, operator_stop_requested=True, open_incidents=[self._HOLD]) == "operator_ui"
 
     def test_a_fault_hold_of_the_same_job_is_not_a_refusal(self):
         """Only the plate-check kind refuses a plate; a runout hold of the same job is a
         fault, and the operator's stop over it keeps its own verdict."""
         runout = {"kind": "runout", "job_id": "JOB-7"}
         payload = {"status": "failed", "subtask_id": "JOB-7"}
-        assert classify_stop(payload, 1, {1}, open_incidents=[runout]) == "operator_ui"
+        assert classify_stop(payload, operator_stop_requested=True, open_incidents=[runout]) == "operator_ui"
 
     def test_no_holds_is_the_pre_existing_behaviour(self):
-        assert classify_stop({"status": "failed", "subtask_id": "JOB-7"}, 1, {1}) == "operator_ui"
+        assert classify_stop({"status": "failed", "subtask_id": "JOB-7"}, operator_stop_requested=True) == "operator_ui"
 
 
 class TestResolvePrintingFarmItem:
@@ -745,9 +813,9 @@ class TestUpgradeToForeignAutoEject:
         callback cannot wait on."""
         assert plate_occupancy.declare_occupied(21, Evidence()) is None
 
-        assert upgrade_to_foreign_auto_eject(21, profile_id=4, threshold_c=33.0) is True
+        assert upgrade_to_foreign_auto_eject(21, profile_id=4) is True
 
-        assert plate_occupancy.snapshot(21).plate_policy == ForeignAutoEject(profile_id=4, threshold_c=33.0)
+        assert plate_occupancy.snapshot(21).plate_policy == ForeignAutoEject(profile_id=4)
 
     def test_a_cleared_plate_refuses_the_promotion(self):
         """False means the authority refused ``not_occupied`` — an operator cleared
@@ -756,10 +824,10 @@ class TestUpgradeToForeignAutoEject:
         assert plate_occupancy.declare_occupied(22, Evidence()) is None
         assert plate_occupancy.clear_plate(22) is None
 
-        assert upgrade_to_foreign_auto_eject(22, profile_id=4, threshold_c=33.0) is False
+        assert upgrade_to_foreign_auto_eject(22, profile_id=4) is False
 
         assert plate_occupancy.snapshot(22).plate_policy is None
 
     def test_a_printer_that_never_had_a_plate_refuses_too(self):
-        assert upgrade_to_foreign_auto_eject(23, profile_id=4, threshold_c=33.0) is False
+        assert upgrade_to_foreign_auto_eject(23, profile_id=4) is False
         assert plate_occupancy.is_plate_occupied(23) is False

@@ -150,6 +150,28 @@ class PrintQueueItem(Base):
     # (``terminal_outcome.TerminalOutcome``), never back off this column.
     stop_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
+    # The operator's STOP, durably: the UTC instant an operator asked THIS unit's print to
+    # stop — the printer card, the printer's own HMS dialog, the API's ``/stop`` and
+    # ``/cancel`` and the queue page all go through ``print_control.stop_as_operator``, which
+    # writes it (``queue_transitions.stamp_operator_stop``) and commits it BEFORE the
+    # ``print.stop`` goes out. A FACT about the request, not the outcome: the terminal of this
+    # unit's dispatch reads it (``farm_correlation.operator_stop_requested``) to classify its
+    # end ``operator_ui``, and the recovery driver reads it to tell an operator's Stop from its
+    # own verb ending the print. On the row rather than in process memory because the terminal
+    # of a stopped job can land after a restart (a deploy): the in-memory mark this replaces
+    # was empty by then, and the farm's own stopped job resolved FOREIGN (2026-09-25). Cleared
+    # only where a unit is RE-ARMED (``queue_transitions.release_unstarted_claim``, the
+    # skipped-unit restore), so a stop that never landed cannot classify a later dispatch; a
+    # requeue mints a fresh row and never carries it (``queue_builder.NOT_CARRIED_COLUMNS``).
+    operator_stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The printer's ANSWER to a stop the QUEUE PAGE recorded ahead of it: the UTC instant the
+    # printer's own terminal for this unit's dispatch was recorded on a row that route had
+    # already ended ``cancelled`` / ``operator_ui`` (``queue_transitions.annotate_stopped_unit``,
+    # its only writer). The annotation's WHERE requires it NULL, so the unit is annotated and
+    # disposed ONCE however many terminals the job produces. NULL on a unit its own terminal
+    # ended (there the end IS the answer) and on a stop of an offline printer (none arrived).
+    stop_answered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     # Durable mirror of the in-memory PendingEject (services/eject/remote.py): the
     # UTC timestamp at which THIS unit's server-dispatched part-present eject was
     # started. NON-NULL == an eject is in flight for this unit (one eject per printer

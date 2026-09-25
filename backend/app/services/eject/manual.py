@@ -18,8 +18,10 @@ The five outcomes:
   operator's input can CURE arrives here — a plate the farm never dispatched, a farm unit
   with no eject profile, a gate naming a unit this lane may not sweep directly, and a
   donor that is only a container.
-* ``bed_hot`` — a real live bed reading above the release threshold, with both numbers,
-  so the confirm dialog is built on measurements rather than a missing value.
+* ``bed_hot`` — a real live bed reading the release predicate refuses
+  (:func:`~backend.app.services.eject.shop_air.release_ok` — the measured eject line, or
+  the bed's own chamber air plus the margin), with the bed and the limit it missed (None
+  when neither term is known), so the confirm dialog is built on measurements.
 * ``refused`` — a state the operator's input cannot cure, carrying a closed
   :data:`~backend.app.schemas.printer.EjectRefusalReason`. The occupancy refusals keep the
   authority's own token spelling, so one vocabulary runs from the state machine to the
@@ -56,7 +58,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.schemas.printer import EjectOrigin, EjectOutcome, EjectRefusalReason
 from backend.app.services import printer_incidents
-from backend.app.services.eject import remote as eject_remote
+from backend.app.services.eject import remote as eject_remote, shop_air
 from backend.app.services.eject.donor import (
     AUTO_DONOR_CHAIN,
     MANUAL_DONOR_CHAIN,
@@ -66,7 +68,7 @@ from backend.app.services.eject.donor import (
     resolve_donor,
 )
 from backend.app.services.eject.geometry import GeometryUnavailable, get_geometry_required
-from backend.app.services.eject.monitor import _resolve_eject_threshold, eject_cooldown_monitor
+from backend.app.services.eject.monitor import _unit_releasable, eject_cooldown_monitor
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     Evidence,
@@ -150,8 +152,10 @@ class EjectVerdict:
         )
 
     @classmethod
-    def bed_hot(cls, bed_c: float, threshold_c: float) -> EjectVerdict:
-        """A REAL live bed reading above the release threshold; both numbers ride along."""
+    def bed_hot(cls, bed_c: float, threshold_c: float | None) -> EjectVerdict:
+        """A REAL live bed reading the release predicate refuses; the bed and the limit it
+        missed ride along — the limit None when there is neither an eject line (shop air
+        unknown) nor a chamber reading to judge the bed by."""
         return cls(outcome="bed_hot", bed_c=bed_c, threshold_c=threshold_c)
 
     @classmethod
@@ -290,22 +294,27 @@ async def _resolve_manual_eject_item(db: AsyncSession, printer_id: int, plate_so
     return ItemResolution(lane="first_article" if gate_item.first_article else "needs_input", item=gate_item)
 
 
-def _thermal_gate(state, threshold: float, *, allow_hot: bool) -> EjectVerdict | None:
+def _thermal_gate(state, line: shop_air.EjectLine, *, model: str | None, allow_hot: bool) -> EjectVerdict | None:
     """The shared hot-bed precondition. ``None`` means the bed is cool enough to sweep.
 
     ``allow_hot`` skips it entirely. An unreadable live bed is a retryable
     ``bed_unreadable`` refusal (never a confirm dialog built on a missing reading — the
-    UI would render ``Number(null)`` as "0 °C"); a real reading above ``threshold`` is a
-    ``bed_hot`` verdict carrying live bed + threshold.
+    UI would render ``Number(null)`` as "0 °C"). Otherwise the bed is judged by THE
+    release predicate the cooldown watch uses, over the live bed, the printer's own
+    chamber air (``model`` gates the sensor) and the current eject line — so "Eject now"
+    and the automatic release can never disagree about what is cool enough. A refusal is
+    a ``bed_hot`` verdict carrying the live bed and the limit it missed.
     """
     if allow_hot:
         return None
     bed = state.temperatures.get("bed") if state is not None and getattr(state, "connected", False) else None
     if bed is None:
         return EjectVerdict.refused("bed_unreadable")
-    if bed > threshold:
-        return EjectVerdict.bed_hot(bed, threshold)
-    return None
+    chamber = shop_air.own_air_c(state.temperatures, model=model)
+    if shop_air.release_ok(bed, chamber, line.line_c, line.margin_c):
+        return None
+    limit = shop_air.release_limit(line.line_c, chamber, line.margin_c)
+    return EjectVerdict.bed_hot(bed, limit.value_c if limit is not None else None)
 
 
 async def _suggest_eject_profile_id(db: AsyncSession, printer_id: int) -> int | None:
@@ -399,7 +408,9 @@ async def manual_eject(
         return EjectVerdict.refused("first_article")
 
     if resolution.lane == "eject" and resolution.item is not None:
-        verdict = await _eject_farm_unit(db, printer_id, resolution.item, state=state, allow_hot=allow_hot)
+        verdict = await _eject_farm_unit(
+            db, printer_id, resolution.item, state=state, model=printer.model, allow_hot=allow_hot
+        )
         if verdict is not None:
             return verdict
         # The unit carries no eject profile after all (today's "Unit has no eject profile"
@@ -426,7 +437,7 @@ async def manual_eject(
 
 
 async def _eject_farm_unit(
-    db: AsyncSession, printer_id: int, item: PrintQueueItem, *, state, allow_hot: bool
+    db: AsyncSession, printer_id: int, item: PrintQueueItem, *, state, model: str | None, allow_hot: bool
 ) -> EjectVerdict | None:
     """The direct path for a sweepable farm unit, or ``None`` when it has no profile.
 
@@ -448,11 +459,10 @@ async def _eject_farm_unit(
     (The direct dispatch registers the eject, so ``_desired_policy`` sees ``eject_present``
     and stands the watch down; its ``finally`` retires the prep.)
     """
-    threshold = await _resolve_eject_threshold(item.id)
-    if threshold is None:
+    if not await _unit_releasable(item.id):
         return None
 
-    hot = _thermal_gate(state, threshold, allow_hot=allow_hot)
+    hot = _thermal_gate(state, await shop_air.current_line(db), model=model, allow_hot=allow_hot)
     if hot is not None:
         return hot
 
@@ -542,7 +552,7 @@ async def _eject_by_confirm(
         )
 
     try:
-        hot = _thermal_gate(state, profile.cooldown_temp_c, allow_hot=allow_hot)
+        hot = _thermal_gate(state, await shop_air.current_line(db), model=printer.model, allow_hot=allow_hot)
         if hot is not None:
             return hot
         await eject_remote.dispatch_foreign_eject(
@@ -573,11 +583,11 @@ async def _eject_by_confirm(
 @dataclass(frozen=True)
 class ForeignFarmFile:
     """A foreign plate positively identified as the farm's OWN file — safe to
-    auto-eject after cooldown. Carries the chosen eject ``profile_id``, the release
-    ``threshold_c`` (the profile's ``cooldown_temp_c``) and the print name for logs."""
+    auto-eject after cooldown. Carries the chosen eject ``profile_id`` and the print name
+    for logs. No temperature: the cooldown it waits through is the same measured eject
+    line every other watch arms with (``shop_air``)."""
 
     profile_id: int
-    threshold_c: float
     print_name: str | None
 
 
@@ -641,7 +651,7 @@ async def identify_farm_file_foreign(
     """Decide whether a FOREIGN completion is positively the farm's OWN file, so the
     farm may auto-eject it after cooldown instead of only escalating (2026-07-18).
 
-    Returns a :class:`ForeignFarmFile` (profile + release threshold) ONLY when ALL of:
+    Returns a :class:`ForeignFarmFile` (the eject profile) ONLY when ALL of:
 
       (a) the echoed ``subtask_name``/``filename`` matches a file the farm has
           dispatched to THIS printer, both sides keyed through
@@ -766,10 +776,9 @@ async def identify_farm_file_foreign(
 
     logger.info(
         "identify_farm_file_foreign: printer %s foreign plate IS the farm's own file "
-        "(profile %s, cooldown %.1f°C, max_z %.1fmm) — auto-eject eligible",
+        "(profile %s, max_z %.1fmm) — auto-eject eligible",
         printer_id,
         profile_id,
-        profile.cooldown_temp_c,
         source.max_z,
     )
-    return ForeignFarmFile(profile_id=profile_id, threshold_c=profile.cooldown_temp_c, print_name=source.print_name)
+    return ForeignFarmFile(profile_id=profile_id, print_name=source.print_name)

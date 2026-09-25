@@ -321,24 +321,42 @@ class TestFarmSettings:
         s = r.json()
         assert s["farm_retry_max_per_unit"] == 1
         assert s["farm_escalate_consecutive_failures"] == 2
-        # Phase 2 ambient-trap guard: warn floor defaults to 30 °C.
-        assert s["farm_cooldown_warn_floor_c"] == 30
+        # The ONE eject-line input (2026-09-25): the line is measured shop air + this margin.
+        assert s["farm_cooldown_margin_c"] == 2.0
+        # The ambient-trap warn floor policed a hand-typed target that no longer exists.
+        assert "farm_cooldown_warn_floor_c" not in s
 
         put = await async_client.put(
             "/api/v1/settings/",
             json={
                 "farm_retry_max_per_unit": 2,
                 "farm_escalate_consecutive_failures": 3,
-                "farm_cooldown_warn_floor_c": 33,
+                "farm_cooldown_margin_c": 3.5,
             },
         )
         assert put.status_code == 200, put.text
         assert put.json()["farm_retry_max_per_unit"] == 2
         assert put.json()["farm_escalate_consecutive_failures"] == 3
-        assert put.json()["farm_cooldown_warn_floor_c"] == 33
+        assert put.json()["farm_cooldown_margin_c"] == 3.5
+        # Round trip: the stored string reads back as the float the owner uses.
+        again = await async_client.get("/api/v1/settings/")
+        assert again.json()["farm_cooldown_margin_c"] == 3.5
 
-    async def test_cooldown_warn_floor_bounds_rejected(self, async_client):
-        # ge=15 le=50 — out-of-range values are a 422, not silently clamped.
-        for bad in (14, 51):
-            r = await async_client.put("/api/v1/settings/", json={"farm_cooldown_warn_floor_c": bad})
+    async def test_cooldown_margin_bounds_rejected(self, async_client):
+        # ge=0.5 le=10 — out-of-range values are a 422, not silently clamped.
+        for bad in (0.4, 10.5):
+            r = await async_client.put("/api/v1/settings/", json={"farm_cooldown_margin_c": bad})
             assert r.status_code == 422, r.text
+
+    async def test_the_retired_warn_floor_is_neither_accepted_nor_stored(self, async_client, db_session):
+        from sqlalchemy import select
+
+        from backend.app.models.settings import Settings
+
+        r = await async_client.put("/api/v1/settings/", json={"farm_cooldown_warn_floor_c": 33})
+        assert r.status_code == 200, r.text
+        assert "farm_cooldown_warn_floor_c" not in r.json()
+        row = (
+            await db_session.execute(select(Settings).where(Settings.key == "farm_cooldown_warn_floor_c"))
+        ).scalar_one_or_none()
+        assert row is None

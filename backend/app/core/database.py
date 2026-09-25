@@ -135,7 +135,7 @@ async def hold_write_lock(db: AsyncSession) -> None:
     first is a READ transaction pinned to that snapshot; if another connection then
     commits, SQLite refuses to upgrade the stale snapshot to a writer and fails the
     write at once with ``database is locked`` (SQLITE_BUSY_SNAPSHOT) — the busy
-    handler never runs, so ``busy_timeout`` does not help. That is what lost 20
+    handler never runs, so ``busy_timeout`` does not help. That is what lost 18
     requeues in production between 2026-09-06 and 09-24: a SAVEPOINT opened a
     deferred transaction, ``SELECT max(position)`` pinned the snapshot, the plate
     authority's persist task committed, and the retry's INSERT died. ``BEGIN
@@ -266,6 +266,7 @@ async def init_db():
         project_bom,
         recovery_escalation,
         settings,
+        shop_air_sample,
         shopping_list,
         sku,
         slot_preset,
@@ -564,6 +565,22 @@ _AUTOINCREMENT_TABLES: tuple[str, ...] = (
     "print_queue",
 )
 
+# RETIRED BUT KEPT PHYSICALLY — the expand half of an expand/contract column retirement.
+# A column the model no longer maps, but the PREVIOUS build still reads, stays in the live
+# table (unread, unwritten) until its contracting drop, so that build remains a working
+# rollback target. ONE ledger, read by both table rebuilds: ``_rebuild_column_nullable``
+# relaxes every entry (the model no longer names it, so a NOT NULL would refuse every
+# INSERT), and ``_rebuild_table_with_autoincrement`` CARRIES every entry verbatim from the
+# live DDL instead of skipping the table as "a live column the model lacks" — which would
+# otherwise leave an install that has not yet had the 2026-09-17 retrofit reissuing
+# deleted ids. Removing an entry IS the contracting drop (a farm-ops Pending item).
+_RETIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    # 2026-09-25, user ruling "ONE value": the eject line is measured shop air + one margin
+    # (``services/eject/shop_air``); the profile threshold and the run override are gone.
+    "eject_profiles": ("cooldown_temp_c",),
+    "print_batches": ("cooldown_temp_c_override",),
+}
+
 
 async def _rebuild_table_with_autoincrement(conn, table) -> None:
     """Rebuild one SQLite table so its INTEGER PRIMARY KEY carries ``AUTOINCREMENT``.
@@ -604,6 +621,10 @@ async def _rebuild_table_with_autoincrement(conn, table) -> None:
     takes that name a statement later. ``sqlite_sequence`` is deliberately not written —
     the explicit-rowid INSERT seeds it to MAX(id), which is exactly the floor the next
     insert must clear.
+
+    A column in :data:`_RETIRED_COLUMNS` is not "a live column the model lacks": it is
+    carried — its live definition spliced into the model's DDL, nullable, and its data
+    copied — because the rollback build still reads it (see the ledger).
     """
     import re
 
@@ -632,8 +653,9 @@ async def _rebuild_table_with_autoincrement(conn, table) -> None:
 
     live_columns = [row[1] for row in await conn.execute(text(f"PRAGMA table_info({name})"))]
     model_columns = [column.name for column in table.columns]
+    retired = [column for column in _RETIRED_COLUMNS.get(name, ()) if column in live_columns]
 
-    unknown_live = [column for column in live_columns if column not in model_columns]
+    unknown_live = [column for column in live_columns if column not in model_columns and column not in retired]
     if unknown_live:
         logger.error(
             "[MIGRATION] AUTOINCREMENT rebuild SKIPPED for %s: live column(s) %s are not in the model, so the "
@@ -673,6 +695,8 @@ async def _rebuild_table_with_autoincrement(conn, table) -> None:
 
     staging = f"{name}__ai"
     ddl = str(CreateTable(table).compile(dialect=sqlite_dialect.dialect()))
+    if retired:
+        ddl = _carry_retired_columns(ddl, existing_sql, retired)
     leading_name = re.compile(
         rf"^(\s*CREATE\s+TABLE\s+)(?:{re.escape(chr(34) + name + chr(34))}|{re.escape(name)})(\s*\()",
         re.IGNORECASE,
@@ -681,7 +705,7 @@ async def _rebuild_table_with_autoincrement(conn, table) -> None:
     if renamed != 1:
         raise RuntimeError(f"AUTOINCREMENT rebuild of {name}: could not rename the CREATE TABLE token in {ddl!r}")
 
-    columns_sql = ", ".join(f'"{column}"' for column in model_columns if column in live_columns)
+    columns_sql = ", ".join(f'"{column}"' for column in [*model_columns, *retired] if column in live_columns)
 
     async with conn.begin_nested():
         await conn.execute(text(staging_ddl))
@@ -712,6 +736,165 @@ async def _rebuild_table_with_autoincrement(conn, table) -> None:
         row_count,
         len(captured),
     )
+
+
+def _ddl_parts(sql: str) -> tuple[str, list[str], str]:
+    """``CREATE TABLE`` DDL as (head up to ``(``, the body's top-level definitions, tail)."""
+    open_paren = sql.index("(")
+    close_paren = sql.rindex(")")
+    return sql[:open_paren], _split_top_level(sql[open_paren + 1 : close_paren]), sql[close_paren:]
+
+
+def _column_definition_index(definitions: list[str], column_name: str) -> int:
+    """The index of ``column_name``'s definition among a table's definitions. Raises unless ONE."""
+    import re
+
+    token = re.compile(rf'^\s*["`\[]?{re.escape(column_name)}["`\]]?\s', re.IGNORECASE)
+    hits = [index for index, definition in enumerate(definitions) if token.match(definition)]
+    if len(hits) != 1:
+        raise RuntimeError(f"found {len(hits)} definitions of column {column_name}")
+    return hits[0]
+
+
+def _without_not_null(definition: str) -> tuple[str, int]:
+    """One column definition with its ``NOT NULL`` removed, and how many were removed."""
+    import re
+
+    return re.subn(r"\s+NOT\s+NULL\b", "", definition, flags=re.IGNORECASE)
+
+
+def _carry_retired_columns(model_ddl: str, live_sql: str, columns: list[str]) -> str:
+    """The model's DDL with each retired column's LIVE definition spliced in, nullable.
+
+    Inserted after the model's last column definition — SQLite wants every column before
+    the first table constraint (``PRIMARY KEY (…)``, ``UNIQUE``, ``FOREIGN KEY``).
+    """
+    import re
+
+    head, model_definitions, tail = _ddl_parts(model_ddl)
+    _, live_definitions, _ = _ddl_parts(live_sql)
+    carried = [_without_not_null(live_definitions[_column_definition_index(live_definitions, c)])[0] for c in columns]
+    constraint = re.compile(r"^\s*(PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK|CONSTRAINT)\b", re.IGNORECASE)
+    last_column = max(index for index, definition in enumerate(model_definitions) if not constraint.match(definition))
+    model_definitions[last_column + 1 : last_column + 1] = carried
+    return f"{head}({','.join(model_definitions)}{tail}"
+
+
+def _split_top_level(body: str) -> list[str]:
+    """Split a CREATE TABLE body on the commas at paren depth 0 (``VARCHAR(100)`` survives)."""
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for char in body:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+async def _rebuild_column_nullable(conn, table_name: str, column_name: str) -> bool:
+    """Drop ``NOT NULL`` from one column, keeping the column, its data and everything else.
+
+    The EXPAND half of an expand/contract column retirement: the model stops writing the
+    column, the column stays physically so the previous build remains a working rollback
+    target, and — because a NOT NULL column with no DDL default rejects every INSERT that no
+    longer names it — the constraint has to go first. Returns True when it rebuilt.
+
+    PostgreSQL has ``ALTER COLUMN … DROP NOT NULL``. SQLite does not, so this is the
+    create-copy-drop-rename procedure of :func:`_rebuild_table_with_autoincrement` with ONE
+    difference that is the whole point: the new table's DDL is the LIVE ``sqlite_master`` SQL
+    with that one column's ``NOT NULL`` removed, never the model's — the model no longer has
+    the column, so a model-built table would drop it. Every other column, its type and
+    default, the AUTOINCREMENT flag and every table constraint are therefore carried
+    verbatim; indexes and triggers are captured before the drop and replayed after the
+    rename, and a replay that does not restore them all raises. Same refusal as that helper
+    under ``PRAGMA foreign_keys = 1`` (the DROP would cascade-delete children).
+
+    Idempotent: a column that is absent or already nullable is left alone (``PRAGMA
+    table_info``'s ``notnull``), so a second boot does nothing.
+    """
+    import re
+
+    from sqlalchemy import text
+
+    if not is_sqlite():
+        if await _column_exists(conn, table_name, column_name):
+            await _safe_execute(conn, f"ALTER TABLE {table_name} ALTER COLUMN {column_name} DROP NOT NULL")
+            return True
+        return False
+
+    info = {row[1]: row for row in await conn.execute(text(f"PRAGMA table_info({table_name})"))}
+    column = info.get(column_name)
+    if column is None or not column[3]:
+        return False  # absent (fresh install) or already nullable (an earlier boot)
+
+    if (await conn.execute(text("PRAGMA foreign_keys"))).scalar():
+        raise RuntimeError(
+            f"refusing the nullable rebuild of {table_name}.{column_name}: PRAGMA foreign_keys is ON, so the "
+            "DROP would cascade-delete child rows."
+        )
+
+    live_sql = (
+        await conn.execute(text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = :t"), {"t": table_name})
+    ).scalar()
+    head, definitions, tail = _ddl_parts(live_sql)
+    index = _column_definition_index(definitions, column_name)
+    relaxed, removed = _without_not_null(definitions[index])
+    if removed != 1:
+        raise RuntimeError(f"nullable rebuild of {table_name}: {column_name} carries {removed} NOT NULL clauses")
+    definitions[index] = relaxed
+
+    staging = f"{table_name}__nullable"
+    leading_name = re.compile(
+        rf"^(\s*CREATE\s+TABLE\s+)(?:{re.escape(chr(34) + table_name + chr(34))}|{re.escape(table_name)})(\s*)$",
+        re.IGNORECASE,
+    )
+    staging_head, renamed = leading_name.subn(rf'\g<1>"{staging}"\g<2>', head, count=1)
+    if renamed != 1:
+        raise RuntimeError(f"nullable rebuild of {table_name}: could not rename the CREATE TABLE token in {head!r}")
+    staging_ddl = f"{staging_head}({','.join(definitions)}{tail}"
+
+    captured = (
+        await conn.execute(
+            text(
+                "SELECT type, name, sql FROM sqlite_master WHERE tbl_name = :t AND type IN ('index', 'trigger') "
+                "AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
+            ),
+            {"t": table_name},
+        )
+    ).fetchall()
+    columns_sql = ", ".join(f'"{name}"' for name in info)
+
+    async with conn.begin_nested():
+        await conn.execute(text(staging_ddl))
+        await conn.execute(text(f'INSERT INTO "{staging}" ({columns_sql}) SELECT {columns_sql} FROM "{table_name}"'))
+        await conn.execute(text(f'DROP TABLE "{table_name}"'))
+        await conn.execute(text(f'ALTER TABLE "{staging}" RENAME TO "{table_name}"'))
+        for _type, _object_name, object_sql in captured:
+            await conn.execute(text(object_sql))
+        restored = (
+            await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = :t AND type IN ('index', 'trigger') "
+                    "AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
+                ),
+                {"t": table_name},
+            )
+        ).scalar()
+        if restored != len(captured):
+            raise RuntimeError(
+                f"nullable rebuild of {table_name}: replayed {restored} of {len(captured)} captured "
+                f"index/trigger objects ({', '.join(row[1] for row in captured)})"
+            )
+    logger.info("[MIGRATION] %s.%s is now nullable (table rebuilt from its live DDL)", table_name, column_name)
+    return True
 
 
 async def _migrate_normalize_printer_ids(conn) -> None:
@@ -1101,9 +1284,10 @@ async def run_migrations(conn):
     # Migration: Drop eject_profiles.cooldown_retries (farm eject went
     # server-dispatched motion-only). The cooldown wait moved OUT of the injected
     # G-code into the eject monitor, which holds the plate gate until the live bed
-    # reaches cooldown_temp_c and then dispatches a motion-only eject job — so there
-    # is no in-file `M190 R` loop and no retry count to store. cooldown_temp_c STAYS
-    # (now purely the server-side release threshold). Presence-guarded because
+    # reaches the eject line and then dispatches a motion-only eject job — so there
+    # is no in-file `M190 R` loop and no retry count to store. (The line itself has
+    # since moved off the profile onto measured shop air — ``services/eject/shop_air``,
+    # 2026-09-25.) Presence-guarded because
     # SQLite's DROP COLUMN has no IF EXISTS and PG's "does not exist" is outside the
     # _safe_execute swallow set (see _column_exists).
     if await _column_exists(conn, "eject_profiles", "cooldown_retries"):
@@ -3995,6 +4179,15 @@ async def run_migrations(conn):
     # Idempotent ADD COLUMN, dialect-safe on SQLite + Postgres.
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN eject_dispatched_at TIMESTAMP NULL")
 
+    # The operator's Stop, durable (2026-09-25): the stop request on the unit row
+    # (``print_control.stop_as_operator`` stamps it before the ``print.stop`` goes out) and
+    # the marker that the printer's terminal answered a stop the queue page recorded ahead
+    # of it (``queue_transitions.annotate_stopped_unit``). Replaces the process-memory
+    # ``_user_stopped_printers`` set a restart emptied. Idempotent ADD COLUMN, dialect-safe.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN operator_stop_requested_at TIMESTAMP NULL")
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN stop_answered_at TIMESTAMP NULL")
+    await _migrate_queue_page_stops_carry_their_stamp(conn)
+
     # Migration: Disambiguate the four ``user_print_*`` notification template
     # names by appending " Email" (#1792). See ``_migrate_rename_user_print_template_names``.
     await _migrate_rename_user_print_template_names(conn)
@@ -5734,6 +5927,176 @@ async def run_migrations(conn):
                 _vision_repair_marker,
             )
 
+    # Repair (2026-09-25): undo what the downtime reconcile's replays did, 2026-09-16..09-24.
+    #
+    # Each restart or reconnect replayed archives LEAKED in ``printing`` (their real completion
+    # could not find them after a restart) as synthesised terminals. A replay charged spools from
+    # the LIVE printer's progress (a phantom charge, ~7.2 kg over 32 charges). It closed the
+    # archive and wrote a print-log row, both ``cancelled`` (``aborted`` before 2026-09-19, the
+    # true status when the printer still showed that job's end). In 10 of 50 cases it closed the
+    # CURRENT print's archive instead of the stale one. The real completions had charged through
+    # the dispatch donor and written no print-log row. By the user's ruling, both damage sets are
+    # repaired through this ONE guarded repair. A charge or print-log row is judged by EVIDENCE,
+    # never by a status word, the run's included. Attributed to a terminal run, it was written
+    # outside that run's own terminal window, so another terminal wrote it. A run recorded
+    # ``cancelled`` too: its outcome was unobserved only when the replay WAS its terminal, and
+    # then the replay's rows sit inside the window. A rewritten print-log row takes its grams from
+    # the run's real terminal's own donor charges. A reversal below a spool's usage baseline lowers
+    # the baseline with it. The rules, the run model they share and the reasoning
+    # live in ``services/foreign_replay_repair.py``, the standalone module that also produces the
+    # read-only report on the farm PC. The per-row log below is therefore line-for-line that
+    # report's body.
+    #
+    # ORDER: this block MUST run before any index on ``print_archives`` that assumes at most one
+    # ``printing`` archive per printer. Its R-dup rule closes every superseded ``printing`` archive,
+    # which is what lets such an index build on a live database. Create that index BELOW this block.
+    #
+    # Shape B (durable settings marker), for the reason the ``repair_runout_reclaim_20260813`` block
+    # states: an operator may reassign a print-log row's status by hand, and a repair re-derived at
+    # every boot would fight that edit at every restart. Plan, apply and the marker
+    # INSERT ride ONE savepoint, so the three are all-or-nothing. A failure rolls everything back,
+    # leaves the marker unwritten, and the next boot retries. Every action is logged at WARNING
+    # with its before-values, and that log is the repair's rollback record beside the pre-deploy
+    # DB backup. Fully guarded: a repair must never take startup down for every install.
+    _replay_repair_marker = "repair_foreign_replay_20260925"
+    _replay_repair_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _replay_repair_marker})
+    ).scalar()
+    if not _replay_repair_done:
+        _replay_log_tag = f"[REPAIR] {_replay_repair_marker}:"
+        try:
+            from datetime import timezone as _tz
+
+            from backend.app.services import foreign_replay_repair as _replay_repair
+
+            _replay_now = _dt.now(_tz.utc)
+            async with conn.begin_nested():
+                _replay_plan = await conn.run_sync(
+                    lambda sync_conn: _replay_repair.plan_foreign_replay_repair(sync_conn, now=_replay_now)
+                )
+                await conn.run_sync(
+                    lambda sync_conn: _replay_repair.apply_foreign_replay_repair(sync_conn, _replay_plan)
+                )
+                # Logged once applied, so a rolled-back boot never reads as a repaired one. Every
+                # mutation at WARNING with its before-values, every skip at INFO: together, the
+                # report's body line for line.
+                for _replay_action in _replay_plan.actions:
+                    logger.warning("%s %s", _replay_log_tag, _replay_repair.describe(_replay_action))
+                for _replay_skip in _replay_plan.skips:
+                    logger.info("%s %s", _replay_log_tag, _replay_repair.describe(_replay_skip))
+                await conn.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _replay_repair_marker},
+                )
+            # A fresh install has nothing to repair; that is not worth a warning.
+            logger.log(
+                logging.WARNING if _replay_plan.actions else logging.INFO,
+                "%s %d action(s) applied, %d candidate(s) skipped (one-time)",
+                _replay_log_tag,
+                len(_replay_plan.actions),
+                len(_replay_plan.skips),
+            )
+        except Exception:  # noqa: BLE001 — a repair must never take startup down for every install
+            logger.exception(
+                "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a later "
+                "boot retries it",
+                _replay_repair_marker,
+            )
+
+    # ONE printing archive per printer (2026-09-25) — the pin under ``services/print_binding.py``, the
+    # only writer of ``status='printing'``. Same name and predicate the model declares, so create_all
+    # and this DDL converge on one index. BELOW the replay repair on purpose: its superseded-duplicate
+    # rule closes every extra ``printing`` archive a printer holds, which is what lets a UNIQUE index
+    # build on a live database at all.
+    #
+    # Guarded, not fatal: should the repair have rolled back, duplicates remain and SQLite raises
+    # IntegrityError here (``_safe_execute`` swallows only idempotency errors). The farm then runs
+    # without the pin — print_binding still supersedes an extra live archive at the next start — and
+    # the next boot retries both. Rollback: the index outlives a downgrade, so the previous build's
+    # name-matched archive creation can hit an IntegrityError in ``on_print_start``; the callback
+    # scheduler (``printer_manager._schedule_async``) logs it and that print records no archive — the
+    # printer and the rest of the farm carry on.
+    from backend.app.models.archive import LIVE_ARCHIVE_PREDICATE as _live_archive_predicate
+
+    try:
+        await _safe_execute(
+            conn,
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_print_archives_live_printer "
+            f"ON print_archives (printer_id) WHERE {_live_archive_predicate}",
+        )
+    except IntegrityError:
+        logger.exception(
+            "[MIGRATION] ux_print_archives_live_printer not built: a printer still holds more than one "
+            "printing archive (non-fatal; the next boot retries after the replay repair)"
+        )
+
+    # The eject line follows MEASURED shop air (2026-09-25, user ruling: ONE value). The
+    # per-profile ``eject_profiles.cooldown_temp_c`` and the per-run
+    # ``print_batches.cooldown_temp_c_override`` are no longer read or written; both
+    # PHYSICAL columns stay (expand/contract) so the previous build remains a working
+    # rollback target. ``cooldown_temp_c`` is ``FLOAT NOT NULL`` with no DDL default, so
+    # with the model no longer naming it every new-profile INSERT would fail — rebuilt
+    # nullable here, from its live DDL. The override column was always nullable. The
+    # CONTRACTING drop of both columns is a farm-ops Pending item, for the build after
+    # rollback to this one stops mattering. Rollback note: a profile CREATED by this build
+    # carries NULL there, which the previous build's response schema cannot serialise —
+    # give such rows a value before rolling back.
+    for _retired_table, _retired in _RETIRED_COLUMNS.items():
+        for _retired_column in _retired:
+            await _rebuild_column_nullable(conn, _retired_table, _retired_column)
+
+    # Migration (2026-09-25): drop the retired ``farm_cooldown_warn_floor_c`` setting. It was
+    # a UI-only "ambient trap" warning on a hand-typed cooldown target; with the line
+    # measured there is no hand-typed target left to warn about, and the key is gone from the
+    # schema, the route lists and the Settings page. Nothing read it server-side, so deleting
+    # the row changes no behaviour. Same shape as the ``auto_add_untagged`` drop; idempotent.
+    if (await conn.execute(text("SELECT 1 FROM settings WHERE key = 'farm_cooldown_warn_floor_c'"))).scalar():
+        async with conn.begin_nested():
+            await conn.execute(text("DELETE FROM settings WHERE key = 'farm_cooldown_warn_floor_c'"))
+        logger.info("[MIGRATION] retired setting farm_cooldown_warn_floor_c deleted")
+
+    await _migrate_aborted_queue_items_to_cancelled(conn)
+
+    # The shop-air sample cache (``services/eject/shop_air``): a documented derived cache
+    # over ``printer_sensor_history``, bootstrapped here from the last 7 days through the
+    # SAME qualification the live writer runs, so the first cooldown after this deploy
+    # already has a day curve. Keyed by the rule's version: the marker row stores the
+    # version the cache was built under, and a different one (or none) drops the whole cache
+    # and re-derives it — samples of two rules are never mixed. Non-fatal: the cache
+    # refills live, a minute at a time, and an unknown shop air still releases every bed on
+    # its own air or at its plateau.
+    from datetime import timezone as _shop_air_tz
+
+    from backend.app.services.eject import shop_air as _shop_air
+
+    _shop_air_marker = "shop_air_sample_rule_version"
+    _shop_air_built = (
+        await conn.execute(text("SELECT value FROM settings WHERE key = :key"), {"key": _shop_air_marker})
+    ).scalar()
+    if _shop_air_built != str(_shop_air.RULE_VERSION):
+        try:
+            async with conn.begin_nested():
+                _shop_air_count = await _shop_air.backfill(conn, now=_dt.now(_shop_air_tz.utc).replace(tzinfo=None))
+                await conn.execute(text("DELETE FROM settings WHERE key = :key"), {"key": _shop_air_marker})
+                await conn.execute(
+                    text("INSERT INTO settings (key, value) VALUES (:key, :value)"),
+                    {"key": _shop_air_marker, "value": str(_shop_air.RULE_VERSION)},
+                )
+            logger.info(
+                "[MIGRATION] shop-air sample cache built under rule v%s (was %s): %d sample(s) from the last 7 days",
+                _shop_air.RULE_VERSION,
+                _shop_air_built or "none",
+                _shop_air_count,
+            )
+        except Exception:  # noqa: BLE001 — a derived cache must never take startup down
+            logger.exception(
+                "[MIGRATION] shop-air sample backfill failed and was rolled back (non-fatal); the cache fills "
+                "live and the next boot retries"
+            )
+
     # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds
     # from and the live table agree. A deleted id is never reused (005-H2S 2026-09-17) —
     # rationale, refusals and failure semantics live on the helper.
@@ -5745,6 +6108,54 @@ async def run_migrations(conn):
             # the forbidden names are real.
             continue
         await _rebuild_table_with_autoincrement(conn, _table)
+
+
+async def _migrate_aborted_queue_items_to_cancelled(conn) -> None:
+    """Repair queue units left ``aborted`` by builds that recorded the printer's raw word.
+
+    ``aborted`` is the MQTT client's word for a job that ended in neither FINISH nor FAILED, never a
+    queue status: the terminal records it ``cancelled`` (``terminal_outcome``), and a unit ends only
+    through ``queue_transitions.record_unit_terminal``, which refuses any word outside the terminal
+    set. Rows an earlier build wrote ``aborted`` fall outside every queue filter and every farm-policy
+    branch. This used to run in the app lifespan as an ORM read-then-write on every boot; it is data
+    repair, so it lives with the migrations as ONE self-predicating statement — idempotent because
+    nothing writes the word any more, so a second boot matches no row. ``waiting_reason`` is cleared
+    in the same statement (terminal-transition hygiene, W4b).
+    """
+    from sqlalchemy import text
+
+    async with conn.begin_nested():
+        result = await conn.execute(
+            text("UPDATE print_queue SET status = 'cancelled', waiting_reason = NULL WHERE status = 'aborted'")
+        )
+    if result.rowcount:
+        logger.info("[MIGRATION] %d queue unit(s) recorded 'aborted' → 'cancelled'", result.rowcount)
+
+
+async def _migrate_queue_page_stops_carry_their_stamp(conn) -> None:
+    """Give every unit an operator's UI Stop ended its durable stop request.
+
+    ``print_queue.operator_stop_requested_at`` is the fact the terminal classifies an operator
+    stop from. A row recorded ``cancelled`` / ``operator_ui`` is, by that token's one meaning, a
+    unit an operator stopped from the UI — but builds before the column existed kept the request
+    only in process memory, so such a row carries no stamp. The one row that matters is the one
+    a deploy lands on: stopped from the queue page on the old build, its printer's terminal
+    arriving on the new one, which would then classify it as no stop at all. The stop time the
+    route recorded (``completed_at``) is the request's instant. ONE self-predicating statement,
+    like the ``aborted`` repair above: every writer since stamps before it records the stop, so
+    a later boot matches no row.
+    """
+    from sqlalchemy import text
+
+    async with conn.begin_nested():
+        result = await conn.execute(
+            text(
+                "UPDATE print_queue SET operator_stop_requested_at = COALESCE(completed_at, CURRENT_TIMESTAMP) "
+                "WHERE status = 'cancelled' AND stop_source = 'operator_ui' AND operator_stop_requested_at IS NULL"
+            )
+        )
+    if result.rowcount:
+        logger.info("[MIGRATION] %d operator-stopped queue unit(s) given their durable stop request", result.rowcount)
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

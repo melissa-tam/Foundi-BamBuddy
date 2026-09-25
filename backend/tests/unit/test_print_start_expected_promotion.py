@@ -1,439 +1,217 @@
-"""Tests for expected print promotion when auto_archive is disabled (#839).
+"""A dispatched print records itself even with auto-archive off (#839) — through the binding owner.
 
-When auto_archive=False but a print was dispatched by BamBuddy (queue/reprint),
-the on_print_start callback must still promote the expected print to _active_prints
-so that at print completion the archive_id and ams_mapping are available for
-filament usage tracking.
+With ``auto_archive=False`` a print Bambuddy dispatched (queue / reprint) must still bind the archive
+the scheduler made for it, so the terminal finds it and usage tracking can charge it. Until
+2026-09-25 that promotion was a name-keyed process-memory registry the scheduler filled; it missed
+whenever the printer normalised the name and was empty after every restart. Now the dispatched unit
+IS the registration: ``print_binding.attach`` finds it by its durable ``dispatch_subtask_id`` and
+adopts its never-printed archive, and the unit's own ``ams_mapping`` / ``plate_id`` columns replace
+the registry's copies. Driven through the real ``main.on_print_start`` over the test database.
 
-These are pure unit tests that verify the module-level dict manipulation logic
-directly, NOT by calling the full on_print_start callback.
+What the old registry tests proved, re-expressed:
+
+* promotion happens for a dispatched print and never for a foreign one (``TestAutoArchiveOff``);
+* the completion finds the promoted archive (``test_the_terminal_finds_the_promoted_archive``);
+* the name variations the old key-builder chased no longer matter — identity is the id
+  (``test_a_printer_normalised_name_still_binds``);
+* the start-time injection of the dispatch's AMS mapping and plate into the usage session
+  (``TestUsageSessionInjection``), now read off the unit row.
 """
 
-import time
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timezone
 
 import pytest
 
-from backend.app.main import (
-    _active_prints,
-    _expected_print_creators,
-    _expected_print_registered_at,
-    _expected_prints,
-    _get_start_plate_id,
-    _print_ams_mappings,
-    _print_plate_ids,
-    register_expected_print,
+from backend.app.services.usage_tracker import PrintSession, _active_sessions
+from backend.tests._fixtures.print_callbacks import (
+    archive_row,
+    drain_new_tasks,
+    live_state,
+    print_callbacks,
+    printer_archives,
+    seed_archive,
+    seed_printer,
+    seed_unit,
 )
 
 
 @pytest.fixture(autouse=True)
-def _clear_dicts():
-    """Clear module-level tracking dicts before and after each test."""
-    _expected_prints.clear()
-    _expected_print_registered_at.clear()
-    _expected_print_creators.clear()
-    _print_ams_mappings.clear()
-    _print_plate_ids.clear()
-    _active_prints.clear()
+def _clear_usage_sessions():
+    _active_sessions.clear()
     yield
-    _expected_prints.clear()
-    _expected_print_registered_at.clear()
-    _expected_print_creators.clear()
-    _print_ams_mappings.clear()
-    _print_plate_ids.clear()
-    _active_prints.clear()
+    _active_sessions.clear()
 
 
-class TestRegisterExpectedPrint:
-    """Verify register_expected_print populates all tracking dicts."""
+async def _start(maker, printer_id: int, payload: dict, *, subtask: str | None):
+    from backend.app.main import on_print_start
 
-    def test_registers_filename_and_variants(self):
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-
-        assert _expected_prints[(1, "Box.3mf")] == 54
-        assert _expected_prints[(1, "Box")] == 54
-        assert _expected_prints[(1, "Box.gcode")] == 54
-
-    def test_stores_ams_mapping(self):
-        register_expected_print(1, "test.3mf", archive_id=10, ams_mapping=[2, -1, 3])
-        assert _print_ams_mappings[10] == [2, -1, 3]
-
-    def test_no_ams_mapping_when_none(self):
-        register_expected_print(1, "test.3mf", archive_id=10, ams_mapping=None)
-        assert 10 not in _print_ams_mappings
-
-    def test_stores_creator(self):
-        register_expected_print(1, "test.3mf", archive_id=10, created_by_id=5)
-        assert _expected_print_creators[(1, "test.3mf")] == 5
-
-    def test_stores_registered_at(self):
-        before = time.monotonic()
-        register_expected_print(1, "test.3mf", archive_id=10)
-        after = time.monotonic()
-
-        ts = _expected_print_registered_at[(1, "test.3mf")]
-        assert before <= ts <= after
-
-    def test_stores_plate_id(self):
-        """plate_id is registered so usage tracking can scope multi-plate 3MFs (#1697)."""
-        register_expected_print(1, "test.3mf", archive_id=10, plate_id=2)
-        assert _print_plate_ids[10] == 2
-
-    def test_no_plate_id_when_none(self):
-        """Direct-Print of a single-plate file passes plate_id=None; nothing stored."""
-        register_expected_print(1, "test.3mf", archive_id=10, plate_id=None)
-        assert 10 not in _print_plate_ids
-
-    def test_get_start_plate_id_reads_back(self):
-        register_expected_print(1, "test.3mf", archive_id=10, plate_id=3)
-        assert _get_start_plate_id(10) == 3
-
-    def test_get_start_plate_id_returns_none_for_unregistered(self):
-        assert _get_start_plate_id(10) is None
-        assert _get_start_plate_id(None) is None
+    tasks_before = set(asyncio.all_tasks())
+    with print_callbacks(maker, status=live_state(subtask_id=subtask)) as mocks:
+        await on_print_start(printer_id, payload)
+        await drain_new_tasks(tasks_before)
+    return mocks
 
 
-class TestExpectedPrintDetection:
-    """Verify the expected-print detection logic used in on_print_start.
+@pytest.mark.asyncio
+class TestAutoArchiveOff:
+    async def test_a_dispatched_print_binds_its_archive(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker, auto_archive=False)
+        archive_id = await seed_archive(maker, printer_id=None)
+        await seed_unit(maker, printer_id=pid, archive_id=archive_id, dispatch_subtask_id="D-839", created_by_id=5)
 
-    Reproduces the key-building and lookup logic from the auto_archive=False
-    block in on_print_start to verify that expected prints are correctly
-    detected across all filename variations.
-    """
-
-    @staticmethod
-    def _build_check_keys(printer_id: int, filename: str, subtask_name: str):
-        """Reproduce the key-building logic from on_print_start."""
-        check_keys = []
-        if subtask_name:
-            check_keys += [
-                (printer_id, subtask_name),
-                (printer_id, f"{subtask_name}.3mf"),
-                (printer_id, f"{subtask_name}.gcode.3mf"),
-            ]
-        if filename:
-            base_fn = filename.split("/")[-1] if "/" in filename else filename
-            check_keys.append((printer_id, base_fn))
-            no_archive_base = base_fn.replace(".gcode", "").replace(".3mf", "")
-            check_keys += [
-                (printer_id, no_archive_base),
-                (printer_id, f"{no_archive_base}.3mf"),
-            ]
-        return check_keys
-
-    def test_detects_expected_print_by_subtask(self):
-        """Expected print is found when subtask_name matches."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-        keys = self._build_check_keys(1, filename="", subtask_name="Box")
-        assert any(k in _expected_prints for k in keys)
-
-    def test_detects_expected_print_by_filename(self):
-        """Expected print is found when filename matches."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-        keys = self._build_check_keys(1, filename="Box.3mf", subtask_name="")
-        assert any(k in _expected_prints for k in keys)
-
-    def test_detects_expected_print_by_gcode_filename(self):
-        """Expected print is found when MQTT reports .gcode filename."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-        # MQTT sometimes reports gcode filename
-        keys = self._build_check_keys(1, filename="Box.gcode", subtask_name="Box")
-        assert any(k in _expected_prints for k in keys)
-
-    def test_no_false_positive_for_different_file(self):
-        """Expected print NOT found for a different filename."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-        keys = self._build_check_keys(1, filename="Benchy.3mf", subtask_name="Benchy")
-        assert not any(k in _expected_prints for k in keys)
-
-    def test_no_false_positive_for_different_printer(self):
-        """Expected print NOT found when printer_id doesn't match."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-        keys = self._build_check_keys(2, filename="Box.3mf", subtask_name="Box")
-        assert not any(k in _expected_prints for k in keys)
-
-    def test_empty_expected_prints_returns_false(self):
-        """No detection when _expected_prints is empty."""
-        keys = self._build_check_keys(1, filename="test.3mf", subtask_name="test")
-        assert not any(k in _expected_prints for k in keys)
-
-    def test_filename_with_spaces_and_parens(self):
-        """Handles filenames with spaces and parentheses (e.g. 'Box3.0_(2)_plate_5.3mf')."""
-        register_expected_print(1, "Box3.0_(2)_plate_5.3mf", archive_id=54, ams_mapping=[1])
-        keys = self._build_check_keys(
-            1,
-            filename="Box3.0_(2)_plate_5.gcode",
-            subtask_name="Box3.0_(2)_plate_5",
-        )
-        assert any(k in _expected_prints for k in keys)
-
-
-class TestExpectedPrintPromotion:
-    """Verify that expected prints are correctly promoted to _active_prints.
-
-    Reproduces the expected-print pop + promotion logic from on_print_start
-    (lines 1468-1496) to verify that _active_prints is populated and
-    _expected_prints is cleaned up.
-    """
-
-    @staticmethod
-    def _simulate_expected_print_promotion(printer_id: int, subtask_name: str, filename: str, archive_filename: str):
-        """Simulate the expected-print lookup and promotion from on_print_start."""
-        expected_keys = []
-        if subtask_name:
-            expected_keys.append((printer_id, subtask_name))
-            expected_keys.append((printer_id, f"{subtask_name}.3mf"))
-            expected_keys.append((printer_id, f"{subtask_name}.gcode.3mf"))
-        if filename:
-            fname = filename.split("/")[-1] if "/" in filename else filename
-            expected_keys.append((printer_id, fname))
-            base = fname.replace(".gcode", "").replace(".3mf", "")
-            expected_keys.append((printer_id, base))
-            expected_keys.append((printer_id, f"{base}.3mf"))
-
-        expected_archive_id = None
-        for key in expected_keys:
-            expected_archive_id = _expected_prints.pop(key, None)
-            _expected_print_registered_at.pop(key, None)
-            if expected_archive_id:
-                for other_key in expected_keys:
-                    _expected_prints.pop(other_key, None)
-                    _expected_print_registered_at.pop(other_key, None)
-                break
-
-        if expected_archive_id:
-            _active_prints[(printer_id, archive_filename)] = expected_archive_id
-            if subtask_name:
-                _active_prints[(printer_id, f"{subtask_name}.3mf")] = expected_archive_id
-
-        return expected_archive_id
-
-    def test_promotion_populates_active_prints(self):
-        """After promotion, archive is in _active_prints."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-
-        archive_id = self._simulate_expected_print_promotion(
-            printer_id=1,
-            subtask_name="Box",
-            filename="Box.gcode",
-            archive_filename="Box.3mf",
+        mocks = await _start(
+            maker, pid, {"filename": "Box.gcode", "subtask_name": "Box", "subtask_id": "D-839"}, subtask="D-839"
         )
 
-        assert archive_id == 54
-        assert _active_prints[(1, "Box.3mf")] == 54
+        row = await archive_row(maker, archive_id)
+        assert (row.status, row.subtask_id, row.printer_id) == ("printing", "D-839", pid)
+        archive_data = mocks.send_start_notification.await_args.args[2]
+        assert archive_data["created_by_id"] == 5, "the unit's creator reaches the start email"
 
-    def test_promotion_cleans_up_expected_prints(self):
-        """After promotion, _expected_prints is empty for this print."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
+    async def test_a_foreign_print_records_nothing(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker, auto_archive=False)
 
-        self._simulate_expected_print_promotion(
-            printer_id=1,
-            subtask_name="Box",
-            filename="Box.gcode",
-            archive_filename="Box.3mf",
+        mocks = await _start(
+            maker, pid, {"filename": "Benchy.gcode", "subtask_name": "Benchy", "subtask_id": "LAN-1"}, subtask="LAN-1"
         )
 
-        # All variants should be cleaned up
-        assert (1, "Box.3mf") not in _expected_prints
-        assert (1, "Box") not in _expected_prints
-        assert (1, "Box.gcode") not in _expected_prints
+        assert await printer_archives(maker, pid) == []
+        mocks.locate.assert_not_awaited()
+        assert mocks.send_start_notification.await_args.args[2] is None
 
-    def test_ams_mapping_survives_promotion(self):
-        """_print_ams_mappings is NOT consumed during promotion — it's needed at completion."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
+    async def test_a_retry_with_auto_archive_off_records_no_second_row(self, own_session_factory):
+        """The retry's donor already recorded its parent's print; with auto-archive off nothing
+        creates a record for the attempt. The start email still reaches the unit's creator."""
+        maker = own_session_factory
+        pid = await seed_printer(maker, auto_archive=False)
+        parent = await seed_archive(
+            maker, printer_id=pid, status="completed", started_at=datetime(2026, 9, 1), subtask_id="OLD"
+        )
+        await seed_unit(maker, printer_id=pid, archive_id=parent, dispatch_subtask_id="RETRY", created_by_id=9)
 
-        self._simulate_expected_print_promotion(
-            printer_id=1,
-            subtask_name="Box",
-            filename="Box.gcode",
-            archive_filename="Box.3mf",
+        mocks = await _start(
+            maker, pid, {"filename": "Box.gcode", "subtask_name": "Box", "subtask_id": "RETRY"}, subtask="RETRY"
         )
 
-        # ams_mapping should still be available for on_print_complete
-        assert _print_ams_mappings[54] == [1]
+        assert [a.id for a in await printer_archives(maker, pid)] == [parent]
+        assert (await archive_row(maker, parent)).status == "completed"
+        assert mocks.send_start_notification.await_args.args[2] == {"created_by_id": 9}
 
-    def test_completion_lookup_finds_promoted_archive(self):
-        """Simulate on_print_complete finding the archive in _active_prints."""
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
+    async def test_the_terminal_finds_the_promoted_archive(self, own_session_factory):
+        from backend.app.services.print_binding import resolve_terminal
 
-        self._simulate_expected_print_promotion(
-            printer_id=1,
-            subtask_name="Box",
-            filename="Box.gcode",
-            archive_filename="Box.3mf",
+        maker = own_session_factory
+        pid = await seed_printer(maker, auto_archive=False)
+        archive_id = await seed_archive(maker, printer_id=None)
+        await seed_unit(maker, printer_id=pid, archive_id=archive_id, dispatch_subtask_id="D-839")
+
+        await _start(
+            maker, pid, {"filename": "Box.gcode", "subtask_name": "Box", "subtask_id": "D-839"}, subtask="D-839"
         )
 
-        # Simulate on_print_complete key building
-        completion_keys = [
-            (1, "Box.3mf"),
-            (1, "Box.gcode.3mf"),
-            (1, "Box"),
-        ]
-        found_id = None
-        for key in completion_keys:
-            found_id = _active_prints.pop(key, None)
-            if found_id:
-                break
+        async with maker() as s:
+            assert await resolve_terminal(s, pid, "D-839") == archive_id
 
-        assert found_id == 54
-        # And ams_mapping is retrievable
-        assert _print_ams_mappings.pop(54, None) == [1]
 
-    def test_no_promotion_for_external_print(self):
-        """When no expected print exists, nothing is promoted."""
-        archive_id = self._simulate_expected_print_promotion(
-            printer_id=1,
-            subtask_name="Benchy",
-            filename="Benchy.gcode",
-            archive_filename="Benchy.3mf",
+@pytest.mark.asyncio
+async def test_a_printer_normalised_name_still_binds(own_session_factory):
+    """The printer echoes ``/data/Metadata/plate_2.gcode`` and a human subtask name while the
+    archive is named by the storage hash — no name agrees, and none has to."""
+    maker = own_session_factory
+    pid = await seed_printer(maker)
+    archive_id = await seed_archive(maker, printer_id=None)
+    await seed_unit(maker, printer_id=pid, archive_id=archive_id, dispatch_subtask_id="D-NORM")
+
+    mocks = await _start(
+        maker,
+        pid,
+        {"filename": "/data/Metadata/plate_2.gcode", "subtask_name": "Fast Half Shell (2)", "subtask_id": "D-NORM"},
+        subtask="D-NORM",
+    )
+
+    assert (await archive_row(maker, archive_id)).status == "printing"
+    assert len(await printer_archives(maker, pid)) == 1, "no second record for the same print"
+    mocks.locate.assert_not_awaited()
+
+
+def _session(*, ams_mapping=None, plate_id=None) -> PrintSession:
+    return PrintSession(
+        printer_id=0,
+        print_name="Box",
+        started_at=datetime.now(timezone.utc),
+        ams_mapping=ams_mapping,
+        plate_id=plate_id,
+    )
+
+
+@pytest.mark.asyncio
+class TestUsageSessionInjection:
+    """The session is opened before the binding; the unit's durable decision fills what the MQTT
+    request-topic capture missed (P1S/A1), and never overwrites what it caught."""
+
+    async def _adopt_with_session(self, maker, session: PrintSession):
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=None)
+        await seed_unit(
+            maker,
+            printer_id=pid,
+            archive_id=archive_id,
+            dispatch_subtask_id="D-UT",
+            ams_mapping=json.dumps([1, -1, 3]),
+            plate_id=2,
+        )
+        session.printer_id = pid
+        _active_sessions[pid] = session
+        mocks = await _start(
+            maker, pid, {"filename": "Box.gcode", "subtask_name": "Box", "subtask_id": "D-UT"}, subtask="D-UT"
+        )
+        return _active_sessions[pid], mocks
+
+    async def test_the_units_mapping_and_plate_fill_an_empty_session(self, own_session_factory):
+        session, mocks = await self._adopt_with_session(own_session_factory, _session())
+
+        assert session.ams_mapping == [1, -1, 3]
+        assert session.plate_id == 2
+        spoolman = mocks.store_spoolman.await_args.kwargs
+        assert (spoolman["ams_mapping"], spoolman["plate_id"]) == ([1, -1, 3], 2)
+
+    async def test_a_captured_mapping_and_plate_are_kept(self, own_session_factory):
+        session, _mocks = await self._adopt_with_session(own_session_factory, _session(ams_mapping=[5, 6], plate_id=3))
+
+        assert session.ams_mapping == [5, 6]
+        assert session.plate_id == 3
+
+    async def test_a_retry_on_a_new_record_gets_the_units_decision_too(self, own_session_factory):
+        """A retry's donor already recorded its parent's print, so the attempt gets a NEW record —
+        and the same injection: every print the farm dispatched feeds from the unit's decision."""
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        parent = await seed_archive(
+            maker, printer_id=pid, status="completed", started_at=datetime(2026, 9, 1), subtask_id="OLD"
+        )
+        await seed_unit(
+            maker,
+            printer_id=pid,
+            archive_id=parent,
+            dispatch_subtask_id="RETRY-UT",
+            ams_mapping=json.dumps([2]),
+            plate_id=4,
+        )
+        _active_sessions[pid] = _session()
+        _active_sessions[pid].printer_id = pid
+
+        mocks = await _start(
+            maker, pid, {"filename": "Box.gcode", "subtask_name": "Box", "subtask_id": "RETRY-UT"}, subtask="RETRY-UT"
         )
 
-        assert archive_id is None
-        assert len(_active_prints) == 0
-
-
-class TestAMSMappingInjection:
-    """Verify ams_mapping injection into usage tracker session."""
-
-    def test_injection_into_session(self):
-        """ams_mapping from _print_ams_mappings is injectable into a session."""
-        from datetime import datetime, timezone
-
-        from backend.app.services.usage_tracker import PrintSession, _active_sessions
-
-        _active_sessions.clear()
-
-        # Create a session without ams_mapping (simulates MQTT not providing it)
-        session = PrintSession(
-            printer_id=1,
-            print_name="Box",
-            started_at=datetime.now(timezone.utc),
-            tray_remain_start={},
-            tray_now_at_start=-1,
-            spool_assignments={},
-            ams_mapping=None,
-        )
-        _active_sessions[1] = session
-
-        # Register expected print with ams_mapping
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-
-        # Simulate the injection logic from on_print_start
-        _stored_map = _print_ams_mappings.get(54)
-        assert _stored_map == [1]
-
-        ut_session = _active_sessions.get(1)
-        assert ut_session is not None
-        assert ut_session.ams_mapping is None  # before injection
-
-        ut_session.ams_mapping = _stored_map  # injection
-        assert ut_session.ams_mapping == [1]
-
-        _active_sessions.clear()
-
-    def test_no_injection_when_session_already_has_mapping(self):
-        """Don't overwrite existing ams_mapping in session."""
-        from datetime import datetime, timezone
-
-        from backend.app.services.usage_tracker import PrintSession, _active_sessions
-
-        _active_sessions.clear()
-
-        session = PrintSession(
-            printer_id=1,
-            print_name="Box",
-            started_at=datetime.now(timezone.utc),
-            tray_remain_start={},
-            tray_now_at_start=-1,
-            spool_assignments={},
-            ams_mapping=[5, 6],  # already has mapping from MQTT
-        )
-        _active_sessions[1] = session
-
-        register_expected_print(1, "Box.3mf", archive_id=54, ams_mapping=[1])
-
-        _stored_map = _print_ams_mappings.get(54)
-        ut_session = _active_sessions.get(1)
-
-        # Guard: don't overwrite if session already has a mapping
-        if ut_session and not ut_session.ams_mapping:
-            ut_session.ams_mapping = _stored_map
-
-        assert ut_session.ams_mapping == [5, 6]  # unchanged
-
-        _active_sessions.clear()
-
-
-class TestPlateIdInjection:
-    """Verify plate_id injection into usage tracker session for direct-Print of
-    a non-first plate from a multi-plate 3MF (#1697)."""
-
-    def test_injection_into_session(self):
-        """plate_id from _print_plate_ids gets injected when session has none."""
-        from datetime import datetime, timezone
-
-        from backend.app.services.usage_tracker import PrintSession, _active_sessions
-
-        _active_sessions.clear()
-
-        # Session created by on_print_start before expected-print promotion;
-        # plate_id is None because no queue item was found (direct-Print path).
-        session = PrintSession(
-            printer_id=1,
-            print_name="Box",
-            started_at=datetime.now(timezone.utc),
-            tray_remain_start={},
-            tray_now_at_start=-1,
-            spool_assignments={},
-            ams_mapping=None,
-            plate_id=None,
-        )
-        _active_sessions[1] = session
-
-        register_expected_print(1, "Box.3mf", archive_id=54, plate_id=2)
-
-        # Mirror the injection branch from main.py.
-        _stored_plate_id = _print_plate_ids.get(54)
-        assert _stored_plate_id == 2
-
-        ut_session = _active_sessions.get(1)
-        assert ut_session is not None
-        assert ut_session.plate_id is None  # before injection
-
-        ut_session.plate_id = _stored_plate_id  # injection
-        assert ut_session.plate_id == 2
-
-        _active_sessions.clear()
-
-    def test_no_injection_when_session_already_has_plate_id(self):
-        """Queue path: on_print_start already captured plate_id from queue_item;
-        don't overwrite with the dict value."""
-        from datetime import datetime, timezone
-
-        from backend.app.services.usage_tracker import PrintSession, _active_sessions
-
-        _active_sessions.clear()
-
-        session = PrintSession(
-            printer_id=1,
-            print_name="Box",
-            started_at=datetime.now(timezone.utc),
-            tray_remain_start={},
-            tray_now_at_start=-1,
-            spool_assignments={},
-            ams_mapping=None,
-            plate_id=3,  # captured from queue_item by on_print_start
-        )
-        _active_sessions[1] = session
-
-        register_expected_print(1, "Box.3mf", archive_id=54, plate_id=2)
-
-        _stored_plate_id = _print_plate_ids.get(54)
-        ut_session = _active_sessions.get(1)
-
-        # Guard: don't overwrite if session already has a plate_id
-        if ut_session and ut_session.plate_id is None:
-            ut_session.plate_id = _stored_plate_id
-
-        assert ut_session.plate_id == 3  # queue value preserved
-
-        _active_sessions.clear()
+        session = _active_sessions[pid]
+        assert (session.ams_mapping, session.plate_id) == ([2], 4)
+        assert len(await printer_archives(maker, pid)) == 2, "the attempt is on a record of its own"
+        spoolman = mocks.store_spoolman.await_args.kwargs
+        assert (spoolman["ams_mapping"], spoolman["plate_id"]) == ([2], 4)

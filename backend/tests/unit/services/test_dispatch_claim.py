@@ -94,6 +94,16 @@ class TestTheVerdictTable:
         exactly the rows that need this most."""
         assert judge(_evidence(dispatch_subtask="")) == "dead"
 
+    @pytest.mark.parametrize(
+        ("dispatch_subtask", "live_subtask"),
+        [("dispatch-1", "0"), ("dispatch-1", ""), ("", ""), ("0", "0")],
+        ids=["lan-echo", "no-echo", "both-empty", "both-zero"],
+    )
+    async def test_an_id_that_names_no_job_is_no_corroboration(self, dispatch_subtask, live_subtask):
+        """``job_identity.same_job`` reads ``""`` / ``"0"`` as ``unknown`` — only a positive
+        ``same`` says started (the dispatcher never mints either value)."""
+        assert judge(_evidence(dispatch_subtask=dispatch_subtask, live_subtask=live_subtask)) == "dead"
+
     async def test_a_live_watchdog_owns_the_claim_at_any_age(self):
         """THE row that replaced the 600 s guess. Ownership is asked, so a watchdog
         genuinely still working keeps its full budget however old the claim is."""
@@ -213,18 +223,29 @@ class TestTheModuleIsALeaf:
     """
 
     async def test_it_imports_no_farm_service(self):
-        """``plate_occupancy`` is the ONE exception, and it is the authority that owns
-        ``ACTIVE_PRINT_STATES`` — a stdlib-only sync core, so importing the set from its
-        origin costs no edge and prevents a second spelling."""
+        """Two exceptions, both stdlib-only owners of a definition a second spelling would
+        fork, so importing from the origin costs no edge: ``plate_occupancy`` owns
+        ``ACTIVE_PRINT_STATES``, and ``job_identity`` owns the ONE comparison of two
+        subtask ids (``same_job``) — itself pinned dependency-free below."""
         import inspect
 
-        imports = [
-            line.strip()
-            for line in inspect.getsource(dispatch_claim).splitlines()
-            if line.strip().startswith(("import ", "from "))
+        from backend.app.services import job_identity
+
+        def module_imports(module) -> list[str]:
+            return [
+                line.strip()
+                for line in inspect.getsource(module).splitlines()
+                if line.strip().startswith(("import ", "from "))
+            ]
+
+        service_imports = [line for line in module_imports(dispatch_claim) if "backend.app.services" in line]
+        assert service_imports == [
+            "from backend.app.services.job_identity import same_job",
+            "from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES",
         ]
-        service_imports = [line for line in imports if "backend.app.services" in line]
-        assert service_imports == ["from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES"]
+        assert not [line for line in module_imports(job_identity) if "backend" in line], (
+            "job_identity must stay dependency-free: leaves import it"
+        )
 
     async def test_both_consumers_import_it_at_module_level(self):
         import inspect

@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 # Why a NEW attempt row is being minted — the log vocabulary of :func:`requeue_attempt`.
 #   failed      — a genuine failure (mid-print, or at dispatch) under the retry cap;
 #   fault_stop  — an operator stopped a print its printer was already holding;
-#   plate_check — the farm stopped a print at the printer's pre-print plate check.
+#   plate_check — the operator stopped a plate-check-paused print (refused plate).
 RequeueCause = Literal["failed", "fault_stop", "plate_check"]
 
 # Why a claimed row is being RETURNED — the log vocabulary of :func:`return_to_queue`.

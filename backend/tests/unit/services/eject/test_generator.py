@@ -51,7 +51,6 @@ def _profile(**overrides) -> EjectProfile:
     """Build an in-memory EjectProfile with the documented defaults."""
     defaults = {
         "name": "default",
-        "cooldown_temp_c": 28.0,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,

@@ -45,6 +45,8 @@ import { APIBrowser } from '../components/APIBrowser';
 import { InfoHint } from '../components/ui/InfoHint';
 import { SettingSwitch } from '../components/settings/SettingSwitch';
 import { SettingNumber } from '../components/settings/SettingNumber';
+import { ShopAirReadout } from '../components/settings/ShopAirReadout';
+import { SHOP_AIR_QUERY_KEY } from '../hooks/useShopAir';
 import { InlineAlert } from '../components/ui/InlineAlert';
 import { printingUnitPrinters } from '../utils/printingUnitsRefusal';
 import { virtualPrinterApi, spoolbuddyApi } from '../api/client';
@@ -92,8 +94,8 @@ registerSettingsSearch({ labelKey: 'settings.plateClear', labelFallback: 'Plate-
 registerSettingsSearch({ labelKey: 'settings.gcodeInjection', labelFallback: 'G-code Injection', tab: 'queue', keywords: 'gcode injection start end autoprint farmloop swapmod autoclear printflow', anchor: 'card-gcode' });
 registerSettingsSearch({ labelKey: 'settings.slicerCard', labelFallback: 'Slicer', tab: 'queue', keywords: 'slicer orcaslicer bambustudio orca bambu api sidecar url docker preferred', anchor: 'card-slicer' });
 registerSettingsSearch({ labelKey: 'settings.queueDrying', tab: 'queue', keywords: 'drying presets temperature time humidity ams', anchor: 'card-drying' });
-registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position chute prime purge start block plate lip', anchor: 'card-farm-production' });
-registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown stall window epsilon plateau min cooling per check give up timer close enough margin release threshold warn floor bed temperature quarantine aux fan auxiliary speed percent hold plate position fan part top chamber exhaust air duct airduct boost sustain toggle enable', anchor: 'card-farm-cooldown' });
+registerSettingsSearch({ labelKey: 'settings.farmProduction', labelFallback: 'Farm Production', tab: 'farm', keywords: 'farm retry quarantine consecutive failures offline stalled usb cleanup pause paused stalled watchdog idle park deep bed lower position chute prime purge start block plate lip blow off blowoff stray filament aux fan print start bed leveling', anchor: 'card-farm-production' });
+registerSettingsSearch({ labelKey: 'settings.farmEjectCooldown', labelFallback: 'Eject Cooldown', tab: 'farm', keywords: 'eject cooldown shop air ambient room temperature eject line margin stall window epsilon plateau min cooling per check give up timer close enough release threshold bed temperature quarantine aux fan auxiliary speed percent hold plate position fan part top chamber exhaust air duct airduct boost sustain toggle enable', anchor: 'card-farm-cooldown' });
 registerSettingsSearch({ labelKey: 'settings.dispatchResponsiveness', labelFallback: 'Dispatch responsiveness', tab: 'farm', keywords: 'dispatch responsiveness latency poll interval queue check kick debounce coalesce usb preflight fresh window max wait parallel concurrency upload skip identical slim 3mf mesh thumbnail eject file speed', anchor: 'card-dispatch-responsiveness' });
 registerSettingsSearch({ labelKey: 'settings.filamentChecks', tab: 'filament', keywords: 'filament check warning runout remaining spool selection policy fifo first loaded lowest slot order minimum start weight floor untagged tagless auto add default bare tray respool observation prompt threshold reused tag grams rfid', anchor: 'card-filamentchecks' });
 registerSettingsSearch({ labelKey: 'settings.printModal', tab: 'filament', keywords: 'print modal custom mapping', anchor: 'card-printmodal' });
@@ -950,6 +952,8 @@ export function SettingsPage() {
       // re-compare the updated `settings` with current `localSettings` and
       // debounce-save any remaining differences.
       queryClient.invalidateQueries({ queryKey: ['archiveStats'] });
+      // The eject line is shop air + the saved margin — re-read it, not the poll.
+      queryClient.invalidateQueries({ queryKey: SHOP_AIR_QUERY_KEY });
       showToast(t('settings.toast.settingsSaved'), 'success');
     },
     onError: (error: Error) => {
@@ -1074,7 +1078,6 @@ export function SettingsPage() {
       (settings.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false) ||
       (settings.farm_retry_max_per_unit ?? 1) !== (localSettings.farm_retry_max_per_unit ?? 1) ||
       (settings.farm_escalate_consecutive_failures ?? 2) !== (localSettings.farm_escalate_consecutive_failures ?? 2) ||
-      (settings.farm_cooldown_warn_floor_c ?? 30) !== (localSettings.farm_cooldown_warn_floor_c ?? 30) ||
       (settings.farm_offline_stall_minutes ?? 30) !== (localSettings.farm_offline_stall_minutes ?? 30) ||
       (settings.farm_pause_stall_minutes ?? 15) !== (localSettings.farm_pause_stall_minutes ?? 15) ||
       (settings.respool_prompt_threshold_g ?? 30) !== (localSettings.respool_prompt_threshold_g ?? 30) ||
@@ -1082,6 +1085,7 @@ export function SettingsPage() {
       (settings.farm_cooldown_stall_epsilon_c ?? 1) !== (localSettings.farm_cooldown_stall_epsilon_c ?? 1) ||
       (settings.farm_cooldown_max_hold_minutes ?? 180) !== (localSettings.farm_cooldown_max_hold_minutes ?? 180) ||
       (settings.farm_cooldown_plateau_eject_margin_c ?? 3) !== (localSettings.farm_cooldown_plateau_eject_margin_c ?? 3) ||
+      (settings.farm_cooldown_margin_c ?? 2) !== (localSettings.farm_cooldown_margin_c ?? 2) ||
       (settings.farm_cooldown_aux_fan_enabled ?? true) !== (localSettings.farm_cooldown_aux_fan_enabled ?? true) ||
       (settings.farm_cooldown_aux_fan_percent ?? 100) !== (localSettings.farm_cooldown_aux_fan_percent ?? 100) ||
       (settings.farm_cooldown_chamber_fan_enabled ?? true) !== (localSettings.farm_cooldown_chamber_fan_enabled ?? true) ||
@@ -1093,6 +1097,8 @@ export function SettingsPage() {
       (settings.farm_idle_park_enabled ?? true) !== (localSettings.farm_idle_park_enabled ?? true) ||
       (settings.farm_idle_park_percent ?? 75) !== (localSettings.farm_idle_park_percent ?? 75) ||
       (settings.farm_chute_prime_enabled ?? true) !== (localSettings.farm_chute_prime_enabled ?? true) ||
+      (settings.farm_plate_blowoff_enabled ?? true) !== (localSettings.farm_plate_blowoff_enabled ?? true) ||
+      (settings.farm_plate_blowoff_seconds ?? 10) !== (localSettings.farm_plate_blowoff_seconds ?? 10) ||
       (settings.queue_check_interval_seconds ?? 30) !== (localSettings.queue_check_interval_seconds ?? 30) ||
       (settings.dispatch_kick_debounce_seconds ?? 1) !== (localSettings.dispatch_kick_debounce_seconds ?? 1) ||
       (settings.usb_preflight_fresh_window_seconds ?? 10) !== (localSettings.usb_preflight_fresh_window_seconds ?? 10) ||
@@ -1204,7 +1210,6 @@ export function SettingsPage() {
         require_plate_clear: localSettings.require_plate_clear,
         farm_retry_max_per_unit: localSettings.farm_retry_max_per_unit,
         farm_escalate_consecutive_failures: localSettings.farm_escalate_consecutive_failures,
-        farm_cooldown_warn_floor_c: localSettings.farm_cooldown_warn_floor_c,
         farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
         farm_pause_stall_minutes: localSettings.farm_pause_stall_minutes,
         respool_prompt_threshold_g: localSettings.respool_prompt_threshold_g,
@@ -1212,6 +1217,7 @@ export function SettingsPage() {
         farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
         farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
         farm_cooldown_plateau_eject_margin_c: localSettings.farm_cooldown_plateau_eject_margin_c,
+        farm_cooldown_margin_c: localSettings.farm_cooldown_margin_c,
         farm_cooldown_aux_fan_enabled: localSettings.farm_cooldown_aux_fan_enabled,
         farm_cooldown_aux_fan_percent: localSettings.farm_cooldown_aux_fan_percent,
         farm_cooldown_chamber_fan_enabled: localSettings.farm_cooldown_chamber_fan_enabled,
@@ -1223,6 +1229,8 @@ export function SettingsPage() {
         farm_idle_park_enabled: localSettings.farm_idle_park_enabled,
         farm_idle_park_percent: localSettings.farm_idle_park_percent,
         farm_chute_prime_enabled: localSettings.farm_chute_prime_enabled,
+        farm_plate_blowoff_enabled: localSettings.farm_plate_blowoff_enabled,
+        farm_plate_blowoff_seconds: localSettings.farm_plate_blowoff_seconds,
         queue_check_interval_seconds: localSettings.queue_check_interval_seconds,
         dispatch_kick_debounce_seconds: localSettings.dispatch_kick_debounce_seconds,
         usb_preflight_fresh_window_seconds: localSettings.usb_preflight_fresh_window_seconds,
@@ -5262,10 +5270,27 @@ export function SettingsPage() {
                 checked={localSettings.farm_chute_prime_enabled ?? true}
                 onChange={(checked) => updateSetting('farm_chute_prime_enabled', checked)}
               />
+              <SettingSwitch
+                label={t('settings.farmPlateBlowoffEnabled', 'Plate blow-off at print start')}
+                hint={t('settings.farmPlateBlowoffEnabledHelp', 'Aux fan at full speed across the plate before bed leveling.')}
+                checked={localSettings.farm_plate_blowoff_enabled ?? true}
+                onChange={(checked) => updateSetting('farm_plate_blowoff_enabled', checked)}
+              />
+              <SettingNumber
+                id="farm-plate-blowoff-seconds"
+                label={t('settings.farmPlateBlowoffSeconds', 'Blow-off time (s)')}
+                hint={t('settings.farmPlateBlowoffSecondsHelp', 'Aux fan run time before bed leveling (3–60).')}
+                value={localSettings.farm_plate_blowoff_seconds ?? 10}
+                onChange={(v) => updateSetting('farm_plate_blowoff_seconds', v)}
+                min={3}
+                max={60}
+                enabled={localSettings.farm_plate_blowoff_enabled ?? true}
+              />
             </CardContent>
           </Card>
 
-          {/* Eject Cooldown — warn floor + server-dispatched eject stall detection (plan 4b) */}
+          {/* Eject Cooldown — the measured shop air and the one margin that set the
+              eject line, then server-dispatched eject stall detection (plan 4b). */}
           <Card id="card-farm-cooldown">
             <CardHeader>
               <h3 className="text-base font-semibold text-white flex items-center gap-2">
@@ -5273,30 +5298,31 @@ export function SettingsPage() {
                 {t('settings.farmEjectCooldown', 'Eject Cooldown')}
               </h3>
             </CardHeader>
-            {/* `@container` so the actuator row below can size itself against
-                THIS CARD rather than the viewport — see the comment there. */}
+            {/* `@container` so the shop-air readout, the monitoring grid and the
+                actuator row below size themselves against THIS CARD rather than
+                the viewport — see the comment on the actuator row. */}
             <CardContent className="space-y-3 @container">
+              {/* The line every cooldown watch arms with, and the one setting it
+                  is derived from — first, because every temperature below is
+                  judged against them. */}
+              <ShopAirReadout timeFormat={localSettings.time_format} />
+              <SettingNumber
+                id="farm-cooldown-margin"
+                label={t('settings.farmCooldownMargin', 'Margin above shop air (°C)')}
+                hint={t('settings.farmCooldownMarginHelp', 'The eject line and the chamber-fan step-down sit this far above shop air.')}
+                value={localSettings.farm_cooldown_margin_c ?? 2}
+                onChange={(v) => updateSetting('farm_cooldown_margin_c', v)}
+                min={0.5}
+                max={10}
+                step={0.5}
+                kind="decimal"
+              />
               <p className="text-xs text-bambu-gray">
                 {t('settings.farmEjectCooldownDescription', 'How the farm waits for the bed to cool before sweeping a finished plate off, and when it gives up or quarantines a printer that will not cool.')}
               </p>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                <div>
-                  <label htmlFor="farm-cooldown-warn-floor" className="block text-xs text-bambu-gray mb-1">
-                    {t('settings.farmCooldownWarnFloor', 'Cooldown warn floor (°C)')}
-                  </label>
-                  <input
-                    id="farm-cooldown-warn-floor"
-                    type="number"
-                    min={15}
-                    max={50}
-                    value={localSettings.farm_cooldown_warn_floor_c ?? 30}
-                    onChange={(e) => updateSetting('farm_cooldown_warn_floor_c', Math.max(15, Math.min(50, parseInt(e.target.value) || 30)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownWarnFloorHelp', 'Warn when an eject profile cooldown threshold is below this — a threshold at or below shop ambient never completes (15–50)')}
-                  </p>
-                </div>
+              {/* Container breakpoint, not a viewport one: this card is ~400 px
+                  inside the Farm tab's half-width column at a 1280 desktop. */}
+              <div className="grid grid-cols-1 gap-4 @md:grid-cols-2">
                 <div>
                   <div className="flex items-center gap-1.5 mb-1">
                     <label htmlFor="farm-cooldown-stall-window" className="block text-xs text-bambu-gray">
@@ -5376,7 +5402,7 @@ export function SettingsPage() {
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownPlateauMarginHelp', 'If cooling stalls but the bed is within this many degrees of the eject temperature, treat it as cooled and eject; stuck hotter than that quarantines the printer.')}
+                    {t('settings.farmCooldownPlateauMarginHelp', 'If cooling stalls with the bed within this many degrees of its own chamber air, treat it as cooled and eject; stuck hotter than that quarantines the printer.')}
                   </p>
                 </div>
               </div>

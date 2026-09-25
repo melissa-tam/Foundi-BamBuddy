@@ -799,23 +799,17 @@ async def get_printer_status(
 
     # Resolve the active print's archive + plate (#881 follow-up): lets the
     # printer card show the actual plate name for multi-plate 3MFs instead of
-    # just the 3MF filename. Only attempted for active prints, since subtask_id
-    # is only meaningful then.
+    # just the 3MF filename. Only attempted for active prints. The archive is the
+    # printer's LIVE print record, provided it records the job the printer names
+    # (print_binding owns both halves of that question).
     current_archive_id: int | None = None
     current_plate_id: int | None = None
     if state.state in ("RUNNING", "PAUSE"):
         current_plate_id = resolve_plate_id(state)
-        if state.subtask_id:
-            from backend.app.models.archive import PrintArchive
+        from backend.app.services.print_binding import live_archive_for_job
 
-            archive_row = await db.execute(
-                select(PrintArchive.id)
-                .where(PrintArchive.subtask_id == state.subtask_id)
-                .where(PrintArchive.printer_id == printer_id)
-                .order_by(PrintArchive.created_at.desc())
-                .limit(1)
-            )
-            current_archive_id = archive_row.scalar_one_or_none()
+        live_archive = await live_archive_for_job(db, printer_id, state.subtask_id)
+        current_archive_id = live_archive.id if live_archive is not None else None
 
     return PrinterStatus(
         id=printer_id,
@@ -2850,42 +2844,58 @@ async def debug_simulate_print_complete(
 
     This triggers the same code path as a real print completion,
     without needing to wait for an actual print to finish.
-    """
-    from backend.app.main import _active_prints, on_print_complete
-    from backend.app.models.archive import PrintArchive
 
-    # Get the most recent archive for this printer
-    result = await db.execute(
-        select(PrintArchive)
-        .where(PrintArchive.printer_id == printer_id)
-        .order_by(PrintArchive.created_at.desc())
-        .limit(1)
-    )
-    archive = result.scalar_one_or_none()
+    The terminal is bound the way a real one is — by job id, through the binding owner
+    (``print_binding.resolve_terminal``) — so it completes the printer's LIVE print when there is
+    one. With none, it simulates a completion named after the newest archive, which takes the
+    handler's no-archive path end to end; a finished archive is never reopened to be completed
+    again (one record per print attempt).
+    """
+    from backend.app.main import on_print_complete
+    from backend.app.models.archive import PrintArchive
+    from backend.app.services.print_binding import live_print_archive
+
+    archive = await live_print_archive(db, printer_id)
+    if archive is None:
+        result = await db.execute(
+            select(PrintArchive)
+            .where(PrintArchive.printer_id == printer_id)
+            .order_by(PrintArchive.created_at.desc())
+            .limit(1)
+        )
+        archive = result.scalar_one_or_none()
 
     if not archive:
         raise HTTPException(status_code=404, detail="No archives found for this printer")
 
-    # Register this archive as "active" so on_print_complete can find it
     filename = archive.file_path.split("/")[-1] if archive.file_path else "test.3mf"
     subtask_name = archive.print_name or "Test Print"
-    _active_prints[(printer_id, filename)] = archive.id
-    _active_prints[(printer_id, subtask_name)] = archive.id
+    live = archive.status == "printing"
 
-    # Simulate print completion data
+    # Simulate print completion data — the live print's own job id, as the printer would echo it.
     data = {
         "status": "completed",
         "filename": filename,
         "subtask_name": subtask_name,
+        "subtask_id": archive.subtask_id if live else None,
         "timelapse_was_active": False,
     }
 
-    logger.info("Simulating print complete for printer %s, archive %s", printer_id, archive.id)
+    logger.info(
+        "Simulating print complete for printer %s, archive %s (%s)",
+        printer_id,
+        archive.id,
+        "live print" if live else "no live print — no-archive path",
+    )
 
     # Call the actual on_print_complete handler
     await on_print_complete(printer_id, data)
 
-    return {"success": True, "archive_id": archive.id, "message": "Print completion simulated"}
+    return {
+        "success": True,
+        "archive_id": archive.id if live else None,
+        "message": "Print completion simulated",
+    }
 
 
 # =============================================================================
@@ -2908,12 +2918,12 @@ async def stop_print(
     if printer_manager.get_client(printer_id) is None:
         raise HTTPException(400, "Printer not connected")
 
-    # The stop AND the user-stopped mark are one act (``print_control`` owns the pair, so
-    # the service-hold quiesce and the queue-page stop cannot drift from this one): the
-    # mark is what makes ``on_print_complete`` reclassify the firmware's
-    # "failed"/"aborted" as "cancelled", instead of the HMS heuristic in
+    # The stop request AND the stop are one act (``print_control`` owns the pair, so the
+    # queue-page stop cannot drift from this one): the request, durable on the running unit,
+    # is what makes ``on_print_complete`` reclassify the firmware's "failed"/"aborted" as
+    # "cancelled" — after a restart too — instead of the HMS heuristic in
     # ``_dispatch_archive_update`` calling a user cancel a layer shift.
-    if not stop_as_operator(printer_id):
+    if not await stop_as_operator(printer_id):
         raise HTTPException(502, "Failed to stop print — printer MQTT session not connected, command not delivered")
 
     return {"success": True, "message": "Print stop command sent"}
@@ -4232,11 +4242,10 @@ async def execute_hms_action(
     if body.action == HMSAction.STOP_PRINTING:
         # The printer's own dialog offering "Stop printing" is an operator pressing Stop,
         # and the operator's Stop has ONE owner (``print_control.stop_as_operator``): the
-        # MQTT stop AND the user-stopped mark, with nothing awaited between them. Sent
-        # through the dialog dispatcher it went out WITHOUT the mark, so the terminal
-        # read as a genuine failure — retry, quarantine count — for a print a human
-        # stopped on purpose.
-        success = stop_as_operator(printer_id)
+        # durable stop request on the running unit, then the MQTT stop. Sent through the
+        # dialog dispatcher it went out WITHOUT the request, so the terminal read as a
+        # genuine failure — retry, quarantine count — for a print a human stopped on purpose.
+        success = await stop_as_operator(printer_id)
     else:
         success = client.execute_hms_action(body.print_error, body.action, body.job_id)
     if not success:

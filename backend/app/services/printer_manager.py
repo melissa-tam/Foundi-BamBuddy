@@ -1204,7 +1204,12 @@ def resolve_plate_id(state) -> int | None:
 
 def _eject_watch_payload(printer_id: int | None) -> dict | None:
     """``{"threshold_c": t, "hold_z": z, "deferred": b}`` for the printer's in-flight eject
-    cooldown watch, or None when no threshold-bearing watch is armed (Phase 4.3c).
+    cooldown watch, or None when no watch is COOLING (Phase 4.3c).
+
+    ``threshold_c`` is the eject line the watch armed with — measured shop air plus the
+    one margin (``services/eject/shop_air``) — and is None on a cooling watch when shop
+    air was unknown at arm: the plate is still cooling (it releases on its own air or at
+    its plateau), there is just no line to quote.
 
     ``hold_z`` is the height the cooldown prep parked the plate at, or None when the
     plate is where the end block left it (an unheld model, a skipped hold, or a hold the
@@ -1218,11 +1223,11 @@ def _eject_watch_payload(printer_id: int | None) -> dict | None:
         return None
     from backend.app.services.eject.monitor import eject_cooldown_monitor
 
-    threshold = eject_cooldown_monitor.active_watch(printer_id)
-    if threshold is None:
+    watch = eject_cooldown_monitor.cooling_watch(printer_id)
+    if watch is None:
         return None
     return {
-        "threshold_c": threshold,
+        "threshold_c": watch.line_c,
         "hold_z": eject_cooldown_monitor.hold_z(printer_id),
         "deferred": eject_cooldown_monitor.deferred(printer_id),
     }

@@ -10,9 +10,9 @@ window these tests care about.
 
 Covered here: the start-side arming decision (foreign arms, farm does not, a
 successful start-time capture does not), the retry's own behaviour (re-derives
-names from the live printer state, attaches file + parsed metadata, no-ops when a
-file is already attached), and the end-to-end claim that a captured foreign print
-charges filament again.
+names from the live printer state — only when the live job IS the archive's, by id —
+attaches file + parsed metadata, no-ops when a file is already attached), and the
+end-to-end claim that a captured foreign print charges filament again.
 """
 
 import zipfile
@@ -74,18 +74,22 @@ def _three_mf_bytes(tmp_path: Path, grams: float = 50.0, seconds: int = 1800, pl
 
 
 def _settled_printer_manager() -> MagicMock:
-    """printer_manager stand-in for a finished print — no live AMS mapping left."""
+    """printer_manager stand-in for a finished print: the live printer's hardware, no AMS reported."""
     pm = MagicMock()
-    pm.get_status.return_value = SimpleNamespace(
-        raw_data={},
-        progress=100,
-        layer_num=1,
-        tray_now=0,
-        last_loaded_tray=0,
-        tray_change_log=[],
-        total_layers=1,
-    )
+    pm.get_status.return_value = SimpleNamespace(raw_data={})
     return pm
+
+
+# The finished job's own consumption evidence, as its terminal payload carries it: one layer,
+# fed from AMS0-T0, no switch. The charge reads THIS, never the live printer.
+_SETTLED_EVIDENCE = {
+    "last_progress": 100,
+    "last_layer_num": 1,
+    "total_layers": 1,
+    "tray_now": 0,
+    "last_loaded_tray": 0,
+    "tray_change_log": [],
+}
 
 
 def _ftp_lane(available: dict[str, bytes]) -> AsyncMock:
@@ -142,8 +146,18 @@ async def _seed_foreign_archive(db, printer_id: int):
 
 
 def _start_harness(printer, queue_items, *, spawned):
-    """Patch bundle for driving main.on_print_start down to the no-3MF fallback."""
+    """Patch bundle for driving main.on_print_start down to the no-3MF fallback.
+
+    The binding decision is the owner's (``print_binding.attach``, tested over a real database in
+    ``test_print_binding``); these tests are about what the CREATE branch does after it, so the
+    owner answers ``CreateNeeded`` for the first queue item (or for none) and binds whatever the
+    branch creates.
+    """
     from unittest.mock import patch as _patch
+
+    from backend.app.services import print_binding
+
+    unit_id = queue_items[0].id if queue_items else None
 
     def execute_router(stmt, *_args, **_kwargs):
         sql = str(stmt).lower()
@@ -171,6 +185,10 @@ def _start_harness(printer, queue_items, *, spawned):
     session.execute = AsyncMock(side_effect=execute_router)
     session.commit = AsyncMock()
     session.refresh = AsyncMock(side_effect=_refresh)
+    session.add = MagicMock()
+    session.get = AsyncMock(
+        side_effect=lambda _model, ident, **_kw: next((q for q in queue_items if q.id == ident), None)
+    )
 
     def fake_spawn(coro, *, name=None):
         spawned.append(name)
@@ -192,6 +210,8 @@ def _start_harness(printer, queue_items, *, spawned):
         _patch("backend.app.main._maybe_start_layer_timelapse", MagicMock()),
         _patch("backend.app.main._load_objects_from_archive", MagicMock()),
         _patch.object(foreign_archive, "spawn_background_task", fake_spawn),
+        _patch.object(print_binding, "attach", AsyncMock(return_value=print_binding.CreateNeeded(unit_id))),
+        _patch.object(print_binding, "bind_created", AsyncMock(return_value=True)),
     ]
     return patches, session
 
@@ -205,19 +225,6 @@ def _farm_printer():
     printer.external_camera_enabled = False
     printer.external_camera_url = None
     return printer
-
-
-@pytest.fixture(autouse=True)
-def _clear_main_state():
-    from backend.app.main import _active_prints, _expected_prints, _print_ams_mappings
-
-    _expected_prints.clear()
-    _active_prints.clear()
-    _print_ams_mappings.clear()
-    yield
-    _expected_prints.clear()
-    _active_prints.clear()
-    _print_ams_mappings.clear()
 
 
 @pytest.mark.asyncio
@@ -265,6 +272,9 @@ async def test_farm_print_start_miss_does_not_arm_the_retry():
     farm_item = MagicMock()
     farm_item.id = 91
     farm_item.dispatch_subtask_id = "FARM-11"
+    farm_item.ams_mapping = None
+    farm_item.plate_id = 1
+    farm_item.created_by_id = None
 
     spawned: list[str | None] = []
     patches, _session = _start_harness(_farm_printer(), [farm_item], spawned=spawned)
@@ -374,6 +384,74 @@ async def test_retry_captures_from_live_state_and_attaches_metadata(db_session, 
     assert archive.status == "printing"
 
 
+# ---------------------------------------------------------------------------
+# The live-state re-derivation binds to the live job BY ID (2026-09-25)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "live, archive, expected",
+    [
+        ("JOB-X", "JOB-X", True),  # same job — the live names are this archive's
+        ("JOB-Y", "JOB-X", False),  # another job — its 3MF must never land here
+        (None, "JOB-X", False),  # the archive names its job, the live state names none
+        ("0", "JOB-X", False),  # the firmware's "no job" spelling is no job either
+        ("JOB-Y", None, True),  # a row that never learned its id: the pre-id behaviour
+        (None, None, True),
+        ("JOB-Y", "0", True),
+    ],
+)
+def test_the_live_state_is_this_archives_only_by_job_id(live, archive, expected):
+    assert foreign_archive._live_state_is_this_job(live, archive) is expected
+
+
+async def _capture_names(db_session, printer_factory, *, archive_job, live_job) -> tuple:
+    """Run ONE capture attempt over a ``printing`` archive for ``archive_job`` while the printer
+    reports ``live_job`` with its own enriched names; return the names the locate was asked for."""
+    printer = await printer_factory()
+    archive = await _seed_foreign_archive(db_session, printer.id)
+    archive.subtask_id = archive_job
+    await db_session.commit()
+    live_state = SimpleNamespace(subtask_id=live_job, subtask_name=LIVE_SUBTASK, gcode_file=LIVE_FILE)
+    locate = AsyncMock(return_value=SimpleNamespace(found=False, local_path=None))
+
+    with (
+        patch.object(foreign_archive, "async_session", _session_factory(db_session)),
+        patch.object(foreign_archive.printer_manager, "get_status", MagicMock(return_value=live_state)),
+        patch.object(foreign_archive, "locate_3mf_for_print", locate),
+    ):
+        done = await foreign_archive._attempt_capture(printer.id, archive.id, DEGENERATE_SUBTASK, DEGENERATE_FILE, 1)
+
+    assert done is False  # nothing found: the retry goes on
+    (call,) = locate.await_args_list
+    return call.args[1:]
+
+
+@pytest.mark.asyncio
+async def test_a_leaked_archive_never_captures_the_next_jobs_file(db_session, printer_factory):
+    """A leaked or stale archive stays ``printing`` while the printer runs the NEXT job. The
+    live names describe that job, so the capture keeps the names its own start captured."""
+    names = await _capture_names(db_session, printer_factory, archive_job="JOB-X", live_job="JOB-Y")
+
+    assert names == (DEGENERATE_SUBTASK, DEGENERATE_FILE)
+
+
+@pytest.mark.asyncio
+async def test_the_archives_own_running_job_is_re_derived_from_the_live_state(db_session, printer_factory):
+    names = await _capture_names(db_session, printer_factory, archive_job="JOB-X", live_job="JOB-X")
+
+    assert names == (LIVE_SUBTASK, LIVE_FILE)
+
+
+@pytest.mark.asyncio
+async def test_an_archive_with_an_id_is_not_re_derived_from_a_live_state_naming_none(db_session, printer_factory):
+    """An absent live id is not evidence of the SAME job: an idle printer, or a start echo not
+    yet enriched, cannot vouch for this archive."""
+    names = await _capture_names(db_session, printer_factory, archive_job="JOB-X", live_job=None)
+
+    assert names == (DEGENERATE_SUBTASK, DEGENERATE_FILE)
+
+
 @pytest.mark.asyncio
 async def test_retry_no_ops_when_a_file_is_already_attached(db_session, printer_factory, tmp_path, monkeypatch):
     """Idempotency vs the terminal path: if the archive already gained a file, the
@@ -468,8 +546,9 @@ async def test_captured_foreign_print_charges_filament_again(db_session, printer
     assert (
         await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
+            data={**_SETTLED_EVIDENCE, "status": "completed"},
             printer_manager=_settled_printer_manager(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -497,8 +576,9 @@ async def test_captured_foreign_print_charges_filament_again(db_session, printer
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
+        data={**_SETTLED_EVIDENCE, "status": "completed"},
         printer_manager=_settled_printer_manager(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )

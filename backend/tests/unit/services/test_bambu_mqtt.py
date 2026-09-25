@@ -6041,8 +6041,8 @@ class TestIdleFromPauseCompletion:
     def test_running_to_idle_still_fires_without_the_was_running_flag(self, mqtt_client):
         """The RUNNING arm is deliberately left unguarded — today's behaviour.
 
-        ``_was_running`` is only set on a RUNNING push that carried a filename, so
-        requiring it here would DROP terminals rather than add them.
+        ``_was_running`` is only set on a push that carried a filename, so requiring it
+        here would DROP terminals rather than add them.
         """
         complete_data = {}
         mqtt_client.on_print_start = lambda data: None
@@ -6063,6 +6063,337 @@ class TestIdleFromPauseCompletion:
         )
 
         assert complete_data.get("status") == "aborted"
+
+
+_JOB_FILE = "/data/Metadata/plate_1.gcode"
+
+
+def _job_push(state, *, file=_JOB_FILE, subtask="Unit-3001", **fields):
+    """One status push of a job: its ``gcode_state``, file and subtask, plus any wire
+    fields the sequence needs (``layer_num``, ``mapping``, …)."""
+    return {"print": {"gcode_state": state, "gcode_file": file, "subtask_name": subtask, **fields}}
+
+
+def _lifecycle_recorders(client):
+    """Capture every start, restart-recovery attach and terminal the client fires."""
+    started, observed, completed = [], [], []
+    client.on_print_start = started.append
+    client.on_print_running_observed = observed.append
+    client.on_print_complete = completed.append
+    return started, observed, completed
+
+
+class TestJobAttach:
+    """The ATTACH: the first observation of an active job with a file, RUNNING or PAUSE.
+
+    Attaching on RUNNING alone lost every job the client first met PAUSEd — a deploy
+    during a plate-check hold or a runout, or the firmware's power-loss prompt: its
+    resume passed ``is_new_print`` and fired a FALSE PRINT START (wiping the pause's
+    HMS and tray log, re-snapshotting usage, notifying a start), and a stop from the
+    pause fired NO terminal. Every sequence here starts from a freshly built client and
+    runs through the real ``_process_message``, so the flags are only ever moved by the
+    code under test.
+    """
+
+    @pytest.mark.parametrize(
+        "states, starts, attaches",
+        [
+            pytest.param(["PAUSE", "RUNNING"], 0, 1, id="first_push_pause_then_resume"),
+            pytest.param(
+                ["PAUSE", "PAUSE", "RUNNING", "PAUSE", "RUNNING"], 0, 1, id="repeated_holds_after_a_pause_attach"
+            ),
+            # Regressions — each shape keeps exactly today's answer.
+            pytest.param(["RUNNING"], 0, 1, id="first_push_running"),
+            pytest.param(["RUNNING", "PAUSE", "RUNNING"], 0, 1, id="running_attach_then_pause_and_resume"),
+            pytest.param(["IDLE", "PREPARE", "RUNNING"], 1, 0, id="a_fresh_job_starts_once"),
+            pytest.param(
+                ["IDLE", "PREPARE", "RUNNING", "PAUSE", "RUNNING"], 1, 0, id="a_watched_job_paused_and_resumed"
+            ),
+            # A PAUSE reached from INSIDE a job whose setup this client watched is not an
+            # attach: that job's first RUNNING is its genuine start and must stay one.
+            pytest.param(["IDLE", "PREPARE", "PAUSE", "RUNNING"], 1, 0, id="pause_after_a_watched_setup"),
+            pytest.param(["IDLE", "PREPARE", "PAUSE", "PAUSE", "RUNNING"], 1, 0, id="held_pause_after_a_watched_setup"),
+        ],
+    )
+    def test_a_job_is_started_or_attached_exactly_once(self, mqtt_client, states, starts, attaches):
+        started, observed, _ = _lifecycle_recorders(mqtt_client)
+
+        for state in states:
+            mqtt_client._process_message(_job_push(state))
+
+        assert len(started) == starts
+        assert len(observed) == attaches
+
+    def test_a_pause_attach_is_adopted_with_the_start_payload_shape(self, mqtt_client):
+        """The consumer reuses its print-start handler, so a PAUSE attach hands over
+        the same keys a RUNNING one does."""
+        _, observed, _ = _lifecycle_recorders(mqtt_client)
+
+        mqtt_client._process_message(_job_push("PAUSE", subtask="PlateCheckHold"))
+
+        assert observed[0]["filename"] == _JOB_FILE
+        assert observed[0]["subtask_name"] == "PlateCheckHold"
+        assert set(observed[0]) == {"filename", "subtask_name", "remaining_time", "raw_data", "ams_mapping"}
+        assert mqtt_client._was_running is True
+        assert mqtt_client._peaks_reliable is False
+
+    def test_the_resume_of_a_pause_attach_is_not_a_print_start(self, mqtt_client):
+        """THE false start: nothing the start block owns may run on the resume."""
+        started, _, _ = _lifecycle_recorders(mqtt_client)
+        mqtt_client._process_message(_job_push("PAUSE", layer_num=12))
+        mqtt_client.state.hms_errors = [HMSError(code="8017", attr=0x03000000, module=3, severity=2)]  # 0300_8017
+        mqtt_client.state.tray_change_log.append((2, 12))
+
+        mqtt_client._process_message(_job_push("RUNNING", layer_num=12))
+
+        assert started == []
+        assert mqtt_client.state.hms_errors, "the pause's HMS must survive its own resume"
+        assert mqtt_client.state.tray_change_log == [(2, 12)]
+        assert mqtt_client.state.layer_num == 12
+        assert mqtt_client._peaks_reliable is False
+
+    def test_a_stop_from_a_pause_attach_fires_the_terminal(self, mqtt_client):
+        """A deploy during a hold, then the operator (or the farm) stops the job."""
+        started, observed, completed = _lifecycle_recorders(mqtt_client)
+
+        mqtt_client._process_message(_job_push("PAUSE"))
+        mqtt_client._process_message(_job_push("IDLE"))
+
+        assert started == []
+        assert len(observed) == 1
+        assert [c["status"] for c in completed] == ["aborted"]
+        assert completed[0]["filename"] == _JOB_FILE
+        assert completed[0]["peaks_reliable"] is False, "the client never saw this job start"
+
+    def test_a_stop_from_a_pause_after_a_resume_fires_one_terminal(self, mqtt_client):
+        _, _, completed = _lifecycle_recorders(mqtt_client)
+
+        for state in ("PAUSE", "RUNNING", "PAUSE", "IDLE", "IDLE"):
+            mqtt_client._process_message(_job_push(state))
+
+        assert [c["status"] for c in completed] == ["aborted"]
+
+    def test_a_finish_after_a_pause_attach_is_completed(self, mqtt_client):
+        _, _, completed = _lifecycle_recorders(mqtt_client)
+
+        for state in ("PAUSE", "RUNNING", "FINISH"):
+            mqtt_client._process_message(_job_push(state))
+
+        assert [c["status"] for c in completed] == ["completed"]
+        assert completed[0]["peaks_reliable"] is False
+
+    def test_pause_with_nothing_loaded_never_attaches(self, mqtt_client):
+        """No file, no job: PAUSE→IDLE must not fabricate a terminal."""
+        _, observed, completed = _lifecycle_recorders(mqtt_client)
+
+        mqtt_client._process_message(_job_push("PAUSE", file="", subtask=""))
+        mqtt_client._process_message(_job_push("IDLE", file="", subtask=""))
+
+        assert observed == []
+        assert completed == []
+        assert mqtt_client._was_running is False
+
+    def test_a_watched_job_stopped_from_a_pause_keeps_reliable_peaks(self, mqtt_client):
+        """Regression: the in-session hold → stop is unchanged — one terminal, and this
+        client DID see the start, so its peaks are measurement."""
+        started, observed, completed = _lifecycle_recorders(mqtt_client)
+
+        for state in ("IDLE", "PREPARE", "RUNNING", "PAUSE", "IDLE"):
+            mqtt_client._process_message(_job_push(state))
+
+        assert len(started) == 1
+        assert observed == []
+        assert [c["status"] for c in completed] == ["aborted"]
+        assert completed[0]["peaks_reliable"] is True
+
+    def test_an_attach_after_a_watched_job_inherits_none_of_its_evidence(self, mqtt_client):
+        """The reconnect gap: job A was watched from its start and finished; job B began
+        while the session was down and is first met PAUSEd. B's terminal must carry
+        B's evidence — not A's True reliability, A's peak layer, or A's tray log."""
+        started, observed, completed = _lifecycle_recorders(mqtt_client)
+        mqtt_client._process_message(_ams_payload(2))
+        for push in (
+            _job_push("IDLE"),
+            _job_push("PREPARE"),
+            _job_push("RUNNING"),
+            _job_push("RUNNING", layer_num=40),
+        ):
+            mqtt_client._process_message(push)
+        mqtt_client._process_message(_ams_payload(3))  # A's mid-print tray change
+        mqtt_client._process_message(_job_push("RUNNING", layer_num=120))
+        mqtt_client._process_message(_job_push("FINISH", layer_num=120))
+
+        b_file = "/data/Metadata/plate_2.gcode"
+        mqtt_client._process_message(_job_push("PAUSE", file=b_file, subtask="Unit-3002", layer_num=0))
+        mqtt_client._process_message(_job_push("IDLE", file=b_file, subtask="Unit-3002", layer_num=0))
+
+        assert len(started) == 1 and len(observed) == 1
+        job_a, job_b = completed
+        assert (job_a["status"], job_a["peaks_reliable"], job_a["last_layer_num"]) == ("completed", True, 120)
+        assert job_a["tray_change_log"] == [(2, 0), (3, 40)]
+        assert (job_b["status"], job_b["subtask_name"]) == ("aborted", "Unit-3002")
+        assert job_b["peaks_reliable"] is False
+        assert job_b["last_layer_num"] == 0
+        assert job_b["last_progress"] == 0.0
+        assert job_b["tray_change_log"] == []
+
+
+class TestTerminalConsumptionEvidence:
+    """The terminal payload carries the job's OWN consumption evidence.
+
+    The charge path read the LIVE printer at charge time — its ``mapping``, tray log,
+    ``tray_now``, layer count — and by then the live printer can describe another job:
+    2026-09-16→24, ~7.2 kg charged over 32 phantom terminals read from the printer's
+    live state while it ran the next print. So the payload captures that evidence AT
+    the terminal, from this client's per-job state, and every value is a snapshot the
+    client's later pushes cannot reach.
+    """
+
+    EVIDENCE_KEYS = (
+        "last_progress",
+        "last_layer_num",
+        "peaks_reliable",
+        "total_layers",
+        "tray_change_log",
+        "tray_now",
+        "last_loaded_tray",
+        "mqtt_mapping",
+    )
+
+    @staticmethod
+    def _run_a_job(client) -> dict:
+        """A watched job: starts on tray 2, switches to tray 3 at layer 40, finishes."""
+        _, _, completed = _lifecycle_recorders(client)
+        client._process_message(_ams_payload(2))
+        client._process_message(_job_push("IDLE"))
+        client._process_message(_job_push("PREPARE"))
+        # The start push carries the job's mapping; its readings follow it (a reading ON
+        # the start push is the predecessor's to the stale-reading gate).
+        client._process_message(_job_push("RUNNING", mapping=[2, 257]))
+        client._process_message(_job_push("RUNNING", total_layer_num=200, layer_num=40, mc_percent=20))
+        client._process_message(_ams_payload(3))
+        client._process_message(_job_push("RUNNING", layer_num=200, mc_percent=99))
+        client._process_message(_job_push("FINISH", layer_num=200, mc_percent=100))
+        assert len(completed) == 1
+        return completed[0]
+
+    def test_the_payload_carries_the_jobs_evidence(self, mqtt_client):
+        payload = self._run_a_job(mqtt_client)
+
+        assert payload["tray_change_log"] == [(2, 0), (3, 40)]
+        assert payload["tray_now"] == 3
+        assert payload["last_loaded_tray"] == 3
+        assert payload["mqtt_mapping"] == [2, 257]  # verbatim — preserved from the start push
+        assert payload["total_layers"] == 200
+        assert payload["last_layer_num"] == 200
+        assert payload["last_progress"] == 99.0
+        assert payload["peaks_reliable"] is True
+
+    def test_the_evidence_is_a_snapshot_the_next_job_cannot_reach(self, mqtt_client):
+        payload = self._run_a_job(mqtt_client)
+        expected = copy.deepcopy({key: payload[key] for key in self.EVIDENCE_KEYS})
+
+        # The live state moves on in place: the mapping list mutated, the tray log
+        # cleared and reseeded by the next job's start, the next job's trays and layers.
+        mqtt_client.state.raw_data["mapping"].append(65535)
+        mqtt_client._process_message(_ams_payload(1))
+        next_job = "/data/Metadata/plate_2.gcode"
+        mqtt_client._process_message(_job_push("PREPARE", file=next_job, subtask="Unit-3002"))
+        mqtt_client._process_message(
+            _job_push("RUNNING", file=next_job, subtask="Unit-3002", total_layer_num=80, mapping=[0])
+        )
+        mqtt_client.state.tray_change_log.append((1, 5))
+
+        assert {key: payload[key] for key in self.EVIDENCE_KEYS} == expected
+
+    def test_a_printer_that_never_reported_a_mapping_carries_none(self, mqtt_client):
+        _, _, completed = _lifecycle_recorders(mqtt_client)
+
+        for state in ("IDLE", "PREPARE", "RUNNING", "FINISH"):
+            mqtt_client._process_message(_job_push(state))
+
+        assert completed[0]["mqtt_mapping"] is None
+        assert completed[0]["tray_change_log"] == []
+        assert completed[0]["last_loaded_tray"] == -1
+
+
+class TestReportEpoch:
+    """``PrinterState.report_epoch`` — has THIS session's first report been applied?
+
+    ``_on_connect`` broadcasts the CACHED previous-session state before the pushall it
+    requests round-trips (nothing is reset on a disconnect), so "connected and a state
+    is known" can judge a new session on the old session's job. The stamp is the
+    transport's own answer: the ``connection_epoch`` whose first fresh report has
+    landed, None until then.
+    """
+
+    client_kwargs = {"publish_target": True}
+
+    @staticmethod
+    def _connect(client):
+        client._client.subscribe.return_value = (0, 1)  # (result, mid)
+        client._on_connect(client._client, None, None, 0)
+
+    def test_none_before_any_report(self, mqtt_client):
+        assert mqtt_client.state.report_epoch is None
+        self._connect(mqtt_client)
+        assert mqtt_client.state.report_epoch is None
+
+    def test_the_first_fresh_report_stamps_the_current_epoch(self, mqtt_client):
+        broadcast: list = []
+        mqtt_client.on_state_change = lambda s: broadcast.append((s.connection_epoch, s.report_epoch))
+        self._connect(mqtt_client)
+
+        mqtt_client._process_message(_job_push("RUNNING"))
+
+        assert mqtt_client.state.report_epoch == mqtt_client.state.connection_epoch == 1
+        # The connect broadcast went out unstamped; the report's own broadcast carries it.
+        assert broadcast == [(1, None), (1, 1)]
+
+    def test_a_reconnect_clears_it_even_while_the_cached_state_is_broadcast(self, mqtt_client):
+        """THE gap: the previous session's RUNNING rides the reconnect broadcast, and the
+        stamp must say it is not this session's."""
+        self._connect(mqtt_client)
+        mqtt_client._process_message(_job_push("RUNNING", subtask="PreviousSession"))
+        assert mqtt_client.state.report_epoch == 1
+
+        broadcast: list = []
+        mqtt_client.on_state_change = lambda s: broadcast.append(
+            (s.connected, s.state, s.subtask_name, s.connection_epoch, s.report_epoch)
+        )
+        self._connect(mqtt_client)
+
+        assert broadcast == [(True, "RUNNING", "PreviousSession", 2, None)]
+        assert mqtt_client.state.report_epoch is None
+
+    def test_the_next_sessions_report_stamps_the_next_epoch(self, mqtt_client):
+        self._connect(mqtt_client)
+        mqtt_client._process_message(_job_push("RUNNING"))
+        self._connect(mqtt_client)
+
+        mqtt_client._process_message(_job_push("IDLE"))
+
+        assert mqtt_client.state.report_epoch == mqtt_client.state.connection_epoch == 2
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            pytest.param({"info": {"command": "get_version", "sequence_id": "1", "module": []}}, id="version_reply"),
+            pytest.param(
+                {"print": {"command": "ams_filament_setting", "sequence_id": "7", "result": "success"}},
+                id="command_echo",
+            ),
+            pytest.param({"print": {"nozzle_temper": 212.0, "bed_temper": 55.0}}, id="push_without_gcode_state"),
+        ],
+    )
+    def test_a_message_that_reports_no_lifecycle_state_does_not_stamp(self, mqtt_client, message):
+        """Version replies and command echoes arrive on the report topic too, and say
+        nothing about the job — the connect-time pushall answer is what stamps."""
+        self._connect(mqtt_client)
+
+        mqtt_client._process_message(message)
+
+        assert mqtt_client.state.report_epoch is None
 
 
 class TestSetFanPercent:
