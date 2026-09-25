@@ -1790,7 +1790,8 @@ class TestArchivePrintPlateScoping:
         source = tmp_path / "multi.gcode.3mf"
         self._write_multi_plate_3mf(source)
 
-        # Resolve exactly as main.on_print_start does, then archive.
+        # Resolve exactly as main.on_print_start does, then archive — as a stored row: the print
+        # binding owner (print_binding.bind_created) is what makes it the printer's live print.
         resolved = await resolve_active_plate_id(db_session, printer.id, "SUB-2")
         assert resolved == 2
 
@@ -1798,12 +1799,12 @@ class TestArchivePrintPlateScoping:
         archive = await service.archive_print(
             printer_id=printer.id,
             source_file=source,
-            print_data={"filename": "multi.gcode.3mf", "status": "printing", "subtask_id": "SUB-2"},
-            subtask_id="SUB-2",
+            print_data={"filename": "multi.gcode.3mf", "status": "archived", "subtask_id": "SUB-2"},
             plate_id=resolved,
         )
 
         assert archive is not None
+        assert (archive.status, archive.started_at) == ("archived", None), "archive_print never creates a live print"
         # Plate 2's values — NOT the summed 6000s / 65.5g project totals.
         assert archive.filament_used_grams == 25.5
         assert archive.print_time_seconds == 2000

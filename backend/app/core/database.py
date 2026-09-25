@@ -5813,6 +5813,33 @@ async def run_migrations(conn):
                 _replay_repair_marker,
             )
 
+    # ONE printing archive per printer (2026-09-25) — the pin under ``services/print_binding.py``, the
+    # only writer of ``status='printing'``. Same name and predicate the model declares, so create_all
+    # and this DDL converge on one index. BELOW the replay repair on purpose: its superseded-duplicate
+    # rule closes every extra ``printing`` archive a printer holds, which is what lets a UNIQUE index
+    # build on a live database at all.
+    #
+    # Guarded, not fatal: should the repair have rolled back, duplicates remain and SQLite raises
+    # IntegrityError here (``_safe_execute`` swallows only idempotency errors). The farm then runs
+    # without the pin — print_binding still supersedes an extra live archive at the next start — and
+    # the next boot retries both. Rollback: the index outlives a downgrade, so the previous build's
+    # name-matched archive creation can hit an IntegrityError in ``on_print_start``; the callback
+    # scheduler (``printer_manager._schedule_async``) logs it and that print records no archive — the
+    # printer and the rest of the farm carry on.
+    from backend.app.models.archive import LIVE_ARCHIVE_PREDICATE as _live_archive_predicate
+
+    try:
+        await _safe_execute(
+            conn,
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_print_archives_live_printer "
+            f"ON print_archives (printer_id) WHERE {_live_archive_predicate}",
+        )
+    except IntegrityError:
+        logger.exception(
+            "[MIGRATION] ux_print_archives_live_printer not built: a printer still holds more than one "
+            "printing archive (non-fatal; the next boot retries after the replay repair)"
+        )
+
     # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds
     # from and the live table agree. A deleted id is never reused (005-H2S 2026-09-17) —
     # rationale, refusals and failure semantics live on the helper.

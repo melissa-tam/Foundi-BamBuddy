@@ -142,8 +142,18 @@ async def _seed_foreign_archive(db, printer_id: int):
 
 
 def _start_harness(printer, queue_items, *, spawned):
-    """Patch bundle for driving main.on_print_start down to the no-3MF fallback."""
+    """Patch bundle for driving main.on_print_start down to the no-3MF fallback.
+
+    The binding decision is the owner's (``print_binding.attach``, tested over a real database in
+    ``test_print_binding``); these tests are about what the CREATE branch does after it, so the
+    owner answers ``CreateNeeded`` for the first queue item (or for none) and binds whatever the
+    branch creates.
+    """
     from unittest.mock import patch as _patch
+
+    from backend.app.services import print_binding
+
+    unit_id = queue_items[0].id if queue_items else None
 
     def execute_router(stmt, *_args, **_kwargs):
         sql = str(stmt).lower()
@@ -171,6 +181,10 @@ def _start_harness(printer, queue_items, *, spawned):
     session.execute = AsyncMock(side_effect=execute_router)
     session.commit = AsyncMock()
     session.refresh = AsyncMock(side_effect=_refresh)
+    session.add = MagicMock()
+    session.get = AsyncMock(
+        side_effect=lambda _model, ident, **_kw: next((q for q in queue_items if q.id == ident), None)
+    )
 
     def fake_spawn(coro, *, name=None):
         spawned.append(name)
@@ -192,6 +206,8 @@ def _start_harness(printer, queue_items, *, spawned):
         _patch("backend.app.main._maybe_start_layer_timelapse", MagicMock()),
         _patch("backend.app.main._load_objects_from_archive", MagicMock()),
         _patch.object(foreign_archive, "spawn_background_task", fake_spawn),
+        _patch.object(print_binding, "attach", AsyncMock(return_value=print_binding.CreateNeeded(unit_id))),
+        _patch.object(print_binding, "bind_created", AsyncMock(return_value=True)),
     ]
     return patches, session
 
@@ -205,19 +221,6 @@ def _farm_printer():
     printer.external_camera_enabled = False
     printer.external_camera_url = None
     return printer
-
-
-@pytest.fixture(autouse=True)
-def _clear_main_state():
-    from backend.app.main import _active_prints, _expected_prints, _print_ams_mappings
-
-    _expected_prints.clear()
-    _active_prints.clear()
-    _print_ams_mappings.clear()
-    yield
-    _expected_prints.clear()
-    _active_prints.clear()
-    _print_ams_mappings.clear()
 
 
 @pytest.mark.asyncio
@@ -265,6 +268,9 @@ async def test_farm_print_start_miss_does_not_arm_the_retry():
     farm_item = MagicMock()
     farm_item.id = 91
     farm_item.dispatch_subtask_id = "FARM-11"
+    farm_item.ams_mapping = None
+    farm_item.plate_id = 1
+    farm_item.created_by_id = None
 
     spawned: list[str | None] = []
     patches, _session = _start_harness(_farm_printer(), [farm_item], spawned=spawned)

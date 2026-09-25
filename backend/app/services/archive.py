@@ -1726,9 +1726,12 @@ class ArchiveService:
             return None
         metadata = ingested.metadata
 
-        # Determine status and timestamps
+        # Determine status and timestamps. A LIVE print is never created here: ``status='printing'``
+        # and ``started_at`` belong to ``services/print_binding`` (``bind_created`` turns the row the
+        # print start creates into the printer's live print), so a caller asking for one is a bug.
         status = print_data.get("status", "completed") if print_data else "archived"
-        started_at = datetime.now(timezone.utc) if status == "printing" else None
+        if status == "printing":
+            raise ValueError("archive_print creates a non-printing row; print_binding.bind_created binds a live print")
         completed_at = datetime.now(timezone.utc) if status in ("completed", "failed", "archived") else None
 
         # Create archive record — identity fields here, everything the file
@@ -1742,7 +1745,6 @@ class ArchiveService:
                 else (metadata.get("print_name") or ingested.display_stem)
             ),
             status=status,
-            started_at=started_at,
             completed_at=completed_at,
             extra_data=metadata,
             created_by_id=created_by_id,
@@ -1767,27 +1769,6 @@ class ArchiveService:
             .where(PrintArchive.id == archive_id)
         )
         return result.scalar_one_or_none()
-
-    async def update_archive_status(
-        self,
-        archive_id: int,
-        status: str,
-        completed_at: datetime | None = None,
-        failure_reason: str | None = None,
-    ) -> bool:
-        """Update the status of an archive."""
-        archive = await self.get_archive(archive_id)
-        if not archive:
-            return False
-
-        archive.status = status
-        if completed_at:
-            archive.completed_at = completed_at
-        if failure_reason:
-            archive.failure_reason = failure_reason
-
-        await self.db.commit()
-        return True
 
     async def list_archives(
         self,

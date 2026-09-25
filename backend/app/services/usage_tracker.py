@@ -67,15 +67,9 @@ async def ams_weight_sync_allowed(db: AsyncSession, printer_id: int, state) -> b
     if not live_state or live_state == "UNKNOWN" or live_state in _ACTIVE_PRINT_GCODE_STATES:
         return False
 
-    from backend.app.models.archive import PrintArchive
+    from backend.app.services.print_binding import live_print_archive
 
-    result = await db.execute(
-        select(PrintArchive.id)
-        .where(PrintArchive.printer_id == printer_id)
-        .where(PrintArchive.status == "printing")
-        .limit(1)
-    )
-    return result.scalar_one_or_none() is None
+    return await live_print_archive(db, printer_id) is None
 
 
 # ── Tagged-ledger DECREASE reconcile (W6) ────────────────────────────────────

@@ -1,15 +1,31 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.core.database import Base
 
+# "A printer runs one job" as a database fact: at most ONE ``printing`` archive per printer. The
+# binding owner (``services/print_binding.py``) is the only writer of ``status='printing'``, and this
+# index is what makes "the printer's live archive" a lookup instead of a choice among leaked rows.
+# PARTIAL (SQLite >= 3.8 and PostgreSQL both take the WHERE), so finished archives accumulate freely.
+# The predicate string is shared with the migration that retrofits it (``core.database``).
+LIVE_ARCHIVE_PREDICATE = "status = 'printing' AND printer_id IS NOT NULL"
+
 
 class PrintArchive(Base):
     __tablename__ = "print_archives"
-    # A deleted id is never reused — see core.database._rebuild_table_with_autoincrement (005-H2S 2026-09-17).
-    __table_args__ = {"sqlite_autoincrement": True}
+    __table_args__ = (
+        Index(
+            "ux_print_archives_live_printer",
+            "printer_id",
+            unique=True,
+            sqlite_where=text(LIVE_ARCHIVE_PREDICATE),
+            postgresql_where=text(LIVE_ARCHIVE_PREDICATE),
+        ),
+        # A deleted id is never reused — see core.database._rebuild_table_with_autoincrement (005-H2S 2026-09-17).
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     printer_id: Mapped[int | None] = mapped_column(ForeignKey("printers.id"), nullable=True)

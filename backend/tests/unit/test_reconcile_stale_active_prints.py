@@ -175,21 +175,41 @@ class TestIsActiveArchiveStale:
         )
 
 
+async def _run_reconcile(live, archive, complete: AsyncMock | None = None) -> tuple[int, AsyncMock]:
+    """One reconcile pass over ``archive`` as the printer's live record (or none).
+
+    The reconcile's archive read is the binding owner's ``live_print_archive`` — at most one per
+    printer, by the ``ux_print_archives_live_printer`` index — so that is what is stubbed, never a
+    session's query shape.
+    """
+    from backend.app.main import reconcile_stale_active_prints
+
+    complete = complete or AsyncMock()
+    with (
+        patch("backend.app.main.printer_manager") as mock_pm,
+        patch("backend.app.main.async_session") as mock_session,
+        patch("backend.app.services.print_binding.live_print_archive", new=AsyncMock(return_value=archive)),
+        patch("backend.app.main.on_print_complete", new=complete),
+    ):
+        mock_pm.get_status.return_value = live
+        mock_session.return_value.__aenter__.return_value = AsyncMock()
+        count = await reconcile_stale_active_prints(printer_id=1)
+    return count, complete
+
+
 class TestReconcileStaleActivePrints:
-    """Orchestrator-level tests — mock the printer manager + DB session so
-    we can drive the decision flow end-to-end without standing up real
-    fixtures.
+    """Orchestrator-level tests — the printer manager and the live-print read are stubbed so the
+    decision flow runs end-to-end without standing up real fixtures.
 
     These cover:
       * No printer status (disconnected) → no-op, no on_print_complete fired.
-      * No active archives → no-op.
+      * No live archive → no-op.
       * Stale archive → synthesised on_print_complete called with status
         ``"aborted"`` and the `_reconciled: True` marker so downstream code
         can distinguish synthetic from real completions.
       * Non-stale archive → on_print_complete NOT called (no false positive
         on a healthy in-flight print).
-      * Exception inside on_print_complete must NOT block reconciliation
-        for subsequent archives or crash the caller.
+      * Exception inside on_print_complete must NOT crash the caller.
     """
 
     @pytest.mark.asyncio
@@ -215,30 +235,14 @@ class TestReconcileStaleActivePrints:
 
     @pytest.mark.asyncio
     async def test_no_active_archives_returns_zero(self):
-        from backend.app.main import reconcile_stale_active_prints
-
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("IDLE")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                count = await reconcile_stale_active_prints(printer_id=1)
+        count, complete = await _run_reconcile(_state("IDLE"), None)
         assert count == 0
+        complete.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stale_archive_synthesises_aborted_completion(self):
-        from backend.app.main import reconcile_stale_active_prints
-
         stale = _archive(subtask_id="OLD_ID", filename="ghost.3mf", print_name="ghost")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("IDLE", subtask_id="", subtask_name="")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
+        count, mock_complete = await _run_reconcile(_state("IDLE", subtask_id="", subtask_name=""), stale)
         assert count == 1
         mock_complete.assert_awaited_once()
         # Verify the synthesised payload shape.
@@ -258,19 +262,10 @@ class TestReconcileStaleActivePrints:
 
     @pytest.mark.asyncio
     async def test_non_stale_archive_does_not_synthesise(self):
-        from backend.app.main import reconcile_stale_active_prints
-
         healthy = _archive(subtask_id="ABC123")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("RUNNING", subtask_id="ABC123", subtask_name="ghost")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(
-                    return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [healthy]))
-                )
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
+        count, mock_complete = await _run_reconcile(
+            _state("RUNNING", subtask_id="ABC123", subtask_name="ghost"), healthy
+        )
         assert count == 0
         mock_complete.assert_not_called()
 
@@ -279,19 +274,10 @@ class TestReconcileStaleActivePrints:
         """Phase 3.4: live FINISH + subtask matching THIS archive → synthesise the
         TRUE 'completed' with real progress/layers/subtask so the normal terminal
         path (correlation → gate → monitor → farm_policy) runs on real evidence."""
-        from backend.app.main import reconcile_stale_active_prints
-
         stale = _archive(subtask_id="MATCH", filename="done.3mf", print_name="done")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state(
-                "FINISH", subtask_id="MATCH", subtask_name="done", progress=100.0, layer_num=250
-            )
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
+        count, mock_complete = await _run_reconcile(
+            _state("FINISH", subtask_id="MATCH", subtask_name="done", progress=100.0, layer_num=250), stale
+        )
         assert count == 1
         payload = mock_complete.call_args[0][1]
         assert payload["status"] == "completed"
@@ -305,19 +291,10 @@ class TestReconcileStaleActivePrints:
 
     @pytest.mark.asyncio
     async def test_failed_matching_subtask_synthesises_failed(self):
-        from backend.app.main import reconcile_stale_active_prints
-
         stale = _archive(subtask_id="MATCH", filename="bad.3mf", print_name="bad")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state(
-                "FAILED", subtask_id="MATCH", subtask_name="bad", progress=42.0, layer_num=88
-            )
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
+        count, mock_complete = await _run_reconcile(
+            _state("FAILED", subtask_id="MATCH", subtask_name="bad", progress=42.0, layer_num=88), stale
+        )
         assert count == 1
         payload = mock_complete.call_args[0][1]
         assert payload["status"] == "failed"
@@ -328,19 +305,10 @@ class TestReconcileStaleActivePrints:
     async def test_finish_mismatched_subtask_keeps_aborted(self):
         """A live FINISH whose subtask does NOT match this archive is not proof of
         THIS print's outcome → keep today's conservative 'aborted' (no progress)."""
-        from backend.app.main import reconcile_stale_active_prints
-
         stale = _archive(subtask_id="ARCHIVE_ID", filename="ghost.3mf", print_name="ghost")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state(
-                "FINISH", subtask_id="DIFFERENT", subtask_name="other", progress=100.0, layer_num=200
-            )
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    count = await reconcile_stale_active_prints(printer_id=1)
+        count, mock_complete = await _run_reconcile(
+            _state("FINISH", subtask_id="DIFFERENT", subtask_name="other", progress=100.0, layer_num=200), stale
+        )
         assert count == 1
         payload = mock_complete.call_args[0][1]
         assert payload["status"] == "aborted"
@@ -348,29 +316,17 @@ class TestReconcileStaleActivePrints:
         assert payload["peaks_reliable"] is False
 
     @pytest.mark.asyncio
-    async def test_on_print_complete_failure_does_not_block_rest(self):
-        """An exception during one archive's synthesis must not abort
-        reconciliation for the other archives — and must not propagate to
-        the caller (the connected-edge handler is a hot path)."""
-        from backend.app.main import reconcile_stale_active_prints
-
-        a1 = _archive(subtask_id="A", filename="a.3mf")
-        a1.id = 1
-        a2 = _archive(subtask_id="B", filename="b.3mf")
-        a2.id = 2
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = _state("IDLE")
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [a1, a2])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                # First call raises, second call must still happen.
-                mock_complete = AsyncMock(side_effect=[RuntimeError("boom"), None])
-                with patch("backend.app.main.on_print_complete", new=mock_complete):
-                    count = await reconcile_stale_active_prints(printer_id=1)
-        # Only the second archive is recorded as reconciled (first raised).
-        assert count == 1
-        assert mock_complete.await_count == 2
+    async def test_on_print_complete_failure_does_not_propagate(self):
+        """An exception during the synthesis must not propagate to the caller (the
+        connected-edge handler is a hot path); the archive stays live and the next
+        reconnect retries. A printer holds at most ONE live archive now (the binding
+        owner's index), so there is no second archive whose reconcile it could block."""
+        stale = _archive(subtask_id="A", filename="a.3mf")
+        count, mock_complete = await _run_reconcile(
+            _state("IDLE"), stale, complete=AsyncMock(side_effect=RuntimeError("boom"))
+        )
+        assert count == 0
+        assert mock_complete.await_count == 1
 
 
 class TestReconciledTerminalsGateThePlate:
@@ -401,17 +357,8 @@ class TestReconciledTerminalsGateThePlate:
     @staticmethod
     async def _reconciled_payload(live_state) -> dict:
         """Run one reconcile pass and hand back the payload it synthesised."""
-        from backend.app.main import reconcile_stale_active_prints
-
         stale = _archive(subtask_id="ARCHIVE_ID", filename="ghost.3mf", print_name="ghost")
-        with patch("backend.app.main.printer_manager") as mock_pm:
-            mock_pm.get_status.return_value = live_state
-            with patch("backend.app.main.async_session") as mock_session:
-                session_ctx = AsyncMock()
-                session_ctx.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: [stale])))
-                mock_session.return_value.__aenter__.return_value = session_ctx
-                with patch("backend.app.main.on_print_complete", new=AsyncMock()) as mock_complete:
-                    await reconcile_stale_active_prints(printer_id=1)
+        _count, mock_complete = await _run_reconcile(live_state, stale)
         return mock_complete.call_args[0][1]
 
     @pytest.mark.asyncio

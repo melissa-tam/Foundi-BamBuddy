@@ -617,8 +617,8 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
     now = time.time() if now is None else now
     from datetime import datetime, timezone
 
-    from backend.app.models.archive import PrintArchive
     from backend.app.services import printer_incidents
+    from backend.app.services.print_binding import printers_with_live_print
     from backend.app.services.requeue import return_to_queue
 
     try:
@@ -640,16 +640,7 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
 
     # Guard 3's disjointness half, read ONCE per tick: which printers the archive
     # side believes are mid-print.
-    archive_printers = {
-        pid
-        for (pid,) in (
-            await db.execute(
-                select(PrintArchive.printer_id)
-                .where(PrintArchive.status == "printing")
-                .where(PrintArchive.printer_id.is_not(None))
-            )
-        ).all()
-    }
+    archive_printers = await printers_with_live_print(db)
 
     for item in items:
         pid = item.printer_id

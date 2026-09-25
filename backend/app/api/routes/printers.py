@@ -2850,42 +2850,58 @@ async def debug_simulate_print_complete(
 
     This triggers the same code path as a real print completion,
     without needing to wait for an actual print to finish.
-    """
-    from backend.app.main import _active_prints, on_print_complete
-    from backend.app.models.archive import PrintArchive
 
-    # Get the most recent archive for this printer
-    result = await db.execute(
-        select(PrintArchive)
-        .where(PrintArchive.printer_id == printer_id)
-        .order_by(PrintArchive.created_at.desc())
-        .limit(1)
-    )
-    archive = result.scalar_one_or_none()
+    The terminal is bound the way a real one is — by job id, through the binding owner
+    (``print_binding.resolve_terminal``) — so it completes the printer's LIVE print when there is
+    one. With none, it simulates a completion named after the newest archive, which takes the
+    handler's no-archive path end to end; a finished archive is never reopened to be completed
+    again (one record per print attempt).
+    """
+    from backend.app.main import on_print_complete
+    from backend.app.models.archive import PrintArchive
+    from backend.app.services.print_binding import live_print_archive
+
+    archive = await live_print_archive(db, printer_id)
+    if archive is None:
+        result = await db.execute(
+            select(PrintArchive)
+            .where(PrintArchive.printer_id == printer_id)
+            .order_by(PrintArchive.created_at.desc())
+            .limit(1)
+        )
+        archive = result.scalar_one_or_none()
 
     if not archive:
         raise HTTPException(status_code=404, detail="No archives found for this printer")
 
-    # Register this archive as "active" so on_print_complete can find it
     filename = archive.file_path.split("/")[-1] if archive.file_path else "test.3mf"
     subtask_name = archive.print_name or "Test Print"
-    _active_prints[(printer_id, filename)] = archive.id
-    _active_prints[(printer_id, subtask_name)] = archive.id
+    live = archive.status == "printing"
 
-    # Simulate print completion data
+    # Simulate print completion data — the live print's own job id, as the printer would echo it.
     data = {
         "status": "completed",
         "filename": filename,
         "subtask_name": subtask_name,
+        "subtask_id": archive.subtask_id if live else None,
         "timelapse_was_active": False,
     }
 
-    logger.info("Simulating print complete for printer %s, archive %s", printer_id, archive.id)
+    logger.info(
+        "Simulating print complete for printer %s, archive %s (%s)",
+        printer_id,
+        archive.id,
+        "live print" if live else "no live print — no-archive path",
+    )
 
     # Call the actual on_print_complete handler
     await on_print_complete(printer_id, data)
 
-    return {"success": True, "archive_id": archive.id, "message": "Print completion simulated"}
+    return {
+        "success": True,
+        "archive_id": archive.id if live else None,
+        "message": "Print completion simulated",
+    }
 
 
 # =============================================================================

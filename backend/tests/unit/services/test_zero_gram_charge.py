@@ -207,8 +207,14 @@ async def _seed_farm_item(
     return item
 
 
-async def _seed_archive(db, printer_id: int, *, file_path: str = "", print_name: str = "plate_3"):
-    """The archive row on_print_start writes. ``file_path=""`` is the incident's."""
+async def _seed_archive(
+    db, printer_id: int, *, file_path: str = "", print_name: str = "plate_3", status: str = "printing"
+):
+    """The archive row on_print_start writes. ``file_path=""`` is the incident's.
+
+    ``status="printing"`` is the running print's record — ONE per printer (the binding owner's
+    ``ux_print_archives_live_printer``); a donor container that is not a live print is ``archived``.
+    """
     from backend.app.models.archive import PrintArchive
 
     archive = PrintArchive(
@@ -217,8 +223,8 @@ async def _seed_archive(db, printer_id: int, *, file_path: str = "", print_name:
         file_path=file_path,
         file_size=0,
         print_name=print_name,
-        status="printing",
-        started_at=datetime.now(timezone.utc) - timedelta(hours=5),
+        status=status,
+        started_at=datetime.now(timezone.utc) - timedelta(hours=5) if status == "printing" else None,
     )
     db.add(archive)
     await db.commit()
@@ -514,6 +520,8 @@ async def test_zero_gram_page_is_deduped_per_printer(db_session, printer_factory
     await _seed_tagless_spool(db_session, printer.id)
     await _seed_farm_item(db_session, printer.id, "FARM-1")
 
+    from backend.app.services.print_binding import close_archive
+
     notify = AsyncMock()
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         for index in range(3):
@@ -526,6 +534,11 @@ async def test_zero_gram_page_is_deduped_per_printer(db_session, printer_factory
                 archive_id=archive.id,
             )
             assert notify.await_count == 1, f"page {index + 1} must ride the per-printer dedup window"
+            # Each print's terminal closes its record before the printer runs the next one.
+            assert await close_archive(
+                db_session, archive.id, status="completed", completed_at=datetime.now(timezone.utc)
+            )
+            await db_session.commit()
 
 
 @pytest.mark.asyncio
@@ -917,14 +930,21 @@ async def test_a_unit_without_a_plate_takes_the_containers_own_answer(
     single = _container(tmp_path / "archive" / "1" / "one_plate.3mf", [1])
     many = _container(tmp_path / "archive" / "2" / "four_plate.3mf", [1, 2, 3, 4])
 
-    single_archive = await _seed_archive(db_session, printer.id, file_path=str(single.relative_to(tmp_path)))
+    # Donor containers (dispatch copies), not live prints.
+    single_archive = await _seed_archive(
+        db_session, printer.id, file_path=str(single.relative_to(tmp_path)), status="archived"
+    )
     plateless = await _seed_farm_item(db_session, printer.id, "FARM-2202", plate_id=None)
     plateless.archive_id = single_archive.id
-    many_archive = await _seed_archive(db_session, printer.id, file_path=str(many.relative_to(tmp_path)))
+    many_archive = await _seed_archive(
+        db_session, printer.id, file_path=str(many.relative_to(tmp_path)), status="archived"
+    )
     many_archive.filename = "four_plate.gcode.3mf"  # no plate hint in the name
     ambiguous = await _seed_farm_item(db_session, printer.id, "FARM-2203", plate_id=None)
     ambiguous.archive_id = many_archive.id
-    hinted_archive = await _seed_archive(db_session, printer.id, file_path=str(many.relative_to(tmp_path)))
+    hinted_archive = await _seed_archive(
+        db_session, printer.id, file_path=str(many.relative_to(tmp_path)), status="archived"
+    )
     hinted_archive.filename = "four_plate_plate_2.gcode.3mf"
     hinted = await _seed_farm_item(db_session, printer.id, "FARM-2204", plate_id=None)
     hinted.archive_id = hinted_archive.id

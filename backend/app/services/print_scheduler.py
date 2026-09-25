@@ -4013,19 +4013,9 @@ class PrintScheduler:
             await self._power_off_if_needed(db, item)
             return
 
-        # Register as expected print so we don't create a duplicate archive
-        # Only applicable for archive-based prints
-        if archive:
-            from backend.app.main import register_expected_print
-
-            register_expected_print(
-                printer_id,
-                remote_filename,
-                archive.id,
-                ams_mapping=ams_mapping,
-                created_by_id=item.created_by_id,
-                plate_id=item.plate_id,
-            )
+        # No print-start registration: the print's archive is found at start by its job id —
+        # ``print_binding.attach`` reads this unit's ``dispatch_subtask_id``, ``archive_id``,
+        # ``ams_mapping`` and ``plate_id`` straight off the row the claim below commits.
 
         # Propagate the queue item's owner into printer_manager so the
         # print-complete callback can credit the user in the PrintLogEntry

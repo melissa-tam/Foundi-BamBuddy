@@ -27,6 +27,7 @@ from backend.app.models.smart_plug import SmartPlug
 from backend.app.models.user import User
 from backend.app.services.log_health import ScanResult, scan_logs
 from backend.app.services.log_reader import collect_sensitive_strings
+from backend.app.services.print_binding import count_live_prints
 from backend.app.services.printer_manager import printer_manager
 
 router = APIRouter(prefix="/system", tags=["system"])
@@ -416,7 +417,7 @@ async def get_system_info(
     # Archive stats by status
     completed_count = await db.scalar(select(func.count(PrintArchive.id)).where(PrintArchive.status == "completed"))
     failed_count = await db.scalar(select(func.count(PrintArchive.id)).where(PrintArchive.status == "failed"))
-    printing_count = await db.scalar(select(func.count(PrintArchive.id)).where(PrintArchive.status == "printing"))
+    printing_count = await count_live_prints(db)
 
     # System-wide totals aggregate per-run from ``print_log_entries`` so
     # reprints contribute each run and multi-plate sums are pulled from the
