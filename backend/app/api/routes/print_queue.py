@@ -44,7 +44,11 @@ from backend.app.services.dispatch_target import (
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.queue_builder import create_queue_items, renumber_pending, seat_for_repin
-from backend.app.services.queue_transitions import cancel_pending_items
+from backend.app.services.queue_transitions import (
+    STOP_SOURCE_QUEUE_PAGE,
+    cancel_pending_items,
+    record_unit_terminal,
+)
 from backend.app.utils.printer_models import normalize_printer_model, normalize_printer_model_id
 from backend.app.utils.threemf_tools import (
     extract_bed_type_from_3mf,
@@ -1386,23 +1390,34 @@ async def stop_queue_item(
     # It never raises, so the route keeps no guard of its own.
     stop_sent = stop_as_operator(printer_id)
 
-    # Update queue item status regardless - if printer is off, print is already stopped
-    item.status = "cancelled"
-    item.completed_at = datetime.now(timezone.utc)
-    item.error_message = "Stopped by user" if stop_sent else "Stopped by user (printer was offline)"
-    # Root-cause fix (W4b): this route force-cancels the item HERE, so by the time the
-    # MQTT terminal callback arrives the item is no longer 'printing' and main.py's
-    # stop_source stamp (guarded on status=='printing') is skipped — the item lands
-    # 'cancelled' with stop_source NULL (prod item 219). Stamp it in the SAME
-    # transition. This IS the queue-UI stop, i.e. classify_stop's 'operator_ui'
-    # verdict. The printer's terminal still reaches the farm policy: the correlation
-    # owner (``farm_correlation.resolve_terminal_item`` with ``ui_stopped``) matches this
-    # ``cancelled`` row by its dispatch id, so the operator-stop hold and the fault
-    # requeue fire for it. Also NULL any stale hold token: a terminal unit must not keep
-    # a spool_jam_recovery_failed / print_paused_stalled reason.
-    item.stop_source = "operator_ui"
-    item.waiting_reason = None
+    # End the unit regardless - if the printer is off, the print is already stopped. Through
+    # the ONE writer of a unit's end (``queue_transitions.record_unit_terminal``), which also
+    # NULLs any stale hold token in the same statement: a terminal unit must not keep a
+    # spool_jam_recovery_failed / print_paused_stalled reason.
+    #
+    # Root-cause fix (W4b): this route ends the item HERE, so by the time the MQTT terminal
+    # callback arrives the item is no longer 'printing' — the stop_source is stamped in the
+    # SAME transition (prod item 219 landed 'cancelled' with stop_source NULL). This IS the
+    # queue-UI stop, i.e. classify_stop's 'operator_ui' verdict. The printer's terminal still
+    # reaches the farm policy: the correlation owner (``farm_correlation.resolve_terminal_item``
+    # with ``ui_stopped``) matches this ``cancelled`` row by its dispatch id, and the terminal
+    # annotates it (``queue_transitions.annotate_stopped_unit``) and runs the operator-stop
+    # hold or the fault requeue for it.
+    #
+    # Conditional: a terminal that landed between the status check above and this write
+    # already ended the unit with the printer's own outcome, and the stop does not write
+    # over it.
+    stopped = await record_unit_terminal(
+        db,
+        item.id,
+        status="cancelled",
+        completed_at=datetime.now(timezone.utc),
+        stop_source=STOP_SOURCE_QUEUE_PAGE,
+        error_message="Stopped by user" if stop_sent else "Stopped by user (printer was offline)",
+    )
     await db.commit()
+    if not stopped:
+        logger.info("Queue item %s: its terminal was recorded before the stop's write — outcome kept", item_id)
 
     # Get smart plug info if auto-off is enabled
     plug_ip = None

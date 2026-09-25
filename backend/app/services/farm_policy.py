@@ -519,8 +519,42 @@ async def on_terminal(
             and outcome.verdict == farm_correlation.STOP_VERDICT_PLATE_REFUSED
         ):
             await _maybe_lift_held_bed(db, printer_id)
+    except Exception:  # noqa: BLE001 — policy must never crash the callback chain
+        logger.exception("farm_policy.on_terminal failed for item=%s status=%s", queue_item_id, final_status)
+        return
 
-        # 3. Item-based policy.
+    # 3. The unit's disposition — its own function, because the downtime reconcile runs it
+    #    WITHOUT the two printer steps above (see :func:`on_unit_terminal`).
+    await on_unit_terminal(db, queue_item_id, final_status, outcome=outcome, archive_data=archive_data)
+
+
+async def on_unit_terminal(
+    db: AsyncSession,
+    item_or_id: PrintQueueItem | int | None,
+    final_status: str,
+    *,
+    outcome: TerminalOutcome | None = None,
+    archive_data: dict | None = None,
+) -> None:
+    """The UNIT half of a terminal: a farm unit's disposition, and nothing about its printer.
+
+    :func:`on_terminal` is two things: the PRINTER's steps (resolve a pending eject, lift
+    the bed off a refused plate — both act on the machine) and then this. They are split
+    because the downtime reconcile's ``superseded`` verdict (``print_reconcile``) owes a
+    unit its disposition while its printer demonstrably runs ANOTHER job: step 1 there
+    would resolve that job's pending eject ``unverified`` and quarantine the printer after
+    a restart, and step 2 would send G-code to a printer mid-print — the RC3 shape
+    (2026-09-25), a stale record acted on as the running job's terminal. So the reconcile
+    calls ONLY this; ``on_terminal`` calls it after its own printer steps; one
+    implementation of the disposition either way.
+
+    ``final_status`` is the terminal's recorded word and drives the fork; ``outcome`` is its
+    ONE classification when the caller has one (see :func:`on_terminal`). Non-farm units
+    are a no-op. Guarded like its caller: a disposition failure is logged, never raised
+    into the terminal chain.
+    """
+    queue_item_id = item_or_id.id if isinstance(item_or_id, PrintQueueItem) else item_or_id
+    try:
         if queue_item_id is None:
             return
         item = await db.get(PrintQueueItem, queue_item_id)
@@ -533,11 +567,11 @@ async def on_terminal(
         # Terminal-transition hygiene (W4b): a farm unit reaching a terminal status
         # must not keep a stale hold token. The 2026-07-20 incident left completed/
         # cancelled rows flagged spool_jam_recovery_failed / printer_offline_stalled /
-        # print_paused_stalled forever. This hook is the single reaction point for
-        # EVERY farm terminal that flows through main.on_print_complete (archive +
-        # no-archive paths) and the scheduler dispatch-failure path
-        # (print_scheduler._fail_queue_item), so clearing here covers them all. Only
-        # touches this exact unit — a still-printing sibling keeps its own reason.
+        # print_paused_stalled forever. The unit's END writers (``queue_transitions``)
+        # clear it in the statement that ends the row; this catches a token another lane
+        # wrote AFTER that statement from a copy it read while the unit was still printing
+        # (the stall and recovery lanes write the column through the ORM). Only touches
+        # this exact unit — a still-printing sibling keeps its own reason.
         if item.waiting_reason is not None:
             item.waiting_reason = None
             await db.commit()
@@ -574,7 +608,7 @@ async def on_terminal(
             # depends on the stamp having been written.)
             await on_operator_stop(db, batch, item)
     except Exception:  # noqa: BLE001 — policy must never crash the callback chain
-        logger.exception("farm_policy.on_terminal failed for item=%s status=%s", queue_item_id, final_status)
+        logger.exception("farm_policy.on_unit_terminal failed for item=%s status=%s", queue_item_id, final_status)
 
 
 # --------------------------------------------------------------------------- #

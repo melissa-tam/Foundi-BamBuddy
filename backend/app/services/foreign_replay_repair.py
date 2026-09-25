@@ -860,7 +860,7 @@ class _Planner:
         The replay's own grams and cost came from another print's progress. The best evidence of
         what the run consumed is its REAL terminal's own charges: the archive-less charges the
         chain wrote through the dispatch donor, on the run's printer, within its terminal window.
-        Their sum is the run's grams, rounded like ``main._compute_run_filament_grams``'s tracked
+        Their sum is the run's grams, rounded like ``job_terminal.compute_run_filament_grams``'s tracked
         sum, and their cost sum is its cost, as the writer's per-run cost is. With no such
         charges, only a completed run has a known figure: the writer's own completed fallback,
         the archive's grams and cost. A failed or cancelled run's partial grams are then unknown

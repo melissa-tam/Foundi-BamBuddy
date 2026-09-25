@@ -778,6 +778,9 @@ _DONOR_READERS: dict[tuple[str, str], str] = {
     ("services/print_binding.py", "_adopt"): "the adopt: binds the donor only while it never recorded a print",
     ("services/print_binding.py", "adoptable_dispatch"): "the adopt's pre-check, same rule",
     ("services/print_binding.py", "attach"): "the adopt step of the print-start binding",
+    ("services/job_terminal.py", "_dispatched_filename"): (
+        "the file name a live unit's dispatch was uploaded under — the path a stale job's cleanup keeps"
+    ),
     ("services/print_scheduler.py", "PrintScheduler._get_filament_requirements"): "dispatch read: the source file",
     ("services/print_scheduler.py", "PrintScheduler._get_job_name"): "dispatch read: the source name",
     ("services/print_scheduler.py", "PrintScheduler._start_print"): "dispatch read: the bytes to upload",
@@ -815,10 +818,6 @@ _JOB_ID_COMPARISONS: dict[tuple[str, str], str] = {
     ("services/usage_tracker.py", "_resolve_run_item"): "SQL filter: tier 1, the unit the terminal's echo names",
     ("services/print_scheduler.py", "PrintScheduler._watchdog_print_start"): (
         "change detection of the printer's OWN echo across the dispatch (did it flip?), not two jobs compared"
-    ),
-    ("main.py", "_is_active_archive_stale"): (
-        "the downtime reconcile's staleness test — main.py is outside the 2026-09-25 capsule; the reconcile "
-        "judge in print_binding replaces it"
     ),
 }
 
@@ -1014,6 +1013,179 @@ class TestRecoveryIncidentOwnership:
             line for py_file in get_python_files(BACKEND_DIR) for line in _scan_recovery_incident_constructions(py_file)
         ]
         assert start <= line < start + len(source), "the one construction must live inside _build_incident"
+
+
+# --- A unit's END has ONE writer (2026-09-25) ---------------------------------------------------
+#
+# ``queue_transitions.record_unit_terminal`` ends a running unit (``printing`` → terminal), in one
+# conditional statement; ``fail_unclaimed_dispatch`` and ``annotate_stopped_unit`` are its two narrow
+# siblings there. Before it, the terminal callback, the queue page's Stop and the scheduler's
+# dispatch failure each wrote the row from an ORM copy read earlier — and the downtime reconcile
+# synthesised a fourth end for a unit a real terminal might already have ended (RC3).
+
+_UNIT_TERMINAL_OWNER = ("services", "queue_transitions.py")
+_UNIT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "skipped"})
+# Every ``<x>.status = <terminal word or computed value>`` outside the owner, keyed by file, enclosing
+# function and target — and why it is NOT a queue unit's end. A second end-writer for a unit is a
+# decision to argue in the diff, not an entry to add.
+_STATUS_WRITES_NOT_A_UNIT_END: dict[tuple[str, str, str], str] = {
+    ("api/routes/inventory.py", "update_shopping_list_status", "item.status"): "a ShoppingListItem",
+    ("api/routes/print_log.py", "update_print_log_entry", "entry.status"): "a PrintLogEntry (the log's own edit)",
+    ("api/routes/print_queue.py", "cancel_batch", "batch.status"): (
+        "a PrintBatch; its pending units end through queue_transitions.cancel_pending_items"
+    ),
+    ("api/routes/projects.py", "update_project", "project.status"): "a Project",
+    ("services/farm_policy.py", "_maybe_complete_run", "batch.status"): "a PrintBatch — the RUN completes",
+    ("services/firmware_update.py", "FirmwareUpdateService.start_upload", "state.status"): "a firmware upload",
+    ("services/firmware_update.py", "FirmwareUpdateService._do_upload", "state.status"): "a firmware upload",
+    ("services/github_backup.py", "GitHubBackupService.run_backup", "log.status"): "a backup log row",
+    ("services/print_scheduler.py", "PrintScheduler.check_queue", "item.status"): (
+        "upstream's require_previous_success SKIP: a PENDING unit the scheduler's own tick holds, skipped "
+        "before it ever printed — pending → skipped, not a running unit's end (the pending-side "
+        "transitions' race — an operator cancel landing in the tick — is not closed here)"
+    ),
+    ("services/printer_incidents.py", "mark_escalated", "incident.status"): "a PrinterIncident",
+    ("services/printer_incidents.py", "close", "incident.status"): "a PrinterIncident",
+    ("services/production_run.py", "transition_run", "run.status"): "a PrintBatch (run lifecycle)",
+    ("services/slice_dispatch.py", "SliceDispatchService._run_job", "job.status"): "a slice job",
+}
+# The lanes that END a running unit — each through the owner, and no other.
+_UNIT_TERMINAL_CALLERS = frozenset(
+    {
+        ("services", "job_terminal.py"),  # the real terminal (main) and the reconcile's superseded phase
+        ("services", "print_scheduler.py"),  # _fail_queue_item, the print-command failure after the claim
+        ("api", "routes", "print_queue.py"),  # the queue page's Stop
+    }
+)
+
+
+def _is_unit_end_value(value: ast.expr | None) -> bool:
+    """A terminal word, or a value computed at run time (which may be one)."""
+    if value is None:
+        return False
+    if isinstance(value, ast.Constant):
+        return isinstance(value.value, str) and value.value in _UNIT_TERMINAL_STATUSES
+    return True
+
+
+def _updates_queue_item(expr: ast.expr) -> bool:
+    """Is ``expr`` a statement chain built from ``update(PrintQueueItem)``?"""
+    node: ast.expr = expr
+    while True:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "update"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "PrintQueueItem"
+            ):
+                return True
+            node = func
+        elif isinstance(node, ast.Attribute):
+            node = node.value
+        else:
+            return False
+
+
+def _scan_unit_end_writes(tree: ast.Module) -> list[tuple[str, str, int]]:
+    """``(qualname, shape, line)`` of every write that could END a queue unit: a ``.status``
+    assignment of a terminal word or a computed value, a ``update(PrintQueueItem).values(status=…)``,
+    a ``PrintQueueItem(status=<terminal>)`` construction, a ``setattr(…, "status", …)``."""
+    hits: list[tuple[str, str, int]] = []
+    for qual, node in _scopes(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                    pairs = list(zip(target.elts, node.value.elts, strict=False))
+                else:
+                    pairs = [(target, node.value)]
+                for tgt, value in pairs:
+                    if isinstance(tgt, ast.Attribute) and tgt.attr == "status" and _is_unit_end_value(value):
+                        hits.append((qual, ast.unparse(tgt), node.lineno))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "values" and _updates_queue_item(func.value):
+                if any(k.arg == "status" and _is_unit_end_value(k.value) for k in node.keywords):
+                    hits.append((qual, "update(PrintQueueItem).values(status=...)", node.lineno))
+            elif isinstance(func, ast.Name) and func.id == "PrintQueueItem":
+                if any(
+                    k.arg == "status" and isinstance(k.value, ast.Constant) and k.value.value in _UNIT_TERMINAL_STATUSES
+                    for k in node.keywords
+                ):
+                    hits.append((qual, "PrintQueueItem(status=<terminal>)", node.lineno))
+            elif (
+                isinstance(func, ast.Name)
+                and func.id == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "status"
+            ):
+                hits.append((qual, 'setattr(..., "status", ...)', node.lineno))
+    return hits
+
+
+class TestUnitTerminalOwnership:
+    """ONE writer of a unit's END. SOURCE pins, like their neighbours: a second end-writer is
+    well-formed code every seeded test passes — until it races the first, and a unit ends twice
+    (the stop over the printer's own outcome) or a stale record ends a unit a real terminal already
+    ended."""
+
+    def test_no_unit_is_ended_outside_the_queue_transitions_owner(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} ({qual}) {shape}"
+            for parts, tree in _app_trees()
+            if parts != _UNIT_TERMINAL_OWNER
+            for qual, shape, line in _scan_unit_end_writes(tree)
+            if ("/".join(parts), qual, shape) not in _STATUS_WRITES_NOT_A_UNIT_END
+        ]
+        if strays:
+            pytest.fail(
+                "A status that can END a queue unit is written outside services/queue_transitions.py:\n"
+                + "\n".join(strays)
+                + "\n\nEnd a running unit through queue_transitions.record_unit_terminal (conditional on "
+                "'printing', once); a dispatch that failed before its claim through fail_unclaimed_dispatch. "
+                "A write that is not a queue unit's end goes on _STATUS_WRITES_NOT_A_UNIT_END with its reason."
+            )
+
+    def test_the_allowlist_names_only_live_writes(self):
+        """The liveness half: an entry whose write is gone would excuse the next one."""
+        live = {
+            ("/".join(parts), qual, shape)
+            for parts, tree in _app_trees()
+            if parts != _UNIT_TERMINAL_OWNER
+            for qual, shape, _ in _scan_unit_end_writes(tree)
+        }
+        stale = sorted(_STATUS_WRITES_NOT_A_UNIT_END.keys() - live)
+        assert not stale, f"allowlisted status writes that no longer write: {stale}"
+
+    def test_every_lane_that_ends_a_running_unit_calls_the_owner(self):
+        """The real terminal (through job_terminal), the queue page's Stop and the scheduler's
+        dispatch failure all end the unit through ``record_unit_terminal`` — and nothing else calls it."""
+        callers = {
+            parts
+            for parts, tree in _app_trees()
+            if parts != _UNIT_TERMINAL_OWNER
+            and any(
+                isinstance(node, ast.Call) and _called_attr(node) == "record_unit_terminal" for node in ast.walk(tree)
+            )
+        }
+        assert callers == _UNIT_TERMINAL_CALLERS
+
+    def test_the_callers_are_the_lanes_that_end_a_unit(self):
+        """The same, per function: the lanes are the ones the ruling names, not merely their modules."""
+        from backend.app import main
+        from backend.app.api.routes import print_queue
+        from backend.app.services import job_terminal
+        from backend.app.services.print_scheduler import PrintScheduler
+
+        assert "record_unit_terminal" in _source_of(print_queue.stop_queue_item)
+        assert "record_unit_terminal" in _source_of(PrintScheduler._fail_queue_item)  # noqa: SLF001
+        assert "record_unit_terminal" in _source_of(job_terminal.record_unit_outcome)
+        assert "job_terminal.record_unit_outcome" in _source_of(main.on_print_complete)
+        assert "record_unit_outcome" in _source_of(job_terminal.close_superseded)
 
 
 # --- The recovery driver's single owners (2026-09-23, the wedge release ladder) -------

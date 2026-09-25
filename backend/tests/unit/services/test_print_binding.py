@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -71,6 +72,27 @@ async def _attach(maker, printer_id: int, job: LiveJob, *, now: datetime = NOW):
         return await attach(s, printer_id, job, now=now)
 
 
+@pytest.fixture
+async def job_phase(own_session_factory):
+    """The job phase a supersede owes after its commit (``job_terminal.settle``) runs in the BACKGROUND
+    on ``core.database.async_session``: point that at the test engine, mock its transports (the
+    archive events and the FTP delete — a real one would dial the seeded printer), and let every task
+    it spawned finish before the test reads the rows. Yields the delete mock."""
+    from backend.app.services.bambu_ftp import DeleteResult
+
+    tasks_before = set(asyncio.all_tasks())
+    deletes = AsyncMock(return_value=DeleteResult.DELETED)
+    ws, relay = MagicMock(send_archive_updated=AsyncMock()), MagicMock(on_archive_updated=AsyncMock())
+    with (
+        patch("backend.app.core.database.async_session", own_session_factory),
+        patch("backend.app.services.job_terminal.ws_manager", ws),
+        patch("backend.app.services.job_terminal.mqtt_relay", relay),
+        patch("backend.app.services.bambu_ftp.delete_file_async", new=deletes),
+    ):
+        yield deletes
+        await drain_new_tasks(tasks_before)
+
+
 # ---------------------------------------------------------------------------
 # Job identity
 # ---------------------------------------------------------------------------
@@ -103,6 +125,7 @@ def test_same_job_table(live, record, expected):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("job_phase")
 class TestAttach:
     async def test_resumes_the_jobs_own_live_archive_by_id(self, own_session_factory):
         maker = own_session_factory
@@ -233,6 +256,69 @@ class TestAttach:
         assert old.completed_at is not None
         assert (await archive_row(maker, archive_id)).status == "printing"
 
+    async def test_a_superseded_archive_whose_run_ended_takes_the_runs_outcome(self, own_session_factory, job_phase):
+        """(f) The job phase, not a bare close: the other live archive's run already RECORDED its end
+        (its terminal could not find the archive — the RC1 leak), so the record takes that outcome and
+        the print-log row the terminal could not write. Before 2026-09-25 this recorded a COMPLETED
+        print 'cancelled / outcome unknown' — the Stats and accounting-feed damage."""
+        from backend.app.models.print_log import PrintLogEntry
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        leaked = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="DONE-1")
+        done_unit = await seed_unit(maker, printer_id=pid, archive_id=None, dispatch_subtask_id="DONE-1")
+        ended_at = datetime(2026, 9, 25, 11, 0)
+        async with maker() as s:
+            row = await s.get(PrintQueueItem, done_unit)
+            row.status, row.completed_at = "completed", ended_at
+            await s.commit()
+        archive_id = await seed_archive(maker, printer_id=None)
+        await seed_unit(maker, printer_id=pid, archive_id=archive_id, dispatch_subtask_id="D5")
+
+        tasks_before = set(asyncio.all_tasks())
+        binding = await _attach(maker, pid, LiveJob(subtask_id="D5"))
+        await drain_new_tasks(tasks_before)
+
+        assert isinstance(binding, Adopted)
+        old = await archive_row(maker, leaked)
+        assert (old.status, _naive(old.completed_at), old.failure_reason) == ("completed", ended_at, None)
+        async with maker() as s:
+            logs = (await s.execute(select(PrintLogEntry.status).where(PrintLogEntry.archive_id == leaked))).all()
+            unit = await s.get(PrintQueueItem, done_unit)
+        assert [status for (status,) in logs] == ["completed"]
+        assert (unit.status, unit.completed_at, unit.stop_source) == ("completed", ended_at, None)  # not written
+        job_phase.assert_not_awaited()  # an observed end owes no file cleanup
+
+    async def test_a_superseded_archive_with_a_running_unit_ends_it_unknown(self, own_session_factory, job_phase):
+        """The other live archive's unit never recorded an end: it ends ``cancelled`` /
+        ``reconcile_unknown`` (its disposition — the run's hold — follows the commit), a ``cancelled``
+        print-log row is written, and its uploaded file is removed — except the path the job being
+        bound itself uploaded to: one file printed twice shares ONE path, and it is the live job's now."""
+        from backend.app.models.print_log import PrintLogEntry
+
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        leaked = await seed_archive(
+            maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="LOST-2", print_name="Old_Job"
+        )
+        lost_unit = await seed_unit(maker, printer_id=pid, archive_id=None, dispatch_subtask_id="LOST-2")
+        archive_id = await seed_archive(maker, printer_id=None)  # the same storage-hash file
+
+        tasks_before = set(asyncio.all_tasks())
+        async with maker() as s:
+            await bind_created(s, archive_id, pid, LiveJob(subtask_id="SCREEN-9"), None, now=NOW)
+        await drain_new_tasks(tasks_before)
+
+        old = await archive_row(maker, leaked)
+        assert (old.status, old.failure_reason) == ("cancelled", SUPERSEDED_REASON)
+        async with maker() as s:
+            logs = (await s.execute(select(PrintLogEntry.status).where(PrintLogEntry.archive_id == leaked))).all()
+            unit = await s.get(PrintQueueItem, lost_unit)
+        assert [status for (status,) in logs] == ["cancelled"]
+        assert (unit.status, unit.stop_source) == ("cancelled", "reconcile_unknown")
+        # The shared storage-hash path is the live job's; the stale job's own name fallbacks still go.
+        assert [call.args[2] for call in job_phase.await_args_list] == ["/Old_Job.3mf", "/Old_Job.gcode"]
+
     async def test_revives_a_stale_cancelled_archive_of_the_same_job(self, own_session_factory):
         """#972: an earlier build stale-cancelled a print that kept running; its id reappearing is
         proof, so the row is revived instead of duplicated."""
@@ -343,6 +429,7 @@ class TestAttach:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("job_phase")
 class TestBindCreated:
     async def test_binds_with_the_units_durable_id_and_supersedes(self, own_session_factory):
         maker = own_session_factory
@@ -750,9 +837,9 @@ class TestTerminalAcrossARestart:
         assert [entry.status for entry in logs] == ["completed"]
 
     async def test_the_downtime_reconcile_closes_the_stale_archive_by_id(self, own_session_factory):
-        """The printer came back IDLE: the reconcile's synthesised terminal carries the ARCHIVE's own
-        subtask id, so ``resolve_terminal`` binds it to exactly that record — never to a same-named
-        one — and ``close_archive`` records the unknown outcome once."""
+        """The printer came back IDLE naming no job: the reconcile cannot attribute the end, so it
+        closes exactly THAT record by id through the superseded job phase — ``cancelled``, outcome
+        unknown, one print-log row — and holds the plate for a human (``print_reconcile``)."""
         from backend.app.main import reconcile_stale_active_prints
 
         maker = own_session_factory

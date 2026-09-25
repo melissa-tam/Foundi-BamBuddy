@@ -37,16 +37,30 @@ class CallbackMocks:
     record_energy: AsyncMock
     locate: AsyncMock
     ws: MagicMock
+    notif: MagicMock
 
 
-def live_state(*, subtask_id: str | None = None, progress: float | None = 40.0, state: str = "RUNNING"):
+def live_state(
+    *,
+    subtask_id: str | None = None,
+    progress: float | None = 40.0,
+    state: str = "RUNNING",
+    fresh: bool = True,
+    subtask_name: str = "Fast_Half_Shell_spliced",
+):
     """What ``printer_manager.get_status`` answers: a live print, no AMS payload (so the usage
-    tracker's start hook leaves any session a test seeded alone)."""
+    tracker's start hook leaves any session a test seeded alone).
+
+    ``fresh`` is whether the state describes THIS MQTT session — its first report applied
+    (``report_epoch == connection_epoch``); False models the previous session's cache that
+    ``_on_connect`` re-broadcasts before its pushall answers."""
     return SimpleNamespace(
         connected=True,
+        connection_epoch=1,
+        report_epoch=1 if fresh else None,
         state=state,
         subtask_id=subtask_id,
-        subtask_name="Fast_Half_Shell_spliced",
+        subtask_name=subtask_name,
         progress=progress,
         layer_num=5,
         raw_data=None,
@@ -97,6 +111,10 @@ def print_callbacks(
         relay = stack.enter_context(patch("backend.app.main.mqtt_relay"))
         for name in ("on_print_start", "on_print_complete", "on_archive_created", "on_archive_updated"):
             setattr(relay, name, AsyncMock())
+        # The terminal's JOB phase (services/job_terminal) announces a closed record itself — the
+        # same two transports, patched where that module reads them.
+        stack.enter_context(patch("backend.app.services.job_terminal.ws_manager", ws))
+        stack.enter_context(patch("backend.app.services.job_terminal.mqtt_relay", relay))
 
         pm = stack.enter_context(patch("backend.app.main.printer_manager"))
         pm.get_printer.return_value = None
@@ -138,6 +156,7 @@ def print_callbacks(
             record_energy=energy,
             locate=locate,
             ws=ws,
+            notif=notif,
         )
 
 

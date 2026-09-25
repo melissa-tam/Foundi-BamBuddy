@@ -14,6 +14,12 @@ saw the unit as pending and wrote ``status='cancelled'`` a second later. The ORM
 emitted only the changed column, leaving the row cancelled while wearing the
 dispatcher's ``started_at`` and ``ams_mapping`` — and the printer kept printing.
 
+A unit's END has one writer here too — ``record_unit_terminal`` (``printing → terminal``), with
+``annotate_stopped_unit`` (the queue page's Stop, annotated by the printer's terminal) and
+``fail_unclaimed_dispatch`` (a dispatch that failed before its claim) beside it — and the same
+race decides it: the terminal and the queue page's Stop both read ``printing``, and only one of
+them may end the unit.
+
 The delete pair pins the same race one step further along (2026-08-22, run 114 on
 001/002/003-H2S): there the request DELETED the rows of three units that were
 still printing, and since the row is the only durable link between a live print
@@ -32,10 +38,13 @@ import backend.app.models  # noqa: F401 — registers every table on Base.metada
 from backend.app.core.database import Base
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.queue_transitions import (
+    annotate_stopped_unit,
     cancel_pending_items,
     claim_pending_for_dispatch,
     delete_items_unless_printing,
     delete_user_items_unless_printing,
+    fail_unclaimed_dispatch,
+    record_unit_terminal,
     release_unstarted_claim,
 )
 
@@ -646,3 +655,184 @@ class TestReleaseUnstartedClaim:
         assert after.status == "printing"
         assert after.ams_mapping == "[2]"
         assert after.started_at is not None
+
+
+# ---------------------------------------------------------------------------
+# A unit's END — record_unit_terminal and its two narrow siblings (2026-09-25)
+# ---------------------------------------------------------------------------
+
+_ENDED_AT = datetime(2026, 9, 25, 3, 0, 0, tzinfo=timezone.utc)
+
+
+class TestRecordUnitTerminal:
+    """THE writer of ``printing → terminal``: conditional, once, and it clears the hold token."""
+
+    async def test_a_printing_unit_ends_with_its_words_and_no_hold_token(self, session_factory):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            (await db.get(PrintQueueItem, item_id)).waiting_reason = "printer_offline_stalled"
+            await db.commit()
+            assert await record_unit_terminal(
+                db,
+                item_id,
+                status="cancelled",
+                completed_at=_ENDED_AT,
+                stop_source="reconcile_unknown",
+                error_message="the printer's words",
+            )
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.status, after.stop_source, after.error_message) == (
+            "cancelled",
+            "reconcile_unknown",
+            "the printer's words",
+        )
+        assert after.completed_at is not None
+        assert after.waiting_reason is None
+
+    async def test_a_second_end_is_refused_and_the_first_stands(self, session_factory):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            assert await record_unit_terminal(db, item_id, status="completed", completed_at=_ENDED_AT) is True
+            await db.commit()
+            second = await record_unit_terminal(
+                db, item_id, status="cancelled", completed_at=_ENDED_AT, stop_source="operator_ui"
+            )
+            assert second is False
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.status, after.stop_source) == ("completed", None)
+
+    @pytest.mark.parametrize("status", ["pending", "cancelled", "completed", "failed"])
+    async def test_only_a_printing_unit_ends(self, session_factory, status):
+        (item_id,) = await _seed(session_factory, status)
+        async with session_factory() as db:
+            assert await record_unit_terminal(db, item_id, status="failed", completed_at=_ENDED_AT) is False
+            await db.commit()
+        assert (await _row(session_factory, item_id)).status == status
+
+    @pytest.mark.parametrize("status", ["printing", "pending", "aborted"])
+    async def test_it_writes_only_a_terminal_status(self, session_factory, status):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            with pytest.raises(ValueError):
+                await record_unit_terminal(db, item_id, status=status, completed_at=_ENDED_AT)
+
+    async def test_words_not_given_are_not_written(self, session_factory):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            item = await db.get(PrintQueueItem, item_id)
+            item.error_message = "a hold's own words"
+            await db.commit()
+            assert await record_unit_terminal(db, item_id, status="failed", completed_at=_ENDED_AT)
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.error_message, after.stop_source) == ("a hold's own words", None)
+
+    async def test_the_terminal_and_the_stop_racing_end_the_unit_once(self, session_factory):
+        """Two writers, two real connections, both having read ``printing``: the queue page's Stop
+        and the printer's terminal. The database decides — the loser learns it lost and writes
+        nothing over the winner's outcome."""
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as terminal, session_factory() as stop:
+            assert (await terminal.get(PrintQueueItem, item_id)).status == "printing"
+            assert (await stop.get(PrintQueueItem, item_id)).status == "printing"
+
+            assert await record_unit_terminal(terminal, item_id, status="completed", completed_at=_ENDED_AT)
+            await terminal.commit()
+            lost = await record_unit_terminal(
+                stop, item_id, status="cancelled", completed_at=_ENDED_AT, stop_source="operator_ui"
+            )
+            assert lost is False
+            await stop.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.status, after.stop_source) == ("completed", None)
+
+
+class TestAnnotateStoppedUnit:
+    """The queue page's Stop ended the row before the printer's terminal arrived; the terminal only
+    adds what it knows — never an end."""
+
+    @staticmethod
+    async def _stopped(session_factory, *, stop_source="operator_ui", error_message="Stopped by user"):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            assert await record_unit_terminal(
+                db,
+                item_id,
+                status="cancelled",
+                completed_at=_ENDED_AT,
+                stop_source=stop_source,
+                error_message=error_message,
+            )
+            await db.commit()
+        return item_id
+
+    async def test_the_terminals_words_annotate_the_stopped_row(self, session_factory):
+        item_id = await self._stopped(session_factory, error_message=None)
+        before = await _row(session_factory, item_id)
+        async with session_factory() as db:
+            assert await annotate_stopped_unit(db, item_id, stop_source="plate_refused", error_message="the plate")
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.status, after.completed_at) == ("cancelled", before.completed_at)
+        assert (after.stop_source, after.error_message) == ("plate_refused", "the plate")
+
+    async def test_only_a_row_the_queue_page_stopped_is_annotated(self, session_factory):
+        other_stop = await self._stopped(session_factory, stop_source="operator_screen")
+        (printing,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            for item_id in (other_stop, printing):
+                assert await annotate_stopped_unit(db, item_id, stop_source="plate_refused") is False
+            await db.commit()
+        assert (await _row(session_factory, other_stop)).stop_source == "operator_screen"
+        assert (await _row(session_factory, printing)).status == "printing"
+
+    async def test_nothing_to_write_is_a_no_op(self, session_factory):
+        item_id = await self._stopped(session_factory)
+        async with session_factory() as db:
+            assert await annotate_stopped_unit(db, item_id) is False
+
+
+class TestFailUnclaimedDispatch:
+    """A dispatch that failed before its claim: ``pending → failed``, attributed to its printer."""
+
+    async def test_a_pending_unit_fails_on_the_printer_it_was_dispatched_to(self, session_factory):
+        (item_id,) = await _seed(session_factory, "pending")
+        async with session_factory() as db:
+            (await db.get(PrintQueueItem, item_id)).waiting_reason = "stagger_hold"
+            await db.commit()
+            assert await fail_unclaimed_dispatch(
+                db,
+                item_id,
+                printer_id=_DISPATCH_PRINTER_ID,
+                error_message="Printer not connected",
+                completed_at=_ENDED_AT,
+            )
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.status, after.printer_id, after.error_message) == (
+            "failed",
+            _DISPATCH_PRINTER_ID,
+            "Printer not connected",
+        )
+        assert after.completed_at is not None
+        assert after.waiting_reason is None
+
+    @pytest.mark.parametrize("status", ["cancelled", "printing", "completed"])
+    async def test_a_row_that_left_pending_is_not_failed(self, session_factory, status):
+        """An operator cancel that landed while the scheduler decided wins."""
+        (item_id,) = await _seed(session_factory, status)
+        async with session_factory() as db:
+            failed = await fail_unclaimed_dispatch(
+                db, item_id, printer_id=_DISPATCH_PRINTER_ID, error_message="boom", completed_at=_ENDED_AT
+            )
+            assert failed is False
+            await db.commit()
+        assert (await _row(session_factory, item_id)).status == status

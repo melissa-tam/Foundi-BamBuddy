@@ -6049,6 +6049,8 @@ async def run_migrations(conn):
             await conn.execute(text("DELETE FROM settings WHERE key = 'farm_cooldown_warn_floor_c'"))
         logger.info("[MIGRATION] retired setting farm_cooldown_warn_floor_c deleted")
 
+    await _migrate_aborted_queue_items_to_cancelled(conn)
+
     # The shop-air sample cache (``services/eject/shop_air``): a documented derived cache
     # over ``printer_sensor_history``, bootstrapped here from the last 7 days through the
     # SAME qualification the live writer runs, so the first cooldown after this deploy
@@ -6097,6 +6099,28 @@ async def run_migrations(conn):
             # the forbidden names are real.
             continue
         await _rebuild_table_with_autoincrement(conn, _table)
+
+
+async def _migrate_aborted_queue_items_to_cancelled(conn) -> None:
+    """Repair queue units left ``aborted`` by builds that recorded the printer's raw word.
+
+    ``aborted`` is the MQTT client's word for a job that ended in neither FINISH nor FAILED, never a
+    queue status: the terminal records it ``cancelled`` (``terminal_outcome``), and a unit ends only
+    through ``queue_transitions.record_unit_terminal``, which refuses any word outside the terminal
+    set. Rows an earlier build wrote ``aborted`` fall outside every queue filter and every farm-policy
+    branch. This used to run in the app lifespan as an ORM read-then-write on every boot; it is data
+    repair, so it lives with the migrations as ONE self-predicating statement — idempotent because
+    nothing writes the word any more, so a second boot matches no row. ``waiting_reason`` is cleared
+    in the same statement (terminal-transition hygiene, W4b).
+    """
+    from sqlalchemy import text
+
+    async with conn.begin_nested():
+        result = await conn.execute(
+            text("UPDATE print_queue SET status = 'cancelled', waiting_reason = NULL WHERE status = 'aborted'")
+        )
+    if result.rowcount:
+        logger.info("[MIGRATION] %d queue unit(s) recorded 'aborted' → 'cancelled'", result.rowcount)
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

@@ -28,7 +28,14 @@ from backend.app import main as main_module
 _OUTAGE_AT = 1_757_000_000.0
 
 
-def _state(connected: bool, state: str = "IDLE", disconnected_at: float | None = None) -> SimpleNamespace:
+def _state(
+    connected: bool,
+    state: str = "IDLE",
+    disconnected_at: float | None = None,
+    *,
+    epoch: int = 1,
+    fresh: bool = True,
+) -> SimpleNamespace:
     """Minimal PrinterState stub. `state="IDLE"` keeps the reconcile-edge
     branch quiescent (it only fires on `connected=True` with a non-unknown
     state-string, which we exercise separately) but otherwise lets the
@@ -38,10 +45,15 @@ def _state(connected: bool, state: str = "IDLE", disconnected_at: float | None =
     (`BambuMQTTClient.note_disconnected`): ONE wall-clock stamp per outage, written on
     the connected -> disconnected transition and KEPT unchanged across every later push
     — including the reconnect. Tests therefore pass the SAME value for repeated offline
-    pushes of one outage, and a different one for a second outage."""
+    pushes of one outage, and a different one for a second outage.
+
+    ``epoch`` / ``fresh`` model the MQTT session (``PrinterState.report_epoch``): ``fresh`` means
+    this session's first report has been applied; False is the previous session's cache that
+    ``_on_connect`` re-broadcasts before its pushall answers."""
     return SimpleNamespace(
         connected=connected,
-        connection_epoch=1,
+        connection_epoch=epoch,
+        report_epoch=epoch if fresh else None,
         disconnected_at=disconnected_at,
         state=state,
         progress=0,
@@ -357,9 +369,7 @@ class TestReconcileOncePerSession:
 
         # A reconnect: the transport increments the epoch. No disconnected callback is
         # required in between — that is the whole point.
-        reconnected = _state(connected=True)
-        reconnected.connection_epoch = 2
-        await self._push(spawn, reconnected)
+        await self._push(spawn, _state(connected=True, epoch=2))
         assert self._reconcile_spawns(spawn) == 2
 
     @pytest.mark.asyncio
@@ -368,7 +378,29 @@ class TestReconcileOncePerSession:
         still the construction default — reconciling there synthesises `aborted` for
         every in-flight archive."""
         spawn = MagicMock()
-        await self._push(spawn, _state(connected=True, state="unknown"))
+        await self._push(spawn, _state(connected=True, state="unknown", fresh=False))
         assert self._reconcile_spawns(spawn) == 0
         await self._push(spawn, _state(connected=True))
         assert self._reconcile_spawns(spawn) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_previous_sessions_cache_never_fires_it_the_first_fresh_report_does(self):
+        """(e) On a RE-connect `_on_connect` re-broadcasts the PREVIOUS session's cached state —
+        a real-looking RUNNING with the old job's id, which the old `state.state not in ('',
+        'unknown')` gate let through, so the reconcile judged the new session on the old
+        session's job (2026-09-25). The transport stamps `report_epoch` only when THIS session's
+        first report is applied: the reconcile fires on that push, once per session."""
+        spawn = MagicMock()
+        await self._push(spawn, _state(connected=True, state="RUNNING", epoch=1))
+        assert self._reconcile_spawns(spawn) == 1
+
+        # Reconnected: the cached RUNNING rides the connect broadcast — twice, it makes no
+        # difference — and nothing fires.
+        for _ in range(2):
+            await self._push(spawn, _state(connected=True, state="RUNNING", epoch=2, fresh=False))
+        assert self._reconcile_spawns(spawn) == 1
+
+        # The session's first fresh report fires it; later reports of the session do not.
+        for _ in range(3):
+            await self._push(spawn, _state(connected=True, state="IDLE", epoch=2))
+        assert self._reconcile_spawns(spawn) == 2

@@ -2,7 +2,10 @@
 
 Four transitions live here: ``pending → cancelled``, its mirror
 ``pending → printing``, the un-claim ``printing → pending`` for a dispatch that
-never landed, and the row's outright DELETION. The first exists as a
+never landed, and the row's outright DELETION — plus, since 2026-09-25, THE writer of
+a unit's END (:func:`record_unit_terminal`, ``printing → terminal``) and its two
+narrow siblings (the dispatch that failed before its claim, and the queue-page stop
+annotated by its terminal). The first exists as a
 module because it had three hand-rolled copies (run abort, batch cancel,
 single-item cancel) and every one of them was a read-then-write over an ORM row
 loaded earlier in the request — a lost update waiting for a dispatch to land in
@@ -77,6 +80,143 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import InstrumentedAttribute
 
 logger = logging.getLogger(__name__)
+
+#: The statuses that END a unit. ``printing`` → one of these is :func:`record_unit_terminal`'s
+#: transition; a row in one of them is a run's recorded outcome, which the downtime reconcile
+#: reads as "the farm already knows how this print ended" (``print_reconcile``).
+UNIT_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled", "skipped"})
+
+# The stop_source the queue page's Stop writes (``POST /queue/{id}/stop``). Its row is committed
+# ``cancelled`` before the printer's terminal can arrive, so that terminal ANNOTATES it instead of
+# ending it (:func:`annotate_stopped_unit`). ONE spelling for the writer and the annotation's
+# precondition; ``farm_correlation.classify_stop``'s ``operator_ui`` verdict is the same word.
+STOP_SOURCE_QUEUE_PAGE = "operator_ui"
+
+
+async def record_unit_terminal(
+    db: AsyncSession,
+    item_id: int,
+    *,
+    status: str,
+    completed_at: datetime,
+    stop_source: str | None = None,
+    error_message: str | None = None,
+) -> bool:
+    """THE writer of a unit's END: ``printing → completed | failed | cancelled | skipped``.
+
+    Every lane that ends a running unit used to write the row its own way from an ORM copy
+    loaded earlier — the terminal callback, the queue page's Stop, the scheduler's
+    dispatch-time failure — and the downtime reconcile then synthesised a FOURTH end for a
+    unit a real terminal might already have ended (RC3, 2026-09-25: a stale archive replayed
+    as a terminal while its printer ran another job). The precondition belongs in the WHERE
+    for the reason this module exists: ``printing`` is a fact another writer can change
+    between any caller's read and its write, and a unit ends ONCE. Returns True iff THIS
+    call ended it; False means another writer already did, and the caller acts on nothing
+    it would have owed a unit that ended here (no disposition, no telemetry, no page).
+
+    ``waiting_reason`` is cleared in the same statement: a hold token (a jam, a stall, a
+    plate check) describes a RUNNING unit, and a terminal row that keeps one is the
+    2026-07-20 shape (a completed row flagged ``spool_jam_recovery_failed`` forever).
+    ``stop_source`` / ``error_message`` are written only when given — each caller decides
+    what its words are (the terminal keeps words a row already carries by passing none).
+
+    Does not commit — the caller owns the transaction, and on the terminal path the row
+    must be committed before ``farm_policy.on_unit_terminal`` runs (its requeue refuses a
+    source that is not terminal in the database).
+    """
+    if status not in UNIT_TERMINAL_STATUSES:
+        raise ValueError(f"record_unit_terminal ends a unit; {status!r} is not a terminal status")
+    values: dict[str, object] = {"status": status, "completed_at": completed_at, "waiting_reason": None}
+    if stop_source is not None:
+        values["stop_source"] = stop_source
+    if error_message is not None:
+        values["error_message"] = error_message
+    result = await db.execute(
+        update(PrintQueueItem)
+        .where(PrintQueueItem.id == item_id, PrintQueueItem.status == "printing")
+        .values(**values)
+        .returning(PrintQueueItem.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def annotate_stopped_unit(
+    db: AsyncSession,
+    item_id: int,
+    *,
+    stop_source: str | None = None,
+    error_message: str | None = None,
+) -> bool:
+    """Add what only the printer's terminal knows to a unit the QUEUE PAGE already stopped.
+
+    ``POST /queue/{id}/stop`` ends the row itself (:func:`record_unit_terminal`, ``cancelled``
+    + ``operator_ui``) BEFORE the printer's terminal can arrive — it must, because a printer
+    that is offline sends no terminal at all. When the terminal does arrive, the correlation
+    owner matches it to that row by its dispatch id, and the terminal adds its verdict and the
+    printer's words. The row is already terminal, so its status and stop time stay the
+    route's: this is an annotation, never an end, and it touches only a row still in exactly
+    the shape the route left (``cancelled`` / ``operator_ui``). Returns True iff a row was
+    annotated; a call with nothing to write is a no-op. Does not commit.
+    """
+    values: dict[str, object] = {}
+    if stop_source is not None:
+        values["stop_source"] = stop_source
+    if error_message is not None:
+        values["error_message"] = error_message
+    if not values:
+        return False
+    result = await db.execute(
+        update(PrintQueueItem)
+        .where(
+            PrintQueueItem.id == item_id,
+            PrintQueueItem.status == "cancelled",
+            PrintQueueItem.stop_source == STOP_SOURCE_QUEUE_PAGE,
+        )
+        .values(**values)
+        .returning(PrintQueueItem.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def fail_unclaimed_dispatch(
+    db: AsyncSession,
+    item_id: int,
+    *,
+    printer_id: int | None,
+    error_message: str,
+    completed_at: datetime,
+) -> bool:
+    """A dispatch that failed BEFORE its claim: ``pending → failed``, attributed to its printer.
+
+    ``print_scheduler._fail_queue_item`` fails every dispatch-time error through one body, and
+    all but one of its sites fire before :func:`claim_pending_for_dispatch` — the printer gone,
+    the file missing, the build refused — so the row is still ``pending`` there, which
+    :func:`record_unit_terminal` (``printing`` only) rightly refuses. The mirror of
+    :func:`cancel_pending_items` on the failure side, with the same precondition in the WHERE:
+    an operator cancel that lands while the scheduler is deciding wins, and the failure is not
+    written over it.
+
+    ``printer_id`` is the printer the dispatch was running on — for a POOL unit the only place
+    the row ever learns it (a pending row's ``printer_id`` is an operator PIN, and this write
+    ends the row's pending life in the same statement). ``waiting_reason`` is cleared as on
+    every terminal. Returns True iff this call failed the row. Does not commit.
+    """
+    result = await db.execute(
+        update(PrintQueueItem)
+        .where(PrintQueueItem.id == item_id, PrintQueueItem.status == "pending")
+        .values(
+            status="failed",
+            error_message=error_message,
+            completed_at=completed_at,
+            waiting_reason=None,
+            printer_id=printer_id,
+        )
+        .returning(PrintQueueItem.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 async def cancel_pending_items(db: AsyncSession, *, item_ids: Sequence[int]) -> list[int]:

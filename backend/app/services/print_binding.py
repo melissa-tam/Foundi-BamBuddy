@@ -19,6 +19,11 @@ echoes the human subtask name and ``/data/Metadata/plate_N.gcode``, so:
 
 Here the subtask id is the key, the database is the only memory, and a restart loses nothing.
 
+**An archive whose terminal the farm never saw** is this module's too. Its judge, gathering and
+applying — the downtime reconcile — live in the sibling this module owns, ``print_reconcile``; the
+supersede at print start (:func:`supersede_other_live`) closes one through the same JOB PHASE
+(``job_terminal``), so a record's end reads the same whichever lane found it.
+
 **A unit's archive link is its DONOR, not its record.** ``PrintQueueItem.archive_id`` names the
 bytes a unit prints FROM — a retry carries its parent's, a reprint the operator's — and since a row
 that already recorded an attempt is never adopted again, it is not the unit's print record. The
@@ -52,6 +57,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import func, or_, select, update
 
 from backend.app.core.database import hold_write_lock
+from backend.app.core.tasks import spawn_background_task
 from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.farm_correlation import resolve_printing_item
@@ -59,10 +65,13 @@ from backend.app.services.farm_correlation import resolve_printing_item
 # Re-exported: the job-identity comparison lives in the dependency-free ``job_identity`` so leaves
 # (``dispatch_claim``, ``incident_resolution``) can take it; this module's callers keep one import.
 from backend.app.services.job_identity import job_id, same_job
+from backend.app.services.queue_transitions import UNIT_TERMINAL_STATUSES
 
 if TYPE_CHECKING:
     from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from backend.app.services.job_terminal import ClosedJob
 
 logger = logging.getLogger(__name__)
 
@@ -342,46 +351,92 @@ async def supersede_other_live(
     printer_id: int,
     keep_archive_id: int,
     *,
-    now: datetime | None = None,
+    now: datetime,
+    owed: list[ClosedJob],
 ) -> list[int]:
-    """Close every OTHER ``printing`` archive on the printer as ``cancelled``; return their ids.
+    """Close every OTHER ``printing`` archive on the printer through the terminal's JOB PHASE.
 
     A printer runs one job, so a second live archive on it cannot be this job's record: it is a
     print whose terminal the farm never saw. It must be closed BEFORE this job's row turns
     ``printing`` — the partial unique index would refuse the binding otherwise — and in the same
     transaction, so no reader ever sees the printer with two live prints or none.
 
-    A later wave routes this through the terminal's JOB PHASE (the unit's disposition, the missing
-    print-log row) instead of a bare close; today the outcome is recorded unknown and nothing else is
-    written. Does not commit.
+    It is closed the way the downtime reconcile closes one (``job_terminal``), by what its RUN
+    recorded — the judge's two job-phase rows (``print_reconcile.judge``); the live-state rows do
+    not apply, because the job being bound IS the printer's live state:
+
+    * ``observed`` — its run unit already ended (a real terminal that could not find this archive,
+      a queue-page stop of an offline printer): the record takes the unit's outcome and the
+      print-log row that terminal could not write. Before 2026-09-25 this recorded a COMPLETED
+      print ``cancelled / outcome unknown`` — the Stats and accounting-feed damage the repair
+      migration undoes;
+    * ``superseded`` — nobody observed how it ended: ``cancelled`` (``SUPERSEDED_REASON``), its
+      still-printing unit ended ``cancelled`` / ``reconcile_unknown`` (its run holds for a human),
+      a ``cancelled`` print-log row, and its uploaded file removed — never a path the job being
+      bound will itself clean up, which for a farm run of one file is usually the SAME path.
+
+    What must wait for the commit — the events, the unit's disposition (its requeue refuses a
+    source that is not committed terminal) and the file cleanup — is appended to ``owed``; the
+    caller settles it after its commit (:func:`_settle_owed`). Nothing is charged and no printer
+    step runs: the plate and the holds belong to the job being bound. Does not commit.
     """
-    stale = (
-        await db.execute(
-            select(PrintArchive.id, PrintArchive.subtask_id)
-            .where(PrintArchive.printer_id == printer_id)
-            .where(PrintArchive.status == "printing")
-            .where(PrintArchive.id != keep_archive_id)
-        )
-    ).all()
-    closed: list[int] = []
-    for other_id, other_job in stale:
-        if await close_archive(
-            db,
-            other_id,
-            status="cancelled",
-            completed_at=now or datetime.now(timezone.utc),
-            failure_reason=SUPERSEDED_REASON,
-        ):
-            closed.append(other_id)
-            logger.warning(
-                "[PRINT-BINDING] printer %s: archive %s (job %r) was still printing when archive %s became the "
-                "live print — closed cancelled, outcome unknown",
-                printer_id,
-                other_id,
-                other_job,
-                keep_archive_id,
+    # Call-time import: ``job_terminal`` closes records through THIS module (``close_archive``).
+    from backend.app.services import job_terminal
+
+    stale = list(
+        (
+            await db.execute(
+                select(PrintArchive)
+                .where(PrintArchive.printer_id == printer_id)
+                .where(PrintArchive.status == "printing")
+                .where(PrintArchive.id != keep_archive_id)
             )
+        )
+        .scalars()
+        .all()
+    )
+    if not stale:
+        return []
+    kept = await db.get(PrintArchive, keep_archive_id)
+    keep_paths = frozenset(job_terminal.upload_candidates(kept.filename, kept.print_name)) if kept else frozenset()
+    closed: list[int] = []
+    for other in stale:
+        run_unit = await unit_of_print_archive(db, other.id)
+        if run_unit is not None and run_unit.status in UNIT_TERMINAL_STATUSES:
+            job = await job_terminal.close_observed(db, other, run_unit, printer_id=printer_id)
+        else:
+            job = await job_terminal.close_superseded(
+                db,
+                other,
+                run_unit,
+                printer_id=printer_id,
+                reason=SUPERSEDED_REASON,
+                keep_paths=keep_paths,
+                now=now,
+            )
+        if job is None:
+            continue
+        owed.append(job)
+        closed.append(other.id)
+        logger.warning(
+            "[PRINT-BINDING] printer %s: archive %s (job %r) was still printing when archive %s became the "
+            "live print — closed %s",
+            printer_id,
+            other.id,
+            other.subtask_id,
+            keep_archive_id,
+            job.status,
+        )
     return closed
+
+
+def _settle_owed(owed: list[ClosedJob]) -> None:
+    """Run the job phase a committed supersede owes — in the background, so a print start is never
+    held up by a file cleanup's FTP retries or a run's hold notification."""
+    from backend.app.services import job_terminal
+
+    for job in owed:
+        spawn_background_task(job_terminal.settle(job), name=f"superseded-job-{job.archive_id}")
 
 
 def _never_bound() -> tuple[ColumnElement[bool], ...]:
@@ -421,7 +476,9 @@ async def _bind_never_printed(
     return bound.scalar_one_or_none() is not None
 
 
-async def _resume_by_job(db: AsyncSession, printer_id: int, job: str, *, now: datetime) -> int | None:
+async def _resume_by_job(
+    db: AsyncSession, printer_id: int, job: str, *, now: datetime, owed: list[ClosedJob]
+) -> int | None:
     """Step 1 of :func:`attach`: the job's own archive, by id — its live one, or a #972 revive."""
     live = (
         (
@@ -437,7 +494,7 @@ async def _resume_by_job(db: AsyncSession, printer_id: int, job: str, *, now: da
         .first()
     )
     if live is not None:
-        await supersede_other_live(db, printer_id, live, now=now)
+        await supersede_other_live(db, printer_id, live, now=now, owed=owed)
         logger.info("[PRINT-BINDING] printer %s job %s: resuming archive %s", printer_id, job, live)
         return live
 
@@ -461,7 +518,7 @@ async def _resume_by_job(db: AsyncSession, printer_id: int, job: str, *, now: da
     )
     if stale is None:
         return None
-    await supersede_other_live(db, printer_id, stale, now=now)
+    await supersede_other_live(db, printer_id, stale, now=now, owed=owed)
     revived = await db.execute(
         update(PrintArchive)
         .where(PrintArchive.id == stale)
@@ -482,7 +539,9 @@ async def _resume_by_job(db: AsyncSession, printer_id: int, job: str, *, now: da
     return stale
 
 
-async def _resume_by_name(db: AsyncSession, printer_id: int, live_job: LiveJob, *, now: datetime) -> int | None:
+async def _resume_by_name(
+    db: AsyncSession, printer_id: int, live_job: LiveJob, *, now: datetime, owed: list[ClosedJob]
+) -> int | None:
     """Step 3 of :func:`attach`, for a job that names no id: upstream's name resume, unchanged.
 
     A ``printing`` archive whose name matches is this print — unless the printer shows a different,
@@ -534,7 +593,7 @@ async def _resume_by_name(db: AsyncSession, printer_id: int, live_job: LiveJob, 
         await close_archive(db, candidate.id, status="cancelled", completed_at=None, failure_reason=_STALE_REASON)
         return None
 
-    await supersede_other_live(db, printer_id, candidate.id, now=now)
+    await supersede_other_live(db, printer_id, candidate.id, now=now, owed=owed)
     logger.info(
         "[PRINT-BINDING] printer %s: resuming id-less print on archive %s by name %r",
         printer_id,
@@ -568,35 +627,44 @@ async def attach(db: AsyncSession, printer_id: int, live_job: LiveJob, *, now: d
     The adopt (2) is one statement — :func:`_bind_never_printed` — so a unit whose archive already
     recorded an attempt (a retry carries its parent's, a reprint the operator's) gets a NEW row: one
     archive per attempt. Before ``Resumed`` / ``Adopted`` every OTHER ``printing`` archive on the
-    printer is superseded (:func:`supersede_other_live`). Commits: the binding is one unit of work,
-    and the caller's side effects that follow must not run under the write lock.
+    printer is superseded through the job phase (:func:`supersede_other_live`). Commits: the binding
+    is one unit of work, and the caller's side effects that follow must not run under the write
+    lock — nor does the supersede's owed job phase, which is settled after the commit.
     """
     await hold_write_lock(db)
     unit = await dispatched_unit(db, printer_id, live_job.subtask_id)
     job = job_id(unit.dispatch_subtask_id if unit is not None else None) or live_job.subtask_id
 
+    owed: list[ClosedJob] = []
     binding: ArchiveBinding
-    resumed = await _resume_by_job(db, printer_id, job, now=now) if job is not None else None
+    resumed = await _resume_by_job(db, printer_id, job, now=now, owed=owed) if job is not None else None
     if resumed is not None:
         binding = Resumed(resumed)
-    elif unit is not None and unit.archive_id is not None and await _adopt(db, printer_id, unit, job=job, now=now):
+    elif (
+        unit is not None
+        and unit.archive_id is not None
+        and await _adopt(db, printer_id, unit, job=job, now=now, owed=owed)
+    ):
         binding = Adopted(unit.archive_id, unit.id)
-    elif job is None and (by_name := await _resume_by_name(db, printer_id, live_job, now=now)) is not None:
+    elif job is None and (by_name := await _resume_by_name(db, printer_id, live_job, now=now, owed=owed)) is not None:
         binding = Resumed(by_name)
     else:
         binding = CreateNeeded(unit.id if unit is not None else None)
     await db.commit()
+    _settle_owed(owed)
     return binding
 
 
-async def _adopt(db: AsyncSession, printer_id: int, unit: PrintQueueItem, *, job: str | None, now: datetime) -> bool:
+async def _adopt(
+    db: AsyncSession, printer_id: int, unit: PrintQueueItem, *, job: str | None, now: datetime, owed: list[ClosedJob]
+) -> bool:
     """Step 2 of :func:`attach`: bind the unit's archive if it never recorded a print."""
     archive_id = unit.archive_id
     if archive_id is None:
         return False
     # Before the bind: the index admits one live print per printer, and any other one here is a
     # print that ended unseen. Whether or not the adopt wins, it is not this job's record.
-    await supersede_other_live(db, printer_id, archive_id, now=now)
+    await supersede_other_live(db, printer_id, archive_id, now=now, owed=owed)
     if await _bind_never_printed(db, archive_id, printer_id=printer_id, job=job, now=now):
         logger.info(
             "[PRINT-BINDING] printer %s job %s: adopted unit %s's archive %s", printer_id, job, unit.id, archive_id
@@ -628,8 +696,9 @@ async def bind_created(
     ``ArchiveService.archive_print``, or the no-3MF fallback archive — and binds it here, so
     ``status='printing'`` and ``started_at`` keep one writer. The row's job id is the unit's durable
     ``dispatch_subtask_id`` when a unit dispatched this print, else the printer's echo. Every other
-    ``printing`` archive on the printer is superseded in the same transaction. Commits; True when the
-    row was bound (False only if it was already bound — a caller bug, logged).
+    ``printing`` archive on the printer is superseded through the job phase in the same transaction,
+    and what that owes after the commit is settled then. Commits; True when the row was bound (False
+    only if it was already bound — a caller bug, logged).
     """
     await hold_write_lock(db)
     job = live_job.subtask_id
@@ -637,9 +706,11 @@ async def bind_created(
         unit = await db.get(PrintQueueItem, unit_id)
         if unit is not None:
             job = job_id(unit.dispatch_subtask_id) or job
-    await supersede_other_live(db, printer_id, archive_id, now=now)
+    owed: list[ClosedJob] = []
+    await supersede_other_live(db, printer_id, archive_id, now=now, owed=owed)
     bound = await _bind_never_printed(db, archive_id, printer_id=printer_id, job=job, now=now)
     await db.commit()
+    _settle_owed(owed)
     if bound:
         logger.info("[PRINT-BINDING] printer %s job %s: new archive %s is the live print", printer_id, job, archive_id)
     else:
