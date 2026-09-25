@@ -2870,7 +2870,7 @@ class TestOnCooldownEscalation:
             mock_build.return_value = ("Cooldown running long — 001-H2S", "body")
 
             await service.on_cooldown_escalation(
-                1, "001-H2S", bed_c=41.0, threshold_c=33.0, max_hold_minutes=180, db=mock_db
+                1, "001-H2S", bed_c=41.0, line_c=33.0, max_hold_minutes=180, db=mock_db
             )
 
             mock_get.assert_awaited_once_with(mock_db, "on_cooldown_escalation", 1)
@@ -2878,7 +2878,7 @@ class TestOnCooldownEscalation:
             assert event == "cooldown_escalation"
             detail = variables["detail"]
             assert "bed 41 °C" in detail
-            assert "target 33 °C" in detail
+            assert "eject line 33 °C" in detail
             assert "forced eject at the 180-minute cap" in detail
             mock_send.assert_awaited_once()
 
@@ -2893,9 +2893,7 @@ class TestOnCooldownEscalation:
             mock_get.return_value = [MagicMock()]
             mock_build.return_value = ("t", "b")
 
-            await service.on_cooldown_escalation(
-                2, "002-H2S", bed_c=35.0, threshold_c=33.0, max_hold_minutes=0, db=mock_db
-            )
+            await service.on_cooldown_escalation(2, "002-H2S", bed_c=35.0, line_c=33.0, max_hold_minutes=0, db=mock_db)
 
             _, _event, variables = mock_build.call_args.args
             assert "no forced-eject cap is set" in variables["detail"]
@@ -2912,12 +2910,79 @@ class TestOnCooldownEscalation:
             mock_get.return_value = [MagicMock()]
             mock_build.return_value = ("t", "b")
 
-            await service.on_cooldown_escalation(
-                3, "003-H2S", bed_c=None, threshold_c=33.0, max_hold_minutes=90, db=mock_db
-            )
+            await service.on_cooldown_escalation(3, "003-H2S", bed_c=None, line_c=33.0, max_hold_minutes=90, db=mock_db)
 
             _, _event, variables = mock_build.call_args.args
             assert "bed unknown °C" in variables["detail"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_shop_air_names_no_line(self, service, mock_db):
+        """Shop air unknown at arm leaves the watch with NO eject line: the page says so
+        rather than inventing a target (2026-09-25, the line is measured shop air)."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "b")
+
+            await service.on_cooldown_escalation(
+                5, "005-H2S", bed_c=36.0, line_c=None, max_hold_minutes=180, db=mock_db
+            )
+
+            _, _event, variables = mock_build.call_args.args
+            assert "no eject line (shop air unknown)" in variables["detail"]
+            assert "bed 36 °C" in variables["detail"]
+
+    @pytest.mark.asyncio
+    async def test_foreign_auto_eject_quotes_the_eject_line(self, service, mock_db):
+        """An identified farm-own foreign plate: the note quotes the owner's eject line."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "body")
+
+            await service.on_foreign_job_detected(1, "001-H2S", "job", mock_db, auto_eject=True, eject_line_c=29.6)
+
+            message = mock_send.await_args.args[2]
+            assert "once the bed cools to 30°C" in message
+            assert mock_send.await_args.kwargs["variables"]["auto_eject_temp_c"] == "30"
+
+    @pytest.mark.asyncio
+    async def test_foreign_auto_eject_with_unknown_shop_air_names_its_own_air(self, service, mock_db):
+        """No shop-air reading yet: the note says the bed releases on its own air, and
+        carries no invented temperature variable."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "body")
+
+            await service.on_foreign_job_detected(1, "001-H2S", "job", mock_db, auto_eject=True, eject_line_c=None)
+
+            message = mock_send.await_args.args[2]
+            assert "cools to its own chamber air (no shop-air reading yet)" in message
+            assert "auto_eject_temp_c" not in mock_send.await_args.kwargs["variables"]
+
+    @pytest.mark.asyncio
+    async def test_foreign_plate_not_identified_has_no_auto_note(self, service, mock_db):
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [MagicMock()]
+            mock_build.return_value = ("t", "body")
+
+            await service.on_foreign_job_detected(1, "001-H2S", "job", mock_db)
+
+            assert mock_send.await_args.args[2] == "body"
 
     @pytest.mark.asyncio
     async def test_toggle_off_sends_nothing(self, service, mock_db):
@@ -2929,7 +2994,7 @@ class TestOnCooldownEscalation:
             mock_get.return_value = []
 
             await service.on_cooldown_escalation(
-                4, "004-H2S", bed_c=40.0, threshold_c=33.0, max_hold_minutes=180, db=mock_db
+                4, "004-H2S", bed_c=40.0, line_c=33.0, max_hold_minutes=180, db=mock_db
             )
 
             mock_send.assert_not_called()

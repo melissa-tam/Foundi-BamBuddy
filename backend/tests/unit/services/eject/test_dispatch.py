@@ -41,7 +41,6 @@ def _donor_3mf(plates: list[int]) -> Path:
 def _profile(**overrides) -> EjectProfile:
     defaults = {
         "name": "pp",
-        "cooldown_temp_c": 33.0,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,
@@ -63,10 +62,11 @@ def test_build_eject_snippet_is_deleted():
 
 
 def test_dispatch_module_surface_is_motion_only():
-    """dispatch.py keeps only the motion-only builder + the cooldown-override
-    resolver the eject MONITOR reads; nothing generates an injectable snippet."""
+    """dispatch.py keeps only the motion-only builder; nothing generates an injectable
+    snippet. The run-level cooldown override is gone with the per-profile threshold
+    (2026-09-25) — the eject line is ``shop_air``'s."""
     assert hasattr(dispatch_mod, "build_part_present_eject_file")
-    assert hasattr(dispatch_mod, "resolve_cooldown_override")
+    assert not hasattr(dispatch_mod, "resolve_cooldown_override")
     # build_part_present_eject_file is motion-only now: no cooldown_temp_c param.
     params = inspect.signature(dispatch_mod.build_part_present_eject_file).parameters
     assert "cooldown_temp_c" not in params

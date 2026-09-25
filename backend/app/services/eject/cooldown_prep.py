@@ -39,15 +39,17 @@ The CHAMBER exhaust fan is different in mechanism, not merely in degree. It bare
 changes ``k``; it lowers ``T_air`` by exhausting the chamber. With the chamber air at
 35-36 °C and the eject line at 33 °C the bed's asymptote sits ABOVE the eject line —
 which is the source of the "still above 33 °C after 5400 s" escalations. Once the
-chamber air reads at or below the eject threshold the exhaust's UNIQUE work is done,
+chamber air reads at or below the eject line the exhaust's UNIQUE work is done,
 and holding the air there needs a fraction of full speed (the vendor's own
 chamber-cooling figure is 50 %, ``M106 P3 S127``). That is a genuinely front-loaded
 reward with a MEASURABLE end, so the chamber lane boosts and then steps down — on the
-first bed poll whose chamber reading is ``<= release_threshold_c``, the same threshold
-the operator already keeps ~2 °C above shop ambient. No fraction constant, no stored
-minute count and no second timer: one comparison per sample of the poll that was
-already running (:meth:`CooldownPrep.note_sample`). If the sensor never reads at or
-under the threshold the boost simply runs the whole wait, which errs toward cooling.
+first bed poll whose chamber reading is ``<= release_line_c``: the eject line itself,
+MEASURED shop air plus the one margin (:mod:`~backend.app.services.eject.shop_air`,
+2026-09-25 — before that a hand-typed 33 °C kept "~2 °C above shop ambient"). No
+fraction constant, no stored minute count and no second timer: one comparison per
+sample of the poll that was already running (:meth:`CooldownPrep.note_sample`). If the
+sensor never reads at or under the line — or shop air is UNKNOWN and there is no line
+at all — the boost simply runs the whole wait, which errs toward cooling.
 
 **MEASURED** (production printer 1, 2026-09-11, 20 s sampler, aux 100 % + plate hold,
 chamber fan OFF throughout, eject threshold 33 °C, shop ~30-31 °C): FINISH at bed 61 /
@@ -233,9 +235,9 @@ COOLDOWN_FANS = (AUX_FAN, CHAMBER_FAN)
 AIRDUCT_COOLING_GCODE = "M145 P0"
 
 # There is no boost-end CONSTANT in this module, by design. The chamber lane steps
-# down the first poll whose chamber reading is at or under the eject threshold — a
-# live measurement of this cooldown, never a stored minute count. See the module
-# docstring for the cooling-law derivation, and for why the aux lane never steps.
+# down the first poll whose chamber reading is at or under the eject line — a live
+# measurement of this cooldown, never a stored minute count. See the module docstring
+# for the cooling-law derivation, and for why the aux lane never steps.
 
 
 @dataclass(frozen=True)
@@ -281,7 +283,7 @@ FanStartOutcome = Literal[
     "skipped:error",
 ]
 
-# What the boost→sustain step did, when the chamber reached the eject threshold.
+# What the boost→sustain step did, when the chamber reached the eject line.
 FanStepOutcome = Literal[
     "sent",
     "skipped:same",  # sustain == boost: the aux lane, which has no step by construction
@@ -313,7 +315,7 @@ class FanLane:
     """One fan's whole story for one cooldown: what was asked, and what each step did.
 
     ``start`` is set by :func:`begin`; ``step`` only if the chamber reached the eject
-    threshold while this prep was live; ``off`` by :meth:`CooldownPrep.end`. Both
+    line while this prep was live; ``off`` by :meth:`CooldownPrep.end`. Both
     later fields stay None when their moment never came, and the summary line renders
     that as ``none`` rather than inventing an outcome.
 
@@ -378,7 +380,7 @@ HoldOutcome = Literal[
 # verdict, so the type it stores travels with it and the monitor annotates its own
 # return with this name.
 WatchVerdict = Literal[
-    "released",  # the bed met its release condition (threshold, near plateau, or the cap)
+    "released",  # the bed met its release condition (the release predicate, plateau, or the cap)
     "stalled",  # cooling plateaued while genuinely hot, or the dispatch failed three times
     "cleared",  # the plate-clear gate dropped mid-watch — an operator, or the eject's own terminal
 ]
@@ -483,7 +485,7 @@ class CooldownPrep:
     lifetime is the COOLING EPISODE, which can now end BEFORE the watch does — a service
     hold withholds the eject, so the watch retires the actuators at the cooldown's end and
     goes on polling. Without the invariant the sampler would re-start the chamber fan at
-    its sustain speed on the first chamber-under-threshold sample AFTER that retirement
+    its sustain speed on the first chamber-under-the-line sample AFTER that retirement
     (the bed reaches the eject line before the chamber does on the measured trace), which
     is the fans-run-for-hours shape again from the other direction.
     """
@@ -498,9 +500,11 @@ class CooldownPrep:
     max_z: float | None
     # One per fan, in :data:`COOLDOWN_FANS` order.
     fans: tuple[FanLane, ...]
-    # The eject threshold this cooldown is waiting for — the chamber lane's step-down
-    # line, resolved once by the watch and handed in with everything else.
-    release_threshold_c: float
+    # The eject line this cooldown is waiting for — the chamber lane's step-down line,
+    # resolved once by the watch (from ``shop_air``) and handed in with everything else.
+    # None when shop air is unknown: then there is no step-down line and the boost runs
+    # the whole wait.
+    release_line_c: float | None
     started_at: float  # time.monotonic()
     # The first sample's readings, diagnostic: they are what makes a boost that ended
     # "after 0 s" readable as a late re-arm rather than a broken comparison.
@@ -516,7 +520,7 @@ class CooldownPrep:
     # measurement reads it once, in :meth:`end`, so whatever stands here when the FIRST
     # ``end()`` runs is what the ledger records for this episode.
     outcome: WatchVerdict | None = None
-    # When the chamber first read at or under the threshold (monotonic), or None for a
+    # When the chamber first read at or under the line (monotonic), or None for a
     # cooldown whose chamber never got there. THE measurement this wave exists to take.
     boost_ended_at: float | None = None
     # The arm-time witness's wait, carried here (not awaited inside :func:`begin`) so
@@ -559,16 +563,17 @@ class CooldownPrep:
         """Feed one bed-poll sample in. Sync, and never raises.
 
         The ONE consumer of the chamber temperature, and the ONE place the boost ends:
-        the first sample reading at or under ``release_threshold_c`` stamps
+        the first sample reading at or under ``release_line_c`` stamps
         :attr:`boost_ended_at`, logs THE measurement line, and steps every lane to its
         sustain speed. Called from the poll that was already running, so there is no
         second timer and no cadence of its own.
 
-        Three honest edge cases, all fail-open toward more cooling: a chamber already
-        under the threshold at arm (a restart re-arming late in a cooldown) steps on
-        the first sample and says so with ``after 0 s``; a chamber that never reads
-        under it never steps, and the summary says ``never``; a model with no chamber
-        reading at all is the same case as the second.
+        Four honest edge cases, all fail-open toward more cooling: a chamber already
+        under the line at arm (a restart re-arming late in a cooldown) steps on the
+        first sample and says so with ``after 0 s``; a chamber that never reads under it
+        never steps, and the summary says ``never``; a model with no chamber reading at
+        all is the same case as the second; and so is a cooldown with NO line (shop air
+        unknown) — there is nothing to step down at.
 
         Also the ONE place the operator's own hand is noticed (:meth:`_note_fan_witnesses`),
         read from the same poll and BEFORE the boost logic, because "a human switched this
@@ -591,18 +596,18 @@ class CooldownPrep:
                 self.bed_at_arm_c = _reading(temperatures, "bed")
             if self.boost_ended_at is not None:
                 return  # stamped once, by the FIRST qualifying sample
-            if chamber is None or chamber > self.release_threshold_c:
+            if chamber is None or self.release_line_c is None or chamber > self.release_line_c:
                 return
             self.boost_ended_at = time.monotonic()
             logger.info(
                 "[cooldown-prep] printer %s: chamber boost ended after %.0f s "
-                "(chamber=%s chamber_at_arm=%s bed=%s threshold=%s)",
+                "(chamber=%s chamber_at_arm=%s bed=%s line=%s)",
                 self.printer_id,
                 self.boost_ended_at - self.started_at,
                 _c(chamber),
                 _c(self.chamber_at_arm_c),
                 _c(_reading(temperatures, "bed")),
-                _c(self.release_threshold_c),
+                _c(self.release_line_c),
             )
             for lane in self.fans:
                 lane.step = self._step_fan(lane)
@@ -835,7 +840,7 @@ async def begin(
     *,
     queue_item_id: int | None,
     fans: CooldownFanSettings,
-    release_threshold_c: float,
+    release_line_c: float | None,
     model: str | None,
     hold_enabled: bool,
     hold_part_top_mm: int,
@@ -853,7 +858,8 @@ async def begin(
     ``queue_item_id`` is None for the foreign auto-eject watch, whose plate carries no
     farm unit: no unit means no donor, no profile and no measured part height, so
     there is nothing to hold the plate SAFELY at and the foreign lane gets the fans
-    alone. ``fans``, ``release_threshold_c``, ``model``, ``hold_enabled`` and
+    alone. ``fans``, ``release_line_c`` (the eject line from ``shop_air``, None when
+    shop air is unknown), ``model``, ``hold_enabled`` and
     ``hold_part_top_mm`` are all resolved ONCE by the watch that arms this prep and
     never re-read here — this module opens no settings session and asks the manager for
     no model. ``settle_s``/``sleep`` are injected only so tests need not wait.
@@ -883,7 +889,7 @@ async def begin(
         hold_z=hold_z,
         max_z=max_z,
         fans=lanes,
-        release_threshold_c=release_threshold_c,
+        release_line_c=release_line_c,
         started_at=started_at,
         settle_s=settle_s,
         sleep=sleep,

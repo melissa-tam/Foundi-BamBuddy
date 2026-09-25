@@ -62,6 +62,7 @@ from backend.app.api.routes import (
     projects,
     service_hold,
     settings as settings_routes,
+    shop_air as shop_air_routes,
     skus,
     slice_jobs,
     slicer_presets,
@@ -4231,26 +4232,23 @@ async def on_print_complete(printer_id: int, data: dict):
                     #    eject. A refusal means the plate is no longer occupied (an
                     #    operator cleared it while we identified), and a sweep onto an
                     #    emptied plate is exactly what must not happen — so the hold
-                    #    that is already standing simply stays.
-                    auto_temp = None
+                    #    that is already standing simply stays. No temperature rides
+                    #    along: the watch arms with the measured eject line like any other.
+                    promoted = False
                     if identified is not None:
                         try:
-                            promoted = farm_correlation.upgrade_to_foreign_auto_eject(
-                                printer_id, identified.profile_id, identified.threshold_c
-                            )
+                            promoted = farm_correlation.upgrade_to_foreign_auto_eject(printer_id, identified.profile_id)
                         except Exception:  # noqa: BLE001
                             logger.exception(
                                 "[CALLBACK] printer %s: arming foreign auto-eject watch failed", printer_id
                             )
                             promoted = False
                         if promoted:
-                            auto_temp = identified.threshold_c
                             logger.warning(
                                 "[CALLBACK] printer %s: FOREIGN plate is the farm's own file — auto-eject armed "
-                                "(profile=%s, cooldown=%.1f°C)",
+                                "(profile=%s)",
                                 printer_id,
                                 identified.profile_id,
-                                identified.threshold_c,
                             )
                         else:
                             logger.info(
@@ -4258,17 +4256,20 @@ async def on_print_complete(printer_id: int, data: dict):
                                 printer_id,
                             )
 
-                    # 3. Foreign notification fires in BOTH outcomes; names the cooldown
-                    #    target °C when auto-eject was armed.
+                    # 3. Foreign notification fires in BOTH outcomes; when auto-eject was
+                    #    armed it quotes the eject line from its one owner (None when shop
+                    #    air is unknown — the message then says so).
                     try:
                         async with async_session() as _fdb:
                             from backend.app.models.printer import Printer as _FPrinter
+                            from backend.app.services.eject import shop_air as _shop_air
 
                             _pres = await _fdb.execute(select(_FPrinter.name).where(_FPrinter.id == printer_id))
                             _pname = _pres.scalar_one_or_none() or f"Printer {printer_id}"
                             _job = _foreign_subtask_name or _foreign_filename or "unknown job"
+                            _line = (await _shop_air.current_line(_fdb)).line_c if promoted else None
                             await notification_service.on_foreign_job_detected(
-                                printer_id, _pname, _job, _fdb, auto_eject_temp_c=auto_temp
+                                printer_id, _pname, _job, _fdb, auto_eject=promoted, eject_line_c=_line
                             )
                     except Exception as _fe:  # noqa: BLE001
                         logger.warning("[CALLBACK] printer %s: foreign-job notification failed: %s", printer_id, _fe)
@@ -5757,11 +5758,10 @@ _printer_sensor_history_task: asyncio.Task | None = None
 PRINTER_SENSOR_HISTORY_INTERVAL = 60  # Record every minute — heaters move faster than AMS humidity
 PRINTER_SENSOR_HISTORY_RETENTION_DAYS = 30
 _printer_sensor_cleanup_counter = 0
-# Sensor kinds tracked in state.temperatures — these are the normalised keys the
-# MQTT parser writes, so we don't need to handle per-model field aliases here
-# (nozzle_temper / left_nozzle_temper / right_nozzle_temper / chamber_temper
-# are all collapsed by services/bambu_mqtt.py before they reach this loop).
-_SENSOR_KINDS = ("nozzle", "nozzle_2", "bed", "chamber")
+# Sensor kinds tracked in state.temperatures (``SENSOR_KINDS``, spelled once beside the
+# model) — these are the normalised keys the MQTT parser writes, so we don't need to handle
+# per-model field aliases here (nozzle_temper / left_nozzle_temper / right_nozzle_temper /
+# chamber_temper are all collapsed by services/bambu_mqtt.py before they reach this loop).
 _SENSOR_TARGET_KEYS = {
     "nozzle": "nozzle_target",
     "nozzle_2": "nozzle_2_target",
@@ -5784,14 +5784,16 @@ async def record_printer_sensor_history():
     while True:
         try:
             from backend.app.models.printer import Printer
-            from backend.app.models.printer_sensor_history import PrinterSensorHistory
+            from backend.app.models.printer_sensor_history import SENSOR_KINDS, PrinterSensorHistory
             from backend.app.models.settings import Settings
+            from backend.app.services.eject import shop_air
 
             async with async_session() as db:
                 result = await db.execute(select(Printer).where(Printer.is_active.is_(True)))
                 printers = result.scalars().all()
 
                 recorded_count = 0
+                recorded_printers: list[int] = []
                 for printer in printers:
                     state = printer_manager.get_status(printer.id)
                     if not state or not state.connected:
@@ -5801,7 +5803,7 @@ async def record_printer_sensor_history():
                     if not isinstance(temps, dict):
                         continue
 
-                    for kind in _SENSOR_KINDS:
+                    for kind in SENSOR_KINDS:
                         if kind not in temps:
                             continue
                         try:
@@ -5826,10 +5828,24 @@ async def record_printer_sensor_history():
                             )
                         )
                         recorded_count += 1
+                    recorded_printers.append(printer.id)
 
                 await db.commit()
                 if recorded_count > 0:
                     logger.debug("Recorded %s printer sensor history entries", recorded_count)
+
+                # The minute just written is the shop-air owner's evidence: ask it, per printer
+                # that produced a row, whether that minute is an at-rest reading. Its own commit,
+                # AFTER the history's, so a shop-air failure can never cost the history a minute.
+                if recorded_printers:
+                    try:
+                        sampled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        for printer_id in recorded_printers:
+                            await shop_air.note_reading(db, printer_id, sampled_at)
+                        await db.commit()
+                    except Exception:  # noqa: BLE001 — a derived cache never costs the recorder its loop
+                        await db.rollback()
+                        logger.exception("Shop-air sampling failed this minute")
 
                 # Periodic cleanup — once every ~24h at this interval.
                 global _printer_sensor_cleanup_counter
@@ -5847,6 +5863,8 @@ async def record_printer_sensor_history():
                     cleanup = await db.execute(
                         delete(PrinterSensorHistory).where(PrinterSensorHistory.recorded_at < cutoff)
                     )
+                    # The shop-air samples derived from this history go with it, same cutoff.
+                    await shop_air.prune(db, before=cutoff)
                     await db.commit()
                     if cleanup.rowcount > 0:
                         logger.info(
@@ -7068,6 +7086,7 @@ app.include_router(camera.router, prefix=app_settings.api_prefix)
 app.include_router(external_links.router, prefix=app_settings.api_prefix)
 app.include_router(eject_profiles.router, prefix=app_settings.api_prefix)
 app.include_router(model_geometry.router, prefix=app_settings.api_prefix)
+app.include_router(shop_air_routes.router, prefix=app_settings.api_prefix)
 app.include_router(skus.router, prefix=app_settings.api_prefix)
 app.include_router(production_runs.router, prefix=app_settings.api_prefix)
 app.include_router(projects.router, prefix=app_settings.api_prefix)

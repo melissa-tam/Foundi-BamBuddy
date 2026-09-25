@@ -480,10 +480,12 @@ class FilaSwitchResponse(BaseModel):
 
 
 class EjectWatchInfo(BaseModel):
-    """In-flight eject cooldown watch summary (Phase 4.3c): the bed temperature
-    (°C) the server-side plate-clear gate releases at, and — since the cooldown
-    prep (2026-09-10) — the Z the plate is HELD at for the wait (None when the hold
-    was skipped or the model has no clearance numbers). Declared here because the
+    """In-flight eject cooldown watch summary (Phase 4.3c): the eject line (°C) the
+    watch armed with — measured shop air plus the one margin since 2026-09-25, None
+    when shop air was unknown (the watch still cools and releases on the bed's own air
+    or at its plateau) — and, since the cooldown prep (2026-09-10), the Z the plate is
+    HELD at for the wait (None when the hold was skipped or the model has no clearance
+    numbers). Declared here because the
     REST ``/status`` lane serialises through this model with ``extra="ignore"``
     while the WS lane dumps the same dict raw: a field missing here would flip the
     card's "plate raised" chip between the two lanes (the C5 class).
@@ -492,7 +494,7 @@ class EjectWatchInfo(BaseModel):
     on maintenance mode": the fans are already retired, so the hold flag and the watch's
     existence cannot tell that state from a cooldown still in progress."""
 
-    threshold_c: float
+    threshold_c: float | None = None
     hold_z: float | None = None
     deferred: bool = False
 

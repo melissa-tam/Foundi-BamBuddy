@@ -745,9 +745,9 @@ class TestUpgradeToForeignAutoEject:
         callback cannot wait on."""
         assert plate_occupancy.declare_occupied(21, Evidence()) is None
 
-        assert upgrade_to_foreign_auto_eject(21, profile_id=4, threshold_c=33.0) is True
+        assert upgrade_to_foreign_auto_eject(21, profile_id=4) is True
 
-        assert plate_occupancy.snapshot(21).plate_policy == ForeignAutoEject(profile_id=4, threshold_c=33.0)
+        assert plate_occupancy.snapshot(21).plate_policy == ForeignAutoEject(profile_id=4)
 
     def test_a_cleared_plate_refuses_the_promotion(self):
         """False means the authority refused ``not_occupied`` — an operator cleared
@@ -756,10 +756,10 @@ class TestUpgradeToForeignAutoEject:
         assert plate_occupancy.declare_occupied(22, Evidence()) is None
         assert plate_occupancy.clear_plate(22) is None
 
-        assert upgrade_to_foreign_auto_eject(22, profile_id=4, threshold_c=33.0) is False
+        assert upgrade_to_foreign_auto_eject(22, profile_id=4) is False
 
         assert plate_occupancy.snapshot(22).plate_policy is None
 
     def test_a_printer_that_never_had_a_plate_refuses_too(self):
-        assert upgrade_to_foreign_auto_eject(23, profile_id=4, threshold_c=33.0) is False
+        assert upgrade_to_foreign_auto_eject(23, profile_id=4) is False
         assert plate_occupancy.is_plate_occupied(23) is False

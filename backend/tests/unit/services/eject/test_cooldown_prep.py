@@ -54,9 +54,9 @@ MAX_Z = 50.1
 BBOX = ((10.0, 20.0, 300.0, 262.0), 1)
 # The operator's hold target, read from the schema so this suite cannot drift from it.
 HOLD_PART_TOP_DEFAULT = int(AppSettings.model_fields["farm_cooldown_hold_part_top_mm"].default)
-# The eject threshold the fleet runs (~2 °C above shop ambient) — and, since this wave,
-# the line the chamber lane steps its boost down at.
-THRESHOLD_C = 33.0
+# The eject line (measured shop air + the one margin, ``services/eject/shop_air``) — the
+# line the chamber lane steps its boost down at.
+LINE_C = 33.0
 # The fleet's model: a chamber fan AND a switchable duct.
 MODEL = "H2S"
 # No chamber fan at all (the open-frame family).
@@ -100,7 +100,6 @@ FANS_ON = _fans()
 def _profile(**overrides) -> EjectProfile:
     defaults = {
         "name": "single-pass-quarter-height",
-        "cooldown_temp_c": 33.0,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,
@@ -227,11 +226,11 @@ class _Env:
         self.hold_enabled = True
         self.hold_part_top_mm = HOLD_PART_TOP_DEFAULT
         # The other three inputs the watch resolves once and hands in: both fans, the
-        # printer's model (the chamber lane's capability gate) and the release
-        # threshold (the chamber lane's step-down line).
+        # printer's model (the chamber lane's capability gate) and the eject line (the
+        # chamber lane's step-down line).
         self.fans = FANS_ON
         self.model: str | None = MODEL
-        self.release_threshold_c = THRESHOLD_C
+        self.release_line_c: float | None = LINE_C
         self.refusal: str | None = None
         self.sessions = 0
         self.sleeps: list[float] = []
@@ -283,7 +282,7 @@ class _Env:
         queue_item_id: int | None = ITEM_ID,
         fans: CooldownFanSettings | None = None,
         model: str | None = _UNSET,  # type: ignore[assignment]
-        release_threshold_c: float | None = None,
+        release_line_c: float | None = _UNSET,  # type: ignore[assignment]
         held: bool = False,
         settle_s: float = 3.0,
     ):
@@ -292,7 +291,7 @@ class _Env:
             PRINTER_ID,
             queue_item_id=queue_item_id,
             fans=self.fans if fans is None else fans,
-            release_threshold_c=self.release_threshold_c if release_threshold_c is None else release_threshold_c,
+            release_line_c=self.release_line_c if release_line_c is _UNSET else release_line_c,
             model=self.model if model is _UNSET else model,
             hold_enabled=self.hold_enabled,
             hold_part_top_mm=self.hold_part_top_mm,
@@ -855,7 +854,7 @@ class TestCooldownFans:
             PRINTER_ID,
             queue_item_id=ITEM_ID,
             fans=FANS_ON,
-            release_threshold_c=THRESHOLD_C,
+            release_line_c=LINE_C,
             model=MODEL,
             hold_enabled=True,
             hold_part_top_mm=HOLD_PART_TOP_DEFAULT,
@@ -875,7 +874,7 @@ class TestCooldownFans:
             PRINTER_ID,
             queue_item_id=ITEM_ID,
             fans=_fans(aux_enabled=False, chamber_enabled=False),
-            release_threshold_c=THRESHOLD_C,
+            release_line_c=LINE_C,
             model=MODEL,
             hold_enabled=True,
             hold_part_top_mm=HOLD_PART_TOP_DEFAULT,
@@ -928,7 +927,7 @@ class TestBoost:
         prep.note_sample({"bed": 46.0, "chamber": 35.0})
         assert (prep.chamber_at_arm_c, prep.bed_at_arm_c) == (38.0, 61.0)  # the ARM reading, not the latest
 
-    async def test_no_step_while_the_chamber_is_above_the_threshold(self, env):
+    async def test_no_step_while_the_chamber_is_above_the_line(self, env):
         """The measured curve: the chamber air sat at 38 → 35 → 33 over 16.5 minutes,
         and the boost is exactly the part of the wait where it is still above the line."""
         prep = await env.begin()
@@ -939,7 +938,7 @@ class TestBoost:
         assert prep.boost_ended_at is None
         assert prep.lane("chamber").step is None
 
-    async def test_steps_on_the_first_sample_at_or_under_the_threshold(self, env, caplog):
+    async def test_steps_on_the_first_sample_at_or_under_the_line(self, env, caplog):
         with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
             prep = await env.begin()
             env.client.fans.clear()
@@ -949,7 +948,7 @@ class TestBoost:
         assert prep.lane("aux").step == "skipped:same"  # no step-down exists for that lane
         assert prep.boost_ended_at is not None
         assert len(_boost_lines(caplog)) == 1
-        assert "chamber=33.0 chamber_at_arm=33.0 bed=40.0 threshold=33.0" in _boost_lines(caplog)[0]
+        assert "chamber=33.0 chamber_at_arm=33.0 bed=40.0 line=33.0" in _boost_lines(caplog)[0]
 
     async def test_the_step_fires_exactly_once(self, env, caplog):
         """A stamp, not a comparison repeated every 20 s: the fan is already at its
@@ -963,7 +962,7 @@ class TestBoost:
         assert env.client.fans == []
         assert len(_boost_lines(caplog)) == 1
 
-    async def test_a_chamber_already_under_the_threshold_at_arm_steps_immediately(self, env, caplog):
+    async def test_a_chamber_already_under_the_line_at_arm_steps_immediately(self, env, caplog):
         """A restart re-arming late in a cooldown, or a shop cooler than the threshold:
         the exhaust's unique work is already done, and the log says ``after 0 s``
         rather than pretending a boost window happened."""
@@ -973,7 +972,31 @@ class TestBoost:
         assert prep.lane("chamber").step == "sent"
         assert "chamber boost ended after 0 s" in _boost_lines(caplog)[0]
 
-    async def test_a_chamber_that_never_reaches_the_threshold_never_steps(self, env, caplog):
+    async def test_an_unknown_line_never_steps_so_the_boost_runs_the_whole_wait(self, env, caplog):
+        """Shop air UNKNOWN hands the prep no line (``release_line_c=None``): there is
+        nothing to step down at, so even a chamber well under any plausible line keeps
+        the boost — the error runs toward MORE cooling, never toward a stall."""
+        with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
+            prep = await env.begin(release_line_c=None)
+            env.client.fans.clear()
+            for chamber in (30.0, 27.0, 25.0):
+                prep.note_sample({"bed": 40.0, "chamber": chamber})
+        assert env.client.fans == []
+        assert prep.boost_ended_at is None
+        assert prep.lane("chamber").step is None
+        assert _boost_lines(caplog) == []
+
+    async def test_the_step_follows_the_line_handed_in(self, env):
+        """The step is at the LINE the watch resolved — a 29.5 °C line (a cooler shop)
+        keeps boosting through a 30 °C chamber and steps at 29.5, not at any fixed number."""
+        prep = await env.begin(release_line_c=29.5)
+        env.client.fans.clear()
+        prep.note_sample({"bed": 40.0, "chamber": 30.0})
+        assert env.client.fans == []
+        prep.note_sample({"bed": 38.0, "chamber": 29.5})
+        assert env.client.fans == [(3, 50)]
+
+    async def test_a_chamber_that_never_reaches_the_line_never_steps(self, env, caplog):
         """Fail-open toward MORE cooling: the boost simply runs the whole wait."""
         with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):
             prep = await env.begin()

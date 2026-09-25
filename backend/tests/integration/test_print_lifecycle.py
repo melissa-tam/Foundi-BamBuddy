@@ -452,9 +452,10 @@ class TestPlateClearGate:
         # 3. Not the farm's own file → the plate keeps the ESCALATION-ONLY policy it was
         #    raised under: neither the queue-bound cooldown nor a foreign auto-eject.
         assert isinstance(_plate_policy(pid), EscalationOnly)
-        # 4. Foreign notification fired WITHOUT an auto-eject temperature (not the farm's file).
+        # 4. Foreign notification fired WITHOUT an auto-eject note (not the farm's file).
         env.notif.on_foreign_job_detected.assert_awaited()
-        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") is None
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject") is False
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("eject_line_c") is None
 
     @pytest.mark.asyncio
     async def test_foreign_terminal_not_gated_when_toggle_off_and_no_farm(self, test_engine):
@@ -500,17 +501,22 @@ class TestPlateClearGate:
     @pytest.mark.asyncio
     async def test_foreign_terminal_farm_file_arms_auto_eject(self, test_engine):
         """F5: a FOREIGN completion positively identified as the farm's OWN file arms
-        the AUTO foreign-eject watch (NOT escalation-only) and the notification names
-        the cooldown target. The farm queue stays untouched; the gate is still raised.
+        the AUTO foreign-eject watch (NOT escalation-only) and the notification quotes
+        the eject line from its one owner (``shop_air`` — the policy carries no temperature
+        since 2026-09-25). The farm queue stays untouched; the gate is still raised.
         Identification itself is unit-tested in test_manual; here the main.py wiring is
         exercised with identify_farm_file_foreign patched to a positive result."""
         from contextlib import ExitStack
         from unittest.mock import AsyncMock
 
         from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services.eject import shop_air
         from backend.app.services.eject.manual import ForeignFarmFile
 
         tasks_before = set(asyncio.all_tasks())
+        line = shop_air.EjectLine(
+            shop=shop_air.ShopAir(value_c=28.0, as_of=None, basis="fresh", printers=3), margin_c=2.0, line_c=30.0
+        )
 
         with ExitStack() as stack:
             env = self._setup_mocks(stack, test_engine)
@@ -518,9 +524,10 @@ class TestPlateClearGate:
             stack.enter_context(
                 patch(
                     "backend.app.services.eject.manual.identify_farm_file_foreign",
-                    AsyncMock(return_value=ForeignFarmFile(profile_id=7, threshold_c=33.0, print_name="Farm Widget")),
+                    AsyncMock(return_value=ForeignFarmFile(profile_id=7, print_name="Farm Widget")),
                 )
             )
+            stack.enter_context(patch.object(shop_air, "current_line", AsyncMock(return_value=line)))
 
             from backend.app.main import on_print_complete
 
@@ -549,11 +556,12 @@ class TestPlateClearGate:
         assert _occupancy().is_plate_occupied(pid)
         assert _occupancy().plate_source(pid) == "FOREIGN-9"
         # The escalation hold the gate went up under was UPGRADED to the AUTO foreign
-        # eject with the identified profile + threshold — not the queue-bound cooldown.
-        assert _plate_policy(pid) == ForeignAutoEject(profile_id=7, threshold_c=33.0)
-        # Notification fired naming the cooldown target °C.
+        # eject with the identified profile — and no temperature of its own.
+        assert _plate_policy(pid) == ForeignAutoEject(profile_id=7)
+        # Notification fired quoting the OWNER's eject line.
         env.notif.on_foreign_job_detected.assert_awaited()
-        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject_temp_c") == 33.0
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("auto_eject") is True
+        assert env.notif.on_foreign_job_detected.call_args.kwargs.get("eject_line_c") == 30.0
 
     @pytest.mark.asyncio
     async def test_genuine_foreign_terminal_still_calls_resolver(self, test_engine):

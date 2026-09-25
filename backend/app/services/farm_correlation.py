@@ -241,7 +241,7 @@ def terminal_disposition(
     )
 
 
-def upgrade_to_foreign_auto_eject(printer_id: int, profile_id: int, threshold_c: float) -> bool:
+def upgrade_to_foreign_auto_eject(printer_id: int, profile_id: int) -> bool:
     """Swap a foreign plate's escalation hold for an AUTO eject once it is identified.
 
     The foreign branch raises its gate SYNCHRONOUSLY under :class:`EscalationOnly` (a
@@ -255,9 +255,7 @@ def upgrade_to_foreign_auto_eject(printer_id: int, profile_id: int, threshold_c:
     ``not_occupied`` — an operator cleared the plate while we were identifying it, and
     an auto-eject onto a plate somebody already emptied is exactly what must not happen.
     """
-    return (
-        plate_occupancy.set_policy(printer_id, ForeignAutoEject(profile_id=profile_id, threshold_c=threshold_c)) is None
-    )
+    return plate_occupancy.set_policy(printer_id, ForeignAutoEject(profile_id=profile_id)) is None
 
 
 @dataclass(frozen=True)
@@ -536,7 +534,7 @@ async def resolve_item_donor(db: AsyncSession, item: PrintQueueItem) -> Dispatch
       ASYMMETRY: an archive cannot be deleted out from under a live queue row (the
       archive delete detaches its queue items — ``archive.py
       delete_related_queue_items`` — and the route refuses a printing row with a 409
-      via ``count_related_queue_items``), while a library row can be trashed and
+      via ``archive_delete_impact``), while a library row can be trashed and
       purged at any moment AND its SQLite rowid re-used by the next upload. On
       2026-09-17 that re-use pointed unit 2200's ``library_file_id`` at a stranger
       single-plate file and the eject was built from it (005-H2S, HMS ``0500_4003``).

@@ -68,10 +68,10 @@ async def test_sweep_start_frac_defaults_to_one(engine):
         await conn.execute(
             text(
                 "INSERT INTO eject_profiles "
-                "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
+                "(name, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
                 "eject_speed_mm_min, skim_speed_mm_min, max_part_height_mm) "
-                "VALUES ('migrated', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42)"
+                "VALUES ('migrated', 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42)"
             )
         )
     async with engine.connect() as conn:
@@ -97,10 +97,10 @@ async def test_final_skim_defaults_to_true(engine):
         await conn.execute(
             text(
                 "INSERT INTO eject_profiles "
-                "(name, cooldown_temp_c, clearance_mm, z_offset_mm, "
+                "(name, clearance_mm, z_offset_mm, "
                 "descent_steps, x_passes, x_margin_mm, front_overhang_mm, back_overhang_mm, "
                 "eject_speed_mm_min, skim_speed_mm_min, max_part_height_mm) "
-                "VALUES ('skimdefault', 28, 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42)"
+                "VALUES ('skimdefault', 10, 0.4, 4, 11, 3, 2, 2, 3000, 1500, 42)"
             )
         )
     async with engine.connect() as conn:
@@ -111,7 +111,8 @@ async def test_final_skim_defaults_to_true(engine):
 @pytest.mark.asyncio
 async def test_migration_drops_cooldown_retries(engine):
     """The eject is server-dispatched motion-only: run_migrations DROPs the legacy
-    cooldown_retries column (cooldown_temp_c stays as the release threshold)."""
+    cooldown_retries column. (The release temperature has since left the profile
+    altogether — the eject line is measured shop air, ``services/eject/shop_air``.)"""
     async with engine.connect() as conn:
         assert "cooldown_retries" in await _columns(conn)  # fixture seeded the legacy column
     async with engine.begin() as conn:
@@ -119,7 +120,6 @@ async def test_migration_drops_cooldown_retries(engine):
     async with engine.connect() as conn:
         cols = await _columns(conn)
     assert "cooldown_retries" not in cols  # dropped
-    assert "cooldown_temp_c" in cols  # release threshold retained
 
 
 @pytest.mark.asyncio

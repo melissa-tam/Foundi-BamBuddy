@@ -66,7 +66,6 @@ def _make_3mf(gcode=_PLATE_GCODE, plate_id=1, slice_info=None):
 def _profile(**overrides):
     defaults = {
         "name": "pp",
-        "cooldown_temp_c": 28.0,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,

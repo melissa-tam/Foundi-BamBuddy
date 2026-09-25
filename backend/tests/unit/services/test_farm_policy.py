@@ -2457,8 +2457,22 @@ class TestIdleDeepPark:
         assert client.sent == []
 
 
+def _fa_line(line_c: float | None, *, margin_c: float = 2.0):
+    """Pin the owner's CURRENT eject line (None = shop air unknown) for the FA gate."""
+    from backend.app.services.eject import shop_air
+
+    shop = (
+        shop_air.ShopAir.unknown()
+        if line_c is None
+        else shop_air.ShopAir(value_c=line_c - margin_c, as_of=None, basis="fresh", printers=3)
+    )
+    return patch.object(
+        shop_air, "current_line", new=AsyncMock(return_value=shop_air.EjectLine(shop, margin_c, line_c))
+    )
+
+
 class TestFaEjectCooldownGate:
-    """approve-with-remote-eject honours the release threshold: hot bed defers the
+    """approve-with-remote-eject honours the release predicate: hot bed defers the
     sweep (the motion-only file must not sweep a hot plate); cold bed dispatches
     immediately (old UX, incl. 409s); disconnected printer is a 409.
 
@@ -2493,7 +2507,8 @@ class TestFaEjectCooldownGate:
         with (
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(80.0)),
-            patch.object(monitor_mod, "_resolve_eject_threshold", new=AsyncMock(return_value=33.0)),
+            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            _fa_line(33.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
         ):
             await farm_policy._dispatch_remote_eject(db_session, batch, fa)
@@ -2515,7 +2530,8 @@ class TestFaEjectCooldownGate:
         with (
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(80.0)),
-            patch.object(monitor_mod, "_resolve_eject_threshold", new=AsyncMock(return_value=33.0)),
+            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            _fa_line(33.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
             pytest.raises(HTTPException) as exc,
         ):
@@ -2533,7 +2549,8 @@ class TestFaEjectCooldownGate:
         with (
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(30.5)),
-            patch.object(monitor_mod, "_resolve_eject_threshold", new=AsyncMock(return_value=33.0)),
+            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            _fa_line(33.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
         ):
             await farm_policy._dispatch_remote_eject(db_session, batch, fa)
@@ -2541,6 +2558,45 @@ class TestFaEjectCooldownGate:
         assert direct.await_args.kwargs["purpose"] == "fa"
         # The immediate path never swaps the policy — no deferred sweep was armed.
         assert isinstance(plate_occupancy.snapshot(printer.id).plate_policy, EscalationOnly)
+
+    async def test_the_gate_is_the_release_predicate_own_air_releases_under_a_low_line(self, db_session):
+        """THE predicate the watch uses (``shop_air.release_ok``): a 31 °C bed with its own
+        air at 29 + margin 2 goes NOW even though the fleet line is only 26 — the gate and
+        the automatic release cannot disagree (2026-09-25)."""
+        import backend.app.services.eject.monitor as monitor_mod
+
+        printer, batch, fa = await self._fa_fixture(db_session)
+        plate_occupancy.hydrate_plate(printer.id, "SUB-FA", EscalationOnly())
+        state = SimpleNamespace(connected=True, temperatures={"bed": 31.0, "chamber": 29.0})
+        with (
+            patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
+            patch.object(farm_policy.printer_manager, "get_status", return_value=state),
+            patch.object(farm_policy.printer_manager, "get_model", return_value="H2S"),
+            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            _fa_line(26.0),
+            patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
+        ):
+            await farm_policy._dispatch_remote_eject(db_session, batch, fa)
+        direct.assert_awaited_once()
+
+    async def test_the_same_bed_with_no_chamber_reading_defers_on_the_line(self, db_session):
+        """The liveness pair: without the own-air term the same 31 °C bed is above the 26
+        line, so the sweep is deferred to the FA cooldown watch."""
+        import backend.app.services.eject.monitor as monitor_mod
+
+        printer, batch, fa = await self._fa_fixture(db_session)
+        plate_occupancy.hydrate_plate(printer.id, "SUB-FA", EscalationOnly())
+        with (
+            patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
+            patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(31.0)),
+            patch.object(farm_policy.printer_manager, "get_model", return_value="H2S"),
+            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            _fa_line(26.0),
+            patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
+        ):
+            await farm_policy._dispatch_remote_eject(db_session, batch, fa)
+        direct.assert_not_awaited()
+        assert plate_occupancy.snapshot(printer.id).plate_policy == FirstArticleEject(unit_id=fa.id, run_id=batch.id)
 
     async def test_disconnected_printer_409s_up_front(self, db_session):
         printer, batch, fa = await self._fa_fixture(db_session)

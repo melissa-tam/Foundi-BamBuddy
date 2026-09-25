@@ -292,10 +292,13 @@ class FirstArticleEject:
 
 @dataclass(frozen=True)
 class ForeignAutoEject:
-    """A positively-identified farm-own file the farm did not dispatch: cooldown, then sweep."""
+    """A positively-identified farm-own file the farm did not dispatch: cooldown, then sweep.
+
+    No temperature: the watch arms with the same measured eject line as every other
+    (``services/eject/shop_air``), so a foreign plate cannot carry a second one.
+    """
 
     profile_id: int
-    threshold_c: float
 
 
 @dataclass(frozen=True)

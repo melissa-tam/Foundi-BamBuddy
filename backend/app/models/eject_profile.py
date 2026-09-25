@@ -25,12 +25,10 @@ class EjectProfile(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
 
-    # Server-side cooldown release threshold (°C). The eject sweep is now a
-    # SEPARATE server-dispatched motion-only job; the cooldown wait moved OUT of
-    # the G-code into the eject monitor, which holds the plate gate until the live
-    # bed_temper drops to this value, then dispatches the motion-only eject. No
-    # in-file `M190 R` loop exists anymore, so there is no retry count to store.
-    cooldown_temp_c: Mapped[float] = mapped_column(Float, default=28.0, nullable=False)
+    # There is no cooldown temperature here (2026-09-25, user ruling: ONE value). The
+    # eject line is MEASURED shop air plus one margin setting (``services/eject/shop_air``);
+    # the physical ``cooldown_temp_c`` column stays, nullable and unread, as the rollback
+    # half of an expand/contract retirement (``core.database._rebuild_column_nullable``).
 
     # Sweep geometry (mm).
     clearance_mm: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)

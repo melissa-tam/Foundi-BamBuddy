@@ -80,6 +80,7 @@ ID_REUSE_REASONED: dict[str, str] = {
     "project_bom_items": _NO_INBOUND + "BOM line items are a leaf",
     "recovery_escalation": _NO_INBOUND + "durable escalation rows are a leaf",
     "settings": _NO_INBOUND + "key/value rows read by key, never by id",
+    "shop_air_sample": _NO_INBOUND + "derived shop-air cache, rebuilt from sensor history; a leaf",
     "slot_preset_mappings": _NO_INBOUND + "per-slot preset mapping, a leaf",
     "slot_recheck_intent": _NO_INBOUND + "operator re-check intents are a leaf",
     "smart_plug_energy_snapshots": _NO_INBOUND + "append-only energy samples, a leaf",

@@ -744,6 +744,221 @@ class TestArchiveBindingOwnership:
         assert {shape for shape, _ in _scan_archive_started_at_writes(owner)} == {".values(started_at=...)"}
 
 
+# --- One archive per print ATTEMPT (2026-09-25) ------------------------------------------------
+#
+# A unit's ``archive_id`` (and its ``archive`` relationship) names the DONOR — the bytes and names it
+# prints FROM, which a retry inherits from its parent — never its own print record. The record is
+# ``print_binding.print_archive_of`` (and back, ``unit_of_print_archive``), by job identity.
+
+# Names a queue unit is bound to where this codebase reads its archive link. A receiver named
+# otherwise is not scanned; these are the spellings a new reader reaches for.
+_QUEUE_UNIT_RECEIVERS = frozenset(
+    {"PrintQueueItem", "item", "unit", "fa_item", "queue_item", "i", "it", "retry", "parent"}
+)
+_QUEUE_UNIT_LINKS = frozenset({"archive_id", "archive"})
+
+# Every reader of a unit's archive link, and the donor question it asks. A reader that wants the
+# unit's OWN print (its photo, its outcome, its charge context) belongs on print_archive_of instead.
+_DONOR_READERS: dict[tuple[str, str], str] = {
+    ("api/routes/print_queue.py", "_enrich_response"): "queue row display: source name, thumbnail, slicer data",
+    ("api/routes/print_queue.py", "add_to_queue"): "the new unit's source file name (relay + notification)",
+    ("api/routes/print_queue.py", "get_queue_item"): "eager-loads the source for _enrich_response",
+    ("api/routes/print_queue.py", "list_queue"): "eager-loads the source for _enrich_response",
+    ("api/routes/print_queue.py", "start_queue_item"): "eager-loads the source for the filament pre-check",
+    ("api/routes/webhook.py", "webhook_add_to_queue"): "echoes the source archive the caller queued",
+    ("api/routes/webhook.py", "webhook_get_queue_status"): "echoes each unit's source archive",
+    ("services/archive.py", "ArchiveService.soft_delete_archive"): "delete scope: the units printing FROM it",
+    ("services/archive.py", "archive_delete_impact"): "delete guard: the units printing FROM it",
+    ("services/eject/manual.py", "_farm_dispatched_names"): "the farm file-name corpus (source names)",
+    ("services/farm_correlation.py", "_item_names"): "the names a unit was dispatched under",
+    ("services/farm_correlation.py", "resolve_item_donor"): "THE donor resolver: the bytes a unit printed from",
+    ("services/farm_stall.py", "_job_name"): "a label for the stalled job (source name)",
+    ("services/filament_deficit.py", "_resolve_source_3mf"): "the source 3MF the deficit is computed from",
+    ("services/filament_deficit.py", "compute_deficit_for_queue_item"): "eager-loads the source 3MF",
+    ("services/print_binding.py", "_adopt"): "the adopt: binds the donor only while it never recorded a print",
+    ("services/print_binding.py", "adoptable_dispatch"): "the adopt's pre-check, same rule",
+    ("services/print_binding.py", "attach"): "the adopt step of the print-start binding",
+    ("services/print_scheduler.py", "PrintScheduler._get_filament_requirements"): "dispatch read: the source file",
+    ("services/print_scheduler.py", "PrintScheduler._get_job_name"): "dispatch read: the source name",
+    ("services/print_scheduler.py", "PrintScheduler._start_print"): "dispatch read: the bytes to upload",
+    ("services/print_scheduler.py", "PrintScheduler.check_queue"): "a log line naming each pending unit's source",
+    ("services/usb_storage.py", "_in_use_remote_names"): "file names on the printer's USB a live unit prints from",
+    ("services/user_deletion.py", "_destroy_owned_items"): "delete scope: the units printing FROM the user's archives",
+    ("services/user_deletion.py", "delete_impact"): "delete forecast over the same scope",
+}
+# Receivers that share a unit's name but are another model.
+_NOT_QUEUE_UNITS: dict[tuple[str, str], str] = {
+    ("api/routes/projects.py", "create_bom_item"): "item is a ProjectBOMItem",
+    ("api/routes/projects.py", "list_bom_items"): "item is a ProjectBOMItem",
+    ("api/routes/projects.py", "update_bom_item"): "item is a ProjectBOMItem",
+}
+
+# Attributes that carry a printer job id. Comparing two of them is the job-identity question, which
+# has three answers — ``job_identity.same_job``.
+_JOB_ID_ATTRS = frozenset({"subtask_id", "dispatch_subtask_id", "dispatch_subtask", "live_subtask"})
+_JOB_IDENTITY_OWNERS = frozenset(
+    {
+        ("services", "job_identity.py"),
+        ("services", "print_binding.py"),
+        ("services", "farm_correlation.py"),
+        ("services", "foreign_replay_repair.py"),
+    }
+)
+# Comparisons outside the owners, each a SQL filter or a question that is not "same job?".
+_JOB_ID_COMPARISONS: dict[tuple[str, str], str] = {
+    ("services/eject/donor.py", "GateSubtaskArchive.resolve"): "SQL filter: the archive a plate gate's stamp names",
+    ("services/eject/manual.py", "_resolve_manual_eject_item"): (
+        "the plate gate's stamp → its unit: a SQL filter plus a guard over two farm-minted ids "
+        "(eject/* is outside the 2026-09-25 capsule; print_binding.print_archive_of is the adoption path)"
+    ),
+    ("services/spool_recovery.py", "_resolve_farm_item"): "SQL filter: the unit an echoed job id names",
+    ("services/usage_tracker.py", "_resolve_run_item"): "SQL filter: tier 1, the unit the terminal's echo names",
+    ("services/print_scheduler.py", "PrintScheduler._watchdog_print_start"): (
+        "change detection of the printer's OWN echo across the dispatch (did it flip?), not two jobs compared"
+    ),
+    ("main.py", "_is_active_archive_stale"): (
+        "the downtime reconcile's staleness test — main.py is outside the 2026-09-25 capsule; the reconcile "
+        "judge in print_binding replaces it"
+    ),
+}
+
+
+def _scopes(tree: ast.Module) -> list[tuple[str, ast.AST]]:
+    """Every node with the qualified name of the def/class it sits in (``<module>`` at top level)."""
+    out: list[tuple[str, ast.AST]] = []
+
+    def walk(node: ast.AST, stack: tuple[str, ...]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                walk(child, (*stack, child.name))
+            else:
+                out.append((".".join(stack) or "<module>", child))
+                walk(child, stack)
+
+    walk(tree, ())
+    return out
+
+
+def _scan_queue_unit_archive_reads(py_file: Path) -> list[tuple[str, int]]:
+    """``(qualname, line)`` of every READ of a queue unit's ``archive_id`` / ``archive`` link.
+
+    Only modules that name ``PrintQueueItem`` are scanned: a module that never names the model does
+    not hold its rows under these receivers."""
+    text = py_file.read_text(encoding="utf-8")
+    if "PrintQueueItem" not in text:
+        return []
+    return [
+        (qual, node.lineno)
+        for qual, node in _scopes(ast.parse(text))
+        if isinstance(node, ast.Attribute)
+        and node.attr in _QUEUE_UNIT_LINKS
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in _QUEUE_UNIT_RECEIVERS
+    ]
+
+
+def _names_job_id(node: ast.expr) -> bool:
+    """Does this comparison operand spell a job id — the attribute itself, through a method chain
+    (``x.subtask_id.strip()``) or an ``or`` default (``(x.subtask_id or "")``)? A call to a FUNCTION
+    (``same_job(...)``) is the adopted form and does not count."""
+    if isinstance(node, ast.Attribute) and node.attr in _JOB_ID_ATTRS:
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return _names_job_id(node.func.value)
+    if isinstance(node, ast.BoolOp):
+        return any(_names_job_id(value) for value in node.values)
+    return False
+
+
+def _scan_job_id_comparisons(tree: ast.Module) -> list[tuple[str, int]]:
+    """``(qualname, line)`` of every ``==`` / ``!=`` whose operand is a job id."""
+    return [
+        (qual, node.lineno)
+        for qual, node in _scopes(tree)
+        if isinstance(node, ast.Compare)
+        and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops)
+        and any(_names_job_id(operand) for operand in (node.left, *node.comparators))
+    ]
+
+
+class TestPrintRecordResolution:
+    """One archive per print ATTEMPT (user ruling 2026-09-25). SOURCE pins, like their neighbours:
+    a unit's ``archive_id`` read as its print record is well-formed code every seeded test passes —
+    until the unit is a retry, whose ``archive_id`` is its FAILED parent's printed record (the
+    first-article approval showed the ancestor's photo; the usage context missed the retry and
+    raised ``MultipleResultsFound`` over the shared donor). And job identity has three answers, so a
+    second spelling of the comparison is how an id-less echo quietly becomes "the same job"."""
+
+    def test_a_unit_archive_link_is_read_only_as_the_donor(self):
+        known = _DONOR_READERS.keys() | _NOT_QUEUE_UNITS.keys()
+        strays = [
+            f"  - {'/'.join(_relative_parts(py_file))}:{line} ({qual})"
+            for py_file in get_python_files(BACKEND_DIR)
+            for qual, line in _scan_queue_unit_archive_reads(py_file)
+            if ("/".join(_relative_parts(py_file)), qual) not in known
+        ]
+        if strays:
+            pytest.fail(
+                "A queue unit's archive_id / archive is read by a function not on the donor allowlist:\n"
+                + "\n".join(strays)
+                + "\n\nThat link is the DONOR — the bytes the unit prints from, its parent's record for a "
+                "retry. The unit's own print is print_binding.print_archive_of(unit) (and back, "
+                "unit_of_print_archive). A genuine donor read goes on _DONOR_READERS with its reason."
+            )
+
+    def test_the_donor_allowlist_names_only_live_readers(self):
+        """The liveness half: an allowlist entry whose reader is gone would excuse the next one."""
+        live = {
+            ("/".join(_relative_parts(py_file)), qual)
+            for py_file in get_python_files(BACKEND_DIR)
+            for qual, _ in _scan_queue_unit_archive_reads(py_file)
+        }
+        stale = sorted((_DONOR_READERS.keys() | _NOT_QUEUE_UNITS.keys()) - live)
+        assert not stale, f"allowlisted archive-link readers that no longer read it: {stale}"
+
+    def test_job_identity_is_not_re_spelled(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} ({qual})"
+            for parts, tree in _app_trees()
+            if parts not in _JOB_IDENTITY_OWNERS
+            for qual, line in _scan_job_id_comparisons(tree)
+            if ("/".join(parts), qual) not in _JOB_ID_COMPARISONS
+        ]
+        if strays:
+            pytest.fail(
+                "A job id is compared with == / != outside the job-identity owners:\n"
+                + "\n".join(strays)
+                + "\n\nAsk job_identity.same_job (same / other / unknown) and decide what 'unknown' means "
+                "at the call site. A SQL filter goes on _JOB_ID_COMPARISONS with its reason."
+            )
+
+    def test_the_identity_allowlist_names_only_live_comparisons(self):
+        live = {
+            ("/".join(parts), qual)
+            for parts, tree in _app_trees()
+            if parts not in _JOB_IDENTITY_OWNERS
+            for qual, _ in _scan_job_id_comparisons(tree)
+        }
+        stale = sorted(_JOB_ID_COMPARISONS.keys() - live)
+        assert not stale, f"allowlisted job-id comparisons that no longer compare: {stale}"
+
+    def test_the_adopted_sites_ask_the_owner(self):
+        """The liveness half of the migration: the sites this wave moved really call the owner."""
+        from backend.app.services import dispatch_claim, incident_resolution, plate_occupancy_store, production_run
+
+        assert "print_archive_of" in _source_of(production_run.build_run_response)
+        assert "same_job" in _source_of(incident_resolution._same_job)  # noqa: SLF001
+        assert "same_job" in _source_of(dispatch_claim.judge)
+        assert "same_job" in _source_of(plate_occupancy_store._startup_policy)  # noqa: SLF001
+
+
+def _source_of(obj: object) -> str:
+    import inspect
+
+    return inspect.getsource(obj)
+
+
 def _scan_recovery_incident_constructions(py_file: Path) -> list[int]:
     """Every CONSTRUCTION of ``RecoveryIncident``, however the module was imported.
 
@@ -1713,3 +1928,223 @@ class TestLogErrorPatterns:
             client._process_message(msg)
 
         assert not capture_logs.has_errors(), f"Errors during MQTT processing:\n{capture_logs.format_errors()}"
+
+
+# --------------------------------------------------------------------------- #
+# The eject line has ONE owner (2026-09-25, services/eject/shop_air)
+# --------------------------------------------------------------------------- #
+_SHOP_AIR_OWNER = ("services", "eject", "shop_air.py")
+_SHOP_AIR_MIGRATION = ("core", "database.py")
+# The one-value ruling deleted these: the per-profile threshold, the per-run override, the
+# warn floor that policed a hand-typed line, and the two resolvers that read them.
+_DELETED_EJECT_LINE_NAMES = frozenset(
+    {
+        "cooldown_temp_c",
+        "cooldown_temp_c_override",
+        "farm_cooldown_warn_floor_c",
+        "resolve_cooldown_override",
+        "_resolve_eject_threshold",
+    }
+)
+# What only the owner may DEFINE: the qualification, the estimate, the line, the predicate.
+_SHOP_AIR_OWNED_DEFS = frozenset(
+    {"qualify", "estimate", "day_curve", "eject_line_c", "release_ok", "release_limit", "own_air_c", "current_line"}
+)
+# The readers, and the owner verbs each must reach THROUGH the module (liveness half).
+_SHOP_AIR_READERS: dict[tuple[str, ...], frozenset[str]] = {
+    ("services", "eject", "monitor.py"): frozenset({"arm_line", "release_ok", "own_air_c"}),
+    ("services", "eject", "manual.py"): frozenset({"current_line", "release_ok", "own_air_c"}),
+    ("services", "farm_policy.py"): frozenset({"current_line", "release_ok", "own_air_c"}),
+    ("main.py",): frozenset({"current_line", "note_reading", "prune"}),
+    ("api", "routes", "shop_air.py"): frozenset({"current_line"}),
+}
+_SHOP_AIR_VERBS = frozenset({"arm_line", "current_line", "release_ok", "release_limit", "own_air_c", "eject_line_c"})
+
+
+def _is_bare_string_statement(node: ast.AST) -> bool:
+    """A docstring (or any bare string statement): prose, where the rule is explained."""
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+
+def _scan_deleted_eject_line_names(py_file: Path) -> list[tuple[str, int]]:
+    """Every CODE reference to a deleted name — attribute, name, keyword, def, or a string
+    (SQL, a settings key) — skipping docstrings, which are where the history is told."""
+    import re
+
+    pattern = re.compile(r"\b(" + "|".join(sorted(_DELETED_EJECT_LINE_NAMES)) + r")\b")
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    prose = {id(node.value) for node in ast.walk(tree) if _is_bare_string_statement(node)}
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        name = None
+        if isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.Name):
+            name = node.id
+        elif isinstance(node, ast.keyword):
+            name = node.arg
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.alias):
+            name = node.asname or node.name.rsplit(".", 1)[-1]
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in prose:
+            match = pattern.search(node.value)
+            name = match.group(1) if match else None
+        if name in _DELETED_EJECT_LINE_NAMES:
+            hits.append((name, getattr(node, "lineno", 0)))
+    return hits
+
+
+def _shop_air_aliases(tree: ast.Module) -> set[str]:
+    """The local names a module binds to the shop_air MODULE (``import … as``, any scope)."""
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "backend.app.services.eject":
+            aliases |= {alias.asname or alias.name for alias in node.names if alias.name == "shop_air"}
+        elif isinstance(node, ast.Import):
+            aliases |= {
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "backend.app.services.eject.shop_air" and alias.asname
+            }
+    return aliases
+
+
+def _shop_air_calls(tree: ast.Module) -> tuple[set[str], list[tuple[str, int]]]:
+    """(owner verbs reached THROUGH the module, owner verbs imported or called bare)."""
+    aliases = _shop_air_aliases(tree)
+    through: set[str] = set()
+    bare: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            through.add(node.attr)
+        elif isinstance(node, ast.ImportFrom) and node.module == "backend.app.services.eject.shop_air":
+            bare += [(alias.name, node.lineno) for alias in node.names if alias.name in _SHOP_AIR_VERBS]
+    return through, bare
+
+
+def _scan_shop_air_sample_writes(py_file: Path) -> list[tuple[str, int]]:
+    """ORM constructions of a sample, Core writes of its table, and raw SQL writing it."""
+    import re
+
+    raw = re.compile(r"(insert\s+into|delete\s+from|update)\s+shop_air_sample\b", re.IGNORECASE)
+    tree = ast.parse(py_file.read_text(encoding="utf-8"))
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = _called_name(node.func)
+            if name == "ShopAirSample":
+                hits.append(("ShopAirSample()", node.lineno))
+            elif name in _TABLE_WRITE_VERBS and node.args and _called_name(node.args[0]) == "ShopAirSample":
+                hits.append((f"{name}(ShopAirSample)", node.lineno))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and raw.search(node.value):
+            hits.append(("raw SQL", node.lineno))
+    return hits
+
+
+class TestEjectLineOwnership:
+    """ONE eject line: measured shop air + one margin, owned by ``services/eject/shop_air``.
+
+    User ruling 2026-09-25: the per-profile ``cooldown_temp_c`` (33 °C on all three production
+    profiles), the per-run override and the warn floor that policed them are deleted — one
+    value, measured. These pins keep a second copy from growing back: no code names the
+    deleted fields, nothing but the owner derives a line or judges a release, every reader
+    reaches the owner by name, and the sample cache has one writer.
+    """
+
+    def test_nothing_references_the_deleted_fields_or_setting(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts == _SHOP_AIR_MIGRATION:
+                continue  # the expand/contract migration must name the physical columns
+            strays += [f"  - {'/'.join(parts)}:{line} {name}" for name, line in _scan_deleted_eject_line_names(py_file)]
+        if strays:
+            pytest.fail(
+                "A deleted eject-line name is back in backend/app:\n"
+                + "\n".join(strays)
+                + "\n\nThere is ONE eject line — measured shop air + farm_cooldown_margin_c — and it is "
+                "services/eject/shop_air's. The profile's cooldown_temp_c, the run override and the warn floor "
+                "were deleted by user ruling (2026-09-25); the physical columns stay only for the rollback build."
+            )
+
+    def test_the_deletion_scan_is_live(self):
+        """The migration still names the physical column it relaxes — proof the scan sees it."""
+        found = {name for name, _ in _scan_deleted_eject_line_names(BACKEND_DIR.joinpath(*_SHOP_AIR_MIGRATION))}
+        assert {"cooldown_temp_c", "farm_cooldown_warn_floor_c"} <= found
+
+    def test_only_the_owner_defines_the_line_and_the_predicate(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts == _SHOP_AIR_OWNER:
+                continue
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            strays += [
+                f"  - {'/'.join(parts)}:{node.lineno} def {node.name}"
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _SHOP_AIR_OWNED_DEFS
+            ]
+        if strays:
+            pytest.fail(
+                "A second definition of the eject line or its release predicate appeared:\n"
+                + "\n".join(strays)
+                + "\n\nThe qualification, the estimate, the line and release_ok live in services/eject/shop_air "
+                "alone; a reader imports them, it never re-derives them."
+            )
+        owner = ast.parse(BACKEND_DIR.joinpath(*_SHOP_AIR_OWNER).read_text(encoding="utf-8"))
+        defined = {n.name for n in ast.walk(owner) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        assert defined >= _SHOP_AIR_OWNED_DEFS, "the owner no longer defines what this pin protects"
+
+    def test_every_reader_reaches_the_owner_by_name(self):
+        """The watch, the manual and FA gates, the foreign page and the recorder reach the
+        line and the predicate through the ``shop_air`` module — never a bare import — so
+        every call site names its owner, and each still does (the liveness half)."""
+        problems: list[str] = []
+        for parts, verbs in _SHOP_AIR_READERS.items():
+            tree = ast.parse(BACKEND_DIR.joinpath(*parts).read_text(encoding="utf-8"))
+            through, _ = _shop_air_calls(tree)
+            missing = verbs - through
+            if missing:
+                problems.append(f"  - {'/'.join(parts)} no longer reaches shop_air.{sorted(missing)}")
+        for py_file in get_python_files(BACKEND_DIR):
+            _, bare = _shop_air_calls(ast.parse(py_file.read_text(encoding="utf-8")))
+            problems += [f"  - {'/'.join(_relative_parts(py_file))}:{line} imports {name} bare" for name, line in bare]
+        if problems:
+            pytest.fail("\n".join(problems))
+
+    def test_no_reader_carries_a_temperature_of_its_own(self):
+        """The foreign lane lost its threshold end to end; the watch and the prep take the
+        LINE (None when shop air is unknown), never a per-plate number."""
+        import dataclasses
+        import inspect
+
+        from backend.app.services.eject import cooldown_prep, monitor
+        from backend.app.services.eject.manual import ForeignFarmFile
+        from backend.app.services.farm_correlation import upgrade_to_foreign_auto_eject
+        from backend.app.services.plate_occupancy import ForeignAutoEject
+
+        assert [f.name for f in dataclasses.fields(ForeignAutoEject)] == ["profile_id"]
+        assert [f.name for f in dataclasses.fields(ForeignFarmFile)] == ["profile_id", "print_name"]
+        assert list(inspect.signature(upgrade_to_foreign_auto_eject).parameters) == ["printer_id", "profile_id"]
+        assert list(inspect.signature(monitor.watch_bed_and_clear).parameters)[1] == "line_c"
+        assert "release_line_c" in inspect.signature(cooldown_prep.begin).parameters
+        assert not hasattr(monitor.EjectCooldownMonitor, "active_watch")
+
+    def test_the_sample_cache_has_one_writer(self):
+        strays: list[str] = []
+        for py_file in get_python_files(BACKEND_DIR):
+            parts = _relative_parts(py_file)
+            if parts == _SHOP_AIR_OWNER:
+                continue
+            strays += [f"  - {'/'.join(parts)}:{line} {what}" for what, line in _scan_shop_air_sample_writes(py_file)]
+        if strays:
+            pytest.fail(
+                "shop_air_sample is written outside its owner:\n"
+                + "\n".join(strays)
+                + "\n\nIt is a derived cache over printer_sensor_history, written ONLY by services/eject/shop_air "
+                "(note_reading live, backfill at bootstrap — the migration calls backfill, it never writes rows). "
+                "A second writer is a second qualification rule."
+            )
+        owner = {what for what, _ in _scan_shop_air_sample_writes(BACKEND_DIR.joinpath(*_SHOP_AIR_OWNER))}
+        assert {"ShopAirSample()", "insert(ShopAirSample)", "delete(ShopAirSample)"} <= owner

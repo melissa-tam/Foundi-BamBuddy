@@ -23,7 +23,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import broadcast_production_run_changed
-from backend.app.models.archive import PrintArchive
 from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_batch import PrintBatch
@@ -251,7 +250,6 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
         status="active",
         sku_file_id=sku_file.id,
         target_units=data.target_units,
-        cooldown_temp_c_override=data.cooldown_temp_c_override,
         require_first_article=require_fa,
         first_article_state="pending_print" if require_fa else None,
         retry_max_per_unit=retry_max,
@@ -735,15 +733,19 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
             first_article_printer_id = fa_item.printer_id
             if fa_item.printer_id is not None:
                 first_article_printer_name = name_by_id.get(fa_item.printer_id)
-            if fa_item.archive_id is not None:
-                archive = await db.get(PrintArchive, fa_item.archive_id)
-                if archive is not None and archive.photos:
-                    # Mirror main.py's finish-photo selection: the capture path
-                    # appends the freshly-taken ``finish_*`` photo last, so the
-                    # newest finish photo is the last such entry.
-                    finish_photos = [p for p in archive.photos if isinstance(p, str) and p.startswith("finish_")]
-                    if finish_photos:
-                        first_article_photo_url = f"/api/v1/archives/{fa_item.archive_id}/photos/{finish_photos[-1]}"
+            # The photo of THIS attempt: a requeued first article (failure retry, refused plate,
+            # fault stop) carries its ancestor's printed archive as its DONOR, and approving from
+            # that would show the failed ancestor's part — so the record is resolved by identity.
+            from backend.app.services.print_binding import print_archive_of
+
+            archive = await print_archive_of(db, fa_item)
+            if archive is not None and archive.photos:
+                # Mirror main.py's finish-photo selection: the capture path
+                # appends the freshly-taken ``finish_*`` photo last, so the
+                # newest finish photo is the last such entry.
+                finish_photos = [p for p in archive.photos if isinstance(p, str) and p.startswith("finish_")]
+                if finish_photos:
+                    first_article_photo_url = f"/api/v1/archives/{archive.id}/photos/{finish_photos[-1]}"
 
     # Prefill values for "Run again" (Phase 5, F9): the eject profile and target
     # model are uniform across a run's items — take the first non-null; the
@@ -821,7 +823,6 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
         "retry_max_per_unit": run.retry_max_per_unit,
         "escalate_consecutive_failures": run.escalate_consecutive_failures,
         "eject_profile_id": prefill_eject_profile_id,
-        "cooldown_temp_c_override": run.cooldown_temp_c_override,
         "target_model": prefill_target_model,
         "target_printers": target_printers,
         "eta_seconds": eta_seconds,

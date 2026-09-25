@@ -1406,23 +1406,27 @@ async def _finalize_remote_eject(db: AsyncSession, run_id: int, printer_id: int)
 
 
 async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: PrintQueueItem | None) -> None:
-    """FA path: eject the first-article plate, honouring the cooldown threshold.
+    """FA path: eject the first-article plate, honouring the cooldown release.
 
     The eject file is MOTION-ONLY — the thermal wait that used to live in its
     G-code is now server policy — so an approval that lands while the bed is
-    still hot must NOT sweep immediately. Live bed already at/below the unit's
-    release threshold (the common case: the bed cooled during inspection) →
-    dispatch NOW through the shared ``eject_remote.dispatch_part_present_eject``
-    (dispatch errors surface to the operator as 409/502, exactly as before).
-    Bed still hot or unreadable → arm the FA cooldown watch, which dispatches
-    the same eject when the threshold is reached (plateau/cap policy applies);
-    the run stays ``awaiting_approval`` and the UI shows the cooldown phase.
+    still hot must NOT sweep immediately. The live bed judged by THE release
+    predicate (``shop_air.release_ok`` over the bed, its own chamber air and the
+    measured eject line — the same one the cooldown watch uses) says it may go
+    (the common case: the bed cooled during inspection) → dispatch NOW through the
+    shared ``eject_remote.dispatch_part_present_eject`` (dispatch errors surface to
+    the operator as 409/502, exactly as before). Bed still hot or unreadable → arm
+    the FA cooldown watch, which dispatches the same eject on the same predicate
+    (plateau/cap policy applies); the run stays ``awaiting_approval`` and the UI
+    shows the cooldown phase. A unit with no usable eject profile is dispatched
+    directly, and the dispatcher's own refusal reaches the operator.
 
     The plate-clear gate is NOT dropped here: it clears when the eject job's
     terminal arrives (``_finalize_remote_eject`` via ``on_terminal`` step 1).
     An unfinished eject is simply re-approvable, never a half state.
     """
-    from backend.app.services.eject.monitor import _resolve_eject_threshold
+    from backend.app.services.eject import shop_air
+    from backend.app.services.eject.monitor import _unit_releasable
 
     if fa_item is None or fa_item.printer_id is None:
         raise HTTPException(status_code=409, detail="First-article printer is unknown; cannot eject remotely")
@@ -1431,11 +1435,18 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
         # just exit "stale" with the operator none the wiser.
         raise HTTPException(status_code=409, detail="Printer is not connected; cannot eject remotely")
 
-    threshold = await _resolve_eject_threshold(fa_item.id, for_first_article=True)
+    releasable = await _unit_releasable(fa_item.id, for_first_article=True)
+    line = await shop_air.current_line(db)
     state = printer_manager.get_status(fa_item.printer_id)
-    bed = state.temperatures.get("bed") if state and getattr(state, "connected", False) else None
+    readable = state is not None and getattr(state, "connected", False)
+    bed = state.temperatures.get("bed") if readable else None
+    chamber = (
+        shop_air.own_air_c(state.temperatures, model=printer_manager.get_model(fa_item.printer_id))
+        if readable
+        else None
+    )
 
-    if threshold is not None and (bed is None or bed > threshold):
+    if releasable and not shop_air.release_ok(bed, chamber, line.line_c, line.margin_c):
         # Arm the deferred sweep by SWAPPING THE PLATE'S POLICY, not by spawning a
         # watch: the plate is what the FA part sits on, so the FA eject is a property
         # of that plate and the policy driver arms the watch off it. A re-approve while
@@ -1444,10 +1455,12 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
         refusal = plate_occupancy.set_policy(fa_item.printer_id, FirstArticleEject(unit_id=fa_item.id, run_id=run.id))
         if refusal is None:
             logger.info(
-                "farm_policy: FA eject for run %s deferred — bed %s > release %.1f°C; cooldown watch armed",
+                "farm_policy: FA eject for run %s deferred — bed %s not released (line %s, chamber %s); "
+                "cooldown watch armed",
                 run.id,
                 f"{bed:.1f}°C" if bed is not None else "unreadable",
-                threshold,
+                f"{line.line_c:.1f}°C" if line.line_c is not None else "unknown",
+                f"{chamber:.1f}°C" if chamber is not None else "none",
             )
             return
         # ``not_occupied``: the plate this approval would sweep is not gated (an

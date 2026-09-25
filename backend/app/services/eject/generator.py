@@ -1036,7 +1036,7 @@ def generate_eject_gcode(
 
     There is NO in-file cooldown wait: the bed-cooldown gate moved OUT of the
     G-code into the eject monitor, which holds the plate-clear gate until the live
-    ``bed_temper`` reaches the profile's ``cooldown_temp_c`` and only THEN dispatches
+    ``bed_temper`` meets the eject line (``services/eject/shop_air``) and only THEN dispatches
     this motion-only job. ``M140 S0`` (heater off) is still emitted defensively, as are
     the ``M106 P2 S0`` / ``M106 P3 S0`` pair that stops the cooldown fans the prep ran
     (aux and chamber exhaust); the old ``M190 R`` thermal wait is gone.
@@ -1146,7 +1146,7 @@ def generate_eject_gcode(
     # --- bed heater off, cooldown fans off --------------------------------
     # Command the bed heater off defensively. The cooldown WAIT is no longer in
     # the G-code — the eject monitor already held the plate gate until the live
-    # bed reached cooldown_temp_c before dispatching this motion-only job — so no
+    # bed met the eject line before dispatching this motion-only job — so no
     # M190 R loop is emitted here.
     #
     # The two fan lines stop the fans the cooldown prep runs during that wait: the

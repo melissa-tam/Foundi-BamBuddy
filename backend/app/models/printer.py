@@ -85,6 +85,11 @@ class Printer(Base):
     sensor_history: Mapped[list["PrinterSensorHistory"]] = relationship(
         back_populates="printer", cascade="all, delete-orphan"
     )
+    # The at-rest shop-air samples DERIVED from ``sensor_history`` go with it (FK
+    # enforcement is off on SQLite, so this cascade is what removes them).
+    shop_air_samples: Mapped[list["ShopAirSample"]] = relationship(
+        back_populates="printer", cascade="all, delete-orphan"
+    )
 
 
 from backend.app.models.ams_history import AMSSensorHistory  # noqa: E402
@@ -93,4 +98,5 @@ from backend.app.models.kprofile_note import KProfileNote  # noqa: E402
 from backend.app.models.maintenance import PrinterMaintenance  # noqa: E402
 from backend.app.models.notification import NotificationProvider  # noqa: E402
 from backend.app.models.printer_sensor_history import PrinterSensorHistory  # noqa: E402
+from backend.app.models.shop_air_sample import ShopAirSample  # noqa: E402
 from backend.app.models.smart_plug import SmartPlug  # noqa: E402

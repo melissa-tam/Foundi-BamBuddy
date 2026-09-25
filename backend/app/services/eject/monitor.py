@@ -6,12 +6,17 @@ The sweep is now a SEPARATE, server-dispatched motion-only job (print files ship
 unmodified). This monitor watches the printer's live ``bed_temper`` (via MQTT,
 through ``printer_manager``) and enacts the policy:
 
-- bed ≤ the release threshold → dispatch a part-present eject job (``on_release``);
+- the bed meets THE release predicate, :func:`shop_air.release_ok` — at or under the
+  eject line (MEASURED shop air + one margin, resolved once at arm), or within that
+  margin of its own chamber air → dispatch a part-present eject job (``on_release``);
 - the bed cooling PLATEAUS (cools < epsilon across two consecutive windows) →
-  either RELEASE (the bed equilibrated within the eject margin of the threshold —
-  an asymptotic settle just above ambient) or QUARANTINE with NO eject (genuinely
-  stuck hot, above threshold + margin);
-- still above threshold at a max-hold cap → dispatch the eject anyway.
+  either RELEASE (the bed settled within the plateau margin of its OWN chamber air —
+  a flat bed is at its floor) or QUARANTINE with NO eject (still hot relative to its
+  own air);
+- still unreleased at a max-hold cap → dispatch the eject anyway.
+
+The line is :mod:`~backend.app.services.eject.shop_air`'s, never this module's: there is
+no per-profile or per-run temperature any more (2026-09-25, user ruling: ONE value).
 
 The monitor NO LONGER clears the plate gate: the gate drops only when the eject
 job's own terminal arrives (matched by subtask echo in ``farm_policy.on_terminal``).
@@ -21,8 +26,8 @@ as an unreadable bed and the watch keeps polling; it ends when the gate clears
 (the eject terminal or an operator) or on a bounded stop (plateau / cap / release).
 
 Identity (Phase 1): the watch is armed only with a positively correlated
-``queue_item_id`` and resolves its release threshold + eject target from THAT item —
-never from "the most recently started print on the printer" (S4/P1-A). A terminal
+``queue_item_id`` and resolves whether it may auto-eject — and its eject target — from
+THAT item, never from "the most recently started print on the printer" (S4/P1-A). A terminal
 we cannot attribute, and a gate whose persisted source we cannot tie to the eject
 job on restart, never auto-eject — they wait for a human.
 ``watch_gate_escalation_only`` covers the foreign-deposit case: it holds the gate
@@ -59,7 +64,7 @@ from sqlalchemy import select
 from backend.app.core.tasks import spawn_background_task
 from backend.app.schemas.settings import AppSettings
 from backend.app.services import printer_incidents
-from backend.app.services.eject import cooldown_prep, remote as eject_remote
+from backend.app.services.eject import cooldown_prep, remote as eject_remote, shop_air
 from backend.app.services.eject.cooldown_prep import WatchVerdict
 from backend.app.services.hms_errors import summary_of
 from backend.app.services.plate_occupancy import (
@@ -92,16 +97,21 @@ class _ArmedWatch:
 
     ``release_now`` is the manual-release channel for the three RELEASING policies
     (cooldown / FA / foreign auto); an escalation-only hold has none, and
-    ``request_release_now`` answers False for it. ``threshold_c`` is filled in by the
-    watch task once it resolves — it is what the UI's ``eject_watch`` payload renders,
-    and it stays None for an escalation-only hold and while a threshold is resolving.
+    ``request_release_now`` answers False for it. ``cooling`` and ``line_c`` are filled
+    in by the watch task once it has resolved its eject line — together they are what
+    the UI's ``eject_watch`` payload renders (:meth:`EjectCooldownMonitor.cooling_watch`).
+    ``cooling`` stays False for an escalation-only hold and while the line is resolving;
+    ``line_c`` may stay None on a cooling watch, because shop air can be UNKNOWN, and a
+    cooldown with no line is still a cooldown (it releases on the bed's own air or at its
+    plateau).
     """
 
     policy: OccupancyPolicy
     task: asyncio.Task
     queue_item_id: int | None = None
     release_now: asyncio.Event | None = None
-    threshold_c: float | None = field(default=None)
+    cooling: bool = False
+    line_c: float | None = field(default=None)
     # The Z the cooldown hold parked this printer's plate at, written ONCE by the
     # watch task and only when its hold was actually SENT (``cooldown_prep``). The
     # one store behind both consumers — ``hold_z()`` → the status payload → the printer
@@ -131,19 +141,31 @@ class _ArmedWatch:
     deferred: bool = False
 
 
+@dataclass(frozen=True)
+class CoolingWatch:
+    """A releasing watch that is COOLING, as its readers see it.
+
+    Its existence is the fact ("this plate is on its way down"); ``line_c`` is the eject
+    line the watch armed with, None when shop air was unknown at arm.
+    """
+
+    line_c: float | None
+
+
 # Fallbacks for direct watch_bed_and_clear callers (tests / manual arms) — derived
 # from the settings schema so the defaults have exactly one declared origin.
 _STALL_EPSILON_FALLBACK = float(AppSettings.model_fields["farm_cooldown_stall_epsilon_c"].default)
 _PLATEAU_MARGIN_FALLBACK = float(AppSettings.model_fields["farm_cooldown_plateau_eject_margin_c"].default)
+_MARGIN_FALLBACK = float(AppSettings.model_fields["farm_cooldown_margin_c"].default)
 
 # Terminal statuses that mean the eject sweep ran to completion. Only these
 # auto-release the plate-clear gate; everything else leaves it set.
 _SUCCESS_TERMINAL = {"completed"}
 
-# Watch bounds. Cooldown from print temp to the release threshold can take a
-# while, so each tick re-reads the live MQTT bed temp.
+# Watch bounds. Cooldown from print temp to the eject line can take a while, so
+# each tick re-reads the live MQTT bed temp.
 _CHECK_INTERVAL_S = 20
-# Escalation, not a stop: if the bed is still above threshold after this long we
+# Escalation, not a stop: if the bed is still unreleased after this long we
 # warn + notify ONCE (the dedicated cooldown_escalation event — NOT plate_not_empty),
 # then keep polling. The watch exits on eject dispatch ("released"), a cooling
 # plateau / triple dispatch failure ("stalled"), or the plate-clear gate being
@@ -197,17 +219,17 @@ async def notify_plate_not_empty(printer_id: int, *, source_detail: str = "") ->
 
 
 async def _default_notify_cooldown_escalation(
-    printer_id: int, *, bed_c: float | None, threshold_c: float, max_hold_s: int
+    printer_id: int, *, bed_c: float | None, line_c: float | None, max_hold_s: int
 ) -> None:
     """Fire the dedicated cooldown-escalation notification for a long-running cooldown.
 
-    The cooldown watch's escalation means "the bed has not reached the release
-    threshold yet", NOT "objects on the plate" — so it uses the truthful
-    ``cooldown_escalation`` event, never ``plate_not_empty``. ``bed_c`` is the live
-    bed at fire time (None if unreadable that tick); ``max_hold_s`` is converted to
-    the minute-valued cap for the message (0 → "no cap"). Opens its own session
-    (mirroring the rest of this module); callers wrap it so a notification failure
-    never kills the watch.
+    The cooldown watch's escalation means "the bed has not been released yet", NOT
+    "objects on the plate" — so it uses the truthful ``cooldown_escalation`` event,
+    never ``plate_not_empty``. ``bed_c`` is the live bed at fire time (None if
+    unreadable that tick); ``line_c`` the eject line the watch armed with (None when
+    shop air was unknown); ``max_hold_s`` is converted to the minute-valued cap for the
+    message (0 → "no cap"). Opens its own session (mirroring the rest of this module);
+    callers wrap it so a notification failure never kills the watch.
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -220,7 +242,7 @@ async def _default_notify_cooldown_escalation(
             printer_id,
             printer_name,
             bed_c=bed_c,
-            threshold_c=threshold_c,
+            line_c=line_c,
             max_hold_minutes=(max_hold_s // 60) if max_hold_s else 0,
             db=db,
         )
@@ -261,8 +283,10 @@ async def _hold_for_human(printer_id: int, exc: eject_remote.EjectDispatchError,
 
 async def watch_bed_and_clear(
     printer_id: int,
-    threshold_c: float,
+    line_c: float | None,
     *,
+    margin_c: float = _MARGIN_FALLBACK,
+    model: str | None = None,
     manager=printer_manager,
     escalate_s: int = _WATCH_ESCALATE_S,
     check_interval_s: int = _CHECK_INTERVAL_S,
@@ -285,19 +309,29 @@ async def watch_bed_and_clear(
     server-dispatched eject job's terminal arrives. Instead, on the release/stall
     conditions below it invokes the injected coroutines and returns a verdict:
 
-    * ``"released"`` — the bed reached ``threshold_c`` (or the ``max_hold_s`` cap
-      forced it while still hot; or a plateau settled WITHIN ``plateau_eject_margin_c``
-      of the threshold — the bed equilibrated just above ambient): ``on_release()``
-      was awaited to dispatch the part-present eject. If ``on_release`` raises it is
-      retried on the next poll; after THREE consecutive dispatch failures the watch
-      falls to the stall path (``on_stall("eject dispatch failed ×3")``) and returns
-      ``"stalled"`` instead.
+    * ``"released"`` — the bed met :func:`shop_air.release_ok` on this tick: at or under
+      ``line_c`` (the eject line, resolved once at arm; None when shop air was unknown),
+      or within ``margin_c`` of the printer's OWN chamber air (read every tick, only on a
+      ``model`` with a real chamber sensor). Or the ``max_hold_s`` cap forced it while
+      still hot; or a plateau settled WITHIN ``plateau_eject_margin_c`` of its own air
+      (the bed equilibrated). ``on_release()`` was awaited to dispatch the part-present
+      eject. If ``on_release`` raises it is retried on the next poll; after THREE
+      consecutive dispatch failures the watch falls to the stall path
+      (``on_stall("eject dispatch failed ×3")``) and returns ``"stalled"`` instead.
     * ``"stalled"`` — the bed cooling PLATEAUED while still MORE than
-      ``plateau_eject_margin_c`` above the threshold (genuinely stuck hot): across
-      two consecutive ``stall_window_s`` windows it failed to cool by at least
+      ``plateau_eject_margin_c`` above its own chamber air (genuinely stuck hot):
+      across two consecutive ``stall_window_s`` windows it failed to cool by at least
       ``stall_epsilon_c`` (a rise counts as a strike). ``on_stall(reason)`` was
       awaited; the plate gate is left SET. Skipped entirely when
       ``stall_window_s == 0`` or ``on_stall`` is None; a None bed reading never strikes.
+
+    **The plateau reads the bed's OWN air (2026-09-25).** A plateaued bed is compared
+    with its own chamber reading, never with the fleet line, so a low shop-air estimate
+    can never quarantine a healthy printer — only a bed still hot relative to the air it
+    sits in is a stall. A model with no chamber sensor falls back to the line; with
+    neither, a plateaued bed releases, because a flat bed is at its floor. The 7-day
+    production replay put 61 cooldowns on the plateau path under the old 33 °C line and
+    32 under this rule (``shop_air`` module docstring).
     * ``"cleared"`` — the plate-clear gate was cleared mid-watch (the eject job's own
       terminal, or an operator): the phase is over, so the watch exits WITHOUT
       dispatching (never ejects onto an already-cleared plate).
@@ -310,7 +344,7 @@ async def watch_bed_and_clear(
     and re-anchored whenever a window DID cool by ≥ epsilon. At a boundary that is
     both a plateau boundary and the cap, the plateau is evaluated FIRST.
 
-    Escalation is unchanged in timing: still above ``threshold_c`` after
+    Escalation is unchanged in timing: still unreleased after
     ``escalate_s`` fires ONE ``notify`` (the ``cooldown_escalation`` event, NOT
     plate_not_empty; failures tolerated) with the live bed, then keeps polling.
     ``on_sample`` is handed the live ``temperatures`` map on every tick the state was
@@ -332,7 +366,7 @@ async def watch_bed_and_clear(
     direct caller and every test that does not pass it gets), and its answer decides only
     whether a release is PERMITTED:
 
-    * threshold, near-threshold plateau and the max-hold cap all still DECIDE; while held
+    * the release predicate, near-equilibrium plateau and the max-hold cap all still DECIDE; while held
       they withhold instead of dispatching — one INFO line, ``on_cooldown_over(cause)``
       (the watch's own retirement of the cooldown actuators: the part is cool, so the fans
       have finished their work) and a watch that keeps polling;
@@ -356,10 +390,10 @@ async def watch_bed_and_clear(
     consume the page while nobody could be told.
     """
     if notify is None:
-        # The escalation means "bed never reached the release threshold", NOT
-        # "objects detected" — fire the dedicated cooldown_escalation event with
-        # the live bed at fire time (bound below).
-        notify = functools.partial(_default_notify_cooldown_escalation, threshold_c=threshold_c, max_hold_s=max_hold_s)
+        # The escalation means "the bed has not been released", NOT "objects
+        # detected" — fire the dedicated cooldown_escalation event with the live bed
+        # at fire time (bound below).
+        notify = functools.partial(_default_notify_cooldown_escalation, line_c=line_c, max_hold_s=max_hold_s)
 
     plateau_enabled = stall_window_s > 0 and on_stall is not None
     elapsed = 0  # wall time: drives the plateau windows, accrues under a hold too
@@ -379,7 +413,7 @@ async def watch_bed_and_clear(
         to "the part is cool but hands may be in the machine": the thermal half of the
         wait is finished, so ``on_cooldown_over`` retires the actuators (fans off, no
         second summary), and the release half waits for the hold to lift. Later calls in
-        the same episode are no-ops, so a bed that keeps meeting the threshold logs once
+        the same episode are no-ops, so a bed that keeps meeting its release logs once
         rather than every 20 s.
         """
         nonlocal deferred
@@ -480,7 +514,7 @@ async def watch_bed_and_clear(
 
         # W2: an operator "Eject now" during an armed watch sets release_now → sweep
         # immediately through the SAME _do_release path (no parallel dispatch race),
-        # bypassing the cooldown threshold. The hot-bed allowance is enforced upstream
+        # bypassing the release predicate. The hot-bed allowance is enforced upstream
         # in the manual-eject service before the event is ever set. Deliberately NOT
         # gated by the hold: every manual verb stays live under maintenance mode, and a
         # click that raised this event IS the human the hold defers to.
@@ -496,8 +530,12 @@ async def watch_bed_and_clear(
         # polling. Its lifetime is the gated phase (above), not connectivity.
         if not state or not getattr(state, "connected", False):
             bed_temp = None
+            chamber_c = None
         else:
             bed_temp = state.temperatures.get("bed")
+            # The bed's OWN air, from the same reading — the release predicate's second
+            # term and the plateau's reference. None on a model without a real sensor.
+            chamber_c = shop_air.own_air_c(state.temperatures, model=model)
             if on_sample is not None and not deferred:
                 # THIS poll is the whole sampling story: the cooldown prep's chamber
                 # boost ends off the same reading that decides the release, so there is
@@ -517,34 +555,44 @@ async def watch_bed_and_clear(
             # decide is the release, and that waits for the hold. The gate check, the
             # manual check and the state read above are the whole tick.
             pass
-        elif bed_temp is not None and bed_temp <= threshold_c:
+        elif shop_air.release_ok(bed_temp, chamber_c, line_c, margin_c):
             if anchor is None:
                 anchor = bed_temp
+            # Which term fired, for the log and the cause: the fleet line, or the bed's
+            # own air plus the margin (``release_ok`` is True, so a limit exists).
+            limit = shop_air.release_limit(line_c, chamber_c, margin_c)
             if release_permitted:
                 logger.info(
-                    "Eject monitor: printer %s bed %.1f°C ≤ %.1f°C — dispatching part-present eject",
+                    "Eject monitor: printer %s bed %.1f°C ≤ %.1f°C (%s; line %s, chamber %s, margin %.1f°C) — "
+                    "dispatching part-present eject",
                     printer_id,
                     bed_temp,
-                    threshold_c,
+                    limit.value_c,
+                    limit.term,
+                    _c(line_c),
+                    _c(chamber_c),
+                    margin_c,
                 )
-                outcome = await _do_release("threshold")
+                outcome = await _do_release(limit.term)
                 if outcome != "retry":
                     return outcome
             else:
-                _withhold("threshold")
+                _withhold(limit.term)
         else:
             if anchor is None and bed_temp is not None:
                 anchor = bed_temp
-            # Still above threshold (or unreadable). Escalate-once, then evaluate
-            # the plateau watchdog and finally the max-hold cap.
+            # Still unreleased (or unreadable). Escalate-once, then evaluate the
+            # plateau watchdog and finally the max-hold cap.
             if release_permitted and not escalated and waited >= escalate_s:
                 escalated = True
                 logger.warning(
-                    "Eject monitor: printer %s bed still above %.1f°C after %ss — escalating "
-                    "(cooldown running long), watch continues",
+                    "Eject monitor: printer %s bed %s still unreleased after %ss (line %s, chamber %s) — "
+                    "escalating (cooldown running long), watch continues",
                     printer_id,
-                    threshold_c,
+                    _c(bed_temp),
                     escalate_s,
+                    _c(line_c),
+                    _c(chamber_c),
                 )
                 try:
                     await notify(printer_id, bed_c=bed_temp)
@@ -559,39 +607,42 @@ async def watch_bed_and_clear(
                     if anchor - bed_temp < stall_epsilon_c:  # < epsilon (a rise → negative → strikes)
                         strikes += 1
                         if strikes >= 2:
-                            # Two-armed plateau: a bed that asymptotically settles just
-                            # above the threshold (within the eject margin) has reached
-                            # ambient — RELEASE it, don't quarantine. Only a bed still
-                            # genuinely hot (> threshold + margin) is a real stall.
-                            if bed_temp <= threshold_c + plateau_eject_margin_c:
+                            # Two-armed plateau: a bed that has stopped cooling within the
+                            # plateau margin of its OWN air has reached its floor — RELEASE
+                            # it, don't quarantine. Only a bed still genuinely hot relative
+                            # to the air it sits in is a real stall.
+                            reference, reference_c = _plateau_reference(chamber_c, line_c)
+                            if reference_c is None or bed_temp <= reference_c + plateau_eject_margin_c:
                                 if release_permitted:
                                     logger.warning(
-                                        "Eject monitor: printer %s cooling plateaued at %.1f°C, within %.1f°C of the "
-                                        "%.1f°C threshold — releasing (near-threshold equilibrium), NO quarantine",
+                                        "Eject monitor: printer %s cooling plateaued at %.1f°C, within %.1f°C of its "
+                                        "%s (%s) — releasing (equilibrium), NO quarantine",
                                         printer_id,
                                         bed_temp,
                                         plateau_eject_margin_c,
-                                        threshold_c,
+                                        reference,
+                                        _c(reference_c),
                                     )
-                                    outcome = await _do_release("plateau_near_threshold")
+                                    outcome = await _do_release("plateau_equilibrium")
                                     if outcome != "retry":
                                         return outcome
                                     # dispatch failed (< 3 so far) — keep polling; the
                                     # next boundary re-strikes and retries the release.
                                 else:
-                                    # Equilibrated at ambient under a hold: the cooling
-                                    # is genuinely finished, so the fans stop — the
-                                    # sweep is the only half that waits.
-                                    _withhold("plateau_near_threshold")
+                                    # Equilibrated under a hold: the cooling is genuinely
+                                    # finished, so the fans stop — the sweep is the only
+                                    # half that waits.
+                                    _withhold("plateau_equilibrium")
                             elif release_permitted:
                                 logger.warning(
                                     "Eject monitor: printer %s cooling plateaued (<%.2f°C over 2 windows) and bed "
-                                    "%.1f°C is still >%.1f°C above the %.1f°C threshold — quarantining, NO eject",
+                                    "%.1f°C is still >%.1f°C above its %s (%.1f°C) — quarantining, NO eject",
                                     printer_id,
                                     stall_epsilon_c,
                                     bed_temp,
                                     plateau_eject_margin_c,
-                                    threshold_c,
+                                    reference,
+                                    reference_c,
                                 )
                                 try:
                                     await on_stall(
@@ -609,13 +660,14 @@ async def watch_bed_and_clear(
                                 # farm's own deferral. Warn, retire the cooldown, wait.
                                 logger.warning(
                                     "Eject monitor: printer %s cooling plateaued (<%.2f°C over 2 windows) and bed "
-                                    "%.1f°C is still >%.1f°C above the %.1f°C threshold — no quarantine, printer in "
+                                    "%.1f°C is still >%.1f°C above its %s (%.1f°C) — no quarantine, printer in "
                                     "maintenance mode",
                                     printer_id,
                                     stall_epsilon_c,
                                     bed_temp,
                                     plateau_eject_margin_c,
-                                    threshold_c,
+                                    reference,
+                                    reference_c,
                                 )
                                 _withhold("plateau_hot")
                     else:
@@ -625,12 +677,13 @@ async def watch_bed_and_clear(
             if max_hold_s > 0 and waited >= max_hold_s and bed_temp is not None:
                 if release_permitted:
                     logger.warning(
-                        "Eject monitor: printer %s still %.1f°C above %.1f°C at the %ss max-hold cap — "
-                        "dispatching eject anyway",
+                        "Eject monitor: printer %s bed %.1f°C still unreleased at the %ss max-hold cap (line %s, "
+                        "chamber %s) — dispatching eject anyway",
                         printer_id,
                         bed_temp,
-                        threshold_c,
                         max_hold_s,
+                        _c(line_c),
+                        _c(chamber_c),
                     )
                     outcome = await _do_release("max_hold_cap")
                     if outcome != "retry":
@@ -652,6 +705,27 @@ async def watch_bed_and_clear(
             # Charged to the HUMAN's clock, not the farm's: this interval was one the
             # farm was not allowed to act in.
             held_s += check_interval_s
+
+
+def _c(value: float | None) -> str:
+    """A temperature for a log line, or ``none``."""
+    return "none" if value is None else f"{value:.1f}°C"
+
+
+def _plateau_reference(chamber_c: float | None, line_c: float | None) -> tuple[str, float | None]:
+    """What a PLATEAUED bed is compared with: its own air, else the line, else nothing.
+
+    The bed's own chamber reading when the model has a real sensor — a bed can never go
+    below the air it sits in, so a flat bed within the plateau margin of it is AT its floor,
+    whatever the fleet estimate says. The eject line on a model without a chamber sensor
+    (today's behaviour there). Neither — shop air unknown on a sensorless model — returns
+    None, and a plateaued bed then releases: flat is the floor.
+    """
+    if chamber_c is not None:
+        return "own chamber air", chamber_c
+    if line_c is not None:
+        return "eject line", line_c
+    return "floor (no chamber reading, no eject line)", None
 
 
 def escalation_sentence(*, farm_source: bool, refusal: PlateRefusal | None) -> str:
@@ -781,43 +855,33 @@ def should_rearm(
     return bool(awaiting_plate_clear) and item_status == "completed" and eject_profile_id is not None
 
 
-async def _resolve_eject_threshold(queue_item_id: int, *, for_first_article: bool = False) -> float | None:
-    """Return the eject cooldown threshold for the queue item that raised the gate,
-    or None if that item did not use an eject profile (nothing to auto-clear).
+async def _unit_releasable(queue_item_id: int, *, for_first_article: bool = False) -> bool:
+    """May the queue item that raised the gate be swept off automatically?
 
-    Resolved from the SPECIFIC item bound to this watch (``db.get``) — not the most
-    recently started item on the printer — so a foreign/local print that finished
-    after the farm unit can never lend its threshold to the wrong plate (S4/P1-A).
+    True only when that SPECIFIC item (``db.get``, never "the most recently started item
+    on the printer" — S4/P1-A) still exists and carries an eject profile that still
+    exists. The temperature it waits for is NOT an item fact any more (2026-09-25, user
+    ruling: ONE value — :mod:`~backend.app.services.eject.shop_air` owns the line), so
+    this answers only the identity half the old threshold resolver also answered.
 
-    The run-level ``PrintBatch.cooldown_temp_c_override`` wins over the profile's
-    ``cooldown_temp_c`` — the single release-threshold precedence shared by the
-    whole server-side eject policy.
-
-    ``for_first_article=False`` (production watch) resolves FA items to None: a
+    ``for_first_article=False`` (production watch) answers False for an FA item: a
     finished first article holds for operator approval, never auto-ejects.
-    ``for_first_article=True`` is the approve-with-remote-eject path, where the
-    operator HAS approved — the FA guard is skipped so the approved plate gets a
-    real threshold for its deferred (cooldown-gated) eject."""
+    ``for_first_article=True`` is the approve-with-remote-eject path, where the operator
+    HAS approved, so the FA guard is skipped for its deferred (cooldown-gated) eject."""
     from backend.app.core.database import async_session
     from backend.app.models.eject_profile import EjectProfile
     from backend.app.models.print_queue import PrintQueueItem
-    from backend.app.services.eject.dispatch import resolve_cooldown_override
 
     async with async_session() as db:
         item = await db.get(PrintQueueItem, queue_item_id)
         if item is None or item.eject_profile_id is None:
-            return None
+            return False
         # First-article items carry an eject profile but must hold on the plate
         # for inspection — the production watch must NOT auto-eject them. Only
-        # the explicit post-approval FA path may resolve their threshold.
+        # the explicit post-approval FA path may release them.
         if getattr(item, "first_article", False) and not for_first_article:
-            return None
-
-        profile = await db.get(EjectProfile, item.eject_profile_id)
-        if profile is None:
-            return None
-        override = await resolve_cooldown_override(db, item.batch_id)
-        return override if override is not None else profile.cooldown_temp_c
+            return False
+        return await db.get(EjectProfile, item.eject_profile_id) is not None
 
 
 async def _setting_num(db, key: str, default, cast):
@@ -903,8 +967,8 @@ async def _resolve_stall_settings() -> CooldownWatchSettings:
     defaults (the single origin — no mirrored literals here). Minute-valued
     settings are converted to seconds. ``window == 0`` disables the plateau
     watchdog; ``max_hold == 0`` disables the cap. ``plateau_eject_margin_c`` is the
-    °C-above-threshold band inside which a plateaued bed is RELEASED rather than
-    quarantined (equilibrated at ambient). The five fan settings are
+    °C band above its OWN chamber air inside which a plateaued bed is RELEASED rather
+    than quarantined (equilibrated). The five fan settings are
     :mod:`~backend.app.services.eject.cooldown_prep`'s two actuators — a switch each,
     the aux fan's one speed, and the chamber fan's boost/sustain pair; each switch is
     the ONE on/off owner, so a speed is never read as an off. ``hold_enabled`` /
@@ -1052,8 +1116,7 @@ async def _dispatch_fa_eject(
     *, printer_id: int, queue_item_id: int, run_id: int | None, plate_z: float | None = None
 ) -> None:
     """``on_release`` action for an approved first article: dispatch its part-present
-    eject through the shared dispatcher once the bed has reached the release
-    threshold. RAISES on failure so the watch retries then stalls (same policy as
+    eject through the shared dispatcher once the bed has been released. RAISES on failure so the watch retries then stalls (same policy as
     the production release). ``plate_z`` carries the hold's parked height, exactly as
     for the production release."""
     from backend.app.core.database import async_session
@@ -1439,7 +1502,6 @@ class EjectCooldownMonitor:
                 printer_id,
                 None,
                 purpose="foreign",
-                threshold_override=policy.threshold_c,
                 profile_id=policy.profile_id,
                 release_now=release_now,
             )
@@ -1500,16 +1562,18 @@ class EjectCooldownMonitor:
 
     # -- queries ------------------------------------------------------------
 
-    def active_watch(self, printer_id: int) -> float | None:
-        """The in-flight cooldown watch's release threshold (°C), or None.
+    def cooling_watch(self, printer_id: int) -> CoolingWatch | None:
+        """The printer's COOLING watch, or None.
 
-        None both when no watch is armed and when the armed watch carries no threshold
-        (an escalation-only hold, or a cooldown watch still resolving its item's
-        profile) — callers surface the cooldown phase only when a real release
-        temperature exists. Unchanged contract: callers (and the UI ``eject_watch``
-        payload) still see ``float | None``."""
+        None when no watch is armed, for an escalation-only hold, and for a releasing
+        watch still resolving its eject line — callers surface the cooldown phase only
+        once a watch is actually waiting on a bed. A cooling watch's ``line_c`` may
+        itself be None (shop air unknown at arm): the plate is still cooling, and the
+        UI's ``eject_watch`` payload says so with no line to quote."""
         armed = self._armed.get(printer_id)
-        return armed.threshold_c if armed is not None else None
+        if armed is None or not armed.cooling:
+            return None
+        return CoolingWatch(line_c=armed.line_c)
 
     def hold_z(self, printer_id: int) -> float | None:
         """The Z the armed cooldown watch is HOLDING this printer's plate at, or None.
@@ -1628,7 +1692,6 @@ class EjectCooldownMonitor:
         *,
         purpose: str = "production",
         run_id: int | None = None,
-        threshold_override: float | None = None,
         profile_id: int | None = None,
         release_now: asyncio.Event,
     ) -> None:
@@ -1636,20 +1699,20 @@ class EjectCooldownMonitor:
             # ONE hold level for this whole watch — arm, every tick, and the fallback
             # escalation watch below. Minted first so no path can grow a second read.
             held_now = self._held_level(printer_id)
-            if threshold_override is not None:
-                # Foreign auto-eject: the release threshold is the chosen profile's
-                # cooldown target, passed directly (there is no queue item to resolve).
-                threshold: float | None = threshold_override
-            else:
-                threshold = await _resolve_eject_threshold(queue_item_id, for_first_article=purpose == "fa")
-            if threshold is None:
+            # A foreign auto-eject carries no queue item: its eligibility was decided when
+            # the plate was identified (``identify_farm_file_foreign``), and its eject
+            # profile rides the policy. A farm unit's is re-read from THAT unit here.
+            releasable = purpose == "foreign" or await _unit_releasable(
+                queue_item_id, for_first_article=purpose == "fa"
+            )
+            if not releasable:
                 # A releasing policy over a unit that carries no usable eject profile
                 # (a deleted profile row, an FA item under a production policy). The
                 # plate is still occupied, and a plate with no watch is the armless
                 # gate 2026-07-18/07-21 forbids — so hold and escalate instead of
                 # returning into silence.
                 logger.warning(
-                    "Eject monitor: printer %s %s policy resolved NO release threshold (item %s) — "
+                    "Eject monitor: printer %s %s policy has NO releasable unit (item %s) — "
                     "holding the plate with an escalation-only watch instead",
                     printer_id,
                     purpose,
@@ -1661,11 +1724,28 @@ class EjectCooldownMonitor:
                 # occupancy re-read, for the reason given in the watch's docstring.
                 await watch_gate_escalation_only(printer_id, held=held_now, farm_source=purpose != "foreign")
                 return
+            # THE eject line, resolved ONCE at arm from its one owner — every watch purpose
+            # alike (production, FA, foreign). ``arm_line`` never raises: an unreadable
+            # store arms with shop air unknown, which the own-air term and the plateau
+            # still end.
+            line = await shop_air.arm_line()
             armed = self._armed.get(printer_id)
             if armed is not None and armed.task is asyncio.current_task():
-                # Publish the resolved threshold so active_watch() (and the UI's
-                # eject_watch payload) can render the cooldown phase.
-                armed.threshold_c = threshold
+                # Publish the line so cooling_watch() (and the UI's eject_watch payload)
+                # can render the cooldown phase.
+                armed.cooling = True
+                armed.line_c = line.line_c
+            logger.info(
+                "Eject monitor: printer %s %s cooldown armed — eject line %s (shop air %s, basis %s, %d printer(s); "
+                "margin %.1f°C)",
+                printer_id,
+                purpose,
+                _c(line.line_c),
+                _c(line.shop.value_c),
+                line.shop.basis,
+                line.shop.printers,
+                line.margin_c,
+            )
             # Resolve the plateau/cap policy once at arm; bind the eject dispatch and
             # the stall reaction to THIS unit so the watch stays identity-scoped.
             settings = await _resolve_stall_settings()
@@ -1675,6 +1755,9 @@ class EjectCooldownMonitor:
             # an honest skip and the bed poll below is what an offline printer's plate
             # actually needs.
             await _await_printer_connected(printer_id)
+            # The model gates the own-air term (only a real chamber sensor is the bed's
+            # air) and the chamber fan lane alike — read once, from the manager's cache.
+            model = printer_manager.get_model(printer_id)
             # Arm the cooldown actuators (plate hold + cooldown fans) BEFORE the first
             # bed poll — the whole point is to shorten the wait this loop is about to
             # sit through. ``begin`` never raises: a prep failure leaves the cooldown
@@ -1686,8 +1769,8 @@ class EjectCooldownMonitor:
                 printer_id,
                 queue_item_id=queue_item_id,
                 fans=settings.fans,
-                release_threshold_c=threshold,
-                model=printer_manager.get_model(printer_id),
+                release_line_c=line.line_c,
+                model=model,
                 hold_enabled=settings.hold_enabled,
                 hold_part_top_mm=settings.hold_part_top_mm,
                 # The plate hold MOVES the machine, so it is the one actuator a service
@@ -1765,7 +1848,9 @@ class EjectCooldownMonitor:
                 await prep.observe_start()
                 verdict = await watch_bed_and_clear(
                     printer_id,
-                    threshold,
+                    line.line_c,
+                    margin_c=line.margin_c,
+                    model=model,
                     stall_window_s=settings.stall_window_s,
                     stall_epsilon_c=settings.stall_epsilon_c,
                     plateau_eject_margin_c=settings.plateau_eject_margin_c,

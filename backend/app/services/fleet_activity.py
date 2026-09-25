@@ -187,8 +187,9 @@ def _plate_phase(printer_id: int, status: PrinterState | None) -> str:
     """The plate axis, first match wins — ONE reading, from the owners of each fact.
 
     The order is physical, not a ranking of severity: a sweep in flight is happening
-    whatever else is true, a cooldown watch armed with a release temperature is a bed
-    on its way down, and only then does an occupied plate mean "waiting on a person".
+    whatever else is true, a COOLING watch is a bed on its way down (with or without an
+    eject line to quote — shop air can be unknown), and only then does an occupied plate
+    mean "waiting on a person".
     A DEFERRED watch (cooled, fans retired, the eject withheld under a service hold)
     deliberately falls through to ``held``: the thermal work is over, and what the
     plate is now waiting for is a human lifting the hold — which is what the read-time
@@ -200,7 +201,7 @@ def _plate_phase(printer_id: int, status: PrinterState | None) -> str:
     view = plate_occupancy.current_view(printer_id)
     if view.eject_present or (status is not None and eject_remote.is_eject_job_name(status.subtask_name)):
         return PLATE_PHASE_EJECTING
-    if eject_cooldown_monitor.active_watch(printer_id) is not None and not eject_cooldown_monitor.deferred(printer_id):
+    if eject_cooldown_monitor.cooling_watch(printer_id) is not None and not eject_cooldown_monitor.deferred(printer_id):
         return PLATE_PHASE_COOLING
     if view.plate_occupied:
         return PLATE_PHASE_HELD

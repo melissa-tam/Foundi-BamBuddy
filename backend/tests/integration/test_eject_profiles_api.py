@@ -119,7 +119,8 @@ class TestEjectProfileCrud:
         created = resp.json()
         pid = created["id"]
         assert created["name"] == "rack-a"
-        assert created["cooldown_temp_c"] == 28.0  # server-side release threshold
+        # No temperature on a profile (2026-09-25): the eject line is measured shop air.
+        assert "cooldown_temp_c" not in created
         assert "cooldown_retries" not in created  # dropped: no in-file cooldown loop anymore
 
         # LIST -> 200 includes it
@@ -132,10 +133,10 @@ class TestEjectProfileCrud:
         assert resp.status_code == 200
         assert resp.json()["id"] == pid
 
-        # PUT -> 200 updates cooldown
-        resp = await async_client.put(f"/api/v1/eject-profiles/{pid}", json={"cooldown_temp_c": 25.0})
+        # PUT -> 200 updates a sweep field
+        resp = await async_client.put(f"/api/v1/eject-profiles/{pid}", json={"clearance_mm": 12.5})
         assert resp.status_code == 200
-        assert resp.json()["cooldown_temp_c"] == 25.0
+        assert resp.json()["clearance_mm"] == 12.5
 
         # DELETE -> 204
         resp = await async_client.delete(f"/api/v1/eject-profiles/{pid}")
@@ -154,13 +155,18 @@ class TestEjectProfileCrud:
         resp = await async_client.post("/api/v1/eject-profiles", json=_valid_profile_body(name="lowz", z_offset_mm=0.1))
         assert resp.status_code == 422
 
-    async def test_invalid_cooldown_temp_422(self, async_client: AsyncClient):
-        # cooldown_temp_c is bounded (0 < t <= 100); the old cooldown_retries bound
-        # is gone (the column was dropped with the in-file cooldown loop).
+    async def test_a_stale_clients_cooldown_temp_is_ignored_not_stored(self, async_client: AsyncClient):
+        """The UI that still sends ``cooldown_temp_c`` (until its own capsule lands) keeps
+        working: the field is no longer part of the contract, so it is ignored on create
+        and update and never echoed back — there is ONE eject line and it is shop_air's."""
         resp = await async_client.post(
             "/api/v1/eject-profiles", json=_valid_profile_body(name="hottemp", cooldown_temp_c=200.0)
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 201, resp.text
+        assert "cooldown_temp_c" not in resp.json()
+        resp = await async_client.put(f"/api/v1/eject-profiles/{resp.json()['id']}", json={"cooldown_temp_c": 25.0})
+        assert resp.status_code == 200, resp.text
+        assert "cooldown_temp_c" not in resp.json()
 
     async def test_get_missing_404(self, async_client: AsyncClient):
         assert (await async_client.get("/api/v1/eject-profiles/987654")).status_code == 404

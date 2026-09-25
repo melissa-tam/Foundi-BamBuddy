@@ -55,9 +55,6 @@ def validate_drop_floor_requires_drop(clearance: float | None, dwell_s: int | No
 
 class EjectProfileBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    # Server-side cooldown release threshold: the eject monitor holds the plate
-    # gate until the live bed drops here, then dispatches the motion-only eject.
-    cooldown_temp_c: float = Field(default=28.0, gt=0, le=100)
     clearance_mm: float = Field(default=10.0, ge=0)
     z_offset_mm: float = Field(default=0.4, gt=0)
     descent_steps: int = Field(default=4, ge=1, le=100)
@@ -129,7 +126,6 @@ class EjectProfileUpdate(BaseModel):
     """
 
     name: str | None = Field(default=None, min_length=1, max_length=100)
-    cooldown_temp_c: float | None = Field(default=None, gt=0, le=100)
     clearance_mm: float | None = Field(default=None, ge=0)
     z_offset_mm: float | None = Field(default=None, gt=0)
     descent_steps: int | None = Field(default=None, ge=1, le=100)

@@ -24,7 +24,6 @@ from backend.tests.unit.services.eject.geometry_fixtures import (
 def _profile(**overrides) -> EjectProfile:
     defaults = {
         "name": "default",
-        "cooldown_temp_c": 28.0,
         "clearance_mm": 10.0,
         "z_offset_mm": 0.4,
         "descent_steps": 4,

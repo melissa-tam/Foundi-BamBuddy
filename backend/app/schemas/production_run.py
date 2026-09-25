@@ -93,7 +93,6 @@ class RunCreate(BaseModel):
     printer_ids: list[int] | None = None
     target_model: str | None = None
     eject_profile_id: int | None = None
-    cooldown_temp_c_override: float | None = Field(default=None, gt=0, le=100)
     # Farm first-article + failure policy (Phase 3). All optional; numbers fall
     # back to the global farm settings, require_first_article defaults False.
     require_first_article: bool | None = Field(default=None, description="Gate the run on first-article approval")
@@ -168,11 +167,9 @@ class RunResponse(BaseModel):
     retry_max_per_unit: int = 1
     escalate_consecutive_failures: int = 2
     # Prefill values for "Run again" (Phase 5, F9): the run's eject profile and
-    # target model are uniform across its items (first non-null); the cooldown
-    # override is the batch column. Null when not applicable — a specific-printer
-    # run has no target_model, and a run may carry no cooldown override.
+    # target model are uniform across its items (first non-null). Null when not
+    # applicable — a specific-printer run has no target_model.
     eject_profile_id: int | None = None
-    cooldown_temp_c_override: float | None = None
     target_model: str | None = None
     # The prefill/display twin of ``target_model`` for a PRINTERS pool: the printer
     # subset the operator chose, id-ordered with names. Empty for a model pool and

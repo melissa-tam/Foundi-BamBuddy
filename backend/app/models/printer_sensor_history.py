@@ -5,6 +5,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.core.database import Base
 
+# The heaters the recorder writes, one row per kind per tick — the ONE spelling, read by the
+# recorder (``main.record_printer_sensor_history``) and by the shop-air qualification, which
+# must see every heater the recorder saw ("no heater target in 90 min" is about all four).
+SENSOR_KINDS: tuple[str, ...] = ("nozzle", "nozzle_2", "bed", "chamber")
+
 
 class PrinterSensorHistory(Base):
     """Historical heater readings (nozzle / nozzle_2 / bed / chamber).
