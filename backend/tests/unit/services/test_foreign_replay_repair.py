@@ -113,6 +113,7 @@ class _Seed:
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
         retry_of_id: int | None = None,
+        stop_source: str | None = None,
     ) -> None:
         self.rows.append(
             (
@@ -126,6 +127,7 @@ class _Seed:
                     "started_at": started_at,
                     "completed_at": completed_at,
                     "retry_of_id": retry_of_id,
+                    "stop_source": stop_source,
                 },
             )
         )
@@ -200,6 +202,7 @@ class _Seed:
         grams: float,
         status: str,
         created_at: datetime,
+        cost: float | None = None,
     ) -> None:
         self.rows.append(
             (
@@ -211,6 +214,7 @@ class _Seed:
                     "printer_id": printer_id,
                     "print_name": "1d1054d9f48447c8ba850943eded4852",
                     "weight_used": grams,
+                    "cost": cost,
                     "status": status,
                     "created_at": created_at,
                 },
@@ -244,7 +248,7 @@ def _shape_leaked(s: _Seed) -> None:
     )
     s.unit(201, 1, status="completed", archive_id=101, subtask="1001", started_at=T0 - 4 * H, completed_at=T0)
     s.spool(301, weight_used=673.0)
-    s.charge(9001, 301, None, 1, grams=118.0, status="completed", created_at=T0 + 5 * S)  # the donor charge
+    s.charge(9001, 301, None, 1, grams=118.0, status="completed", created_at=T0 + 5 * S, cost=2.95)  # the donor
     s.log(
         501,
         101,
@@ -274,14 +278,15 @@ def _shape_misbinding(s: _Seed) -> None:
 
 
 def _shape_unobserved(s: _Seed) -> None:
-    """(c) The downtime reconcile genuinely never saw how this print ended: the unit is cancelled."""
+    """(c) The downtime reconcile genuinely never saw how this print ended. The replay at T0 WAS
+    the run's terminal: it matched the still-printing unit and stamped its ``completed_at``, so its
+    rows sit inside the run's own window."""
     s.printer(3)
     s.archive(121, 3, status="cancelled", subtask="1021", started_at=T0 - 2 * H, completed_at=T0)
     s.unit(221, 3, status="cancelled", archive_id=121, subtask="1021", started_at=T0 - 2 * H, completed_at=T0)
     s.spool(303, weight_used=250.0)
-    s.log(521, 121, 3, status="cancelled", created_at=T0 + 10 * S, started_at=T0 - 2 * H, completed_at=T0)
-    s.charge(621, 303, 121, 3, grams=30.0, status="cancelled", created_at=T0 + 10 * S)
-    s.charge(622, 303, 121, 3, grams=20.0, status="aborted", created_at=T0 + D)
+    s.log(521, 121, 3, status="cancelled", created_at=T0 + 2 * S, started_at=T0 - 2 * H, completed_at=T0)
+    s.charge(621, 303, 121, 3, grams=30.0, status="cancelled", created_at=T0 + S)
 
 
 def _shape_failed(s: _Seed) -> None:
@@ -427,7 +432,7 @@ def _shape_true_status_after_archiveless_terminal(s: _Seed) -> None:
     s.archive(199, 16, status="completed", subtask="1099", started_at=T0 - 4 * H, completed_at=T0 + D)
     s.unit(299, 16, status="completed", archive_id=199, subtask="1099", started_at=T0 - 4 * H, completed_at=T0)
     s.spool(314, weight_used=300.0)
-    s.charge(9002, 314, None, 16, grams=118.0, status="completed", created_at=T0 + 5 * S)  # the donor charge
+    s.charge(9002, 314, None, 16, grams=118.0, status="completed", created_at=T0 + 5 * S, cost=2.9)  # the donor
     s.log(
         590,
         199,
@@ -453,6 +458,92 @@ def _shape_run_still_printing(s: _Seed) -> None:
     s.charge(692, 315, 200, 17, grams=35.0, status="cancelled", created_at=T0 + S)
 
 
+def _shape_cancelled_run_replayed_later(s: _Seed) -> None:
+    """(q) Printer 10 / archive 2318 in production: the real terminal arrived CANCELLED and charged
+    then; the restart replay 42 h later, finding the unit already ended, resolved FOREIGN and
+    charged again."""
+    s.printer(18)
+    s.archive(210, 18, status="cancelled", subtask="1110", started_at=T0 - 3 * H, completed_at=T0 + 42 * H)
+    s.unit(310, 18, status="cancelled", archive_id=210, subtask="1110", started_at=T0 - 3 * H, completed_at=T0)
+    s.spool(316, weight_used=400.0)
+    s.charge(693, 316, 210, 18, grams=20.0, status="cancelled", created_at=T0 + 5 * S)
+    s.charge(694, 316, 210, 18, grams=133.7, status="cancelled", created_at=T0 + 42 * H)
+    s.log(
+        589,
+        210,
+        18,
+        status="cancelled",
+        created_at=T0 + 42 * H,
+        started_at=T0 - 3 * H,
+        completed_at=T0 + 42 * H,
+        grams=133.7,
+        cost=3.3,
+    )
+
+
+def _shape_donor_grams(s: _Seed) -> None:
+    """(r) A cancelled run whose real terminal charged two spools through the donor. The run's
+    grams are those two charges, and not another printer's, nor a later one on this printer."""
+    s.printer(19)
+    s.printer(20)
+    s.archive(211, 19, status="cancelled", subtask="1111", started_at=T0 - 2 * H, completed_at=T0 + 42 * H)
+    s.unit(311, 19, status="cancelled", archive_id=211, subtask="1111", started_at=T0 - 2 * H, completed_at=T0)
+    s.spool(317, weight_used=500.0)
+    s.spool(318, weight_used=300.0)
+    s.charge(9003, 317, None, 19, grams=22.5, status="cancelled", created_at=T0 + 5 * S, cost=0.55)
+    s.charge(9004, 318, None, 19, grams=10.0, status="cancelled", created_at=T0 + 6 * S, cost=0.25)
+    s.charge(9005, 317, None, 20, grams=99.0, status="completed", created_at=T0 + 5 * S, cost=2.4)
+    s.charge(9006, 317, None, 19, grams=7.0, status="completed", created_at=T0 + H, cost=0.2)
+    s.log(
+        593,
+        211,
+        19,
+        status="cancelled",
+        created_at=T0 + 42 * H,
+        started_at=T0 - 2 * H,
+        completed_at=T0 + 42 * H,
+        grams=150.0,
+        cost=3.5,
+    )
+    s.charge(686, 317, 211, 19, grams=45.0, status="cancelled", created_at=T0 + 42 * H + S)
+
+
+def _shape_queue_page_stops(s: _Seed) -> None:
+    """(s) Two units stopped from the queue page, whose route stamps ``completed_at`` before the
+    terminal. Printer 21 was offline: the stop never arrived and the print's real terminal came
+    two hours later. Printer 22's terminal followed the stop within seconds, then a replay came."""
+    s.printer(21)
+    s.printer(22)
+    s.archive(212, 21, status="completed", subtask="1112", started_at=T0 - H, completed_at=T0 + 2 * H)
+    s.unit(
+        312,
+        21,
+        status="cancelled",
+        archive_id=212,
+        subtask="1112",
+        started_at=T0 - H,
+        completed_at=T0,
+        stop_source="operator_ui",
+    )
+    s.spool(319, weight_used=300.0)
+    s.charge(687, 319, 212, 21, grams=60.0, status="completed", created_at=T0 + 2 * H)
+    s.log(588, 212, 21, status="completed", created_at=T0 + 2 * H, started_at=T0 - H, completed_at=T0 + 2 * H)
+    s.archive(213, 22, status="cancelled", subtask="1113", started_at=T0 - H, completed_at=T0 + 42 * H)
+    s.unit(
+        313,
+        22,
+        status="cancelled",
+        archive_id=213,
+        subtask="1113",
+        started_at=T0 - H,
+        completed_at=T0,
+        stop_source="operator_ui",
+    )
+    s.spool(320, weight_used=250.0)
+    s.charge(9007, 320, None, 22, grams=12.0, status="cancelled", created_at=T0 + 20 * S)
+    s.charge(688, 320, 213, 22, grams=30.0, status="cancelled", created_at=T0 + 42 * H)
+
+
 ALL_SHAPES: tuple[Shape, ...] = (
     _shape_leaked,
     _shape_misbinding,
@@ -467,6 +558,9 @@ ALL_SHAPES: tuple[Shape, ...] = (
     _shape_true_status_beside_genuine,
     _shape_true_status_after_archiveless_terminal,
     _shape_run_still_printing,
+    _shape_cancelled_run_replayed_later,
+    _shape_donor_grams,
+    _shape_queue_page_stops,
 )
 
 
@@ -581,7 +675,7 @@ def test_leaked_archive_replayed_later_is_restored_and_its_phantom_charge_revers
     assert entry.status == "completed"
     assert entry.completed_at == T0
     assert entry.duration_seconds == 4 * 3600, "recomputed from the row's own start to the run's terminal"
-    assert entry.filament_used_grams == 120.0 and entry.cost == 3.0, "the archive's figures, not the replay's"
+    assert (entry.filament_used_grams, entry.cost) == (118.0, 2.95), "the real terminal's own donor charge"
     assert entry.failure_reason is None
     assert entry.created_at == T0 + 2 * D, "the write time is history; it is not rewritten"
     assert _row(engine, "spool_usage_history", 601) is None
@@ -604,21 +698,70 @@ def test_misbinding_mid_run_is_attributed_to_the_run_whose_window_holds_it(engin
     assert _row(engine, "spool", 302).weight_used == pytest.approx(320.0)
 
 
-def test_a_run_recorded_cancelled_is_never_touched(engine: Engine) -> None:
-    """(c) Even a replay-status charge a day after the terminal: the run's outcome was unobserved."""
+def test_a_genuinely_unobserved_outcome_is_the_runs_own_record(engine: Engine) -> None:
+    """(c) The replay was the run's terminal, so its rows are the only record of the run."""
     _seed(engine, _shape_unobserved)
     plan = _repair(engine)
 
     assert plan.actions == ()
     assert plan.skips == ()
     tallies = dict(plan.tallies)
-    assert tallies["charge: genuine: its run recorded cancelled (an unobserved outcome)"] == 2
-    assert tallies["print-log: genuine: its run recorded cancelled (an unobserved outcome)"] == 1
+    assert tallies["charge: genuine: written at its run's own terminal"] == 1
+    assert tallies["print-log: genuine: written at its run's own terminal"] == 1
     assert _row(engine, "print_archives", 121).status == "cancelled"
     assert _row(engine, "print_log_entries", 521).status == "cancelled"
     assert _row(engine, "spool_usage_history", 621) is not None
-    assert _row(engine, "spool_usage_history", 622) is not None
     assert _row(engine, "spool", 303).weight_used == pytest.approx(250.0)
+
+
+def test_a_cancelled_run_replayed_later_is_repaired_and_its_own_charge_kept(engine: Engine) -> None:
+    """(q) The run recorded cancelled at its real terminal; the replay 42 h later is a replay."""
+    _seed(engine, _shape_cancelled_run_replayed_later)
+    plan = _repair(engine)
+
+    assert _ids(plan, frr.ReverseSpoolCharge) == {694}
+    assert _row(engine, "spool_usage_history", 693) is not None, "the genuine charge at its terminal stays"
+    assert _row(engine, "spool_usage_history", 694) is None
+    assert _row(engine, "spool", 316).weight_used == pytest.approx(266.3)
+    entry = _row(engine, "print_log_entries", 589)
+    assert (entry.status, entry.completed_at, entry.duration_seconds) == ("cancelled", T0, 3 * 3600)
+    assert entry.filament_used_grams is None, "a cancelled run with no donor charge has no known grams"
+    assert entry.cost == 3.3, "its cost stays as written"
+    assert _ids(plan, frr.RestoreArchiveOutcome) == set(), "R-archive restores only completed/failed outcomes"
+    assert _row(engine, "print_archives", 210).status == "cancelled"
+
+
+def test_a_rewritten_row_takes_its_grams_from_the_real_terminals_donor_charges(engine: Engine) -> None:
+    """(r) The two donor charges on the run's printer within its window, and nothing else."""
+    _seed(engine, _shape_donor_grams)
+    plan = _repair(engine)
+
+    rewrite = next(a for a in plan.actions if isinstance(a, frr.RewritePrintLogEntry))
+    assert rewrite.after.filament_used_grams == 32.5
+    assert rewrite.after.cost == pytest.approx(0.8)
+    entry = _row(engine, "print_log_entries", 593)
+    assert (entry.status, entry.completed_at, entry.filament_used_grams) == ("cancelled", T0, 32.5)
+    assert _ids(plan, frr.ReverseSpoolCharge) == {686}
+    for donor in (9003, 9004, 9005, 9006):
+        assert _row(engine, "spool_usage_history", donor) is not None, "donor charges are never touched"
+    assert _plan(engine).actions == (), "the rewrite is idempotent"
+
+
+def test_a_queue_page_stop_is_judged_only_once_its_terminal_is_seen(engine: Engine) -> None:
+    """(s) The Stop route's ``completed_at`` is not a terminal. With no terminal written beside it
+    (an offline printer), a later row may be the print's real end: listed, never reversed. With
+    the terminal seen right after the stop, the premise holds and the replay is reversed."""
+    _seed(engine, _shape_queue_page_stops)
+    plan = _repair(engine)
+
+    assert _skip_codes(plan) == {
+        ("print_log_entries", 588): "stop_terminal_unseen",
+        ("spool_usage_history", 687): "stop_terminal_unseen",
+    }
+    assert _row(engine, "spool_usage_history", 687) is not None
+    assert _row(engine, "spool", 319).weight_used == pytest.approx(300.0)
+    assert _ids(plan, frr.ReverseSpoolCharge) == {688}
+    assert _row(engine, "spool", 320).weight_used == pytest.approx(220.0)
 
 
 def test_failed_run_restores_failed_and_drops_the_replay_row_beside_its_own(engine: Engine) -> None:
@@ -754,6 +897,7 @@ def test_a_pre_0919_aborted_replay_is_repaired_like_any_other(engine: Engine) ->
     archive = _row(engine, "print_archives", 197)
     assert (archive.status, archive.completed_at) == ("completed", T0)
     entry = _row(engine, "print_log_entries", 597)
+    # No donor charge on printer 14: a completed run falls back to the archive's figure.
     assert (entry.status, entry.completed_at, entry.filament_used_grams) == ("completed", T0, 120.0)
     assert _row(engine, "spool_usage_history", 699) is None
     assert _row(engine, "spool", 312).weight_used == pytest.approx(375.0)
@@ -783,7 +927,7 @@ def test_a_completed_replay_row_that_is_the_runs_only_record_is_restated(engine:
     assert rewrite.before.status == rewrite.after.status == "completed"
     entry = _row(engine, "print_log_entries", 590)
     assert (entry.completed_at, entry.duration_seconds) == (T0, 4 * 3600)
-    assert (entry.filament_used_grams, entry.cost) == (120.0, 3.0)
+    assert (entry.filament_used_grams, entry.cost) == (118.0, 2.9), "the real terminal's donor charge"
     assert _ids(plan, frr.ReverseSpoolCharge) == {691}
     assert _row(engine, "spool", 314).weight_used == pytest.approx(205.0)
     assert _row(engine, "spool_usage_history", 9002) is not None, "the real completion's donor charge stays"
@@ -892,8 +1036,8 @@ def test_the_report_is_ascii_and_carries_every_action_and_skip(engine: Engine) -
     assert report.isascii()
     for item in (*plan.actions, *plan.skips):
         assert frr.describe(item) in report
-    assert "reverse spool charge (R-charge): 9" in report
-    assert "grams reversed: 585.0 g across 9 spool(s)" in report
+    assert "reverse spool charge (R-charge): 12" in report
+    assert "grams reversed: 793.7 g across 12 spool(s)" in report
     assert "012-Drucker-\\xfc" in report, "a non-ASCII printer name is escaped, not dropped"
 
 

@@ -35,14 +35,29 @@ last print was not a farm unit (an operator reprint), so that print is a FOREIGN
 whose window holds it, or else to the latest run that ended before it with no later run started
 before it. Both cases reduce to one rule: the run with the latest start at or before the row.
 
-**Why 180 s identifies a replay, whatever the row's status says.** Charges (the three
+**Why 180 s identifies a replay, whatever the row or the run recorded.** Charges (the three
 ``SpoolUsageHistory`` writers in ``usage_tracker``) and print-log rows (``main.on_print_complete``'s
-one ``write_log_entry``) are written ONLY inside a terminal chain. That chain stamps the unit's
-``completed_at`` seconds before writing them. The only other writers of a ``completed``/``failed``
-unit's ``completed_at`` are pre-start dispatch failures, which never print and so write no rows.
-A row attributed to such a run but written further than ``TERMINAL_WINDOW`` from its terminal
-therefore came from ANOTHER terminal, a replay. That holds whatever status word the replay wrote,
-so the rules judge by that evidence and never by the word.
+one ``write_log_entry``) are written ONLY inside a terminal chain. That chain stamps a still
+``printing`` unit's ``completed_at`` seconds before writing them. The only other writers of a
+terminal unit's ``completed_at`` are pre-start dispatch failures and pending-unit cancellations,
+which never print and so write no rows. A row attributed to a terminal run but written further
+than ``TERMINAL_WINDOW`` from that terminal therefore came from ANOTHER terminal, a replay. That
+holds for a run recorded ``cancelled`` too. A run's outcome was unobserved only when the replay
+itself was its terminal: the replay then matched the still-printing unit and stamped its
+``completed_at`` in the same chain, so its rows sit inside the window and are the run's own.
+When the unit had already ended, the replay resolved FOREIGN and left it alone. The unit kept
+its earlier real terminal, and the replay's rows fall outside the window. The rules judge by
+that evidence, never by a status word.
+
+**The one writer that breaks that premise.** The queue page's Stop
+(``routes/print_queue.stop_queue_item``) commits ``cancelled``, ``completed_at`` and
+``stop_source='operator_ui'`` BEFORE the printer's terminal arrives. The terminal chain then
+leaves that ``completed_at`` alone. The terminal normally follows within seconds. But a Stop sent
+to an offline printer never reaches it, and the print's real terminal can come hours later.
+So, for such a unit, the window is evidence only once the ledger shows its terminal there: a
+charge or print-log row on its printer within the window of that ``completed_at``. Without
+that, a row outside the window cannot be told from a late real terminal. It is listed
+(``stop_terminal_unseen``), never reversed.
 
 **The rules** (see each ``_plan_*`` method):
 
@@ -51,17 +66,18 @@ so the rules judge by that evidence and never by the word.
   latest one is left for the runtime to heal.
 * R-archive: a ``cancelled`` or ``aborted`` archive whose last run recorded ``completed``/``failed``
   takes that outcome.
-* R-log: a print-log row that is a replay of a completed/failed run is rewritten to the run's
-  outcome, or dropped when the run already has its own row. One run keeps at most one row.
-* R-charge: a charge that is a replay of a completed/failed run is reversed and deleted. It is
-  skipped when the spool is weight-locked, spent or archived. A reversal that takes
-  ``weight_used`` below the spool's ``weight_used_baseline`` also lowers the baseline by the same
-  grams, floored at 0. Consumption since an operator's "Reset Total Consumed" cannot be negative,
-  so such a reset anchored a value that already held the phantom.
+* R-log: a print-log row that is a replay of a terminal run is rewritten to the run's outcome,
+  or dropped when the run already has its own row. One run keeps at most one row. Its grams are
+  the run's real terminal's own charges (see ``_Planner._rewrite``).
+* R-charge: a charge that is a replay of a terminal run is reversed and deleted. It is skipped
+  when the spool is weight-locked, spent or archived. A reversal that takes ``weight_used``
+  below the spool's ``weight_used_baseline`` also lowers the baseline by the same grams,
+  floored at 0. Consumption since an operator's "Reset Total Consumed" cannot be negative, so
+  such a reset anchored a value that already held the phantom.
 
-A run recorded ``cancelled`` is never touched: that was a genuinely unobserved outcome, and its
-rows are the only record of it. Rows with no farm run to judge them by (foreign prints, rows
-whose archive is gone) are counted in the report and never touched.
+Rows written at their run's own terminal are the run's record, whatever it recorded, and are
+never touched. So are rows with no farm run to judge them by (foreign prints, rows whose
+archive is gone); these are counted in the report.
 
 **Plan, then apply.** ``plan_foreign_replay_repair`` only SELECTs, re-verifying each fact per
 row, and returns a closed set of typed actions carrying their before-values.
@@ -119,10 +135,13 @@ _ABORTED: Final = "aborted"
 #: archive holds one status, overwritten by whichever terminal wrote last, so there is no second
 #: row to compare against: a status a replay never writes is not the repair's to change.
 _REPLAY_ARCHIVE_STATUSES: Final = frozenset({_CANCELLED, _ABORTED})
-#: A unit outcome the repair restores onto replay damage.
+#: A unit outcome R-archive restores onto an archive a replay closed.
 _RESTORABLE_OUTCOMES: Final = frozenset({_COMPLETED, _FAILED})
-#: Unit outcomes that end a run: R-dup closes a superseded archive to one of these.
+#: Unit outcomes that end a run. R-dup closes a superseded archive to one of these, and a row
+#: outside such a run's terminal window is a replay.
 _TERMINAL_UNIT_STATUSES: Final = frozenset({_COMPLETED, _FAILED, _CANCELLED})
+#: ``print_queue.stop_source`` of the queue page's Stop, whose ``completed_at`` precedes the terminal.
+_STOP_OPERATOR_UI: Final = "operator_ui"
 #: Printer subtask ids that name no dispatch: a screen-started print echoes "0".
 _NO_SUBTASK: Final = frozenset({"", "0"})
 
@@ -149,6 +168,7 @@ _units = Table(
     Column("archive_id", Integer),
     Column("dispatch_subtask_id", String),
     Column("status", String),
+    Column("stop_source", String),
     Column("started_at", DateTime),
     Column("completed_at", DateTime),
 )
@@ -176,6 +196,7 @@ _charges = Table(
     Column("printer_id", Integer),
     Column("archive_id", Integer),
     Column("weight_used", Float),
+    Column("cost", Float),
     Column("status", String),
     Column("created_at", DateTime),
 )
@@ -307,8 +328,9 @@ RepairAction: TypeAlias = (
 # --- skips: reported, never applied ------------------------------------------------------------
 
 SpoolSkipCode = Literal["spool_missing", "weight_locked", "spent", "archived"]
-#: Replay-shaped rows the rules cannot judge YET: their run has not recorded its terminal.
-RowSkipCode = Literal["run_open", "run_time_unknown"]
+#: Replay-shaped rows the rules cannot judge: their run has not recorded its terminal yet, or its
+#: recorded ``completed_at`` is a queue-page Stop's with no terminal seen beside it.
+RowSkipCode = Literal["run_open", "run_time_unknown", "stop_terminal_unseen"]
 SkippedTable = Literal["print_archives", "print_log_entries", "spool_usage_history"]
 
 
@@ -343,7 +365,7 @@ class RepairPlan:
     """What one plan found: the actions to apply, the skips to report, and what was examined.
 
     ``tallies`` counts the rows and archives left alone for a reason that needs no reader. They
-    were judged GENUINE (a row written at its own run's terminal, a run recorded ``cancelled``),
+    were judged GENUINE (a row written at its own run's terminal, whatever the run recorded),
     or they have no farm run to judge them by (a foreign print, a row whose archive is gone).
     They are counted rather than listed because they are every print the farm ever logged, and
     listing them would bury the damage.
@@ -382,6 +404,7 @@ class _Unit:
     archive_id: int | None
     dispatch_subtask_id: str | None
     status: str
+    stop_source: str | None
     started_at: datetime | None
     completed_at: datetime | None
 
@@ -430,6 +453,16 @@ class _Charge:
     weight_used: float
     status: str
     created_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DonorCharge:
+    """A charge the terminal chain wrote with no archive: the real completion of a leaked print,
+    which charged through the dispatch donor because it could not find its archive."""
+
+    weight_used: float
+    cost: float | None
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +517,7 @@ class _Facts:
                 archive_id=row.archive_id,
                 dispatch_subtask_id=_subtask(row.dispatch_subtask_id),
                 status=row.status,
+                stop_source=row.stop_source,
                 started_at=_naive_utc(row.started_at),
                 completed_at=_naive_utc(row.completed_at),
             )
@@ -513,17 +547,32 @@ class _Facts:
             )
             for row in conn.execute(select(_log).order_by(_log.c.id))
         ]
-        self.charges: list[_Charge] = [
-            _Charge(
-                id=row.id,
-                spool_id=row.spool_id,
-                archive_id=row.archive_id,
-                weight_used=_float(row.weight_used),
-                status=row.status,
-                created_at=_naive_utc(row.created_at),
-            )
-            for row in conn.execute(select(_charges).where(_charges.c.archive_id.is_not(None)).order_by(_charges.c.id))
-        ]
+        self.charges: list[_Charge] = []
+        self._donors: dict[int, list[_DonorCharge]] = defaultdict(list)
+        # When a terminal chain wrote anything on a printer: every charge and print-log row.
+        self._marks: dict[int, list[datetime]] = defaultdict(list)
+        for row in conn.execute(select(_charges).order_by(_charges.c.id)):
+            created_at = _naive_utc(row.created_at)
+            if row.printer_id is not None and created_at is not None:
+                self._marks[row.printer_id].append(created_at)
+            if row.archive_id is not None:
+                self.charges.append(
+                    _Charge(
+                        id=row.id,
+                        spool_id=row.spool_id,
+                        archive_id=row.archive_id,
+                        weight_used=_float(row.weight_used),
+                        status=row.status,
+                        created_at=created_at,
+                    )
+                )
+            elif row.printer_id is not None and created_at is not None:
+                self._donors[row.printer_id].append(
+                    _DonorCharge(weight_used=_float(row.weight_used), cost=row.cost, created_at=created_at)
+                )
+        for entry in self.log_rows:
+            if entry.printer_id is not None and entry.created_at is not None:
+                self._marks[entry.printer_id].append(entry.created_at)
         self.spools: dict[int, _Spool] = {
             row.id: _Spool(
                 id=row.id,
@@ -536,6 +585,22 @@ class _Facts:
             for row in conn.execute(select(_spools))
         }
         self.printer_names: dict[int, str | None] = {row.id: row.name for row in conn.execute(select(_printers))}
+
+    def donor_charges(self, unit: _Unit) -> list[_DonorCharge]:
+        """The run's real terminal's own archive-less charges: on its printer, within its window."""
+        if unit.completed_at is None:
+            return []
+        return [
+            donor
+            for donor in self._donors.get(unit.printer_id, [])
+            if abs(donor.created_at - unit.completed_at) <= TERMINAL_WINDOW
+        ]
+
+    def terminal_seen(self, unit: _Unit) -> bool:
+        """Did any terminal chain write on the unit's printer within the window of its ``completed_at``?"""
+        if unit.completed_at is None:
+            return False
+        return any(abs(mark - unit.completed_at) <= TERMINAL_WINDOW for mark in self._marks.get(unit.printer_id, []))
 
     def last_run(self, archive: _Archive) -> _Unit | None:
         """The unit that printed A's LAST print: the one its ``subtask_id`` names, on its printer."""
@@ -591,7 +656,6 @@ class _Verdict:
 
 
 _TALLY_OWN_TERMINAL: Final = "genuine: written at its run's own terminal"
-_TALLY_RUN_CANCELLED: Final = "genuine: its run recorded cancelled (an unobserved outcome)"
 _TALLY_NO_RUN: Final = "no farm run started before it (a foreign print)"
 _TALLY_FOREIGN_RUN: Final = "written during its archive's last print, which was no queue unit (an operator reprint)"
 _TALLY_ARCHIVE_GONE: Final = "its archive row is gone (nothing to judge it by)"
@@ -623,8 +687,11 @@ class _Planner:
     def _judge(self, archive: _Archive, at: datetime | None) -> _Verdict:
         """Attribute a row against ``archive`` written at ``at`` to its run, and judge it.
 
-        Returns the run's unit when the row is a replay of a completed/failed run, which is the
-        only case a rule acts on. The row's own status plays no part: see the module docstring.
+        Returns the run's unit when the row is a replay of a terminal run, which is the only case
+        a rule acts on. Neither the row's status nor the run's plays a part: a row inside the
+        run's own terminal window is the run's record (a genuinely unobserved outcome included,
+        because then the replay WAS the terminal), and a row outside it came from another
+        terminal. See the module docstring.
         """
         if at is None:
             return _Verdict(skip=("run_time_unknown", "the row carries no write time"))
@@ -634,14 +701,20 @@ class _Planner:
         unit = run.unit
         if unit is None:
             return _Verdict(tally=_TALLY_FOREIGN_RUN)
-        if unit.status == _CANCELLED:
-            return _Verdict(tally=_TALLY_RUN_CANCELLED)
-        if unit.status not in _RESTORABLE_OUTCOMES:
+        if unit.status not in _TERMINAL_UNIT_STATUSES:
             return _Verdict(skip=("run_open", f"its run, unit {unit.id}, is still {unit.status}"))
         if unit.completed_at is None:
             return _Verdict(skip=("run_time_unknown", f"unit {unit.id} is {unit.status} with no completed_at"))
         if abs(at - unit.completed_at) <= TERMINAL_WINDOW:
             return _Verdict(tally=_TALLY_OWN_TERMINAL)
+        if unit.stop_source == _STOP_OPERATOR_UI and not self._facts.terminal_seen(unit):
+            return _Verdict(
+                skip=(
+                    "stop_terminal_unseen",
+                    f"unit {unit.id} was stopped from the queue page at {_fmt(unit.completed_at)} and no terminal "
+                    "was written beside it; a late real terminal cannot be told from a replay",
+                )
+            )
         return _Verdict(unit=unit)
 
     # R-dup ------------------------------------------------------------------------------------
@@ -784,10 +857,14 @@ class _Planner:
     def _rewrite(self, entry: _LogRow, archive: _Archive, unit: _Unit) -> RewritePrintLogEntry:
         """The replay row, restated as the run's terminal.
 
-        Grams and cost follow ``main._compute_run_filament_grams``'s fallback for a completed
-        print with no linked charge: the archive's figures. The real completion's charge was
-        never linked to the archive, and the replay's own figures came from another print's
-        progress. For a failed run the partial figures are unknown, so they stay as written.
+        The replay's own grams and cost came from another print's progress. The best evidence of
+        what the run consumed is its REAL terminal's own charges: the archive-less charges the
+        chain wrote through the dispatch donor, on the run's printer, within its terminal window.
+        Their sum is the run's grams, rounded like ``main._compute_run_filament_grams``'s tracked
+        sum, and their cost sum is its cost, as the writer's per-run cost is. With no such
+        charges, only a completed run has a known figure: the writer's own completed fallback,
+        the archive's grams and cost. A failed or cancelled run's partial grams are then unknown
+        (None), and its cost stays as written.
         """
         assert unit.completed_at is not None
         completed = unit.status == _COMPLETED
@@ -797,12 +874,22 @@ class _Planner:
         printer_id, printer_name = entry.printer_id, entry.printer_name
         if entry.printer_id != unit.printer_id:
             printer_id, printer_name = unit.printer_id, self._facts.printer_names.get(unit.printer_id)
+        donors = self._facts.donor_charges(unit)
+        grams: float | None
+        cost: float | None
+        if donors:
+            grams = round(sum(donor.weight_used for donor in donors), 1)
+            cost = sum(donor.cost or 0.0 for donor in donors) or None
+        elif completed:
+            grams, cost = archive.filament_used_grams, archive.cost
+        else:
+            grams, cost = None, entry.cost
         after = LogEntryFields(
             status=unit.status,
             completed_at=unit.completed_at,
             duration_seconds=duration,
-            filament_used_grams=archive.filament_used_grams if completed else entry.filament_used_grams,
-            cost=archive.cost if completed else entry.cost,
+            filament_used_grams=grams,
+            cost=cost,
             failure_reason=None if completed else entry.failure_reason,
             printer_id=printer_id,
             printer_name=printer_name,

@@ -5744,9 +5744,12 @@ async def run_migrations(conn):
     # CURRENT print's archive instead of the stale one. The real completions had charged through
     # the dispatch donor and written no print-log row. By the user's ruling, both damage sets are
     # repaired through this ONE guarded repair. A charge or print-log row is judged by EVIDENCE,
-    # never by its status word: attributed to a completed/failed run, it was written outside that
-    # run's own terminal window, so another terminal wrote it. A reversal below a spool's usage
-    # baseline lowers the baseline with it. The rules, the run model they share and the reasoning
+    # never by a status word, the run's included. Attributed to a terminal run, it was written
+    # outside that run's own terminal window, so another terminal wrote it. A run recorded
+    # ``cancelled`` too: its outcome was unobserved only when the replay WAS its terminal, and
+    # then the replay's rows sit inside the window. A rewritten print-log row takes its grams from
+    # the run's real terminal's own donor charges. A reversal below a spool's usage baseline lowers
+    # the baseline with it. The rules, the run model they share and the reasoning
     # live in ``services/foreign_replay_repair.py``, the standalone module that also produces the
     # read-only report on the farm PC. The per-row log below is therefore line-for-line that
     # report's body.
