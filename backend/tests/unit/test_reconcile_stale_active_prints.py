@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import func, select
 
+from backend.app.services.bambu_mqtt import job_consumption_evidence
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     DepositEvidence,
@@ -179,8 +180,10 @@ class TestEvidence:
 # ---------------------------------------------------------------------------
 
 
-def _ended_state(state: str, *, progress: float = 0.0, layer: int = 0):
-    return SimpleNamespace(state=state, subtask_id="ARCHIVE_ID", progress=progress, layer_num=layer, raw_data={})
+def _ended_state(state: str, *, progress: float = 0.0, layer: int = 0, **job_fields):
+    fields = {"total_layers": 0, "tray_change_log": [], "tray_now": 255, "last_loaded_tray": -1, "raw_data": {}}
+    fields.update(job_fields)
+    return SimpleNamespace(state=state, subtask_id="ARCHIVE_ID", progress=progress, layer_num=layer, **fields)
 
 
 _GHOST = SimpleNamespace(filename="ghost.3mf", print_name="ghost", subtask_id="ARCHIVE_ID")
@@ -203,14 +206,43 @@ class TestEndedPayload:
         assert payload["status"] == "failed"
         assert payload["last_layer_num"] == 88
 
+    @pytest.mark.parametrize("state", ["FINISH", "FAILED"])
+    def test_the_jobs_consumption_evidence_rides_in_the_mqtt_terminals_own_keys(self, state):
+        """``ended`` means the live job IS this archive's (the ids matched), so its live record is this
+        job's evidence — carried in the payload, because the charge never reads the live printer. A
+        snapshot, never a reference: the client keeps mutating its state."""
+        live = _ended_state(
+            state,
+            progress=42.0,
+            layer=88,
+            total_layers=200,
+            tray_change_log=[(0, 0), (1, 60)],
+            tray_now=1,
+            last_loaded_tray=1,
+            raw_data={"mapping": [0, 65535]},
+        )
+
+        payload = ended_payload(live, _GHOST)
+
+        assert {key: payload[key] for key in job_consumption_evidence(live)} == {
+            "total_layers": 200,
+            "tray_change_log": [(0, 0), (1, 60)],
+            "tray_now": 1,
+            "last_loaded_tray": 1,
+            "mqtt_mapping": [0, 65535],
+        }
+        live.tray_change_log.append((2, 90))
+        assert payload["tray_change_log"] == [(0, 0), (1, 60)]
+
     def test_idle_synthesises_an_unknown_outcome(self):
         """The one classifier turns ``outcome_unknown`` into ``reconcile_unknown`` — the run HOLDS for
         a human instead of finishing one plate short (2026-09-19)."""
-        payload = ended_payload(_ended_state("IDLE"), _GHOST)
+        payload = ended_payload(_ended_state("IDLE", tray_change_log=[(0, 0)], tray_now=0), _GHOST)
         assert payload["status"] == "aborted"
         assert payload["outcome_unknown"] is True
         assert payload["subtask_id"] == "ARCHIVE_ID"
         assert "last_progress" not in payload  # no fabricated evidence
+        assert "tray_change_log" not in payload and "mqtt_mapping" not in payload  # nothing to charge from
         assert payload["peaks_reliable"] is False
 
 
@@ -291,6 +323,24 @@ async def _log_statuses(maker, archive_id: int) -> list[str]:
     async with maker() as s:
         rows = await s.execute(select(PrintLogEntry.status).where(PrintLogEntry.archive_id == archive_id))
         return [status for (status,) in rows.all()]
+
+
+async def _log_grams(maker, archive_id: int) -> list[float | None]:
+    from backend.app.models.print_log import PrintLogEntry
+
+    async with maker() as s:
+        rows = await s.execute(select(PrintLogEntry.filament_used_grams).where(PrintLogEntry.archive_id == archive_id))
+        return [grams for (grams,) in rows.all()]
+
+
+async def _set_archive_grams(maker, archive_id: int, grams: float) -> None:
+    """The slicer estimate the archive carries — what a print-log row may scale."""
+    from backend.app.models.archive import PrintArchive
+
+    async with maker() as s:
+        archive = await s.get(PrintArchive, archive_id)
+        archive.filament_used_grams = grams
+        await s.commit()
 
 
 class _Reconnect:
@@ -461,6 +511,7 @@ class TestEnded:
         assert plate_occupancy.is_plate_occupied(pid) is True
         assert plate_occupancy.snapshot(pid).plate_policy == CooldownEject(unit_id=unit_id, run_id=_run)
         reconnect.usage.assert_awaited_once()
+        assert reconnect.usage.await_args.kwargs["charge"] == "full"  # the printer said FINISH of THIS job
         reconnect.on_terminal.assert_awaited_once()
 
     async def test_idle_on_this_job_is_an_unknown_outcome_that_holds_the_run(self, own_session_factory):
@@ -478,6 +529,10 @@ class TestEnded:
         unit = await _row(maker, PrintQueueItem, unit_id)
         assert (unit.status, unit.stop_source) == ("cancelled", "reconcile_unknown")
         assert plate_occupancy.is_plate_occupied(pid) is True  # fail-closed: nobody measured the deposit
+        # ...and nobody measured its filament either: the one charge path runs on a ``none`` basis —
+        # it consumes the job's usage session and charges nothing.
+        reconnect.usage.assert_awaited_once()
+        assert reconnect.usage.await_args.kwargs["charge"] == "none"
 
 
 @pytest.mark.asyncio
@@ -621,3 +676,62 @@ class TestNothingToDo:
             assert await _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING")).run(pid) == 0
 
         assert (await archive_row(maker, archive_id)).status == "printing"
+
+
+@pytest.mark.asyncio
+class TestTheRunLogFollowsTheChargeBasis:
+    """The print-log row's grams (Stats, the accounting feed) follow the SAME basis the spool is
+    charged on — the job's own evidence, never a key the payload does not carry: ``main`` used to
+    scale a partial run by ``data["progress"]``, which no terminal payload has, so every stopped
+    print logged no grams. Every lane that writes a run's row is covered: the real terminal, and the
+    reconcile's ``observed`` / ``superseded`` job phase."""
+
+    async def test_a_reconciled_failure_logs_the_share_its_own_progress_measured(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1")
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J1", state="FAILED", progress=25.0))
+        assert await reconnect.run(pid) == 1
+
+        assert reconnect.usage.await_args.kwargs["charge"] == "partial"
+        assert await _log_grams(maker, archive_id) == [20.0]
+
+    async def test_an_unknown_outcome_logs_no_grams(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1")
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J1", state="IDLE", progress=0.0))
+        assert await reconnect.run(pid) == 1
+
+        assert await _log_grams(maker, archive_id) == [None]
+
+    async def test_a_superseded_run_logs_no_grams(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1")
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING", progress=95.0))
+        assert await reconnect.run(pid) == 1
+
+        assert await _log_grams(maker, archive_id) == [None]  # never the running job's 95 %
+
+    @pytest.mark.parametrize(("unit_status", "grams"), [("completed", 80.0), ("failed", None), ("cancelled", None)])
+    async def test_an_observed_run_logs_the_plate_only_when_it_completed(self, own_session_factory, unit_status, grams):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="J1")
+        await _set_archive_grams(maker, archive_id, 80.0)
+        await _seed_farm_unit(maker, pid, dispatch="J1", status=unit_status, completed_at=datetime.now(timezone.utc))
+
+        reconnect = _Reconnect(maker, live_state(subtask_id="J2", state="RUNNING", progress=95.0))
+        assert await reconnect.run(pid) == 1
+
+        assert await _log_grams(maker, archive_id) == [grams]

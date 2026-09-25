@@ -135,7 +135,7 @@ async def hold_write_lock(db: AsyncSession) -> None:
     first is a READ transaction pinned to that snapshot; if another connection then
     commits, SQLite refuses to upgrade the stale snapshot to a writer and fails the
     write at once with ``database is locked`` (SQLITE_BUSY_SNAPSHOT) — the busy
-    handler never runs, so ``busy_timeout`` does not help. That is what lost 20
+    handler never runs, so ``busy_timeout`` does not help. That is what lost 18
     requeues in production between 2026-09-06 and 09-24: a SAVEPOINT opened a
     deferred transaction, ``SELECT max(position)`` pinned the snapshot, the plate
     authority's persist task committed, and the retry's INSERT died. ``BEGIN
@@ -4179,6 +4179,15 @@ async def run_migrations(conn):
     # Idempotent ADD COLUMN, dialect-safe on SQLite + Postgres.
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN eject_dispatched_at TIMESTAMP NULL")
 
+    # The operator's Stop, durable (2026-09-25): the stop request on the unit row
+    # (``print_control.stop_as_operator`` stamps it before the ``print.stop`` goes out) and
+    # the marker that the printer's terminal answered a stop the queue page recorded ahead
+    # of it (``queue_transitions.annotate_stopped_unit``). Replaces the process-memory
+    # ``_user_stopped_printers`` set a restart emptied. Idempotent ADD COLUMN, dialect-safe.
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN operator_stop_requested_at TIMESTAMP NULL")
+    await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN stop_answered_at TIMESTAMP NULL")
+    await _migrate_queue_page_stops_carry_their_stamp(conn)
+
     # Migration: Disambiguate the four ``user_print_*`` notification template
     # names by appending " Email" (#1792). See ``_migrate_rename_user_print_template_names``.
     await _migrate_rename_user_print_template_names(conn)
@@ -6121,6 +6130,32 @@ async def _migrate_aborted_queue_items_to_cancelled(conn) -> None:
         )
     if result.rowcount:
         logger.info("[MIGRATION] %d queue unit(s) recorded 'aborted' → 'cancelled'", result.rowcount)
+
+
+async def _migrate_queue_page_stops_carry_their_stamp(conn) -> None:
+    """Give every unit an operator's UI Stop ended its durable stop request.
+
+    ``print_queue.operator_stop_requested_at`` is the fact the terminal classifies an operator
+    stop from. A row recorded ``cancelled`` / ``operator_ui`` is, by that token's one meaning, a
+    unit an operator stopped from the UI — but builds before the column existed kept the request
+    only in process memory, so such a row carries no stamp. The one row that matters is the one
+    a deploy lands on: stopped from the queue page on the old build, its printer's terminal
+    arriving on the new one, which would then classify it as no stop at all. The stop time the
+    route recorded (``completed_at``) is the request's instant. ONE self-predicating statement,
+    like the ``aborted`` repair above: every writer since stamps before it records the stop, so
+    a later boot matches no row.
+    """
+    from sqlalchemy import text
+
+    async with conn.begin_nested():
+        result = await conn.execute(
+            text(
+                "UPDATE print_queue SET operator_stop_requested_at = COALESCE(completed_at, CURRENT_TIMESTAMP) "
+                "WHERE status = 'cancelled' AND stop_source = 'operator_ui' AND operator_stop_requested_at IS NULL"
+            )
+        )
+    if result.rowcount:
+        logger.info("[MIGRATION] %d operator-stopped queue unit(s) given their durable stop request", result.rowcount)
 
 
 _USER_PRINT_TEMPLATE_RENAMES: tuple[tuple[str, str, str], ...] = (

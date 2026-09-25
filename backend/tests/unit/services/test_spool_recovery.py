@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
 from typing import get_args
@@ -422,6 +423,19 @@ class FakeClient:
         self._sent("pause")
         self.state.state = "PAUSE"
         return True
+
+
+@contextmanager
+def _driver_logs(caplog):
+    """Capture the driver's own lines AND the ``[ams-command]`` answer lines its sends produce,
+    which ``ams_command`` logs under ITS logger. A case asserting on those must capture that
+    logger itself: these cases used to pass only because the driver's call-time import of
+    ``main`` (the deleted user-stop mark's reader) configured root logging mid-test."""
+    with (
+        caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"),
+        caplog.at_level(logging.INFO, logger="backend.app.services.ams_command"),
+    ):
+        yield
 
 
 def _wire(monkeypatch, state, client, *, on_poll=None):
@@ -1932,7 +1946,7 @@ async def test_incident_pin_unloads_before_first_load_when_ams_stuck_mid_change(
     client = FakeClient(state)
     _wire(monkeypatch, state, client)
 
-    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+    with _driver_logs(caplog):
         task = await on_ams_fault(printer.id, state)
         await task
 
@@ -2039,7 +2053,7 @@ async def test_an_unload_that_never_completed_never_leads_to_a_load(
     client = FakeClient(state, **{unload_knob: True})
     _wire(monkeypatch, state, client)
 
-    with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+    with _driver_logs(caplog):
         task = await on_ams_fault(printer.id, state)
         await task
 
@@ -5932,26 +5946,49 @@ _FRAME: dict[str, tuple] = {
 
 
 @pytest.fixture
-def user_stop():
-    """The queue UI's Stop mark (``main``), per printer: set it, or clear one an earlier
-    case left so it cannot stand in for this case's. Every printer touched is cleared
-    after the case."""
-    from backend.app import main as app_main
+def user_stop(db_session):
+    """The Bambuddy UI's Stop: the DURABLE request ``print_control.stop_as_operator``
+    commits on the job's unit before the ``print.stop`` goes out (2026-09-25 — it used to be
+    a process-memory mark ``main`` dropped at the terminal's own callback, and a restart
+    emptied). ``request`` stamps the printing unit dispatched as ``job`` through the one
+    writer (``queue_transitions.stamp_operator_stop``), creating that unit when the case has
+    none; ``ended`` then records the unit's end the way the terminal's callback would.
 
-    touched: set[int] = set()
+    Stamped BEFORE the verb's window opens, because the recorded request is a fact about the
+    job rather than an instant: the reader asks it at the terminal, and a Stop pressed before
+    the verb went out ended the same print. No case needs to clear one — the database is the
+    case's own."""
+    from sqlalchemy import update
 
-    class _Marks:
-        def mark(self, printer_id: int) -> None:
-            touched.add(printer_id)
-            app_main.mark_printer_stopped_by_user(printer_id)
+    from backend.app.services.queue_transitions import stamp_operator_stop
 
-        def clear(self, printer_id: int) -> None:
-            touched.add(printer_id)
-            app_main._user_stopped_printers.discard(printer_id)  # noqa: SLF001
+    class _Requests:
+        async def request(self, printer_id: int, *, job: str = "task-1", ended: str | None = None) -> None:
+            item = (
+                (
+                    await db_session.execute(
+                        select(PrintQueueItem).where(
+                            PrintQueueItem.printer_id == printer_id, PrintQueueItem.dispatch_subtask_id == job
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if item is None:
+                item = PrintQueueItem(
+                    printer_id=printer_id, status="printing", dispatch_subtask_id=job, started_at=datetime.utcnow()
+                )
+                db_session.add(item)
+                await db_session.commit()
+            assert await stamp_operator_stop(db_session, item.id, requested_at=datetime.utcnow())
+            if ended is not None:
+                await db_session.execute(
+                    update(PrintQueueItem).where(PrintQueueItem.id == item.id).values(status=ended)
+                )
+            await db_session.commit()
 
-    yield _Marks()
-    for printer_id in touched:
-        app_main._user_stopped_printers.discard(printer_id)  # noqa: SLF001
+    return _Requests()
 
 
 class TestTheLeverTable:
@@ -6141,13 +6178,10 @@ class TestTheReader:
         assert ("pause",) in client.calls  # the hung arm, at the deadline
         assert len(running_polls_before_pause) > 1  # not on the first sample
 
-    async def test_a_terminal_the_operator_did_not_produce_reads_ended(
-        self, db_session, printer_factory, monkeypatch, user_stop
-    ):
+    async def test_a_terminal_the_operator_did_not_produce_reads_ended(self, db_session, printer_factory, monkeypatch):
         """A verb with an unmeasured effect ENDED the print inside its own window, and no
-        operator Stop mark stands: ``ended`` — the driver records it itself."""
+        operator Stop request stands: ``ended`` — the driver records it itself."""
         printer = await printer_factory()
-        user_stop.clear(printer.id)
         state = _make_state(tray_now=0, ams_status_main=1)
         client = FakeClient(state, resume_unwedges=False)
 
@@ -6166,13 +6200,13 @@ class TestTheReader:
         self, db_session, printer_factory, monkeypatch, caplog, user_stop
     ):
         printer = await printer_factory()
+        await user_stop.request(printer.id)  # the UI's Stop: the request, committed before the stop
         state = _make_state(tray_now=0, ams_status_main=1)
         client = FakeClient(state, resume_unwedges=False)
 
         def _on_poll(_n, st):
             if ("clean_print_error",) in client.calls and st.state != "FAILED":
-                user_stop.mark(printer.id)  # the queue UI's Stop: the mark, then the terminal
-                st.state = "FAILED"
+                st.state = "FAILED"  # ...and the terminal it produced
 
         _wire(monkeypatch, state, client, on_poll=_on_poll)
 
@@ -6186,14 +6220,13 @@ class TestTheReader:
 
     @pytest.mark.parametrize("stamp,expected", [("after_publish", "abort"), ("before_publish", "ended")])
     async def test_a_cancel_echo_newer_than_the_publish_is_the_operators_stop(
-        self, db_session, printer_factory, monkeypatch, caplog, user_stop, stamp, expected
+        self, db_session, printer_factory, monkeypatch, caplog, stamp, expected
     ):
-        """A TOUCHSCREEN Stop sets no UI mark; the H2S firmware answers it with a cancel
+        """A TOUCHSCREEN Stop records no UI request; the H2S firmware answers it with a cancel
         echo the client stamps (``user_cancel_seen_at``, wall clock). A stamp NEWER than the
         verb's publish is the operator's Stop inside the window → the ``job_ended`` abort.
         An OLDER stamp is an echo this window did not produce → the verb ended the print."""
-        printer = await printer_factory()
-        user_stop.clear(printer.id)  # no UI mark: the cancel echo is the only witness
+        printer = await printer_factory()  # no UI request: the cancel echo is the only witness
         state = _make_state(tray_now=0, ams_status_main=1)
         if stamp == "before_publish":
             state.user_cancel_seen_at = time.time() - 60.0
@@ -6217,12 +6250,14 @@ class TestTheReader:
         )
         assert aborted is (expected == "abort")
 
-    async def test_a_stop_mark_the_terminal_callback_already_dropped_is_still_the_operators(
+    async def test_a_stop_the_terminal_callback_already_recorded_is_still_the_operators(
         self, db_session, printer_factory, monkeypatch, user_stop
     ):
-        """``main`` drops the mark in the terminal's own callback, which can run between two
-        of the reader's polls: a mark seen once inside the window is latched."""
+        """``main``'s terminal callback can run between two of the reader's polls and END the
+        unit first. The in-memory mark it used to DROP there needed a latch; the durable
+        request is read off the row in any status, so the ended unit still says who stopped it."""
         printer = await printer_factory()
+        await user_stop.request(printer.id, ended="cancelled")  # the Stop, and the callback's end
         state = _make_state(tray_now=0, ams_status_main=1)
         client = FakeClient(state, resume_unwedges=False)
         polls = {"n": 0}
@@ -6231,10 +6266,7 @@ class TestTheReader:
             if ("clean_print_error",) not in client.calls:
                 return
             polls["n"] += 1
-            if polls["n"] == 1:
-                user_stop.mark(printer.id)  # the Stop is pressed
-            elif polls["n"] == 2:
-                user_stop.clear(printer.id)  # the terminal callback already dropped the mark
+            if polls["n"] == 2:
                 st.state = "FAILED"
 
         _wire(monkeypatch, state, client, on_poll=_on_poll)
@@ -6242,6 +6274,27 @@ class TestTheReader:
         read, _evidence = await self._read(db_session, printer.id, client, "clean_print_error", step_timeout_s=1.0)
 
         assert read.reading == "abort"
+
+    async def test_a_foreign_prints_ui_stop_is_read_from_the_echo_alone(
+        self, db_session, printer_factory, monkeypatch, user_stop
+    ):
+        """A FOREIGN print has no unit, so a UI stop of it records no request (2026-09-25):
+        the farm's stamped unit on this printer belongs to ANOTHER job and says nothing about
+        this one. Without a cancel echo the terminal reads as the verb's own ``ended``."""
+        printer = await printer_factory()
+        await user_stop.request(printer.id, job="FARM-OTHER")
+        state = _make_state(tray_now=0, ams_status_main=1)
+        client = FakeClient(state, resume_unwedges=False)
+
+        def _on_poll(_n, st):
+            if ("clean_print_error",) in client.calls:
+                st.state = "FAILED"
+
+        _wire(monkeypatch, state, client, on_poll=_on_poll)
+
+        read, _evidence = await self._read(db_session, printer.id, client, "clean_print_error")
+
+        assert read.reading == "ended"
 
     @pytest.mark.parametrize(
         "tray_now,expected",
@@ -6252,10 +6305,9 @@ class TestTheReader:
         ],
     )
     async def test_a_finish_inside_the_window_is_the_print_completing(
-        self, db_session, printer_factory, monkeypatch, user_stop, tray_now, expected
+        self, db_session, printer_factory, monkeypatch, tray_now, expected
     ):
         printer = await printer_factory()
-        user_stop.clear(printer.id)
         state = _make_state(tray_now=tray_now, ams_status_main=1)
         client = FakeClient(state)  # the resume moves the change on and runs
         running = {"n": 0}
@@ -6578,7 +6630,7 @@ class TestTheLoadedWedge:
 
         monkeypatch.setattr(spool_recovery, "_unload_and_confirm", _reentered)
 
-        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        with _driver_logs(caplog):
             task = await on_ams_fault(printer.id, state)
             await task
 
@@ -6619,7 +6671,7 @@ class TestTheLoadedWedge:
 
         monkeypatch.setattr(spool_recovery, "_load_and_confirm", _reentered)
 
-        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        with _driver_logs(caplog):
             task = await on_ams_fault(printer.id, state)
             await task
 
@@ -6663,7 +6715,7 @@ class TestTheLoadedWedge:
         oor.assert_not_awaited()
 
     async def test_a_verb_that_ends_the_print_closes_the_row_as_the_driver_and_pages(
-        self, db_session, printer_factory, install_settings, monkeypatch, user_stop
+        self, db_session, printer_factory, install_settings, monkeypatch
     ):
         """``clean_print_error`` ENDS the print inside its window and no operator Stop
         stands: the driver closes its own row (``driver_ended``) and pages
@@ -6674,7 +6726,6 @@ class TestTheLoadedWedge:
 
         install_settings(step_timeout_s=0.05)
         printer = await printer_factory()
-        user_stop.clear(printer.id)
         item = await _farm_item(db_session, printer.id, ams_mapping="[3, -1, -1, -1]")
         failed = _spy(monkeypatch, "on_spool_recovery_failed")
         quarantine = AsyncMock(return_value=True)
@@ -6706,17 +6757,17 @@ class TestTheLoadedWedge:
     async def test_an_operator_stop_inside_a_verb_window_is_the_abort(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog, user_stop
     ):
-        """The same terminal, with the queue UI's Stop mark standing: the operator's —
-        today's ``job_ended`` abort, no page."""
+        """The same terminal, with the UI's Stop request standing on the unit: the operator's
+        — today's ``job_ended`` abort, no page."""
         install_settings(step_timeout_s=0.05)
         printer = await printer_factory()
         await _farm_item(db_session, printer.id, ams_mapping="[3, -1, -1, -1]")
+        await user_stop.request(printer.id)  # stamps THAT unit (dispatched as task-1)
         failed = _spy(monkeypatch, "on_spool_recovery_failed")
         state, client = _wedge_012()
 
         def _on_poll(_n, st):
             if ("clean_print_error",) in client.calls and st.state != "FAILED":
-                user_stop.mark(printer.id)
                 st.state = "FAILED"
 
         _wire(monkeypatch, state, client, on_poll=_on_poll)
@@ -6754,7 +6805,7 @@ class TestTheLoadedWedge:
 
         monkeypatch.setattr(spool_recovery, "_unload_and_confirm", _reentered)
 
-        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        with _driver_logs(caplog):
             task = await on_ams_fault(printer.id, state)
             await task
 
@@ -6830,7 +6881,7 @@ class TestTheConfirmWindow:
 
         _wire(monkeypatch, state, client, on_poll=_poll)
 
-        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+        with _driver_logs(caplog):
             task = await on_ams_fault(printer.id, state)
             await task
 

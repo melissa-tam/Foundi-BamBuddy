@@ -2839,6 +2839,7 @@ def _outcome(verdict=None, *, recorded="cancelled", faults=frozenset(), refusal=
         failure_category=None,
         printer_message=None,
         plate_refusal=refusal,
+        charge="full" if recorded == "completed" else "partial",  # the policy never reads it
     )
 
 
@@ -3403,5 +3404,5 @@ class TestEscalationNeverStops:
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
         }
-        forbidden = {"stop_print", "mark_printer_stopped_by_user"}
+        forbidden = {"stop_print", "stop_as_operator", "stamp_operator_stop"}
         assert called & forbidden == set(), f"spool_recovery must never stop a print: {called & forbidden}"

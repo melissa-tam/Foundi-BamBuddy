@@ -770,6 +770,38 @@ class PrinterState:
     reported_model: str | None = None
 
 
+def job_consumption_evidence(state: PrinterState) -> dict[str, object]:
+    """The per-job consumption evidence a terminal payload carries — read off ``state`` NOW.
+
+    A consumer of a terminal must never read the live printer for these: by the time it runs,
+    the printer can describe ANOTHER job (2026-09-16 → 24, ~7.2 kg went out over 32 phantom
+    charges read off the live printer while it ran the next print). So the terminal captures them
+    at the moment it fires, and every value is a SNAPSHOT, never a reference — the client keeps
+    mutating its state for the next job. ONE spelling of the key set, for both producers: the MQTT
+    client's terminal and the downtime reconcile's ``ended`` synthesis (``print_reconcile``), which
+    reads a state it has proven describes the SAME job (the subtask id matched). The consumer is
+    ``usage_tracker.JobEvidence.from_payload``.
+
+    * ``total_layers`` — the job's slicer layer count, the per-tray split's denominator, kept
+      across the firmware's end-of-print 0 (#1771);
+    * ``tray_change_log`` — every ``(global_tray_id, layer)`` the job switched to, the per-tray
+      split's segments, seeded at an observed print start and cleared at an attach;
+    * ``tray_now`` — the tray fed at the terminal (often 255 by now: unloaded, or Ext-R on H2);
+    * ``last_loaded_tray`` — the last real tray this job fed (-1 = none observed);
+    * ``mqtt_mapping`` — the printer-reported ``mapping`` field (slicer slot → snow-encoded tray),
+      verbatim; decode with ``usage_tracker._decode_mqtt_mapping``. None when the printer never
+      reported one. Not the payload's ``ams_mapping``, which is the request-topic capture of the
+      print command.
+    """
+    return {
+        "total_layers": state.total_layers,
+        "tray_change_log": list(state.tray_change_log),
+        "tray_now": state.tray_now,
+        "last_loaded_tray": state.last_loaded_tray,
+        "mqtt_mapping": copy.deepcopy((state.raw_data or {}).get("mapping")),
+    }
+
+
 # Stage name mapping from BambuStudio DeviceManager.cpp
 STAGE_NAMES = {
     0: "Printing",
@@ -4754,12 +4786,8 @@ class BambuMQTTClient:
                     "hms_errors": hms_errors_data,
                     "ams_mapping": self._captured_ams_mapping,
                     # ---- The job's consumption evidence — a consumer must never read the
-                    # live printer for these. Captured HERE, at the terminal, from this
-                    # client's per-job state: by the time a consumer runs, the live
-                    # printer can describe ANOTHER job — 2026-09-16→24, ~7.2 kg went out
-                    # over 32 phantom charges read from the live printer's progress while
-                    # it ran the next print. Every value is a snapshot, never a
-                    # reference: the client keeps mutating its state for the next job.
+                    # live printer for these (``job_consumption_evidence`` says why, and
+                    # owns the per-job key set it shares with the reconcile's synthesis).
                     #
                     # Last valid progress/layer before firmware reset (for partial usage tracking)
                     "last_progress": self._last_valid_progress,
@@ -4769,21 +4797,7 @@ class BambuMQTTClient:
                     # recovery), so a consumer deciding "did this leave a part on the
                     # plate?" must fail closed instead of trusting a zero.
                     "peaks_reliable": self._peaks_reliable,
-                    # The job's slicer layer count — the per-tray split's denominator,
-                    # kept across the firmware's end-of-print 0 (#1771).
-                    "total_layers": self.state.total_layers,
-                    # Every (global_tray_id, layer) the job switched to — the per-tray
-                    # split's segments, seeded at an observed print start.
-                    "tray_change_log": list(self.state.tray_change_log),
-                    # The tray fed at the terminal (often 255 by now: unloaded, or Ext-R
-                    # on H2) and the last real tray this job fed (-1 = none observed).
-                    "tray_now": self.state.tray_now,
-                    "last_loaded_tray": self.state.last_loaded_tray,
-                    # The printer-reported `mapping` field (slicer slot → snow-encoded
-                    # tray, verbatim — decode with usage_tracker._decode_mqtt_mapping;
-                    # None when the printer never reported one). Not `ams_mapping` above,
-                    # which is the request-topic capture of the print command.
-                    "mqtt_mapping": copy.deepcopy(self.state.raw_data.get("mapping")),
+                    **job_consumption_evidence(self.state),
                     # Operator-cancel echo seen during this print (Phase 3.1): lets the
                     # terminal-status handler classify a screen-stop and skip retry /
                     # quarantine for it. False on a genuine failure or normal finish.
@@ -7252,7 +7266,7 @@ class BambuMQTTClient:
 
         ``STOP_PRINTING`` is deliberately NOT dispatched here (2026-09-24): an operator
         stopping a print from the HMS dialog is the operator's Stop, whose one owner is
-        ``print_control.stop_as_operator`` (the stop AND the user-stopped mark) — the
+        ``print_control.stop_as_operator`` (the durable stop request AND the stop) — the
         route sends it there, and this dispatcher answers False for it like any other
         action it does not own.
 

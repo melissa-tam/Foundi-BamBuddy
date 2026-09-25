@@ -259,8 +259,8 @@ _INCIDENT_CLOSERS = {
 
 # --- The operator stop, and who may send one (2026-09-19) --------------------------
 
-# WHO may call ``print_control.stop_as_operator``. The pair it sends (MQTT ``print.stop``
-# plus the user-stopped mark) MEANS "a human pressed Stop", and the whole terminal
+# WHO may call ``print_control.stop_as_operator``. The pair it sends (the durable stop
+# request on the running unit, then MQTT ``print.stop``) MEANS "a human pressed Stop", and the whole terminal
 # disposition downstream is built on that meaning: the unit lands ``cancelled`` with a
 # ``stop_source``, the run holds, RESUME tops the deficit back up. Every caller is a Stop
 # an operator can actually press:
@@ -268,7 +268,7 @@ _INCIDENT_CLOSERS = {
 #                                     dialog "Stop printing" (2026-09-24);
 #   * ``api/routes/print_queue.py`` — the queue page's stop;
 #   * ``api/routes/webhook.py``     — an API client's ``/stop`` and ``/cancel`` (2026-09-24:
-#                                     both used to send a bare stop with no mark — and
+#                                     both used to send a bare stop with no request — and
 #                                     ``/cancel`` called a method that does not exist).
 # The third caller used to be ``service_hold.quiesce``, and deleting it IS the 2026-09-19
 # ruling: **no mode verb ends a print.** Entering maintenance mode or deactivating a
@@ -283,15 +283,15 @@ _OPERATOR_STOP_CALLERS = {
     ("api", "routes", "webhook.py"),
 }
 
-# WHO may send a RAW ``stop_print`` — the MQTT ``print.stop`` WITHOUT the operator mark.
+# WHO may send a RAW ``stop_print`` — the MQTT ``print.stop`` WITHOUT the operator's request.
 # A bare stop is the FARM ending a job it owns, and there are exactly two such acts:
-#   * ``print_control``   — the operator verb itself (the stop, then the mark);
+#   * ``print_control``   — the operator verb itself (the request, then the stop);
 #   * ``eject/remote``    — the eject lane's kill of its OWN sweep (the runtime watchdog,
 #                           the start deadline, the re-drive).
 # ``printer_manager`` is the per-printer facade that forwards to the client.
 # ``pause_recovery``'s plate-check stop is gone (2026-09-24: the printer's plate check
 # PAUSES the job for a human, and the farm sends nothing), and so is every route's bare
-# stop — an operator's stop goes through ``print_control`` so it carries its mark.
+# stop — an operator's stop goes through ``print_control`` so it carries its request.
 _RAW_STOP_CALLERS = {
     ("services", "print_control.py"),
     ("services", "eject", "remote.py"),
@@ -351,8 +351,8 @@ class TestRawStopOwnership:
             pytest.fail(
                 "A raw stop_print is sent outside the allowlisted lanes:\n"
                 + "\n".join(strays)
-                + "\n\nAn operator's stop goes through print_control.stop_as_operator (it carries the "
-                "user-stopped mark, so the terminal records a cancel). A farm lane that must end its own "
+                + "\n\nAn operator's stop goes through print_control.stop_as_operator (it records the "
+                "durable stop request, so the terminal records a cancel). A farm lane that must end its own "
                 "job is a decision to argue in the diff, and belongs in the allowlist with its reason."
             )
 
@@ -429,6 +429,80 @@ class TestOperatorStopOwnership:
         callers = _OPERATOR_STOP_CALLERS - {("services", "print_control.py")}
         senders = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_operator_stops(f)}
         assert senders == callers
+
+
+# --- The operator's stop REQUEST is durable and has one writer (2026-09-25) -------------
+
+# ``print_queue.operator_stop_requested_at`` is the ONE store of "an operator asked this
+# unit's print to stop". It replaced ``main._user_stopped_printers``, a process-memory set a
+# restart emptied — after a deploy the farm's own stopped job resolved FOREIGN. Written
+# (non-NULL) only by ``queue_transitions.stamp_operator_stop``, called only by the verb; set
+# NULL only where a unit is RE-ARMED (the dead-claim release, the skipped-unit restore).
+_STOP_REQUEST_COLUMN = "operator_stop_requested_at"
+_STOP_REQUEST_WRITER = ("services", "queue_transitions.py")
+_STOP_REQUEST_CLEARERS = {("services", "queue_transitions.py"), ("api", "routes", "print_queue.py")}
+# The names of the deleted process-memory mark: none may come back as a second store.
+_DELETED_STOP_MARK = {"_user_stopped_printers", "mark_printer_stopped_by_user", "printer_stopped_by_user"}
+
+
+def _stop_request_writes(tree: ast.Module) -> list[tuple[bool, int]]:
+    """Every write of the request column: ``(is_a_clear, line)``. A keyword argument (the
+    ``update().values(...)`` shape) or an attribute assignment (the ORM shape)."""
+    writes: list[tuple[bool, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == _STOP_REQUEST_COLUMN:
+                    writes.append((isinstance(kw.value, ast.Constant) and kw.value.value is None, node.lineno))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr == _STOP_REQUEST_COLUMN:
+                    writes.append((isinstance(node.value, ast.Constant) and node.value.value is None, node.lineno))
+    return writes
+
+
+class TestOperatorStopRequestOwnership:
+    """ONE store, ONE writer, ONE caller. SOURCE pins: a second store (a process set again) or
+    a second writer is well-formed code every seeded test passes — until a restart."""
+
+    def test_only_the_transitions_owner_writes_a_request_and_only_re_arm_writers_clear_one(self):
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for is_clear, line in _stop_request_writes(tree):
+                allowed = _STOP_REQUEST_CLEARERS if is_clear else {_STOP_REQUEST_WRITER}
+                if parts not in allowed:
+                    strays.append(f"  - {'/'.join(parts)}:{line} {'clears' if is_clear else 'writes'} the request")
+        assert not strays, "operator_stop_requested_at written outside its owners:\n" + "\n".join(strays)
+
+    def test_the_writers_and_clearers_are_still_there(self):
+        """The liveness half."""
+        writers = {parts for parts, tree in _app_trees() if any(not c for c, _ in _stop_request_writes(tree))}
+        clearers = {parts for parts, tree in _app_trees() if any(c for c, _ in _stop_request_writes(tree))}
+        assert (writers, clearers) == ({_STOP_REQUEST_WRITER}, _STOP_REQUEST_CLEARERS)
+
+    def test_only_the_operator_verb_stamps_a_request(self):
+        callers = {
+            parts
+            for parts, tree in _app_trees()
+            if parts != _STOP_REQUEST_WRITER
+            and any(isinstance(n, ast.Call) and _called_attr(n) == "stamp_operator_stop" for n in ast.walk(tree))
+        }
+        assert callers == {("services", "print_control.py")}
+
+    def test_the_process_memory_mark_is_gone(self):
+        """Its names may not return — not as a set, not as its mark/read functions."""
+        hits = [
+            f"  - {'/'.join(parts)}:{node.lineno} {name}"
+            for parts, tree in _app_trees()
+            for node in ast.walk(tree)
+            for name in (
+                getattr(node, "id", None),
+                getattr(node, "attr", None),
+                getattr(node, "name", None),
+            )
+            if name in _DELETED_STOP_MARK
+        ]
+        assert not hits, "the deleted in-memory stop mark is back:\n" + "\n".join(hits)
 
 
 # --- Putting a plate back has ONE owner (operator ruling 2026-09-24) ----------------
@@ -2320,3 +2394,132 @@ class TestEjectLineOwnership:
             )
         owner = {what for what, _ in _scan_shop_air_sample_writes(BACKEND_DIR.joinpath(*_SHOP_AIR_OWNER))}
         assert {"ShopAirSample()", "insert(ShopAirSample)", "delete(ShopAirSample)"} <= owner
+
+
+# --- The filament charge's one path (2026-09-25) ---------------------------------------------
+
+_USAGE_TRACKER = ("services", "usage_tracker.py")
+_USAGE_TRACKER_MODULE = "backend.app.services.usage_tracker"
+_SPOOLMAN_TRACKING = ("services", "spoolman_tracking.py")
+# A job's consumption fields, as a live PrinterState names them.
+_JOB_FIELDS = frozenset({"progress", "layer_num", "total_layers", "tray_now", "last_loaded_tray", "tray_change_log"})
+# Every function that turns a terminal into grams, in both inventories and the print log.
+_CHARGE_FUNCTIONS: dict[tuple[str, ...], set[str]] = {
+    _USAGE_TRACKER: {"on_print_complete", "_track_from_3mf"},
+    _SPOOLMAN_TRACKING: {"cleanup_tracking", "_report_partial_usage", "report_usage"},
+    ("services", "job_terminal.py"): {
+        "charge_usage",
+        "_charge_spoolman",
+        "write_run_log",
+        "compute_run_filament_grams",
+    },
+}
+
+
+class TestUsageChargeOwnership:
+    """A charge follows the terminal's OWN evidence, through ONE path (2026-09-25).
+
+    Production 2026-09-16 → 24 charged ~7.2 kg over 32 phantom charges: a terminal processed while
+    the printer ran another job was scaled by the LIVE printer's progress, and popped the running
+    job's usage session. The behaviour tests pin the charge; these pin the SHAPE that keeps a second
+    reading from growing back — each failure they catch is a well-formed live read that every
+    behaviour test with a self-consistent mock passes."""
+
+    def test_the_charge_has_one_caller_on_the_outcomes_basis(self):
+        """``usage_tracker.on_print_complete`` is reached only through ``job_terminal.charge_usage`` —
+        the job phase's (f) — which hands it the outcome's basis. A second caller is a second charge
+        path, and the lane that decided nothing about the basis is the one that would guess."""
+        callers: list[tuple[str, int]] = []
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                imported = (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == _USAGE_TRACKER_MODULE
+                    and any(alias.name == "on_print_complete" for alias in node.names)
+                )
+                called = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "on_print_complete"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "usage_tracker"
+                )
+                if imported or called:
+                    callers.append(("/".join(parts), node.lineno))
+        assert [path for path, _ in callers] == ["services/job_terminal.py"], callers
+
+        from backend.app.services import job_terminal
+
+        assert "charge=outcome.charge" in _source_of(job_terminal.charge_usage)
+
+    def test_the_charge_path_reads_the_live_printer_once_and_only_for_its_hardware(self):
+        """Every ``get_status`` in the tracker is the print-START snapshot or the ONE hardware read of
+        ``on_print_complete``; the 3MF lane takes no printer manager at all — how far the job ran and
+        which trays fed it is ``JobEvidence``, off the terminal payload."""
+        tree = ast.parse(BACKEND_DIR.joinpath(*_USAGE_TRACKER).read_text(encoding="utf-8"))
+        reads = sorted(
+            qual for qual, node in _scopes(tree) if isinstance(node, ast.Call) and _called_attr(node) == "get_status"
+        )
+        assert reads == ["on_print_complete", "on_print_start"], reads
+
+        track = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_track_from_3mf")
+        params = {arg.arg for arg in (*track.args.args, *track.args.kwonlyargs)}
+        assert "printer_manager" not in params
+        assert {"charge", "evidence", "hardware"} <= params
+
+    def test_the_spoolman_lane_reads_the_live_printer_only_for_its_hardware(self):
+        """The Spoolman lane's live reads are the print-START snapshot (``store_print_data``) and the
+        trays' remain% at the end (``report_usage`` Path 2, the no-3MF branch of
+        ``_report_partial_usage``) — never a layer or a progress: those are ``JobEvidence``."""
+        tree = ast.parse(BACKEND_DIR.joinpath(*_SPOOLMAN_TRACKING).read_text(encoding="utf-8"))
+        reads = sorted(
+            qual for qual, node in _scopes(tree) if isinstance(node, ast.Call) and _called_attr(node) == "get_status"
+        )
+        assert reads == ["_report_partial_usage", "report_usage", "store_print_data"], reads
+
+    def test_a_charge_reads_the_jobs_own_fields_only_off_its_evidence(self):
+        """How far a job ran and which trays fed it is read, in every charge function of both
+        inventories, off ``JobEvidence`` alone — an attribute named like one of the job's fields on
+        anything else (a live state, a ``_m`` of the moment) is the 2026-09-16 → 24 phantom's shape."""
+        strays: list[tuple[str, str, int]] = []
+        for parts, functions in _CHARGE_FUNCTIONS.items():
+            tree = ast.parse(BACKEND_DIR.joinpath(*parts).read_text(encoding="utf-8"))
+            defs = [
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in functions
+            ]
+            assert {d.name for d in defs} == functions, f"a pinned charge function was renamed in {parts}"
+            for fn in defs:
+                for node in ast.walk(fn):
+                    if (
+                        isinstance(node, ast.Attribute)
+                        and node.attr in _JOB_FIELDS
+                        and not (isinstance(node.value, ast.Name) and node.value.id == "evidence")
+                    ):
+                        strays.append(("/".join(parts), fn.name, node.lineno))
+        assert not strays, strays
+
+    def test_only_the_tracker_touches_its_usage_sessions(self):
+        """A session is keyed to its job and consumed only by that job's terminal (``_take_session``);
+        the one writer beside print start is ``adopt_dispatched_unit``. A module reaching into
+        ``_active_sessions`` is a second writer that knows nothing about the job it touches."""
+        strays: list[tuple[str, int]] = []
+        for parts, tree in _app_trees():
+            if parts == _USAGE_TRACKER:
+                continue
+            for node in ast.walk(tree):
+                imported = (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == _USAGE_TRACKER_MODULE
+                    and any(alias.name == "_active_sessions" for alias in node.names)
+                )
+                reached = (
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "_active_sessions"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "usage_tracker"
+                )
+                if imported or reached:
+                    strays.append(("/".join(parts), node.lineno))
+        assert not strays, strays

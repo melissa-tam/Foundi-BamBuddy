@@ -144,8 +144,8 @@ PAYLOAD_KEY_OUTCOME_UNKNOWN = "outcome_unknown"
 # has to be added here rather than sniffed out of a status string downstream.
 StopVerdict = Literal["plate_refused", "operator_ui", "operator_screen", "reconcile_unknown"]
 
-# The two verdicts a HUMAN produced by pressing Stop — the UI button (membership) or
-# the printer's own screen (the cancel echo). One origin for "was this stop an
+# The two verdicts a HUMAN produced by pressing Stop — the UI button (the unit's durable
+# stop request) or the printer's own screen (the cancel echo). One origin for "was this stop an
 # operator's", read by the terminal outcome's failure attribution and the farm policy's
 # fault-stop requeue.
 OPERATOR_STOP_VERDICTS: frozenset[str] = frozenset({"operator_ui", "operator_screen"})
@@ -334,9 +334,7 @@ async def _item_names(db: AsyncSession, item: PrintQueueItem) -> set[str]:
     return names
 
 
-async def resolve_terminal_item(
-    db: AsyncSession, printer_id: int, payload: dict, *, ui_stopped: bool = False
-) -> TerminalResolution:
+async def resolve_terminal_item(db: AsyncSession, printer_id: int, payload: dict) -> TerminalResolution:
     """Correlate a terminal MQTT status to the queue item that produced it.
 
     Candidates are the queue items on ``printer_id`` currently in ``printing``
@@ -350,12 +348,14 @@ async def resolve_terminal_item(
     offline sends no terminal at all), so by the time this runs the row it stopped is
     no longer ``printing`` — and the terminal of the farm's own dispatch used to resolve
     FOREIGN: no operator-stop hold, no fault requeue, and a foreign-plate page for the
-    farm's own part. ``ui_stopped`` is the terminal's own evidence that the route acted
-    — the user-stopped mark ``print_control.stop_as_operator`` set, which the handler
-    consumes AT this terminal, so a duplicate terminal later cannot carry it. With it,
-    a ``cancelled`` row the operator's Stop wrote (``stop_source='operator_ui'``) is a
-    candidate for step (1) — id equality ONLY, the one identity that cannot be another
-    print's — and nothing else about the ladder changes.
+    farm's own part. A ``cancelled`` row the operator's Stop wrote
+    (``stop_source='operator_ui'``) is therefore a candidate for step (1) — id equality
+    ONLY, the one identity that cannot be another print's — and nothing else about the
+    ladder changes. The row itself is the evidence, and nothing else is asked: this used to
+    need the in-memory user-stopped mark as well, which a restart emptied, so a stopped job
+    whose terminal landed after a deploy resolved FOREIGN (2026-09-25). A duplicate terminal
+    for the same stopped job resolves here too; the unit is disposed once because its
+    annotation is conditional (``queue_transitions.annotate_stopped_unit``).
     """
     result = await db.execute(
         select(PrintQueueItem)
@@ -366,7 +366,7 @@ async def resolve_terminal_item(
     candidates = list(result.scalars().all())
     payload_subtask = (payload.get("subtask_id") or "").strip() or None
 
-    if ui_stopped and payload_subtask is not None:
+    if payload_subtask is not None:
         stopped = (
             await db.execute(
                 select(PrintQueueItem)
@@ -499,6 +499,40 @@ async def resolve_printing_item(db: AsyncSession, printer_id: int, subtask_id: s
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+async def operator_stop_requested(db: AsyncSession, printer_id: int, subtask_id: str | None) -> bool:
+    """Did an operator ask THIS job's unit to stop? THE reader of the durable stop request.
+
+    The job is the terminal's echoed ``subtask_id`` (a recovery driver passes the job its
+    hold paused). Its unit is found the way :func:`resolve_terminal_item` finds a terminal's
+    unit: by ``dispatch_subtask_id`` on this printer, in ANY status — ``printing`` for a
+    printer-card / HMS-dialog / API stop, ``cancelled`` for the row the queue page already
+    ended, already ended for a duplicate terminal — and, for a job that echoes no id at all,
+    the ladder's fallback, the sole ``printing`` unit (:func:`resolve_printing_item`). The
+    answer is that unit's ``operator_stop_requested_at``
+    (``print_control.stop_as_operator`` commits it before the stop goes out).
+
+    Durable on purpose: a stopped job's terminal can land after a restart, and the in-memory
+    mark this replaced was empty by then (2026-09-25). A FOREIGN job has no unit, so it has
+    no request — its stop is classified from the printer's own cancel echo, as a touchscreen
+    stop is. ``release_unstarted_claim`` clears a request whose print never started, so a
+    re-dispatch of the same row is never read as stopped.
+    """
+    job = (subtask_id or "").strip() or None
+    if job is None:
+        item = await resolve_printing_item(db, printer_id, None)
+        return item is not None and item.operator_stop_requested_at is not None
+    stamped = (
+        await db.execute(
+            select(PrintQueueItem.id)
+            .where(PrintQueueItem.printer_id == printer_id)
+            .where(PrintQueueItem.dispatch_subtask_id == job)
+            .where(PrintQueueItem.operator_stop_requested_at.is_not(None))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return stamped is not None
 
 
 async def resolve_active_plate_id(db: AsyncSession, printer_id: int, subtask_id: str | None) -> int | None:
@@ -674,12 +708,17 @@ async def resolve_dispatch_donor(db: AsyncSession, printer_id: int, subtask_id: 
 
 def classify_stop(
     payload: dict,
-    printer_id: int,
-    user_stopped_printer_ids: set[int],
     *,
+    operator_stop_requested: bool,
     open_incidents: Sequence[Mapping[str, object]] = (),
 ) -> StopVerdict | None:
     """THE classifier of "why did this terminal happen" — a closed set of verdicts.
+
+    ``operator_stop_requested`` is the terminal's unit's DURABLE stop request, read by
+    :func:`operator_stop_requested` off the row (the caller reads it; this stays pure). It
+    replaced a process-memory set of user-stopped printers (2026-09-25), which a restart
+    emptied — so a job an operator stopped, whose terminal landed after a deploy, was
+    classified as no stop at all.
 
     ``open_incidents`` is the printer's OPEN holds as the incident store's DB-free
     projection (``printer_incidents.snapshots``), read by the caller ONCE and BEFORE any
@@ -697,8 +736,10 @@ def classify_stop(
       both operator signals: the operator pressing Stop on a paused plate check is how
       this verdict is USUALLY produced, and what it means for the plate and the unit is
       the refusal, not the button.
-    - ``operator_ui``       — ``printer_id`` is in ``user_stopped_printer_ids`` (Stop
-      was pressed in the Bambuddy UI).
+    - ``operator_ui``       — ``operator_stop_requested``: Stop was pressed in the Bambuddy
+      UI (the printer card, the queue page, the printer's HMS dialog, the API) for THIS
+      job's unit. A FOREIGN job has no unit and no request; a UI stop of one falls through
+      to the printer's own echo below, like a touchscreen stop.
     - ``operator_screen``   — the payload carries ``user_cancel_observed`` True: the
       firmware emitted a cancel-echo HMS code, i.e. the operator stopped the print
       on the printer's own touchscreen.
@@ -713,11 +754,11 @@ def classify_stop(
     HMS on a touchscreen stop, so an H2C screen stop classifies as ``None`` — i.e.
     a genuine failure that feeds retry + quarantine accounting. Pending a deliberate
     wire-capture session hunting an alternative echo code on this firmware line,
-    prefer stopping H2C farm units from the Bambuddy UI (membership wins). A screen
+    prefer stopping H2C farm units from the Bambuddy UI (the request wins). A screen
     stop of a PAUSED plate check is unaffected: ``plate_refused`` needs no echo.
 
-    Pure — no DB, no I/O — so it is directly unit-testable and callable before the
-    ``_user_stopped_printers`` set is mutated by the surrounding handler.
+    Pure — no DB, no I/O — so it is directly unit-testable; the caller captures its
+    inputs once, before any consumer of the terminal mutates state.
     """
     status = str(payload.get("status") or "")
     job = (payload.get("subtask_id") or "").strip()
@@ -726,7 +767,7 @@ def classify_stop(
         for incident in open_incidents
     ):
         return STOP_VERDICT_PLATE_REFUSED
-    if printer_id in user_stopped_printer_ids:
+    if operator_stop_requested:
         return "operator_ui"
     if payload.get("user_cancel_observed"):
         return "operator_screen"

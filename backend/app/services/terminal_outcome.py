@@ -17,7 +17,7 @@ So a terminal is now classified ONCE, into the frozen :class:`TerminalOutcome`, 
 facts captured BEFORE any consumer mutates state — the printer's open holds are read off
 the incident store's DB-free projection ahead of every closer — and the handler threads
 that one value to every sink: the queue row, the plate authority, the archive and print
-log, the notification and the farm policy. This module decides; ``main`` only captures
+log, the filament charge, the notification and the farm policy. This module decides; ``main`` only captures
 the inputs and hands the value on (fork discipline: logic in a farm module, a small hook
 in the monolith).
 
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from backend.app.models.printer_incident import FAULT_KINDS, KIND_PLATE_VISION
 from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
@@ -95,6 +95,12 @@ USER_CANCELLED_CATEGORY = "User cancelled"
 # for an outcome it could not read.
 _STOP_RAW_STATUSES: frozenset[str] = frozenset({"failed", "aborted"})
 
+# What the job that ended is charged for — :func:`_charge_basis` decides it, the usage tracker
+# obeys it. ``full`` = the whole plate's slicer grams; ``partial`` = scaled by the TERMINAL
+# PAYLOAD's own peaks (``last_progress`` / ``last_layer_num``, never the live printer's, which by
+# then may describe another job); ``none`` = nothing is charged.
+ChargeBasis = Literal["full", "partial", "none"]
+
 
 @dataclass(frozen=True, slots=True)
 class TerminalOutcome:
@@ -126,6 +132,9 @@ class TerminalOutcome:
 
     ``plate_refusal`` — set iff the verdict is ``plate_refused``: the plate authority's
     gate cause, carrying the printer's words for the check that refused the plate.
+
+    ``charge`` — the filament charge basis (:data:`ChargeBasis`), decided once by
+    :func:`_charge_basis` from the terminal's own evidence.
     """
 
     raw_status: str
@@ -135,6 +144,7 @@ class TerminalOutcome:
     failure_category: str | None
     printer_message: str | None
     plate_refusal: PlateRefusal | None
+    charge: ChargeBasis
 
     @property
     def operator_stopped(self) -> bool:
@@ -205,6 +215,40 @@ def _recorded_status(
     return raw_status
 
 
+def _charge_basis(raw_status: str, verdict: StopVerdict | None, evidence: DepositEvidence) -> ChargeBasis:
+    """What the job that ended is charged for — from THIS terminal's evidence, never the live printer.
+
+    * the downtime reconcile's unknown outcome (verdict ``reconcile_unknown``, the payload's
+      ``outcome_unknown``) → ``none``: nobody observed how the job ended or how far it ran.
+    * the printer said FINISH (raw ``completed``) → ``full``: the whole plate ran through. The RAW
+      word, because it is the printer's own statement that the job reached its end; a recorded
+      rewrite (a dry run recorded ``cancelled``) does not un-extrude anything, and a motion-only
+      file declares zero grams anyway (its ``slice_info`` usage is zeroed at build).
+    * any other end whose peaks were MEASURED (``peaks_reliable``) → ``partial``, scaled by the
+      payload's ``last_progress`` / ``last_layer_num`` — a measured zero included (a job stopped
+      before its first layer charges nothing, honestly).
+    * any other end whose peaks were NOT measured (a client that attached mid-job — a restart or
+      reconnect — or the reconcile's synthesis): ``partial`` when a non-zero peak was read after the
+      attach (the firmware's percent and layer are ABSOLUTE, so a reading taken after the attach
+      measures this job; only its zero means nothing), else ``none`` — there is nothing to scale by.
+
+    Why ``none`` rather than a guess whenever nothing measured the job (doctrine rule 8): the ledger
+    heals in ONE direction. For a tagged roll — and this fleet is RFID'd — the increase-only AMS
+    remain% sync restores an under-charge from the wire; an over-charge never heals (the decrease
+    repair needs a 50-point contradiction). A charge nobody measured is exactly the phantom this
+    basis exists to end (production 2026-09-16 → 24: ~7.2 kg over 32 charges scaled by ANOTHER
+    job's live progress).
+    """
+    if verdict == STOP_SOURCE_RECONCILE_UNKNOWN:
+        return "none"
+    if raw_status == "completed":
+        return "full"
+    if evidence.peaks_reliable:
+        return "partial"
+    read_a_peak = (evidence.last_progress or 0) > 0 or (evidence.last_layer_num or 0) > 0
+    return "partial" if read_a_peak else "none"
+
+
 def build_terminal_outcome(
     *,
     raw_status: str,
@@ -266,4 +310,5 @@ def build_terminal_outcome(
         failure_category=category,
         printer_message=summary_of(printer_evidence) if ended_without_part else None,
         plate_refusal=refusal,
+        charge=_charge_basis(raw_status, verdict, evidence),
     )

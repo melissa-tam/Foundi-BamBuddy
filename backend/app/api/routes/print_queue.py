@@ -1283,6 +1283,9 @@ async def resume_queue_after_failure(
         skipped_item.error_message = None
         skipped_item.waiting_reason = None
         skipped_item.completed_at = None
+        # A re-armed unit carries no operator stop request: its next dispatch's terminal must
+        # not read a stop nobody asked of it (``queue_transitions.release_unstarted_claim``).
+        skipped_item.operator_stop_requested_at = None
 
     await db.commit()
 
@@ -1382,13 +1385,13 @@ async def stop_queue_item(
     printer_id = item.printer_id
     auto_off_after = item.auto_off_after
 
-    # The stop and the user-stopped mark are ONE act, owned by ``print_control``: it
-    # sends ``print.stop`` and sets the mark with nothing awaited in between, which is
-    # what this route's own comment demanded — if the MQTT on_print_complete callback
-    # fires during the db.commit() yield below, the flag is already set and the "failed"
-    # status is correctly overridden to "cancelled" (no spurious "print failed" page).
-    # It never raises, so the route keeps no guard of its own.
-    stop_sent = stop_as_operator(printer_id)
+    # The stop request and the stop are ONE act, owned by ``print_control``: it records the
+    # request on THIS unit (named here, so it is exact) and commits it BEFORE the
+    # ``print.stop`` goes out — so a terminal landing during the write below, or after a
+    # restart, reads a committed request and the "failed" status is correctly recorded
+    # "cancelled" (no spurious "print failed" page, no FOREIGN verdict for the farm's own
+    # job). It never raises, so the route keeps no guard of its own.
+    stop_sent = await stop_as_operator(printer_id, unit_id=item.id)
 
     # End the unit regardless - if the printer is off, the print is already stopped. Through
     # the ONE writer of a unit's end (``queue_transitions.record_unit_terminal``), which also
@@ -1399,10 +1402,10 @@ async def stop_queue_item(
     # callback arrives the item is no longer 'printing' — the stop_source is stamped in the
     # SAME transition (prod item 219 landed 'cancelled' with stop_source NULL). This IS the
     # queue-UI stop, i.e. classify_stop's 'operator_ui' verdict. The printer's terminal still
-    # reaches the farm policy: the correlation owner (``farm_correlation.resolve_terminal_item``
-    # with ``ui_stopped``) matches this ``cancelled`` row by its dispatch id, and the terminal
-    # annotates it (``queue_transitions.annotate_stopped_unit``) and runs the operator-stop
-    # hold or the fault requeue for it.
+    # reaches the farm policy: the correlation owner (``farm_correlation.resolve_terminal_item``)
+    # matches this ``cancelled`` row by its dispatch id, and the terminal annotates it ONCE
+    # (``queue_transitions.annotate_stopped_unit``) and runs the operator-stop hold or the
+    # fault requeue for it.
     #
     # Conditional: a terminal that landed between the status check above and this write
     # already ended the unit with the printer's own outcome, and the stop does not write

@@ -115,8 +115,6 @@ from backend.app.services.spool_assignment_notifications import (
 )
 from backend.app.services.spoolman import close_spoolman_client, get_spoolman_client, init_spoolman_client
 from backend.app.services.spoolman_tracking import (
-    cleanup_tracking as _cleanup_spoolman_tracking,
-    report_usage as _report_spoolman_usage,
     store_print_data as _store_spoolman_print_data,
 )
 from backend.app.services.tasmota import tasmota_service
@@ -446,11 +444,6 @@ _timelapse_baselines: dict[int, set[str]] = {}
 # {printer_id: {"threshold": float, "filename": str, "registered_at": float}}
 _bed_cool_waiters: dict[int, dict] = {}
 
-# Track printers where the user explicitly stopped the print from the queue UI.
-# When on_print_complete fires with status "failed" for these printers we treat it
-# as "cancelled" (stopped by user) so the correct notification email is sent.
-_user_stopped_printers: set[int] = set()
-
 # Offline-notification edge state (#1752): fire `on_printer_offline` exactly once when a
 # printer transitions connected → disconnected. The EDGE is the transport's fact —
 # `PrinterState.disconnected_at` is stamped by `BambuMQTTClient.note_disconnected` on
@@ -563,26 +556,19 @@ def _get_start_ams_mapping(data: dict, unit_ams_mapping: str | None) -> list[int
 
 
 def _inject_unit_into_usage_session(printer_id: int, unit, logger: logging.Logger) -> None:
-    """Fill the usage-tracker session with the dispatched unit's durable mapping and plate.
+    """Fill the usage-tracker session with the dispatched unit's durable mapping, plate and job id.
 
     The session opens before the print is bound to its archive, so it may lack the mapping when the
-    MQTT request-topic subscription failed (common on P1S/A1). Every print the farm dispatched gets
-    the unit's decision — adopted or newly recorded alike — and a value the session already caught is
-    never overwritten. Best-effort: the print start must not fail over usage bookkeeping.
+    MQTT request-topic subscription failed (common on P1S/A1) — and the job it measures when the
+    first echo carried no id yet. The session's owner decides (``usage_tracker.adopt_dispatched_unit``).
+    Best-effort: the print start must not fail over usage bookkeeping.
     """
     if unit is None:
         return
     try:
-        from backend.app.services.usage_tracker import _active_sessions, _parse_ams_mapping
+        from backend.app.services.usage_tracker import adopt_dispatched_unit
 
-        stored_map = _parse_ams_mapping(unit.ams_mapping)
-        session = _active_sessions.get(printer_id)
-        if session and stored_map and not session.ams_mapping:
-            session.ams_mapping = stored_map
-            logger.info("[CALLBACK] Injected ams_mapping into usage tracker session: %s", stored_map)
-        if session and unit.plate_id is not None and session.plate_id is None:
-            session.plate_id = unit.plate_id
-            logger.info("[CALLBACK] Injected plate_id into usage tracker session: %s", unit.plate_id)
+        adopt_dispatched_unit(printer_id, unit)
     except Exception:  # noqa: BLE001 — usage bookkeeping must never fail a print start
         logger.debug("[CALLBACK] usage-session injection failed for printer %s", printer_id, exc_info=True)
 
@@ -780,29 +766,6 @@ def _hms_should_notify_severity(severity: int) -> bool:
     silently dropped genuine fatal faults; this is the corrected predicate.
     """
     return severity <= 3
-
-
-def mark_printer_stopped_by_user(printer_id: int) -> None:
-    """Mark that the active print on this printer was stopped by the user from the queue UI.
-
-    When on_print_complete fires with status 'failed' for a printer in this set we
-    reclassify it as 'cancelled' so the correct 'print stopped' notification is sent
-    rather than a 'print failed' notification.
-    """
-    _user_stopped_printers.add(printer_id)
-    logging.getLogger(__name__).info("Marked printer %s as user-stopped from queue", printer_id)
-
-
-def printer_stopped_by_user(printer_id: int) -> bool:
-    """Is the active print on this printer marked as stopped by the user?
-
-    The read half of :func:`mark_printer_stopped_by_user`, for a reader outside this
-    module: a recovery driver that reads a terminal inside a release verb's window asks
-    it whether the terminal was the operator's Stop (``spool_recovery``) or its own
-    verb's doing. The mark lives until the print's terminal callback or the next print
-    start drops it.
-    """
-    return printer_id in _user_stopped_printers
 
 
 _last_status_broadcast: dict[int, str] = {}
@@ -2372,9 +2335,6 @@ async def on_print_start(printer_id: int, data: dict):
 
     logger.info("[CALLBACK] on_print_start called for printer %s, data keys: %s", printer_id, list(data.keys()))
 
-    # Clear any stale user-stopped flag from previous print cycles
-    _user_stopped_printers.discard(printer_id)
-
     # gcode_state → RUNNING edge for the AMS presence suppression tier. Starting a print
     # engages the AMS, so trays disengage/re-seat with nobody having touched a roll;
     # ams_presence disqualifies those edges BY CAUSE (doctrine rule 6 — never by a timer).
@@ -3696,15 +3656,23 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # terminal answers (runout / jam / power loss) and the plate-check hold of this job.
     # A verdict read after that close is a verdict over a printer that has forgotten why
     # the job was held: the 2026-09-11 "operator stop over an open fault requeues" ruling
-    # never fired in production for exactly that reason. The UI-stop membership is read
-    # before the discard below consumes it.
+    # never fired in production for exactly that reason. An operator's UI Stop is a DURABLE
+    # fact on this job's unit (``print_control.stop_as_operator`` commits it before the stop
+    # goes out), read first — the one await — so the snapshot and the verdict below are
+    # taken together, and a stop pressed before a restart still reads as the operator's.
+    from backend.app.core.database import run_with_retry as _run_with_retry
     from backend.app.services import printer_incidents as _printer_incidents
-    from backend.app.services.farm_correlation import classify_stop
+    from backend.app.services.farm_correlation import classify_stop, operator_stop_requested
 
+    try:
+        _operator_stop = await _run_with_retry(
+            lambda db: operator_stop_requested(db, printer_id, data.get("subtask_id")), label="operator stop request"
+        )
+    except Exception as _osr:  # noqa: BLE001 — an unreadable request must not crash the callback
+        logger.warning("[CALLBACK] printer %s: operator stop request unreadable: %s", printer_id, _osr)
+        _operator_stop = False
     _open_at_terminal = _printer_incidents.snapshots(printer_id)
-    _stop_source = classify_stop(data, printer_id, _user_stopped_printers, open_incidents=_open_at_terminal)
-    _ui_stopped = printer_id in _user_stopped_printers
-    _user_stopped_printers.discard(printer_id)
+    _stop_source = classify_stop(data, operator_stop_requested=_operator_stop, open_incidents=_open_at_terminal)
 
     # Server-dispatched eject jobs (part-present sweep / FA remote eject) are
     # motion-only prints with NO queue item and NO archive. Detect this terminal as
@@ -3801,10 +3769,10 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             from backend.app.core.database import run_with_retry
 
             async def _do_resolve(db):
-                # ``ui_stopped``: the terminal of a job the QUEUE PAGE stopped arrives after
-                # that route committed the row ``cancelled`` — the correlation owner matches
-                # it by its dispatch id instead of calling the farm's own print foreign.
-                resolution = await resolve_terminal_item(db, printer_id, data, ui_stopped=_ui_stopped)
+                # The terminal of a job the QUEUE PAGE stopped arrives after that route
+                # committed the row ``cancelled`` — the correlation owner matches it by its
+                # dispatch id instead of calling the farm's own print foreign.
+                resolution = await resolve_terminal_item(db, printer_id, data)
                 item = resolution.item
                 raw_rpc = await get_setting(db, "require_plate_clear")
                 return {
@@ -4144,13 +4112,12 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             if not _attributed or _resolved_item_id is None:
                 return
             # The job phase's (c): the unit's end through the ONE writer of it (or, for a unit the
-            # QUEUE PAGE already stopped, the terminal's annotation), plus the library-usage bump
-            # (#1008) — ``job_terminal.record_unit_outcome``.
+            # QUEUE PAGE already stopped, the terminal's annotation — once), plus the library-usage
+            # bump (#1008) — ``job_terminal.record_unit_outcome``.
             recorded = await job_terminal.record_unit_outcome(
                 db,
                 _resolved_item_id,
                 _outcome,
-                ui_stopped=_ui_stopped,
                 completed_at=datetime.now(timezone.utc),
             )
             if recorded is None:
@@ -4274,8 +4241,8 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             logger.warning("[BED-COOL] Failed to register waiter: %s", e)
 
     # --- Track filament consumption (must run before archive_id early-return so usage
-    # is recorded even when auto-archive is disabled) ---
-    usage_results: list[dict] = []
+    # is recorded even when auto-archive is disabled) — the job phase's (f), on the outcome's
+    # charge basis, from this terminal's own payload (``job_terminal.charge_usage``) ---
     # The mapping captured from the MQTT request topic (works for all print sources), else the
     # attributed unit's durable decision.
     stored_ams_mapping = _get_start_ams_mapping(data, _resolved_ams_mapping)
@@ -4285,58 +4252,10 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # plate that was actually printed (#1785, #1697).
     notify_plate_id: int | None = _resolved_plate_id if archive_id else None
 
-    # Internal inventory: track AMS remain% deltas (skip if Spoolman handles usage)
-    try:
-        async with async_session() as db:
-            from backend.app.api.routes.settings import get_setting
-
-            _spoolman_on = await get_setting(db, "spoolman_enabled")
-        if not _spoolman_on or _spoolman_on.lower() != "true":
-            from backend.app.services.usage_tracker import on_print_complete as usage_on_print_complete
-
-            async with async_session() as db:
-                usage_results = await usage_on_print_complete(
-                    printer_id,
-                    data,
-                    printer_manager,
-                    db,
-                    archive_id=archive_id,
-                    ams_mapping=stored_ams_mapping,
-                )
-                if usage_results:
-                    await ws_manager.broadcast(
-                        {
-                            "type": "spool_usage_logged",
-                            "printer_id": printer_id,
-                            "usage": usage_results,
-                        }
-                    )
-                    log_timing("Usage tracker")
-
-    except Exception as e:
-        logger.warning("Usage tracker on_print_complete failed: %s", e)
-
-    # Spoolman: report filament usage (requires archive_id for tracking data lookup)
-    if archive_id:
-        if data.get("status") == "completed":
-            try:
-                await _report_spoolman_usage(printer_id, archive_id)
-                log_timing("Spoolman usage report")
-            except Exception as e:
-                logger.warning("Spoolman usage reporting failed: %s", e)
-        else:
-            # Report partial usage if tracking data exists (only stored when weight sync is disabled)
-            try:
-                async with async_session() as db:
-                    await _cleanup_spoolman_tracking(
-                        printer_id,
-                        archive_id,
-                        db,
-                        last_layer_num=data.get("last_layer_num"),
-                        last_progress=data.get("last_progress"),
-                    )
-            except Exception as e:
-                logger.debug("[SPOOLMAN] Cleanup failed: %s", e)
+    # Both inventories — the internal ledger and the Spoolman lane — on the one basis.
+    usage_results = await job_terminal.charge_usage(
+        printer_id, data, _outcome, archive_id=archive_id, ams_mapping=stored_ams_mapping
+    )
 
     log_timing("Filament usage tracking")
 
@@ -4569,7 +4488,9 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                     printer_id=printer_id,
                     printer_name=p_info.name if p_info else None,
                     status=data.get("status", "completed"),
-                    progress=data.get("progress"),
+                    # the run's grams on the charge's own basis and the job's own last progress
+                    charge=_outcome.charge,
+                    last_progress=data.get("last_progress"),
                     usage_results=usage_results,
                     print_user=_print_user_info,
                 )
@@ -4882,18 +4803,20 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                             "created_by_id": archive.created_by_id,
                         }
 
-                        # Scale filament usage for partial prints
+                        # Scale filament usage for partial prints — by the job's OWN last progress
+                        # (the terminal payload's ``last_progress``; it carries no ``progress``
+                        # key, which is why a stopped print used to be reported at 0 g).
+                        run_progress = data.get("last_progress") or 0
                         if print_status != "completed" and archive.filament_used_grams:
-                            progress = data.get("progress") or 0
-                            scale = _partial_progress_scale(progress)
+                            scale = _partial_progress_scale(run_progress)
                             archive_data["actual_filament_grams"] = round(archive.filament_used_grams * scale, 1)
-                            archive_data["progress"] = progress
+                            archive_data["progress"] = run_progress
 
                         # Pass per-slot data from archive.extra_data
                         if archive.extra_data and archive.extra_data.get("filament_slots"):
                             slots = archive.extra_data["filament_slots"]
                             if print_status != "completed":
-                                scale = _partial_progress_scale(data.get("progress"))
+                                scale = _partial_progress_scale(run_progress)
                                 slots = [{**s, "used_g": round(s["used_g"] * scale, 1)} for s in slots]
                             archive_data["filament_slots"] = slots
 
@@ -4905,7 +4828,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                             archive.file_path,
                             notify_plate_id,
                             print_status,
-                            data.get("progress"),
+                            run_progress,
                             app_settings.base_dir,
                         )
 

@@ -118,9 +118,9 @@ class TestExecuteHmsActionDispatch:
     def test_stop_is_not_the_dialog_dispatchers_to_send(self, client):
         """CHANGED 2026-09-24: an operator choosing "Stop printing" in the HMS dialog is
         the operator's Stop, whose one owner is ``print_control.stop_as_operator`` (the
-        stop AND the user-stopped mark). The route sends it there; this dispatcher owns
+        durable stop request AND the stop). The route sends it there; this dispatcher owns
         no stop and answers False for it like any action it does not handle — sending
-        one here went out WITHOUT the mark, so the terminal read as a failure."""
+        one here went out WITHOUT the request, so the terminal read as a failure."""
         assert client.execute_hms_action("03008070", HMSAction.STOP_PRINTING, job_id="task-1") is False
         assert self._published_commands(client) == []
 

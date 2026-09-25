@@ -7,7 +7,7 @@ dataclass (``backend/app/services/bambu_mqtt.py``), so the call raised
 actually had a status row. See #1584.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -227,7 +227,7 @@ class TestWebhookCancelPrint:
 
 class TestWebhookStopsAreTheOperatorsStop:
     """``/stop`` and ``/cancel`` are an API client pressing Stop — one owner,
-    ``print_control.stop_as_operator`` (the stop AND the user-stopped mark), so the
+    ``print_control.stop_as_operator`` (the durable stop request AND the stop), so the
     terminal records a cancel rather than a failure (2026-09-24). ``/cancel`` used to call
     ``printer_manager.cancel_print``, which does not exist: every call answered 500."""
 
@@ -238,7 +238,7 @@ class TestWebhookStopsAreTheOperatorsStop:
         state = PrinterState(connected=True, state=live)
         with (
             patch("backend.app.api.routes.webhook.printer_manager.get_status", MagicMock(return_value=state)),
-            patch("backend.app.api.routes.webhook.stop_as_operator", MagicMock(return_value=True)) as operator_stop,
+            patch("backend.app.api.routes.webhook.stop_as_operator", AsyncMock(return_value=True)) as operator_stop,
         ):
             resp = await async_client.post(
                 f"/api/v1/webhook/printer/{printer_row.id}/{verb}",
@@ -246,7 +246,7 @@ class TestWebhookStopsAreTheOperatorsStop:
             )
 
         assert resp.status_code == 200
-        operator_stop.assert_called_once_with(printer_row.id)
+        operator_stop.assert_awaited_once_with(printer_row.id)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -257,7 +257,7 @@ class TestWebhookStopsAreTheOperatorsStop:
         state = PrinterState(connected=True, state="RUNNING")
         with (
             patch("backend.app.api.routes.webhook.printer_manager.get_status", MagicMock(return_value=state)),
-            patch("backend.app.api.routes.webhook.stop_as_operator", MagicMock(return_value=False)),
+            patch("backend.app.api.routes.webhook.stop_as_operator", AsyncMock(return_value=False)),
         ):
             resp = await async_client.post(
                 f"/api/v1/webhook/printer/{printer_row.id}/{verb}",

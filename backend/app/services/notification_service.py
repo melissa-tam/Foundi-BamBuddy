@@ -1416,12 +1416,16 @@ class NotificationService:
     ):
         """Handle plate not empty event — the plate may be occupied before/at print.
 
-        ``source_detail`` disambiguates the three sources that raise this one event
-        with an honest, source-specific sentence (Phase 3.3):
-          - ``printer_vision``  — the printer's own pre-print HMS plate check,
-          - ``camera_cv``       — Bambuddy's OpenCV pre-print camera diff,
-          - ``cooldown_timeout``— the eject cooldown watch's 90-min escalation
-            (which actually means "bed never cooled", not "objects on the plate").
+        ``source_detail`` is the CALLER's full sentence saying why this one event fired
+        (Phase 3.3), rendered verbatim — prose, never a source token. Today's callers:
+          - ``main`` — Bambuddy's OpenCV pre-print camera diff;
+          - ``pause_recovery`` — the printer's own plate check paused the job: its
+            reported words plus the operator instruction;
+          - ``eject.monitor.escalation_sentence`` — a plate only a human may clear (a
+            refused plate, a farm part whose eject never ran, a foreign part);
+          - ``farm_stall`` — the reminder of an open plate-vision hold.
+        A cooldown that has not released is NOT this event: it pages through
+        :meth:`on_cooldown_escalation`.
 
         Rendering tolerates an OLDER install whose seeded ``plate_not_empty`` body
         predates the ``{source_detail}`` placeholder (seeds are insert-if-absent, so

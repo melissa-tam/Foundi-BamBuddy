@@ -199,10 +199,10 @@ async def webhook_stop_print(
         raise HTTPException(status_code=409, detail="No print in progress")
 
     # An API client pressing Stop is an OPERATOR stop: ``print_control.stop_as_operator``
-    # is its one owner — the MQTT stop plus the user-stopped mark, so the terminal records
-    # a cancel rather than a failure. It never raises and answers whether the stop was
-    # DELIVERED; an undelivered stop is a 502, never a 200 "Print stopped".
-    if not stop_as_operator(printer_id):
+    # is its one owner — the durable stop request on the running unit plus the MQTT stop, so
+    # the terminal records a cancel rather than a failure. It never raises and answers whether
+    # the stop was DELIVERED; an undelivered stop is a 502, never a 200 "Print stopped".
+    if not await stop_as_operator(printer_id):
         raise HTTPException(
             status_code=502,
             detail="printer MQTT session not connected — command not delivered",
@@ -234,7 +234,7 @@ async def webhook_cancel_print(
     # Cancel IS the operator's stop (a paused print included), through its one owner. It
     # used to call ``printer_manager.cancel_print``, which does not exist, so every call
     # answered 500 and cancelled nothing.
-    if not stop_as_operator(printer_id):
+    if not await stop_as_operator(printer_id):
         raise HTTPException(
             status_code=502,
             detail="printer MQTT session not connected — command not delivered",

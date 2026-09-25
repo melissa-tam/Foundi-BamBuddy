@@ -7,6 +7,7 @@ Supports accurate partial usage reporting for failed/cancelled prints.
 
 import json
 import logging
+from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, select
 
@@ -19,6 +20,9 @@ from backend.app.services.spoolman import (
     get_spoolman_client,
     init_spoolman_client,
 )
+
+if TYPE_CHECKING:
+    from backend.app.services.usage_tracker import JobEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -373,10 +377,16 @@ async def cleanup_tracking(
     printer_id: int,
     archive_id: int,
     db,
-    last_layer_num: int | None = None,
-    last_progress: int | None = None,
+    *,
+    evidence: "JobEvidence | None",
 ):
-    """Report partial usage and clean up Spoolman tracking data for failed/aborted prints."""
+    """Report a partial charge and retire the Spoolman tracking row of a print that did not finish.
+
+    ``evidence`` is the ending job's own record (``usage_tracker.JobEvidence``, off its terminal
+    payload) when the terminal outcome's charge basis is ``partial``; None when it is ``none`` —
+    nobody measured the job, so nothing is reported and the row is only removed (the job phase's
+    ``job_terminal.charge_usage`` decides which).
+    """
     from backend.app.models.active_print_spoolman import ActivePrintSpoolman
 
     # Get tracking data first (needed for partial usage reporting)
@@ -391,16 +401,14 @@ async def cleanup_tracking(
         logger.debug("[SPOOLMAN] No tracking data to clean up for printer=%s, archive=%s", printer_id, archive_id)
         return
 
-    # Try to report partial usage before cleanup
-    try:
-        await _report_partial_usage(
-            printer_id,
-            tracking,
-            last_layer_num=last_layer_num,
-            last_progress=last_progress,
-        )
-    except Exception as e:
-        logger.warning("[SPOOLMAN] Partial usage report failed: %s", e)
+    # Report the partial charge before cleanup — only a job something measured has one
+    if evidence is None:
+        logger.info("[SPOOLMAN] archive %s: charge basis 'none' — no partial usage reported", archive_id)
+    else:
+        try:
+            await _report_partial_usage(printer_id, tracking, evidence)
+        except Exception as e:
+            logger.warning("[SPOOLMAN] Partial usage report failed: %s", e)
 
     # Delete tracking data
     await db.execute(
@@ -568,19 +576,20 @@ async def _report_spool_usage_for_slots(
     return spools_updated
 
 
-async def _report_partial_usage(
-    printer_id: int,
-    tracking,
-    last_layer_num: int | None = None,
-    last_progress: int | None = None,
-):
+async def _report_partial_usage(printer_id: int, tracking, evidence: "JobEvidence"):
     """Report partial filament usage based on actual G-code layer data.
 
     Uses per-layer cumulative extrusion from G-code parsing for accurate
     multi-material tracking. Falls back to linear interpolation if G-code
     data is unavailable.
+
+    How far the job ran is ``evidence`` — the ENDING job's own last layer, layer count and last
+    progress, off its terminal payload (``usage_tracker.JobEvidence``). Never the live printer's:
+    by the time a terminal is processed the printer can be running another job, and a partial
+    charge scaled by that job's progress is the 2026-09-16 → 24 phantom the internal-inventory
+    charge made (~7.2 kg over 32 charges). The live printer is read only for the no-3MF branch's
+    tray remain% below — the job's end state, hardware.
     """
-    from backend.app.services.printer_manager import printer_manager
     from backend.app.utils.threemf_tools import get_cumulative_usage_at_layer, mm_to_grams
 
     async with async_session() as db:
@@ -597,25 +606,14 @@ async def _report_partial_usage(
         if not spoolman_enabled or spoolman_enabled.lower() != "true":
             return
 
-    # Get current printer state for layer progress.
-    # On failed/aborted prints the firmware may already reset to IDLE with layer=0,
-    # so we fall back to completion-time hints captured from MQTT.
-    state = printer_manager.get_status(printer_id)
-    current_layer = state.layer_num if state else None
-    total_layers = state.total_layers if state else None
+    # The job's own last valid layer and slicer layer count — the firmware resets the live
+    # counters on a stop, the payload kept the last reading of THIS job.
+    current_layer = evidence.last_layer_num
+    total_layers = evidence.total_layers
+    last_progress = evidence.last_progress
+    progress_ratio_from_event = min(last_progress, 100.0) / 100.0 if last_progress > 0 else None
 
-    if (not current_layer or current_layer <= 0) and last_layer_num and last_layer_num > 0:
-        current_layer = last_layer_num
-        logger.debug("[SPOOLMAN] Using captured last_layer_num=%s for partial usage", current_layer)
-
-    progress_ratio_from_event = None
-    if last_progress is not None:
-        try:
-            progress_ratio_from_event = min(max(float(last_progress), 0.0), 100.0) / 100.0
-        except (TypeError, ValueError):
-            progress_ratio_from_event = None
-
-    if (not current_layer or current_layer <= 0) and progress_ratio_from_event and total_layers and total_layers > 0:
+    if current_layer <= 0 and progress_ratio_from_event and total_layers > 0:
         current_layer = max(1, int(round(total_layers * progress_ratio_from_event)))
         logger.debug(
             "[SPOOLMAN] Estimated layer from last_progress=%s%% and total_layers=%s -> %s",
@@ -624,10 +622,10 @@ async def _report_partial_usage(
             current_layer,
         )
 
-    if not current_layer or current_layer <= 0:
+    if current_layer <= 0:
         logger.debug(
             "[SPOOLMAN] No progress to report (layer 0/unknown, last_layer_num=%s, last_progress=%s)",
-            last_layer_num,
+            evidence.last_layer_num,
             last_progress,
         )
         return
@@ -653,8 +651,11 @@ async def _report_partial_usage(
     # remain%-delta snapshot we captured at start still describes consumption
     # up to the abort moment. Write it the same way report_usage's fallback
     # does, then return — there's no 3MF-derived partial to layer on top.
-    # ``state`` was already fetched at the top of the function for current_layer.
+    # The trays' remain% NOW is the job's end state (hardware), the one live read here.
     if not filament_usage and not layer_usage and tray_remain_start:
+        from backend.app.services.printer_manager import printer_manager
+
+        state = printer_manager.get_status(printer_id)
         current_lookup = _snapshot_tray_remain(state.raw_data) if state and state.raw_data else {}
         await _report_remain_delta_for_slots(
             client,
@@ -719,7 +720,7 @@ async def _report_partial_usage(
 
     # Fallback: linear interpolation (if no G-code data available)
     progress_ratio = None
-    if total_layers and total_layers > 0:
+    if total_layers > 0:
         progress_ratio = min(current_layer / total_layers, 1.0)
     elif progress_ratio_from_event is not None:
         progress_ratio = progress_ratio_from_event
@@ -834,7 +835,9 @@ async def report_usage(printer_id: int, archive_id: int):
 
         # --- Path 2: AMS remain%-delta for slots 3MF didn't cover -------
         # Triggered for no-3MF "Untitled" prints (#1820) AND for partial
-        # 3MF coverage (slots whose filament_id wasn't in slice_info).
+        # 3MF coverage (slots whose filament_id wasn't in slice_info). The trays'
+        # remain% NOW is the finished job's end state — hardware, the one live read
+        # of this lane (the job phase calls it only on a ``full`` charge basis).
         if tray_remain_start:
             from backend.app.services.printer_manager import printer_manager
 

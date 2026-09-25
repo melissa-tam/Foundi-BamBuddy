@@ -31,10 +31,15 @@ The steps (the letters are the plan's):
   library-usage bump stays here, in the job phase);
 * (d) the unit's disposition — ``farm_policy.on_unit_terminal`` (:func:`dispose_unit` for a lane
   that has no session of its own);
-* (e) the job's uploaded file — :func:`delete_uploaded_file` (#374 / #1542).
+* (e) the job's uploaded file — :func:`delete_uploaded_file` (#374 / #1542);
+* (f) the job's filament charge — :func:`charge_usage`, THE one charge step (the internal inventory
+  and the Spoolman lane alike), on the outcome's own ``charge`` basis (``terminal_outcome.ChargeBasis``)
+  from the terminal payload's evidence. The print-log row's grams (b) follow the same basis.
 
-The usage CHARGE is not here yet: it stays in ``main`` until it moves onto the outcome's own
-charge basis. A job phase run for an unobserved terminal charges nothing — nobody measured it.
+A job phase run for an unobserved terminal charges nothing — nobody measured it: its outcome is
+built by :func:`unobserved_outcome` under the ``reconcile_unknown`` verdict, whose basis is
+``none`` by construction, so ``close_superseded`` and ``close_observed`` have no charge to make and
+make none.
 """
 
 from __future__ import annotations
@@ -69,7 +74,7 @@ from backend.app.services.queue_transitions import (
     annotate_stopped_unit,
     record_unit_terminal,
 )
-from backend.app.services.terminal_outcome import TerminalOutcome, build_terminal_outcome
+from backend.app.services.terminal_outcome import ChargeBasis, TerminalOutcome, build_terminal_outcome
 from backend.app.utils.filename import derive_remote_filename
 
 if TYPE_CHECKING:
@@ -106,32 +111,35 @@ async def announce_archive_closed(archive_id: int, *, status: str, print_name: s
 # (b) the run's print-log row
 # --------------------------------------------------------------------------- #
 def compute_run_filament_grams(
-    status: str,
+    charge: ChargeBasis,
     archive_filament_used_grams: float | None,
-    progress: float | int | None,
+    last_progress: float | int | None,
     usage_results: list[dict] | None,
 ) -> float | None:
     """Per-run filament for PrintLogEntry, partial- and tracker-aware (#1378, #1390).
 
-    Priority for every status:
+    The grams a run is RECORDED as having used follow the same basis as the grams it is
+    CHARGED (``terminal_outcome.ChargeBasis``), so the print log (Stats, the accounting feed)
+    and the spool ledger tell one story. Priority:
         1. Sum of tracked spool deltas in ``usage_results`` (AMS-measured
            weight delta — same source that drives "Total Consumed" on the
            Inventory page, so Stats and Inventory totals stay aligned).
-        2. For ``completed``: the slicer estimate (no tracker available, fall
-           back to the canonical "this print used X" value).
-        3. For partial statuses: ``estimate * progress%``.
-        4. ``None`` if nothing is known — which is what an unobserved end records: no tracker
-           ran for it and no progress was seen, so it states no grams rather than inventing them.
+        2. ``full``: the slicer estimate (no tracker available, fall back to
+           the canonical "this print used X" value).
+        3. ``partial``: ``estimate * last_progress%`` — the job's OWN last
+           progress, off its terminal payload, never the live printer's.
+        4. ``None`` — a ``none`` basis, or a partial with nothing to scale: nobody
+           measured the run, so the row states no grams rather than inventing them.
     """
     tracked_grams = sum(r.get("weight_used") or 0 for r in (usage_results or []))
     if tracked_grams > 0:
         return round(tracked_grams, 1)
 
-    if status == "completed":
+    if charge == "full":
         return archive_filament_used_grams
 
-    if archive_filament_used_grams:
-        scale = max(0.0, min(((progress or 0) / 100.0), 1.0))
+    if charge == "partial" and archive_filament_used_grams:
+        scale = max(0.0, min(((last_progress or 0) / 100.0), 1.0))
         if scale > 0:
             return round(archive_filament_used_grams * scale, 1)
 
@@ -145,7 +153,8 @@ async def write_run_log(
     printer_id: int,
     printer_name: str | None,
     status: str,
-    progress: float | int | None,
+    charge: ChargeBasis,
+    last_progress: float | int | None,
     usage_results: list[dict] | None,
     print_user: dict | None,
 ) -> PrintLogEntry:
@@ -154,6 +163,11 @@ async def write_run_log(
     A separate table that never touches the archive's own figures: per-run actuals (#1378), so
     Stats reflect what THIS print used, not the archive's first-run values. ``archive`` must be
     read AFTER its close (``completed_at`` and ``failure_reason`` are the close's).
+
+    ``status`` is the recorded word; the grams and the cost follow ``charge`` — the run's charge
+    basis — and ``last_progress``, the job's own last progress off its terminal payload (None
+    where no terminal was observed), exactly as the spool charge does
+    (:func:`compute_run_filament_grams`).
 
     Back-fills ``created_by_id`` on an unattributed archive from the print-session user (#730):
     an archive auto-created from a printer-initiated print stays unattributed otherwise; an
@@ -164,7 +178,7 @@ async def write_run_log(
     print_user_id = print_user.get("user_id") if print_user else None
     if archive.created_by_id is None and print_user_id is not None:
         archive.created_by_id = print_user_id
-    run_grams = compute_run_filament_grams(status, archive.filament_used_grams, progress, usage_results)
+    run_grams = compute_run_filament_grams(charge, archive.filament_used_grams, last_progress, usage_results)
 
     # Per-run cost — prefer the usage_results sum. For partial prints the topup-to-estimate logic
     # in usage_tracker (which assumes the print completed) is deliberately skipped; the raw
@@ -172,7 +186,7 @@ async def write_run_log(
     run_cost: float | None = None
     if usage_results:
         run_cost = sum(r.get("cost") or 0 for r in usage_results) or None
-    if run_cost is None and status == "completed":
+    if run_cost is None and charge == "full":
         run_cost = archive.cost
 
     return await write_log_entry(
@@ -241,7 +255,6 @@ async def record_unit_outcome(
     item_id: int,
     outcome: TerminalOutcome,
     *,
-    ui_stopped: bool,
     completed_at: datetime,
 ) -> RecordedUnit | None:
     """Record ``outcome`` on the unit a terminal was attributed to; None when there is nothing to record.
@@ -253,16 +266,18 @@ async def record_unit_outcome(
     without its part, unless the row already carries words of its own.
 
     A unit the QUEUE PAGE's Stop already ended (``cancelled`` / ``operator_ui``, committed before
-    the terminal could arrive — ``ui_stopped`` is the terminal's evidence that it did) is not
-    ended again: its status and stop time stay the route's, and the terminal adds only what the
-    terminal knows (``queue_transitions.annotate_stopped_unit``).
+    the terminal could arrive) is not ended again: its status and stop time stay the route's,
+    and the terminal records only what the terminal knows (``queue_transitions
+    .annotate_stopped_unit``) — ONCE. The row's own shape is the evidence (the correlation owner
+    matched it by dispatch id); a second terminal for the same stopped job finds it answered and
+    is owed nothing, exactly as a second terminal for a unit its first one ended.
 
     The library-usage bump (#1008) rides the same transaction. Does not commit.
     """
     item = await db.get(PrintQueueItem, item_id)
     if item is None:
         return None
-    queue_stopped = ui_stopped and item.status == "cancelled" and item.stop_source == STOP_SOURCE_QUEUE_PAGE
+    queue_stopped = item.status == "cancelled" and item.stop_source == STOP_SOURCE_QUEUE_PAGE
     if item.status != "printing" and not queue_stopped:
         return None
     status = outcome.recorded_status
@@ -275,7 +290,10 @@ async def record_unit_outcome(
         else None
     )
     if queue_stopped:
-        await annotate_stopped_unit(db, item.id, stop_source=stop_source, error_message=message)
+        if not await annotate_stopped_unit(
+            db, item.id, answered_at=completed_at, stop_source=stop_source, error_message=message
+        ):
+            return None
     elif not await record_unit_terminal(
         db, item.id, status=status, completed_at=completed_at, stop_source=stop_source, error_message=message
     ):
@@ -470,6 +488,82 @@ async def delete_uploaded_file(
 
 
 # --------------------------------------------------------------------------- #
+# (f) the job's filament charge
+# --------------------------------------------------------------------------- #
+async def charge_usage(
+    printer_id: int,
+    data: dict,
+    outcome: TerminalOutcome,
+    *,
+    archive_id: int | None,
+    ams_mapping: list[int] | None,
+) -> list[dict]:
+    """Charge the job that ended — THE one charge step, for both inventories, on one basis.
+
+    What is charged is ``outcome.charge`` (``full`` / ``partial`` / ``none``), decided once by the
+    outcome's builder; how far the job ran and which trays fed it is the terminal payload ``data``.
+
+    * the internal inventory (Spoolman off) — THE one call into ``usage_tracker.on_print_complete``.
+      A ``none`` basis still reaches the tracker, which consumes the ending job's usage session (a
+      session belongs to its job and only that job's terminal may take it) and charges nothing.
+      Broadcasts ``spool_usage_logged`` when something was charged; returns the charged rows (the
+      print-log row and the notification read them).
+    * the Spoolman lane — :func:`_charge_spoolman`, for any terminal with an archive (its tracking
+      row is keyed by one), whatever the setting says now: the row was written when Spoolman was on
+      at print start, and each lane asks the setting itself before it reports.
+
+    Each lane is guarded on its own — a failure is a WARNING and the terminal goes on.
+    """
+    from backend.app.api.routes.settings import get_setting
+    from backend.app.services import usage_tracker
+
+    results: list[dict] = []
+    try:
+        async with _database.async_session() as db:
+            spoolman_on = await get_setting(db, "spoolman_enabled")
+        if not (spoolman_on and spoolman_on.lower() == "true"):
+            async with _database.async_session() as db:
+                results = await usage_tracker.on_print_complete(
+                    printer_id,
+                    data,
+                    printer_manager,
+                    db,
+                    charge=outcome.charge,
+                    archive_id=archive_id,
+                    ams_mapping=ams_mapping,
+                )
+            if results:
+                await ws_manager.broadcast({"type": "spool_usage_logged", "printer_id": printer_id, "usage": results})
+    except Exception as e:  # noqa: BLE001 — a charge failure must never fail the terminal
+        logger.warning("[JOB-TERMINAL] usage charge failed for printer %s archive %s: %s", printer_id, archive_id, e)
+        results = []
+    if archive_id:
+        await _charge_spoolman(printer_id, data, outcome, archive_id=archive_id)
+    return results
+
+
+async def _charge_spoolman(printer_id: int, data: dict, outcome: TerminalOutcome, *, archive_id: int) -> None:
+    """The Spoolman lane of the charge, on the outcome's basis — every basis retires the tracking row.
+
+    ``full`` reports the plate's usage (``spoolman_tracking.report_usage``); ``partial`` reports the
+    share the job's OWN evidence measures (its terminal payload — ``usage_tracker.JobEvidence``,
+    never the live printer's layer); ``none`` reports nothing — nobody measured the job.
+    """
+    from backend.app.services import spoolman_tracking
+    from backend.app.services.usage_tracker import JobEvidence
+
+    try:
+        if outcome.charge == "full":
+            await spoolman_tracking.report_usage(printer_id, archive_id)
+            return
+        evidence = JobEvidence.from_payload(data) if outcome.charge == "partial" else None
+        async with _database.async_session() as db:
+            await spoolman_tracking.cleanup_tracking(printer_id, archive_id, db, evidence=evidence)
+    except Exception as e:  # noqa: BLE001 — the Spoolman lane must never fail the terminal
+        logger.warning("[SPOOLMAN] usage reporting failed for printer %s archive %s: %s", printer_id, archive_id, e)
+
+
+# --------------------------------------------------------------------------- #
 # The job phase of an archive whose terminal the farm never saw
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -523,7 +617,10 @@ async def close_observed(
             printer_id=printer_id,
             printer_name=_printer_name(printer_id),
             status=run_unit.status,
-            progress=None,
+            # The unit's own terminal recorded how the run ended: a completed run ran the whole
+            # plate; any other end was measured by nobody here (no peaks reach this lane).
+            charge="full" if run_unit.status == "completed" else "none",
+            last_progress=None,
             usage_results=None,
             print_user=None,
         )
@@ -569,7 +666,7 @@ async def close_superseded(
     outcome: TerminalOutcome | None = None
     if run_unit is not None and run_unit.status == "printing":
         unit_outcome = unobserved_outcome(archive, run_unit)
-        recorded = await record_unit_outcome(db, run_unit.id, unit_outcome, ui_stopped=False, completed_at=now)
+        recorded = await record_unit_outcome(db, run_unit.id, unit_outcome, completed_at=now)
         if recorded is not None:
             unit_id, outcome = recorded.item_id, unit_outcome
     await write_run_log(
@@ -578,7 +675,8 @@ async def close_superseded(
         printer_id=printer_id,
         printer_name=_printer_name(printer_id),
         status="cancelled",
-        progress=None,
+        charge="none",  # an unobserved end — :func:`unobserved_outcome`'s basis, by construction
+        last_progress=None,
         usage_results=None,
         print_user=None,
     )

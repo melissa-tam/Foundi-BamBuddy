@@ -448,17 +448,20 @@ class TestQuiesceLeavesTheJobRunning:
     way to take a printer without losing the plate on it.
 
     Pinned as the absence of BOTH halves of the operator stop (the wire ``print.stop``
-    and the user-stopped mark), over every state the plate authority calls a job, while
+    and the durable stop request), over every state the plate authority calls a job, while
     the steps that genuinely ARE the farm's still run.
     """
 
     @pytest.fixture()
     def _marks(self, monkeypatch):
-        """Record the user-stopped mark ``print_control`` sets through ``main``."""
-        import backend.app.main as main_mod
-
+        """Record the operator stop REQUEST ``print_control`` writes (its one writer)."""
         marked: list[int] = []
-        monkeypatch.setattr(main_mod, "mark_printer_stopped_by_user", marked.append)
+
+        async def _stamp(_db, item_id, *, requested_at):
+            marked.append(item_id)
+            return True
+
+        monkeypatch.setattr(print_control, "stamp_operator_stop", _stamp)
         return marked
 
     @pytest.mark.parametrize("live", ["RUNNING", "PAUSE", "PREPARE", "SLICING", "IDLE", "FINISH", "FAILED", None])
@@ -471,7 +474,7 @@ class TestQuiesceLeavesTheJobRunning:
         verdict = await service_hold.enter(db_session, printer.id, actor="raymond")
 
         assert manager.stopped == []
-        # The mark is the half that would relabel the terminal a CANCEL. Neither half
+        # The request is the half that would relabel the terminal a CANCEL. Neither half
         # is sent: the print reaches its own terminal through the ordinary lanes.
         assert _marks == []
         assert verdict.held is True

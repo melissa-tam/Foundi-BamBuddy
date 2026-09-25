@@ -2918,12 +2918,12 @@ async def stop_print(
     if printer_manager.get_client(printer_id) is None:
         raise HTTPException(400, "Printer not connected")
 
-    # The stop AND the user-stopped mark are one act (``print_control`` owns the pair, so
-    # the service-hold quiesce and the queue-page stop cannot drift from this one): the
-    # mark is what makes ``on_print_complete`` reclassify the firmware's
-    # "failed"/"aborted" as "cancelled", instead of the HMS heuristic in
+    # The stop request AND the stop are one act (``print_control`` owns the pair, so the
+    # queue-page stop cannot drift from this one): the request, durable on the running unit,
+    # is what makes ``on_print_complete`` reclassify the firmware's "failed"/"aborted" as
+    # "cancelled" — after a restart too — instead of the HMS heuristic in
     # ``_dispatch_archive_update`` calling a user cancel a layer shift.
-    if not stop_as_operator(printer_id):
+    if not await stop_as_operator(printer_id):
         raise HTTPException(502, "Failed to stop print — printer MQTT session not connected, command not delivered")
 
     return {"success": True, "message": "Print stop command sent"}
@@ -4242,11 +4242,10 @@ async def execute_hms_action(
     if body.action == HMSAction.STOP_PRINTING:
         # The printer's own dialog offering "Stop printing" is an operator pressing Stop,
         # and the operator's Stop has ONE owner (``print_control.stop_as_operator``): the
-        # MQTT stop AND the user-stopped mark, with nothing awaited between them. Sent
-        # through the dialog dispatcher it went out WITHOUT the mark, so the terminal
-        # read as a genuine failure — retry, quarantine count — for a print a human
-        # stopped on purpose.
-        success = stop_as_operator(printer_id)
+        # durable stop request on the running unit, then the MQTT stop. Sent through the
+        # dialog dispatcher it went out WITHOUT the request, so the terminal read as a
+        # genuine failure — retry, quarantine count — for a print a human stopped on purpose.
+        success = await stop_as_operator(printer_id)
     else:
         success = client.execute_hms_action(body.print_error, body.action, body.job_id)
     if not success:

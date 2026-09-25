@@ -53,7 +53,10 @@ def live_state(
 
     ``fresh`` is whether the state describes THIS MQTT session — its first report applied
     (``report_epoch == connection_epoch``); False models the previous session's cache that
-    ``_on_connect`` re-broadcasts before its pushall answers."""
+    ``_on_connect`` re-broadcasts before its pushall answers.
+
+    The per-job consumption fields (``bambu_mqtt.job_consumption_evidence``) carry
+    ``PrinterState``'s defaults: a client that watched no switch and knows no layer count."""
     return SimpleNamespace(
         connected=True,
         connection_epoch=1,
@@ -63,6 +66,10 @@ def live_state(
         subtask_name=subtask_name,
         progress=progress,
         layer_num=5,
+        total_layers=0,
+        tray_change_log=[],
+        tray_now=255,
+        last_loaded_tray=-1,
         raw_data=None,
     )
 

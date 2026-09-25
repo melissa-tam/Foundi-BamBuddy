@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from backend.app.core import database as _database
 from backend.app.core.database import hold_write_lock
 from backend.app.services import farm_correlation, job_terminal, print_binding
+from backend.app.services.bambu_mqtt import job_consumption_evidence
 from backend.app.services.farm_correlation import PAYLOAD_KEY_OUTCOME_UNKNOWN
 from backend.app.services.job_identity import same_job
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, DepositEvidence, plate_occupancy
@@ -162,7 +163,10 @@ def ended_payload(state: PrinterState, archive: PrintArchive) -> dict:
 
     FINISH / FAILED of THIS job is real evidence of the outcome, so the TRUE status rides with
     the live progress and layer (Phase 3.4) and the one normal terminal path runs on it (the gate,
-    the identity cooldown watch, the farm policy). IDLE says only that it ended: ``aborted`` plus
+    the identity cooldown watch, the farm policy). The job's consumption evidence rides with it in
+    the MQTT terminal's own key set (``bambu_mqtt.job_consumption_evidence``): the verdict is
+    ``ended`` only when the live job id is the archive's, so the live state IS this job's record —
+    and the usage charge reads only the payload, never the live printer. IDLE says only that it ended: ``aborted`` plus
     ``outcome_unknown`` (``farm_correlation.PAYLOAD_KEY_OUTCOME_UNKNOWN``), which the one classifier
     turns into the ``reconcile_unknown`` verdict — the run HOLDS for a human instead of finishing
     one plate short. Both carry ``peaks_reliable: False``: nobody observed this print's peaks, and
@@ -178,6 +182,7 @@ def ended_payload(state: PrinterState, archive: PrintArchive) -> dict:
             "last_progress": state.progress,
             "last_layer_num": state.layer_num,
             "peaks_reliable": False,
+            **job_consumption_evidence(state),
             "raw_data": state.raw_data or {},
             "_reconciled": True,
         }

@@ -139,18 +139,27 @@ async def _locate(printer, subtask_name, filename, *, cached=None, available=Non
             p.stop()
 
 
-def _settled_printer_manager(last_loaded_tray: int = 0, mapping: list[int] | None = None) -> MagicMock:
-    """printer_manager stand-in for a finished print."""
+def _settled_payload(last_loaded_tray: int = 0, mapping: list[int] | None = None) -> dict:
+    """The finished job's own consumption evidence, as its terminal payload carries it — the charge
+    reads THIS, never the live printer. ``mapping`` is the printer's reported ``mapping`` field as the
+    terminal captured it (``mqtt_mapping``)."""
+    payload = {
+        "last_progress": 100,
+        "last_layer_num": 88,
+        "total_layers": 88,
+        "tray_now": 255,
+        "last_loaded_tray": last_loaded_tray,
+        "tray_change_log": [],
+    }
+    if mapping is not None:
+        payload["mqtt_mapping"] = mapping
+    return payload
+
+
+def _live_printer() -> MagicMock:
+    """printer_manager stand-in after the print: the live printer's hardware only, no AMS reported."""
     pm = MagicMock()
-    pm.get_status.return_value = SimpleNamespace(
-        raw_data={"mapping": mapping} if mapping is not None else {},
-        progress=100,
-        layer_num=88,
-        tray_now=255,
-        last_loaded_tray=last_loaded_tray,
-        tray_change_log=[],
-        total_layers=88,
-    )
+    pm.get_status.return_value = SimpleNamespace(raw_data={})
     return pm
 
 
@@ -263,8 +272,9 @@ async def test_the_multi_plate_file_charges_the_running_plates_grams(
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -415,8 +425,9 @@ async def test_the_library_rescue_finds_the_spliced_file_by_print_identity(
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -453,8 +464,9 @@ async def test_the_library_rescue_refuses_a_different_ladder_cut(db_session, pri
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -649,8 +661,9 @@ async def test_completion_with_no_session_and_no_queue_item_charges_the_stamped_
     with caplog.at_level(logging.INFO, logger="backend.app.services.usage_tracker"):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(mapping=[0]),
+            data={**_settled_payload(mapping=[0]), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -686,8 +699,9 @@ async def test_an_unstamped_foreign_completion_still_refuses_a_multi_plate_file(
 
     results = await on_print_complete(
         printer_id=printer.id,
-        data={"status": "completed"},
-        printer_manager=_settled_printer_manager(mapping=[0]),
+        data={**_settled_payload(mapping=[0]), "status": "completed"},
+        printer_manager=_live_printer(),
+        charge="full",
         db=db_session,
         archive_id=archive.id,
     )
@@ -722,8 +736,9 @@ async def test_a_stamped_plate_the_file_does_not_contain_refuses_to_charge(
     with caplog.at_level(logging.WARNING, logger="backend.app.services.usage_tracker"):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(mapping=[0]),
+            data={**_settled_payload(mapping=[0]), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -804,8 +819,9 @@ async def test_a_lost_foreign_print_on_a_tagless_feeder_warns_and_pages(
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={**_settled_payload(last_loaded_tray=0), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -846,8 +862,13 @@ async def test_an_eject_sweep_completion_stays_silent(db_session, printer_factor
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_name": "eject_production_item890"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={
+                **_settled_payload(last_loaded_tray=0),
+                "status": "completed",
+                "subtask_name": "eject_production_item890",
+            },
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=None,
         )
@@ -907,8 +928,9 @@ async def test_a_farm_dispatched_dry_run_that_lost_its_3mf_stays_silent(
     ):
         results = await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed", "subtask_id": "DRYRUN-733"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={**_settled_payload(last_loaded_tray=0), "status": "completed", "subtask_id": "DRYRUN-733"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )
@@ -951,8 +973,9 @@ async def test_a_captured_foreign_print_that_charges_zero_does_not_widen_the_wit
     with patch("backend.app.services.notification_service.notification_service.on_zero_gram_charge", notify):
         await on_print_complete(
             printer_id=printer.id,
-            data={"status": "completed"},
-            printer_manager=_settled_printer_manager(last_loaded_tray=0),
+            data={**_settled_payload(last_loaded_tray=0), "status": "completed"},
+            printer_manager=_live_printer(),
+            charge="full",
             db=db_session,
             archive_id=archive.id,
         )

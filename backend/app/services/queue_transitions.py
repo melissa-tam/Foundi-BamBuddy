@@ -5,7 +5,8 @@ Four transitions live here: ``pending → cancelled``, its mirror
 never landed, and the row's outright DELETION — plus, since 2026-09-25, THE writer of
 a unit's END (:func:`record_unit_terminal`, ``printing → terminal``) and its two
 narrow siblings (the dispatch that failed before its claim, and the queue-page stop
-annotated by its terminal). The first exists as a
+annotated by its terminal), and THE writer of an operator's stop request on a running
+unit (:func:`stamp_operator_stop`). The first exists as a
 module because it had three hand-rolled copies (run abort, batch cancel,
 single-item cancel) and every one of them was a read-then-write over an ORM row
 loaded earlier in the request — a lost update waiting for a dispatch to land in
@@ -69,7 +70,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Exists, and_, case, delete, select, update
+from sqlalchemy import Exists, and_, case, delete, func, select, update
 
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
@@ -145,10 +146,11 @@ async def annotate_stopped_unit(
     db: AsyncSession,
     item_id: int,
     *,
+    answered_at: datetime,
     stop_source: str | None = None,
     error_message: str | None = None,
 ) -> bool:
-    """Add what only the printer's terminal knows to a unit the QUEUE PAGE already stopped.
+    """Record the printer's terminal on a unit the QUEUE PAGE already stopped — ONCE.
 
     ``POST /queue/{id}/stop`` ends the row itself (:func:`record_unit_terminal`, ``cancelled``
     + ``operator_ui``) BEFORE the printer's terminal can arrive — it must, because a printer
@@ -156,24 +158,50 @@ async def annotate_stopped_unit(
     owner matches it to that row by its dispatch id, and the terminal adds its verdict and the
     printer's words. The row is already terminal, so its status and stop time stay the
     route's: this is an annotation, never an end, and it touches only a row still in exactly
-    the shape the route left (``cancelled`` / ``operator_ui``). Returns True iff a row was
-    annotated; a call with nothing to write is a no-op. Does not commit.
+    the shape the route left (``cancelled`` / ``operator_ui``).
+
+    **Once.** ``stop_answered_at`` is the answer's own record, and the WHERE requires it NULL:
+    a second terminal for the same stopped job — nothing in process memory marks the first one
+    any more, and a restart would have emptied it if it did — finds it set and answers False,
+    and the caller owes that terminal nothing (no disposition, no page). The mirror of
+    :func:`record_unit_terminal`'s ``printing`` precondition, for a row whose end was written
+    ahead of its terminal. Returns True iff THIS call answered the stop. Does not commit.
     """
-    values: dict[str, object] = {}
+    values: dict[str, object] = {"stop_answered_at": answered_at}
     if stop_source is not None:
         values["stop_source"] = stop_source
     if error_message is not None:
         values["error_message"] = error_message
-    if not values:
-        return False
     result = await db.execute(
         update(PrintQueueItem)
         .where(
             PrintQueueItem.id == item_id,
             PrintQueueItem.status == "cancelled",
             PrintQueueItem.stop_source == STOP_SOURCE_QUEUE_PAGE,
+            PrintQueueItem.stop_answered_at.is_(None),
         )
         .values(**values)
+        .returning(PrintQueueItem.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def stamp_operator_stop(db: AsyncSession, item_id: int, *, requested_at: datetime) -> bool:
+    """THE writer of an operator's stop request: ``operator_stop_requested_at`` on a RUNNING unit.
+
+    ``print_control.stop_as_operator`` calls it — and commits — BEFORE it publishes
+    ``print.stop``, so the terminal the stop produces always reads a committed request, however
+    soon it lands and whatever restarts in between. ``printing`` is in the WHERE: a unit that
+    already ended cannot be asked to stop, and a request written onto a pending row would be
+    read by the NEXT dispatch's terminal. The first instant stands (``COALESCE``): a second
+    press is the same request, not a later one. Returns True iff the unit is ``printing`` and
+    now carries a request. Does not commit.
+    """
+    result = await db.execute(
+        update(PrintQueueItem)
+        .where(PrintQueueItem.id == item_id, PrintQueueItem.status == "printing")
+        .values(operator_stop_requested_at=func.coalesce(PrintQueueItem.operator_stop_requested_at, requested_at))
         .returning(PrintQueueItem.id)
         .execution_options(synchronize_session=False)
     )
@@ -365,6 +393,14 @@ async def release_unstarted_claim(db: AsyncSession, *, item_id: int) -> bool:
     operator set on this unit BEFORE it was dispatched is lost, and the matcher
     re-decides from live trays.
 
+    ``operator_stop_requested_at`` is cleared for the same reason. An operator's Stop of a
+    claim whose print never started asked a job that does not exist to stop; kept, the
+    request would ride the row into its NEXT dispatch and classify that print's terminal
+    — a genuine failure included — as the operator's stop (``farm_correlation
+    .operator_stop_requested`` reads it by dispatch id, and the re-dispatch's id is this
+    row's). A pending row carries no stop request, by construction of every writer that
+    makes one.
+
     ``printer_id`` follows the same rule, decided per row by what the row TARGETS. A
     POOL unit — one carrying ``target_model`` or ``target_printer_ids`` — goes back to
     the pool: its ``printer_id`` was the RECORD of the dispatch now being un-made
@@ -388,6 +424,7 @@ async def release_unstarted_claim(db: AsyncSession, *, item_id: int) -> bool:
             started_at=None,
             ams_mapping=None,
             waiting_reason=None,
+            operator_stop_requested_at=None,
             # Evaluated by the database on the row's OWN target columns, in the same
             # atomic statement — a Python branch would need the row read first, which
             # is the read-then-write this module exists to remove. Plain CASE/AND/IS

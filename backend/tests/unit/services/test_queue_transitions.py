@@ -46,6 +46,7 @@ from backend.app.services.queue_transitions import (
     fail_unclaimed_dispatch,
     record_unit_terminal,
     release_unstarted_claim,
+    stamp_operator_stop,
 )
 
 pytestmark = pytest.mark.unit
@@ -551,6 +552,20 @@ class TestReleaseUnstartedClaim:
         assert after.ams_mapping is None
         assert after.waiting_reason is None
 
+    async def test_a_stop_request_the_print_never_answered_does_not_survive_the_release(self, session_factory):
+        """An operator's Stop of a claim whose print never started asked a job that does
+        not exist to stop. Kept, it would ride the row into its NEXT dispatch and classify
+        that print's terminal — a genuine failure included — as the operator's stop."""
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            assert await stamp_operator_stop(db, item_id, requested_at=_REQUESTED_AT)
+            await db.commit()
+            assert await release_unstarted_claim(db, item_id=item_id) is True
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.status, after.operator_stop_requested_at) == ("pending", None)
+
     async def test_a_model_targeted_row_goes_back_to_the_pool(self, session_factory):
         """On a POOL row ``printer_id`` was the dispatch RECORD, so un-making the
         dispatch un-makes it: leaving it would hand the next tick a scheduler decision
@@ -662,6 +677,9 @@ class TestReleaseUnstartedClaim:
 # ---------------------------------------------------------------------------
 
 _ENDED_AT = datetime(2026, 9, 25, 3, 0, 0, tzinfo=timezone.utc)
+# Naive UTC: SQLite's ``DateTime`` round-trips a naive value, so these compare as read back.
+_REQUESTED_AT = datetime(2026, 9, 25, 2, 59, 0)
+_ANSWERED_AT = datetime(2026, 9, 25, 3, 0, 30)
 
 
 class TestRecordUnitTerminal:
@@ -776,27 +794,115 @@ class TestAnnotateStoppedUnit:
         item_id = await self._stopped(session_factory, error_message=None)
         before = await _row(session_factory, item_id)
         async with session_factory() as db:
-            assert await annotate_stopped_unit(db, item_id, stop_source="plate_refused", error_message="the plate")
+            assert await annotate_stopped_unit(
+                db, item_id, answered_at=_ANSWERED_AT, stop_source="plate_refused", error_message="the plate"
+            )
             await db.commit()
 
         after = await _row(session_factory, item_id)
         assert (after.status, after.completed_at) == ("cancelled", before.completed_at)
         assert (after.stop_source, after.error_message) == ("plate_refused", "the plate")
+        assert after.stop_answered_at == _ANSWERED_AT
 
     async def test_only_a_row_the_queue_page_stopped_is_annotated(self, session_factory):
         other_stop = await self._stopped(session_factory, stop_source="operator_screen")
         (printing,) = await _seed(session_factory, "printing")
         async with session_factory() as db:
             for item_id in (other_stop, printing):
-                assert await annotate_stopped_unit(db, item_id, stop_source="plate_refused") is False
+                assert (
+                    await annotate_stopped_unit(db, item_id, answered_at=_ANSWERED_AT, stop_source="plate_refused")
+                    is False
+                )
             await db.commit()
         assert (await _row(session_factory, other_stop)).stop_source == "operator_screen"
         assert (await _row(session_factory, printing)).status == "printing"
 
-    async def test_nothing_to_write_is_a_no_op(self, session_factory):
+    async def test_an_answer_with_no_words_is_still_the_answer(self, session_factory):
+        """The terminal's usual shape for a queue-page stop: its verdict is the route's own
+        ``operator_ui`` and the route's words stand — the answer is recorded all the same, and
+        it is what the terminal is owed its disposition for."""
         item_id = await self._stopped(session_factory)
         async with session_factory() as db:
-            assert await annotate_stopped_unit(db, item_id) is False
+            assert await annotate_stopped_unit(db, item_id, answered_at=_ANSWERED_AT) is True
+            await db.commit()
+        after = await _row(session_factory, item_id)
+        assert (after.stop_source, after.error_message, after.stop_answered_at) == (
+            "operator_ui",
+            "Stopped by user",
+            _ANSWERED_AT,
+        )
+
+    async def test_a_second_terminal_for_the_same_stop_is_refused(self, session_factory):
+        """ONCE. Nothing in process memory marks the first terminal any more (and a restart
+        would have emptied it) — the row's own answer does, so a duplicate terminal annotates
+        nothing and its caller disposes nothing."""
+        item_id = await self._stopped(session_factory, error_message=None)
+        async with session_factory() as db:
+            assert await annotate_stopped_unit(db, item_id, answered_at=_ANSWERED_AT, stop_source="plate_refused")
+            await db.commit()
+        async with session_factory() as db:
+            later = datetime(2026, 9, 25, 13, 0, tzinfo=timezone.utc)
+            assert (
+                await annotate_stopped_unit(
+                    db, item_id, answered_at=later, stop_source="operator_ui", error_message="x"
+                )
+                is False
+            )
+            await db.commit()
+
+        after = await _row(session_factory, item_id)
+        assert (after.stop_source, after.error_message, after.stop_answered_at) == (
+            "plate_refused",
+            None,
+            _ANSWERED_AT,
+        )
+
+    async def test_two_racing_terminals_answer_the_stop_once(self, session_factory):
+        """Two sessions over a FILE database, both having read the row unanswered: the
+        precondition is evaluated in the write, so exactly one of them answers."""
+        item_id = await self._stopped(session_factory)
+        async with session_factory() as first, session_factory() as second:
+            await first.get(PrintQueueItem, item_id)
+            await second.get(PrintQueueItem, item_id)
+            won_first = await annotate_stopped_unit(first, item_id, answered_at=_ANSWERED_AT)
+            await first.commit()
+            won_second = await annotate_stopped_unit(second, item_id, answered_at=_ANSWERED_AT)
+            await second.commit()
+        assert (won_first, won_second) == (True, False)
+
+
+class TestStampOperatorStop:
+    """THE writer of an operator's stop request — a RUNNING unit only, first instant kept."""
+
+    async def test_a_printing_unit_carries_the_request(self, session_factory):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            assert await stamp_operator_stop(db, item_id, requested_at=_REQUESTED_AT) is True
+            await db.commit()
+        after = await _row(session_factory, item_id)
+        assert (after.status, after.operator_stop_requested_at) == ("printing", _REQUESTED_AT)
+
+    @pytest.mark.parametrize("status", ["pending", "cancelled", "completed", "failed"])
+    async def test_a_unit_that_is_not_running_is_never_stamped(self, session_factory, status):
+        """A pending row's request would be read by its NEXT dispatch's terminal; an ended
+        unit cannot be asked to stop."""
+        (item_id,) = await _seed(session_factory, status)
+        async with session_factory() as db:
+            assert await stamp_operator_stop(db, item_id, requested_at=_REQUESTED_AT) is False
+            await db.commit()
+        assert (await _row(session_factory, item_id)).operator_stop_requested_at is None
+
+    async def test_a_second_press_keeps_the_first_instant(self, session_factory):
+        (item_id,) = await _seed(session_factory, "printing")
+        async with session_factory() as db:
+            assert await stamp_operator_stop(db, item_id, requested_at=_REQUESTED_AT)
+            assert await stamp_operator_stop(db, item_id, requested_at=_ANSWERED_AT)
+            await db.commit()
+        assert (await _row(session_factory, item_id)).operator_stop_requested_at == _REQUESTED_AT
+
+    async def test_a_missing_unit_is_refused(self, session_factory):
+        async with session_factory() as db:
+            assert await stamp_operator_stop(db, 999_999, requested_at=_REQUESTED_AT) is False
 
 
 class TestFailUnclaimedDispatch:
