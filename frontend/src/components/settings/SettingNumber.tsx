@@ -1,6 +1,6 @@
 /**
  * SettingNumber — the ONE implementation of the Settings page's clamped
- * integer field: a `<label htmlFor>` caption, an `InfoHint` carrying the
+ * number field: a `<label htmlFor>` caption, an `InfoHint` carrying the
  * mechanism copy, and a `type="number"` input bounded to [min, max].
  *
  * The rule it owns: **an emptied field is a keystroke, not a value.** A
@@ -15,11 +15,15 @@
  * to the stored value. The draft is deliberately local to this component: it is
  * transient input state, never a second home for the setting.
  *
- * Integer-valued by construction (`parseInt`): every consumer — the two fan
- * speeds, the chamber sustain speed, the plate-hold part top and the idle park
- * depth — stores a whole number. `step` only tunes the spinner increment.
- * Fractional settings (the cooling epsilon, the plateau margin) keep their own
- * inputs in the monitoring grid.
+ * `kind` states what the setting stores. `integer` (the default — the two fan
+ * speeds, the chamber sustain speed, the plate-hold part top, the idle park
+ * depth, the blow-off time) parses with `parseInt`; `step` only tunes the
+ * spinner. `decimal` (the cooldown margin) parses with `parseFloat`, and there
+ * an entry BELOW `min` is also a keystroke: "0" is how "0.5" begins, so
+ * clamping it at once would rewrite the box mid-number. It is held as a draft
+ * and clamped when the field is left. Above `max` still clamps at once — more
+ * digits can only raise it. The cooling epsilon and the plateau margin keep
+ * their own inputs in the monitoring grid.
  *
  * Supplementary copy goes in `hint` and is rendered only in the tooltip
  * (react-best-practices §9); there is no inline help slot. `enabled={false}`
@@ -32,6 +36,9 @@
 import { useState } from 'react';
 import { InfoHint } from '../ui/InfoHint';
 
+/** What the setting stores; decides the parser and the below-min rule. */
+export type SettingNumberKind = 'integer' | 'decimal';
+
 interface SettingNumberProps {
   /** DOM id; ties the visible `<label>` to the input. */
   id: string;
@@ -41,12 +48,14 @@ interface SettingNumberProps {
   hint: string;
   /** The stored setting. Shown whenever no draft keystroke is pending. */
   value: number;
-  /** Called with a clamped integer; never called for an unparseable entry. */
+  /** Called with a clamped value; never called for an unparseable entry. */
   onChange: (value: number) => void;
   min: number;
   max: number;
-  /** Spinner increment only — the stored value is always an integer. */
+  /** Spinner increment (and the browser's step validity). */
   step?: number;
+  /** `integer` (default) or `decimal`. */
+  kind?: SettingNumberKind;
   /** False when a switch above has made this number meaningless. */
   enabled?: boolean;
 }
@@ -60,9 +69,11 @@ export function SettingNumber({
   min,
   max,
   step = 1,
+  kind = 'integer',
   enabled = true,
 }: SettingNumberProps) {
   const [draft, setDraft] = useState<string | null>(null);
+  const parse = (raw: string): number => (kind === 'decimal' ? parseFloat(raw) : parseInt(raw, 10));
 
   return (
     <div className={`sm:max-w-xs ${enabled ? '' : 'opacity-50'}`}>
@@ -81,10 +92,10 @@ export function SettingNumber({
         value={draft ?? String(value)}
         onChange={(e) => {
           const raw = e.target.value;
-          const parsed = parseInt(raw, 10);
-          if (Number.isNaN(parsed)) {
-            // Mid-typing ("-", or an emptied field): show the raw string,
-            // leave the stored value alone.
+          const parsed = parse(raw);
+          if (Number.isNaN(parsed) || (kind === 'decimal' && parsed < min)) {
+            // Mid-typing ("-", an emptied field, or a decimal's leading "0"):
+            // show the raw string, leave the stored value alone.
             setDraft(raw);
             return;
           }
@@ -93,7 +104,13 @@ export function SettingNumber({
           setDraft(clamped === parsed ? raw : null);
           onChange(clamped);
         }}
-        onBlur={() => setDraft(null)}
+        onBlur={() => {
+          // A decimal left below its floor commits the floor; any other draft
+          // is either unparseable (nothing to commit) or already written.
+          const pending = draft === null ? Number.NaN : parse(draft);
+          if (!Number.isNaN(pending) && pending < min) onChange(min);
+          setDraft(null);
+        }}
         disabled={!enabled}
         className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
       />

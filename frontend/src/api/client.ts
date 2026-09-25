@@ -705,6 +705,14 @@ export interface FilaSwitchState {
   info: number;
 }
 
+/** In-flight eject cooldown watch (`schemas/printer.py` `EjectWatchInfo`). */
+export interface EjectWatchInfo {
+  /** The eject line (°C) the watch armed with; null when shop air was unknown. */
+  threshold_c: number | null;
+  hold_z: number | null;
+  deferred: boolean;
+}
+
 export interface PrinterStatus {
   id: number;
   name: string;
@@ -833,15 +841,19 @@ export interface PrinterStatus {
   // this printer until the declaration is corrected. Absent report = no mismatch.
   model_mismatch?: boolean;
   model_mismatch_reason?: string | null;
-  // Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
-  // release threshold. Present while the farm waits for the bed to cool before
-  // auto-clearing the plate gate; null/absent otherwise.
+  // Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch.
+  // Present while the farm waits for the bed to cool before auto-clearing the
+  // plate gate; null/absent otherwise.
+  // `threshold_c` is the eject line the watch armed with (measured shop air
+  // plus `farm_cooldown_margin_c`); null when shop air was unknown at arm — the
+  // plate still cools and releases on its own air or at its plateau, there is
+  // just no line to quote.
   // `hold_z` is the height the plate is being HELD at for the duration of that
   // wait (nozzle plane, toolhead parked at the chute) — non-null means an
   // operator must not jog the toolhead until the eject runs; null = not held.
   // `deferred` is true once the cooldown watch has retired its fans and is
   // withholding the eject under maintenance mode.
-  eject_watch?: { threshold_c: number; hold_z: number | null; deferred: boolean } | null;
+  eject_watch?: EjectWatchInfo | null;
   // Open printer-hold incident (WS2b): the fault this printer is currently held
   // by. Present for FOREIGN prints too — those have no queue unit, so this chip
   // is the only place their hold is visible. Null/absent when clear.
@@ -1573,10 +1585,6 @@ export interface AppSettings {
   // retry / quarantine policy fields.
   farm_retry_max_per_unit: number;
   farm_escalate_consecutive_failures: number;
-  // Ambient-trap guard (Phase 2): warn in the eject-profile form when a
-  // cooldown threshold sits below this floor (a threshold at/below shop
-  // ambient can never be reached, stalling the eject wait forever).
-  farm_cooldown_warn_floor_c: number;
   // Offline-stall watch (Phase 3.2): flag a farm unit still 'printing' whose
   // printer has been offline at least this many minutes (never terminates it —
   // the reconcile resolves the true outcome on reconnect).
@@ -1594,9 +1602,14 @@ export interface AppSettings {
   farm_cooldown_stall_window_minutes: number;
   farm_cooldown_stall_epsilon_c: number;
   farm_cooldown_max_hold_minutes: number;
-  // When cooling plateaus within this many °C of the release threshold, eject
-  // (bed equilibrated at ambient) instead of quarantining the printer.
+  // When cooling plateaus within this many °C of the printer's OWN chamber air,
+  // eject (bed equilibrated) instead of quarantining the printer.
   farm_cooldown_plateau_eject_margin_c: number;
+  // THE one eject-line input: the eject line and the chamber-fan step-down sit
+  // this far (°C, 0.5–10) above measured shop air (`GET /shop-air`). Replaced
+  // the per-profile cooldown temperature, the per-run override and the warn
+  // floor that policed them.
+  farm_cooldown_margin_c: number;
   // Cooldown fans: from the end of the print until the eject dispatches the
   // farm runs the printer's auxiliary fan and its chamber exhaust fan, each
   // switchable. The aux fan holds ONE speed for the whole wait (forced
@@ -1635,6 +1648,12 @@ export interface AppSettings {
   // plate's front lip. A file whose start block is not recognised dispatches
   // unmodified.
   farm_chute_prime_enabled: boolean;
+  // Plate blow-off: at dispatch a full-speed auxiliary-fan pulse is inserted
+  // into the start block just before bed leveling, blowing stray filament off
+  // the plate. A file whose start block is not recognised, or that selects the
+  // heating airduct mode, dispatches without it. Seconds are 3–60.
+  farm_plate_blowoff_enabled: boolean;
+  farm_plate_blowoff_seconds: number;
   // Dispatch responsiveness (latency-reduction wave). Event kicks make dispatch
   // immediate; these tune the fallback poll, kick coalescing, USB-preflight
   // freshness, upload concurrency, and eject-file upload optimizations.
@@ -1693,6 +1712,28 @@ export interface AppSettings {
 }
 
 export type AppSettingsUpdate = Partial<AppSettings>;
+
+/** How the shop air is known: `fresh` = at-rest samples from ≥ 3 printers in
+ *  the last hour; `carried` = the latest sample moved along the 7-day day
+ *  curve; `unknown` = no at-rest sample in 7 days (no value, no line). */
+export type ShopAirBasis = 'fresh' | 'carried' | 'unknown';
+
+/** `GET /shop-air` (`backend/app/schemas/shop_air.py` `ShopAirResponse`): the
+ *  measured shop air, how it is known, and the eject line the farm arms every
+ *  cooldown watch with. `value_c` / `eject_line_c` are null exactly when
+ *  `basis` is `unknown`. */
+export interface ShopAirResponse {
+  value_c: number | null;
+  /** UTC ISO: the newest contributing sample (fresh) or the carried sample's
+   *  minute (carried); null when unknown. */
+  as_of: string | null;
+  basis: ShopAirBasis;
+  /** How many printers the value rests on. */
+  printers: number;
+  /** `farm_cooldown_margin_c` as the server read it. */
+  margin_c: number;
+  eject_line_c: number | null;
+}
 
 // MQTT relay status
 export interface MQTTStatus {
@@ -3909,6 +3950,21 @@ export interface UserUpdate {
  *   - `currently_printing` printing queue items that make the destructive
  *                        delete fail closed with `user_has_printing_units`.
  */
+/**
+ * `GET /archives/{id}/delete-impact` (`services/archive.ArchiveDeleteImpact`).
+ *   - `related_queue_items` queue items linked to the archive, removed with it.
+ *   - `currently_printing`  prints in progress the delete would pull out from
+ *                           under a printer: related units mid-print, PLUS the
+ *                           print this archive itself records when it is live.
+ *                           So it can be > 0 with `related_queue_items == 0`
+ *                           (a retry's own archive). The delete 409s whenever
+ *                           it is non-zero.
+ */
+export interface ArchiveDeleteImpact {
+  related_queue_items: number;
+  currently_printing: number;
+}
+
 export interface UserDeleteImpact {
   archives: number;
   library_files: number;
@@ -4432,8 +4488,9 @@ export const api = {
   // Farm manual eject (W2): trigger the part-present eject sweep for a
   // farm-known completed unit. Call with allowHot=false first; the backend 409s
   // with `{code:'bed_hot', bed_c, threshold_c}` when the bed is above the
-  // release threshold, and the caller re-invokes with allowHot=true after an
-  // explicit operator confirm. A `{code:'foreign_plate', ...}` 409 means the
+  // release threshold (`threshold_c` null when there is neither an eject line
+  // nor a chamber reading to judge the bed by), and the caller re-invokes with
+  // allowHot=true after an explicit operator confirm. A `{code:'foreign_plate', ...}` 409 means the
   // plate gate was raised by a print the farm did not dispatch (sent manually
   // from Bambu Studio); the caller confirms an eject profile and re-invokes
   // with `ejectProfileId` set. 200 → `{mode}` ('released_watch' | 'dispatched').
@@ -4769,15 +4826,9 @@ export const api = {
   },
   getArchive: (id: number) => request<Archive>(`/archives/${id}`),
   getArchiveRuns: (id: number) => request<PrintLogResponse>(`/archives/${id}/runs`),
-  /**
-   * Pre-flight for the delete-confirm modal (#1734). Returns the number of
-   * related queue items that will be removed along with the archive AND how
-   * many are currently printing (server 409s on delete if > 0).
-   */
+  /** Pre-flight for the delete-confirm modal (#1734); see `ArchiveDeleteImpact`. */
   getArchiveDeleteImpact: (id: number) =>
-    request<{ related_queue_items: number; currently_printing: number }>(
-      `/archives/${id}/delete-impact`
-    ),
+    request<ArchiveDeleteImpact>(`/archives/${id}/delete-impact`),
   searchArchives: (query: string, options?: {
     printerId?: number;
     projectId?: number;
@@ -5410,6 +5461,9 @@ export const api = {
       body: JSON.stringify(data),
     }),
   getMQTTStatus: () => request<MQTTStatus>('/settings/mqtt/status'),
+  // The measured shop air and the eject line derived from it — the same read
+  // the cooldown watch makes at arm (settings:read).
+  getShopAir: () => request<ShopAirResponse>('/shop-air'),
   resetSettings: () =>
     request<AppSettings>('/settings/reset', { method: 'POST' }),
   exportBackup: async (): Promise<{ blob: Blob; filename: string }> => {

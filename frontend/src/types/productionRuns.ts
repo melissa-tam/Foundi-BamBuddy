@@ -171,8 +171,6 @@ export interface ProductionRun {
   /** Eject profile the run's plates use (uniform per run), or null. Seeds the
    *  "Run again" dialog (Phase 5, F9). */
   eject_profile_id: number | null;
-  /** Per-run cooldown override (°C) applied to eject generation, or null. */
-  cooldown_temp_c_override: number | null;
   /** Target printer model for a model-targeted run, or null for a
    *  printers-pool run (its members are in `target_printers`). */
   target_model: string | null;
@@ -204,7 +202,6 @@ export interface RunPrefill {
   printerIds: number[];
   targetModel: string | null;
   ejectProfileId: number | null;
-  cooldownOverride: number | null;
   requireFirstArticle: boolean;
   retryMaxPerUnit: number;
   escalateConsecutiveFailures: number;
@@ -268,7 +265,6 @@ export interface ProductionRunCreate {
   printer_ids?: number[];
   target_model?: string;
   eject_profile_id?: number | null;
-  cooldown_temp_c_override?: number | null;
   /** Gate the run on first-article approval. Defaults to true server-side. */
   require_first_article?: boolean;
   /** Automatic retries per plate before a plate is marked failed (0–10). */

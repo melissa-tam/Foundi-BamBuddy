@@ -1,11 +1,13 @@
 /**
  * Phase derivation for the farm loop (Phase 4.3c): printing / eject deferred /
- * cooling (release target only) / awaiting plate clear / nothing. Pure function
- * — the printer card pill and the run-detail chips both consume it.
+ * cooling (eject line, or none) / awaiting plate clear / nothing. Pure function
+ * — the printer card pill and the run-detail chips both consume it, and both
+ * word a cooling watch through `coolingLabel`.
  */
 
 import { describe, it, expect } from 'vitest';
-import { deriveFarmPhase } from '../../utils/farmPhase';
+import i18n from '../../i18n';
+import { coolingLabel, deriveFarmPhase } from '../../utils/farmPhase';
 
 describe('deriveFarmPhase', () => {
   it('reports printing while a job runs, even with a stale watch flag', () => {
@@ -161,13 +163,80 @@ describe('deriveFarmPhase', () => {
     expect(deriveFarmPhase({ state: null })).toBeNull();
   });
 
-  it('ignores a non-numeric threshold defensively', () => {
+  // A watch armed while shop air was unknown quotes no line: the plate still
+  // cools and releases on its own air or at its plateau. The watch's presence
+  // is the cooling fact — a missing line never demotes it to "awaiting clear".
+  it('reports cooling with no line when the watch armed without one', () => {
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: null },
+      }),
+    ).toEqual({ kind: 'cooling', threshold: null, held: false });
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: null, hold_z: 2 },
+      }),
+    ).toEqual({ kind: 'cooling', threshold: null, held: true });
+  });
+
+  it('still reports a deferred eject when the watch has no line', () => {
+    expect(
+      deriveFarmPhase({
+        state: 'FINISH',
+        awaiting_plate_clear: true,
+        eject_watch: { threshold_c: null, deferred: true },
+      }),
+    ).toEqual({ kind: 'ejectDeferred', held: false });
+  });
+
+  it('treats a non-finite line as no line, never as a number', () => {
     expect(
       deriveFarmPhase({
         state: 'FINISH',
         awaiting_plate_clear: true,
         eject_watch: { threshold_c: Number.NaN },
       }),
-    ).toEqual({ kind: 'awaitingPlateClear' });
+    ).toEqual({ kind: 'cooling', threshold: null, held: false });
+  });
+});
+
+describe('coolingLabel', () => {
+  it('quotes the rounded eject line when the watch has one', () => {
+    expect(coolingLabel({ kind: 'cooling', threshold: 27.6, held: false })).toEqual({
+      key: 'printers.phase.cooling',
+      threshold: 28,
+    });
+    expect(coolingLabel({ kind: 'cooling', threshold: 27.4, held: true })).toEqual({
+      key: 'printers.phase.coolingHeld',
+      threshold: 27,
+    });
+  });
+
+  it('names the plateau when the watch has no line', () => {
+    expect(coolingLabel({ kind: 'cooling', threshold: null, held: false })).toEqual({
+      key: 'printers.phase.coolingToPlateau',
+      threshold: null,
+    });
+    expect(coolingLabel({ kind: 'cooling', threshold: null, held: true })).toEqual({
+      key: 'printers.phase.coolingToPlateauHeld',
+      threshold: null,
+    });
+  });
+
+  it('resolves every key it can return in the live locale', () => {
+    // A key that fell out of the locale would render as the raw key string.
+    for (const phase of [
+      { kind: 'cooling' as const, threshold: 30, held: false },
+      { kind: 'cooling' as const, threshold: 30, held: true },
+      { kind: 'cooling' as const, threshold: null, held: false },
+      { kind: 'cooling' as const, threshold: null, held: true },
+    ]) {
+      const label = coolingLabel(phase);
+      expect(i18n.exists(label.key)).toBe(true);
+    }
   });
 });

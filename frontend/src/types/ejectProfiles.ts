@@ -11,9 +11,6 @@
 
 /** The numeric/boolean parameter set shared by create, update, and read. */
 export interface EjectProfileParams {
-  /** Bed temperature (°C) the part must cool below before the server dispatches
-   *  the eject job (the release threshold). */
-  cooldown_temp_c: number;
   /** Vertical clearance (mm) the toolhead keeps above the part while sweeping. */
   clearance_mm: number;
   /** Z offset (mm) applied to the sweep pass height. */
@@ -79,7 +76,6 @@ export type EjectProfileUpdate = EjectProfileCreate;
 
 /** Backend default parameter set, prefilled into the create form. */
 export const DEFAULT_EJECT_PROFILE_PARAMS: EjectProfileParams = {
-  cooldown_temp_c: 28,
   clearance_mm: 10,
   z_offset_mm: 0.4,
   descent_steps: 4,

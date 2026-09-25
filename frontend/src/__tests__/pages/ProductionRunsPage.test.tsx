@@ -49,7 +49,6 @@ function run(overrides: Partial<ProductionRun> = {}): ProductionRun {
     escalate_consecutive_failures: 3,
     first_article_reject_reason: null,
     eject_profile_id: null,
-    cooldown_temp_c_override: null,
     target_model: null,
     target_printers: [],
     eta_seconds: 7200,
@@ -345,17 +344,18 @@ describe('ProductionRunsPage', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Phase 4.3i: cooldown override shows the profile default it would replace
+  // The eject line is measured shop air + the Settings margin: a run carries
+  // no eject-temperature override of its own.
   // -------------------------------------------------------------------------
 
-  it("shows the selected eject profile's cooldown default under the override input", async () => {
+  it('offers the eject profile in Advanced, with no eject-temperature override', async () => {
     server.use(
       http.get('*/api/v1/production-runs', () => HttpResponse.json([])),
       http.get('*/api/v1/skus', () =>
         HttpResponse.json([skuWithFile({ default_eject_profile_id: 5 })]),
       ),
       http.get('*/api/v1/eject-profiles', () =>
-        HttpResponse.json([{ id: 5, name: 'PETG default', cooldown_temp_c: 33 }]),
+        HttpResponse.json([{ id: 5, name: 'PETG default' }]),
       ),
     );
 
@@ -364,12 +364,12 @@ describe('ProductionRunsPage', () => {
 
     await screen.findByText('No production runs yet');
     await user.click(screen.getByRole('button', { name: /start run/i }));
-    await screen.findByRole('dialog');
+    const dialog = await screen.findByRole('dialog');
 
-    // Eject/cooldown moved under the collapsed "Advanced" disclosure (F5).
-    await user.click(screen.getByRole('button', { name: /^advanced$/i }));
-    // The dialog seeds the SKU default profile → the hint names its default.
-    expect(await screen.findByText('Overrides profile default 33°C')).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: /^advanced$/i }));
+    // The dialog seeds the SKU default profile; nothing temperature-shaped remains.
+    expect((within(dialog).getByLabelText(/eject profile/i) as HTMLSelectElement).value).toBe('5');
+    expect(within(dialog).queryByLabelText(/cooldown/i)).not.toBeInTheDocument();
   });
 
   // -------------------------------------------------------------------------
@@ -541,7 +541,7 @@ describe('ProductionRunsPage', () => {
       http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
       twoModelFleet,
       http.get('*/api/v1/eject-profiles', () =>
-        HttpResponse.json([{ id: 5, name: 'PETG default', cooldown_temp_c: 33 }]),
+        HttpResponse.json([{ id: 5, name: 'PETG default' }]),
       ),
     );
 
@@ -549,12 +549,12 @@ describe('ProductionRunsPage', () => {
     render(<ProductionRunsPage />);
     await openDialog(user);
 
-    // Set a cooldown override, then collapse — the summary must name it so an
-    // override is never invisible.
+    // Pick an eject profile the SKU does not default to, then collapse — the
+    // summary must name it so an override is never invisible.
     await user.click(await screen.findByRole('button', { name: /^advanced$/i }));
-    await user.type(screen.getByLabelText(/cooldown override/i), '34');
+    await user.selectOptions(screen.getByLabelText(/eject profile/i), '5');
     await user.click(screen.getByRole('button', { name: /^advanced$/i }));
-    expect(await screen.findByText(/cooldown override.*34/i)).toBeInTheDocument();
+    expect(await screen.findByText(/eject profile.*PETG default/i)).toBeInTheDocument();
   });
 
   // -------------------------------------------------------------------------
@@ -588,7 +588,6 @@ describe('ProductionRunsPage', () => {
       target_units: 10,
       target_model: 'H2C',
       eject_profile_id: 5,
-      cooldown_temp_c_override: 34,
       require_first_article: true,
       retry_max_per_unit: 2,
       escalate_consecutive_failures: 4,
@@ -598,7 +597,7 @@ describe('ProductionRunsPage', () => {
       http.get('*/api/v1/skus', () => HttpResponse.json([skuWithFile()])),
       twoModelFleet,
       http.get('*/api/v1/eject-profiles', () =>
-        HttpResponse.json([{ id: 5, name: 'PETG default', cooldown_temp_c: 33 }]),
+        HttpResponse.json([{ id: 5, name: 'PETG default' }]),
       ),
       http.post('*/api/v1/production-runs', async ({ request }) => {
         posted = (await request.json()) as Record<string, unknown>;
@@ -621,12 +620,12 @@ describe('ProductionRunsPage', () => {
     }) as HTMLSelectElement;
     expect(modelSelect.value).toBe('H2C');
 
-    // The eject profile + cooldown override are prefilled inside Advanced.
-    // Collapsed, the toggle's name also carries the non-default summary, so match
-    // by prefix rather than an exact "Advanced".
+    // The eject profile is prefilled inside Advanced. Collapsed, the toggle's
+    // name also carries the non-default summary, so match by prefix rather than
+    // an exact "Advanced".
     await user.click(within(dialog).getByRole('button', { name: /^advanced/i }));
     expect((within(dialog).getByLabelText(/eject profile/i) as HTMLSelectElement).value).toBe('5');
-    expect((within(dialog).getByLabelText(/cooldown override/i) as HTMLInputElement).value).toBe('34');
+    expect(within(dialog).queryByLabelText(/cooldown/i)).not.toBeInTheDocument();
 
     await user.click(within(dialog).getByRole('button', { name: /start run/i }));
     await waitFor(() => expect(posted).not.toBeNull());
@@ -635,12 +634,13 @@ describe('ProductionRunsPage', () => {
       target_units: 10,
       target_model: 'H2C',
       eject_profile_id: 5,
-      cooldown_temp_c_override: 34,
       require_first_article: true,
       retry_max_per_unit: 2,
       escalate_consecutive_failures: 4,
     });
     expect(posted).not.toHaveProperty('printer_ids');
+    // The eject line is shop air + the Settings margin — never a per-run value.
+    expect(posted).not.toHaveProperty('cooldown_temp_c_override');
   });
 
   // -------------------------------------------------------------------------

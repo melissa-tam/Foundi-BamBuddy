@@ -3,8 +3,9 @@
  * Phase 2):
  * - The create/edit dialog derives validation bounds from the mocked
  *   /model-geometry API: sub-minimum or beyond-bed sweep bands are hard errors
- *   that block save; the cooldown ambient-trap and part-height-ceiling checks
- *   are non-blocking warnings.
+ *   that block save; the part-height-ceiling check is a non-blocking warning.
+ *   A profile carries no cooldown temperature — the eject line is measured
+ *   shop air plus the one Settings margin.
  * - The preview panel resolves geometry from a model picker (defaulting to the
  *   first hardware-validated registry row), sends it as `model`, and surfaces
  *   the response's geometry warnings.
@@ -53,7 +54,6 @@ function profile(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     id: 1,
     name: 'Fast sweep',
-    cooldown_temp_c: 28,
     clearance_mm: 10,
     z_offset_mm: 0.4,
     descent_steps: 4,
@@ -82,9 +82,6 @@ beforeEach(() => {
   server.use(
     http.get('*/api/v1/model-geometry', () =>
       HttpResponse.json({ geometries: geometryRows, sweep_band_min_width_mm: 10 }),
-    ),
-    http.get('*/api/v1/settings/', () =>
-      HttpResponse.json({ farm_cooldown_warn_floor_c: 30 }),
     ),
     http.get('*/api/v1/library/files', () => HttpResponse.json([])),
   );
@@ -168,25 +165,27 @@ describe('EjectProfilesPage geometry-derived form validation', () => {
     expect(postedBody).toMatchObject({ sweep_x_min_mm: 50, sweep_x_max_mm: 200 });
   });
 
-  it('warns (non-blocking) when the cooldown sits below the ambient-trap floor', async () => {
-    server.use(http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])));
+  it('has no cooldown field and saves a profile without a cooldown temperature', async () => {
+    let postedBody: Record<string, unknown> | null = null;
+    server.use(
+      http.get('*/api/v1/eject-profiles', () => HttpResponse.json([])),
+      http.post('*/api/v1/eject-profiles', async ({ request }) => {
+        postedBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(profile({ id: 9, name: 'plain' }), { status: 201 });
+      }),
+    );
 
     const user = userEvent.setup();
     render(<EjectProfilesPage />);
     await openCreateDialog(user);
 
-    // Default cooldown is 28 °C, below the mocked farm_cooldown_warn_floor_c=30.
-    expect(
-      await screen.findByText(/below the cooldown warn floor \(30 °C\)/i),
-    ).toBeInTheDocument();
+    // The eject line lives in Settings (shop air + margin), never on a profile.
+    expect(screen.queryByLabelText(/cooldown/i)).not.toBeInTheDocument();
 
-    // Raising the threshold above the floor clears the warning.
-    const cooldown = screen.getByLabelText('Cooldown temperature (°C)');
-    await user.clear(cooldown);
-    await user.type(cooldown, '33');
-    await waitFor(() =>
-      expect(screen.queryByText(/below the cooldown warn floor/i)).not.toBeInTheDocument(),
-    );
+    await user.type(screen.getByLabelText('Name'), 'plain');
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+    await waitFor(() => expect(postedBody).not.toBeNull());
+    expect(postedBody).not.toHaveProperty('cooldown_temp_c');
   });
 
   it('warns when max part height exceeds every registered model ceiling', async () => {

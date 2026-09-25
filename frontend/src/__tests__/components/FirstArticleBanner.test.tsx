@@ -59,7 +59,6 @@ function run(overrides: Partial<ProductionRun> = {}): ProductionRun {
     first_article_printer_id: null,
     first_article_printer_name: null,
     eject_profile_id: null,
-    cooldown_temp_c_override: null,
     target_model: null,
     eta_seconds: 7200,
     printers: [{ id: 1, name: 'H2S-Alpha' }],

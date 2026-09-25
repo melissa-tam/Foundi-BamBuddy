@@ -1,17 +1,18 @@
 /**
- * SettingNumber: the shared clamped-integer Settings field. The rule under
+ * SettingNumber: the shared clamped Settings number field. The rule under
  * test is the emptied-field draft — a controlled number input with a
  * `|| fallback` cannot be typed into once cleared (with min 1, clearing and
  * typing "5" yields "15"; with a signed range a lone "-" is untypable). An
  * unparseable entry must therefore write NOTHING and stay on screen, while a
- * parseable one clamps and commits at once.
+ * parseable one clamps and commits at once. The `decimal` kind also holds a
+ * below-min entry as a keystroke ("0" begins "0.5") and clamps it on blur.
  */
 import { useState } from 'react';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { screen, cleanup, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { render } from '../../utils';
-import { SettingNumber } from '../../../components/settings/SettingNumber';
+import { SettingNumber, type SettingNumberKind } from '../../../components/settings/SettingNumber';
 
 /** Controlled host: the component owns the draft, the parent owns the value. */
 function Harness({
@@ -19,12 +20,16 @@ function Harness({
   min,
   max,
   enabled,
+  kind,
+  step,
   onChange,
 }: {
   initial: number;
   min: number;
   max: number;
   enabled?: boolean;
+  kind?: SettingNumberKind;
+  step?: number;
   onChange?: (v: number) => void;
 }) {
   const [value, setValue] = useState(initial);
@@ -41,6 +46,8 @@ function Harness({
       min={min}
       max={max}
       enabled={enabled}
+      kind={kind}
+      step={step}
     />
   );
 }
@@ -124,6 +131,59 @@ describe('SettingNumber', () => {
     render(<Harness initial={100} min={1} max={100} enabled={false} />);
 
     expect(field().disabled).toBe(true);
+  });
+
+  it('truncates a fractional entry in the default integer kind', () => {
+    const onChange = vi.fn();
+    render(<Harness initial={10} min={3} max={60} onChange={onChange} />);
+
+    fireEvent.change(field(), { target: { value: '12.5' } });
+    expect(onChange).toHaveBeenLastCalledWith(12);
+  });
+
+  describe('decimal kind', () => {
+    it('commits a fractional entry unchanged', () => {
+      const onChange = vi.fn();
+      render(<Harness initial={2} min={0.5} max={10} step={0.5} kind="decimal" onChange={onChange} />);
+
+      fireEvent.change(field(), { target: { value: '2.5' } });
+      expect(field().value).toBe('2.5');
+      expect(onChange).toHaveBeenLastCalledWith(2.5);
+      expect(field()).toHaveAttribute('step', '0.5');
+    });
+
+    it('holds a below-min entry as a keystroke so "0.5" can be typed', () => {
+      const onChange = vi.fn();
+      render(<Harness initial={2} min={0.5} max={10} kind="decimal" onChange={onChange} />);
+
+      // "0" is how "0.5" begins — clamping it at once would rewrite the box.
+      fireEvent.change(field(), { target: { value: '0' } });
+      expect(field().value).toBe('0');
+      expect(onChange).not.toHaveBeenCalled();
+
+      fireEvent.change(field(), { target: { value: '0.5' } });
+      expect(field().value).toBe('0.5');
+      expect(onChange).toHaveBeenLastCalledWith(0.5);
+    });
+
+    it('commits the floor when a below-min entry is left', () => {
+      const onChange = vi.fn();
+      render(<Harness initial={2} min={0.5} max={10} kind="decimal" onChange={onChange} />);
+
+      fireEvent.change(field(), { target: { value: '0' } });
+      fireEvent.blur(field());
+      expect(onChange).toHaveBeenLastCalledWith(0.5);
+      expect(field().value).toBe('0.5');
+    });
+
+    it('clamps an over-max entry at once', () => {
+      const onChange = vi.fn();
+      render(<Harness initial={2} min={0.5} max={10} kind="decimal" onChange={onChange} />);
+
+      fireEvent.change(field(), { target: { value: '12.5' } });
+      expect(field().value).toBe('10');
+      expect(onChange).toHaveBeenLastCalledWith(10);
+    });
   });
 
   it('carries the mechanism copy in a tooltip, never inline', async () => {

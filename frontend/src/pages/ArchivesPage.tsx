@@ -63,7 +63,7 @@ import { getCurrencySymbol } from '../utils/currency';
 import { getBedTypeInfo } from '../utils/bedType';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { usePageFileDrop } from '../hooks/usePageFileDrop';
-import type { Archive, PrintLogEntry, ProjectListItem } from '../api/client';
+import type { Archive, ArchiveDeleteImpact, PrintLogEntry, ProjectListItem } from '../api/client';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { Modal } from '../components/ui/Modal';
@@ -111,6 +111,38 @@ function isSlicedFile(archive: { filename?: string | null; total_layers?: number
 }
 
 // formatDate imported from '../utils/date' - handles UTC conversion
+
+/**
+ * The delete-confirm's impact line (#1734), shared by the card and list views.
+ *
+ * A live print blocks the delete (the confirm is disabled and the server 409s),
+ * so its reason wins: the printing queue items when the archive has related
+ * units, otherwise the print this archive itself records — a retry prints into
+ * its own archive, which is no unit's donor, so `currently_printing > 0` can
+ * arrive with `related_queue_items == 0`, and a disabled button with no reason
+ * is a dead end. With nothing printing, the queue items the delete removes.
+ */
+function ArchiveDeleteImpactNotice({ impact }: { impact: ArchiveDeleteImpact | undefined }) {
+  const { t } = useTranslation();
+  if (!impact) return null;
+  if (impact.currently_printing > 0) {
+    return (
+      <div role="alert" className="text-sm text-red-400 mb-2">
+        {impact.related_queue_items > 0
+          ? t('archives.modal.deleteBlockedByPrinting', { count: impact.currently_printing })
+          : t('archives.modal.deleteBlockedByLivePrint')}
+      </div>
+    );
+  }
+  if (impact.related_queue_items > 0) {
+    return (
+      <div className="text-sm text-amber-400 mb-2">
+        {t('archives.modal.deleteQueueItemsWarning', { count: impact.related_queue_items })}
+      </div>
+    );
+  }
+  return null;
+}
 
 /**
  * Open an archive file in the slicer.
@@ -1291,25 +1323,7 @@ function ArchiveCard({
             setDeletePurgeStats(false);
           }}
         >
-          {/* #1734: warn the user when related queue items will also be removed,
-              and block the action entirely if any are currently printing. */}
-          {(deleteImpactQuery.data?.related_queue_items ?? 0) > 0 && (
-            <div
-              className={
-                (deleteImpactQuery.data?.currently_printing ?? 0) > 0
-                  ? 'text-sm text-red-400 mb-2'
-                  : 'text-sm text-amber-400 mb-2'
-              }
-            >
-              {(deleteImpactQuery.data?.currently_printing ?? 0) > 0
-                ? t('archives.modal.deleteBlockedByPrinting', {
-                    count: deleteImpactQuery.data!.currently_printing,
-                  })
-                : t('archives.modal.deleteQueueItemsWarning', {
-                    count: deleteImpactQuery.data!.related_queue_items,
-                  })}
-            </div>
-          )}
+          <ArchiveDeleteImpactNotice impact={deleteImpactQuery.data} />
           {/* #1343: opt-in checkbox — by default the archive is soft-deleted,
               so its filament / time / cost contribution stays in Quick Stats. */}
           <label className="flex items-start gap-2 cursor-pointer text-sm text-bambu-gray">
@@ -2301,25 +2315,7 @@ function ArchiveListRow({
             setDeletePurgeStats(false);
           }}
         >
-          {/* #1734: warn the user when related queue items will also be removed,
-              and block the action entirely if any are currently printing. */}
-          {(deleteImpactQuery.data?.related_queue_items ?? 0) > 0 && (
-            <div
-              className={
-                (deleteImpactQuery.data?.currently_printing ?? 0) > 0
-                  ? 'text-sm text-red-400 mb-2'
-                  : 'text-sm text-amber-400 mb-2'
-              }
-            >
-              {(deleteImpactQuery.data?.currently_printing ?? 0) > 0
-                ? t('archives.modal.deleteBlockedByPrinting', {
-                    count: deleteImpactQuery.data!.currently_printing,
-                  })
-                : t('archives.modal.deleteQueueItemsWarning', {
-                    count: deleteImpactQuery.data!.related_queue_items,
-                  })}
-            </div>
-          )}
+          <ArchiveDeleteImpactNotice impact={deleteImpactQuery.data} />
           {/* #1343: opt-in checkbox — by default the archive is soft-deleted,
               so its filament / time / cost contribution stays in Quick Stats. */}
           <label className="flex items-start gap-2 cursor-pointer text-sm text-bambu-gray">
