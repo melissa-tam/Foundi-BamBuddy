@@ -298,6 +298,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "farm_cooldown_chamber_fan_enabled",
             "farm_idle_park_enabled",
             "farm_chute_prime_enabled",
+            "farm_plate_blowoff_enabled",
             "queue_shortest_first",
             "default_bed_levelling",
             "default_flow_cali",
@@ -359,6 +360,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "farm_cooldown_chamber_fan_sustain_percent",
             "farm_cooldown_hold_part_top_mm",
             "farm_idle_park_percent",
+            "farm_plate_blowoff_seconds",
             "respool_prompt_threshold_g",
             "erp_db_port",
         ]:

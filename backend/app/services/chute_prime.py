@@ -76,7 +76,9 @@ Two traps this module is built around, both live in the corpus:
   ``; machine_start_gcode = …`` (H2S :315, H2C :312 — BEFORE ``; EXECUTABLE_BLOCK_START``
   at :578 / :575). The search window is ``; EXECUTABLE_BLOCK_START`` …
   ``; MACHINE_START_GCODE_END`` for that reason alone, and the CONFIG_BLOCK copy is never
-  touched.
+  touched. The window — and what part of a line executes — is
+  :mod:`backend.app.utils.machine_start_gcode`'s, shared with the plate blow-off, so the
+  two start-block rewrites cannot disagree about where the start block is.
 """
 
 from __future__ import annotations
@@ -84,6 +86,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
+
+from backend.app.utils.machine_start_gcode import (
+    EXEC_BLOCK_START_MARKER,
+    START_GCODE_END_MARKER,
+    code_part,
+    executable_window,
+)
 
 #: Identifies the recipe these bytes were produced by. The dispatch seam folds it into the
 #: derived-artifact cache key, so bumping it re-derives every cached file. Bump it whenever
@@ -107,9 +116,6 @@ _CHUTE_WIPE = "G150.1"
 #: Emitted between the last prime line and the wipe: the prime must be complete before the
 #: toolhead moves, or the bead trails out of the chute.
 _SYNC = "M400"
-
-_EXEC_BLOCK_START_MARKER = "; EXECUTABLE_BLOCK_START"
-_START_GCODE_END_MARKER = "; MACHINE_START_GCODE_END"
 
 _SECTION_OPEN_PREFIX = ";===== nozzle load line"
 _SECTION_CLOSE_PREFIX = ";====="
@@ -251,18 +257,6 @@ _WIPER_EXIT_PATTERNS = tuple(re.compile(p) for p in _WIPER_EXIT_SHAPE)
 _X_WORD_RE = re.compile(rf"\s+X{_NUM}")
 
 
-def _code_part(line: str) -> str:
-    """The executable part of a section line: indentation removed, trailing comment cut.
-
-    A comment-ONLY line is returned verbatim rather than as an empty string, so the table
-    refuses it (``unknown_line``) instead of the blank-line arm silently swallowing it.
-    """
-    body = line.lstrip()
-    if body.startswith(";"):
-        return body
-    return body.partition(";")[0].rstrip()
-
-
 def _classify(code: str) -> tuple[_Row, re.Match[str]] | None:
     """First matching table row and its match, or None when the shape is unknown."""
     for row in _TABLE:
@@ -284,13 +278,6 @@ def _is_close_marker(line: str) -> bool:
     return any(spelling in body for spelling in _SECTION_CLOSE_SPELLINGS)
 
 
-def _index_of_marker(lines: list[str], marker: str) -> int | None:
-    for i, line in enumerate(lines):
-        if line.startswith(marker):
-            return i
-    return None
-
-
 def _section_indent(body: list[str]) -> str:
     """The indentation new lines are emitted at: that of the section's first real line."""
     for line in body:
@@ -302,7 +289,7 @@ def _section_indent(body: list[str]) -> str:
 def _uses_macro(lines: list[str], macro: str) -> bool:
     """True when some line's executable part STARTS with ``macro`` as its own token."""
     for line in lines:
-        words = _code_part(line).split()
+        words = code_part(line).split()
         if words and words[0] == macro:
             return True
     return False
@@ -319,7 +306,7 @@ def _wiper_exit(lines: list[str], open_idx: int, window_start: int) -> list[str]
     i = open_idx - 1
     while i >= window_start and len(collected) < len(_WIPER_EXIT_PATTERNS):
         if lines[i].strip():
-            collected.append(_code_part(lines[i]))
+            collected.append(code_part(lines[i]))
         i -= 1
     if len(collected) < len(_WIPER_EXIT_PATTERNS):
         return None
@@ -354,14 +341,14 @@ def rewrite_head(head: bytes) -> ChutePrimeOutcome:
     # its "\r" on every element, and a trailing newline keeps its empty final element.
     lines = text.split("\n")
 
-    window_start = _index_of_marker(lines, _EXEC_BLOCK_START_MARKER)
-    window_end = _index_of_marker(lines, _START_GCODE_END_MARKER)
-    if window_start is None or window_end is None or window_end <= window_start:
+    bounds = executable_window(lines)
+    if bounds is None:
         return Refused(
             "no_start_block",
-            f"no {_EXEC_BLOCK_START_MARKER} … {_START_GCODE_END_MARKER} window in the head",
+            f"no {EXEC_BLOCK_START_MARKER} … {START_GCODE_END_MARKER} window in the head",
         )
 
+    window_start, window_end = bounds
     window = range(window_start, window_end + 1)
     opens = [i for i in window if _is_open_marker(lines[i])]
     closes = [i for i in window if _is_close_marker(lines[i])]
@@ -391,7 +378,7 @@ def rewrite_head(head: bytes) -> ChutePrimeOutcome:
         if not line.strip():
             classified.append(None)
             continue
-        hit = _classify(_code_part(line))
+        hit = _classify(code_part(line))
         if hit is None:
             return Refused("unknown_line", line)
         classified.append(hit)

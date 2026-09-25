@@ -565,6 +565,185 @@ class TestRequeueOwnership:
         }
 
 
+_BINDING_OWNER = ("services", "print_binding.py")
+# The one-shot repair of the 2026-09 replay damage and the migrations that run it write archive
+# status as DATA REPAIR, at boot, before any binding exists — not as print binding.
+_ARCHIVE_STATUS_EXEMPT = frozenset({_BINDING_OWNER, ("services", "foreign_replay_repair.py"), ("core", "database.py")})
+# Names DELETED with the process-memory binding (2026-09-25). A reappearance is the leak coming back.
+_DELETED_BINDING_NAMES = (
+    "_active_prints",
+    "_expected_prints",
+    "_expected_print_creators",
+    "_expected_print_registered_at",
+    "_print_ams_mappings",
+    "_print_plate_ids",
+    "register_expected_print",
+    "_evict_stale_expected_prints",
+    "_expected_prints_cleanup_task",
+    "_expected_prints_cleanup_loop",
+    "start_expected_prints_cleanup",
+    "stop_expected_prints_cleanup",
+    "_EXPECTED_PRINT_TTL_SECONDS",
+    "_EXPECTED_PRINT_CLEANUP_INTERVAL",
+    "_get_start_plate_id",
+    "update_archive_status",
+)
+
+
+def _is_print_archive_attr(node: ast.expr, attr: str) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "PrintArchive"
+    )
+
+
+def _updates_print_archive(expr: ast.expr) -> bool:
+    """Is ``expr`` a statement chain built from ``update(PrintArchive)``?"""
+    node: ast.expr = expr
+    while True:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "update"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "PrintArchive"
+            ):
+                return True
+            node = func
+        elif isinstance(node, ast.Attribute):
+            node = node.value
+        else:
+            return False
+
+
+def _is_printing(value: ast.expr | None) -> bool:
+    return isinstance(value, ast.Constant) and value.value == "printing"
+
+
+def _scan_archive_live_status(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every read or write of an archive's ``printing`` status: the comparison, the ``in_`` list,
+    the construction, the Core update and any attribute assignment of the literal."""
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and _is_print_archive_attr(node.left, "status"):
+            if any(_is_printing(c) for c in node.comparators):
+                hits.append(("PrintArchive.status == 'printing'", node.lineno))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "in_" and _is_print_archive_attr(func.value, "status"):
+                listed = [e for a in node.args if isinstance(a, (ast.List, ast.Tuple, ast.Set)) for e in a.elts]
+                if any(_is_printing(e) for e in listed):
+                    hits.append(("PrintArchive.status.in_([... 'printing' ...])", node.lineno))
+            constructs = isinstance(func, ast.Name) and func.id == "PrintArchive"
+            core_update = (
+                isinstance(func, ast.Attribute) and func.attr == "values" and _updates_print_archive(func.value)
+            )
+            if (constructs or core_update) and any(k.arg == "status" and _is_printing(k.value) for k in node.keywords):
+                hits.append(
+                    ("PrintArchive(status='printing')" if constructs else ".values(status='printing')", node.lineno)
+                )
+        elif isinstance(node, ast.Assign) and _is_printing(node.value):
+            if any(isinstance(t, ast.Attribute) and t.attr == "status" for t in node.targets):
+                hits.append(("<row>.status = 'printing'", node.lineno))
+    return hits
+
+
+def _scan_archive_started_at_writes(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every write of an archive's ``started_at``: the construction keyword, the Core update, and an
+    assignment onto an ``*archive*``-named row."""
+    hits: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            constructs = isinstance(func, ast.Name) and func.id == "PrintArchive"
+            core_update = (
+                isinstance(func, ast.Attribute) and func.attr == "values" and _updates_print_archive(func.value)
+            )
+            if (constructs or core_update) and any(k.arg == "started_at" for k in node.keywords):
+                hits.append(("PrintArchive(started_at=...)" if constructs else ".values(started_at=...)", node.lineno))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "started_at"
+                    and isinstance(target.value, ast.Name)
+                    and "archive" in target.value.id.lower()
+                ):
+                    hits.append((f"{target.value.id}.started_at = ...", node.lineno))
+    return hits
+
+
+class TestArchiveBindingOwnership:
+    """ONE owner binds a print to its archive — ``services/print_binding.py``. SOURCE pins, like
+    their neighbours: a second writer of ``status='printing'`` / ``started_at`` is well-formed code
+    that every behaviour test passes, and it is precisely what makes ``started_at IS NULL`` stop
+    meaning "never printed" — the adopt's whole precondition — and a name-keyed registry the way
+    every print in flight across a restart leaked its archive (RC1, 2026-09-23)."""
+
+    def test_no_archive_printing_status_outside_the_binding_owner(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {shape}"
+            for parts, tree in _app_trees()
+            if parts not in _ARCHIVE_STATUS_EXEMPT
+            for shape, line in _scan_archive_live_status(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "An archive's 'printing' status is read or written outside services/print_binding.py:\n"
+                + "\n".join(strays)
+                + "\n\nBind a print with print_binding.attach / bind_created, close it with close_archive, "
+                "and read the live print with live_print_archive / printers_with_live_print / "
+                "count_live_prints."
+            )
+
+    def test_no_archive_started_at_write_outside_the_binding_owner(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {shape}"
+            for parts, tree in _app_trees()
+            if parts not in _ARCHIVE_STATUS_EXEMPT
+            for shape, line in _scan_archive_started_at_writes(tree)
+        ]
+        if strays:
+            pytest.fail(
+                "An archive's started_at is written outside services/print_binding.py:\n"
+                + "\n".join(strays)
+                + "\n\nstarted_at is stamped only when a print is BOUND to the row; that is what lets the "
+                "adopt read started_at IS NULL as 'never printed'."
+            )
+
+    def test_the_deleted_process_memory_binding_stays_deleted(self):
+        import re
+
+        pattern = re.compile(r"\b(" + "|".join(map(re.escape, _DELETED_BINDING_NAMES)) + r")\b")
+        strays = [
+            f"  - {f.relative_to(BACKEND_DIR).as_posix()}:{number} {match.group(1)}"
+            for f in get_python_files(BACKEND_DIR)
+            for number, line in enumerate(f.read_text(encoding="utf-8").splitlines(), start=1)
+            if (match := pattern.search(line))
+        ]
+        if strays:
+            pytest.fail(
+                "A name of the deleted process-memory print binding reappears in backend/app:\n"
+                + "\n".join(strays)
+                + "\n\nA print's archive is found by job id in the database (print_binding); a registry "
+                "keyed by names is empty after every restart."
+            )
+
+    def test_the_owner_still_does_it(self):
+        """The liveness half: pins that scan for strays pass on an empty tree too."""
+        owner = dict(_app_trees())[_BINDING_OWNER]
+        assert {shape for shape, _ in _scan_archive_live_status(owner)} >= {
+            "PrintArchive.status == 'printing'",
+            ".values(status='printing')",
+        }
+        assert {shape for shape, _ in _scan_archive_started_at_writes(owner)} == {".values(started_at=...)"}
+
+
 def _scan_recovery_incident_constructions(py_file: Path) -> list[int]:
     """Every CONSTRUCTION of ``RecoveryIncident``, however the module was imported.
 
@@ -994,14 +1173,16 @@ class TestDerivedCacheOwnership:
 
 # The question "what does the printer actually receive" has ONE owner:
 # ``services/dispatch_file.py``. It builds the transform stack (the chute-prime rewrite,
-# then the upstream per-model snippets), DERIVES the cache key from that stack, and hands
-# ``print_scheduler._start_print`` a verdict. Two things are pinned here:
+# the plate blow-off, then the upstream per-model snippets), DERIVES the cache key from
+# that stack, and hands ``print_scheduler._start_print`` a verdict. Two things are pinned
+# here:
 #
-#   * the two transform entry points — ``chute_prime.rewrite_head`` and
-#     ``threemf_tools.apply_gcode_snippets`` — are called from the seam and nowhere else;
-#   * the two settings keys that SELECT them are spelled only by the seam that reads them
-#     and by the two modules that define the setting (the schema twin, the PUT coercion
-#     whitelist).
+#   * the three transform entry points — ``chute_prime.rewrite_head``,
+#     ``plate_blowoff.insert_blowoff`` and ``threemf_tools.apply_gcode_snippets`` — are called
+#     from the seam and nowhere else;
+#   * the settings keys that SELECT and SHAPE them are spelled only by the seam that reads
+#     them and by the two modules that define the setting (the schema twin, the PUT
+#     coercion whitelists).
 #
 # The failure this catches is a second rewrite site: a perfectly working injection added
 # back into the scheduler, a route or a recovery lane. Every behaviour test would pass —
@@ -1009,14 +1190,19 @@ class TestDerivedCacheOwnership:
 # turned off still serves chute-primed files out of the cache.
 _DISPATCH_SEAM = ("services", "dispatch_file.py")
 
-_DISPATCH_TRANSFORM_CALLS = {"rewrite_head", "apply_gcode_snippets"}
+_DISPATCH_TRANSFORM_CALLS = {"rewrite_head", "insert_blowoff", "apply_gcode_snippets"}
 
-_DISPATCH_SETTING_KEYS = {"farm_chute_prime_enabled", "gcode_snippets"}
+_DISPATCH_SETTING_KEYS = {
+    "farm_chute_prime_enabled",
+    "farm_plate_blowoff_enabled",
+    "farm_plate_blowoff_seconds",
+    "gcode_snippets",
+}
 
 _DISPATCH_SETTING_SPELLERS = {
     _DISPATCH_SEAM,
     ("schemas", "settings.py"),  # defines the typed field + its update twin
-    ("api", "routes", "settings.py"),  # the boolean-coercion whitelist
+    ("api", "routes", "settings.py"),  # the bool / int coercion whitelists
 }
 
 # What ``print_scheduler`` may no longer import from ``threemf_tools``: it does not
@@ -1088,14 +1274,17 @@ class TestDispatchFileOwnership:
                 "print_scheduler reached back into threemf_tools for an injection symbol:\n" + "\n".join(strays)
             )
 
-    def test_the_seam_still_owns_both_transforms_and_both_keys(self):
+    def test_the_seam_still_owns_every_transform_and_every_key(self):
         """The liveness half: an ownership pin whose owner has moved away polices nothing,
         and the scan above would then pass on a codebase with no seam at all."""
         seam = BACKEND_DIR.joinpath(*_DISPATCH_SEAM)
         assert seam.exists(), f"{'/'.join(_DISPATCH_SEAM)} is gone — the seam moved without this pin"
 
         found = {symbol for symbol, _ in _scan_dispatch_decisions(seam)}
-        for expected in ("rewrite_head()", "apply_gcode_snippets()", '"farm_chute_prime_enabled"', '"gcode_snippets"'):
+        expected_symbols = {f"{name}()" for name in _DISPATCH_TRANSFORM_CALLS} | {
+            f'"{key}"' for key in _DISPATCH_SETTING_KEYS
+        }
+        for expected in sorted(expected_symbols):
             assert expected in found, f"{'/'.join(_DISPATCH_SEAM)} no longer uses {expected}"
 
 
@@ -1459,7 +1648,7 @@ class TestModuleImports:
         IMPORTANT: We must NOT ``del sys.modules[name]`` to force a fresh
         import here. ``backend.app.main`` is a stateful module — re-importing
         it builds NEW module-level dicts (_timelapse_baselines,
-        _expected_prints, _active_prints, …) and re-runs ``root_logger.
+        _stage22_finish_frames, _bed_cool_waiters, …) and re-runs ``root_logger.
         addHandler(console_handler)``. Any test that already bound those
         names via ``from backend.app.main import _timelapse_baselines`` now
         holds a stale reference, while production code resolves the symbol

@@ -743,6 +743,18 @@ class AppSettings(BaseModel):
         "the purge chute instead of onto the plate's front lip; a file whose start block is not recognised "
         "dispatches unmodified",
     )
+    farm_plate_blowoff_enabled: bool = Field(
+        default=True,
+        description="Insert a full-speed auxiliary-fan pulse into the sliced file's start block at dispatch, just "
+        "before bed leveling, so the fan blows stray filament off the plate; a file whose start block is not "
+        "recognised, or that selects the heating airduct mode, dispatches without it",
+    )
+    farm_plate_blowoff_seconds: int = Field(
+        default=10,
+        ge=3,
+        le=60,
+        description="How long the auxiliary fan blows across the plate before bed leveling (seconds, 3-60)",
+    )
 
     # Reused-tag auto re-spool (peel a spent Bambu RFID tag onto a fresh
     # third-party spool). `respool_prompt_threshold_g` is the remaining-grams
@@ -926,6 +938,8 @@ class AppSettingsUpdate(BaseModel):
     farm_idle_park_enabled: bool | None = None
     farm_idle_park_percent: int | None = Field(default=None, ge=10, le=95)
     farm_chute_prime_enabled: bool | None = None
+    farm_plate_blowoff_enabled: bool | None = None
+    farm_plate_blowoff_seconds: int | None = Field(default=None, ge=3, le=60)
     respool_prompt_threshold_g: int | None = Field(default=None, ge=0, le=1000)
     respool_last_brand: str | None = None
 
