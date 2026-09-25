@@ -573,6 +573,9 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
     import_all_models()
     eng = create_engine(f"sqlite:///{(tmp_path / 'repair.db').as_posix()}")
     Base.metadata.create_all(eng)
+    with eng.begin() as conn:
+        # The pre-repair shapes hold several printing archives per printer; production builds this index after R-dup.
+        conn.exec_driver_sql("DROP INDEX IF EXISTS ux_print_archives_live_printer")
     yield eng
     eng.dispose()
 
