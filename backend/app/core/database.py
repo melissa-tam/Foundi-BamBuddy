@@ -5734,6 +5734,82 @@ async def run_migrations(conn):
                 _vision_repair_marker,
             )
 
+    # Repair (2026-09-25): undo what the downtime reconcile's replays did, 2026-09-16..09-24.
+    #
+    # Each restart or reconnect replayed archives LEAKED in ``printing`` (their real completion
+    # could not find them after a restart) as synthesised terminals. A replay charged spools from
+    # the LIVE printer's progress (a phantom charge, ~7.2 kg over 32 charges). It closed the
+    # archive and wrote a print-log row, both ``cancelled`` (``aborted`` before 2026-09-19, the
+    # true status when the printer still showed that job's end). In 10 of 50 cases it closed the
+    # CURRENT print's archive instead of the stale one. The real completions had charged through
+    # the dispatch donor and written no print-log row. By the user's ruling, both damage sets are
+    # repaired through this ONE guarded repair. A charge or print-log row is judged by EVIDENCE,
+    # never by its status word: attributed to a completed/failed run, it was written outside that
+    # run's own terminal window, so another terminal wrote it. A reversal below a spool's usage
+    # baseline lowers the baseline with it. The rules, the run model they share and the reasoning
+    # live in ``services/foreign_replay_repair.py``, the standalone module that also produces the
+    # read-only report on the farm PC. The per-row log below is therefore line-for-line that
+    # report's body.
+    #
+    # ORDER: this block MUST run before any index on ``print_archives`` that assumes at most one
+    # ``printing`` archive per printer. Its R-dup rule closes every superseded ``printing`` archive,
+    # which is what lets such an index build on a live database. Create that index BELOW this block.
+    #
+    # Shape B (durable settings marker), for the reason the ``repair_runout_reclaim_20260813`` block
+    # states: an operator may reassign a print-log row's status by hand, and a repair re-derived at
+    # every boot would fight that edit at every restart. Plan, apply and the marker
+    # INSERT ride ONE savepoint, so the three are all-or-nothing. A failure rolls everything back,
+    # leaves the marker unwritten, and the next boot retries. Every action is logged at WARNING
+    # with its before-values, and that log is the repair's rollback record beside the pre-deploy
+    # DB backup. Fully guarded: a repair must never take startup down for every install.
+    _replay_repair_marker = "repair_foreign_replay_20260925"
+    _replay_repair_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _replay_repair_marker})
+    ).scalar()
+    if not _replay_repair_done:
+        _replay_log_tag = f"[REPAIR] {_replay_repair_marker}:"
+        try:
+            from datetime import timezone as _tz
+
+            from backend.app.services import foreign_replay_repair as _replay_repair
+
+            _replay_now = _dt.now(_tz.utc)
+            async with conn.begin_nested():
+                _replay_plan = await conn.run_sync(
+                    lambda sync_conn: _replay_repair.plan_foreign_replay_repair(sync_conn, now=_replay_now)
+                )
+                await conn.run_sync(
+                    lambda sync_conn: _replay_repair.apply_foreign_replay_repair(sync_conn, _replay_plan)
+                )
+                # Logged once applied, so a rolled-back boot never reads as a repaired one. Every
+                # mutation at WARNING with its before-values, every skip at INFO: together, the
+                # report's body line for line.
+                for _replay_action in _replay_plan.actions:
+                    logger.warning("%s %s", _replay_log_tag, _replay_repair.describe(_replay_action))
+                for _replay_skip in _replay_plan.skips:
+                    logger.info("%s %s", _replay_log_tag, _replay_repair.describe(_replay_skip))
+                await conn.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _replay_repair_marker},
+                )
+            # A fresh install has nothing to repair; that is not worth a warning.
+            logger.log(
+                logging.WARNING if _replay_plan.actions else logging.INFO,
+                "%s %d action(s) applied, %d candidate(s) skipped (one-time)",
+                _replay_log_tag,
+                len(_replay_plan.actions),
+                len(_replay_plan.skips),
+            )
+        except Exception:  # noqa: BLE001 — a repair must never take startup down for every install
+            logger.exception(
+                "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a later "
+                "boot retries it",
+                _replay_repair_marker,
+            )
+
     # LAST, deliberately: every column ALTER above has landed, so the model this rebuilds
     # from and the live table agree. A deleted id is never reused (005-H2S 2026-09-17) —
     # rationale, refusals and failure semantics live on the helper.
