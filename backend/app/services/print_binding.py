@@ -19,6 +19,14 @@ echoes the human subtask name and ``/data/Metadata/plate_N.gcode``, so:
 
 Here the subtask id is the key, the database is the only memory, and a restart loses nothing.
 
+**A unit's archive link is its DONOR, not its record.** ``PrintQueueItem.archive_id`` names the
+bytes a unit prints FROM — a retry carries its parent's, a reprint the operator's — and since a row
+that already recorded an attempt is never adopted again, it is not the unit's print record. The
+record of a unit's attempt is reached only by identity: :func:`print_archive_of` (unit → record)
+and :func:`unit_of_print_archive` (record → unit), ``archive.subtask_id ==
+unit.dispatch_subtask_id`` on the unit's printer. ``test_code_quality.TestPrintRecordResolution``
+allowlists the donor consumers of ``archive_id``.
+
 **Invariant:** ``status='printing'`` and ``started_at`` on ``print_archives`` are written ONLY by this
 module (``test_code_quality.TestArchiveBindingOwnership``; the one-shot migration repair in
 ``foreign_replay_repair`` and ``core.database`` excepted). Two things follow and both are load-bearing:
@@ -36,9 +44,10 @@ upgraded to a writer once another connection commits, and the adopt must see the
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, or_, select, update
 
@@ -47,17 +56,15 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.farm_correlation import resolve_printing_item
 
+# Re-exported: the job-identity comparison lives in the dependency-free ``job_identity`` so leaves
+# (``dispatch_claim``, ``incident_resolution``) can take it; this module's callers keep one import.
+from backend.app.services.job_identity import job_id, same_job
+
 if TYPE_CHECKING:
     from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
-
-JobIdentity = Literal["same", "other", "unknown"]
-
-# The printer's word for "this print names no job": Bambu reports "0" for a LAN / non-cloud print and
-# an empty id on a screen restart. Neither identifies anything, on either side of a comparison.
-_NO_JOB_IDS: frozenset[str] = frozenset({"", "0"})
 
 # failure_reason of an archive closed because its printer started another job. Deliberately NOT
 # prefixed "Stale": the #972 revive below reopens only a "Stale…" row, and a superseded print is over.
@@ -70,29 +77,6 @@ _STALE_REASON = "Stale - print likely cancelled or failed without status update"
 # The id-less name resume treats a matching ``printing`` archive as a stale leftover only when the
 # printer reports near-zero progress AND the archive is older than this (upstream #1485, unchanged).
 _NAME_RESUME_STALE_AGE_S = 2 * 60 * 60
-
-
-def job_id(raw: object) -> str | None:
-    """A subtask id normalised to the stripped string, or None when it names no job."""
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    return None if text in _NO_JOB_IDS else text
-
-
-def same_job(live: str | None, record: str | None) -> JobIdentity:
-    """Are these two subtask ids the same print job?
-
-    ``unknown`` when either side names no job (None, ``""`` or ``"0"``) — an absent id is not
-    evidence of a DIFFERENT job, and callers decide what an unknown is worth to them (the terminal
-    lookup accepts it, the adopt accepts it only for the sole printing unit). ``same`` / ``other``
-    only when both sides name a job. THE one comparison of job identity; ``incident_resolution`` and
-    ``dispatch_claim`` adopt it in a later wave.
-    """
-    live_id, record_id = job_id(live), job_id(record)
-    if live_id is None or record_id is None:
-        return "unknown"
-    return "same" if live_id == record_id else "other"
 
 
 @dataclass(frozen=True)
@@ -198,6 +182,123 @@ async def printers_with_live_print(db: AsyncSession) -> set[int]:
 async def count_live_prints(db: AsyncSession) -> int:
     """How many archives are ``printing``, fleet-wide."""
     return int(await db.scalar(select(func.count(PrintArchive.id)).where(PrintArchive.status == "printing")) or 0)
+
+
+def is_live_status(status: str | None) -> bool:
+    """Does an archive ``status`` value say "a printer is running the print this row records"?
+
+    The ONE spelling for readers outside this module: only :func:`attach` / :func:`bind_created`
+    make a row live and only :func:`close_archive` ends it, so an edit surface asks this of the row
+    it would touch and of the value it would write (``PATCH /archives/{id}``).
+    """
+    return status == "printing"
+
+
+def live_print_clause() -> ColumnElement[bool]:
+    """:func:`is_live_status` as a WHERE clause over ``print_archives`` — what a deletion keeps."""
+    return PrintArchive.status == "printing"
+
+
+def _records_unit() -> ColumnElement[bool]:
+    """The identity join "this archive records that unit's print": the unit's durable dispatch id is
+    the archive's job id, on the same printer. Both columns are stored normalised (the dispatcher
+    mints ids >= 1 and the binding stamps :func:`job_id`'s value), so SQL equality is the identity
+    and a NULL on either side matches nothing. ONE spelling, for :func:`unit_of_print_archive` and
+    :func:`uncounted_live_records`."""
+    return (PrintArchive.printer_id == PrintQueueItem.printer_id) & (
+        PrintArchive.subtask_id == PrintQueueItem.dispatch_subtask_id
+    )
+
+
+async def uncounted_live_records(
+    db: AsyncSession, scope: ColumnElement[bool], counted_units: Collection[int]
+) -> list[int]:
+    """The LIVE print records ``scope`` selects whose print is not one of ``counted_units``.
+
+    The deletion guards ask it after counting the printing units that print FROM what they delete
+    (the donor link, ``queue_transitions.live_prints_blocking``). Under one archive per attempt a
+    live record is usually no unit's ``archive_id`` — a retry prints into a NEW row — so the donor
+    count never sees it, and deleting it mid-print purges the files the print's charge and finish
+    photo still need and leaves its terminal nothing to close. Counted ONCE: a first attempt adopts
+    its own dispatch copy, so there the live record is one of the counted units' print. A live
+    record whose unit cannot be named (an id-less or foreign print) always counts.
+    """
+    rows = await db.execute(
+        select(PrintArchive.id, PrintQueueItem.id)
+        .select_from(PrintArchive)
+        .outerjoin(PrintQueueItem, _records_unit())
+        .where(scope, live_print_clause())
+    )
+    counted = set(counted_units)
+    already_counted: dict[int, bool] = {}
+    for archive_id, unit_id in rows.all():
+        already_counted[archive_id] = already_counted.get(archive_id, False) or unit_id in counted
+    return sorted(archive_id for archive_id, seen in already_counted.items() if not seen)
+
+
+def _records_job(archive: PrintArchive, job: str | None) -> bool:
+    """Is ``archive`` the record of ``job``? Anything but a positive ``other``: an id-less print, or
+    an echo that has not arrived, is the printer's one live print. ONE rule, for
+    :func:`live_archive_for_job` and :func:`resolve_terminal`."""
+    return same_job(job, archive.subtask_id) != "other"
+
+
+async def live_archive_for_job(db: AsyncSession, printer_id: int, job: str | None) -> PrintArchive | None:
+    """The printer's live archive when it records ``job`` (the printer's live echo), else None.
+
+    ``other`` means the live row is a print whose terminal the farm never saw — the downtime
+    reconcile's to close — and showing it for the running job would label one print with another's
+    record.
+    """
+    archive = await live_print_archive(db, printer_id)
+    if archive is None or not _records_job(archive, job):
+        return None
+    return archive
+
+
+async def print_archive_of(db: AsyncSession, unit: PrintQueueItem) -> PrintArchive | None:
+    """THE unit → attempt-record resolver: the archive that records this unit's print, or None.
+
+    ``unit.archive_id`` is the unit's DONOR — the bytes it prints from, which for a failure retry, a
+    refused-plate requeue or a fault-stop requeue is the PARENT's printed record — so it is never
+    read as the unit's own print. The record is the archive on the unit's printer whose
+    ``subtask_id`` is the unit's durable ``dispatch_subtask_id`` (what :func:`attach` /
+    :func:`bind_created` stamp), newest first. None when the unit never dispatched (no id), has no
+    printer, or its print has not been bound yet.
+    """
+    job = job_id(unit.dispatch_subtask_id)
+    if job is None or unit.printer_id is None:
+        return None
+    return (
+        (
+            await db.execute(
+                select(PrintArchive)
+                .where(PrintArchive.printer_id == unit.printer_id)
+                .where(PrintArchive.subtask_id == job)
+                .order_by(PrintArchive.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def unit_of_print_archive(
+    db: AsyncSession, archive_id: int, *, statuses: Collection[str] | None = None
+) -> PrintQueueItem | None:
+    """THE record → unit resolver: the farm unit whose dispatch this archive records, or None.
+
+    The inverse of :func:`print_archive_of` — ``unit.dispatch_subtask_id == archive.subtask_id`` on
+    the archive's printer (:func:`_records_unit`) — in ONE statement. ``statuses`` narrows to the
+    caller's lifecycle window (a completion accepts the terminal statuses, a print start only
+    ``printing``). None for a print the farm did not dispatch. A dispatch id names one unit, so
+    ``limit(1)`` reads the one row.
+    """
+    stmt = select(PrintQueueItem).join(PrintArchive, _records_unit()).where(PrintArchive.id == archive_id)
+    if statuses is not None:
+        stmt = stmt.where(PrintQueueItem.status.in_(tuple(statuses)))
+    return (await db.execute(stmt.order_by(PrintQueueItem.id.desc()).limit(1))).scalar_one_or_none()
 
 
 async def close_archive(
@@ -563,8 +664,7 @@ async def resolve_terminal(db: AsyncSession, printer_id: int, payload_subtask: s
     archive = await live_print_archive(db, printer_id)
     if archive is None:
         return None
-    verdict = same_job(payload_subtask, archive.subtask_id)
-    if verdict == "other":
+    if not _records_job(archive, payload_subtask):
         logger.info(
             "[PRINT-BINDING] printer %s: terminal job %r is not live archive %s's job %r — left for the reconcile",
             printer_id,

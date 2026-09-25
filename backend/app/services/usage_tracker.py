@@ -675,8 +675,9 @@ async def _resolve_run_context(
     1. the live session's captured values (the print-start truth — one path);
     2. the queue item whose ``dispatch_subtask_id`` equals the terminal payload's
        ``subtask_id`` (the id Bambuddy minted for this exact dispatch), any status;
-    3. the queue item linked to this ``archive_id`` (accepting any terminal status
-       the scheduler may already have stamped — see ``_RUN_CONTEXT_STATUSES``);
+    3. the queue item whose attempt this ``archive_id`` records (by job identity —
+       ``_resolve_run_item``; accepting any terminal status the scheduler may already
+       have stamped — see ``_RUN_CONTEXT_STATUSES``);
     4. the ARCHIVE's own ``plate_id``, stamped at print start from the printer's
        ``gcode_file`` echo.
 
@@ -760,14 +761,18 @@ async def _resolve_run_item(db: AsyncSession, subtask_id: str | None, archive_id
     1. the item whose ``dispatch_subtask_id`` equals the terminal payload's
        ``subtask_id`` — the id Bambuddy minted for this exact dispatch, accepted at
        any status because the scheduler may already have stamped the row terminal;
-    2. the item linked to this ``archive_id`` (the id-less path: a firmware that
-       resets ``subtask_id`` on cancel, or a pre-stamping row). Reprints reuse the
-       archive, so the most recently started matching row wins.
+    2. the unit whose attempt this ``archive_id`` RECORDS (the id-less path: a
+       firmware that resets ``subtask_id`` on cancel). The archive carries the job's
+       id from the moment its print was bound, so the terminal's missing echo is
+       recovered from the record — ``print_binding.unit_of_print_archive``. Never the
+       unit whose ``archive_id`` this is: that link is the DONOR, shared by a unit and
+       every retry of it, and the terminal hands a retry's OWN attempt row.
 
     Returns None for every print the farm did not dispatch, which is what keeps the
     foreign/screen-print lanes on their own (guessing) path.
     """
     from backend.app.models.print_queue import PrintQueueItem
+    from backend.app.services.print_binding import unit_of_print_archive
 
     if subtask_id:
         result = await db.execute(
@@ -780,13 +785,7 @@ async def _resolve_run_item(db: AsyncSession, subtask_id: str | None, archive_id
             return item
 
     if archive_id:
-        result = await db.execute(
-            select(PrintQueueItem)
-            .where(PrintQueueItem.archive_id == archive_id)
-            .where(PrintQueueItem.status.in_(_RUN_CONTEXT_STATUSES))
-            .order_by(PrintQueueItem.started_at.desc())
-        )
-        return result.scalars().first()
+        return await unit_of_print_archive(db, archive_id, statuses=_RUN_CONTEXT_STATUSES)
 
     return None
 
@@ -1046,7 +1045,7 @@ async def on_print_complete(
     default_filament_cost = float(default_cost_str) if default_cost_str else 0.0
 
     # Resolve the printed plate + AMS mapping from the most durable source (live
-    # session → dispatch_subtask_id-matched queue item → archive-linked queue item)
+    # session → dispatch_subtask_id-matched queue item → the unit this archive records)
     # so multi-plate 3MF usage stays plate-scoped even when the session did not
     # survive to completion (restart mid-print / reconcile synthesis).
     resolved_plate_id, resolved_ams_mapping = await _resolve_run_context(db, printer_id, data, archive_id, session)
@@ -1803,7 +1802,6 @@ async def _track_from_3mf(
 
     from backend.app.core.config import settings as app_settings
     from backend.app.models.archive import PrintArchive
-    from backend.app.models.print_queue import PrintQueueItem
     from backend.app.utils.threemf_tools import count_plates_in_slice_info, extract_filament_usage_from_3mf
 
     file_path: Path | None = threemf_path
@@ -1954,14 +1952,15 @@ async def _track_from_3mf(
                 slot_to_tray = decoded
                 mapping_source = "mqtt"
 
-    # 3. Try queue item ams_mapping (queue-initiated prints store the exact mapping)
+    # 3. Try queue item ams_mapping (queue-initiated prints store the exact mapping) —
+    #    the unit whose attempt THIS archive records, by job identity. The unit's own
+    #    ``archive_id`` is its donor, shared with every retry of it: matching on it
+    #    missed a retry's own attempt row and raised MultipleResultsFound over the
+    #    shared donor of a first attempt.
     if not slot_to_tray and archive_id:
-        queue_result = await db.execute(
-            select(PrintQueueItem)
-            .where(PrintQueueItem.archive_id == archive_id)
-            .where(PrintQueueItem.status.in_(_RUN_CONTEXT_STATUSES))
-        )
-        queue_item = queue_result.scalar_one_or_none()
+        from backend.app.services.print_binding import unit_of_print_archive
+
+        queue_item = await unit_of_print_archive(db, archive_id, statuses=_RUN_CONTEXT_STATUSES)
         if queue_item and queue_item.ams_mapping:
             try:
                 slot_to_tray = json.loads(queue_item.ams_mapping)

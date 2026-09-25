@@ -32,11 +32,12 @@ two lanes can never come to disagree about how long a start is allowed to take.
 **Leaf by construction.** It imports no farm service and holds no DB handle, so both
 consumers (``print_scheduler`` for the registry, ``farm_stall`` for the judge) import it
 at MODULE level — no call-time import to dodge a cycle, because there is no cycle. The
-one exception is ``ACTIVE_PRINT_STATES``, taken from the plate-occupancy authority that
-OWNS "what counts as an active job": that module is a stdlib-only sync core, and a
-second spelling of the set is how two lanes come to disagree about PAUSE — which here is
-the difference between leaving a native-vision hold alone and double-dispatching onto an
-occupied plate.
+two exceptions are stdlib-only owners of a definition a second spelling would fork:
+``ACTIVE_PRINT_STATES``, taken from the plate-occupancy authority that OWNS "what counts
+as an active job" (a second spelling of the set is how two lanes come to disagree about
+PAUSE — which here is the difference between leaving a native-vision hold alone and
+double-dispatching onto an occupied plate); and ``job_identity.same_job``, the ONE
+comparison of two subtask ids.
 
 :func:`judge` is pure, I/O-free and table-testable: every guard that used to live in a
 docstring paragraph is a row it can be asked about. The GATHERING (DB reads, wire reads)
@@ -51,6 +52,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
+from backend.app.services.job_identity import same_job
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES
 
 logger = logging.getLogger(__name__)
@@ -200,7 +202,9 @@ def judge(evidence: ClaimEvidence) -> ClaimVerdict:
         return "started"
     if evidence.archive_printing:
         return "started"
-    if evidence.dispatch_subtask and evidence.live_subtask and evidence.dispatch_subtask == evidence.live_subtask:
+    # Only a positive ``same``: an id missing on either side is ``unknown`` — no
+    # corroboration, never a reason to read the claim as started.
+    if same_job(evidence.live_subtask, evidence.dispatch_subtask) == "same":
         return "started"
 
     if evidence.watchdog_live:

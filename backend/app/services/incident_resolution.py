@@ -68,6 +68,7 @@ from backend.app.models.printer_incident import (
 from backend.app.services import printer_incidents
 from backend.app.services.bambu_mqtt import PrinterState, ams_mid_filament_change
 from backend.app.services.hms_errors import live_candidates
+from backend.app.services.job_identity import job_id, same_job
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.tray_fields import valid_feeder
 
@@ -520,11 +521,15 @@ def _operator_plate_cleared(_row: PrinterIncident, ctx: Context) -> Verdict:
 _JOB_OVER_STATES: frozenset[str] = frozenset({"FINISH", "FAILED", "IDLE"})
 
 
-def _same_job(row: PrinterIncident, job_id: str | None) -> bool:
-    """Is ``job_id`` the job this row paused? Both sides normalised to the stripped
-    string — the row stores ``''`` for "the printer named no job", and an equally
-    degenerate echo of that same job is the same job."""
-    return (job_id or "").strip() == (row.job_id or "").strip()
+def _same_job(row: PrinterIncident, job: str | None) -> bool:
+    """Is ``job`` the job this row paused? ``job_identity.same_job``, with ``unknown``
+    read the way this rule table reads a missing id: the row stores ``''`` for "the
+    printer named no job", and an echo that names none either is that same id-less
+    job — while an id on only ONE side is a different job, never a match."""
+    verdict = same_job(job, row.job_id)
+    if verdict == "unknown":
+        return job_id(job) is None and job_id(row.job_id) is None
+    return verdict == "same"
 
 
 def _live_job(state: PrinterState | None) -> str:

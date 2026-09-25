@@ -3549,6 +3549,138 @@ class TestUsageIntegrityIntegration:
         assert spool.weight_used == 0.0
         assert any("plates but the printed plate is unknown" in r.message for r in caplog.records)
 
+    @staticmethod
+    async def _seed_retry_of(db, printer_id: int, *, record_archive, retry_job: str, retry_plate: int):
+        """A failed parent and its retry, both carrying the parent's printed archive as the DONOR,
+        with ``record_archive`` stamped as the retry's own attempt (one archive per attempt)."""
+        from backend.app.models.archive import PrintArchive
+        from backend.app.models.print_queue import PrintQueueItem
+
+        donor = PrintArchive(
+            printer_id=printer_id,
+            filename="donor.gcode.3mf",
+            file_path="archives/donor/donor.gcode.3mf",
+            file_size=1,
+            status="failed",
+            subtask_id="PARENT-1",
+        )
+        db.add(donor)
+        await db.flush()
+        parent = PrintQueueItem(
+            printer_id=printer_id,
+            archive_id=donor.id,
+            status="failed",
+            plate_id=2,  # the WRONG plate for this print, so a donor-link match is visible
+            ams_mapping="[4]",
+            dispatch_subtask_id="PARENT-1",
+            started_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        )
+        retry = PrintQueueItem(
+            printer_id=printer_id,
+            archive_id=donor.id,
+            status="completed",
+            plate_id=retry_plate,
+            ams_mapping="[0]",
+            dispatch_subtask_id=retry_job,
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        )
+        db.add_all([parent, retry])
+        record_archive.subtask_id = retry_job
+        await db.commit()
+        return parent, retry
+
+    @pytest.mark.asyncio
+    async def test_an_id_less_terminal_of_a_retry_resolves_the_retry_by_its_record(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """A retry prints into its OWN archive row; the donor link (``archive_id``) is its parent's.
+        A terminal whose echo carries no id (firmware reset on cancel) is tied back to the retry
+        through the record's job id — the retry's plate is charged, not the whole file and not the
+        parent's plate."""
+        from backend.app.core.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        # Plate 1 = 50 g (the retry's), plate 2 = 999 g (the parent's).
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 50.0, "PLA", "#FF0000")], 2: [(1, 999.0, "PLA", "#00FF00")]},
+            with_queue_item=False,
+        )
+        await self._seed_retry_of(db_session, printer.id, record_archive=archive, retry_job="RETRY-1", retry_plate=1)
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed"},  # the echo named no job
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert sum(r["weight_used"] for r in results) == pytest.approx(50.0, abs=0.1)
+        assert spool.weight_used == pytest.approx(50.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_the_queue_mapping_tier_reads_the_attempts_unit_over_a_shared_donor(
+        self, db_session, printer_factory, tmp_path, monkeypatch
+    ):
+        """The 3MF lane's queue-mapping tier (no print-command mapping, no MQTT mapping) finds the
+        unit THIS archive records. Keyed on the donor link it raised MultipleResultsFound as soon as a
+        unit and its retry shared the donor — here the record is the first attempt's adopted copy, so
+        parent and retry both point at it."""
+        from backend.app.core.config import settings as app_settings
+        from backend.app.models.print_queue import PrintQueueItem
+
+        monkeypatch.setattr(app_settings, "base_dir", tmp_path)
+        printer = await printer_factory()
+        archive, spool, _ = await _seed_completion(
+            db_session,
+            printer.id,
+            tmp_path,
+            plates={1: [(1, 30.0, "PLA", "#FF0000")]},
+            assign_ams_id=1,
+            assign_tray_id=2,
+            with_queue_item=False,
+        )
+        archive.subtask_id = "FIRST-1"
+        first = PrintQueueItem(
+            printer_id=printer.id,
+            archive_id=archive.id,  # adopted: donor AND record
+            status="failed",
+            ams_mapping="[6]",  # slicer slot 1 -> global tray 6 -> AMS1-T2
+            dispatch_subtask_id="FIRST-1",
+            started_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+        )
+        retry = PrintQueueItem(
+            printer_id=printer.id,
+            archive_id=archive.id,  # the donor it inherited
+            status="printing",
+            ams_mapping="[0]",
+            dispatch_subtask_id="RETRY-2",
+            started_at=datetime.now(timezone.utc),
+        )
+        db_session.add_all([first, retry])
+        await db_session.commit()
+        # A live session that captured no mapping: the charge must reach the queue-mapping tier.
+        _active_sessions[printer.id] = PrintSession(
+            printer_id=printer.id, print_name="SeededPrint", started_at=datetime.now(timezone.utc), plate_id=1
+        )
+
+        results = await on_print_complete(
+            printer_id=printer.id,
+            data={"status": "completed"},
+            printer_manager=_completion_pm(),
+            db=db_session,
+            archive_id=archive.id,
+        )
+
+        await db_session.refresh(spool)
+        assert [(r["ams_id"], r["tray_id"]) for r in results] == [(1, 2)], "the FIRST attempt's mapping"
+        assert spool.weight_used == pytest.approx(30.0, abs=0.1)
+
     @pytest.mark.asyncio
     async def test_single_plate_no_session_tracks_full(self, db_session, printer_factory, tmp_path, monkeypatch):
         """A single-plate file with no session still tracks the full usage — the

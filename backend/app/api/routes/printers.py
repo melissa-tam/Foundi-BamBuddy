@@ -799,23 +799,17 @@ async def get_printer_status(
 
     # Resolve the active print's archive + plate (#881 follow-up): lets the
     # printer card show the actual plate name for multi-plate 3MFs instead of
-    # just the 3MF filename. Only attempted for active prints, since subtask_id
-    # is only meaningful then.
+    # just the 3MF filename. Only attempted for active prints. The archive is the
+    # printer's LIVE print record, provided it records the job the printer names
+    # (print_binding owns both halves of that question).
     current_archive_id: int | None = None
     current_plate_id: int | None = None
     if state.state in ("RUNNING", "PAUSE"):
         current_plate_id = resolve_plate_id(state)
-        if state.subtask_id:
-            from backend.app.models.archive import PrintArchive
+        from backend.app.services.print_binding import live_archive_for_job
 
-            archive_row = await db.execute(
-                select(PrintArchive.id)
-                .where(PrintArchive.subtask_id == state.subtask_id)
-                .where(PrintArchive.printer_id == printer_id)
-                .order_by(PrintArchive.created_at.desc())
-                .limit(1)
-            )
-            current_archive_id = archive_row.scalar_one_or_none()
+        live_archive = await live_archive_for_job(db, printer_id, state.subtask_id)
+        current_archive_id = live_archive.id if live_archive is not None else None
 
     return PrinterStatus(
         id=printer_id,

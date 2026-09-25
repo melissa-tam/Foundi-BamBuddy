@@ -342,6 +342,64 @@ class TestTheJobPauseLane:
         assert resolve(_row(RESOLUTION_JOB_PAUSE), "plate_cleared", ctx).close is False
 
 
+class TestTheJobPauseIdentityCells:
+    """The job-pause cells ask ``job_identity.same_job`` and read ``unknown`` the way this table
+    always read a missing id: an echo naming no job matches only a row that recorded none, and an
+    id on ONE side is a different job. ``""`` and ``"0"`` are both "names no job"."""
+
+    @staticmethod
+    def _resolve(occasion: str, *, row_job: str, live: str, echo: str):
+        row = _row(RESOLUTION_JOB_PAUSE)
+        row.job_id = row_job
+        state = _state(live)
+        state.subtask_id = echo
+        return resolve(row, occasion, Context(state=state, ledger=MotionLedger(), driver_live=False))
+
+    @pytest.mark.parametrize(
+        ("row_job", "echo", "closes"),
+        [
+            (_JOB, _JOB, True),
+            (_JOB, f" {_JOB} ", True),
+            (_JOB, "other-job", False),
+            (_JOB, "", False),
+            (_JOB, "0", False),
+            ("", "", True),
+            ("", "0", True),
+            ("0", "0", True),
+            ("", _JOB, False),
+        ],
+        ids=[
+            "same",
+            "same-padded",
+            "other",
+            "echo-none",
+            "echo-zero",
+            "both-none",
+            "none-zero",
+            "both-zero",
+            "row-none",
+        ],
+    )
+    def test_the_running_edge(self, row_job, echo, closes):
+        assert self._resolve("running_edge", row_job=row_job, live="RUNNING", echo=echo).close is closes
+
+    @pytest.mark.parametrize(
+        ("row_job", "echo", "ended"),
+        [
+            (_JOB, "other-job", True),
+            (_JOB, "0", True),
+            ("", _JOB, True),
+            (_JOB, "", False),
+            ("", "0", False),
+        ],
+        ids=["other", "lan-print", "row-none-echo-named", "silent-echo", "both-name-none"],
+    )
+    def test_another_job_on_the_printer(self, row_job, echo, ended):
+        """``PAUSE`` keeps the RUNNING close out of the way: only the "another job" reading answers."""
+        verdict = self._resolve("sweep_tick", row_job=row_job, live="PAUSE", echo=echo)
+        assert (verdict.close and verdict.source == RESOLVE_JOB_ENDED_UNSEEN) is ended
+
+
 class TestAJobPauseCannotOutliveItsJob:
     """A job-pause row whose job ended without the farm seeing its terminal has no other
     exit (no plate verb answers a job pause), so it would block dispatch and stand every

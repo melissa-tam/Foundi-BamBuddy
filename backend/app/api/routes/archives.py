@@ -1496,19 +1496,20 @@ async def get_archive_delete_impact(
     """Pre-flight for the delete-confirm modal (#1734).
 
     Returns the number of related queue items the user is about to remove
-    AND whether any of them are currently printing (which would block the
-    delete with a 409 — surfaced to the modal so it can disable the
-    confirm button instead of failing on submit). Cheap, single endpoint —
-    not folded into the archive GET response so the much larger list
-    endpoint isn't forced to run the same query per row.
+    AND how many prints in progress the delete would pull out from under a
+    printer — the related units mid-print plus the print this archive itself
+    records (which block the delete with a 409 — surfaced to the modal so it
+    can disable the confirm button instead of failing on submit). Cheap,
+    single endpoint — not folded into the archive GET response so the much
+    larger list endpoint isn't forced to run the same query per row.
     """
     user, can_read_all = auth_result
     service = ArchiveService(db)
     archive = _ensure_archive_visible(await service.get_archive(archive_id), user, can_read_all)
-    from backend.app.services.archive import count_related_queue_items
+    from backend.app.services.archive import archive_delete_impact
 
-    total, printing = await count_related_queue_items(db, archive.id)
-    return {"related_queue_items": total, "currently_printing": printing}
+    impact = await archive_delete_impact(db, archive.id)
+    return {"related_queue_items": impact.related_queue_items, "currently_printing": impact.currently_printing}
 
 
 @router.get("/{archive_id}/runs", response_model=PrintLogResponse)
@@ -1604,7 +1605,17 @@ async def update_archive(
         if archive.created_by_id != user.id:
             raise HTTPException(403, "You can only update your own archives")
 
+    # A live print's record belongs to the print binding (services/print_binding): only a printer
+    # starting the print makes a row live, and only its terminal ends it. An edit of a live row
+    # (its status, its printer) would detach the print from its record mid-run.
+    from backend.app.services.print_binding import is_live_status
+
     update_payload = update_data.model_dump(exclude_unset=True)
+    if is_live_status(archive.status):
+        raise HTTPException(409, "Archive records a print in progress. Edit it after the print ends.")
+    if is_live_status(update_payload.get("status")):
+        raise HTTPException(409, "Status 'printing' is set only by a printer starting the print.")
+
     for field, value in update_payload.items():
         setattr(archive, field, value)
 
@@ -1979,17 +1990,19 @@ async def delete_archive(
         if archive.created_by_id != user.id:
             raise HTTPException(403, "You can only delete your own archives")
 
-    # #1734: block delete when any related queue item is currently printing.
-    # Both soft and hard delete are gated — an in-flight print needs its
-    # backing archive to stay around for the metadata trail (filament,
-    # plate, ams_mapping). The user can stop the print first, then retry.
-    from backend.app.services.archive import count_related_queue_items
+    # #1734: block delete while a print in progress uses the archive — a
+    # related queue item printing from it, or the print it records. Both soft
+    # and hard delete are gated — an in-flight print needs its backing archive
+    # to stay around for the metadata trail (filament, plate, ams_mapping) and
+    # its record for the terminal, the charge and the finish photo. The user
+    # can stop the print first, then retry.
+    from backend.app.services.archive import archive_delete_impact
 
-    _related_total, related_printing = await count_related_queue_items(db, archive_id)
-    if related_printing > 0:
+    impact = await archive_delete_impact(db, archive_id)
+    if impact.currently_printing > 0:
         raise HTTPException(
             409,
-            f"Cannot delete archive — {related_printing} related queue item(s) are "
+            f"Cannot delete archive — {impact.currently_printing} print(s) using it are "
             f"currently printing. Stop the print first, then retry.",
         )
 

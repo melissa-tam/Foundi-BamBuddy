@@ -253,7 +253,6 @@ async def store_print_data(
     """
     from backend.app.api.routes.settings import get_setting
     from backend.app.models.active_print_spoolman import ActivePrintSpoolman
-    from backend.app.models.print_queue import PrintQueueItem
     from backend.app.utils.threemf_tools import (
         extract_filament_properties_from_3mf,
         extract_filament_usage_from_3mf,
@@ -291,13 +290,13 @@ async def store_print_data(
     if threemf_available:
         # Resolve the queue item once — used both for the plate-scoped 3MF parsing
         # fallback (#1697: multi-plate file dispatched for one plate must only count
-        # that plate's filament) and for the ams_mapping fallback below.
-        queue_result = await db.execute(
-            select(PrintQueueItem)
-            .where(PrintQueueItem.archive_id == archive_id)
-            .where(PrintQueueItem.status == "printing")
-        )
-        queue_item = queue_result.scalar_one_or_none()
+        # that plate's filament) and for the ams_mapping fallback below. It is the unit
+        # whose attempt this archive RECORDS, by job identity: a retry prints into its
+        # own new archive row, and its ``archive_id`` (the donor) is shared with its
+        # parent — matching on that missed every retry and could return two rows.
+        from backend.app.services.print_binding import unit_of_print_archive
+
+        queue_item = await unit_of_print_archive(db, archive_id, statuses=("printing",))
         # Caller-supplied plate_id wins (direct-Print path); fall back to the queue
         # item's plate_id (queue dispatch path).
         effective_plate_id = (

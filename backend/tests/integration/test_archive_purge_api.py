@@ -128,6 +128,43 @@ async def test_manual_purge_soft_deletes_by_default(
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+@pytest.mark.parametrize("purge_stats", [False, True], ids=["soft", "hard"])
+async def test_purge_never_takes_a_live_print(
+    async_client: AsyncClient, archive_factory, printer_factory, db_session, purge_stats
+):
+    """A live print's last activity is its START, so a print running past the retention — or a record
+    whose terminal the farm has not seen yet — is "old" by the clock. It is never eligible: the purge
+    would take the files its charge and finish photo need (the single-archive delete refuses the same
+    row). The finished row beside it still purges — the liveness pair."""
+    from backend.app.models.archive import PrintArchive
+
+    printer = await printer_factory()
+    long_ago = datetime.now(timezone.utc) - timedelta(days=400)
+    live = await archive_factory(printer.id, print_name="Live", status="printing", subtask_id="LIVE-1", with_run=False)
+    done = await archive_factory(printer.id, print_name="Done")
+    live_id, done_id = live.id, done.id
+    live.created_at = live.started_at = long_ago
+    done.created_at = long_ago
+    await db_session.commit()
+
+    preview = await async_client.get(
+        f"/api/v1/archives/purge/preview?older_than_days=365&purge_stats={str(purge_stats).lower()}"
+    )
+    assert preview.json()["count"] == 1
+    resp = await async_client.post("/api/v1/archives/purge", json={"older_than_days": 365, "purge_stats": purge_stats})
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == 1
+
+    db_session.expire_all()
+    live_row = await db_session.get(PrintArchive, live_id)
+    assert live_row is not None
+    assert (live_row.status, live_row.deleted_at) == ("printing", None)
+    done_row = await db_session.get(PrintArchive, done_id)
+    assert done_row is None if purge_stats else done_row.deleted_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_manual_purge_hard_deletes_when_purge_stats_set(
     async_client: AsyncClient, archive_factory, printer_factory, db_session
 ):

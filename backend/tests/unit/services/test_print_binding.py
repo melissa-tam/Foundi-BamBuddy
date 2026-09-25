@@ -23,6 +23,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.print_binding import (
     SUPERSEDED_REASON,
     Adopted,
@@ -33,10 +34,15 @@ from backend.app.services.print_binding import (
     bind_created,
     close_archive,
     count_live_prints,
+    is_live_status,
+    live_archive_for_job,
     live_print_archive,
+    print_archive_of,
     printers_with_live_print,
     resolve_terminal,
     same_job,
+    uncounted_live_records,
+    unit_of_print_archive,
 )
 from backend.tests._fixtures.print_callbacks import (
     STORAGE_HASH_FILENAME,
@@ -516,6 +522,172 @@ class TestTerminal:
         async with own_session_factory() as s:
             with pytest.raises(ValueError):
                 await close_archive(s, 1, status="printing", completed_at=None)
+
+
+# ---------------------------------------------------------------------------
+# The unit ↔ attempt-record link (one archive per ATTEMPT): identity, never the donor link
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPrintRecordResolution:
+    async def test_a_first_attempt_resolves_to_its_adopted_row(self, own_session_factory):
+        """The common shape: the first attempt adopted its dispatch copy, so the record is also its
+        donor — and identity finds it both ways."""
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        record = await seed_archive(
+            maker, printer_id=pid, status="completed", started_at=EARLIER, completed_at=NOW, subtask_id="D1"
+        )
+        unit_id = await seed_unit(
+            maker, printer_id=pid, archive_id=record, dispatch_subtask_id="D1", status="completed"
+        )
+
+        async with maker() as s:
+            assert (await print_archive_of(s, await s.get(PrintQueueItem, unit_id))).id == record
+            assert (await unit_of_print_archive(s, record)).id == unit_id
+
+    async def test_a_retry_resolves_to_its_own_row_never_its_donor(self, own_session_factory):
+        """A retry's ``archive_id`` is its FAILED parent's printed record (the donor). Its own attempt
+        is the row stamped with ITS dispatch id — and the shared donor names neither unit wrongly."""
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        parent_record = await seed_archive(
+            maker, printer_id=pid, status="failed", started_at=EARLIER, completed_at=EARLIER, subtask_id="P1"
+        )
+        parent = await seed_unit(
+            maker, printer_id=pid, archive_id=parent_record, dispatch_subtask_id="P1", status="failed"
+        )
+        retry = await seed_unit(
+            maker, printer_id=pid, archive_id=parent_record, dispatch_subtask_id="R1", status="completed"
+        )
+        retry_record = await seed_archive(
+            maker, printer_id=pid, status="completed", started_at=NOW, completed_at=NOW, subtask_id="R1"
+        )
+
+        async with maker() as s:
+            assert (await print_archive_of(s, await s.get(PrintQueueItem, retry))).id == retry_record
+            assert (await print_archive_of(s, await s.get(PrintQueueItem, parent))).id == parent_record
+            assert (await unit_of_print_archive(s, retry_record)).id == retry
+            assert (await unit_of_print_archive(s, parent_record)).id == parent, "the donor names two units"
+
+    async def test_a_retry_gets_a_new_record_through_the_binding(self, own_session_factory):
+        """End to end through the owner: the retry's start finds its donor already printed, a new row
+        is created and bound — and THAT row is the retry's record, not the parent's."""
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        parent_record = await seed_archive(
+            maker, printer_id=pid, status="failed", started_at=EARLIER, completed_at=EARLIER, subtask_id="OLD"
+        )
+        retry = await seed_unit(maker, printer_id=pid, archive_id=parent_record, dispatch_subtask_id="NEW")
+
+        binding = await _attach(maker, pid, LiveJob(subtask_id="NEW"))
+        assert binding == CreateNeeded(retry)
+        created = await seed_archive(maker, printer_id=None)
+        async with maker() as s:
+            assert await bind_created(s, created, pid, LiveJob(subtask_id="NEW"), retry, now=NOW)
+
+        async with maker() as s:
+            assert (await print_archive_of(s, await s.get(PrintQueueItem, retry))).id == created
+            assert (await unit_of_print_archive(s, created, statuses=("printing",))).id == retry
+
+    async def test_no_dispatch_id_or_no_printer_has_no_record(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        await seed_archive(maker, printer_id=pid, status="completed", started_at=EARLIER, subtask_id="D9")
+        donor = await seed_archive(maker, printer_id=pid, status="completed", started_at=EARLIER, subtask_id="X")
+
+        async with maker() as s:
+            never_dispatched = PrintQueueItem(printer_id=pid, archive_id=donor, dispatch_subtask_id=None)
+            unplaced = PrintQueueItem(printer_id=None, archive_id=donor, dispatch_subtask_id="D9")
+            id_less = PrintQueueItem(printer_id=pid, archive_id=donor, dispatch_subtask_id="0")
+            assert await print_archive_of(s, never_dispatched) is None, "the donor is never read as the record"
+            assert await print_archive_of(s, unplaced) is None
+            assert await print_archive_of(s, id_less) is None
+
+    async def test_identity_is_per_printer(self, own_session_factory):
+        maker = own_session_factory
+        p1 = await seed_printer(maker, serial="H2S-1")
+        p2 = await seed_printer(maker, serial="H2S-2")
+        elsewhere = await seed_archive(maker, printer_id=p2, status="completed", started_at=EARLIER, subtask_id="D1")
+        unit_id = await seed_unit(maker, printer_id=p1, archive_id=None, dispatch_subtask_id="D1", status="completed")
+
+        async with maker() as s:
+            assert await print_archive_of(s, await s.get(PrintQueueItem, unit_id)) is None
+            assert await unit_of_print_archive(s, elsewhere) is None
+
+    async def test_unit_of_print_archive_honours_the_status_window(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        record = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="D1")
+        unit_id = await seed_unit(maker, printer_id=pid, archive_id=record, dispatch_subtask_id="D1")
+
+        async with maker() as s:
+            assert (await unit_of_print_archive(s, record, statuses=("printing",))).id == unit_id
+            assert await unit_of_print_archive(s, record, statuses=("completed", "failed")) is None
+
+    async def test_a_foreign_print_has_no_unit(self, own_session_factory):
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        lan = await seed_archive(maker, printer_id=pid, status="completed", started_at=EARLIER, subtask_id="0")
+        await seed_unit(maker, printer_id=pid, archive_id=lan, dispatch_subtask_id="D1", status="completed")
+
+        async with maker() as s:
+            assert await unit_of_print_archive(s, lan) is None, "a donor link alone never makes it the unit's record"
+            assert await unit_of_print_archive(s, 999_999) is None
+
+
+@pytest.mark.asyncio
+class TestLivePrintQuestions:
+    @pytest.mark.parametrize(
+        ("live_echo", "found"),
+        [("S1", True), (None, True), ("", True), ("0", True), ("OTHER", False)],
+        ids=["same", "none", "empty", "zero", "other"],
+    )
+    async def test_live_archive_for_job(self, own_session_factory, live_echo, found):
+        """The printer card's live record: the one ``printing`` row unless the printer names ANOTHER
+        job (a leaked record the reconcile owns)."""
+        maker = own_session_factory
+        pid = await seed_printer(maker)
+        archive_id = await seed_archive(maker, printer_id=pid, status="printing", started_at=EARLIER, subtask_id="S1")
+
+        async with maker() as s:
+            live = await live_archive_for_job(s, pid, live_echo)
+            assert (live.id if live is not None else None) == (archive_id if found else None)
+            assert await live_archive_for_job(s, pid + 1, "S1") is None
+
+    async def test_uncounted_live_records(self, own_session_factory):
+        """The deletion guards' second question, counted ONCE: a retry's live record is no unit's
+        donor, so it counts beside the donor-linked units; a first attempt's adopted record IS one
+        of those units' print, so it does not count twice; an id-less live print always counts; a
+        finished row never does; ``scope`` narrows."""
+        from backend.app.models.archive import PrintArchive
+
+        maker = own_session_factory
+        p_retry, p_first, p_lan = [await seed_printer(maker, serial=f"H2S-{n}") for n in (1, 2, 3)]
+        parent = await seed_archive(maker, printer_id=p_retry, status="failed", started_at=EARLIER, subtask_id="P1")
+        retry_record = await seed_archive(maker, printer_id=p_retry, status="printing", started_at=NOW, subtask_id="R1")
+        retry_unit = await seed_unit(maker, printer_id=p_retry, archive_id=parent, dispatch_subtask_id="R1")
+        first_record = await seed_archive(maker, printer_id=p_first, status="printing", started_at=NOW, subtask_id="F1")
+        first_unit = await seed_unit(maker, printer_id=p_first, archive_id=first_record, dispatch_subtask_id="F1")
+        lan_record = await seed_archive(maker, printer_id=p_lan, status="printing", started_at=NOW, subtask_id="0")
+        everything = PrintArchive.id.is_not(None)
+
+        async with maker() as s:
+            # The donor count for "every archive" names the first attempt's unit (its archive_id)
+            # and the retry (its donor, the parent) — the retry's record is still uncounted.
+            assert await uncounted_live_records(s, everything, [first_unit, retry_unit]) == [lan_record]
+            assert await uncounted_live_records(s, everything, [first_unit]) == [retry_record, lan_record]
+            assert await uncounted_live_records(s, everything, []) == [retry_record, first_record, lan_record]
+            assert await uncounted_live_records(s, PrintArchive.id == parent, []) == [], "a finished row"
+            assert await uncounted_live_records(s, PrintArchive.id == retry_record, [first_unit]) == [retry_record]
+
+    @pytest.mark.parametrize(
+        ("status", "live"),
+        [("printing", True), ("completed", False), ("failed", False), ("archived", False), (None, False)],
+    )
+    async def test_is_live_status(self, status, live):
+        assert is_live_status(status) is live
 
 
 # ---------------------------------------------------------------------------

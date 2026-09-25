@@ -352,6 +352,138 @@ class TestArchivesAPI:
         assert body["related_queue_items"] == 3
         assert body["currently_printing"] == 1
 
+    # ------------------------------------------------------------------------
+    # One archive per print ATTEMPT (2026-09-25): a live record is guarded as a live print
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    async def _stored(db_session, archive_id: int):
+        """The archive as the database holds it now, not the session's identity-map copy."""
+        from sqlalchemy import select
+
+        from backend.app.models.archive import PrintArchive
+
+        db_session.expire_all()
+        return (await db_session.execute(select(PrintArchive).where(PrintArchive.id == archive_id))).scalar_one()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_refused_while_the_archive_records_a_live_print(
+        self, async_client: AsyncClient, archive_factory, printer_factory, db_session
+    ):
+        """A retry prints into its OWN archive row, which is no queue unit's ``archive_id`` — so the
+        #1734 related-unit guard never saw it, and a soft delete purged the files that print's
+        charge and finish photo still need. The row's own live status refuses the delete too."""
+        from backend.app.models.print_queue import PrintQueueItem
+
+        printer = await printer_factory()
+        donor = await archive_factory(printer.id, subtask_id="PARENT-1")
+        record = await archive_factory(printer.id, status="printing", subtask_id="RETRY-1", with_run=False)
+        db_session.add(
+            PrintQueueItem(
+                printer_id=printer.id,
+                archive_id=donor.id,
+                status="printing",
+                dispatch_subtask_id="RETRY-1",
+                position=1,
+            )
+        )
+        await db_session.commit()
+
+        impact = await async_client.get(f"/api/v1/archives/{record.id}/delete-impact")
+        assert impact.status_code == 200
+        assert impact.json() == {"related_queue_items": 0, "currently_printing": 1}
+
+        soft = await async_client.delete(f"/api/v1/archives/{record.id}")
+        assert soft.status_code == 409
+        assert "printing" in soft.json()["detail"].lower()
+        hard = await async_client.delete(f"/api/v1/archives/{record.id}?purge_stats=true")
+        assert hard.status_code == 409
+
+        stored = await self._stored(db_session, record.id)
+        assert (stored.status, stored.deleted_at) == ("printing", None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_impact_counts_an_adopted_live_print_once(
+        self, async_client: AsyncClient, archive_factory, printer_factory, db_session
+    ):
+        """A first attempt adopts its dispatch copy: the live record IS the printing unit's donor, one
+        print — reported once, so the modal never says two prints stand in the way."""
+        from backend.app.models.print_queue import PrintQueueItem
+
+        printer = await printer_factory()
+        record = await archive_factory(printer.id, status="printing", subtask_id="FIRST-1", with_run=False)
+        db_session.add(
+            PrintQueueItem(
+                printer_id=printer.id,
+                archive_id=record.id,
+                status="printing",
+                dispatch_subtask_id="FIRST-1",
+                position=1,
+            )
+        )
+        await db_session.commit()
+
+        impact = await async_client.get(f"/api/v1/archives/{record.id}/delete-impact")
+        assert impact.json() == {"related_queue_items": 1, "currently_printing": 1}
+        assert (await async_client.delete(f"/api/v1/archives/{record.id}")).status_code == 409
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_delete_allowed_on_a_completed_attempt_record(
+        self, async_client: AsyncClient, archive_factory, printer_factory, db_session
+    ):
+        """The liveness pair: the guard refuses a LIVE record only — a finished one deletes."""
+        printer = await printer_factory()
+        record = await archive_factory(printer.id, status="completed", subtask_id="RETRY-1")
+
+        impact = await async_client.get(f"/api/v1/archives/{record.id}/delete-impact")
+        assert impact.json() == {"related_queue_items": 0, "currently_printing": 0}
+        response = await async_client.delete(f"/api/v1/archives/{record.id}")
+        assert response.status_code == 200
+
+        assert (await self._stored(db_session, record.id)).deleted_at is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_refuses_to_make_a_row_live(
+        self, async_client: AsyncClient, archive_factory, printer_factory, db_session
+    ):
+        """``printing`` is the print binding's to write (a printer starting the print); a PATCH that
+        set it would fabricate a live print the partial unique index and every live-print reader
+        then believe. A normal edit of the same row still goes through."""
+        printer = await printer_factory()
+        archive_id = (await archive_factory(printer.id, status="completed")).id
+
+        refused = await async_client.patch(f"/api/v1/archives/{archive_id}", json={"status": "printing"})
+        assert refused.status_code == 409
+        assert (await self._stored(db_session, archive_id)).status == "completed"
+
+        edited = await async_client.patch(f"/api/v1/archives/{archive_id}", json={"notes": "kept", "status": "failed"})
+        assert edited.status_code == 200
+        stored = await self._stored(db_session, archive_id)
+        assert (stored.notes, stored.status) == ("kept", "failed")
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_patch_refuses_any_edit_of_a_live_record(
+        self, async_client: AsyncClient, archive_factory, printer_factory, db_session
+    ):
+        """A live record ends only through its terminal (``print_binding.close_archive``): an edit of
+        its status or printer mid-run would detach the print from the row its terminal closes."""
+        printer = await printer_factory()
+        other = await printer_factory(name="Other", serial_number="00M09A000000099")
+        archive = await archive_factory(printer.id, status="printing", subtask_id="LIVE-1", with_run=False)
+        printer_id, archive_id = printer.id, archive.id
+
+        for payload in ({"status": "completed"}, {"printer_id": other.id}, {"notes": "hands off"}):
+            response = await async_client.patch(f"/api/v1/archives/{archive_id}", json=payload)
+            assert response.status_code == 409, payload
+
+        stored = await self._stored(db_session, archive_id)
+        assert (stored.status, stored.printer_id, stored.notes) == ("printing", printer_id, None)
+
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_soft_delete_preserves_stats_contribution(
