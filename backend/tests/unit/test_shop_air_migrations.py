@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.database import _rebuild_column_nullable, run_migrations
 from backend.app.models.eject_profile import EjectProfile
@@ -54,8 +54,7 @@ async def _seed_at_rest_history(eng) -> datetime:
     evaluated = datetime.fromisoformat(cut["evaluated_at"])
     now = datetime.now(timezone.utc).replace(tzinfo=None, second=0, microsecond=0)
     shift = (now - timedelta(minutes=30)) - evaluated
-    maker = async_sessionmaker(eng, expire_on_commit=False)
-    async with maker() as db:
+    async with AsyncSession(eng, expire_on_commit=False) as db:
         db.add(Printer(id=1, name="air", serial_number="SAIR", ip_address="10.0.0.1", access_code="x", model="H2S"))
         for row in cut["rows"]:
             at = datetime.fromisoformat(row[0]) + shift
@@ -167,8 +166,7 @@ async def _old_eject_profiles_schema(eng) -> None:
                 "BEGIN INSERT INTO eject_probe_log (profile_id) VALUES (NEW.id); END"
             )
         )
-    maker = async_sessionmaker(eng, expire_on_commit=False)
-    async with maker() as db:
+    async with AsyncSession(eng, expire_on_commit=False) as db:
         await db.execute(
             text(
                 "INSERT INTO eject_profiles (id, name, cooldown_temp_c, clearance_mm, z_offset_mm, descent_steps, "
@@ -190,8 +188,7 @@ class TestEjectProfileColumnRelaxed:
     async def test_on_the_old_schema_a_new_profile_cannot_be_inserted(self, engine):
         """The failure the migration exists for: the model no longer names the column."""
         await _old_eject_profiles_schema(engine)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-        async with maker() as db:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
             db.add(EjectProfile(name="new"))
             with pytest.raises(IntegrityError):
                 await db.commit()
@@ -231,8 +228,7 @@ class TestEjectProfileColumnRelaxed:
         async with engine.begin() as conn:
             await run_migrations(conn)
 
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-        async with maker() as db:
+        async with AsyncSession(engine, expire_on_commit=False) as db:
             created = await create_eject_profile(EjectProfileCreate(name="after"), db=db, _=None)
             assert created.id > 7  # AUTOINCREMENT survived: never a reissued id
             updated = await update_eject_profile(created.id, EjectProfileUpdate(clearance_mm=12.0), db=db, _=None)

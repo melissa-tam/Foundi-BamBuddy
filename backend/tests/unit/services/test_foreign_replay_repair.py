@@ -17,13 +17,13 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import Connection, Engine, Row, create_engine, delete, insert, select, update
+from sqlalchemy import Connection, Row, delete, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from backend.app.core.database import Base, run_migrations
@@ -52,7 +52,7 @@ def _printer_name(printer_id: int) -> str:
 
 @dataclass
 class _Seed:
-    """Rows to insert, in order, through the REAL tables (``Base.metadata``), sync or async."""
+    """Rows to insert, in order, through the REAL tables (``Base.metadata``)."""
 
     rows: list[tuple[str, dict[str, object]]] = field(default_factory=list)
 
@@ -221,11 +221,7 @@ class _Seed:
             )
         )
 
-    def write(self, conn: Connection) -> None:
-        for table, values in self.rows:
-            conn.execute(insert(Base.metadata.tables[table]).values(**values))
-
-    async def write_async(self, conn: AsyncConnection) -> None:
+    async def write(self, conn: AsyncConnection) -> None:
         for table, values in self.rows:
             await conn.execute(insert(Base.metadata.tables[table]).values(**values))
 
@@ -568,42 +564,41 @@ ALL_SHAPES: tuple[Shape, ...] = (
 
 
 @pytest.fixture
-def engine(tmp_path: Path) -> Iterator[Engine]:
-    """A real temp-file SQLite database built from the app's own models."""
-    import_all_models()
-    eng = create_engine(f"sqlite:///{(tmp_path / 'repair.db').as_posix()}")
-    Base.metadata.create_all(eng)
-    with eng.begin() as conn:
+async def engine() -> AsyncIterator[AsyncEngine]:
+    """The app's own schema (``create_memory_engine``). The repair takes a SYNC ``Connection``, which
+    ``run_sync`` hands it — the same bridge the migration uses."""
+    eng = await create_memory_engine()
+    async with eng.begin() as conn:
         # The pre-repair shapes hold several printing archives per printer; production builds this index after R-dup.
-        conn.exec_driver_sql("DROP INDEX IF EXISTS ux_print_archives_live_printer")
+        await conn.exec_driver_sql("DROP INDEX IF EXISTS ux_print_archives_live_printer")
     yield eng
-    eng.dispose()
+    await eng.dispose()
 
 
-def _seed(engine: Engine, *shapes: Shape) -> None:
+async def _seed(engine: AsyncEngine, *shapes: Shape) -> None:
     seed = _Seed()
     for shape in shapes:
         shape(seed)
-    with engine.begin() as conn:
-        seed.write(conn)
+    async with engine.begin() as conn:
+        await seed.write(conn)
 
 
-def _plan(engine: Engine, now: datetime = NOW) -> frr.RepairPlan:
-    with engine.connect() as conn:
-        return frr.plan_foreign_replay_repair(conn, now=now)
+async def _plan(engine: AsyncEngine, now: datetime = NOW) -> frr.RepairPlan:
+    async with engine.connect() as conn:
+        return await conn.run_sync(frr.plan_foreign_replay_repair, now=now)
 
 
-def _repair(engine: Engine) -> frr.RepairPlan:
-    plan = _plan(engine)
-    with engine.begin() as conn:
-        frr.apply_foreign_replay_repair(conn, plan)
+async def _repair(engine: AsyncEngine) -> frr.RepairPlan:
+    plan = await _plan(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(frr.apply_foreign_replay_repair, plan)
     return plan
 
 
-def _row(engine: Engine, table: str, row_id: int) -> Row | None:
+async def _row(engine: AsyncEngine, table: str, row_id: int) -> Row | None:
     tab = Base.metadata.tables[table]
-    with engine.connect() as conn:
-        return conn.execute(select(tab).where(tab.c.id == row_id)).one_or_none()
+    async with engine.connect() as conn:
+        return (await conn.execute(select(tab).where(tab.c.id == row_id))).one_or_none()
 
 
 def _ids(plan: frr.RepairPlan, kind: type) -> set[int]:
@@ -662,166 +657,168 @@ def test_imports_only_the_standard_library_and_sqlalchemy(path: Path) -> None:
 # --- the rules, per shape -------------------------------------------------------------------------------
 
 
-def test_leaked_archive_replayed_later_is_restored_and_its_phantom_charge_reversed(engine: Engine) -> None:
+async def test_leaked_archive_replayed_later_is_restored_and_its_phantom_charge_reversed(engine: AsyncEngine) -> None:
     """(a)"""
-    _seed(engine, _shape_leaked)
-    plan = _repair(engine)
+    await _seed(engine, _shape_leaked)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.RestoreArchiveOutcome) == {101}
     assert _ids(plan, frr.RewritePrintLogEntry) == {501}
     assert _ids(plan, frr.ReverseSpoolCharge) == {601}
     assert len(plan.actions) == 3
 
-    archive = _row(engine, "print_archives", 101)
+    archive = await _row(engine, "print_archives", 101)
     assert (archive.status, archive.completed_at, archive.failure_reason) == ("completed", T0, None)
-    entry = _row(engine, "print_log_entries", 501)
+    entry = await _row(engine, "print_log_entries", 501)
     assert entry.status == "completed"
     assert entry.completed_at == T0
     assert entry.duration_seconds == 4 * 3600, "recomputed from the row's own start to the run's terminal"
     assert (entry.filament_used_grams, entry.cost) == (118.0, 2.95), "the real terminal's own donor charge"
     assert entry.failure_reason is None
     assert entry.created_at == T0 + 2 * D, "the write time is history; it is not rewritten"
-    assert _row(engine, "spool_usage_history", 601) is None
-    assert _row(engine, "spool", 301).weight_used == pytest.approx(618.0)
-    assert _row(engine, "spool_usage_history", 9001) is not None, "the real completion's donor charge stays"
+    assert await _row(engine, "spool_usage_history", 601) is None
+    assert (await _row(engine, "spool", 301)).weight_used == pytest.approx(618.0)
+    assert await _row(engine, "spool_usage_history", 9001) is not None, "the real completion's donor charge stays"
 
 
-def test_misbinding_mid_run_is_attributed_to_the_run_whose_window_holds_it(engine: Engine) -> None:
+async def test_misbinding_mid_run_is_attributed_to_the_run_whose_window_holds_it(engine: AsyncEngine) -> None:
     """(b) The replay row lands INSIDE the current run's window, hours before its terminal."""
-    _seed(engine, _shape_misbinding)
-    plan = _repair(engine)
+    await _seed(engine, _shape_misbinding)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.RestoreArchiveOutcome) == {111}
     assert _ids(plan, frr.ReverseSpoolCharge) == {611}
-    archive = _row(engine, "print_archives", 111)
+    archive = await _row(engine, "print_archives", 111)
     assert (archive.status, archive.completed_at) == ("completed", T0 + 3 * H)
-    entry = _row(engine, "print_log_entries", 511)
+    entry = await _row(engine, "print_log_entries", 511)
     assert (entry.status, entry.completed_at, entry.duration_seconds) == ("completed", T0 + 3 * H, 4 * 3600)
-    assert _row(engine, "spool_usage_history", 611) is None
-    assert _row(engine, "spool", 302).weight_used == pytest.approx(320.0)
+    assert await _row(engine, "spool_usage_history", 611) is None
+    assert (await _row(engine, "spool", 302)).weight_used == pytest.approx(320.0)
 
 
-def test_a_genuinely_unobserved_outcome_is_the_runs_own_record(engine: Engine) -> None:
+async def test_a_genuinely_unobserved_outcome_is_the_runs_own_record(engine: AsyncEngine) -> None:
     """(c) The replay was the run's terminal, so its rows are the only record of the run."""
-    _seed(engine, _shape_unobserved)
-    plan = _repair(engine)
+    await _seed(engine, _shape_unobserved)
+    plan = await _repair(engine)
 
     assert plan.actions == ()
     assert plan.skips == ()
     tallies = dict(plan.tallies)
     assert tallies["charge: genuine: written at its run's own terminal"] == 1
     assert tallies["print-log: genuine: written at its run's own terminal"] == 1
-    assert _row(engine, "print_archives", 121).status == "cancelled"
-    assert _row(engine, "print_log_entries", 521).status == "cancelled"
-    assert _row(engine, "spool_usage_history", 621) is not None
-    assert _row(engine, "spool", 303).weight_used == pytest.approx(250.0)
+    assert (await _row(engine, "print_archives", 121)).status == "cancelled"
+    assert (await _row(engine, "print_log_entries", 521)).status == "cancelled"
+    assert await _row(engine, "spool_usage_history", 621) is not None
+    assert (await _row(engine, "spool", 303)).weight_used == pytest.approx(250.0)
 
 
-def test_a_cancelled_run_replayed_later_is_repaired_and_its_own_charge_kept(engine: Engine) -> None:
+async def test_a_cancelled_run_replayed_later_is_repaired_and_its_own_charge_kept(engine: AsyncEngine) -> None:
     """(q) The run recorded cancelled at its real terminal; the replay 42 h later is a replay."""
-    _seed(engine, _shape_cancelled_run_replayed_later)
-    plan = _repair(engine)
+    await _seed(engine, _shape_cancelled_run_replayed_later)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.ReverseSpoolCharge) == {694}
-    assert _row(engine, "spool_usage_history", 693) is not None, "the genuine charge at its terminal stays"
-    assert _row(engine, "spool_usage_history", 694) is None
-    assert _row(engine, "spool", 316).weight_used == pytest.approx(266.3)
-    entry = _row(engine, "print_log_entries", 589)
+    assert await _row(engine, "spool_usage_history", 693) is not None, "the genuine charge at its terminal stays"
+    assert await _row(engine, "spool_usage_history", 694) is None
+    assert (await _row(engine, "spool", 316)).weight_used == pytest.approx(266.3)
+    entry = await _row(engine, "print_log_entries", 589)
     assert (entry.status, entry.completed_at, entry.duration_seconds) == ("cancelled", T0, 3 * 3600)
     assert entry.filament_used_grams is None, "a cancelled run with no donor charge has no known grams"
     assert entry.cost == 3.3, "its cost stays as written"
     assert _ids(plan, frr.RestoreArchiveOutcome) == set(), "R-archive restores only completed/failed outcomes"
-    assert _row(engine, "print_archives", 210).status == "cancelled"
+    assert (await _row(engine, "print_archives", 210)).status == "cancelled"
 
 
-def test_a_rewritten_row_takes_its_grams_from_the_real_terminals_donor_charges(engine: Engine) -> None:
+async def test_a_rewritten_row_takes_its_grams_from_the_real_terminals_donor_charges(engine: AsyncEngine) -> None:
     """(r) The two donor charges on the run's printer within its window, and nothing else."""
-    _seed(engine, _shape_donor_grams)
-    plan = _repair(engine)
+    await _seed(engine, _shape_donor_grams)
+    plan = await _repair(engine)
 
     rewrite = next(a for a in plan.actions if isinstance(a, frr.RewritePrintLogEntry))
     assert rewrite.after.filament_used_grams == 32.5
     assert rewrite.after.cost == pytest.approx(0.8)
-    entry = _row(engine, "print_log_entries", 593)
+    entry = await _row(engine, "print_log_entries", 593)
     assert (entry.status, entry.completed_at, entry.filament_used_grams) == ("cancelled", T0, 32.5)
     assert _ids(plan, frr.ReverseSpoolCharge) == {686}
     for donor in (9003, 9004, 9005, 9006):
-        assert _row(engine, "spool_usage_history", donor) is not None, "donor charges are never touched"
-    assert _plan(engine).actions == (), "the rewrite is idempotent"
+        assert await _row(engine, "spool_usage_history", donor) is not None, "donor charges are never touched"
+    assert (await _plan(engine)).actions == (), "the rewrite is idempotent"
 
 
-def test_a_queue_page_stop_is_judged_only_once_its_terminal_is_seen(engine: Engine) -> None:
+async def test_a_queue_page_stop_is_judged_only_once_its_terminal_is_seen(engine: AsyncEngine) -> None:
     """(s) The Stop route's ``completed_at`` is not a terminal. With no terminal written beside it
     (an offline printer), a later row may be the print's real end: listed, never reversed. With
     the terminal seen right after the stop, the premise holds and the replay is reversed."""
-    _seed(engine, _shape_queue_page_stops)
-    plan = _repair(engine)
+    await _seed(engine, _shape_queue_page_stops)
+    plan = await _repair(engine)
 
     assert _skip_codes(plan) == {
         ("print_log_entries", 588): "stop_terminal_unseen",
         ("spool_usage_history", 687): "stop_terminal_unseen",
     }
-    assert _row(engine, "spool_usage_history", 687) is not None
-    assert _row(engine, "spool", 319).weight_used == pytest.approx(300.0)
+    assert await _row(engine, "spool_usage_history", 687) is not None
+    assert (await _row(engine, "spool", 319)).weight_used == pytest.approx(300.0)
     assert _ids(plan, frr.ReverseSpoolCharge) == {688}
-    assert _row(engine, "spool", 320).weight_used == pytest.approx(220.0)
+    assert (await _row(engine, "spool", 320)).weight_used == pytest.approx(220.0)
 
 
-def test_failed_run_restores_failed_and_drops_the_replay_row_beside_its_own(engine: Engine) -> None:
+async def test_failed_run_restores_failed_and_drops_the_replay_row_beside_its_own(engine: AsyncEngine) -> None:
     """(d)"""
-    _seed(engine, _shape_failed)
-    plan = _repair(engine)
+    await _seed(engine, _shape_failed)
+    plan = await _repair(engine)
 
-    archive = _row(engine, "print_archives", 131)
+    archive = await _row(engine, "print_archives", 131)
     assert (archive.status, archive.completed_at) == ("failed", T0)
     assert _ids(plan, frr.DropPrintLogEntry) == {532}
     assert _ids(plan, frr.RewritePrintLogEntry) == set()
-    assert _row(engine, "print_log_entries", 532) is None
-    genuine = _row(engine, "print_log_entries", 531)
+    assert await _row(engine, "print_log_entries", 532) is None
+    genuine = await _row(engine, "print_log_entries", 531)
     assert (genuine.status, genuine.failure_reason) == ("failed", "clog"), "the run's own row is untouched"
     assert _ids(plan, frr.ReverseSpoolCharge) == {632}
-    assert _row(engine, "spool_usage_history", 631) is not None, "the genuine failed charge stays"
-    assert _row(engine, "spool", 304).weight_used == pytest.approx(325.0)
+    assert await _row(engine, "spool_usage_history", 631) is not None, "the genuine failed charge stays"
+    assert (await _row(engine, "spool", 304)).weight_used == pytest.approx(325.0)
 
 
-def test_retry_chain_leaves_the_parents_genuine_rows_alone(engine: Engine) -> None:
+async def test_retry_chain_leaves_the_parents_genuine_rows_alone(engine: AsyncEngine) -> None:
     """(e) The parent's stop-word charge at ITS terminal is 30 s from the parent's run, and hours
     from the child's. An archive-keyed rule would call it a replay of the archive's last run."""
-    _seed(engine, _shape_retry_chain)
-    plan = _repair(engine)
+    await _seed(engine, _shape_retry_chain)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.ReverseSpoolCharge) == {643}
-    assert _row(engine, "spool_usage_history", 641) is not None
-    assert _row(engine, "spool_usage_history", 642) is not None
-    assert _row(engine, "spool", 305).weight_used == pytest.approx(540.0)
-    assert _row(engine, "print_log_entries", 541).status == "failed"
-    child_row = _row(engine, "print_log_entries", 542)
+    assert await _row(engine, "spool_usage_history", 641) is not None
+    assert await _row(engine, "spool_usage_history", 642) is not None
+    assert (await _row(engine, "spool", 305)).weight_used == pytest.approx(540.0)
+    assert (await _row(engine, "print_log_entries", 541)).status == "failed"
+    child_row = await _row(engine, "print_log_entries", 542)
     assert (child_row.status, child_row.completed_at) == ("completed", T0 + 3 * H)
     reversal = next(a for a in plan.actions if isinstance(a, frr.ReverseSpoolCharge))
     assert reversal.unit_id == 241, "attributed to the child run, whose window holds it"
-    archive = _row(engine, "print_archives", 141)
+    archive = await _row(engine, "print_archives", 141)
     assert (archive.status, archive.completed_at) == ("completed", T0 + 3 * H), "its LAST run is the child"
 
 
-def test_locked_spent_and_archived_spools_are_skipped_and_logged(engine: Engine) -> None:
+async def test_locked_spent_and_archived_spools_are_skipped_and_logged(engine: AsyncEngine) -> None:
     """(f)"""
-    _seed(engine, _shape_retired_spools)
-    plan = _repair(engine)
+    await _seed(engine, _shape_retired_spools)
+    plan = await _repair(engine)
 
     skips = {skip.usage_id: skip.code for skip in plan.skips if isinstance(skip, frr.SkipSpoolCharge)}
     assert skips == {651: "weight_locked", 652: "spent", 653: "archived"}
     assert _ids(plan, frr.ReverseSpoolCharge) == {654}
     for charge_id, spool_id in ((651, 306), (652, 307), (653, 308)):
-        assert _row(engine, "spool_usage_history", charge_id) is not None
-        assert _row(engine, "spool", spool_id).weight_used == pytest.approx(300.0)
-    assert _row(engine, "spool", 309).weight_used == pytest.approx(250.0)
-    assert _row(engine, "print_archives", 151).status == "completed", "the archive repair does not wait on spools"
+        assert await _row(engine, "spool_usage_history", charge_id) is not None
+        assert (await _row(engine, "spool", spool_id)).weight_used == pytest.approx(300.0)
+    assert (await _row(engine, "spool", 309)).weight_used == pytest.approx(250.0)
+    assert (await _row(engine, "print_archives", 151)).status == "completed", (
+        "the archive repair does not wait on spools"
+    )
 
 
-def test_duplicate_printing_archives_close_to_their_run_outcome_leaving_the_latest(engine: Engine) -> None:
+async def test_duplicate_printing_archives_close_to_their_run_outcome_leaving_the_latest(engine: AsyncEngine) -> None:
     """(g) The index prerequisite: at most one ``printing`` archive per printer afterwards."""
-    _seed(engine, _shape_printing_duplicates)
-    plan = _repair(engine)
+    await _seed(engine, _shape_printing_duplicates)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.ClosePrintingDuplicate) == {160, 161, 162, 164}
     expected = {
@@ -833,34 +830,34 @@ def test_duplicate_printing_archives_close_to_their_run_outcome_leaving_the_late
         170: ("printing", None),  # alone on printer 8
     }
     for archive_id, (status, completed_at) in expected.items():
-        archive = _row(engine, "print_archives", archive_id)
+        archive = await _row(engine, "print_archives", archive_id)
         assert (archive.status, archive.completed_at) == (status, completed_at), archive_id
-    with engine.connect() as conn:
+    async with engine.connect() as conn:
         tab = Base.metadata.tables["print_archives"]
-        printing = conn.execute(select(tab.c.printer_id).where(tab.c.status == "printing")).scalars().all()
+        printing = (await conn.execute(select(tab.c.printer_id).where(tab.c.status == "printing"))).scalars().all()
     assert sorted(printing) == [7, 8]
 
 
-def test_cross_printer_replay_keeps_the_runs_own_printer_row(engine: Engine) -> None:
+async def test_cross_printer_replay_keeps_the_runs_own_printer_row(engine: AsyncEngine) -> None:
     """(k) Two replay rows for one run: the one written on the run's printer is kept, even though
     it is the later one. (k2) A lone row from another printer is restated on the run's printer."""
-    _seed(engine, _shape_cross_printer)
-    plan = _repair(engine)
+    await _seed(engine, _shape_cross_printer)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.RewritePrintLogEntry) == {582, 591}
     assert _ids(plan, frr.DropPrintLogEntry) == {581}
     assert _ids(plan, frr.ReverseSpoolCharge) == {681}, "a phantom charge is phantom on any printer"
-    kept = _row(engine, "print_log_entries", 582)
+    kept = await _row(engine, "print_log_entries", 582)
     assert (kept.status, kept.printer_id) == ("completed", 9)
-    restated = _row(engine, "print_log_entries", 591)
+    restated = await _row(engine, "print_log_entries", 591)
     assert (restated.status, restated.printer_id, restated.printer_name) == ("completed", 11, "011-H2S")
 
 
-def test_foreign_prints_are_never_touched_and_are_counted(engine: Engine) -> None:
+async def test_foreign_prints_are_never_touched_and_are_counted(engine: AsyncEngine) -> None:
     """(l) A row after an operator reprint belongs to that reprint, not to the farm's earlier run.
     Rows with no farm run are every foreign print ever logged, so the report counts them."""
-    _seed(engine, _shape_foreign)
-    plan = _repair(engine)
+    await _seed(engine, _shape_foreign)
+    plan = await _repair(engine)
 
     assert plan.actions == ()
     assert plan.skips == ()
@@ -870,113 +867,116 @@ def test_foreign_prints_are_never_touched_and_are_counted(engine: Engine) -> Non
     )
     assert tallies["charge: no farm run started before it (a foreign print)"] == 1
     assert tallies["print-log: no farm run started before it (a foreign print)"] == 1
-    assert _row(engine, "spool", 311).weight_used == pytest.approx(200.0)
-    assert _row(engine, "spool_usage_history", 695) is not None
-    assert _row(engine, "print_log_entries", 596) is not None
+    assert (await _row(engine, "spool", 311)).weight_used == pytest.approx(200.0)
+    assert await _row(engine, "spool_usage_history", 695) is not None
+    assert await _row(engine, "print_log_entries", 596) is not None
 
 
-def test_a_replay_inside_a_run_still_printing_is_listed_and_left_alone(engine: Engine) -> None:
+async def test_a_replay_inside_a_run_still_printing_is_listed_and_left_alone(engine: AsyncEngine) -> None:
     """(p) Replay-shaped, but not judgeable yet: the report lists it so a reader can follow it up."""
-    _seed(engine, _shape_run_still_printing)
-    plan = _repair(engine)
+    await _seed(engine, _shape_run_still_printing)
+    plan = await _repair(engine)
 
     assert plan.actions == ()
     assert _skip_codes(plan) == {
         ("print_log_entries", 594): "run_open",
         ("spool_usage_history", 692): "run_open",
     }
-    assert _row(engine, "print_archives", 200).status == "cancelled"
-    assert _row(engine, "spool", 315).weight_used == pytest.approx(250.0)
+    assert (await _row(engine, "print_archives", 200)).status == "cancelled"
+    assert (await _row(engine, "spool", 315)).weight_used == pytest.approx(250.0)
 
 
-def test_a_pre_0919_aborted_replay_is_repaired_like_any_other(engine: Engine) -> None:
+async def test_a_pre_0919_aborted_replay_is_repaired_like_any_other(engine: AsyncEngine) -> None:
     """(m) The status word is not the evidence: the write time against the run's terminal is."""
-    _seed(engine, _shape_pre_0919)
-    plan = _repair(engine)
+    await _seed(engine, _shape_pre_0919)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.RestoreArchiveOutcome) == {197}
     assert _ids(plan, frr.RewritePrintLogEntry) == {597}
     assert _ids(plan, frr.ReverseSpoolCharge) == {699}
-    archive = _row(engine, "print_archives", 197)
+    archive = await _row(engine, "print_archives", 197)
     assert (archive.status, archive.completed_at) == ("completed", T0)
-    entry = _row(engine, "print_log_entries", 597)
+    entry = await _row(engine, "print_log_entries", 597)
     # No donor charge on printer 14: a completed run falls back to the archive's figure.
     assert (entry.status, entry.completed_at, entry.filament_used_grams) == ("completed", T0, 120.0)
-    assert _row(engine, "spool_usage_history", 699) is None
-    assert _row(engine, "spool", 312).weight_used == pytest.approx(375.0)
+    assert await _row(engine, "spool_usage_history", 699) is None
+    assert (await _row(engine, "spool", 312)).weight_used == pytest.approx(375.0)
 
 
-def test_a_completed_replay_charge_is_reversed_and_the_genuine_one_at_the_terminal_kept(engine: Engine) -> None:
+async def test_a_completed_replay_charge_is_reversed_and_the_genuine_one_at_the_terminal_kept(
+    engine: AsyncEngine,
+) -> None:
     """(n) Both charges say ``completed``. The one written 5 s after the run's terminal is the
     run's own; the one written a day later is the true-status branch charging the print twice."""
-    _seed(engine, _shape_true_status_beside_genuine)
-    plan = _repair(engine)
+    await _seed(engine, _shape_true_status_beside_genuine)
+    plan = await _repair(engine)
 
     assert _ids(plan, frr.ReverseSpoolCharge) == {690}
-    assert _row(engine, "spool_usage_history", 698) is not None, "the genuine charge at the terminal stays"
-    assert _row(engine, "spool_usage_history", 690) is None
-    assert _row(engine, "spool", 313).weight_used == pytest.approx(390.0)
+    assert await _row(engine, "spool_usage_history", 698) is not None, "the genuine charge at the terminal stays"
+    assert await _row(engine, "spool_usage_history", 690) is None
+    assert (await _row(engine, "spool", 313)).weight_used == pytest.approx(390.0)
     assert _ids(plan, frr.DropPrintLogEntry) == {598}, "a second completed row would count the plate twice"
-    assert _row(engine, "print_log_entries", 599).completed_at == T0, "the run's own row is untouched"
+    assert (await _row(engine, "print_log_entries", 599)).completed_at == T0, "the run's own row is untouched"
     assert _ids(plan, frr.RestoreArchiveOutcome) == set(), "a completed archive is not a replay's word"
 
 
-def test_a_completed_replay_row_that_is_the_runs_only_record_is_restated(engine: Engine) -> None:
+async def test_a_completed_replay_row_that_is_the_runs_only_record_is_restated(engine: AsyncEngine) -> None:
     """(o) Same status before and after; the time, duration and grams become the run's own."""
-    _seed(engine, _shape_true_status_after_archiveless_terminal)
-    plan = _repair(engine)
+    await _seed(engine, _shape_true_status_after_archiveless_terminal)
+    plan = await _repair(engine)
 
     rewrite = next(a for a in plan.actions if isinstance(a, frr.RewritePrintLogEntry))
     assert rewrite.before.status == rewrite.after.status == "completed"
-    entry = _row(engine, "print_log_entries", 590)
+    entry = await _row(engine, "print_log_entries", 590)
     assert (entry.completed_at, entry.duration_seconds) == (T0, 4 * 3600)
     assert (entry.filament_used_grams, entry.cost) == (118.0, 2.9), "the real terminal's donor charge"
     assert _ids(plan, frr.ReverseSpoolCharge) == {691}
-    assert _row(engine, "spool", 314).weight_used == pytest.approx(205.0)
-    assert _row(engine, "spool_usage_history", 9002) is not None, "the real completion's donor charge stays"
-    assert _plan(engine).actions == (), "the restated row now reads as the run's record: no second rewrite"
+    assert (await _row(engine, "spool", 314)).weight_used == pytest.approx(205.0)
+    assert await _row(engine, "spool_usage_history", 9002) is not None, "the real completion's donor charge stays"
+    assert (await _plan(engine)).actions == (), "the restated row now reads as the run's record: no second rewrite"
 
 
-def test_a_second_plan_after_apply_has_no_actions(engine: Engine) -> None:
+async def test_a_second_plan_after_apply_has_no_actions(engine: AsyncEngine) -> None:
     """(h) Every shape at once; then the repair has nothing left to do, and skips stay skips."""
-    _seed(engine, *ALL_SHAPES)
-    first = _repair(engine)
+    await _seed(engine, *ALL_SHAPES)
+    first = await _repair(engine)
     assert len(first.actions) > 0
-    second = _plan(engine)
+    second = await _plan(engine)
     assert second.actions == ()
     assert second.skips == first.skips
 
 
-def test_apply_refuses_a_database_that_moved_since_the_plan(engine: Engine) -> None:
+async def test_apply_refuses_a_database_that_moved_since_the_plan(engine: AsyncEngine) -> None:
     """Apply is guarded on the plan's pre-image; the caller's transaction discards everything."""
-    _seed(engine, _shape_leaked)
-    plan = _plan(engine)
+    await _seed(engine, _shape_leaked)
+    plan = await _plan(engine)
     spool = Base.metadata.tables["spool"]
-    with engine.begin() as conn:
-        conn.execute(update(spool).where(spool.c.id == 301).values(weight_used=700.0))
+    async with engine.begin() as conn:
+        await conn.execute(update(spool).where(spool.c.id == 301).values(weight_used=700.0))
 
-    with pytest.raises(frr.RepairDrift, match="UPDATE spool hit 0 rows"), engine.begin() as conn:
-        frr.apply_foreign_replay_repair(conn, plan)
+    with pytest.raises(frr.RepairDrift, match="UPDATE spool hit 0 rows"):
+        async with engine.begin() as conn:
+            await conn.run_sync(frr.apply_foreign_replay_repair, plan)
 
-    assert _row(engine, "print_archives", 101).status == "cancelled", "the archive restore rolled back with it"
-    assert _row(engine, "spool_usage_history", 601) is not None
+    assert (await _row(engine, "print_archives", 101)).status == "cancelled", "the archive restore rolled back with it"
+    assert await _row(engine, "spool_usage_history", 601) is not None
 
 
-def test_two_reversals_on_one_spool_chain_their_guards(engine: Engine) -> None:
+async def test_two_reversals_on_one_spool_chain_their_guards(engine: AsyncEngine) -> None:
     """The second reversal's pre-image is the first one's after, and the floor is zero."""
-    _seed(engine, _shape_leaked)
+    await _seed(engine, _shape_leaked)
     extra = _Seed()
     extra.charge(602, 301, 101, 1, grams=700.0, status="aborted", created_at=T0 + 3 * D)
-    with engine.begin() as conn:
-        extra.write(conn)
-    plan = _repair(engine)
+    async with engine.begin() as conn:
+        await extra.write(conn)
+    plan = await _repair(engine)
 
     reversals = [a for a in plan.actions if isinstance(a, frr.ReverseSpoolCharge)]
     assert [(r.spool_weight_used_before, r.spool_weight_used_after) for r in reversals] == [
         (673.0, 618.0),
         (618.0, 0.0),
     ]
-    assert _row(engine, "spool", 301).weight_used == 0.0
+    assert (await _row(engine, "spool", 301)).weight_used == 0.0
 
 
 @pytest.mark.parametrize(
@@ -989,24 +989,24 @@ def test_two_reversals_on_one_spool_chain_their_guards(engine: Engine) -> None:
     ],
     ids=["reset-after-phantom", "reset-before-phantom", "never-reset", "floored"],
 )
-def test_a_reversal_below_the_usage_baseline_lowers_the_baseline_with_it(
-    engine: Engine, weight_before: float, baseline_before: float, weight_after: float, baseline_after: float
+async def test_a_reversal_below_the_usage_baseline_lowers_the_baseline_with_it(
+    engine: AsyncEngine, weight_before: float, baseline_before: float, weight_after: float, baseline_after: float
 ) -> None:
     """Consumption since an operator's reset cannot be negative, so a reset that would read
     negative after the reversal anchored the phantom, and gives its grams back too."""
-    _seed(engine, _shape_leaked)
+    await _seed(engine, _shape_leaked)
     spool = Base.metadata.tables["spool"]
-    with engine.begin() as conn:
-        conn.execute(
+    async with engine.begin() as conn:
+        await conn.execute(
             update(spool)
             .where(spool.c.id == 301)
             .values(weight_used=weight_before, weight_used_baseline=baseline_before)
         )
-    plan = _repair(engine)
+    plan = await _repair(engine)
 
     reversal = next(a for a in plan.actions if isinstance(a, frr.ReverseSpoolCharge))
     assert (reversal.baseline_before, reversal.baseline_after) == (baseline_before, baseline_after)
-    row = _row(engine, "spool", 301)
+    row = await _row(engine, "spool", 301)
     assert (row.weight_used, row.weight_used_baseline) == (pytest.approx(weight_after), pytest.approx(baseline_after))
     assert row.weight_used >= row.weight_used_baseline, "Total Consumed never reads negative"
     expected = (
@@ -1017,23 +1017,24 @@ def test_a_reversal_below_the_usage_baseline_lowers_the_baseline_with_it(
     assert expected in frr.describe(reversal)
 
 
-def test_apply_is_guarded_on_the_baseline_pre_image_too(engine: Engine) -> None:
+async def test_apply_is_guarded_on_the_baseline_pre_image_too(engine: AsyncEngine) -> None:
     """An operator resetting Total Consumed between plan and apply moves the pre-image."""
-    _seed(engine, _shape_leaked)
-    plan = _plan(engine)
+    await _seed(engine, _shape_leaked)
+    plan = await _plan(engine)
     spool = Base.metadata.tables["spool"]
-    with engine.begin() as conn:
-        conn.execute(update(spool).where(spool.c.id == 301).values(weight_used_baseline=673.0))
+    async with engine.begin() as conn:
+        await conn.execute(update(spool).where(spool.c.id == 301).values(weight_used_baseline=673.0))
 
-    with pytest.raises(frr.RepairDrift, match="UPDATE spool hit 0 rows"), engine.begin() as conn:
-        frr.apply_foreign_replay_repair(conn, plan)
+    with pytest.raises(frr.RepairDrift, match="UPDATE spool hit 0 rows"):
+        async with engine.begin() as conn:
+            await conn.run_sync(frr.apply_foreign_replay_repair, plan)
 
-    assert _row(engine, "spool", 301).weight_used == pytest.approx(673.0)
+    assert (await _row(engine, "spool", 301)).weight_used == pytest.approx(673.0)
 
 
-def test_the_report_is_ascii_and_carries_every_action_and_skip(engine: Engine) -> None:
-    _seed(engine, *ALL_SHAPES)
-    plan = _plan(engine)
+async def test_the_report_is_ascii_and_carries_every_action_and_skip(engine: AsyncEngine) -> None:
+    await _seed(engine, *ALL_SHAPES)
+    plan = await _plan(engine)
     report = frr.format_report(plan)
 
     assert report.isascii()
@@ -1045,12 +1046,6 @@ def test_the_report_is_ascii_and_carries_every_action_and_skip(engine: Engine) -
 
 
 # --- the migration: ONE savepoint with the marker ---------------------------------------------------------
-
-
-async def _async_row(engine: AsyncEngine, table: str, row_id: int) -> Row | None:
-    tab = Base.metadata.tables[table]
-    async with engine.connect() as conn:
-        return (await conn.execute(select(tab).where(tab.c.id == row_id))).one_or_none()
 
 
 async def _marker_count(engine: AsyncEngine) -> int:
@@ -1088,9 +1083,8 @@ async def test_the_migration_rolls_back_whole_then_applies_once(
         _shape_leaked(seed)
         async with engine.begin() as conn:
             await conn.execute(delete(settings).where(settings.c.key == _MARKER))
-            await seed.write_async(conn)
-        async with engine.connect() as conn:
-            expected = await conn.run_sync(lambda sync_conn: frr.plan_foreign_replay_repair(sync_conn, now=NOW))
+            await seed.write(conn)
+        expected = await _plan(engine)
         assert len(expected.actions) == 3
 
         real_apply = frr.apply_foreign_replay_repair
@@ -1107,19 +1101,19 @@ async def test_the_migration_rolls_back_whole_then_applies_once(
             "a rolled-back boot must not read as a repaired one"
         )
         assert await _marker_count(engine) == 0
-        assert (await _async_row(engine, "print_archives", 101)).status == "cancelled"
-        assert (await _async_row(engine, "print_log_entries", 501)).status == "cancelled"
-        assert await _async_row(engine, "spool_usage_history", 601) is not None
-        assert (await _async_row(engine, "spool", 301)).weight_used == pytest.approx(673.0)
+        assert (await _row(engine, "print_archives", 101)).status == "cancelled"
+        assert (await _row(engine, "print_log_entries", 501)).status == "cancelled"
+        assert await _row(engine, "spool_usage_history", 601) is not None
+        assert (await _row(engine, "spool", 301)).weight_used == pytest.approx(673.0)
 
         monkeypatch.setattr(frr, "apply_foreign_replay_repair", real_apply)
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             await _migrate(engine)
         assert await _marker_count(engine) == 1
-        assert (await _async_row(engine, "print_archives", 101)).status == "completed"
-        assert await _async_row(engine, "spool_usage_history", 601) is None
-        assert (await _async_row(engine, "spool", 301)).weight_used == pytest.approx(618.0)
+        assert (await _row(engine, "print_archives", 101)).status == "completed"
+        assert await _row(engine, "spool_usage_history", 601) is None
+        assert (await _row(engine, "spool", 301)).weight_used == pytest.approx(618.0)
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         for action in expected.actions:
             assert f"[REPAIR] {_MARKER}: {frr.describe(action)}" in warnings, "the per-row log is the report's body"
@@ -1135,21 +1129,27 @@ async def test_the_migration_rolls_back_whole_then_applies_once(
 # --- the report runner: the live file is never written ------------------------------------------------------
 
 
-def _live_db(tmp_path: Path, *ddl: str) -> Path:
-    """A 'live' database file holding shape (a), plus any extra DDL, closed before the run."""
+async def _live_db(tmp_path: Path, *ddl: str) -> Path:
+    """A 'live' database FILE holding shape (a), plus any extra DDL, closed before the run.
+
+    The runner reads a file through the backup API, so the fixture's in-memory schema is seeded and
+    then written out whole with ``VACUUM INTO``: a standalone file, no journal left beside it, and
+    no second schema build."""
     live = tmp_path / "live"
     live.mkdir()
     db_path = live / "bambuddy.db"
-    import_all_models()
-    seed_engine = create_engine(f"sqlite:///{db_path.as_posix()}")
-    Base.metadata.create_all(seed_engine)
     seed = _Seed()
     _shape_leaked(seed)
-    with seed_engine.begin() as conn:
-        seed.write(conn)
-        for statement in ddl:
-            conn.exec_driver_sql(statement)
-    seed_engine.dispose()
+    engine = await create_memory_engine()
+    try:
+        async with engine.begin() as conn:
+            await seed.write(conn)
+            for statement in ddl:
+                await conn.exec_driver_sql(statement)
+        async with engine.connect() as conn:
+            await conn.exec_driver_sql("VACUUM INTO ?", (str(db_path),))
+    finally:
+        await engine.dispose()
     return db_path
 
 
@@ -1176,9 +1176,9 @@ def _assert_source_untouched_and_copy_gone(tmp_path: Path, db_path: Path, before
     assert list((tmp_path / "scratch").iterdir()) == [], "the temporary copy is deleted"
 
 
-def test_the_report_runner_reads_a_copy_and_leaves_the_source_untouched(tmp_path: Path) -> None:
+async def test_the_report_runner_reads_a_copy_and_leaves_the_source_untouched(tmp_path: Path) -> None:
     """(j) The plain report, then the rehearsal: neither writes the source, both delete the copy."""
-    db_path = _live_db(tmp_path)
+    db_path = await _live_db(tmp_path)
     before = (db_path.read_bytes(), db_path.stat().st_mtime_ns)
 
     report = _run_report(tmp_path, db_path)
@@ -1194,9 +1194,9 @@ def test_the_report_runner_reads_a_copy_and_leaves_the_source_untouched(tmp_path
     _assert_source_untouched_and_copy_gone(tmp_path, db_path, before)
 
 
-def test_a_failing_rehearsal_exits_non_zero_and_still_leaves_the_source_untouched(tmp_path: Path) -> None:
+async def test_a_failing_rehearsal_exits_non_zero_and_still_leaves_the_source_untouched(tmp_path: Path) -> None:
     """A write the real rows refuse (here, a trigger) is what the rehearsal exists to surface."""
-    db_path = _live_db(
+    db_path = await _live_db(
         tmp_path,
         "CREATE TRIGGER refuse_spool_update BEFORE UPDATE ON spool BEGIN SELECT RAISE(ABORT, 'refused'); END",
     )

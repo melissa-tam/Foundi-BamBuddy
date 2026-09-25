@@ -509,21 +509,30 @@ class TestOneLivePrintPerPrinter:
         """The id-reuse retrofit DROPs and recreates ``print_archives``; the partial index is
         captured from ``sqlite_master`` with its WHERE clause, replayed, and still enforces."""
         from sqlalchemy import text
-        from sqlalchemy.ext.asyncio import create_async_engine
 
         from backend.app.core.database import Base, _rebuild_table_with_autoincrement
-        from backend.tests._fixtures.db import MEMORY_DATABASE_URL, import_all_models
+        from backend.tests._fixtures.db import create_memory_engine
 
-        import_all_models()
         table = Base.metadata.tables["print_archives"]
-        engine = create_async_engine(MEMORY_DATABASE_URL)
-        table.dialect_options["sqlite"]["autoincrement"] = False
+        engine = await create_memory_engine()
         try:
             async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-        finally:
-            table.dialect_options["sqlite"]["autoincrement"] = True
-        try:
+                # ``create_all`` gives a fresh install the flag; an install from before the retrofit has
+                # the same table and indexes without it. Rebuild it that way from its own live DDL.
+                ddl = (
+                    await conn.exec_driver_sql(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'print_archives'"
+                    )
+                ).scalar()
+                indexes = await conn.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'print_archives' "
+                    "AND sql IS NOT NULL"
+                )
+                index_ddl = indexes.scalars().all()
+                await conn.exec_driver_sql("DROP TABLE print_archives")
+                await conn.exec_driver_sql(ddl.replace(" AUTOINCREMENT", ""))
+                for statement in index_ddl:
+                    await conn.exec_driver_sql(statement)
             async with engine.begin() as conn:
                 before = (
                     await conn.execute(text("SELECT sql FROM sqlite_master WHERE name = 'print_archives'"))
