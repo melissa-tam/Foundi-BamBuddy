@@ -80,6 +80,7 @@ def _snap(
     sub: int | None = 0,
     tray_tar: int | None = None,
     epoch: int = 1,
+    fresh: bool = True,
 ) -> AmsWireSnapshot:
     return AmsWireSnapshot(
         tray_now=tray_now,
@@ -87,6 +88,7 @@ def _snap(
         ams_status_sub=sub,
         tray_tar=tray_tar,
         connection_epoch=epoch,
+        fresh=fresh,
         taken_at=0.0,
     )
 
@@ -179,6 +181,23 @@ class TestSnapshot:
         snap = snapshot(SimpleNamespace(state="PAUSE"))
 
         assert snap.tray_now is None and snap.ams_status_main is None and snap.connection_epoch is None
+        assert snap.fresh is False
+
+    @pytest.mark.parametrize(
+        "connected, report_epoch, fresh",
+        [
+            pytest.param(True, 4, True, id="the_current_sessions_report_applied"),
+            pytest.param(True, None, False, id="a_new_session_before_its_first_report"),
+            pytest.param(True, 3, False, id="the_previous_sessions_report"),
+            pytest.param(False, 4, False, id="a_dropped_session"),
+        ],
+    )
+    def test_fresh_is_the_one_freshness_question(self, connected: bool, report_epoch: int | None, fresh: bool) -> None:
+        """``print_reconcile.is_fresh`` — connected, and THIS session's report applied."""
+        state = PrinterState(connected=connected, connection_epoch=4, report_epoch=report_epoch)
+
+        assert snapshot(state).fresh is fresh
+        assert snapshot(None).fresh is False
 
 
 # --- the classifier table ------------------------------------------------------------------
@@ -222,20 +241,117 @@ _ENTRY: dict[Posture, AmsWireSnapshot] = {
 }
 
 
+def _new_session(entry: AmsWireSnapshot, *, fresh: bool, **fields: int | None) -> AmsWireSnapshot:
+    """A reading on the session AFTER the entry's: ``fresh`` False is the new session's
+    cache (the old session's fields, before its first report lands)."""
+    return replace(entry, connection_epoch=(entry.connection_epoch or 0) + 1, fresh=fresh, **fields)
+
+
 class TestSessionChanged:
+    """A command read on a NEWER session (F4, 2026-09-25). It used to answer
+    ``session_changed`` at once in every row — so a load that completed across a reconnect
+    read as unknowable, and the recovery driver aborted on it. Now the new session is
+    waited out to its first FRESH report and the command is answered by its motion
+    (:data:`ams_command._ACROSS_ROWS`)."""
+
+    def test_the_cross_session_table_spells_out_every_command_posture_pair(self) -> None:
+        assert set(ams_command._ACROSS_ROWS) == set(itertools.product(get_args(Command), get_args(Posture)))
+
+    def test_a_missing_cross_session_row_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delitem(ams_command._ACROSS_ROWS, ("load", "idle"))
+        entry = _ENTRY["idle"]
+
+        with pytest.raises(LookupError, match=r"no cross-session row for \(command='load', posture='idle'\)"):
+            _run("load", 5, entry, [(1.0, _new_session(entry, fresh=True))])
+
     @pytest.mark.parametrize("command, entry_posture", sorted(ams_command._ROWS))
-    def test_a_new_session_answers_first_in_every_row(self, command: Command, entry_posture: Posture) -> None:
-        """Checked before the row: even a reading that would be ``complete`` (a load's
-        tray_now on target) is not an answer when the session it was sent on is gone."""
+    def test_a_new_session_that_is_not_fresh_is_waited_out_then_session_changed_at_the_deadline(
+        self, command: Command, entry_posture: Posture
+    ) -> None:
+        """The new session's fields are the old session's cache — even a reading that
+        WOULD be ``complete`` (a load's tray_now on target) answers nothing yet."""
         entry = _ENTRY[entry_posture]
-        on_new_session = replace(entry, tray_now=5, ams_status_main=0, connection_epoch=entry.connection_epoch + 1)
+        cached = _new_session(entry, fresh=False, tray_now=5, ams_status_main=0)
 
-        assert _run(command, 5, entry, [(0.5, on_new_session)]) == ("session_changed", 0.5)
+        assert _run(command, 5, entry, [(0.5, cached), (_DRIVER_DEADLINE_S - 0.1, cached)]) == (None, None)
+        assert _run(command, 5, entry, [(0.5, cached), (_DRIVER_DEADLINE_S, cached)]) == (
+            "session_changed",
+            _DRIVER_DEADLINE_S,
+        )
 
-    def test_a_lost_state_is_a_session_change(self) -> None:
+    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other", "mid_change_loaded", "mid_change_empty"])
+    def test_a_load_whose_feeder_reads_the_target_on_the_first_fresh_report_is_complete(
+        self, entry_posture: Posture
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+
+        assert _run("load", 5, entry, [(0.5, _new_session(entry, fresh=True, tray_now=5))]) == ("complete", 0.5)
+
+    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other", "mid_change_loaded"])
+    def test_an_unload_whose_ams_reads_idle_and_empty_on_the_first_fresh_report_is_complete(
+        self, entry_posture: Posture
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+        now = _new_session(entry, fresh=True, tray_now=255, ams_status_main=0)
+
+        assert _run("unload", None, entry, [(0.5, now)]) == ("complete", 0.5)
+
+    def test_an_unload_sent_with_nothing_loaded_stays_undecidable_on_any_session(self) -> None:
+        """No filament was at the feeder for it to move: an idle, empty AMS afterwards is
+        not its answer."""
+        entry = _ENTRY["mid_change_empty"]
+        now = _new_session(entry, fresh=True, tray_now=255, ams_status_main=0)
+
+        assert _run("unload", None, entry, [(0.5, now)]) == ("undecidable", 0.5)
+
+    def test_a_mid_change_empty_reading_is_not_an_unloads_completion_across_a_reconnect(self) -> None:
+        """Idle AND empty is the strict reading: a 255 inside the change the AMS still
+        owes is motion (``acted``), never proof across a gap nobody watched."""
+        entry = _ENTRY["mid_change_loaded"]
+        now = _new_session(entry, fresh=True, tray_now=255)
+
+        assert _run("unload", None, entry, [(0.5, now)]) == ("acted", 0.5)
+
+    @pytest.mark.parametrize("command", ["load", "unload"])
+    def test_a_moved_field_short_of_completion_is_acted(self, command: Command) -> None:
+        entry = _ENTRY["idle"]
+        now = _new_session(entry, fresh=True, ams_status_sub=4)
+
+        assert _run(command, 5, entry, [(0.5, now)]) == ("acted", 0.5)
+
+    def test_motion_seen_on_the_old_session_still_counts_after_the_reconnect(self) -> None:
+        entry = _ENTRY["idle"]
+        polls = [(0.5, replace(entry, ams_status_sub=4)), (1.0, _new_session(entry, fresh=True))]
+
+        assert _run("load", 5, entry, polls) == ("acted", 1.0)
+
+    @pytest.mark.parametrize("command", ["load", "unload"])
+    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other", "mid_change_loaded"])
+    def test_nothing_moved_is_session_changed_the_honest_cannot_tell(
+        self, command: Command, entry_posture: Posture
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+
+        assert _run(command, 5, entry, [(0.5, _new_session(entry, fresh=True))]) == ("session_changed", 0.5)
+
+    @pytest.mark.parametrize("command", ["load", "unload"])
+    def test_an_acknowledged_unmoved_command_is_never_held_across_a_reconnect(self, command: Command) -> None:
+        """The ACK was read on the session that is gone: held is a same-session answer."""
+        entry = _ENTRY["mid_change_loaded"]
+        polls = [(UNLOAD_GRACE_S + 1.0, _new_session(entry, fresh=True))]
+
+        assert _run(command, 5, entry, polls, ack=_ack("success")) == ("session_changed", UNLOAD_GRACE_S + 1.0)
+
+    def test_a_lost_state_is_not_evidence_and_reads_session_changed_at_the_deadline(self) -> None:
+        """No state at all (``snapshot(None)``: no epoch, not fresh) used to answer
+        ``session_changed`` on the spot; it is waited out like any new session's cache."""
         entry = _ENTRY["mid_change_loaded"]
 
-        assert _run("unload", None, entry, [(1.0, snapshot(None))]) == ("session_changed", 1.0)
+        assert _run("unload", None, entry, [(1.0, snapshot(None))]) == (None, None)
+        assert _run("unload", None, entry, [(1.0, snapshot(None)), (_DRIVER_DEADLINE_S, snapshot(None))]) == (
+            "session_changed",
+            _DRIVER_DEADLINE_S,
+        )
 
 
 class TestUnloadOutsideAChange:
@@ -1060,17 +1176,48 @@ class TestCommandForOperator:
 
     @pytest.mark.parametrize("command, tray_id", [("load", 5), ("unload", None)])
     async def test_a_reconnect_during_the_command_is_session_changed(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], command: Command, tray_id: int | None
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        call_log: list[str],
+        short_ack: float,
+        command: Command,
+        tray_id: int | None,
     ) -> None:
+        """The operator's window is short (:data:`OPERATOR_ACK_S`): a new session whose
+        first report has not landed by its end reads ``session_changed`` — the toast copy
+        stands. (Since F4 the classifier waits the cache out instead of answering at once,
+        so the window is shortened here like every "nothing happened" case.)"""
         state = _state(connection_epoch=3)
 
         def reconnects(tray: int | None) -> None:
             state.connection_epoch = 4
+            state.report_epoch = None  # _on_connect: the new session's report has not landed
 
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=reconnects), state=state))
 
         assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult(
             "session_changed", "Printer reconnected during the command. Check the AMS."
+        )
+
+    def test_the_operator_window_is_five_seconds(self) -> None:
+        assert ams_command.OPERATOR_ACK_S == 5.0
+
+    async def test_a_reconnect_whose_first_report_lands_inside_the_window_answers_from_motion(
+        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float
+    ) -> None:
+        """The session changed under the click, and the new session's first FRESH report —
+        inside the window — shows the load on its tray: ``complete``, not a reconnect toast."""
+        state = _state(connection_epoch=3)
+
+        def reconnects_loaded(tray: int | None) -> None:
+            state.connection_epoch = 4
+            state.tray_now = tray
+            state.report_epoch = 4  # the new session's first report, applied
+
+        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=reconnects_loaded), state=state))
+
+        assert await command_for_operator(_PID, "load", 5) == AmsCommandResult(
+            "complete", "Loading filament from AMS 1 slot 2"
         )
 
     async def test_a_load_without_a_tray_is_a_programming_error(self) -> None:

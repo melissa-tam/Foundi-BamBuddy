@@ -175,6 +175,14 @@ async def _grace_seconds(db: AsyncSession, key: str, default: int) -> float:
     return max(1, minutes) * 60.0
 
 
+async def offline_stall_seconds(db: AsyncSession) -> float:
+    """How long a printer may stay off its session before the farm stops waiting for it —
+    THE reading of ``farm_offline_stall_minutes``. Two readers: this module's stall watch
+    flags a printing unit past it, and a recovery driver waiting out a session gap gives up
+    past it (``spool_recovery.RecoverySettings.offline_bound_s``)."""
+    return await _grace_seconds(db, "farm_offline_stall_minutes", _DEFAULT_GRACE_MINUTES)
+
+
 async def _notify_run_changed(db: AsyncSession, item: PrintQueueItem) -> None:
     """Fire ``production_run_changed`` when the flagged item belongs to a farm run.
 
@@ -225,7 +233,7 @@ async def check_stalled_prints(db: AsyncSession, *, manager=printer_manager, now
     Never writes a terminal status. Injectable ``manager``/``now`` for tests.
     """
     now = time.time() if now is None else now
-    grace_s = await _grace_seconds(db, "farm_offline_stall_minutes", _DEFAULT_GRACE_MINUTES)
+    grace_s = await offline_stall_seconds(db)
 
     result = await db.execute(
         select(PrintQueueItem).where(PrintQueueItem.status == "printing").where(PrintQueueItem.printer_id.is_not(None))

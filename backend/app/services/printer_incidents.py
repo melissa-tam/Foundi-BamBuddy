@@ -1175,6 +1175,14 @@ def outcome_of(incident: PrinterIncident) -> str:
     Everything else that closed unpaged closed on evidence nobody produced (a wire
     edge, a job ending, a restart) and is counted honestly as neither.
 
+    An ABORTED row that names its source is ``taken_over`` whatever the source: the
+    driver stood aside because another actor holds the printer — ``operator`` (a human
+    took it mid-procedure) and ``paused_elsewhere`` (the print was PAUSEd on a quiet path
+    after the driver's own swap resume ran, by an actor the wire does not name) alike. One
+    rule for every sourced abort, so a new stand-aside token lands in the bucket by
+    construction; only a source-less abort (the fault never held the printer) is
+    ``transient``.
+
     The ``plate_vision`` / ``terminal`` arm is a RENDERER OF HISTORY only (2026-09-24):
     it buckets the rows the retired 2026-09-04 lane closed at the terminal of its own
     stop. No writer produces that shape any more — a plate-check hold opens ESCALATED, so

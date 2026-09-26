@@ -1203,6 +1203,28 @@ class TestOutcomeDerivation:
         assert printer_incidents.outcome_of(self._row(status=STATUS_ABORTED, source=RESOLVE_OPERATOR)) == "taken_over"
         assert printer_incidents.outcome_of(self._row(status=STATUS_ABORTED, source=None)) == "transient"
 
+    def test_another_actors_pause_is_taken_over_and_fits_its_column(self):
+        """``paused_elsewhere`` (F5, 2026-09-25): the recovery driver stood aside from a
+        quiet PAUSE after its own swap resume ran. The printer was taken over — by an actor
+        the wire does not name — so the row is ``taken_over``, never ``transient`` (it held
+        the printer) and never a recovery."""
+        from backend.app.models.printer_incident import RESOLVE_PAUSED_ELSEWHERE
+
+        column = PrinterIncident.__table__.c.resolve_source
+
+        assert RESOLVE_PAUSED_ELSEWHERE == "paused_elsewhere"
+        assert len(RESOLVE_PAUSED_ELSEWHERE) <= column.type.length
+        assert (
+            printer_incidents.outcome_of(self._row(status=STATUS_ABORTED, source=RESOLVE_PAUSED_ELSEWHERE))
+            == "taken_over"
+        )
+        assert (
+            printer_incidents.outcome_of(
+                self._row(status=STATUS_ABORTED, escalated=True, source=RESOLVE_PAUSED_ELSEWHERE)
+            )
+            == "taken_over"
+        )
+
     def test_every_token_lands_in_exactly_one_bucket(self):
         import backend.app.models.printer_incident as model
 
