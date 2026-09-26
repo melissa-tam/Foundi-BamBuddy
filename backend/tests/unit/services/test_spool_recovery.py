@@ -555,6 +555,30 @@ def _after_running(client, polls=2):
     return _trigger
 
 
+async def _cancel_once_parked(task, client, polls):
+    """Cancel a driver only once it is parked in its unload confirm poll — awaiting
+    ``asyncio.sleep`` and nothing else — then reap it.
+
+    A cancel that lands inside one of the driver's DB statements leaves that pooled
+    connection's read unfinished, and the NEXT test's table truncate then waits out
+    SQLite's busy timeout ("database is locked" at its setup). Measured 2026-09-25: 7 of 7
+    failures were a cancel inside ``_stamp_recovering``'s ``db.get`` mid ``Cursor.execute``,
+    exposed when the driver's evidence read moved to its start. ``polls`` is ``_wire``'s
+    counter: the test runs only while the driver is suspended, and every confirm-loop poll
+    after the unload's step is noted is followed by the loop's sleep, so two polls past the
+    unload means the driver is in that sleep."""
+    while ("unload",) not in client.calls:
+        await asyncio.sleep(0.005)
+    parked_at = polls["n"] + 2
+    while polls["n"] < parked_at:
+        await asyncio.sleep(0.005)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 def _spy(monkeypatch, name):
     from backend.app.services.notification_service import notification_service
 
@@ -884,17 +908,13 @@ async def test_dedup_blocks_while_incident_active(db_session, printer_factory, i
     # Unload never confirms (tray_now never reaches 255) → task1 stays busy in the
     # confirm loop, so the incident is genuinely ACTIVE when the duplicate arrives.
     client = FakeClient(state, unload_after=9999)
-    _wire(monkeypatch, state, client)
+    polls = _wire(monkeypatch, state, client)
 
     task1 = await on_ams_fault(printer.id, state)
     assert task1 is not None
     task2 = await on_ams_fault(printer.id, state)
     assert task2 is None  # dedup: same incident still live
-    task1.cancel()
-    try:
-        await task1
-    except asyncio.CancelledError:
-        pass
+    await _cancel_once_parked(task1, client, polls)
 
 
 async def test_success_rearms_same_code(db_session, printer_factory, install_settings, monkeypatch):
@@ -4042,7 +4062,7 @@ async def test_the_recovering_projection_is_farm_only(
     item = await _farm_item(db_session, printer.id) if origin == "farm" else None
     state = _make_state(subtask="task-1" if origin == "farm" else "screen-start")
     client = FakeClient(state, unload_after=9999)  # park the driver inside the confirm
-    _wire(monkeypatch, state, client)
+    polls = _wire(monkeypatch, state, client)
 
     task = await on_ams_fault(printer.id, state)
     assert task is not None
@@ -4054,11 +4074,7 @@ async def test_the_recovering_projection_is_farm_only(
     else:
         assert (await db_session.execute(select(PrintQueueItem))).scalars().all() == []
 
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    await _cancel_once_parked(task, client, polls)
 
 
 async def test_a_foreign_jam_with_no_derivable_feeder_still_escalates(
