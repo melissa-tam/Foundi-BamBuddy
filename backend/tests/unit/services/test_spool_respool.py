@@ -2294,7 +2294,9 @@ async def _runout_incident(db, printer_id, *, external):
         codes=frozenset({"07FF_8011" if external else "0700_8011"}),
         fingerprint="runout",
         item_id=None,
-        settings=spool_recovery.RecoverySettings(enabled=True, max_attempts=2, step_timeout_s=0.05, protect_layers=7),
+        settings=spool_recovery.RecoverySettings(
+            enabled=True, max_attempts=2, step_timeout_s=0.05, protect_layers=7, offline_bound_s=60.0
+        ),
         jammed_global_tray=254 if external else 0,
         kind=spool_recovery.KIND_RUNOUT,
         external=external,

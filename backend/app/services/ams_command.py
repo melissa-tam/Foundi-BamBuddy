@@ -62,6 +62,23 @@ The table rule
 missing key RAISES (``LookupError``) — the ``incident_resolution`` rule-table pattern:
 a new command or posture must be given its own row, never inherit another row's
 evidence from an ``else`` nobody considered it for.
+
+A command whose session ended under it
+--------------------------------------
+A reconnect does not answer a command, and it does not un-ask it either: the AMS kept
+doing (or not doing) what it was told while the farm could not see it. So a reading on a
+NEWER session (``connection_epoch`` moved) is waited out until that session's first
+fresh report (``AmsWireSnapshot.fresh`` — ``print_reconcile.is_fresh``, the one spelling),
+and then the command is answered by its MOTION alone, through the second table
+:data:`_ACROSS_ROWS` (same key, same no-default rule): a load whose feeder reads the
+commanded tray, an unload whose AMS reads idle with nothing fed → ``complete``; an unload
+sent with nothing loaded into a change → ``undecidable`` (nothing physical can answer it,
+on any session); otherwise a moved field → ``acted``, and nothing moved →
+``session_changed``, the honest "nobody can tell whether it ran". Never ``held``: the ACK
+was read on the session that is gone. A new session that is not fresh by the caller's
+deadline is ``session_changed`` too — the operator's short window (:data:`OPERATOR_ACK_S`)
+reads a gap that way, while the recovery driver keeps a gap out of its window altogether
+(``spool_recovery._live_reading``).
 """
 
 from __future__ import annotations
@@ -74,7 +91,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from backend.app.schemas.printer import AmsCommandOutcome
-from backend.app.services import spool_respool
+from backend.app.services import print_reconcile, spool_respool
 from backend.app.services.bambu_mqtt import (
     AMS_STATUS_ASSIST,
     AMS_STATUS_IDLE,
@@ -138,15 +155,27 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+def clock() -> float:
+    """The clock every :class:`AmsWireSnapshot` is stamped on (``taken_at``).
+
+    Public for a caller that must measure its own time on the SAME timeline as the
+    ``elapsed_s`` it hands :func:`classify` — the recovery driver keeping a session gap
+    out of a command's window (``spool_recovery._observe_command``)."""
+    return _monotonic()
+
+
 # --- the wire snapshot ----------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class AmsWireSnapshot:
-    """The five wire fields a motion command's answer is read from, at one instant.
+    """The wire fields a motion command's answer is read from, at one instant.
 
     Taken BEFORE every send (the entry) and at every poll after it (``now``). ``None``
     means the state did not carry a parseable value — never a stand-in for a reading.
+    ``fresh`` is whether the state describes its CURRENT MQTT session
+    (``print_reconcile.is_fresh`` — the one spelling): what lets :func:`classify` tell a
+    new session's cached, previous-session fields from its first real report.
     ``taken_at`` is :func:`time.monotonic` (via :func:`_monotonic`).
     """
 
@@ -155,18 +184,21 @@ class AmsWireSnapshot:
     ams_status_sub: int | None
     tray_tar: int | None
     connection_epoch: int | None
+    fresh: bool
     taken_at: float
 
 
 def snapshot(state: PrinterState | None) -> AmsWireSnapshot:
     """Read the snapshot off a live ``PrinterState``. Getattr-safe and total: a ``None``
-    state (no status yet) and a state without a field both give ``None`` fields."""
+    state (no status yet) and a state without a field both give ``None`` fields, and
+    neither is fresh."""
     return AmsWireSnapshot(
         tray_now=parse_int_field(getattr(state, "tray_now", None)),
         ams_status_main=parse_int_field(getattr(state, "ams_status_main", None)),
         ams_status_sub=parse_int_field(getattr(state, "ams_status_sub", None)),
         tray_tar=parse_int_field(getattr(state, "tray_tar", None)),
         connection_epoch=parse_int_field(getattr(state, "connection_epoch", None)),
+        fresh=print_reconcile.is_fresh(state),
         taken_at=_monotonic(),
     )
 
@@ -254,7 +286,7 @@ class Observation:
 
 def _moving_fields(snap: AmsWireSnapshot) -> tuple[int | None, int | None, int | None, int | None]:
     """The fields whose change counts as "the AMS moved" (the epoch is not one of them —
-    an epoch change is a different answer, ``session_changed``)."""
+    an epoch change selects the cross-session table, :data:`_ACROSS_ROWS`)."""
     return (snap.tray_now, snap.ams_status_main, snap.ams_status_sub, snap.tray_tar)
 
 
@@ -377,6 +409,88 @@ def _row(command: Command, entry_posture: Posture) -> Row:
         ) from None
 
 
+# --- the cross-session table: a command read on the session AFTER the one it went out on ----
+
+
+def _unload_idle_and_empty(
+    target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
+) -> Answer | None:
+    """An unload read across a reconnect, from ONE fresh snapshot: ``complete`` when the
+    AMS reads idle with nothing fed. No dwell — the dwell of :func:`_unload_settled` guards
+    a reading still inside the change cycle the farm watched, and nothing was watched
+    across the gap; idle AND empty is the strict reading, so a mid-change 255 (the AMS still
+    owing the print's change) is not completion here, whatever it would be on one session."""
+    if now.ams_status_main == AMS_STATUS_IDLE and now.tray_now == TRAY_NOW_NOTHING_FED:
+        return "complete"
+    return None
+
+
+def _unload_nothing_was_loaded(
+    target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
+) -> Answer:
+    """An unload sent into a mid-change AMS with NOTHING loaded (:func:`_unload_mid_change_empty`'s
+    posture), read across a reconnect: ``undecidable`` on any session — no filament was at
+    the feeder for it to move, so no reading of the AMS afterwards is its answer."""
+    return "undecidable"
+
+
+# EXPLICIT, every cell, no default: the lookup RAISES exactly as :data:`_ROWS`' does. Read
+# only on a FRESH snapshot of a newer session; a row's ``None`` falls to the motion rule in
+# :func:`_across_sessions` (moved → ``acted``, nothing moved → ``session_changed``).
+_ACROSS_ROWS: dict[tuple[Command, Posture], Row] = {
+    ("unload", "idle"): _unload_idle_and_empty,
+    ("unload", "assist"): _unload_idle_and_empty,
+    ("unload", "other"): _unload_idle_and_empty,
+    ("unload", "mid_change_loaded"): _unload_idle_and_empty,
+    ("unload", "mid_change_empty"): _unload_nothing_was_loaded,
+    ("load", "idle"): _load_reached_target,
+    ("load", "assist"): _load_reached_target,
+    ("load", "other"): _load_reached_target,
+    ("load", "mid_change_loaded"): _load_reached_target,
+    ("load", "mid_change_empty"): _load_reached_target,
+}
+
+
+def _across_row(command: Command, entry_posture: Posture) -> Row:
+    try:
+        return _ACROSS_ROWS[(command, entry_posture)]
+    except KeyError:
+        raise LookupError(
+            f"ams_command: no cross-session row for (command={command!r}, posture={entry_posture!r}) — "
+            "every (command, posture) pair must be given its own row in _ACROSS_ROWS"
+        ) from None
+
+
+def _across_sessions(
+    command: Command,
+    target: int | None,
+    entry: AmsWireSnapshot,
+    now: AmsWireSnapshot,
+    *,
+    observation: Observation,
+    elapsed_s: float,
+    deadline_s: float,
+) -> Answer | None:
+    """A command whose MQTT session ended under it, read on a newer one.
+
+    Not fresh yet (the new session's fields are the old session's cache until its first
+    report lands, ``PrinterState.report_epoch``) → nothing to read: ``None`` until the
+    deadline, then ``session_changed``. Fresh → the cross-session row for the posture the
+    command was SENT into, and when it has no verdict the motion rule: a field that moved
+    since the entry (on any poll) → ``acted``, nothing moved → ``session_changed``. The ACK
+    is never read here (it belongs to the session that is gone), so ``held`` cannot be
+    answered across a reconnect.
+    """
+    row = _across_row(command, posture(entry))
+    if not now.fresh:
+        return "session_changed" if elapsed_s >= deadline_s else None
+    answer = row(target, now, observation, elapsed_s, deadline_s)
+    if answer is not None:
+        return answer
+    moved = observation.moved or _moving_fields(now) != _moving_fields(entry)
+    return "acted" if moved else "session_changed"
+
+
 def classify(
     command: Command,
     target: int | None,
@@ -404,8 +518,11 @@ def classify(
 
     Order, for every command:
 
-    1. ``now.connection_epoch != entry.connection_epoch`` → ``session_changed`` (the
-       session the command was sent on is gone; nothing read after it answers it).
+    1. ``now.connection_epoch != entry.connection_epoch`` — the session the command was
+       sent on is gone — → :func:`_across_sessions`: ``None`` until the new session's
+       first FRESH report (or ``session_changed`` at the deadline), then the command's
+       MOTION alone through :data:`_ACROSS_ROWS` (``complete`` / ``undecidable``), else
+       ``acted`` on a moved field and ``session_changed`` on none. Never ``held``.
     2. The row for ``(command, posture(entry))`` — a missing row raises ``LookupError``.
        The mid-change rows that can move answer ``held`` early (acknowledged + unmoved,
        :func:`_held_behind_the_change`).
@@ -413,7 +530,9 @@ def classify(
        ``no_movement``.
     """
     if now.connection_epoch != entry.connection_epoch:
-        return "session_changed"
+        return _across_sessions(
+            command, target, entry, now, observation=observation, elapsed_s=elapsed_s, deadline_s=deadline_s
+        )
     row = _row(command, posture(entry))
     observation.fold(entry, now, elapsed_s)
     answer = row(target, now, observation, elapsed_s, deadline_s)

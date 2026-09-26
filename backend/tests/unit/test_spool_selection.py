@@ -237,15 +237,63 @@ class TestMinStartFloor:
         assert out.start_blocked_slots == []
 
 
+# --- REAL-row inventory: ``build_slot_inventory`` over transient ``Spool`` objects, so a
+# pin reads the model's own derivation (``Spool.remaining_g``), never a stub's arithmetic.
+
+
+def _inventory_db(rows):
+    """Stub AsyncSession whose .execute().scalars().all() yields ``rows``."""
+    scalars = MagicMock()
+    scalars.all.return_value = rows
+    result = MagicMock()
+    result.scalars.return_value = scalars
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=result)
+    return db
+
+
+def _internal_mode():
+    return patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False))
+
+
+def _assignment(spool, *, ams_id=0, tray_id=0):
+    return MagicMock(ams_id=ams_id, tray_id=tray_id, spool=spool)
+
+
+def _spool_row(*, weight_used, spent_at=None):
+    return Spool(
+        label_weight=1000,
+        weight_used=weight_used,
+        loaded_at=None,
+        first_loaded_at=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        feed_fault_at=None,
+        spent_at=spent_at,
+        archived_at=None,
+    )
+
+
+# The mid-print replacement floor past the protected layers: OFF. ``spool_recovery``'s
+# ``_match_candidates`` passes the matcher's own "no floor" there (2026-09-25).
+_FLOOR_OFF = 0
+
+
 class TestRowT10SubFloorDonor:
     """§4.1 row T10 — a sub-floor roll left seated as a firmware backup donor: **KEEP**.
 
     The row's verdict is "never pulled, never re-decided", and the two halves of that are
-    owned by different modules. This class pins the SELECTION half: the same 90 g roll is
-    refused by the START lane (``require_known_grams`` on, the full
-    ``min_start_spool_g`` floor) and accepted by the MID-PRINT lane, where
-    ``spool_recovery`` lowers the floor to its hard minimum past the protected layers —
-    a low-but-not-empty roll is a valid replacement, a known-empty one never is.
+    owned by different modules. This class pins the SELECTION half: a sub-floor roll is
+    refused by the START lane (``require_known_grams`` on, the full ``min_start_spool_g``
+    floor) and taken by the MID-PRINT lane past the protected layers, where
+    ``spool_recovery`` turns the floor OFF (``min_start_g=0``).
+
+    The ledger never vetoes a present, not-spent spare: the gram ledger is not exhaustion
+    evidence — ``spent_at`` is (doctrine rule 8). 004-H2S 2026-09-17 (incident 192)
+    refused spool 684 at 1013 g used of a 1000 g label, and it then printed ~23 h to a real
+    runout; 011-H2S refused rolls at 1169 / 1204 g used that ran 16 h and 3 days more; seven
+    loaded prod rolls read under 150 g with no runout, two of them NEGATIVE. What still
+    refuses a roll mid-print is the hard exclude (spent / out of rotation / archived), which
+    runs whatever the floor.
 
     Read the pair as one statement: "below the floor" is a fact about STARTING a print,
     not about the roll's fitness or its identity. The binding half — no release, no mint,
@@ -253,7 +301,7 @@ class TestRowT10SubFloorDonor:
     ``services/test_slot_pipeline.py::test_T10_a_sub_floor_roll_left_seated_is_never_re_decided``.
     """
 
-    SUB_FLOOR_G = 90.0  # under the 150 g start floor, far above the 5 g replacement floor
+    SUB_FLOOR_G = 90.0  # under the 150 g start floor
 
     def _sub_floor_only(self):
         loaded = [_loaded(0, tray_id=0, color="#FF0000")]
@@ -277,31 +325,64 @@ class TestRowT10SubFloorDonor:
     def test_the_mid_print_replacement_lane_still_takes_it(self):
         """The liveness half. Without it, "the floor holds" and "the roll is unusable"
         look identical — and the doctrine sentence T10 encodes is that they differ."""
-        from backend.app.services.spool_recovery import _RECOVERY_HARD_MIN_G
-
         loaded, inv = self._sub_floor_only()
-        out = _match(
+        out = _match([_req(color="#FF0000")], loaded, policy="first_loaded", inv=inv, min_start_g=_FLOOR_OFF)
+        assert out.mapping == [0], "still a donor mid-print"
+        assert out.start_blocked_slots == []
+        assert self.SUB_FLOOR_G < DEFAULT_MIN_START_SPOOL_G, "the fixture must sit under the start floor"
+
+    @pytest.mark.asyncio
+    async def test_a_present_not_spent_roll_with_a_negative_ledger_is_a_donor(self):
+        """THE F2 PIN, on a real row: 1085 g used of a 1000 g label (prod spool 785 read
+        −85 g). ``Spool.remaining_g`` derives 0.0 — the ledger is raw, the reading is
+        floored — and the roll is NOT spent, so mid-print it is a donor. The same roll can
+        still never START a print."""
+        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
+        with _internal_mode():
+            inv = await build_slot_inventory(
+                _inventory_db([_assignment(_spool_row(weight_used=1085.0))]), printer_id=1, loaded=loaded
+            )
+        assert (inv[0].remaining_g, inv[0].spent) == (0.0, False)
+
+        mid_print = _match([_req(color="#FF0000")], loaded, policy="first_loaded", inv=inv, min_start_g=_FLOOR_OFF)
+        assert mid_print.mapping == [0], "the ledger never vetoes a present, not-spent spare"
+        assert mid_print.start_blocked_slots == []
+
+        start = _match(
             [_req(color="#FF0000")],
             loaded,
             policy="first_loaded",
             inv=inv,
-            min_start_g=_RECOVERY_HARD_MIN_G,
+            min_start_g=DEFAULT_MIN_START_SPOOL_G,
+            require_known_grams=True,
         )
-        assert out.mapping == [0], "still a donor mid-print"
-        assert out.start_blocked_slots == []
-        assert _RECOVERY_HARD_MIN_G < self.SUB_FLOOR_G < DEFAULT_MIN_START_SPOOL_G, (
-            "the fixture must sit between the two floors, or the pair proves nothing"
+        assert start.mapping == [-1]
+        assert start.start_block_kinds == {1: START_BLOCK_BELOW_FLOOR}
+
+    @pytest.mark.asyncio
+    async def test_a_spent_roll_is_never_a_donor(self):
+        """The other side, on real rows: ``spent_at`` is the exhaustion truth. A spent roll
+        with a HEALTHY ledger (50 g used) is hard-excluded at floor 0 — excluded, never
+        floor-reserved — and a negative-ledger roll beside it is the one taken."""
+        spent = _spool_row(weight_used=50.0, spent_at=datetime(2026, 9, 18, tzinfo=timezone.utc))
+        overdrawn = _spool_row(weight_used=1085.0)
+        loaded = [_loaded(0, tray_id=0, color="#FF0000"), _loaded(1, tray_id=1, color="#FF0000")]
+        with _internal_mode():
+            inv = await build_slot_inventory(
+                _inventory_db([_assignment(spent, tray_id=0), _assignment(overdrawn, tray_id=1)]),
+                printer_id=1,
+                loaded=loaded,
+            )
+        assert inv[0].spent is True and inv[1].spent is False
+
+        alone = _match(
+            [_req(color="#FF0000")], loaded[:1], policy="first_loaded", inv={0: inv[0]}, min_start_g=_FLOOR_OFF
         )
+        assert alone.mapping == [-1]
+        assert alone.start_blocked_slots == []  # hard-excluded, not reserved
 
-    def test_a_genuinely_empty_roll_is_refused_by_both(self):
-        """The other side of the replacement floor: 'low' is a donor, 'empty' is not."""
-        from backend.app.services.spool_recovery import _RECOVERY_HARD_MIN_G
-
-        loaded = [_loaded(0, tray_id=0, color="#FF0000")]
-        inv = {0: SlotInventory(remaining_g=2.0, first_loaded_ord=100.0)}
-        out = _match([_req(color="#FF0000")], loaded, policy="first_loaded", inv=inv, min_start_g=_RECOVERY_HARD_MIN_G)
-        assert out.mapping == [-1]
-        assert out.start_blocked_slots == [1]
+        beside = _match([_req(color="#FF0000")], loaded, policy="first_loaded", inv=inv, min_start_g=_FLOOR_OFF)
+        assert beside.mapping == [1]
 
 
 class TestStartBlockedSlots:
@@ -643,39 +724,7 @@ class TestRemainingGramsOrigin:
     operator-gated un-spend is lossless). The slot-level ``unread`` verdict outranks
     that number — it speaks for the tray's physical contents, which no row-level
     figure can. Rows are REAL (transient) ``Spool`` objects so these pin the model's
-    derivation, not a stub's arithmetic."""
-
-    @staticmethod
-    def _db(rows):
-        """Stub AsyncSession whose .execute().scalars().all() yields ``rows``."""
-        scalars = MagicMock()
-        scalars.all.return_value = rows
-        result = MagicMock()
-        result.scalars.return_value = scalars
-        db = MagicMock()
-        db.execute = AsyncMock(return_value=result)
-        return db
-
-    @staticmethod
-    def _internal_mode():
-        return patch("backend.app.services.spool_selection._is_spoolman_mode", new=AsyncMock(return_value=False))
-
-    @staticmethod
-    def _assignment(spool, *, ams_id=0, tray_id=0):
-        return MagicMock(ams_id=ams_id, tray_id=tray_id, spool=spool)
-
-    @staticmethod
-    def _spool(*, weight_used, spent_at=None):
-        return Spool(
-            label_weight=1000,
-            weight_used=weight_used,
-            loaded_at=None,
-            first_loaded_at=None,
-            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-            feed_fault_at=None,
-            spent_at=spent_at,
-            archived_at=None,
-        )
+    derivation, not a stub's arithmetic (the module-level real-row helpers)."""
 
     @pytest.mark.asyncio
     async def test_spent_row_reads_zero_though_its_ledger_says_positive(self):
@@ -683,10 +732,10 @@ class TestRemainingGramsOrigin:
         publishes 0.0: the stamp is the hardware's statement that the roll ran dry,
         and an under-counted ledger must never present it as printable material.
         The ``spent`` flag rides separately (it drives the hard exclude)."""
-        spool = self._spool(weight_used=50.0, spent_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
+        spool = _spool_row(weight_used=50.0, spent_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
         loaded = [_loaded(0, tray_id=0)]
-        with self._internal_mode():
-            out = await build_slot_inventory(self._db([self._assignment(spool)]), printer_id=1, loaded=loaded)
+        with _internal_mode():
+            out = await build_slot_inventory(_inventory_db([_assignment(spool)]), printer_id=1, loaded=loaded)
         assert out[0].remaining_g == 0.0
         assert out[0].spent is True
         # Storage is untouched — the derivation floors nothing on the row itself.
@@ -698,10 +747,10 @@ class TestRemainingGramsOrigin:
         (undetermined) even when the binding it displaced is spent. The wire says a
         roll is physically there and the farm cannot name it, so neither the ledger
         figure NOR the derived zero is knowledge about this tray."""
-        spool = self._spool(weight_used=50.0, spent_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
+        spool = _spool_row(weight_used=50.0, spent_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
         loaded = [dict(_loaded(0, tray_id=0), unread=True)]
-        with self._internal_mode():
-            out = await build_slot_inventory(self._db([self._assignment(spool)]), printer_id=1, loaded=loaded)
+        with _internal_mode():
+            out = await build_slot_inventory(_inventory_db([_assignment(spool)]), printer_id=1, loaded=loaded)
         assert out[0].remaining_g is None
         assert out[0].unread is True
         assert out[0].spent is True  # the flag still reaches the trace / hard exclude
@@ -711,9 +760,9 @@ class TestRemainingGramsOrigin:
         """The derivation is a spent-only override: a live row publishes the plain
         ``label_weight - weight_used`` it always did."""
         loaded = [_loaded(0, tray_id=0)]
-        with self._internal_mode():
+        with _internal_mode():
             out = await build_slot_inventory(
-                self._db([self._assignment(self._spool(weight_used=250.0))]), printer_id=1, loaded=loaded
+                _inventory_db([_assignment(_spool_row(weight_used=250.0))]), printer_id=1, loaded=loaded
             )
         assert out[0].remaining_g == 750.0
         assert out[0].spent is False

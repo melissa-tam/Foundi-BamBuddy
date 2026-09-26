@@ -49,6 +49,7 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.services import incident_resolution, printer_incidents
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
+from backend.app.services.hms_errors import candidate_fingerprint, live_candidates
 from backend.app.services.incident_resolution import (
     ClearedEvent,
     Context,
@@ -60,7 +61,7 @@ from backend.app.services.incident_resolution import (
 )
 from backend.app.services.plate_occupancy import EscalationOnly, PendingEject, plate_occupancy
 
-_OCCASIONS = ("running_edge", "job_terminal", "sweep_tick", "startup", "plate_cleared")
+_OCCASIONS = ("running_edge", "job_terminal", "sweep_tick", "startup", "plate_cleared", "new_fault")
 
 # One representative kind per resolution class. The table is keyed by CLASS, so the kind
 # is only how a row acquires one — and reading the class off the store (rather than
@@ -119,14 +120,23 @@ def _state(live: str = "IDLE", *, hms=None, tray_now=None, epoch=1, ams_status_m
     return st
 
 
-def _ledger_with(*, load_at=None, running_at=None, printer_id: int = 7) -> MotionLedger:
-    """A ledger pre-loaded with the motion this case means to have happened."""
+def _ledger_with(*, load_at=None, ran_at=None, printer_id: int = 7) -> MotionLedger:
+    """A ledger pre-loaded with the motion this case means to have happened.
+
+    ``ran_at`` is the QUALIFIED "a print ran through the path" sighting. The cases that
+    are ABOUT what qualifies a sighting drive ``MotionLedger.observe`` instead
+    (``TestTheSightingIsQualified``, ``TestTheNewFaultOccasion``)."""
     ledger = MotionLedger()
     if load_at is not None:
         ledger._load_completed_at[printer_id] = load_at  # noqa: SLF001
-    if running_at is not None:
-        ledger._running_seen_at[printer_id] = running_at  # noqa: SLF001
+    if ran_at is not None:
+        ledger._path_ran_at[printer_id] = ran_at  # noqa: SLF001
     return ledger
+
+
+def _jam_hms() -> HMSError:
+    """``0700_8010`` — an ACTIONABLE mechanical feed fault (the jam 002-H2S kept raising)."""
+    return HMSError(code="8010", attr=0x07000000, module=7, severity=2)
 
 
 def _permissive(occasion: str) -> Context:
@@ -137,12 +147,13 @@ def _permissive(occasion: str) -> Context:
     fixture failing to supply something. The printer is RUNNING the row's own job with
     no eject owning it — the one reading every class that closes on the wire closes on
     (a positive non-PAUSE state for ``wire``, a print through the path for ``repair``,
-    the paused job printing again for ``job_pause``).
+    the paused job printing again for ``job_pause``). For ``new_fault`` the wire also
+    carries a DIFFERENT actionable fault than the row's own (its occasion's meaning).
     """
     after = _OPENED_AT + timedelta(seconds=30)
     return Context(
-        state=_state("RUNNING"),
-        ledger=_ledger_with(load_at=after, running_at=after),
+        state=_state("RUNNING", hms=[_jam_hms()] if occasion == "new_fault" else None),
+        ledger=_ledger_with(load_at=after, ran_at=after),
         driver_live=False,
         terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
         cleared=ClearedEvent(recover=True),
@@ -156,26 +167,33 @@ _EXPECTED: dict[tuple[str, str], str | None] = {
     (RESOLUTION_WIRE, "sweep_tick"): RESOLVE_WIRE_CLEAR,
     (RESOLUTION_WIRE, "startup"): RESOLVE_REARM,
     (RESOLUTION_WIRE, "plate_cleared"): None,
+    # Open while a new fault arrives = the fault arrived INSIDE the hold (the wire row
+    # closes on its own resume); the outrank test re-classifies, nothing here closes.
+    (RESOLUTION_WIRE, "new_fault"): None,
     (RESOLUTION_REPAIR, "running_edge"): None,
     (RESOLUTION_REPAIR, "job_terminal"): RESOLVE_REPAIR_COMPLETED,
     (RESOLUTION_REPAIR, "sweep_tick"): RESOLVE_REPAIR_OBSERVED,
     (RESOLUTION_REPAIR, "startup"): RESOLVE_REARM,
     (RESOLUTION_REPAIR, "plate_cleared"): RESOLVE_OPERATOR,
+    (RESOLUTION_REPAIR, "new_fault"): RESOLVE_REPAIR_OBSERVED,
     (RESOLUTION_OPERATOR, "running_edge"): None,
     (RESOLUTION_OPERATOR, "job_terminal"): None,
     (RESOLUTION_OPERATOR, "sweep_tick"): None,
     (RESOLUTION_OPERATOR, "startup"): None,
     (RESOLUTION_OPERATOR, "plate_cleared"): RESOLVE_OPERATOR,
+    (RESOLUTION_OPERATOR, "new_fault"): None,
     (RESOLUTION_JOB_PAUSE, "running_edge"): RESOLVE_OBSERVED_RUNNING,
     (RESOLUTION_JOB_PAUSE, "job_terminal"): RESOLVE_TERMINAL,
     (RESOLUTION_JOB_PAUSE, "sweep_tick"): RESOLVE_OBSERVED_RUNNING,
     (RESOLUTION_JOB_PAUSE, "startup"): RESOLVE_REARM,
     (RESOLUTION_JOB_PAUSE, "plate_cleared"): None,
+    (RESOLUTION_JOB_PAUSE, "new_fault"): None,
     (RESOLUTION_DECLARED, "running_edge"): None,
     (RESOLUTION_DECLARED, "job_terminal"): None,
     (RESOLUTION_DECLARED, "sweep_tick"): None,
     (RESOLUTION_DECLARED, "startup"): None,
     (RESOLUTION_DECLARED, "plate_cleared"): None,
+    (RESOLUTION_DECLARED, "new_fault"): None,
 }
 
 
@@ -538,10 +556,10 @@ class TestTheWireLane:
 
 
 class TestTheRepairLaneMotionEvidence:
-    def _ctx(self, *, live="IDLE", hms=None, load_at=None, running_at=None, ams_status_main=0):
+    def _ctx(self, *, live="IDLE", hms=None, load_at=None, ams_status_main=0):
         return Context(
             state=_state(live, hms=hms, ams_status_main=ams_status_main),
-            ledger=_ledger_with(load_at=load_at, running_at=running_at),
+            ledger=_ledger_with(load_at=load_at),
             driver_live=False,
         )
 
@@ -648,7 +666,7 @@ class TestTheCompletedArm:
         }[running_at]
         return Context(
             state=_state("FINISH", hms=hms),
-            ledger=_ledger_with(running_at=seen),
+            ledger=_ledger_with(ran_at=seen),
             driver_live=False,
             terminal=TerminalEvent(status=status, eject=eject, job_id=job_id),
         )
@@ -757,14 +775,14 @@ class TestMotionLedger:
         ledger = MotionLedger()
         self._sample(ledger, 7, tray_now=1, live="RUNNING")
 
-        assert ledger.running_seen_at(7) is not None
+        assert ledger.path_ran_at(7) is not None
 
     @pytest.mark.parametrize("live", ["IDLE", "PAUSE", "FINISH", "PREPARE", ""])
     def test_only_running_stamps_the_sighting(self, live):
         ledger = MotionLedger()
         self._sample(ledger, 7, tray_now=1, live=live)
 
-        assert ledger.running_seen_at(7) is None
+        assert ledger.path_ran_at(7) is None
 
     def test_a_running_eject_sweep_never_enters_the_ledger(self):
         """The eject exclusion is asked at STAMP time for this fact, so a sweep's
@@ -785,7 +803,7 @@ class TestMotionLedger:
         ledger = MotionLedger()
         self._sample(ledger, 7, tray_now=1, live="RUNNING")
 
-        assert ledger.running_seen_at(7) is None
+        assert ledger.path_ran_at(7) is None
 
     def test_the_ledger_is_per_printer(self):
         ledger = MotionLedger()
@@ -800,15 +818,308 @@ class TestMotionLedger:
         self._sample(ledger, 7, tray_now=255)
         self._sample(ledger, 7, tray_now=1, live="RUNNING")
         assert ledger.load_completed_at(7) is not None
-        assert ledger.running_seen_at(7) is not None
+        assert ledger.path_ran_at(7) is not None
 
         ledger.reset()
 
         assert ledger.load_completed_at(7) is None
-        assert ledger.running_seen_at(7) is None
+        assert ledger.path_ran_at(7) is None
         # ...including the feeder memory, so the next sample seeds rather than edges.
         self._sample(ledger, 7, tray_now=2)
         assert ledger.load_completed_at(7) is None
+
+
+class _LiveTask:
+    """A recovery driver's liveness-slot occupant that has not finished — all the store's
+    ``driver_live`` asks of a task is ``done()``."""
+
+    def done(self) -> bool:
+        return False
+
+
+@pytest.fixture
+def live_driver():
+    """A recovery driver LIVE on printer 7 for the test's duration, through the store's own
+    ``register_driver`` / ``release_driver`` (the one liveness store)."""
+    task = _LiveTask()
+    printer_incidents.register_driver(7, task, incident_id=1)
+    yield task
+    printer_incidents.release_driver(7, task)
+
+
+class TestTheSightingIsQualified:
+    """``path_ran_at`` is "a print ran THROUGH THE PATH", qualified when it is WRITTEN — the
+    reading is used long after the sample, when the printer's state then says nothing
+    about the state at the sample. Each exclusion below is a RUNNING reading that is not
+    filament feeding through a repaired path."""
+
+    @staticmethod
+    def _sample(ledger, *, hms=None, ams_status_main=0):
+        ledger.observe(7, _state("RUNNING", hms=hms, tray_now=1, ams_status_main=ams_status_main), 1)
+
+    def test_a_quiet_running_print_with_no_driver_is_a_sighting(self):
+        ledger = MotionLedger()
+        self._sample(ledger)
+
+        assert ledger.path_ran_at(7) is not None
+
+    def test_running_with_a_fault_standing_is_not(self):
+        """The fault-before-PAUSE window: the row opens on the HMS push, BEFORE the PAUSE
+        lands, and the samples between carry the very fault it is about."""
+        ledger = MotionLedger()
+        self._sample(ledger, hms=[_ptfe_breakage_hms()])
+
+        assert ledger.path_ran_at(7) is None
+
+    def test_running_with_the_ams_mid_change_is_not(self):
+        """A wedge outlives its code: a fault-free wire with the AMS mid-change is not quiet."""
+        ledger = MotionLedger()
+        self._sample(ledger, ams_status_main=1)
+
+        assert ledger.path_ran_at(7) is None
+
+    def test_running_under_a_live_recovery_driver_is_not(self, live_driver):
+        """A driver's own lever resume: the running-edge cells' rule — a RUNNING sample taken
+        during a resume the driver published is its intermediate reading."""
+        ledger = MotionLedger()
+        self._sample(ledger)
+
+        assert ledger.path_ran_at(7) is None
+
+    def test_the_driver_releasing_lets_the_next_quiet_sample_count(self, live_driver):
+        ledger = MotionLedger()
+        self._sample(ledger)
+        printer_incidents.release_driver(7, live_driver)
+
+        self._sample(ledger)
+
+        assert ledger.path_ran_at(7) is not None
+
+
+def _pull_back_hms() -> list[HMSError]:
+    """002-H2S's pull-back pair, one per wire lane: ``0700_0011`` (hms[], AMS A slot 3 —
+    "pull-back timeout") and ``0700_8004`` (print_error — "failed to pull back")."""
+    attr = 0x07000000 | ((0x20 + 2) << 8)
+    return [
+        HMSError(code="0x20011", attr=attr, module=7, severity=2, full_code=f"{attr:08X}00020011"),
+        HMSError(code="8004", attr=0x07008004, module=7, severity=2, full_code="07008004"),
+    ]
+
+
+def _extruder_overload_hms() -> HMSError:
+    """``0300_801E`` — the fault 006-H2S's incident 289 swallowed on 2026-09-21."""
+    return HMSError(code="801E", attr=0x03000000, module=3, severity=2)
+
+
+def _physical_row(opened_on: list[HMSError], *, created_at: datetime) -> PrinterIncident:
+    """An open AMS-side PHYSICAL row (the ``repair`` class) whose ``codes`` are the entry
+    gate's own fingerprint of the faults it opened on."""
+    return PrinterIncident(
+        id=1,
+        printer_id=7,
+        job_id=_JOB,
+        item_id=None,
+        kind=KIND_PHYSICAL,
+        code="0700_0011",
+        codes=candidate_fingerprint(live_candidates(_state(hms=opened_on))),
+        slot_global_tray=2,
+        status=STATUS_ESCALATED,
+        created_at=created_at,
+    )
+
+
+def _opened_minutes_ago() -> datetime:
+    """``created_at`` safely before any sighting this case then writes (the ledger stamps
+    the wall clock at ``observe``)."""
+    return datetime.utcnow() - timedelta(minutes=5)
+
+
+class TestTheNewFaultOccasion:
+    """The AMS entry gate asks the open AMS row whether the fault now on the wire ENDS it.
+
+    002-H2S 2026-09-15/16: three ``0700_8010`` jams swallowed behind ``0700_0011`` +
+    ``0700_8004`` pull-back rows; 006-H2S 2026-09-21: a ``0300_801E`` behind incident 289.
+    The rework made the RUNNING edge no repair evidence for the class, so the rows
+    outlived the resume that had repaired the path, and the entry refused every new fault
+    as "already held". A repair row now closes ``repair_observed`` on a new fault once a
+    print demonstrably RAN through the path after it opened — and on nothing weaker.
+
+    Every sighting is written the way production writes it, through
+    ``MotionLedger.observe`` (the sampler's own call), never pre-seeded.
+    """
+
+    @staticmethod
+    def _ran(ledger: MotionLedger, *, hms=None) -> None:
+        """One RUNNING push through the sampler's call (qualified or not is the ledger's)."""
+        ledger.observe(7, _state("RUNNING", hms=hms, tray_now=1), 1)
+
+    @staticmethod
+    def _now_on_wire(ledger: MotionLedger, hms, *, live="PAUSE", driver_live=False) -> Context:
+        return Context(state=_state(live, hms=hms, tray_now=1), ledger=ledger, driver_live=driver_live)
+
+    @pytest.mark.parametrize(
+        "new_fault",
+        [pytest.param(_jam_hms, id="002-H2S-0700_8010"), pytest.param(_extruder_overload_hms, id="006-H2S-0300_801E")],
+    )
+    def test_a_new_fault_after_a_print_ran_through_the_path_closes_it(self, new_fault):
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger)  # the operator repaired the path and resumed; it printed
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [new_fault()], live="RUNNING"))
+
+        assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_REPAIR_OBSERVED, False)
+        assert verdict.evidence == incident_resolution._REPAIR_EVIDENCE_NEW_FAULT  # noqa: SLF001
+
+    def test_the_rows_own_fault_still_standing_keeps_it(self):
+        """A new code BESIDE the row's own is the same blockage, better described — the
+        entry's outrank test is what re-classifies a row, never this close."""
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger)
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [*_pull_back_hms(), _jam_hms()]))
+
+        assert verdict.close is False
+        assert "own fault still stands" in verdict.evidence
+
+    @pytest.mark.parametrize("lane", [0, 1], ids=["hms-lane-0700_0011", "print-error-lane-0700_8004"])
+    def test_one_own_code_on_either_wire_lane_keeps_it(self, lane):
+        """Both lanes are the row's own words: either one standing is the old fault."""
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger)
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_pull_back_hms()[lane], _jam_hms()]))
+
+        assert verdict.close is False
+
+    def test_the_same_code_on_another_slot_is_a_different_fault(self):
+        """The comparison is the entry gate's own slot-qualified token: a second slot's
+        breakage is a new fault, exactly as a second roll running dry is a new runout."""
+        ledger = MotionLedger()
+        row = _physical_row([_ptfe_breakage_hms(tray_id=3)], created_at=_opened_minutes_ago())
+        self._ran(ledger)
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_ptfe_breakage_hms(tray_id=1)]))
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_REPAIR_OBSERVED)
+
+    def test_no_actionable_fault_is_no_new_fault(self):
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger)
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, []))
+
+        assert verdict.close is False
+
+    def test_a_sighting_from_a_drivers_own_resume_does_not_count(self, live_driver):
+        """A RUNNING sample during a resume a live driver published is its reading — on an
+        UPGRADED row too, whose ``created_at`` is the jam's."""
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger)  # the driver's lever resume: RUNNING, quiet, driver live
+        printer_incidents.release_driver(7, live_driver)  # it handed over
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()]))
+
+        assert verdict.close is False
+        assert "no print ran through the path" in verdict.evidence
+
+    def test_the_fault_before_pause_window_does_not_count(self):
+        """The row opens on the HMS push, BEFORE the PAUSE lands; the RUNNING samples in
+        between carry the very fault it is about — a sighting there is not the path running."""
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger, hms=_pull_back_hms())
+        self._ran(ledger, hms=_pull_back_hms())
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()]))
+
+        assert verdict.close is False
+        assert "no print ran through the path" in verdict.evidence
+
+    def test_a_sighting_from_before_the_row_opened_does_not_count(self):
+        """The print that was running when the fault arrived is the one it interrupted."""
+        ledger = MotionLedger()
+        self._ran(ledger)
+        row = _physical_row(_pull_back_hms(), created_at=ledger.path_ran_at(7) + timedelta(seconds=1))
+
+        assert resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()])).close is False
+
+    def test_a_live_driver_at_the_verdict_stands_aside(self):
+        """The told-occasion ownership rule: closing a row from under a live driver would let
+        the entry spawn a second driver onto one AMS (006-H2S 2026-09-04)."""
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger)
+
+        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()], driver_live=True))
+
+        assert verdict.close is False
+        assert "closer stands aside" in verdict.evidence
+
+    def test_after_a_restart_the_row_stands_until_this_process_sees_the_path_run(self):
+        """The ledger is process memory, and a restart empties it (``ledger.reset`` is what a
+        restart leaves). With no sighting of its own the process never ends a hold on motion
+        it did not witness — the SAFE direction: the row stands and the new fault waits.
+        The first quiet RUNNING the new process samples is the evidence again."""
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        self._ran(ledger)
+        ledger.reset()  # the restart
+
+        assert resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()])).close is False
+
+        self._ran(ledger)  # after the restart, the printer prints on a quiet path
+
+        assert resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()])).close is True
+
+
+class TestTheCompletedArmReadsTheSharedSighting:
+    """``_repair_job_terminal`` and the new-fault arm read ONE predicate of "a print ran
+    through the path" (``_ran_through_path_since``, over the qualified sighting). These
+    fail if the completed arm read a bare RUNNING stamp: each writes a RUNNING sample the
+    old stamp recorded and the qualified one does not."""
+
+    @staticmethod
+    def _completed(ledger: MotionLedger, row: PrinterIncident):
+        return resolve(
+            row,
+            "job_terminal",
+            Context(
+                state=_state("FINISH"),
+                ledger=ledger,
+                driver_live=False,
+                terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
+            ),
+        )
+
+    def test_a_qualified_sighting_lets_the_completion_close_it(self):
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        ledger.observe(7, _state("RUNNING", tray_now=1), 1)
+
+        verdict = self._completed(ledger, row)
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_REPAIR_COMPLETED)
+
+    def test_a_drivers_own_resume_does_not_launder_the_completion(self, live_driver):
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        ledger.observe(7, _state("RUNNING", tray_now=1), 1)
+        printer_incidents.release_driver(7, live_driver)
+
+        assert self._completed(ledger, row).close is False
+
+    def test_running_with_the_fault_standing_does_not_launder_it_either(self):
+        """The fault-before-PAUSE samples, then the firmware wipes its list at the terminal."""
+        ledger = MotionLedger()
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+        ledger.observe(7, _state("RUNNING", hms=_pull_back_hms(), tray_now=1), 1)
+
+        assert self._completed(ledger, row).close is False
 
 
 class TestDriverOwns:

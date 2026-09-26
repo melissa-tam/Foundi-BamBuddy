@@ -135,10 +135,22 @@ def judge(evidence: ArchiveEvidence) -> ReconcileVerdict:
     return "ended_unattributed"
 
 
-def is_fresh(state: PrinterState) -> bool:
+def is_fresh(state: PrinterState | None) -> bool:
     """Does ``state`` describe the printer's CURRENT MQTT session? ONE spelling, for the
-    connected-edge hook in ``main`` and for the evidence."""
-    return bool(state.connected) and state.report_epoch is not None and state.report_epoch == state.connection_epoch
+    connected-edge hook in ``main``, for the evidence, for the AMS command snapshot
+    (``ams_command.snapshot``) and for the recovery driver's session gate
+    (``spool_recovery._reads_live``).
+
+    Total: no state (no client registered), or an object without the session fields, is
+    not fresh — the command snapshot is getattr-safe by contract and reads through here."""
+    if state is None:
+        return False
+    report_epoch = getattr(state, "report_epoch", None)
+    return (
+        bool(getattr(state, "connected", False))
+        and report_epoch is not None
+        and report_epoch == getattr(state, "connection_epoch", None)
+    )
 
 
 def evidence_of(state: PrinterState, archive: PrintArchive, run_unit: PrintQueueItem | None) -> ArchiveEvidence:

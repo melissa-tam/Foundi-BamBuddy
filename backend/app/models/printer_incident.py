@@ -255,6 +255,16 @@ RESOLVE_AUTO_RESUME = "auto_resume"
 RESOLVE_OBSERVED_RUNNING = "observed_running"
 RESOLVE_TERMINAL = "terminal"
 RESOLVE_OPERATOR = "operator"
+# Another actor PAUSED the print after the recovery driver's own swap resume ran
+# (``spool_recovery._takeover``'s ``paused_elsewhere``): the PAUSE read on a quiet path —
+# no actionable fault on either wire lane and the AMS out of a change — so it is not the
+# re-jam the driver retries, and the driver stands aside (no resume, no park). Its own
+# token beside ``operator`` because the pause's actor is not known: a touchscreen or UI
+# Pause, the firmware's power-loss prompt and AI spaghetti detection (``0300_8003``, outside
+# the AMS taxonomy) all read the same, and ``operator`` would claim a human. The row closes
+# ABORTED, so ``printer_incidents.outcome_of`` buckets it ``taken_over``. 16 characters —
+# inside ``resolve_source``'s VARCHAR(24).
+RESOLVE_PAUSED_ELSEWHERE = "paused_elsewhere"
 # The wire says the hold is over: the printer is live in a positive non-PAUSE state
 # AND no actionable AMS fault stands on it any more (``spool_recovery.
 # sweep_open_incidents``). Its own token rather than ``observed_running`` because it

@@ -1401,3 +1401,36 @@ class TestPowerLossVocabulary:
 
         assert classify_short_code("0300_8007") is None
         assert classify_short_code("0300_400D") is None
+
+
+class TestFingerprintTokens:
+    """``fingerprint_tokens`` is ``candidate_fingerprint``'s inverse: a STORED fingerprint
+    (an incident's ``codes``, an aborted-close block) reads back as the very tokens the
+    live wire is compared against, through one decoder beside the encoder."""
+
+    def test_a_stored_fingerprint_reads_back_as_its_live_tokens(self):
+        from backend.app.services.bambu_mqtt import HMSError, PrinterState
+        from backend.app.services.hms_errors import (
+            candidate_fingerprint,
+            fault_tokens,
+            fingerprint_tokens,
+            live_candidates,
+        )
+
+        attr = 0x07000000 | ((0x20 + 2) << 8)
+        state = PrinterState(
+            hms_errors=[
+                HMSError(code="0x20011", attr=attr, module=7, severity=2, full_code=f"{attr:08X}00020011"),
+                HMSError(code="8004", attr=0x07008004, module=7, severity=2, full_code="07008004"),
+            ]
+        )
+        candidates = live_candidates(state)
+
+        assert fingerprint_tokens(candidate_fingerprint(candidates)) == fault_tokens(candidates)
+        assert fault_tokens(candidates) == {"physical_fault:0700_0011@0-2", "physical_fault:0700_8004"}
+
+    @pytest.mark.parametrize("stored", [None, ""])
+    def test_an_empty_fingerprint_names_no_fault(self, stored):
+        from backend.app.services.hms_errors import fingerprint_tokens
+
+        assert fingerprint_tokens(stored) == frozenset()
