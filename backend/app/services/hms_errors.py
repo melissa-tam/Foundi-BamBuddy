@@ -2023,6 +2023,21 @@ def candidate_fingerprint(candidates) -> str:
     return ",".join(sorted(fault_tokens(candidates)))[:256]
 
 
+def fingerprint_tokens(fingerprint: str | None) -> frozenset[str]:
+    """The :func:`fault_tokens` a STORED fingerprint names — :func:`candidate_fingerprint`'s inverse.
+
+    The one decoder of the encoding, beside its encoder, so every reader that asks
+    "which of the faults this fingerprint named still stand?" compares token to token
+    against ``fault_tokens(live_candidates(state))``: the aborted-close re-arm
+    (``spool_recovery._rearm_blocked``) and the rule table's ``new_fault`` occasion
+    (``incident_resolution``). ``None`` and ``""`` name no fault. A fingerprint cut at
+    the column width can end in a PARTIAL token, which matches no live token — reading
+    that one code as no longer standing; eight simultaneous actionable faults on one
+    printer would be needed to reach the width.
+    """
+    return frozenset(token for token in (fingerprint or "").split(",") if token)
+
+
 def _code_word(code: int | str) -> int:
     """Parse an HMSError ``code`` (int or hex string like ``"0x20001"``) to its full
     32-bit int — the form :func:`runout_slot_from_hms` expects."""

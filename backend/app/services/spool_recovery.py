@@ -192,6 +192,7 @@ from backend.app.services.hms_errors import (
     candidate_fingerprint,
     current_runout_demand,
     fault_tokens,
+    fingerprint_tokens,
     full_codes_of,
     live_candidates,
     power_loss_prompt_standing,
@@ -1293,7 +1294,7 @@ def _rearm_blocked(printer_id: int, live_tokens: frozenset[str], *, paused_edge:
         if paused_edge:
             _blocked.pop((pid, job), None)
             continue
-        survivors = {fp for fp in fingerprints if set(fp.split(",")) <= live_tokens}
+        survivors = {fp for fp in fingerprints if fingerprint_tokens(fp) <= live_tokens}
         if survivors:
             _blocked[(pid, job)] = survivors
         else:
@@ -2175,6 +2176,45 @@ def _held_escalate_reason(kind: str, *, external: bool) -> str:
 # --- entry ------------------------------------------------------------------
 
 
+def _new_fault_verdict(row: PrinterIncident, state, printer_id: int) -> incident_resolution.Verdict:
+    """Does the fault standing on the wire now END the open AMS row ``row``?
+
+    The rule table's ``new_fault`` occasion, asked with the entry's own live state and
+    the ONE liveness store. One spelling for the entry gate (:func:`on_ams_fault`) and
+    its mirror (:func:`will_own`), so a suppressed raw alert and an opened incident can
+    never disagree about whether the open row still owns the printer.
+    """
+    return incident_resolution.resolve(
+        row,
+        "new_fault",
+        Context(state=state, ledger=ledger, driver_live=printer_incidents.driver_live(printer_id)),
+    )
+
+
+async def _close_for_new_fault(db: AsyncSession, row: PrinterIncident, verdict: incident_resolution.Verdict) -> None:
+    """End the open AMS row the new fault answered — the closers' own two steps.
+
+    ``printer_incidents.close`` (the store's one closer, which logs the ``CLOSED …
+    source=`` line) and the unit's hold projection (:func:`_clear_hold_projection`), in
+    that order, as every lifecycle closer does; the new incident stamps its own token
+    when it opens. A close somebody else won leaves nothing to clear: that closer
+    cleared it.
+    """
+    incident_id, printer_id, item_id, kind, status = row.id, row.printer_id, row.item_id, row.kind, row.status
+    if await printer_incidents.close(db, incident_id, status=STATUS_RESOLVED, source=verdict.source) is None:
+        return
+    cleared = await _clear_hold_projection(db, item_id)
+    logger.info(
+        "spool_recovery: printer %s new fault — %s incident %s closed (was %s) — %s%s",
+        printer_id,
+        kind,
+        incident_id,
+        status,
+        verdict.evidence,
+        "; hold token cleared" if cleared else "",
+    )
+
+
 async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
     """Own the AMS faults standing on this printer right now. Never raises.
 
@@ -2189,8 +2229,14 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
     0. actionable candidates exist, and this exact fault was not evaluated moments
        ago (:func:`_eval_throttled` — a standing fault rides ~1 Hz);
     1. the ``spool_recovery_enabled`` setting;
-    2. this printer has NO open incident (the partial unique index is the real
-       enforcement; the pre-check is what turns the ordinary case into a log line);
+    2. this printer has NO open AMS incident (the partial unique index is the real
+       enforcement; the pre-check is what turns the ordinary case into a log line) —
+       or the open one ENDS on this fault: the rule table's ``new_fault`` occasion is
+       asked of it FIRST (:func:`_new_fault_verdict`), and a row it closes is closed
+       through the store, its hold token cleared, and the fault then opens its own
+       incident exactly as if no row had been open (002-H2S 2026-09-15/16: three jams
+       swallowed behind pull-back rows the resume had in fact repaired). A row that
+       stands keeps the printer, and only a worse class re-classifies it (the upgrade);
     3. this exact ``(printer, job, fingerprint)`` did not already close as ABORTED.
        A RESOLVED close deliberately does NOT bar re-entry — a genuine second tangle
        in one job must still be recovered, and the flap cap below is what bounds it.
@@ -2247,13 +2293,24 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
             # lost Z frame) standing beside an AMS fault never blocks the fault from
             # being owned — that is the multi-alarm rule.
             existing = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
+            stands = ""
+            if existing is not None:
+                # Does THIS fault end the open row? Asked before the outrank test, because
+                # a row the table closes owns nothing any more: its fault is over, and the
+                # new one is its own incident, opened below as if no row had been open.
+                ended = _new_fault_verdict(existing, state, printer_id)
+                if ended.close:
+                    await _close_for_new_fault(db, existing, ended)
+                    existing = None
+                else:
+                    stands = ended.evidence
             if existing is not None and not _outranks(fault_class, existing.kind):
                 _note_outcome(
                     printer_id,
                     job_id,
                     fingerprint,
                     "not opened — this printer already has an open AMS incident",
-                    detail=f"incident {existing.id} {existing.status} kind={existing.kind}",
+                    detail=f"incident {existing.id} {existing.status} kind={existing.kind}: {stands}",
                 )
                 return None
 
@@ -2429,7 +2486,11 @@ async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
             return False
         # The AMS-kind row: a pause-cause hold is not an AMS fault's owner, and a
         # plate-vision row standing beside a jam must not silence the jam's raw alert.
-        if await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS) is not None:
+        # A row that STANDS on this fault owns the printer (or is upgraded by it), so the
+        # raw alert is the duplicate; a row the fault ENDS is closed by the entry, which
+        # then runs the gates below — so this falls through to them too.
+        existing = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
+        if existing is not None and not _new_fault_verdict(existing, state, printer_id).close:
             return True
         # Mirrors the entry gate: while the printer's job is paused for a human (its own
         # plate check), no NEW AMS incident is opened, so nothing speaks for this fault
