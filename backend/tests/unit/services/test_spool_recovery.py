@@ -6992,7 +6992,7 @@ class TestPhysicalHoldsOutliveTheJob:
         """Resume the printer the way production does: a PAUSE sample, then RUNNING.
 
         Two pushes, because the sampler is EDGE-triggered and the seed is what makes the
-        second one an edge. The ledger's ``running_seen_at`` is stamped by the real
+        second one an edge. The ledger's ``path_ran_at`` is stamped by the real
         :func:`spool_recovery.note_demand_watch` — nothing here writes it.
         """
         spawned = _capture_spawns(monkeypatch)
@@ -7016,7 +7016,7 @@ class TestPhysicalHoldsOutliveTheJob:
         state, _client, row = await self._physical_hold(db_session, printer, monkeypatch)
 
         await self._running_push(printer, state, monkeypatch)
-        assert incident_resolution.ledger.running_seen_at(printer.id) is not None
+        assert incident_resolution.ledger.path_ran_at(printer.id) is not None
 
         assert await spool_recovery.on_job_terminal(printer.id, _terminal(job_id=row.job_id)) is True
 
@@ -7092,7 +7092,7 @@ class TestPhysicalHoldsOutliveTheJob:
         # refuses first, and this case would pass without testing anything (caught by
         # mutation, 2026-09-17).
         state.hms_errors = []
-        assert incident_resolution.ledger.running_seen_at(printer.id) is None
+        assert incident_resolution.ledger.path_ran_at(printer.id) is None
 
         assert await spool_recovery.on_job_terminal(printer.id, _terminal(job_id=row.job_id)) is False
 
@@ -7134,13 +7134,174 @@ class TestPhysicalHoldsOutliveTheJob:
 
         await self._running_push(printer, state, monkeypatch)
 
-        assert incident_resolution.ledger.running_seen_at(printer.id) is None, (
+        assert incident_resolution.ledger.path_ran_at(printer.id) is None, (
             "an eject sweep's RUNNING must never be recorded as a print through the path"
         )
         # ...and the completion that follows it therefore closes nothing.
         assert await spool_recovery.on_job_terminal(printer.id, _terminal(job_id=row.job_id)) is False
         held = await _incident_row(db_session, printer.id)
         assert held is not None and held.resolved_at is None
+
+    # --- a NEW fault ends a repaired physical hold (2026-09-25) -----------------------
+    #
+    # 002-H2S 2026-09-15/16 (incidents 177, 178, 184) and 006-H2S 2026-09-21 (#289): the
+    # resume had repaired the path and the print ran on, but the physical row stood (a
+    # running edge is no repair evidence for the class) and the entry gate refused every
+    # new fault as "already held" — suppressing its raw alert too. The table's own cells
+    # live in ``test_incident_resolution.py``; these drive the real chain: the per-push
+    # sampler writes the sighting, ``on_ams_fault`` asks the table and acts on its answer.
+
+    @staticmethod
+    async def _jam_arrives(printer, state, caplog):
+        """The jam lands on the next push, the printer still RUNNING — before its PAUSE."""
+        state.hms_errors = [_feed_fault_hms()]
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            return await on_ams_fault(printer.id, state)
+
+    @staticmethod
+    async def _cancel(task):
+        """Stop the new driver where it parked (its PAUSE wait): the swap it would run next
+        is the ladder's business, not the entry's."""
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def test_a_new_jam_after_the_repaired_path_ran_opens_its_own_incident(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """THE 002-H2S chain, closed: the row ends ``repair_observed``, its unit's hold token
+        is cleared, and the jam opens its OWN incident and spawns its driver — all in the
+        one ``on_ams_fault`` call, exactly as if no row had been open."""
+        install_settings(step_timeout_s=5.0)  # the new driver parks in its PAUSE wait while we look
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        await _bind_spool(db_session, printer.id, 0, 1)
+        state, _client, physical = await self._physical_hold(db_session, printer, monkeypatch)
+        db_session.expunge_all()
+        held_on = (await db_session.get(PrintQueueItem, item.id)).waiting_reason
+        assert held_on == printer_incidents.waiting_reason_for("physical")
+
+        await self._running_push(printer, state, monkeypatch)  # repaired and resumed: a quiet RUNNING
+        assert incident_resolution.ledger.path_ran_at(printer.id) is not None
+        task = await self._jam_arrives(printer, state, caplog)
+
+        assert task is not None, "the jam must get its own incident AND its driver, in the same call"
+        assert printer_incidents.driver_live(printer.id) is True
+        rows = {row.id: row for row in await _incident_rows(db_session, printer.id)}
+        closed = rows.pop(physical.id)
+        assert (closed.status, closed.resolve_source) == ("resolved", "repair_observed")
+        (jam,) = rows.values()
+        assert (jam.kind, jam.status, jam.resolved_at, jam.codes) == (
+            "jam",
+            "recovering",
+            None,
+            "mechanical_feed:0700_8010",
+        )
+        assert any(
+            f"physical incident {physical.id} closed" in r.getMessage() and "hold token cleared" in r.getMessage()
+            for r in caplog.records
+        )
+        # The closed row's projection is gone; the new driver stamps its own once the PAUSE lands.
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is True  # the jam holds the printer now
+
+        state.state = "PAUSE"
+        await self._cancel(task)
+
+    async def test_a_new_fault_with_no_quiet_running_since_the_fault_is_still_held(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """The fault-before-PAUSE window and nothing after it: every RUNNING sample carried the
+        row's own fault. Nothing ran through the path, so the new fault may be the same
+        blockage — the row stands, and the refusal line says why."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, physical = await self._physical_hold(db_session, printer, monkeypatch)
+
+        spawned = _capture_spawns(monkeypatch)
+        state.state = "RUNNING"  # the physical code still standing — the PAUSE has not landed
+        spool_recovery.note_demand_watch(printer.id, state)
+        spool_recovery.note_demand_watch(printer.id, state)
+        for coro in spawned:
+            await coro
+        assert incident_resolution.ledger.path_ran_at(printer.id) is None
+        state.state = "PAUSE"
+
+        assert await self._jam_arrives(printer, state, caplog) is None
+
+        rows = await _incident_rows(db_session, printer.id)
+        assert [(r.id, r.kind, r.resolved_at) for r in rows] == [(physical.id, "physical", None)]
+        assert any(
+            "not opened — this printer already has an open AMS incident" in r.getMessage()
+            and "no print ran through the path" in r.getMessage()
+            for r in caplog.records
+        )
+        # The mirror agrees: the standing row speaks for the printer.
+        assert await spool_recovery.will_own(db_session, printer.id, state) is True
+
+    async def test_a_drivers_own_resume_is_not_the_path_running(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """A RUNNING sample taken while a recovery driver is live is that driver's reading —
+        the jam driver's lever resume on a row the upgrade then made physical, keeping the
+        jam's ``created_at``. It writes no sighting, so a later fault finds the row held."""
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, physical = await self._physical_hold(db_session, printer, monkeypatch)
+        driver = _FakeRecoveryTask(done=False)
+        printer_incidents.register_driver(printer.id, driver, incident_id=physical.id)
+
+        await self._running_push(printer, state, monkeypatch)  # the driver's resume
+        assert incident_resolution.ledger.path_ran_at(printer.id) is None
+        printer_incidents.release_driver(printer.id, driver)  # it handed over
+
+        assert await self._jam_arrives(printer, state, caplog) is None
+        rows = await _incident_rows(db_session, printer.id)
+        assert [(r.id, r.resolved_at) for r in rows] == [(physical.id, None)]
+
+    async def test_will_own_mirrors_the_close_then_the_job_pause_gate(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """``will_own`` must read the same verdict the entry acts on. Here the new fault ENDS
+        the physical row, and the entry's next gate — the printer's plate check holding its
+        job for a human — then opens nothing: no incident speaks for the jam, so its raw
+        alert must reach the operator. An AMS row being open is no longer enough to say an
+        incident owns the fault."""
+        from backend.app.models.printer_incident import STATUS_ESCALATED
+
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state, _client, physical = await self._physical_hold(db_session, printer, monkeypatch)
+        await self._running_push(printer, state, monkeypatch)
+        assert (
+            await printer_incidents.open_new(
+                db_session,
+                printer_id=printer.id,
+                job_id="task-1",
+                item_id=None,
+                kind=KIND_PLATE_VISION,
+                code="0500_808C",
+                codes="0500_808C",
+                slot_global_tray=None,
+                status=STATUS_ESCALATED,
+            )
+            is not None
+        )
+        state.hms_errors = [_feed_fault_hms()]
+
+        assert await spool_recovery.will_own(db_session, printer.id, state) is False
+
+        assert await self._jam_arrives(printer, state, caplog) is None
+        rows = {row.kind: row for row in await _incident_rows(db_session, printer.id)}
+        assert set(rows) == {"physical", KIND_PLATE_VISION}, "the jam opened nothing"
+        assert (rows["physical"].id, rows["physical"].resolve_source) == (physical.id, "repair_observed")
+        assert rows[KIND_PLATE_VISION].resolved_at is None
 
     async def test_a_later_push_upgrades_a_jam_and_the_driver_hands_over(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
