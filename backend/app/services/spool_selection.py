@@ -37,9 +37,12 @@ the unknown reserve stands down (the same stance the deficit lane already takes
 on undetermined grams). A gap in a ledger that IS in use is the closed hole.
 
 Fail-closed is the START reading only. ``spool_recovery``'s mid-print donor
-search leaves ``require_known_grams`` off by design: a refill runs against a 5 g
-hard floor to keep a live print moving, where refusing an unpriceable roll would
-stall the print it exists to rescue. Two consequences of the start reading are
+search leaves ``require_known_grams`` off by design, and past the protected layers
+it turns the floor OFF (``min_start_g = 0``): a replacement exists to keep a live
+print moving, the gram ledger is not exhaustion evidence (doctrine rule 8 —
+``spent_at`` is), and refusing a present, not-spent roll for its grams would stall
+the print it exists to rescue. Inside the protected layers it passes the ordinary
+floor (rule 4). Two consequences of the start reading are
 deliberate, both on a printer whose ledger speaks: an externally-held roll
 (``vt_tray``) is never inventory-tracked, so it is unpriceable by construction and
 cannot START a print, and a tray with no binding at all is likewise start-blocked.
@@ -648,7 +651,8 @@ def match_filaments_to_slots(
     remaining grams are UNKNOWN is reserved instead of started, because an
     unpriceable roll may hold 5 g. Dispatch / manual-start / preview all pass it;
     the default is OFF for ``spool_recovery``'s mid-print donor search, which must
-    keep a live print fed against a 5 g hard floor (see the module docstring). It
+    keep a live print fed — past the protected layers with the floor off entirely,
+    ``min_start_g = 0`` (see the module docstring). It
     takes effect only when at least one loaded slot HAS quotable grams — a printer
     with no inventory at all is not tracking spools, and a floor that refuses every
     roll would park it rather than protect it.

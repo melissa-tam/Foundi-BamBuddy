@@ -306,9 +306,6 @@ def _outranks(fault_class: AmsFaultClass, kind: str) -> bool:
 _POLL_INTERVAL_S = 1.0  # live-state poll spacing during every confirm wait
 _POST_RESUME_STABLE_S = 60  # a quiet RUNNING on a real feeder must hold this long = success
 _MAX_CANDIDATES = 3  # distinct replacement trays tried before escalating
-# Absolute floor a replacement spool must clear even past the protected layers —
-# never load a known-empty spool. A ledger ≤ 5 g is empty for replacement purposes.
-_RECOVERY_HARD_MIN_G = 5
 # How many times each lever of the release ladder (:data:`_LEVERS`) may be pulled per
 # INCIDENT, judged from the durable evidence log (:class:`_RecoveryEvidence`): a second
 # pull of the same verb against the same wedge measures nothing the first did not
@@ -376,7 +373,6 @@ _ESCALATE_DETAIL: dict[str, str] = {
     "only_low_spools_in_protected_layers": (
         "The only matching spool is below the minimum-start weight this early in the print. Left PAUSED for a human."
     ),
-    "only_near_empty_spools": "Every matching spool is effectively empty. Left PAUSED for a human.",
     "runout_needs_refill": (
         "Filament ran out and the printer only accepts new filament in the SAME slot — "
         "insert filament and resume on the printer."
@@ -461,8 +457,8 @@ class RecoverySettings:
 
 Lever = Literal[
     "resume",
-    "ams_control_resume",
     "resume_then_pause",
+    "ams_control_resume",
     "clean_print_error",
     "ams_control_abort",
     "ams_control_reset",
@@ -473,14 +469,15 @@ Lever = Literal[
 @dataclass(frozen=True)
 class LeverSpec:
     """One release verb: the frame it publishes, whether its read pauses the print on
-    the first RUNNING sample, and the page's one-line name of it.
+    the first RUNNING sample with NOTHING at the feeder (the firmware's retract), and the
+    page's one-line name of it.
 
     ``publish`` is the wire verb and nothing else — True when the client sent the frame.
     What the wire answered is :func:`_read_after`'s alone, for every verb.
     """
 
     publish: Callable[[BambuMQTTClient], bool]
-    pause_on_first_running: bool
+    pause_on_empty_path: bool
     text: str
 
 
@@ -488,16 +485,36 @@ class LeverSpec:
 # spelled; a missing key RAISES at the lookup (:func:`_lever`, the ``ams_command._row``
 # idiom). The ONE place the release verbs are published (AST-pinned in
 # ``test_code_quality``). Vendor evidence per verb (BambuStudio ``DeviceManager.cpp`` /
-# ``StatusPanel.cpp``, the vendored action catalog):
+# ``StatusPanel.cpp``, the vendored action catalog ``backend/app/data/hms_actions.json``):
 #
-# * ``resume`` — ``print.resume``, the error dialog's CONTINUE (``hms_resume``). Freed
-#   009-H2S 2026-07-20 (an EMPTY path); on a LOADED stalled feeder it re-runs the print's
-#   own change and re-holds (002-H2S 2026-09-11; 012-H2S 2026-09-23, re-PAUSEd in 47 s).
-# * ``ams_control_resume`` — ``ams_control("resume")``: the dialog's RETRY and the
-#   extruder-switch panel's "Retry". 012-H2S 2026-09-23: echo SUCCESS, re-held in 87 s.
-# * ``resume_then_pause`` — ``print.resume``, then ``print.pause`` on the FIRST RUNNING
-#   sample that is not quiet: the July 2026-07-20 "workable PAUSE" (a pause that landed
-#   outside the change on an empty path). Unmeasured on a loaded feeder.
+# * ``resume`` — ``print.resume`` (``BambuMQTTClient.resume_print``): BambuStudio's bare
+#   ``command_task_resume`` (``{"print": {"command": "resume", "param": ""}}`` — the fork
+#   sends the same verb with a sequence id and no empty ``param``). It is NOT the error
+#   dialog's CONTINUE: for ``07008006`` / ``07008005`` the catalog offers CONTINUE and
+#   CHECK_ASSISTANT only, and CONTINUE is ``ams_control resume`` (``ams_control_resume``
+#   below; the fork's own dialog dispatcher, ``bambu_mqtt`` ``HMSAction.CONTINUE``, maps
+#   it so). Nor is it Studio's ``command_hms_resume`` / ``command_hms_ignore``, which carry
+#   ``err`` + ``param: "reserve"`` + ``job_id``: no fork publisher has ever sent that shape
+#   (the ``bambu_mqtt`` dialog helper NAMED ``hms_resume`` sends the plain resume). Freed
+#   009-H2S 2026-07-20 (an EMPTY path) — the one measured remote release, so it stays
+#   first; on a LOADED stalled feeder it re-runs the print's own change and re-holds
+#   (002-H2S 2026-09-11; 012-H2S 2026-09-23, re-PAUSEd in 47 s; 012-H2S 2026-09-25,
+#   incidents 341/343, read ``wedged`` twice).
+# * ``resume_then_pause`` — ``print.resume``, then ``print.pause`` on the first RUNNING
+#   sample whose feeder reads EMPTY (:func:`_feeder_position` kind ``empty``) — the July
+#   2026-07-20 "workable PAUSE", a pause that lands outside the change with nothing
+#   loaded. On an EMPTY-path wedge that is the FIRST RUNNING sample (009, unchanged). On
+#   a LOADED stall it is the firmware's own retract of the jammed filament: 012-H2S
+#   2026-09-25 pulled slot 3 back and re-fed the same slot after every resume, the wire
+#   reading ``tray_now`` 2 → 255 → 2 every ~12 s (13:28:34 → 13:29:22), while a pause on
+#   the first RUNNING sample (13:32:06, ``tray_now=2``) landed LOADED and read wedged.
+#   Second in the pull order: it is the only lever whose pause is timed to a posture the
+#   swap can go out from. Dual-nozzle: ``_feeder_position`` prefers the per-extruder map,
+#   which may never read empty through a retract — that case degrades to the ``hung``
+#   arm at the deadline.
+# * ``ams_control_resume`` — ``ams_control("resume")``: the error dialog's CONTINUE for
+#   ``07008006`` / ``07008005``, its RETRY, and the extruder-switch panel's "Retry".
+#   012-H2S 2026-09-23: echo SUCCESS, re-held in 87 s.
 # * ``clean_print_error`` — the dialog's OK / close ("clears whatever error dialog is
 #   currently active"). The FRAME only (``BambuMQTTClient.clean_print_error``): a local
 #   HMS wipe would fake the quiet reading this ladder is judged by. Unmeasured.
@@ -516,37 +533,37 @@ class LeverSpec:
 _LEVERS: dict[Lever, LeverSpec] = {
     "resume": LeverSpec(
         publish=lambda client: client.resume_print(),
-        pause_on_first_running=False,
+        pause_on_empty_path=False,
         text="resume",
-    ),
-    "ams_control_resume": LeverSpec(
-        publish=lambda client: client.ams_control("resume"),
-        pause_on_first_running=False,
-        text="ams_control resume",
     ),
     "resume_then_pause": LeverSpec(
         publish=lambda client: client.resume_print(),
-        pause_on_first_running=True,
+        pause_on_empty_path=True,
         text="resume then pause",
+    ),
+    "ams_control_resume": LeverSpec(
+        publish=lambda client: client.ams_control("resume"),
+        pause_on_empty_path=False,
+        text="ams_control resume",
     ),
     "clean_print_error": LeverSpec(
         publish=lambda client: client.clean_print_error(),
-        pause_on_first_running=False,
+        pause_on_empty_path=False,
         text="clean_print_error",
     ),
     "ams_control_abort": LeverSpec(
         publish=lambda client: client.ams_control("abort"),
-        pause_on_first_running=False,
+        pause_on_empty_path=False,
         text="ams_control abort",
     ),
     "ams_control_reset": LeverSpec(
         publish=lambda client: client.ams_control("reset"),
-        pause_on_first_running=False,
+        pause_on_empty_path=False,
         text="ams_control reset",
     ),
     "ams_control_pause": LeverSpec(
         publish=lambda client: client.ams_control("pause"),
-        pause_on_first_running=False,
+        pause_on_empty_path=False,
         text="ams_control pause",
     ),
 }
@@ -1147,7 +1164,6 @@ _NON_QUARANTINE_REASONS: frozenset[str] = frozenset(
         "multi_feeder_job",  # the JOB's shape refused the swap; the AMS is fine
         "no_eligible_spool",  # inventory: nothing to swap to, no load was ever attempted
         "only_low_spools_in_protected_layers",  # inventory + the grams floor
-        "only_near_empty_spools",  # inventory: every match is effectively empty
         "ams_drying",  # a lockout the farm declined to fight; the AMS is healthy
         "recovery_interrupted",  # a restart artifact — kind-ambiguous, evidence of nothing
         "service_hold",  # the farm never tried: a human holds the printer, and the AMS is not the suspect
@@ -2527,17 +2543,10 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
                     else:
                         await _abort(incident, token=token)
                     return
-                if only_low:
-                    # At/after the protected layers the floor is the hard minimum, so
-                    # "only low" there means every match is effectively empty; below
-                    # them it means below the ordinary minimum-start weight.
-                    reason = (
-                        "only_near_empty_spools"
-                        if incident.layer_at_fault >= incident.settings.protect_layers
-                        else "only_low_spools_in_protected_layers"
-                    )
-                else:
-                    reason = evidence.exhaustion_reason()
+                # ``only_low`` is reachable only INSIDE the protected layers: at or after
+                # them the ledger floor is off (:func:`_match_candidates`), so a present,
+                # not-spent spare is never withheld for its grams.
+                reason = "only_low_spools_in_protected_layers" if only_low else evidence.exhaustion_reason()
                 await _give_up(incident, client, reason, evidence=evidence)
                 return
 
@@ -2971,9 +2980,11 @@ async def _operator_stopped(incident: RecoveryIncident, st, *, published_at: flo
         return await farm_correlation.operator_stop_requested(db, incident.printer_id, incident.job_id)
 
 
-# The reader's two arms that publish ``print.pause`` (:func:`_read_after`): tier 3's
-# first RUNNING sample, and a change hung RUNNING at the deadline.
-PauseArm = Literal["first_running", "hung"]
+# The reader's two arms that publish ``print.pause`` (:func:`_read_after`):
+# ``resume_then_pause``'s first RUNNING sample with nothing at the feeder (the firmware's
+# retract on a loaded stall, the first sample on an empty path), and a change hung
+# RUNNING at the deadline — the fallback when no retract is ever seen.
+PauseArm = Literal["path_empty", "hung"]
 
 
 def _terminal_read(
@@ -3031,9 +3042,15 @@ async def _watch_lever(
     * RUNNING — a quiet path (``incident_resolution.path_quiet``) on a real feeder
       (:func:`_success_reading`) held for :data:`_POST_RESUME_STABLE_S` is the success;
       at the deadline the success reads at once (the stable hold cannot outlast the
-      window). Not quiet on tier 3's FIRST RUNNING sample → ``first_running``; still no
-      success at the deadline → ``hung`` (the live 009 case, ~2.5 min RUNNING in an
-      incomplete change).
+      window). For a lever with :attr:`LeverSpec.pause_on_empty_path`, a RUNNING sample
+      whose feeder reads ``empty`` (:func:`_feeder_position`) → ``path_empty``, quiet or
+      not: on a loaded stall that is the firmware's own retract of the jammed filament
+      (012-H2S 2026-09-25, ``tray_now`` 2 → 255 every ~12 s after a resume), on an empty
+      path it is the first sample, and a quiet RUNNING with nothing fed prints air
+      (shape 39), so pausing it at once is the safe direction. Still no success at the
+      deadline → ``hung`` (the live 009 case, ~2.5 min RUNNING in an incomplete change;
+      and the fallback when no retract is ever seen — a dual-nozzle per-extruder map may
+      never read empty).
     * PAUSE after the printer LEFT it, or with the AMS's state word changed →
       ``wedged`` / ``released`` at once (:func:`_pause_reading`); PAUSE never left →
       the same reading at the deadline, with ``moved`` False.
@@ -3042,7 +3059,6 @@ async def _watch_lever(
     jammed = incident.jammed_global_tray
     deadline = _now() + incident.settings.step_timeout_s
     left = False
-    saw_running = False
     last_fed: FeederPosition | None = None
     holding: tuple[Literal["self_healed", "swapped"], float] | None = None
     while True:
@@ -3071,22 +3087,21 @@ async def _watch_lever(
             return LeverRead(_note_takeover(incident, token, f"lever={lever}"), moved=left, position=position)
         if live == "RUNNING":
             left = True
-            first_running = not saw_running
-            saw_running = True
             quiet = incident_resolution.path_quiet(st)
             success = _success_reading(position, quiet=quiet, budgeted=budgeted)
             if success is None:
                 holding = None
-                if spec.pause_on_first_running and first_running and not quiet:
+                if spec.pause_on_empty_path and position.kind == "empty":
                     logger.info(
-                        "spool_recovery: printer %s RUNNING on a path that is not quiet on the first sample after "
-                        "lever %s (tray_now=%s ams_status_main=%s) — publishing pause (the workable PAUSE)",
+                        "spool_recovery: printer %s RUNNING with nothing at the feeder after lever %s (tray_now=%s "
+                        "ams_status_main=%s quiet=%s) — publishing pause (the workable PAUSE, timed to the retract)",
                         pid,
                         lever,
                         getattr(st, "tray_now", None),
                         getattr(st, "ams_status_main", None),
+                        quiet,
                     )
-                    return "first_running"
+                    return "path_empty"
                 if at_deadline:
                     logger.info(
                         "spool_recovery: printer %s hung RUNNING after lever %s (tray_now=%s ams_status_main=%s "
@@ -3209,7 +3224,7 @@ async def _read_after(
         match watched:
             case LeverRead():
                 read = watched
-            case "first_running" | "hung":
+            case "path_empty" | "hung":
                 landed = client.pause_print() and await printer_manager.await_state(
                     pid, {"PAUSE"}, incident.settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
                 )
@@ -3553,8 +3568,9 @@ async def _select_replacement(incident: RecoveryIncident, tried: set[int]) -> tu
     """Pick the next eligible loaded tray for the jammed filament, reusing the
     dispatcher's own selection functions. Returns ``(global_tray_id | None,
     only_low)`` — ``only_low`` True when the only match was withheld by the
-    layer-conditional minimum-start floor. External / jammed / already-tried
-    trays are excluded; out-of-rotation exclusion is inside the matcher.
+    minimum-start floor, which applies only inside the protected layers
+    (:func:`_match_candidates`). External / jammed / already-tried trays are
+    excluded; out-of-rotation / spent / archived exclusion is inside the matcher.
 
     Two robustness paths added after the 18:45 runout incident (a full spool sat
     unusable in a BARE tray while recovery escalated ``no_eligible_spool`` in
@@ -3758,11 +3774,18 @@ async def _match_candidates(
         base_min = await _read_min_start_g(db)
         policy_setting = await get_setting(db, "spool_selection_policy")
 
-    # The layer rule is a floor PARAMETER, not new floor logic: below the
-    # protected-layer threshold a low spool stays a backup donor; at/after it the
-    # floor drops to the hard minimum — a low-but-not-empty spool is a valid
-    # mid-print replacement, but a known-empty one (≤ _RECOVERY_HARD_MIN_G) never is.
-    min_start_g = _RECOVERY_HARD_MIN_G if incident.layer_at_fault >= incident.settings.protect_layers else base_min
+    # The layer rule is a floor PARAMETER, not new floor logic. Inside the protected
+    # layers the ordinary minimum-start floor holds (doctrine rule 4: the first layers
+    # are a print START, and a low roll there stays a backup donor, never the feeder).
+    # At or after them the floor is OFF (``min_start_g=0``, the matcher's own "no floor"):
+    # the gram ledger never vetoes a present, not-spent spare. The ledger is the
+    # untrustworthy half here (rule 8) — 004-H2S 2026-09-17 refused spool 684 at 1013 g
+    # used of a 1000 g label and it then printed ~23 h to a real runout; 011-H2S refused
+    # rows that ran 16 h and 3 days more. Exhaustion is ``spent_at``, and spent,
+    # out-of-rotation and archived rolls stay hard-excluded inside the matcher whatever
+    # the floor; tray presence (``_present`` above) guards the load itself — and is the
+    # only guard in Spoolman mode, which carries none of those flags.
+    min_start_g = 0 if incident.layer_at_fault >= incident.settings.protect_layers else base_min
     policy = effective_policy(policy_setting, backup_on)
 
     outcome = match_filaments_to_slots(
