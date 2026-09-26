@@ -1,4 +1,4 @@
-"""Integration tests for scheduled production runs (Phase 5).
+"""Integration tests for scheduled production runs.
 
 A run can carry a one-time deferred start: the operator's ``scheduled_start_at`` is
 stamped onto every plate item's ``scheduled_time`` (the existing scheduler gate then

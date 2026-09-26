@@ -579,7 +579,7 @@ function SortableQueueItem({
                 {item.batch_name}
               </span>
             )}
-            {/* Farm run identity (Phase 4.3g): links to the run detail page. */}
+            {/* Farm run identity: links to the run detail page. */}
             {item.production_run_id != null && (
               <Link
                 to={`/production-runs/${item.production_run_id}`}
@@ -1634,7 +1634,7 @@ export function QueuePage() {
     onError: () => showToast(t('queue.toast.resumeAfterFailureFailed'), 'error'),
   });
 
-  // Phase 4.2: re-check every system-staged (low-spool) item against live spool
+  // Re-check every system-staged (low-spool) item against live spool
   // state and release the resolved ones. Distinct from the per-row Play, which
   // acknowledges the deficit and prints anyway.
   const releaseStagedMutation = useMutation({
@@ -1961,7 +1961,7 @@ export function QueuePage() {
   // downstream `require_previous_success` items. We surface a per-printer
   // Resume banner above the active queue so the user can clear the gate +
   // restore the skipped jobs in one click, without re-queuing each one.
-  // Detection key: skipped + the scheduler's machine code (Phase 4.3f) —
+  // Detection key: skipped + the scheduler's machine code —
   // never the English error_message, which is display-only. Other skip
   // reasons (filament deficit, etc.) get their own UX and stay untouched.
   const gateBlockedPrinters = useMemo<
@@ -1994,7 +1994,7 @@ export function QueuePage() {
       .sort((a, b) => a.printerName.localeCompare(b.printerName));
   }, [queue]);
 
-  // Phase 4.2: rows staged by the low-spool guard (manual_start AND
+  // Rows staged by the low-spool guard (manual_start AND
   // filament_short — the SYSTEM-staged marker). Grouped under one banner with
   // a "Re-check and release" action; the per-row Play stays the
   // acknowledge-the-deficit path ("Print anyway").
@@ -2146,7 +2146,7 @@ export function QueuePage() {
         </div>
       )}
 
-      {/* Phase 4.2: low-spool staging banner. Groups the system-staged rows
+      {/* Low-spool staging banner. Groups the system-staged rows
           (manual_start + filament_short) under one line whose ask is PHYSICAL:
           load filament into the printer(s) named below. The farm detects the
           load (AMS-change hook + 60 s periodic net) and releases the items whose
@@ -2707,7 +2707,7 @@ export function QueuePage() {
             t('queue.confirm.removeTitle')
           }
           message={(() => {
-            // Farm-aware copy (Phase 4.3g + deferred 3.1 item): a run-managed
+            // Farm-aware copy: a run-managed
             // item spells out the run consequence — a stop is an operator stop
             // (no auto-retry, printer held); cancel/remove leave the run short
             // until the next Resume tops it up.

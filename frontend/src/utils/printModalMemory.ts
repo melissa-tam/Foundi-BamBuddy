@@ -1,5 +1,5 @@
 /**
- * Per-file "remember my last choices" persistence for the PrintModal (plan 2c).
+ * Per-file "remember my last choices" persistence for the PrintModal.
  *
  * Stores the operator's last CREATE-mode selections keyed by the file being
  * printed, so re-opening the modal for the same library file / archive
@@ -8,8 +8,8 @@
  *
  * NOT persisted here: AMS manual slot mappings. Slot contents (which spool sits
  * in which tray) go stale between sessions, so a remembered mapping would point
- * at the wrong spool. Manual mappings only carry over on a same-context requeue
- * (plan 2a), where the item's printer/plate context is known-good.
+ * at the wrong spool. Manual mappings only carry over on a same-context requeue,
+ * where the item's printer/plate context is known-good.
  */
 import type { AssignmentMode, PrintOptions } from '../components/PrintModal/types';
 

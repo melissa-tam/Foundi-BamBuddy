@@ -1,6 +1,5 @@
 /**
- * First-article approval banner (farm production, Phase 3; self-contained in
- * Phase 4, F1).
+ * First-article approval banner (farm production).
  *
  * Extracted verbatim from ProductionRunsPage so BOTH the runs list and the run
  * detail page render the same approve/reject controls, then extended so the
@@ -33,7 +32,7 @@ import { useToast } from '../contexts/ToastContext';
 import type { ProductionRun } from '../types/productionRuns';
 
 /**
- * First-article inspection aids (Phase 4, F1): the finished part's finish photo
+ * First-article inspection aids: the finished part's finish photo
  * (tap → full-size in a new tab; degrades to a "photo unavailable" note if the
  * image 403s for a user without archive perms or was pruned) and a
  * collapsed-by-default live camera view of the printer that produced it. The

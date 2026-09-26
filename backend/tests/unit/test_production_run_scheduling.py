@@ -1,4 +1,4 @@
-"""Unit tests for the production-run deferred-start time helpers (Phase 5).
+"""Unit tests for the production-run deferred-start time helpers.
 
 ``_as_utc`` / ``resolve_scheduled_start`` normalise an operator-supplied start
 time to the naive-UTC convention of ``PrintQueueItem.scheduled_time`` and collapse

@@ -1,6 +1,5 @@
 /**
- * Tests for the Farm production event toggles added to NotificationProviderCard
- * (Phase 6 / finding F4).
+ * Tests for the Farm production event toggles added to NotificationProviderCard.
  *
  * Coverage:
  * - The "Farm production" section renders in the expanded settings panel with a

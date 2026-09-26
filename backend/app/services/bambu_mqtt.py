@@ -759,10 +759,8 @@ class PrinterState:
     # 0300_400C / 0500_400E) for the current print. Set when the cancel echo is
     # seen and reset on a new print. Distinguishes an operator screen-stop from a
     # genuine print failure so the farm policy skips retry/quarantine for it.
-    # Recorded here in Phase 1; the classify/attribution logic consumes it in
-    # Phase 3.
     user_cancel_seen_at: float | None = None
-    # Device-reported printer model (Phase 2): first non-empty of the device dict's
+    # Device-reported printer model: first non-empty of the device dict's
     # dev_model_name / dev_product_name / project_name, when the firmware reports
     # one. None on firmwares that emit none (the live H2S, fw 01.01.02.00, reports
     # NONE of them) — absent report ⇒ never a model mismatch ⇒ zero behaviour
@@ -3204,7 +3202,7 @@ class BambuMQTTClient:
 
         # Create a hash of relevant AMS data to detect changes.
         #
-        # Two invariants (W6 mid-run refill recognition):
+        # Two invariants (mid-run refill recognition):
         #  1. MERGED basis (not the raw incremental ams_list): a partial MQTT
         #     update that omits fields — state, remain — would flap the hash and
         #     storm the callback. merged_ams is the authoritative merged tray
@@ -3548,7 +3546,7 @@ class BambuMQTTClient:
             # diagnosing. INFO level so it shows up without debug logging. Falls
             # back to dumping device.keys() if none of the known fields are present
             # (so a future Bambu rename like `model_name` is still observable).
-            # Store the device-reported model (Phase 2, device-vs-declared
+            # Store the device-reported model (device-vs-declared
             # reconciliation): first non-empty of the known id fields. The live
             # H2S (fw 01.01.02.00) reports NONE of these, so reported_model stays
             # None there — future firmwares / the H2C may populate one, at which
@@ -4012,7 +4010,7 @@ class BambuMQTTClient:
                         # already suppresses 0500_400E for the same reason.
                         short_code = f"{(attr >> 16) & 0xFFFF:04X}_{code & 0xFFFF:04X}"
                         if short_code in _HMS_USER_ACTION_CODES:
-                            # Record the operator-cancel observation (Phase 3.1) so the
+                            # Record the operator-cancel observation so the
                             # farm policy can distinguish a screen-stop from a genuine
                             # failure — while STILL keeping the echo out of hms_errors.
                             self.state.user_cancel_seen_at = time.time()
@@ -4070,7 +4068,7 @@ class BambuMQTTClient:
                     # not surface as faults on the printer card.
                     if short_code in _HMS_USER_ACTION_CODES:
                         # Cancel echo — keep it out of hms_errors, but record the
-                        # operator-cancel observation (Phase 3.1) so the farm policy
+                        # operator-cancel observation so the farm policy
                         # can tell a screen-stop from a genuine failure.
                         self.state.user_cancel_seen_at = time.time()
                     else:
@@ -4585,7 +4583,7 @@ class BambuMQTTClient:
             # Reset completion tracking for new print
             self._was_running = True
             self._completion_triggered = False
-            # W6.1: last_loaded_tray means "last tray fed THIS job" — reset it so a
+            # last_loaded_tray means "last tray fed THIS job" — reset it so a
             # runout PAUSE renders the was-feeding ring for the CURRENT job's slot,
             # not a stale tray leaked from the previous print.
             self.state.last_loaded_tray = -1
@@ -4600,7 +4598,7 @@ class BambuMQTTClient:
             # deliberately sets it False, which is the whole point of the flag.
             self._peaks_reliable = True
             # A new print starts fresh: any operator-cancel echo belonged to the
-            # PREVIOUS print (Phase 3.1). Clear so it can't leak into this print's
+            # PREVIOUS print. Clear so it can't leak into this print's
             # completion classification.
             self.state.user_cancel_seen_at = None
             # Clear and seed tray change log for mid-print usage splitting
@@ -4629,7 +4627,7 @@ class BambuMQTTClient:
                     "subtask_name": self.state.subtask_name,
                     # Printer-echoed submission id (matches last_dispatch_subtask_id
                     # when Bambuddy dispatched the job). Lets the terminal-status
-                    # correlation bind this print to its queue item (Phase 1).
+                    # correlation bind this print to its queue item.
                     "subtask_id": self.state.subtask_id,
                     "remaining_time": self.state.remaining_time * 60
                     if self.state.remaining_time > 0
@@ -4779,7 +4777,7 @@ class BambuMQTTClient:
                     "subtask_name": self.state.subtask_name,
                     # Printer-echoed submission id — the terminal-status correlation
                     # matches it against the queue item's dispatch_subtask_id to bind
-                    # this finish to the exact unit that produced it (Phase 1).
+                    # this finish to the exact unit that produced it.
                     "subtask_id": self.state.subtask_id,
                     "raw_data": data,
                     "timelapse_was_active": timelapse_was_active,
@@ -4798,7 +4796,7 @@ class BambuMQTTClient:
                     # plate?" must fail closed instead of trusting a zero.
                     "peaks_reliable": self._peaks_reliable,
                     **job_consumption_evidence(self.state),
-                    # Operator-cancel echo seen during this print (Phase 3.1): lets the
+                    # Operator-cancel echo seen during this print: lets the
                     # terminal-status handler classify a screen-stop and skip retry /
                     # quarantine for it. False on a genuine failure or normal finish.
                     "user_cancel_observed": bool(self.state.user_cancel_seen_at),

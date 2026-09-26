@@ -1,4 +1,4 @@
-"""Low-spool staging release tests (Phase 4.2).
+"""Low-spool staging release tests.
 
 ``release_filament_staged`` re-runs the deficit check for SYSTEM-staged items
 (``manual_start`` + ``filament_short``) and un-stages ONLY the ones whose

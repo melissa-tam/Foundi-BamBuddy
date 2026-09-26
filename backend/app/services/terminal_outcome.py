@@ -82,7 +82,7 @@ _HMS_FAILURE_REASONS: dict[str, str] = {
     "0701_8013": "Clogged nozzle",
     "0702_8003": "Clogged nozzle",
 }
-# The printer's own pre-print plate check (Phase 3.3), from the one code set the wire
+# The printer's own pre-print plate check, from the one code set the wire
 # layer defines, so the category and the trip lane can never name different codes.
 for _occupancy_code in _HMS_PLATE_OCCUPANCY_CODES:
     _HMS_FAILURE_REASONS.setdefault(_occupancy_code, "Plate not empty (printer vision)")

@@ -52,10 +52,10 @@ class BuiltEject:
     That is now a DECISION rather than a description. Since the block became one Z flow,
     an assist-OFF block's P5→P50 span is no longer empty: it holds the 63 mm open-loop
     lift to the sweep height plus the X/Y home — real motion this lane could bound. It
-    is left DISARMED for such profiles this wave anyway: no SKU runs an assist-off
+    is left DISARMED for such profiles anyway: no SKU runs an assist-off
     profile, so the lane would gain no coverage today, and arming it cannot make an
     existing eject safer while it can make a healthy one killable. The alternative,
-    for the wave that wants it, is to arm on the SPAN rather than on the profile flag —
+    when it is wanted, is to arm on the SPAN rather than on the profile flag —
     the ``_EDGE_LANE_MIN_LEAD_S`` test in ``remote.py`` already refuses a span too close
     to the whole-job deadline to be worth timing, which is the same question asked
     honestly.
@@ -186,7 +186,7 @@ async def build_part_present_eject_file(
     # The edge lane is armed only for a profile that actually drops the bed — see
     # BuiltEject.drop_span_s for why that is now a decision rather than a description
     # (an assist-off block's P5→P50 span holds its lift and its home, and could be
-    # bounded; it is deliberately not, this wave).
+    # bounded; it is deliberately not).
     drop_span_s = segments.drop_span_s if profile.bed_drop_clearance_mm is not None else None
 
     try:

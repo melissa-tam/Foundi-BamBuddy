@@ -1,4 +1,4 @@
-"""Tests for services.slot_pipeline — the W3a orchestrator.
+"""Tests for services.slot_pipeline — the orchestrator.
 
 The decision table (``slot_state``) is pure and pinned by its own suite; this one pins
 what the orchestrator DOES with each answer: the candidate lookups it feeds the table,
@@ -103,9 +103,9 @@ class _Recorder:
 class _FakeClient:
     """Minimal stand-in for a BambuMQTTClient's read-only wire-safety surface.
 
-    The three exist-bit fields are the triage surface wave 2 put on ``PrinterState``
+    The three exist-bit fields are the triage surface on ``PrinterState``
     (``ams_tray_exist_bits`` / ``ams_bits_trusted`` / ``last_full_report_at``), read by
-    WS7's release-evidence record. Their defaults are what a client that has never carried
+    the release-evidence record. Their defaults are what a client that has never carried
     a mask reports, so every pre-existing test keeps the exact client it had.
     """
 
@@ -1222,7 +1222,7 @@ _LEDGER_T1 = datetime(2026, 8, 12, 9, 56, 0)
 
 @pytest.mark.asyncio
 async def test_a_debounce_stamps_no_swap_boundary_for_the_overcharge_reconciler(db_session, printer_factory, env):
-    """The WS1 ↔ 2026-08-12 interaction a reviewer would not go looking for.
+    """The de-bounce ↔ 2026-08-12 interaction a reviewer would not go looking for.
 
     ``SpoolAssignment.created_at`` is not decoration: ``reconcile_ledger_overcharges`` reads
     it as the ONE instant at which an unobserved roll swap could have happened. A de-bounce
@@ -1260,7 +1260,7 @@ async def test_a_debounce_stamps_no_swap_boundary_for_the_overcharge_reconciler(
     assert donor.archived_at is None and donor.weight_used == pytest.approx(1200.5)
     assert await _spool_count(db_session) == 1  # no phantom successor
 
-    # Control arm: the pre-wave stamp — a boundary meaningfully later than the row's own
+    # Control arm: the ordinary stamp — a boundary meaningfully later than the row's own
     # creation — and the very same sweep acts.
     row.created_at = _LEDGER_T1
     await db_session.commit()
@@ -1399,12 +1399,12 @@ async def test_release_of_an_unstamped_row_dismisses_nothing(db_session, printer
     assert dismissed == []
 
 
-# --- WS7: release evidence (diagnosis only) ---------------------------------
+# --- Release evidence (diagnosis only) --------------------------------------
 #
-# The wave that scoped the de-bounce lane measured 8 days of production: of 52
+# The de-bounce lane's scope rests on 8 days of production: of 52
 # last-location reclaims with a matched prior release on the same slot, 14 came back in
 # under five minutes and four at 0.0 minutes — four printers, one minute, the same spool.
-# Those are SPURIOUS releases, and since wave 2 made a cleared exist bit
+# Those are SPURIOUS releases, and since a cleared exist bit is
 # release-authorizing one glitched bit hard-DELETES a binding. The de-bounce contains that
 # damage; nothing explained it. These pin the record that makes the next one explainable
 # from the log alone, and — the assertion that matters most — that collecting it moved
@@ -1604,7 +1604,7 @@ async def test_collecting_the_evidence_changes_nothing_about_the_release(
 ):
     """THE SCOPE BOUNDARY, asserted rather than promised.
 
-    WS7 is diagnosis, not a fix: a release that happens today must still happen, at the
+    Release evidence is diagnosis, not a fix: a release that happens today must still happen, at the
     same moment, with the same verdict and the same resulting DB state. The proof is to run
     the identical release twice — once with the record built, once with the builder
     stubbed out entirely — and compare every observable: the decision, whether it applied,
@@ -1924,7 +1924,7 @@ async def test_replace_spent_skips_when_the_tray_is_not_loaded(db_session, print
 
 @pytest.mark.asyncio
 async def test_replace_spent_mints_the_default_and_consumes_the_cycle_once(db_session, printer_factory, env):
-    """The W1 silent spent→mint: the drained row retires, a fresh row from the tagless
+    """The silent spent→mint: the drained row retires, a fresh row from the tagless
     DEFAULT takes the slot (the tray still carries the departed config — firmware
     leftover), the config is pushed, and the cycle is spent exactly once."""
     printer = await printer_factory()
@@ -2301,7 +2301,7 @@ async def test_the_read_this_arm_concludes_on_is_one_the_REAL_need_authority_com
     # The operator pulled the Bambu roll and seated a third-party one: a qualified physical
     # cycle the presence lane recorded and no read has answered yet. Aged past
     # ``spool_tagless._CONFIG_SETTLE_MAX_S`` so the wire-protection settle window has
-    # concluded — which is not a test convenience but the very shape this wave is about: a
+    # concluded — which is not a test convenience but the very shape this test is about: a
     # slot whose physical change has gone unanswered LONGER than the settle cap is a parked
     # slot, and parked is where G7 lived.
     ams_presence._physical_cycle_at[(printer.id, 0, 1)] = (
@@ -2336,7 +2336,7 @@ async def test_the_read_this_arm_concludes_on_is_one_the_REAL_need_authority_com
 async def test_a_spent_tagged_binding_under_a_CONFIGURED_tray_concludes_too(db_session, printer_factory, env):
     """Row 4a′ — row 5a's missing twin, end to end.
 
-    The same slot, the same answer, and before this wave it parked on ``spent_latch`` for no
+    The same slot, the same answer, and it used to park on ``spent_latch`` for no
     better reason than that the firmware had left the departed roll's ``tray_type`` behind,
     which is the ordinary state of a tray after a swap. Proof does not become less positive
     because the tray happens to carry configuration."""
@@ -2764,7 +2764,7 @@ async def test_two_passes_for_one_printer_run_sequentially(db_session, printer_f
     Two AMS pushes ~30 ms apart is ordinary MQTT burst behaviour; if both read "no
     assignment for this slot" before either writes, both INSERT and the second one hits
     the unique constraint. This lock is the fork's ONE defence against that (it replaced
-    ``main.py``'s per-printer assignment lock at the W3b cutover).
+    ``main.py``'s per-printer assignment lock at the slot-pipeline cutover).
     """
     printer = await printer_factory()
     order: list[str] = []
@@ -2848,7 +2848,7 @@ async def test_a_poisoned_observation_never_escapes_and_the_pass_continues(db_se
 class TestUnknownTagPrompt:
     """With auto-add OFF the table refuses to mint an unowned roll, and the operator
     gets a per-slot prompt instead. The prompt and its dedup moved here from
-    ``main.py`` at the W3b cutover, because exactly one decision raises it and exactly
+    ``main.py`` at the slot-pipeline cutover, because exactly one decision raises it and exactly
     two pipeline outcomes — an emptied slot and a successful bind — clear it."""
 
     TAG = "AABBCCDD00000100"
@@ -3005,7 +3005,7 @@ class TestStaleEmptyReplay003T2:
         await db_session.refresh(spool)
         assert spool.last_location_at is not None
         assert spool.archived_at is None  # the roll is inventory, not retired
-        # The AUDIT line specifically: a release now also emits WS7's ``release-evidence``
+        # The AUDIT line specifically: a release now also emits the ``release-evidence``
         # record from this same logger, so the selector names the audit grammar's own
         # prefix instead of taking whichever ``[slot-state]`` line came first.
         line = next(m for m in _records(caplog, logging.INFO) if m.startswith(f"[slot-state] printer={printer.id}"))

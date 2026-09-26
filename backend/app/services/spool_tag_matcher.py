@@ -644,7 +644,7 @@ async def get_spool_by_tag(db: AsyncSession, tag_uid: str, tray_uuid: str, *, co
         # DELETED: Bambu tag uids all end "00000100", so a suffix-8 LIKE matched very
         # nearly the entire inventory and any two distinct rolls could be merged onto
         # one ledger row — with `converge=True` making the merge permanent
-        # (2026-08-01 false-merge hazard, plan §"Root causes confirmed").
+        # (2026-08-01 false-merge hazard).
         if len(tag_uid_norm) >= 8:
             like_patterns = [
                 # Stored form carries the whole scanned uid at its end (legacy
@@ -716,7 +716,7 @@ async def find_spool_sharing_tray_uuid(db: AsyncSession, tray_uuid: str) -> Spoo
     uuid?", with no tag fallback and no widening. Callers want the narrow question when
     they adjudicate tag disagreements THEMSELVES rather than delegating:
 
-    * the W3 slot orchestrator's uuid-primary candidate lookup — the uuid-owning row is
+    * the slot orchestrator's uuid-primary candidate lookup — the uuid-owning row is
       the first candidate it offers ``slot_state.resolve``, the exact-tag row second;
     * the re-spool sibling guard (``spool_respool.RespoolSiblingConflict``), which must
       distinguish a reused-type row already holding this uuid (409) from the donor roll

@@ -1,4 +1,4 @@
-"""Unit tests for the farm capability-matching dispatch gate (Phase 4).
+"""Unit tests for the farm capability-matching dispatch gate.
 
 The decision matrix is exercised against the PURE ``evaluate_capability`` (no DB,
 no MQTT); the async ``check_dispatch_capability`` wrapper is tested for the

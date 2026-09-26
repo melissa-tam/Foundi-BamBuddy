@@ -1637,8 +1637,8 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # ~2h40m because this code was outside the trigger set). A swap still helps,
     # but the extruder is the common factor on a re-fault.
     (("0300",), "801E", _ShortRow(_MECHANICAL, extruder_side=True)),
-    # The send-out / feed-into-extruder families. Classified from the start (WS2a)
-    # and swap triggers since the 2026-08-09 operator-ratified widening (WS2b) —
+    # The send-out / feed-into-extruder families. Classified from the start
+    # and swap triggers since the 2026-08-09 operator-ratified widening —
     # the fault they name is the same obstruction the 8010 family names, one step
     # further along the path.
     #
@@ -1799,13 +1799,13 @@ def runout_external_short_codes() -> frozenset[str]:
 def mechanical_feed_short_codes() -> frozenset[str]:
     """Feed faults an obstruction or a slipping path causes — fresh filament can clear them.
 
-    Since the 2026-08-09 operator-ratified widening (WS2b) this IS the jam-swap
+    Since the 2026-08-09 operator-ratified widening this IS the jam-swap
     machine's trigger vocabulary: ``spool_recovery`` derives its two trigger sets by
     splitting this class on :func:`extruder_side_short_codes`, with no second marker
-    in between. The WS2a ``legacy_swap`` pin that held the machine at the 8010/801E
+    in between. The ``legacy_swap`` pin that held the machine at the 8010/801E
     subset was scaffolding for a behavior-neutral relocation and is deleted — a
     marker whose only job is "do not act on the classification yet" cannot outlive
-    the wave that acts on it.
+    the change that acts on it.
     """
     return _MECHANICAL_FEED_SHORTS
 
@@ -1968,7 +1968,7 @@ class FaultCandidate:
 def live_candidates(state) -> frozenset[FaultCandidate]:
     """Every ACTIONABLE AMS fault standing on the printer right now.
 
-    Derived from ALL live ``state.hms_errors`` entries through the WS2a taxonomy
+    Derived from ALL live ``state.hms_errors`` entries through the fault taxonomy
     (``hms_errors.classify_hms_entry``, which resolves the two wire lanes), not from
     the notification dedup's "new codes". That decoupling is the fix for the silent
     class: a code STANDING at restart (``notify_dedup.seed_standing`` marks it

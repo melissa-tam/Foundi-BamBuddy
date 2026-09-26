@@ -1,12 +1,11 @@
-"""Derived AMS slot state + the ONE identity-resolution decision table (W1).
+"""Derived AMS slot state + the ONE identity-resolution decision table.
 
 Three pure functions and their vocabulary:
 
 * :func:`derive_state` — ``state = f(observation, binding)``. NOTHING is persisted:
-  a stored copy would be a second source of truth that can drift from the wire,
-  which is the disease this rebuild cures (plan §"Schema — NO NEW TABLES"). The
+  a stored copy would be a second source of truth that can drift from the wire. The
   durable facts the state is derived FROM already exist: the assignment row,
-  ``spool.spent_at`` (the W1 runout latch), ``spool_assignment.pre_configured_at``.
+  ``spool.spent_at`` (the runout latch), ``spool_assignment.pre_configured_at``.
 * :func:`resolve` — the decision table. Flat, exhaustively commented, one row per
   situation. It returns a :class:`Decision`; it never performs it.
 * :func:`post_state` — the state an APPLIED decision leaves behind. ``derive_state``
@@ -14,7 +13,7 @@ Three pure functions and their vocabulary:
   line and can never be its right side without printing a tautology.
 
 **I/O-free by contract.** No session, no DB models, no awaits, and no imports of
-modules that pull either. The orchestrator (W2/W3) fetches candidates, calls these,
+modules that pull either. The orchestrator fetches candidates, calls these,
 and applies the returned decision. If this module ever needs an ``await``, the
 design is wrong.
 
@@ -33,7 +32,7 @@ written for the same shape. Three consequences drive :func:`identity_relation`:
   indistinguishable without the uuid), so it must defer for a full read rather than
   mint — minting there would create a duplicate ledger row for one physical roll.
 
-The observation layer's atomic-pair rule STAYS exactly as it was: a push asserts only
+The observation layer's atomic-pair rule: a push asserts only
 the members it actually carried, never members inherited from an earlier push. That
 rule is precisely what makes :func:`identity_relation` honest — it is the reason
 "both sides asserted this member" is a fact and not a merge artefact.
@@ -89,7 +88,7 @@ class DecisionKind(str, Enum):
       de-bounce must not stamp the swap boundary the ledger reconciler reads).
     * ``RELEASE`` — unbind: the slot is empty and the roll's location claim is no
       longer true (operator ruling 1 — assignment = physical location truth).
-    * ``REPLACE_SPENT`` — the W1 silent spent→mint: archive the drained row and mint
+    * ``REPLACE_SPENT`` — the silent spent→mint: archive the drained row and mint
       its replacement, no prompt (the runout already proved the roll is gone).
     * ``DEFER`` — do nothing THIS push; a wire-safety input or an unresolved
       identity says now is the wrong moment. Always safe to repeat.
@@ -207,7 +206,7 @@ class BindingView:
     ``fingerprint_type`` / ``fingerprint_color`` are "the filament this row stands
     for" — the assignment's fingerprint for a bound row, the spool's material/rgba
     for an unbound candidate. ``pre_configured`` mirrors
-    ``spool_assignment.pre_configured_at is not None`` (W2 column; it replaces the
+    ``spool_assignment.pre_configured_at is not None`` (it replaces the
     fragile blank-fingerprint inference).
     """
 
@@ -296,7 +295,7 @@ class ResolutionContext:
     # runout code). Also computed outside the table.
     runout_suspect: bool = False
     # A physical roll cycle (≥ _MIN_PHYSICAL_ABSENT_S absence) is pending on this
-    # slot — the ONLY thing that releases the W1 spent latch (doctrine rule 6:
+    # slot — the ONLY thing that releases the spent latch (doctrine rule 6:
     # duration is a flap filter, never identity).
     qualified_cycle_pending: bool = False
     # A commanded DISCOVERY read on this slot ANSWERED "no tag" while something is still
@@ -306,8 +305,8 @@ class ResolutionContext:
     #
     # Computed for ANY binding that CLAIMS a tag (doctrine rule 11, 2026-08-19) — spent or
     # live, bare tray or configured — and consumed by the four arms
-    # :func:`_no_tag_answer_contradicts` gates. It was scoped to the spent+bare
-    # constellation until this wave, which is why scenario G7 (a Bambu roll swapped for a
+    # :func:`_no_tag_answer_contradicts` gates. It was once scoped to the spent+bare
+    # constellation only, which is why scenario G7 (a Bambu roll swapped for a
     # third-party one, the tray reporting configuration and no tag) persisted silently with
     # the wrong row bound. False everywhere else, and False for "not yet asked": silence is
     # not an answer (scenario G10).
@@ -343,7 +342,7 @@ def derive_state(obs: TrayObservation, binding: BindingView | None) -> SlotState
     Order is load-bearing:
 
     1. A spent binding is ``SPENT_AWAITING_SWAP`` regardless of presence — that IS
-       the W1 runout latch (the binding + ``spool.spent_at`` are its durable
+       the runout latch (the binding + ``spool.spent_at`` are its durable
        storage). Presence flaps at the runout instant, so keying the latch on
        presence would phantom-mint over a still-seated dead roll.
     2. A pre-configured binding with the tray not (yet) present is
@@ -480,12 +479,11 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         # declared empty cannot come back holding filament, so the tag is on a DIFFERENT
         # roll. That is CONCLUDED from evidence, never asked.
         #
-        # This row used to not exist and the lane was spent-BLIND in both directions: a
-        # bound finished row fell to 2.1's KEEP (the slot kept describing filament that no
-        # longer existed, and the fresh roll printed against a ledger reading 0 g
-        # remaining), and an unbound one fell to 2.3's BIND — the ledger RESURRECTION that
-        # incident shape 31 is made of, reached here through the tagged door instead of
-        # the breadcrumb one.
+        # Without this row the lane is spent-BLIND in both directions: a bound finished
+        # row falls to 2.1's KEEP (the slot describes filament that no longer exists, and
+        # the fresh roll prints against a ledger reading 0 g remaining), and an unbound
+        # one falls to 2.3's BIND — the ledger RESURRECTION of incident shape 31, reached
+        # through the tagged door instead of the breadcrumb one.
         if _finished_roll_reading_loaded(binding, obs) and relation == "same":
             # The finished row HOLDS this slot, so retiring it and minting its successor is
             # one transition, not two — the same ``REPLACE_SPENT`` arm every other spent
@@ -526,14 +524,13 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         candidate = ctx.identity_candidate
         if candidate is not None and candidate.spent:
             # 2.3a — the row that owns this identity is a FINISHED roll (the second half
-            # of ruling 3, and the branch that had no test in either direction). It is the
-            # normal post-runout shape for a tagged roll: the AMS clears the drained
-            # slot's exist bit ~3 min BEFORE it declares the runout, so the binding is
-            # released first and the spent stamp lands on an UNBOUND row (the 2026-08-13
-            # tier-2 attribution). The operator then puts a fresh roll on the reused core,
-            # the tag reads, and this lane used to BIND the drained row straight back onto
-            # the slot — the fresh roll instantly reading 0 g remaining and staging every
-            # run behind it.
+            # of ruling 3). It is the normal post-runout shape for a tagged roll: the AMS
+            # clears the drained slot's exist bit ~3 min BEFORE it declares the runout, so
+            # the binding is released first and the spent stamp lands on an UNBOUND row
+            # (the 2026-08-13 tier-2 attribution). The operator then puts a fresh roll on
+            # the reused core and the tag reads; binding the drained row straight back onto
+            # the slot would leave the fresh roll reading 0 g remaining and stage every run
+            # behind it.
             #
             # A finished roll is not a bindable owner, so it is treated as NO owner and the
             # lane below decides — under exactly the gates every other unowned identity
@@ -612,7 +609,7 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
                 reason="unknown_identity_auto_add",
             )
         # Auto-add off: the operator prompt lane belongs to the orchestrator (a
-        # durable prompt, not a WS-only broadcast — the pre-W1 gap).
+        # durable prompt, not a WS-only broadcast).
         return Decision(DecisionKind.NONE, reason="unknown_tag_prompt_owed")
 
     # -- Row 3: the slot is EMPTY on the wire --------------------------------
@@ -622,7 +619,7 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         if binding is None:
             return Decision(DecisionKind.NONE, reason="empty_unbound")
         if binding.spent:
-            # W1 latch: the spent binding is the durable "this tray ran dry" state.
+            # Spent latch: the spent binding is the durable "this tray ran dry" state.
             # It survives the core physically leaving and self-clears at the next
             # qualified swap (row 4a) — not here.
             return Decision(DecisionKind.KEEP, spool_id=binding.spool_id, reason="spent_latch_on_empty")
@@ -705,7 +702,7 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
     # "No tag" is the fleet's common case for third-party rolls (doctrine rule 2:
     # the tagless default is assumed unless a tag or an operator says otherwise).
     if obs.config_nonempty:
-        # 4a — the W1 spent latch releases ONLY on a qualified physical cycle, for a
+        # 4a — the spent latch releases ONLY on a qualified physical cycle, for a
         # spent binding of ANY tag-ness. The old "tagless rows only, a spent TAGGED row
         # belongs to the respool tiers (doctrine rule 3)" reasoning was the deadlock: the
         # tiers act when a TAG IS READ, which is ROW 2, not this row — and this row is
@@ -717,7 +714,7 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         #
         # "Of ANY tag-ness" needs one honest qualification: the release SIGNAL only reaches
         # this row because ``spool_tagless._maybe_prompt_fresh_roll`` checks spent-ness
-        # BEFORE tag-ness (fixed in this same wave) — a tagged spent binding whose cycle was
+        # BEFORE tag-ness — a tagged spent binding whose cycle was
         # instead routed to the fresh-roll prompt would never present
         # ``qualified_cycle_pending`` here. And this row needs a CONFIGURED tray, so the
         # constellations with no config and no cycle at all — a bare tray under a spent
@@ -761,12 +758,10 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         # altogether), so ``tray_fields.tray_presence`` can only answer None for
         # them and a ``present is True`` gate left every one of those dialects "awaiting
         # insert" FOREVER — the roll physically seated, configured, and never applied
-        # (upstream #1322; the pre-cutover replay handled exactly this shape).
-        # Reaching row 4 already proves ``present is not False`` twice over — row 3 owns
-        # every present-False push, and the cleared shape that makes presence False
-        # asserts an EMPTY ``tray_type`` while this row needs a non-empty one — so the
-        # KEEP arm that used to sit here was unreachable and is deleted rather than left
-        # as a branch no push can take. Awaiting-insert is row 3's / row 5's answer.
+        # (upstream #1322). Reaching row 4 already proves ``present is not False`` twice
+        # over — row 3 owns every present-False push, and the cleared shape that makes
+        # presence False asserts an EMPTY ``tray_type`` while this row needs a non-empty
+        # one — so no awaiting-insert arm belongs here: that is row 3's / row 5's answer.
         if binding is not None and binding.pre_configured and obs.present is not False:
             return Decision(DecisionKind.BIND, spool_id=binding.spool_id, reason="pre_configured_apply")
 
@@ -775,14 +770,12 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
         # telling them apart: "not asked" versus "asked and answered" (doctrine rule 11).
         if binding is not None and not binding.is_tagless:
             # ASKED AND ANSWERED — scenario G7, the commonest physical swap on this
-            # fleet and the one that used to persist silently with the wrong row bound:
-            # a Bambu roll pulled, a third-party roll seated, the tray reporting
+            # fleet: a Bambu roll pulled, a third-party roll seated, the tray reporting
             # ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``, ``tag_uid: null``. The
-            # evidence for it existed the whole time — a commanded discovery read came
-            # back finding no chip — and row 5a's own comment already called that
+            # evidence is a commanded discovery read that came back finding no chip —
             # "positive proof of a different roll, the same certainty class as a uuid
-            # disagreement". It was simply confined to spent rows and bare trays. It is
-            # not confined any more (:func:`_no_tag_answer_contradicts`).
+            # disagreement", for every binding constellation, not only spent rows and bare
+            # trays (:func:`_no_tag_answer_contradicts`).
             #
             # The departed row is NOT archived: it is a live roll that left this slot,
             # not an exhausted one, so it keeps its grams and its history and is merely
@@ -816,9 +809,9 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             # (doctrine rule 7 — the rebind must not re-stamp ``loaded_at``).
             #
             # THIS LANE IS A GLITCH FILTER, NOT AN IDENTITY ORACLE (rule 7 as amended
-            # 2026-08-19, operator-ratified). It used to fire on nothing but a
-            # ``last_location_*`` breadcrumb plus a fingerprint match — and on this
-            # fleet every roll is black PETG reporting ``tag_uid: null, tray_uuid:
+            # 2026-08-19, operator-ratified). A ``last_location_*`` breadcrumb plus a
+            # fingerprint match alone proves nothing here: on this fleet every roll is
+            # black PETG reporting ``tag_uid: null, tray_uuid:
             # null, remain: -1``, so that test is ALWAYS TRUE against residue that is
             # never cleared and has no age bound. 002/005-H2S, 2026-08-19: two AMS
             # units sat empty for three days, one fresh roll went into each, and the
@@ -898,14 +891,11 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             # here, exactly as row 5's unresolved arm leaves it.
             #
             # Presence must be the TRI-STATE True: this arm exists to earn a discovery
-            # read, and ``ams_presence.identify_needed``'s spent-occupied arm now grants
-            # one on exactly that — either present state, the same rule
-            # ``tray_fields.tray_presence`` applies here. The two were misaligned (the
-            # need authority demanded state 10 specifically), so this table emitted a
-            # reason for every state-11 spent-occupied slot that the authority could
-            # never grant: a request standing forever, resolving nothing. A verdict
-            # emitted on evidence the need authority does not accept is not a read, it is
-            # a loop with no exit. Wire safety for a threaded-on tray is enforced where
+            # read, and ``ams_presence.identify_needed``'s spent-occupied arm grants one on
+            # exactly that — either present state, the same rule
+            # ``tray_fields.tray_presence`` applies here. The two must stay aligned: a
+            # verdict emitted on evidence the need authority does not accept is not a
+            # read, it is a loop with no exit. Wire safety for a threaded-on tray is enforced where
             # the rest of it lives — ``command_identify`` defers on engaged filament and
             # spends nothing, so the entitlement waits for the idle edge.
 
@@ -921,12 +911,10 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
             # instead of waiting for evidence that can never arrive: the tray is bare, so
             # row 4's cycle machinery is unreachable by construction.
             #
-            # Since 2026-08-19 (doctrine rule 11) this arm is ONE CALLER of the general
-            # predicate rather than its only definition — the conclusion is unchanged and
-            # its guards are unchanged, they simply live in
-            # :func:`_no_tag_answer_contradicts` now, beside the three other constellations
-            # the same proof licenses. Scenario G9 (a spent TAGLESS binding) is still
-            # excluded, and still for the reason this row first gave: over a claim-less
+            # This arm is ONE CALLER of the general predicate (doctrine rule 11); its
+            # guards live in :func:`_no_tag_answer_contradicts`, beside the three other
+            # constellations the same proof licenses. Scenario G9 (a spent TAGLESS
+            # binding) is excluded: over a claim-less
             # binding a no-tag read proves nothing at all, because the same core reads the
             # same way before and after a swap. That case stays with the qualified-cycle
             # machinery, which measures a PHYSICAL event instead.
@@ -956,11 +944,10 @@ def resolve(obs: TrayObservation, state: SlotState, ctx: ResolutionContext) -> D
     # 5b — row 5a's mirror for a LIVE tagged binding: same bare tray, same answered
     # no-tag read, same proof (doctrine rule 11) — only the departed row is a roll that
     # LEFT rather than one that ran dry, so it is unlinked and keeps its grams instead of
-    # being archived. Without this arm the constellation fell to ``identity_unresolved``
-    # and re-owed a read it had already been given — the exact silence that parked spool
-    # 226 for a day (observed-incidents shape 25), reproduced one binding-state over.
-    # ``close_answered_read`` now spends the entitlements on that answer, so the slot
-    # would not even go on asking: it would simply sit wrong and quiet.
+    # being archived. Without this arm the constellation falls to ``identity_unresolved``,
+    # and because ``close_answered_read`` spends the entitlements on that answer, the
+    # slot would sit wrong and quiet (observed-incidents shape 25, one binding-state
+    # over).
     #
     # Ordered AFTER the pre-configured KEEP on purpose: operator intent is never guessed
     # over (scenario T13), so a slot awaiting a pre-assigned roll owes this nothing — the
@@ -1094,12 +1081,11 @@ def _no_tag_answer_contradicts(obs: TrayObservation, ctx: ResolutionContext) -> 
 
     A commanded discovery read that ANSWERED "no chip" over a binding that CLAIMS one is
     positive proof of a different roll: the same certainty class as a ``tray_uuid``
-    disagreement, and it does not care what else is true of the row. The table used to say
-    exactly this in row 5a's own comment and then confine the conclusion to one
-    constellation (spent row, bare tray), so the commonest physical shape on this fleet — a
+    disagreement, and it does not care what else is true of the row. Confined to one
+    constellation (spent row, bare tray), the commonest physical shape on this fleet — a
     Bambu roll swapped for a third-party one, which reports ``tray_type: "PETG"``,
-    ``tray_info_idx: "GFG02"``, ``tag_uid: null`` — persisted silently with the wrong row
-    bound (scenario G7). This predicate is the whole of rule 11's positive clause; the FOUR
+    ``tray_info_idx: "GFG02"``, ``tag_uid: null`` — would stay silently bound to the wrong
+    row (scenario G7). This predicate is the whole of rule 11's positive clause; the FOUR
     arms that call it are the several conclusions it licenses:
 
     * row 4a — spent binding, CONFIGURED tray → ``spent_swap_no_tag_read``;
@@ -1194,7 +1180,7 @@ def format_slot_event(
     ``[slot-state] printer=3 A0T2 OCCUPIED_ASSUMED→EMPTY release spool=140
     reason=cleared_tray``
 
-    The plan drops the ``slot_events`` table on purpose (operator ruling): this
+    There is no ``slot_events`` table, on purpose (operator ruling): this
     grammar through the existing log pipeline + the ``support/logs`` endpoint is
     the forensic record. Keep it greppable — the token order is the contract.
     """

@@ -1,4 +1,4 @@
-"""Farm capability-matching dispatch gate (Phase 4).
+"""Farm capability-matching dispatch gate.
 
 Before the scheduler dispatches a FARM queue item (an item whose batch carries a
 ``sku_file_id``), the target printer's LIVE state must be able to actually run

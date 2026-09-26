@@ -1,9 +1,9 @@
-"""The ONE authority for "who owns this printer, and what is on its plate?" (WS1).
+"""The ONE authority for "who owns this printer, and what is on its plate?".
 
 Until this module, that question had FIVE independent answers — the plate-clear
 flag (5 raise sites, 8 clear sites), the pending-eject dict, the scheduler's
 dispatch holds, the per-tick DB busy set, and the monitor's watch registry —
-coupled only by ad-hoc cross-checks. Every interlock wave since 2026-08-25 added
+coupled only by ad-hoc cross-checks. Every interlock change since 2026-08-25 added
 another cross-check, and the night of 2026-08-29 → 08-30 cashed four of the seams
 in one cascade across printers 1-6:
 

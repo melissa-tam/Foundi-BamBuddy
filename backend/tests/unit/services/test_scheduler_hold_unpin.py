@@ -7,7 +7,7 @@ become a unit's permanent home. That worked only where a guard was reached: a re
 dispatch-lease claim left the row pinned to a busy printer with nothing to undo it, and
 the row then entered the PINNED branch on every later tick and waited forever.
 
-The 2026-09-04 pool-target wave removed the write instead of adding a fourth guard. The
+The 2026-09-04 pool targets removed the write instead of adding a fourth guard. The
 decided printer rides the dispatch plan — ``_PlannedDispatch`` → ``_start_print_by_id``
 → ``_start_print(printer_id=…)`` — exactly as the decided ``ams_mapping`` already did,
 and lands on the row only at the ``pending → printing`` claim

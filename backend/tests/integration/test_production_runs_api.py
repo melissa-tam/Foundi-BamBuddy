@@ -756,7 +756,7 @@ class TestQueueRetryLineageExposure:
 @pytest.mark.asyncio
 @pytest.mark.integration
 class TestRunDetailPhase4:
-    """Run visibility (Phase 4.1): lean list vs full detail, pause_reason
+    """Run visibility: lean list vs full detail, pause_reason
     lifecycle over HTTP, staged counts, and the queue rows' run identity."""
 
     async def _make_run(self, async_client, db_session, tmp_path, code, *, target_units=2):
@@ -915,7 +915,7 @@ class TestRunDetailPhase4:
 @pytest.mark.asyncio
 @pytest.mark.integration
 class TestReleaseStagedRoute:
-    """POST /queue/release-staged (Phase 4.2): re-checks system-staged items and
+    """POST /queue/release-staged: re-checks system-staged items and
     releases only the resolved ones. Queue-update permission required."""
 
     async def _stage_run_items(self, async_client, db_session, tmp_path, code):
@@ -1020,7 +1020,7 @@ class TestReleaseStagedRoute:
 @pytest.mark.asyncio
 @pytest.mark.integration
 class TestFarmPrinterStates:
-    """GET /production-runs/printer-states (Phase 3, F2): fleet-scoped per-printer
+    """GET /production-runs/printer-states: fleet-scoped per-printer
     farm context surfaced on the Printers page."""
 
     async def _run_on_printers(self, async_client, db_session, tmp_path, code, printer_ids, *, target_units):

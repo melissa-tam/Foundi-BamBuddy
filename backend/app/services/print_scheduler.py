@@ -398,7 +398,7 @@ class PrintScheduler:
     async def check_queue(self):
         """Check for prints ready to start."""
         async with async_session() as db:
-            # Offline-stall watch (Phase 3.2): flag farm units still 'printing'
+            # Offline-stall watch: flag farm units still 'printing'
             # whose printer has been offline past the grace window. One guarded
             # call, mirroring the stagger consumer — a stall-check failure must
             # never kill the dispatch tick. Runs before the pending-item gate so a
@@ -421,7 +421,7 @@ class PrintScheduler:
             except Exception:
                 logger.exception("Pause-stall watch failed (non-fatal)")
 
-            # Foreign-pause watch (WS2b): a print the farm did NOT dispatch, PAUSEd
+            # Foreign-pause watch: a print the farm did NOT dispatch, PAUSEd
             # past the same grace with no farm unit and no AMS incident owning it.
             # Every other watch starts from a farm queue item, so a vision trip on a
             # LAN print used to sit until a human noticed. Own guard, same as the
@@ -464,7 +464,7 @@ class PrintScheduler:
             # AMS wedged-idle watch (2026-09-11): the gate below refuses to dispatch
             # onto an AMS latched mid filament-change, and that refusal is silent —
             # no print, no incident, no HMS. Runs beside the sibling watch so the one
-            # class of hold this wave introduces cannot become a new #60.
+            # class of hold this gate introduces cannot become a new #60.
             try:
                 from backend.app.services.farm_stall import check_ams_wedged_idle
 
@@ -472,7 +472,7 @@ class PrintScheduler:
             except Exception:
                 logger.exception("AMS wedged-idle watch failed (non-fatal)")
 
-            # Attention-reminder nag (W3): the offline / pause-stall / recovery /
+            # Attention-reminder nag: the offline / pause-stall / recovery /
             # runout escalations each alert only ONCE per incident, so a printer left
             # PAUSEd needing a human went silent for hours (2026-07-20). Re-fire the
             # ORIGINAL escalation notification once per hour while the hold persists.
@@ -576,7 +576,7 @@ class PrintScheduler:
             # lane too, which the old hold set never saw.
             busy_printers |= plate_occupancy.printers_with_lease_or_eject()
 
-            # Power-stagger budget (#Phase4 / Phase E): how many more prints may
+            # Power-stagger budget: how many more prints may
             # BEGIN heating this tick. Owned by the stagger_policy module: budget =
             # group_size − (in-flight + still-ramping recent starts), so the bed-
             # temperature dynamic release frees a slot the moment a bed reaches
@@ -643,7 +643,7 @@ class PrintScheduler:
                         continue
 
                     # Check if printer is idle. The plate-clear gate is now
-                    # unconditional (Phase 1, P1-B) — a raised gate blocks dispatch
+                    # unconditional — a raised gate blocks dispatch
                     # regardless of the global convenience toggle.
                     printer_idle = self._is_printer_idle(item.printer_id)
                     printer_connected = printer_manager.is_connected(item.printer_id)
@@ -704,7 +704,7 @@ class PrintScheduler:
                         if not await self._check_previous_success(db, item):
                             item.status = "skipped"
                             item.error_message = "Previous print failed or was aborted"
-                            # Machine code for the UI (Phase 4.3f): the queue
+                            # Machine code for the UI: the queue
                             # banner matches this, never the English message.
                             item.waiting_reason = "previous_print_failed"
                             item.completed_at = datetime.now(timezone.utc)
@@ -1075,7 +1075,7 @@ class PrintScheduler:
                             if not await self._check_previous_success(db, item):
                                 item.status = "skipped"
                                 item.error_message = "Previous print failed or was aborted"
-                                # Machine code for the UI (Phase 4.3f) — see the
+                                # Machine code for the UI — see the
                                 # assigned-printer skip site above.
                                 item.waiting_reason = "previous_print_failed"
                                 item.completed_at = datetime.now(timezone.utc)
@@ -2039,12 +2039,12 @@ class PrintScheduler:
             return self._refuse(printer_id, "not_connected")
 
         # Quarantined printers (farm failure policy) are excluded from ALL
-        # dispatch until an operator clears the quarantine (#Phase3).
+        # dispatch until an operator clears the quarantine.
         if printer_manager.is_quarantined(printer_id):
             logger.debug("Printer %d: not idle — quarantined", printer_id)
             return self._refuse(printer_id, "quarantined")
 
-        # Device-vs-declared model mismatch (Phase 2): eject geometry keyed on the
+        # Device-vs-declared model mismatch: eject geometry keyed on the
         # wrong model could drive the toolhead outside the real bed, so block ALL
         # dispatch until the registration is corrected (mirrors the quarantine gate).
         if printer_manager.is_model_mismatch(printer_id):
@@ -2069,7 +2069,7 @@ class PrintScheduler:
         # where the alternative is dispatch-then-immediate-fault: informational codes
         # are excluded by the taxonomy and never reach here.
         #
-        # Deliberately NOT applied to the eject lane (2026-08-29 W4 gotcha d): this
+        # Deliberately NOT applied to the eject lane (2026-08-29): this
         # gate is scheduler-internal, the eject dispatcher never routes through it, and
         # gating a filament-less sweep behind an AMS fault would deadlock the very
         # plate that is holding the printer.
@@ -2118,8 +2118,8 @@ class PrintScheduler:
             logger.debug("Printer %d: not idle — open incident(s) %s (state=%s)", printer_id, kinds, state.state)
             return self._refuse(printer_id, f"incident:{kinds}")
 
-        # Ownership, in one question. ``plate_occupied`` is the unconditional gate
-        # (Phase 1, P1-B) — it no longer keys on the global require_plate_clear
+        # Ownership, in one question. ``plate_occupied`` is the unconditional gate:
+        # it no longer keys on the global require_plate_clear
         # convenience toggle, because the gate is only ever RAISED when it should be.
         # After Auto Off cycles the printer it boots back into IDLE with no memory of
         # the finish; the authority's record survives (#961, rebuilt at startup).
@@ -3106,7 +3106,7 @@ class PrintScheduler:
     async def _stage_filament_short(
         self, db: AsyncSession, item: PrintQueueItem, *, reason: str = "filament_short"
     ) -> None:
-        """Mark a queue item low-spool staged (#1496 / #Phase4).
+        """Mark a queue item low-spool staged (#1496).
 
         Writes only the staging columns. The old ``unpin`` parameter is gone with the
         thing it undid: a POOL unit's row never carries the scheduler's pick (it rides
@@ -3305,7 +3305,7 @@ class PrintScheduler:
         (``fail_unclaimed_dispatch``); the print-command failure fires after it, on the
         row the claim made ``printing`` (``record_unit_terminal``, the one writer of a
         unit's end — the claim already recorded the printer). Both are conditional, and
-        both clear ``waiting_reason`` in the same statement (W4b). A row another actor
+        both clear ``waiting_reason`` in the same statement. A row another actor
         moved first — an operator cancel landing while the scheduler decided — is not
         this dispatch's failure: nothing is written over it and no policy runs for it.
         """
@@ -3718,7 +3718,7 @@ class PrintScheduler:
             )
             return
 
-        # Farm capability-matching gate (#Phase4). Non-farm items bypass it. A
+        # Farm capability-matching gate. Non-farm items bypass it. A
         # BLOCK is NOT a failure: record the reason on waiting_reason (surfaced in
         # the queue UI), leave the item pending, and let a later tick re-evaluate
         # (a swapped spool / corrected assignment clears it). This is the single
@@ -4213,7 +4213,7 @@ class PrintScheduler:
                 phase="sent",
             )
 
-            # Correlation (Phase 1, P1-A): stamp the subtask_id minted for THIS
+            # Correlation: stamp the subtask_id minted for THIS
             # dispatch so a terminal MQTT status can be bound back to this exact
             # queue item (not a printer_id-only lookup). start_print set it on the
             # client synchronously above; commit it with the already-'printing' row.

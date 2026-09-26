@@ -48,7 +48,7 @@ interface InventoryConfig {
   onUnassignSpool?: () => void;
   assignedSpool?: { id: number; material: string; brand: string | null; color_name: string | null; remainingWeightGrams?: number | null } | null;
   isAssigned?: boolean;
-  // "New roll…" (W5a): set whenever the slot has a BOUND ledger row, of either
+  // "New roll…": set whenever the slot has a BOUND ledger row, of either
   // tag-ness. It retires that row and starts a fresh full one — for an untagged
   // roll this click is the farm's only possible swap signal, and for a tagged one
   // it moves the Bambu tag onto the new roll. It replaced a second verb
@@ -581,7 +581,7 @@ export function FilamentHoverCard({ data, children, disabled, className = '', la
 }
 
 /**
- * A spool binding that survives on a slot the printer reports EMPTY (W5a).
+ * A spool binding that survives on a slot the printer reports EMPTY.
  *
  * Three shapes reach this state and the operator must be able to tell them
  * apart: the runout latch (`spool.spent_at` — the roll ran dry and the binding
@@ -625,7 +625,7 @@ interface EmptySlotHoverCardProps {
   // could not read) surfaces the unread-spool label; undefined / "physical"
   // keeps the historical "Empty slot" wording.
   kind?: EmptySlotKind;
-  // W5a: a binding that outlived the filament. Without this the empty-slot card
+  // A binding that outlived the filament. Without this the empty-slot card
   // showed NO assignment information at all, so a lingering binding was both
   // invisible and unclearable from the printer card.
   binding?: EmptySlotBinding | null;
@@ -727,7 +727,7 @@ export function EmptySlotHoverCard({ children, className = '', label, configureS
                   ? t('ams.slotPresentUnread')
                   : t('ams.emptySlot')}
             </div>
-            {/* Lingering binding on a physically empty slot (W5a). */}
+            {/* Lingering binding on a physically empty slot. */}
             {binding && bindingStatus && (
               <div className="px-3 pb-2 pt-1 w-52 border-t border-bambu-dark-tertiary space-y-1">
                 <p className="text-[10px] uppercase tracking-wider text-bambu-gray font-medium">

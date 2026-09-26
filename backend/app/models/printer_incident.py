@@ -1,16 +1,11 @@
 """Durable per-printer EQUIPMENT FAULT — the one lifecycle record of a hold.
 
-Production gap (2026-08-09 audit, WS2b): the whole recovery/hold/auto-resume/
-escalation machine lived in ``spool_recovery``'s PROCESS-LIFETIME dicts
-(``_handled`` / ``_escalated`` / ``_success_counts``) and was reachable only through a
-matching FARM queue item. Three consequences, all observed:
-
-* 12 foreign-print runouts got ``spent_at`` stamps but no alert, no hold and no
-  resume — the entry gate returned early because no farm unit was printing;
-* ``_escalated`` never expired, so a LATER, different fault on the same job could
-  never be recovered — the latch outlived the incident it was written for;
-* a restart erased every latch and every "we already told the operator", while the
-  standing HMS came straight back.
+Why durable, and why not keyed to a farm queue item (2026-08-09 audit, all observed):
+a latch reachable only through a FARM unit left 12 foreign-print runouts spent-stamped
+with no alert, no hold and no resume; a process-lifetime latch never expires, so a
+LATER, different fault on the same job could never be recovered; and a restart erases
+every latch and every "we already told the operator" while the standing HMS comes
+straight back.
 
 This table is that state, durably: **one row per fault incident**, farm or foreign.
 
@@ -29,17 +24,15 @@ status           resolved_at     meaning
 An ESCALATED incident stays OPEN on purpose: the hold IS the incident, so the
 hourly attention reminder, the printer-card chip and the "one open incident per
 printer" exclusion all read the same row. It closes when the printer is observed
-RUNNING again (any resume source — including an operator pressing Resume on the
-screen, which nothing used to notice), when the job reaches a terminal, or when the
-refill auto-resume lands.
+RUNNING again (any resume source, including an operator pressing Resume on the
+screen), when the job reaches a terminal, or when the refill auto-resume lands.
 
-**THREE AXES, three owners (2026-09-11, 003-H2S).** The row used to be the
-equipment fault, the job hold and the recovery driver's ownership token at once, so
-the JOB's terminal ended all three: the operator stopped a print held on
-``0700_0012`` + ``0700_8004`` (filament physically stuck in the shared PTFE path),
-``on_job_terminal`` closed the row, the firmware wiped the HMS list at the terminal,
-and two minutes later the scheduler dispatched the next unit onto the same printer
-and the same stuck filament. Three times. Equipment state and work state are
+**THREE AXES, three owners.** One row serving as the equipment fault, the job hold
+and the recovery driver's ownership token at once lets the JOB's terminal end all
+three: on 003-H2S (2026-09-11) an operator stop over ``0700_0012`` + ``0700_8004``
+(filament physically stuck in the shared PTFE path) closed the row, the firmware
+wiped its HMS list at the terminal, and the scheduler dispatched the next unit onto
+the same stuck filament, three times. Equipment state and work state are
 separate models with separate lifecycles (ISA-95 equipment hierarchy; ISA-18.2 alarm
 lifecycle: raise → acknowledge → return-to-normal → clear), so:
 
@@ -48,10 +41,10 @@ lifecycle: raise → acknowledge → return-to-normal → clear), so:
 * :data:`RESOLVES_ON` is the RETURN-TO-NORMAL RULE — what evidence ends this hold.
 
 **An asset carries concurrent alarms.** One open row PER KIND, not one per printer:
-a lost-Z hold must be able to stand beside an AMS fault (before this, the
-``pause_recovery`` Z hold silently got ``None`` from ``open_new`` on a printer that
-already carried a jam, and ``z_reference_evidence`` then let an eject through — the
-2026-09-04 bed-past-the-floor mechanism). The three AMS kinds stay mutually
+a lost-Z hold must be able to stand beside an AMS fault (with one row per printer,
+the ``pause_recovery`` Z hold got ``None`` from ``open_new`` on a printer already
+carrying a jam, and ``z_reference_evidence`` let an eject through — the 2026-09-04
+bed-past-the-floor mechanism). The three AMS kinds stay mutually
 exclusive among THEMSELVES, at the entry gate, on the upgrade path and in the
 DATABASE, because they are three readings of one AMS and the taxonomy already ranks
 them.
@@ -78,7 +71,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from backend.app.core.database import Base
 
 # Incident kinds — the farm's reaction vocabulary. THREE closed origins, all listed
-# here so the store owns the whole vocabulary (2026-09-04 pause-recovery wave;
+# here so the store owns the whole vocabulary (2026-09-04 pause recovery;
 # 2026-09-12 service hold):
 #
 # 1. The AMS fault taxonomy (``hms_errors.AmsFaultClass``) — NOT a second
@@ -282,9 +275,9 @@ RESOLVE_REPAIR_OBSERVED = "repair_observed"
 # Its own token beside ``repair_observed`` because it is a different, stronger
 # statement: not "filament moved once" but "filament fed through this path to the end
 # of the very print the fault broke". 23 of the 40 physical rows in this farm's
-# history ended as a hand repair plus a resume, and every one of those completions was
-# invisible to the farm until 2026-09-17 (011-H2S) — the completion landed inside the
-# sweep's 120 s dwell and the terminal closer had no repair vocabulary. Its own token
+# history ended as a hand repair plus a resume, and such a completion lands inside the
+# sweep's 120 s dwell, invisible to a closer without repair vocabulary (011-H2S,
+# 2026-09-17). Its own token
 # so the audit ledger can COUNT the new evidence against the other two. ``outcome_of``
 # needs no entry: a physical row is escalated at entry, so ``escalated_at`` puts every
 # close of one in ``human_resolved`` whatever produced it.
@@ -292,10 +285,9 @@ RESOLVE_REPAIR_COMPLETED = "repair_completed"
 # The recovery DRIVER produced the outcome itself (``spool_recovery._succeed``): the
 # jammed feeder was swapped for a replacement and the print resumed, or the firmware
 # CONTINUE self-healed the wedged change on the SAME feeder. Their own tokens rather
-# than ``observed_running`` — which they used to share with a touchscreen resume —
-# because the outcome ledger has to tell "the farm recovered it" from "a human
-# resumed it": the zero-human tally the 2026-09-11 audit could only reconstruct from
-# a day of log reading is now ``printer_incidents.outcome_of``.
+# than ``observed_running`` (a touchscreen resume's token), because the outcome ledger
+# has to tell "the farm recovered it" from "a human resumed it"; the zero-human tally
+# is ``printer_incidents.outcome_of``.
 RESOLVE_DRIVER_SWAP = "driver_swap"
 RESOLVE_DRIVER_SELF_HEAL = "driver_self_heal"
 # The startup rearm found the printer positive and closed the row: a RESTART's

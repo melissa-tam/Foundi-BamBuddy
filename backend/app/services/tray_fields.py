@@ -1,6 +1,6 @@
 """Pure per-tray wire-field helpers shared by the MQTT client and the spool core.
 
-Extracted from ``bambu_mqtt`` (W1 of the spool-core re-architecture) so the
+Extracted from ``bambu_mqtt`` (spool-core re-architecture) so the
 observation layer (``services.tray_observation``) parses a raw AMS tray dict with
 EXACTLY the same rules the MQTT merge uses — a second wire parser would drift, and
 drift between "what the merge believes" and "what the spool pipeline believes" is
@@ -444,7 +444,7 @@ def tray_unread(tray: object) -> bool:
     ``tray_type`` emptiness: an asserted-empty ``tray_type`` beside a non-present state
     is the CLEARED shape (presence ``False``), which is a different fact with a
     different consequence (release, doctrine rule 9). Unknown presence is likewise NOT
-    unread — nothing is known about the slot at all, and WS1's presence-stale machinery
+    unread — nothing is known about the slot at all, and the presence-stale machinery
     owns that case.
     """
     return tray_presence_from_dict(tray) is True and not tray_identity_asserted(tray)

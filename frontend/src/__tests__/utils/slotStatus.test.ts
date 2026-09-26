@@ -1,5 +1,5 @@
 /**
- * Pure derivations behind the PrintersPage W6 slot badges/ring: the was-feeding
+ * Pure derivations behind the PrintersPage slot badges/ring: the was-feeding
  * dimmed-ring tray id and the per-slot ran-out flag.
  */
 import { describe, it, expect } from 'vitest';

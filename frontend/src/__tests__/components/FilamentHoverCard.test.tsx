@@ -400,7 +400,7 @@ describe('EmptySlotHoverCard (#1133)', () => {
   });
 });
 
-// W5a — a binding that outlives the filament. Before this the empty-slot card
+// A binding that outlives the filament. Before this the empty-slot card
 // carried NO assignment information at all, so a stale or latched claim was
 // both invisible and unclearable from the printer card (the 2026-08 stale-empty
 // class of incident). The three states must be distinguishable by TEXT, not by
@@ -600,7 +600,7 @@ describe('EmptySlotHoverCard binding block (W5a)', () => {
   });
 });
 
-// W5a — the tagless counterpart of "Re-spool tag…". Only the caller knows
+// The tagless counterpart of "Re-spool tag…". Only the caller knows
 // whether the bound row carries a tag, so the card renders the verb purely on
 // the presence of the handler.
 describe('FilamentHoverCard "New roll…" verb (W5a)', () => {
@@ -665,7 +665,7 @@ describe('FilamentHoverCard "New roll…" verb (W5a)', () => {
   });
 });
 
-// WS11 R8 — the standing undo for a "Re-check slot" mint. The card renders the
+// R8 — the standing undo for a "Re-check slot" mint. The card renders the
 // verb purely on the presence of the handler; PrintersPage derives that from the
 // backend's `recheck_undo_available`, so the offer lapsing removes the verb.
 describe('FilamentHoverCard "Restore previous roll" verb (WS11 R8)', () => {

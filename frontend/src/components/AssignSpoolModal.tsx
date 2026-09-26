@@ -240,7 +240,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
   // Bindings held by OTHER slots, split by whether the roll is physically there,
   // plus the roll bound to THIS slot (which the picker floats to the top).
   //
-  // W5b: a binding whose tray reports `present === false` is a claim on a spool
+  // A binding whose tray reports `present === false` is a claim on a spool
   // that is sitting on a SHELF, not filament loaded in another printer. Hiding
   // those made the picker refuse the one spool the operator was holding — the
   // stale claim silently vetoed the assign. They stay listed now, annotated with
@@ -499,8 +499,8 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
             ) : localPicked.rows.length > 0 ? (
               <div className="max-h-96 overflow-y-auto grid grid-cols-2 sm:grid-cols-3 gap-2">
                 {localPicked.rows.map((spool: InventorySpool) => {
-                  // A binding this spool still holds on a slot that reads empty
-                  // (W5b). Listed rather than hidden, but the operator has to be
+                  // A binding this spool still holds on a slot that reads empty.
+                  // Listed rather than hidden, but the operator has to be
                   // told the claim exists — picking it here MOVES the binding.
                   const staleClaim = notInsertedElsewhere.get(spool.id);
                   return (
@@ -529,7 +529,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                     backend / cache returned nothing; if it's > 0 then
                     the archived / assigned-elsewhere filter ate the
                     spool and the toggle is the right escape hatch.
-                    The last count is listed-not-hidden (W5b): those
+                    The last count is listed-not-hidden: those
                     spools ARE offered, so an empty picker with a
                     non-zero tail means the tray-match filter ate
                     them, not the assignment filter. */}

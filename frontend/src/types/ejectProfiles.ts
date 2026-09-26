@@ -1,5 +1,5 @@
 /**
- * Eject profile types (farm auto part-removal, Phase 1).
+ * Eject profile types (farm auto part-removal).
  *
  * An eject profile parameterises the end-of-print G-code that sweeps a finished
  * part off the bed once it has cooled. The backend owns the G-code generator;

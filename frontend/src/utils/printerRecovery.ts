@@ -3,8 +3,8 @@
  *
  * Recover (`POST /printers/{id}/recover`) is the operator's override for
  * everything the farm is holding a printer by: the plate gate, a dispatch lease,
- * an in-flight eject claim, a quarantine, and — since the incident-resolution
- * wave — an open equipment fault whose rule names Recover as its exit. Before
+ * an in-flight eject claim, a quarantine, and
+ * an open equipment fault whose rule names Recover as its exit. Before
  * this module each surface decided for itself which of those counted, so a
  * printer held ONLY by an escalated fault (011-H2S, row 188) had no card
  * affordance at all while the backend verb sat there able to close it.

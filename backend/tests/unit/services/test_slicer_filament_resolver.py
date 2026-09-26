@@ -173,7 +173,7 @@ async def test_literal_material_name_clears_both():
 
 
 class TestNozzleTempResolution:
-    """W4: the resolver returns the full wire-identity tuple and resolves temps in
+    """The resolver returns the full wire-identity tuple and resolves temps in
     tier order - spool-row temps -> tagless-default fingerprint -> MATERIAL_TEMPS."""
 
     @pytest.mark.asyncio

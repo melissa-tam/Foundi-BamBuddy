@@ -265,7 +265,7 @@ async def test_stale_bit_starves_the_release_and_the_answering_report_delivers_i
 
 
 async def test_the_release_evidence_record_rides_the_production_journey(db_session, wired, sessions, passes, caplog):
-    """WS7 liveness: the record fires on a REAL release, from REAL wire evidence.
+    """Release-evidence liveness: the record fires on a REAL release, from REAL wire evidence.
 
     Its unit tests hand-build observations and a stub client, which proves the grammar but
     not that the fields ever get populated in production — the same blind spot that let

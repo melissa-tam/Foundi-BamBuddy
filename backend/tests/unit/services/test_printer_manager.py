@@ -2071,7 +2071,7 @@ class TestRunSlotPipelinePass:
 
 
 class TestOpenIncidentProjection:
-    """WS2b: the printer card's AMS-incident chip.
+    """The printer card's AMS-incident chip.
 
     A FOREIGN print's hold has no queue row and therefore no ``waiting_reason``
     anywhere in the UI — this projection is the only place it can be seen. It is
@@ -2247,7 +2247,7 @@ class TestServiceHoldProjection:
 
 
 class TestOccupancyProjection:
-    """WS3: the manager's plate answers are projections of the occupancy authority.
+    """The manager's plate answers are projections of the occupancy authority.
 
     The manager used to be the second of five stores answering "who owns this
     printer" — an in-memory set plus a DB writer plus a loader. Since the 2026-08-30

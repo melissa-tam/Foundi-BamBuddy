@@ -513,7 +513,7 @@ export interface Printer {
   camera_rotation: number;  // 0, 90, 180, 270 degrees
   plate_detection_enabled: boolean;  // Check plate before print
   plate_detection_roi?: PlateDetectionROI;  // ROI for plate detection
-  // Farm auto-recovery (Phase 3): a printer is quarantined after too many
+  // Farm auto-recovery: a printer is quarantined after too many
   // consecutive dispatch failures and is skipped by the scheduler until an
   // operator clears it.
   quarantined: boolean;
@@ -545,7 +545,7 @@ export interface HMSError {
   short_code?: string;
   description?: string | null;
   wiki_url?: string;
-  // Per-slot runout attribution (W6): present on filament-runout HMS codes whose
+  // Per-slot runout attribution: present on filament-runout HMS codes whose
   // wire attr names the exhausted AMS slot (the `0700_2X00` family). Drives the
   // per-slot "ran out" badge on PrintersPage. Absent for the slot-agnostic
   // `_8011`-only case and for every non-runout code.
@@ -783,7 +783,7 @@ export interface PrinterStatus {
   tray_now: number;
   // Last tray the printer loaded for THIS job (global tray ID; -1 = none). Reset
   // per-job on the backend, so during a runout PAUSE (tray_now flips to 255) the
-  // UI can still show which slot WAS feeding via a dimmed "was feeding" ring (W6).
+  // UI can still show which slot WAS feeding via a dimmed "was feeding" ring.
   last_loaded_tray: number;
   // AMS status for filament change tracking (0=idle, 1=filament_change, 2=rfid_identifying, 3=assist, 4=calibration)
   ams_status_main: number;
@@ -809,7 +809,7 @@ export interface PrinterStatus {
   // Queue: printer is awaiting user ack that the build plate was cleared after a
   // finished/failed print. Persisted across restarts (#961).
   awaiting_plate_clear: boolean;
-  // Plate-occupancy authority (WS2): the single record behind
+  // Plate-occupancy authority: the single record behind
   // `awaiting_plate_clear`, exposed so a client can see WHO owns the plate and
   // whether an eject is in flight rather than inferring it from the flag.
   // Absent on backends predating the authority.
@@ -832,16 +832,16 @@ export interface PrinterStatus {
     /** Seconds since a dispatch lease was taken on this printer; null when none. */
     lease_age_s: number | null;
   };
-  // Farm failure policy (Phase 3): quarantined printers are excluded from all
+  // Farm failure policy: quarantined printers are excluded from all
   // dispatch until an operator clears them.
   quarantined?: boolean;
   quarantine_reason?: string | null;
-  // Farm device reconciliation (Phase 2): the device's self-reported model
+  // Farm device reconciliation: the device's self-reported model
   // differs from the declared Printer.model — the scheduler blocks dispatch to
   // this printer until the declaration is corrected. Absent report = no mismatch.
   model_mismatch?: boolean;
   model_mismatch_reason?: string | null;
-  // Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch.
+  // Cooldown/eject phase: the in-flight eject cooldown watch.
   // Present while the farm waits for the bed to cool before auto-clearing the
   // plate gate; null/absent otherwise.
   // `threshold_c` is the eject line the watch armed with (measured shop air
@@ -854,14 +854,13 @@ export interface PrinterStatus {
   // `deferred` is true once the cooldown watch has retired its fans and is
   // withholding the eject under maintenance mode.
   eject_watch?: EjectWatchInfo | null;
-  // Open printer-hold incident (WS2b): the fault this printer is currently held
+  // Open printer-hold incident: the fault this printer is currently held
   // by. Present for FOREIGN prints too — those have no queue unit, so this chip
   // is the only place their hold is visible. Null/absent when clear.
   // The kinds are the backend's `printer_incident` vocabulary verbatim
   // (`models/printer_incident.py`) — the chip looks up `printers.incident.<kind>`
   // by that exact string, so a kind added here needs its locale key in the same
-  // change (pinned by `__tests__/i18n/incidentKinds.test.ts`). The three
-  // pause-cause kinds joined the AMS three in the 2026-09-04 pause-recovery wave.
+  // change (pinned by `__tests__/i18n/incidentKinds.test.ts`).
   open_incident?: OpenIncidentState | null;
   // Operator maintenance hold, mirrored onto the status frame (including the
   // disconnected branch) so a card rendered from a stale fleet list still shows
@@ -1581,11 +1580,11 @@ export interface AppSettings {
   stagger_heatup_grace_seconds: number;
   // Plate-clear confirmation
   require_plate_clear: boolean;
-  // Farm production defaults (Phase 3) — prefill the start-run dialog's
+  // Farm production defaults — prefill the start-run dialog's
   // retry / quarantine policy fields.
   farm_retry_max_per_unit: number;
   farm_escalate_consecutive_failures: number;
-  // Offline-stall watch (Phase 3.2): flag a farm unit still 'printing' whose
+  // Offline-stall watch: flag a farm unit still 'printing' whose
   // printer has been offline at least this many minutes (never terminates it —
   // the reconcile resolves the true outcome on reconnect).
   farm_offline_stall_minutes: number;
@@ -1654,7 +1653,7 @@ export interface AppSettings {
   // heating airduct mode, dispatches without it. Seconds are 3–60.
   farm_plate_blowoff_enabled: boolean;
   farm_plate_blowoff_seconds: number;
-  // Dispatch responsiveness (latency-reduction wave). Event kicks make dispatch
+  // Dispatch responsiveness. Event kicks make dispatch
   // immediate; these tune the fallback poll, kick coalescing, USB-preflight
   // freshness, upload concurrency, and eject-file upload optimizations.
   queue_check_interval_seconds: number;
@@ -2467,7 +2466,7 @@ export interface PrintQueueItem {
   // Batch grouping
   batch_id?: number | null;
   batch_name?: string | null;
-  // Farm run identity (Phase 4.3g): set (= batch_id) when the item's batch is a
+  // Farm run identity: set (= batch_id) when the item's batch is a
   // production run. Drives the "Run" badge/link and farm-aware confirms.
   production_run_id?: number | null;
   // Shortest-job-first scheduling
@@ -3266,7 +3265,7 @@ export interface InventorySpool {
   // back-compat with pre-migration snapshots and object-literal test fixtures.
   feed_fault_at?: string | null;
   feed_fault_code?: string | null;
-  // Hardware-certain spent marker (W6/W3): set when the roll is genuinely spent
+  // Hardware-certain spent marker: set when the roll is genuinely spent
   // (RFID runout, confirmed exhaustion). Drives the "spent — replace roll" slot
   // badge; a spent spool is hard-excluded from selection. Optional for
   // back-compat with pre-migration snapshots and object-literal test fixtures.
@@ -3362,7 +3361,7 @@ export interface SpoolRespooledMessage {
   label_weight: number;
 }
 
-/** WS `tagless_fresh_prompt` payload (W5) — a tagless (non-RFID) roll has been
+/** WS `tagless_fresh_prompt` payload — a tagless (non-RFID) roll has been
  *  consumed past half its label weight and a qualified physical cycle occurred,
  *  so the operator is asked whether a FRESH roll is now on the slot (over-
  *  consumption + swap visibility). Dismissal is PER physical cycle, not
@@ -3498,7 +3497,7 @@ export interface NewRollRequest {
   note?: string | null;
 }
 
-/** Response from `POST /printers/{id}/eject` (W2 manual eject). `released_watch`
+/** Response from `POST /printers/{id}/eject` (manual eject). `released_watch`
  *  = an already-armed cooldown watch was released to sweep now; `dispatched` =
  *  a fresh part-present eject job was dispatched onto the printer. */
 export interface EjectNowResponse {
@@ -4485,7 +4484,7 @@ export const api = {
       `/printers/${printerId}/mark-plate-occupied`,
       { method: 'POST' }
     ),
-  // Farm manual eject (W2): trigger the part-present eject sweep for a
+  // Farm manual eject: trigger the part-present eject sweep for a
   // farm-known completed unit. Call with allowHot=false first; the backend 409s
   // with `{code:'bed_hot', bed_c, threshold_c}` when the bed is above the
   // release threshold (`threshold_c` null when there is neither an eject line
@@ -5696,7 +5695,7 @@ export const api = {
       body: JSON.stringify({ url, method, headers }),
     }),
 
-  // Eject Profiles (farm auto part-removal, Phase 1)
+  // Eject Profiles (farm auto part-removal)
   getEjectProfiles: () => request<EjectProfile[]>('/eject-profiles'),
   getEjectProfile: (id: number) => request<EjectProfile>(`/eject-profiles/${id}`),
   createEjectProfile: (data: EjectProfileCreate) =>
@@ -5756,7 +5755,7 @@ export const api = {
     window.URL.revokeObjectURL(url);
   },
 
-  // Printer model-geometry registry (farm eject, Phase 2)
+  // Printer model-geometry registry (farm eject)
   getModelGeometries: () => request<ModelGeometryList>('/model-geometry'),
   updateModelGeometry: (modelKey: string, data: ModelGeometryUpdate) =>
     request<ModelGeometry>(`/model-geometry/${encodeURIComponent(modelKey)}`, {
@@ -5764,7 +5763,7 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  // SKU catalog (farm production, Phase 2)
+  // SKU catalog (farm production)
   getSkus: () => request<Sku[]>('/skus'),
   getSku: (id: number) => request<Sku>(`/skus/${id}`),
   createSku: (data: SkuCreate) =>
@@ -5789,9 +5788,9 @@ export const api = {
     request<SkuSuggest>(`/skus/suggest?library_file_id=${libraryFileId}`),
   getSkuStats: (id: number) => request<SkuStats>(`/skus/${id}/stats`),
 
-  // Production runs (farm production, Phase 2)
+  // Production runs (farm production)
   getProductionRuns: () => request<ProductionRun[]>('/production-runs'),
-  // Fleet-scoped per-printer farm context for the Printers page (Phase 3, F2).
+  // Fleet-scoped per-printer farm context for the Printers page.
   getFarmPrinterStates: () => request<FarmPrinterContext[]>('/production-runs/printer-states'),
   getProductionRun: (id: number) => request<ProductionRun>(`/production-runs/${id}`),
   createProductionRun: (data: ProductionRunCreate) =>
@@ -5805,7 +5804,7 @@ export const api = {
     request<ProductionRun>(`/production-runs/${id}/resume`, { method: 'POST' }),
   abortProductionRun: (id: number) =>
     request<ProductionRun>(`/production-runs/${id}/abort`, { method: 'POST' }),
-  // Change or clear a not-yet-started run's deferred start (Phase 5). A future
+  // Change or clear a not-yet-started run's deferred start. A future
   // ISO string reschedules; null (or a past time) starts the run now.
   rescheduleProductionRun: (id: number, scheduled_start_at: string | null) =>
     request<ProductionRun>(`/production-runs/${id}/reschedule`, {
@@ -5880,7 +5879,7 @@ export const api = {
    */
   /**
    * Re-check system-staged (low-spool) queue items against live spool state and
-   * release the ones whose deficit has cleared (Phase 4.2). Optionally scoped to
+   * release the ones whose deficit has cleared. Optionally scoped to
    * one printer. Returns the released count for the toast.
    */
   releaseStagedQueueItems: (printerId?: number) => {

@@ -1,4 +1,4 @@
-"""Unit tests for SKU auto-suggestion regex parsing (Phase 2)."""
+"""Unit tests for SKU auto-suggestion regex parsing."""
 
 from backend.app.services.sku_catalog import parse_sku_suggestion
 

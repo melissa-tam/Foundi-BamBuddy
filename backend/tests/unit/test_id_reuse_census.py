@@ -37,7 +37,7 @@ _CLEARED = "referenced, cleared on delete — "
 # being claimed safe here in the same edit.
 #
 # There is deliberately no "deferred" third bucket. The first cut of this census had one —
-# five tables that were referenced AND left dangling but sat outside the wave's original
+# five tables that were referenced AND left dangling but sat outside the census's original
 # scope — and a bucket for "unsafe, but not today" is how a closed class reopens. The
 # operator ruling was to close it here, so every one of them is in the forbidden set and
 # the only remaining answers are "cannot mis-bind" and "must never reuse an id".

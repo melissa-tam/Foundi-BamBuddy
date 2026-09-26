@@ -1117,7 +1117,7 @@ class TestPrintersAPI:
     async def test_get_printer_status_enriches_hms_errors(self, async_client: AsyncClient, printer_factory, db_session):
         """The status response must carry the serialization-time enrichment
         (short_code/description/wiki_url) for each HMS error, so the frontend
-        never re-derives the code or holds its own description table (Phase 2)."""
+        never re-derives the code or holds its own description table."""
         from unittest.mock import MagicMock, patch
 
         from backend.app.services.bambu_mqtt import HMSError, PrinterState
@@ -1514,7 +1514,7 @@ class TestPrintersAPI:
     async def test_get_printer_status_reports_model_mismatch(
         self, async_client: AsyncClient, printer_factory, db_session
     ):
-        """The REST status surface must carry the Phase 2 model-mismatch flag so
+        """The REST status surface must carry the model-mismatch flag so
         the Printers page banner works from the first poll (not only after a WS
         push) — including while the printer is offline (the flag is in-memory
         sticky and the scheduler keeps skipping the printer)."""
@@ -2670,7 +2670,7 @@ class TestChamberLightAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/chamber-light?on=true")
 
             # 502, not 500: an undelivered command is the PRINTER's session failing, and
-            # ``send_command`` has been fail-loud about that since the command-latency wave.
+            # ``send_command`` is fail-loud about that.
             assert response.status_code == 502
             assert "failed" in response.json()["detail"].lower()
 
@@ -3983,7 +3983,7 @@ class TestConfigureAmsSlotPersistsKProfile:
         db_session,
         printer_factory,
     ):
-        """W4 presence gate: the bound tray reads the cleared-tray shape, so the
+        """Presence gate: the bound tray reads the cleared-tray shape, so the
         binding is a stale location claim and the profile would land on a roll that
         is not in the machine. The MQTT configure still goes out (the operator asked
         for it); only the DB write is withheld."""

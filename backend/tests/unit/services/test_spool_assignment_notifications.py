@@ -191,7 +191,7 @@ def _state(trays: list[dict], *, ams_id: int = 0):
 
 @pytest.mark.asyncio
 async def test_binding_on_a_cleared_tray_no_longer_suppresses_the_alert():
-    """W4 — a binding whose tray reads EMPTY on the wire is a stale location claim,
+    """A binding whose tray reads EMPTY on the wire is a stale location claim,
     not an assignment. Counting it here false-suppressed the very alert this
     function exists for: the print maps a tray with nothing in it."""
     logger = logging.getLogger(__name__)

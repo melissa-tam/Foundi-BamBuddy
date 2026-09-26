@@ -12,15 +12,11 @@ landing, and exactly one of them is a task:
   restarted and took every watchdog with it. That claim is what
   ``farm_stall.check_dead_dispatch_claims`` exists to release.
 
-**This module is the ownership HANDOFF, and it replaced a timer that guessed at it.**
-``farm_stall`` used to require a claim to be 600 s old before it would look, with the
-comment that the figure existed so the watchdog was "ALWAYS the first responder" — i.e.
-one task inferring another task's liveness from a clock, with no evidence and a wide
-margin for safety. The watchdog's real budget is 90 s + 180 s, it exits on ANY active
-state, and it dies with every restart, so precisely the cases with NO watchdog — the
-ones nothing else can retire — waited the full ~12 minutes while the UI said "printing"
-over a demonstrably idle printer. Operators stopped those units by hand first, which is
-the farm losing an argument with its own bookkeeping.
+**This module is the ownership HANDOFF.** One task must never infer another task's
+liveness from a clock: the watchdog's real budget is 90 s + 180 s, it exits on ANY
+active state, and it dies with every restart, so a fixed age floor (it was 600 s) makes
+precisely the claims with NO watchdog — the ones nothing else can retire — wait ~12
+minutes while the UI says "printing" over a demonstrably idle printer.
 
 So liveness is ASKED rather than assumed (:func:`has_live_start_watchdog`, the same
 shape as ``printer_incidents.driver_live``), and what is left of the clock is one
@@ -39,8 +35,8 @@ PAUSE — which here is the difference between leaving a native-vision hold alon
 double-dispatching onto an occupied plate); and ``job_identity.same_job``, the ONE
 comparison of two subtask ids.
 
-:func:`judge` is pure, I/O-free and table-testable: every guard that used to live in a
-docstring paragraph is a row it can be asked about. The GATHERING (DB reads, wire reads)
+:func:`judge` is pure, I/O-free and table-testable: every guard is a row it can be asked
+about. The GATHERING (DB reads, wire reads)
 and the APPLYING (the dwell, the release, the broadcast) stay with ``farm_stall``, which
 owns the tick.
 """

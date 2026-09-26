@@ -1,4 +1,4 @@
-"""Unit tests for the farm first-article + failure/quarantine policy (Phase 3)."""
+"""Unit tests for the farm first-article + failure/quarantine policy."""
 
 import dataclasses
 import logging
@@ -575,7 +575,7 @@ class TestQuarantine:
 
 
 class TestOperatorStop:
-    """Operator-stop policy (Phase 3.1): a farm unit cancelled WITH a stop_source
+    """Operator-stop policy: a farm unit cancelled WITH a stop_source
     takes the no-retry / no-quarantine path, holds the run (active), notifies once."""
 
     async def _mk_printer(self, db, name="OS"):
@@ -991,7 +991,7 @@ async def _mk_exhausted_chain(db, batch, prof, *, printer_id=3, pos=99):
     """A plate whose ONE genuine retry is already spent: failed original -> failed retry.
 
     Built as a real lineage rather than by stamping ``retry_count``, because the cap is
-    DERIVED from the failed ancestors in the ``retry_of_id`` chain (W10) — a bare
+    DERIVED from the failed ancestors in the ``retry_of_id`` chain — a bare
     ``retry_count`` on a parentless row describes no failure that ever happened, and a
     fixture that fakes one would stop testing the mechanism the farm actually runs.
     Returns the retry (the row whose failure event is being decided).
@@ -1009,7 +1009,7 @@ async def _mk_exhausted_chain(db, batch, prof, *, printer_id=3, pos=99):
 
 
 class TestFailurePolicyBatchGate:
-    """The batch-status gate on `_on_item_failed` (Phase 1, R1/R2/R3)."""
+    """The batch-status gate on `_on_item_failed`."""
 
     async def _mk_printer(self, db, name="BG"):
         p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
@@ -1117,7 +1117,7 @@ class TestFailurePolicyBatchGate:
 
 
 class TestRetryRebalance:
-    """Retry rebalance (Phase 1, F7): POOL retries return to the pool."""
+    """Retry rebalance: POOL retries return to the pool."""
 
     async def test_model_targeted_retry_returns_to_unassigned_pool(self, db_session):
         batch, prof = await _mk_run(db_session, quantity=2, target_model="H2S", require_fa=False)
@@ -1429,7 +1429,7 @@ class TestApproveGuards:
 
 
 class TestLifecycleNotifications:
-    """Phase 6: transition_run pause/abort/resume fire the lifecycle events once."""
+    """transition_run pause/abort/resume fire the lifecycle events once."""
 
     async def test_pause_fires_on_run_paused_operator_reason(self, db_session):
         from backend.app.services.production_run import transition_run
@@ -1830,7 +1830,7 @@ class TestOnTerminalEjectHandling:
         assert "First-article eject job ended 'failed'" in (printer.quarantine_reason or "")
 
     async def test_name_mismatch_during_pending_keeps_the_eject(self, db_session):
-        # W1/R2: a foreign terminal whose echoed NAME is not our eject stem is a
+        # A foreign terminal whose echoed NAME is not our eject stem is a
         # positive mismatch even when the id path is lenient (no client) — the
         # eject is kept for the real eject terminal.
         printer = await self._mk_printer(db_session, "PEname")
@@ -1851,7 +1851,7 @@ class TestOnTerminalEjectHandling:
 
     async def test_completed_clears_plate_and_retires_the_durable_mirror(self, db_session):
         """A name-matched production eject completion clears the plate AND retires the
-        record whose durable mirror is ``print_queue.eject_dispatched_at`` (W1).
+        record whose durable mirror is ``print_queue.eject_dispatched_at``.
 
         The DB write itself moved one layer down at the 2026-08-30 cut-over — the
         authority's injected ``persist`` callable owns it, and ``test_plate_occupancy_store``
@@ -2231,7 +2231,7 @@ class TestEjectRuntimeExceededMark:
 
     async def test_unmarked_completed_releases_the_plate(self, db_session):
         # No mark = the watchdog never fired: pure normal-terminal handling, exactly
-        # as before the guard wave.
+        # as with no guard.
         printer = await self._mk_printer(db_session, "RGok")
         batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
         pending = dataclasses.replace(self._marked("production", batch.id, 112), runtime_exceeded_at=None)
@@ -2242,7 +2242,7 @@ class TestEjectRuntimeExceededMark:
         quarantine.assert_not_awaited()
 
     async def test_unmarked_failed_still_quarantines(self, db_session):
-        # The genuine-failure branch is untouched by this wave.
+        # The genuine-failure branch is untouched by the watchdog mark.
         printer = await self._mk_printer(db_session, "RGgenuine")
         batch, _ = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
         pending = dataclasses.replace(self._marked("production", batch.id, 116), runtime_exceeded_at=None)
@@ -2610,7 +2610,7 @@ class TestFaEjectCooldownGate:
 
 
 class TestTerminalWaitingReasonHygiene:
-    """W4b: a farm unit reaching a terminal status through ``on_terminal`` must not
+    """A farm unit reaching a terminal status through ``on_terminal`` must not
     keep a stale hold token (the 2026-07-20 completed/cancelled rows still flagged
     spool_jam_recovery_failed / printer_offline_stalled / print_paused_stalled)."""
 
@@ -2755,7 +2755,7 @@ class TestRecoverPrinterIgnoresNonFarmBatches:
 
 
 # --------------------------------------------------------------------------- #
-# W10 — the third terminal disposition, and W9's post-terminal half
+# The third terminal disposition: a graceful requeue
 # --------------------------------------------------------------------------- #
 async def _mk_printer_row(db, name, model="H2S"):
     p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model=model)
@@ -2844,7 +2844,7 @@ def _outcome(verdict=None, *, recorded="cancelled", faults=frozenset(), refusal=
 
 
 class TestGracefulRequeue:
-    """W10: a plate the printer REFUSED, or one an operator stopped on a fault-held
+    """A plate the printer REFUSED, or one an operator stopped on a fault-held
     printer, is queued again with its settings — lineage only, no quarantine, no run pause.
 
     Decided from the terminal's OUTCOME — its verdict and the faults it captured before
@@ -2977,7 +2977,7 @@ class TestGracefulRequeue:
         assert batch.pause_reason == "operator_stop"
 
     async def test_an_operator_stop_over_a_physical_hold_requeues_and_the_hold_survives(self, db_session):
-        """The disposition change of the equipment-fault wave (2026-09-11): the unit
+        """The equipment-fault disposition (2026-09-11): the unit
         is requeued (it lands elsewhere in its pool — dispatch to THIS printer stays
         refused on the record), and the physical row is still open afterwards."""
         printer = await _mk_printer_row(db_session, "GRQ5")
@@ -3389,7 +3389,7 @@ class TestEscalationNeverStops:
 
     Pinned at MODULE scope by parsing the recovery lane: the invariant is "no stop is
     ever sent from this lane", not "not from this one branch", and an AST walk is the
-    only assertion that covers every path including the ones a future wave adds.
+    only assertion that covers every path including the ones a future change adds.
     """
 
     async def test_the_recovery_lane_sends_no_stop_anywhere(self):

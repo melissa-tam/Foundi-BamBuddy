@@ -1126,8 +1126,8 @@ async def _migrate_widen_spoolman_slot_ams_id_range(conn) -> None:
 
 # The H2S cooldown-hold clearance (mm): how far a part's top may stand above the nozzle
 # plane while the toolhead is parked at the chute. MEASURED by the operator 2026-09-10
-# ("it's 100mm part max"), superseding the 51 mm witnessed-safe placeholder the first
-# wave shipped with. Spelled ONCE because two statements consume it — the fresh-DB seed
+# ("it's 100mm part max"), superseding the 51 mm witnessed-safe placeholder that shipped
+# first. Spelled ONCE because two statements consume it — the fresh-DB seed
 # and the one-time migration that lifts the placeholder on installs that already ran.
 #
 # Consumed with NO margin against the slicer's MODELLED ``max_z``: a warped or failed
@@ -1547,8 +1547,8 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN nozzle_mapping TEXT")
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN nozzles_info TEXT")
 
-    # Migration: target_printer_ids on print_queue — the printer POOL target
-    # (2026-09-04 pool-target wave). Canonical JSON int list; see the column's
+    # Migration: target_printer_ids on print_queue — the printer POOL target.
+    # Canonical JSON int list; see the column's
     # comment block in models/print_queue.py and services/dispatch_target.py.
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN target_printer_ids TEXT")
 
@@ -3815,7 +3815,7 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN groups_claim VARCHAR(64)")
     await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN group_mapping TEXT")
 
-    # Migration: Farm production-run fields on print_batches (Phase 2). The
+    # Migration: Farm production-run fields on print_batches. The
     # ``skus`` and ``sku_files`` tables are created by create_all() before
     # run_migrations, so the ``sku_files`` FK reference resolves on both SQLite
     # and Postgres. Non-farm/legacy batches leave these NULL.
@@ -3826,7 +3826,7 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN target_units INTEGER")
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN cooldown_temp_c_override REAL")
 
-    # Migration: Farm first-article + failure policy (Phase 3). BOOLEAN literals
+    # Migration: Farm first-article + failure policy. BOOLEAN literals
     # are dialect-branched (Postgres rejects DEFAULT 1 on a BOOLEAN column).
     if is_sqlite():
         await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN require_first_article BOOLEAN DEFAULT 1")
@@ -3837,7 +3837,7 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN retry_max_per_unit INTEGER DEFAULT 1")
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN escalate_consecutive_failures INTEGER DEFAULT 2")
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN first_article_plan TEXT")
-    # Run hold reason (Phase 3, 3.1; consumed more broadly in Phase 4). Event-fact
+    # Run hold reason. Event-fact
     # only; run status stays derived. Set to 'operator_stop' when a unit is stopped
     # by the operator (run stays active, shows the hold); cleared on resume.
     await _safe_execute(conn, "ALTER TABLE print_batches ADD COLUMN pause_reason VARCHAR(50)")
@@ -3852,10 +3852,10 @@ async def run_migrations(conn):
         "ALTER TABLE print_queue ADD COLUMN retry_of_id INTEGER REFERENCES print_queue(id) ON DELETE SET NULL",
     )
 
-    # Terminal-status correlation (Phase 1, P1-A): bind a terminal MQTT status to
+    # Terminal-status correlation: bind a terminal MQTT status to
     # the exact queue item it came from instead of a printer_id-only lookup.
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN dispatch_subtask_id VARCHAR(32)")
-    # Operator-stop attribution (Phase 3, 3.1): which operator action cancelled a
+    # Operator-stop attribution: which operator action cancelled a
     # unit ('operator_ui' / 'operator_screen'); NULL for failures/completions and
     # for reconcile-synthesised interruptions. Drives no-retry / no-quarantine.
     await _safe_execute(conn, "ALTER TABLE print_queue ADD COLUMN stop_source VARCHAR(20)")
@@ -3863,8 +3863,8 @@ async def run_migrations(conn):
         conn,
         "CREATE INDEX IF NOT EXISTS ix_print_queue_dispatch_subtask_id ON print_queue (dispatch_subtask_id)",
     )
-    # Dedup pre-constraint duplicate retry lineages BEFORE creating the unique index
-    # (Phase 1, R4): a DB migrated before the idempotency guard existed may hold two
+    # Dedup pre-constraint duplicate retry lineages BEFORE creating the unique index:
+    # a DB migrated before the idempotency guard existed may hold two
     # retries for one failure event. SQLite raises IntegrityError on the CREATE UNIQUE
     # INDEX below for such rows — and _safe_execute does NOT swallow that (it isn't an
     # "already exists" error), so startup would abort. Keep the oldest lineage (MIN id)
@@ -3893,7 +3893,7 @@ async def run_migrations(conn):
         await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantined BOOLEAN DEFAULT FALSE")
     await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN quarantine_reason TEXT")
 
-    # Plate-clear gate provenance (Phase 1): the subtask id of the print that
+    # Plate-clear gate provenance: the subtask id of the print that
     # raised the current gate, so the cooldown monitor only auto-clears a gate it
     # can positively attribute to a farm eject job on restart.
     await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN plate_gate_subtask_id VARCHAR(64)")
@@ -3905,27 +3905,27 @@ async def run_migrations(conn):
         ("on_run_paused", "1", "TRUE"),
         ("on_run_completed", "0", "FALSE"),
         ("on_foreign_job_detected", "1", "TRUE"),
-        # Phase 2: device-reported model differs from the registered Printer.model.
+        # Device-reported model differs from the registered Printer.model.
         ("on_model_mismatch", "1", "TRUE"),
-        # Phase 3.1: a run unit was stopped by the operator (UI or printer screen).
+        # A run unit was stopped by the operator (UI or printer screen).
         ("on_run_unit_stopped", "1", "TRUE"),
-        # Phase 3.2: a printing unit's printer has been offline past the stall grace.
+        # A printing unit's printer has been offline past the stall grace.
         ("on_print_stalled", "1", "TRUE"),
         # Pause-stall: a printing unit's CONNECTED printer sat unattended-PAUSEd
         # past the pause-stall grace (an HMS outside the recovery sets, door-open).
         ("on_print_paused_stalled", "1", "TRUE"),
-        # WS2b foreign-pause watch: a print the farm did not dispatch sat PAUSEd past
+        # Foreign-pause watch: a print the farm did not dispatch sat PAUSEd past
         # the same grace with no AMS incident owning it (a vision trip on a LAN print
         # is the common case) — the farm-item watch above can never see those.
         ("on_foreign_print_paused", "1", "TRUE"),
-        # WS3 spent-contradiction detector: a spool stamped SPENT is still seated in
+        # Spent-contradiction detector: a spool stamped SPENT is still seated in
         # its slot reading substantially full on the wire — a false spent stamp, which
         # no AUTOMATIC un-spend lane will ever undo (the one deliberate un-spend is
         # operator-answered and evidence-gated: dismissing the respool prompt via
         # POST /inventory/spools/{id}/respool-dismiss) and which silently removes the
         # roll from selection. Spools 185/205 sat like that for nine days unnoticed.
         ("on_spent_contradiction", "1", "TRUE"),
-        # WS6 zero-gram detector: a print COMPLETED while a TAGLESS roll fed it and
+        # Zero-gram detector: a print COMPLETED while a TAGLESS roll fed it and
         # charged nothing. A tagless tray reports remain: -1 forever, so the slicer
         # 3MF is its ONLY gram source — lose the 3MF and the charge silently becomes
         # zero rather than failing. 15 consecutive prints did exactly that on
@@ -3953,7 +3953,7 @@ async def run_migrations(conn):
         # Cooldown escalation: post-print eject cooldown is running long (bed still
         # above the release threshold past the escalation window).
         ("on_cooldown_escalation", "1", "TRUE"),
-        # Phase 6: manual/lifecycle events surfaced to the other operator. Aborted
+        # Manual/lifecycle events surfaced to the other operator. Aborted
         # and first-article-approved default ON (they close a loop the other
         # operator is waiting on); resume is informational and defaults OFF.
         ("on_run_aborted", "1", "TRUE"),
@@ -3969,7 +3969,7 @@ async def run_migrations(conn):
         ("on_spool_recovery_failed", "1", "TRUE"),
         ("on_spool_out_of_rotation", "1", "TRUE"),
         ("on_spool_recovery_self_healed", "0", "FALSE"),
-        # Pause-recovery wave (2026-09-04 fleet outage): ONE column carries the whole
+        # Pause recovery (2026-09-04 fleet outage): ONE column carries the whole
         # lane — the per-outage fleet summary ("power restored — N resumed, M held")
         # and the per-printer HOLD pages (a resume the firmware refused, a plate-vision
         # trip confirmed on the second start, a printer that rebooted with a part on
@@ -3981,7 +3981,7 @@ async def run_migrations(conn):
         _default = _sqlite_default if is_sqlite() else _pg_default
         await _safe_execute(conn, f"ALTER TABLE notification_providers ADD COLUMN {_col} BOOLEAN DEFAULT {_default}")
 
-    # Phase 2: printer model-geometry registry (replaces the eject generator's
+    # Printer model-geometry registry (replaces the eject generator's
     # in-code PRINTER_BED_DIMS / PRINTER_TRAVEL_ENVELOPE dicts). create_all builds
     # the table on fresh installs; this CREATE ... IF NOT EXISTS covers the throwaway
     # migration probe + belt-and-suspenders on existing installs. Idempotent seeds
@@ -4034,7 +4034,7 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE printer_model_geometry ADD COLUMN z_travel_mm FLOAT")
     _true = "1" if is_sqlite() else "TRUE"
     _false = "0" if is_sqlite() else "FALSE"
-    # Pause-recovery wave (2026-09-04): two per-model motion facts for the eject lane.
+    # Pause recovery (2026-09-04 fleet outage): two per-model motion facts for the eject lane.
     # z_reference_validated — the contact-free Z re-reference prologue (bed to its
     # bottom stop, G92 Z<z_travel>) is emitted for this model ONLY after the hardware
     # ladder flipped this flag through the geometry manager; default FALSE for every
@@ -4092,7 +4092,7 @@ async def run_migrations(conn):
         # Cooldown plate-hold seed — H2S ONLY. Operator ruling 2026-09-10 (eyewitness):
         # with the toolhead parked at the chute the space above the nozzle plane over the
         # part area is clear to 100 mm (``_H2S_COOLDOWN_HOLD_CLEAR_ABOVE_MM``, MEASURED —
-        # the first wave shipped 51 as a witnessed-safe placeholder and the one-time
+        # 51 shipped first as a witnessed-safe placeholder and the one-time
         # migration below lifts it on installs that already have it). The keep-out line is
         # the vendor's rear service area (Y295) minus 10 mm of margin = 285; for reference
         # the production plate's own bbox_all ends at Y 261.97, well clear of it.
@@ -4172,7 +4172,7 @@ async def run_migrations(conn):
     # ISO strings on SQLite regardless of affinity).
     await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN spent_at TIMESTAMP NULL")
 
-    # Restart-safe eject terminal handling (W1): durable per-unit mirror of the
+    # Restart-safe eject terminal handling: durable per-unit mirror of the
     # in-memory PendingEject registry. NON-NULL == a server-dispatched part-present
     # eject is in flight for this unit; resolution NULLs it. A timestamp (not a
     # boolean) so the startup hydrator can drop stamps older than the 24h TTL.
@@ -4266,7 +4266,7 @@ async def run_migrations(conn):
     )
     await conn.execute(text("DELETE FROM settings WHERE key = 'prefer_lowest_filament'"))
 
-    # Migration (W4): normalize the shipped tagless-default filament to a complete wire
+    # Migration: normalize the shipped tagless-default filament to a complete wire
     # identity (GFG02 Bambu PETG HF + nozzle range 230/270) so every bare-tray config
     # push emits the fleet's one canonical identity — of which the PRESET half is what
     # makes the slot a firmware backup-group peer (grouping is preset + colour). ONLY
@@ -4323,7 +4323,7 @@ async def run_migrations(conn):
         """,
     )
 
-    # Migration (W2): durable per-escalation ledger for the repeat-jam printer
+    # Migration: durable per-escalation ledger for the repeat-jam printer
     # quarantine (services/spool_recovery._escalate writes one row per give-up).
     # Two escalations for a printer within _JAM_QUARANTINE_WINDOW_H hours →
     # farm_policy.quarantine_printer, surviving the restarts the in-memory latch
@@ -4359,7 +4359,7 @@ async def run_migrations(conn):
         "ON recovery_escalation(printer_id, created_at)",
     )
 
-    # W2 retention: a recovery_escalation row older than the quarantine window can
+    # Retention: a recovery_escalation row older than the quarantine window can
     # never influence a decision, so drop it at startup — behaviour-preserving and
     # it bounds the table. This is the recovery-escalation twin of the
     # notification_ledger startup prune (notify_dedup.prune_ledger, run from main's
@@ -4415,7 +4415,7 @@ async def run_migrations(conn):
     for key in ("eject_slim_3mf", "eject_upload_skip_identical"):
         await conn.execute(text("DELETE FROM settings WHERE key = :key"), {"key": key})
 
-    # Migration (W5 durable fresh-roll prompt): the tagless "is this a fresh roll?"
+    # Migration (durable fresh-roll prompt): the tagless "is this a fresh roll?"
     # prompt kept its only state in process memory, so a broadcast that reached zero
     # connected clients — or any restart — lost it permanently and the reconnect
     # replay had nothing to replay (2026-07-24 prod). The stamp lives on the row it
@@ -4467,7 +4467,7 @@ async def run_migrations(conn):
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_spool_assignment_spool_id ON spool_assignment (spool_id)",
     )
 
-    # Migration (W2 spool-core re-architecture, 2026-08-01): the last physical slot a
+    # Migration (spool-core re-architecture, 2026-08-01): the last physical slot a
     # roll was RELEASED from. An assignment row is a LOCATION claim (doctrine rule 9),
     # so a tray reading empty must drop it — but a roll pulled for drying and returned
     # has to reclaim its own gram history rather than mint a fresh 0 g row, and the
@@ -4483,7 +4483,7 @@ async def run_migrations(conn):
     await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN last_location_tray_id INTEGER")
     await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN last_location_at TIMESTAMP NULL")
 
-    # Migration (W2): pre-configured assignments become an ASSERTED fact. Binding a
+    # Migration: pre-configured assignments become an ASSERTED fact. Binding a
     # spool to an empty slot on purpose (SpoolBuddy weigh-then-assign) was previously
     # distinguishable only by a blank ``fingerprint_type`` — an inference that broke in
     # both directions (an unreadable tray looked pre-configured; any writer filling the
@@ -4504,7 +4504,7 @@ async def run_migrations(conn):
             {"now": _dt.utcnow()},
         )
 
-    # Cleanup (W2, PRE-EXISTING bug): ``DELETE /printers/{id}`` never deleted the
+    # Cleanup (PRE-EXISTING bug): ``DELETE /printers/{id}`` never deleted the
     # printer's SpoolAssignment rows and SQLite enforces no FK cascade (this module
     # sets no ``PRAGMA foreign_keys=ON``), so every printer ever removed left its
     # bindings behind — invisible rows that still hold their spools "assigned",
@@ -4528,7 +4528,7 @@ async def run_migrations(conn):
         async with conn.begin_nested():
             await conn.execute(text("DELETE FROM spool_assignment WHERE printer_id NOT IN (SELECT id FROM printers)"))
 
-    # Migration (WS6, 2026-08-09): the durable HMS vocabulary. HMS codes were persisted
+    # Migration (2026-08-09): the durable HMS vocabulary. HMS codes were persisted
     # NOWHERE — the notification ledger records only that an ALERT was sent, and a code
     # with no catalog description never notifies, so it left one DEBUG line that prod
     # logging does not write (printer 2's live 0500_0051 / 0500_0005: zero occurrences in
@@ -4578,7 +4578,7 @@ async def run_migrations(conn):
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_hms_event_printer_code ON hms_event (printer_id, full_code)",
     )
 
-    # Migration (WS2b, 2026-08-09): durable per-printer AMS incidents. The whole
+    # Migration (2026-08-09): durable per-printer AMS incidents. The whole
     # recovery/hold/auto-resume/escalation lifecycle lived in process-lifetime dicts
     # reachable only through a matching FARM queue item — so 12 foreign-print runouts
     # were stamped spent but never alerted, held or resumed; an escalation latch
@@ -4750,7 +4750,7 @@ async def run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_printer_incident_step_incident ON printer_incident_step (incident_id)",
     )
 
-    # Migration (WS7, 2026-08-09): the roll's SECOND RFID chip. A Bambu roll physically
+    # Migration (2026-08-09): the roll's SECOND RFID chip. A Bambu roll physically
     # carries TWO tags — one per flange side — sharing one tray_uuid, and the AMS reads
     # whichever side faces its antenna. Only one of the two was ever stored, so the other
     # was re-discovered as a surprise on every push: six prod spools replayed the
@@ -4760,7 +4760,7 @@ async def run_migrations(conn):
     # "already exists"); NULL = only one side has ever been read.
     await _safe_execute(conn, "ALTER TABLE spool ADD COLUMN sibling_tag_uid VARCHAR(32)")
 
-    # Repair (WS7, 2026-08-09): clear FALSE spent stamps — the one thing running code
+    # Repair (2026-08-09): clear FALSE spent stamps — the one thing running code
     # cannot fix for itself.
     #
     # A spool that "ran out" but never fed is self-contradictory. Doctrine rule 8 makes
@@ -4768,12 +4768,12 @@ async def run_migrations(conn):
     # not — a full-weight reset makes 0 g used ≠ never used), and rule 10 rules out every
     # reuse story on this fleet, so "spent, never fed, still bound" has exactly one
     # explanation: the stamp was wrong. Prod rows 185 and 205 were stamped by the
-    # pre-WS3 multi-AMS misattribution while their trays read LOADED at 100 %.
+    # earlier multi-AMS misattribution while their trays read LOADED at 100 %.
     #
     # Why it must be a migration rather than self-healing: a spent row is hard-excluded
     # from selection and a same-roll discovery read concludes KEEP on the spent latch, so
     # the stamp is a closed loop — the slot is blocked FOREVER and no amount of correct
-    # code reopens it. WS3 stopped producing these; only a repair clears the ones already
+    # code reopens it. Running code no longer produces these; only a repair clears the ones already
     # written. There is no AUTOMATIC un-spend lane by operator ruling — the one deliberate
     # un-spend is operator-ANSWERED and evidence-gated (dismissing the respool prompt via
     # POST /inventory/spools/{id}/respool-dismiss NULLs spent_at when the live AMS remain
@@ -4964,7 +4964,7 @@ async def run_migrations(conn):
                 [r[0] for r in _stale_mapped],
             )
 
-    # Cutover (2026-09-04, the printer-subset POOL wave): re-type every pending farm
+    # Cutover (2026-09-04, printer-subset POOL targets): re-type every pending farm
     # unit whose ``printer_id`` was a creation-time DERIVATION, once.
     #
     # ``printer_id`` on a PENDING row changed meaning in this release, exactly as
@@ -4987,7 +4987,7 @@ async def run_migrations(conn):
     # shapes, in this order:
     #   * ANY unit of the batch (any status) carrying a target_model means the run was a
     #     MODEL run all along, and these pinned pending rows are ``top_up_run``'s
-    #     mis-pinned replacements of failed units (the latent bug this wave also fixes).
+    #     mis-pinned replacements of failed units (a latent bug this cutover also fixes).
     #     They become that model pool — never a printers pool, which would silently
     #     narrow a whole-fleet run down to whichever machines happened to fail on it.
     #   * otherwise the batch was a SUBSET run, and its pool is the DISTINCT printer_ids
@@ -5156,9 +5156,9 @@ async def run_migrations(conn):
     # Repair (2026-08-13, the release-before-runout resurrection incident): retire the
     # seven DEAD ledger rows that were re-bound onto freshly-loaded rolls, once.
     #
-    # What happened (plan ``003-h2s-ran-out-of-eventual-harbor.md``): the AMS clears a
+    # What happened: the AMS clears a
     # drained slot's exist bit ~3 minutes BEFORE the firmware declares the runout, so
-    # ever since release-on-empty started firing reliably (wave 2, 08-10) every natural
+    # ever since release-on-empty started firing reliably (2026-08-10) every natural
     # runout's binding was already gone when the runout HMS arrived — and the single
     # spent writer resolves its victim from a LIVE assignment, so nothing was stamped
     # fleet-wide for three days. The released row keeps its ``last_location_*``
@@ -5172,7 +5172,7 @@ async def run_migrations(conn):
     # row carrying only what it has actually printed since the reclaim.
     # ``stamp_donor_spent`` writes ``spent_at`` directly rather than through
     # ``spool_respool._mark_tray_spent``, the one live writer — the sanctioned repair
-    # exception (plan WS6): a repair asserts a fact about a past the wire will never
+    # exception: a repair asserts a fact about a past the wire will never
     # re-assert, and the live writer resolves its victim from tray state that has since
     # moved on. ``require_positive_moved=False`` because a print held on the runout has
     # charged nothing yet: a 0 g successor is still the correct answer to "which roll is
@@ -5404,7 +5404,7 @@ async def run_migrations(conn):
     else:
         await _safe_execute(conn, "ALTER TABLE library_files ADD COLUMN transient BOOLEAN DEFAULT FALSE")
 
-    # Migration (WS11, 2026-08-19): the operator's "Re-check slot" intent — doctrine
+    # Migration (2026-08-19): the operator's "Re-check slot" intent — doctrine
     # rule 12's durable half (incident shape 32).
     #
     # Rule 6 has always named two identity oracles, "an RFID tag OR a human answer", and
@@ -5639,7 +5639,7 @@ async def run_migrations(conn):
 
     # Cooldown-hold clearance (2026-09-10): the H2S placeholder becomes the measured
     # value. The seed above only fills a NULL, so an install that already ran the first
-    # wave carries 51.0 and would keep holding every plate 49 mm lower than the machine
+    # seed carries 51.0 and would keep holding every plate 49 mm lower than the machine
     # allows.
     #
     # ONE-TIME, not idempotent-by-repetition: a plain UPDATE keyed on 51.0 would re-run
@@ -6120,7 +6120,7 @@ async def _migrate_aborted_queue_items_to_cancelled(conn) -> None:
     branch. This used to run in the app lifespan as an ORM read-then-write on every boot; it is data
     repair, so it lives with the migrations as ONE self-predicating statement — idempotent because
     nothing writes the word any more, so a second boot matches no row. ``waiting_reason`` is cleared
-    in the same statement (terminal-transition hygiene, W4b).
+    in the same statement (terminal-transition hygiene).
     """
     from sqlalchemy import text
 

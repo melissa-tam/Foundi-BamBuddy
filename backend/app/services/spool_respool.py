@@ -481,10 +481,10 @@ def _bound_after_the_bay_cleared(
     Tier 1's ELIGIBILITY test, and a physical impossibility rather than a heuristic: a roll
     that was bound to the slot only after the bay emptied cannot be the roll that emptied it.
 
-    It exists because the 2026-08-19 spool-identity wave changed a precondition this lane
+    It exists because the 2026-08-19 spool-identity change altered a precondition this lane
     depends on without re-checking the lane (the shape memory ``liveness-paired-verification``
-    is about — the same way the 08-13 wave starved every spent stamp for three days). That
-    wave made a refill inside the ~3-minute bay-clear→HMS gap MINT a fresh row and bind it
+    is about — the same way the 2026-08-13 regression starved every spent stamp for three days). That
+    change made a refill inside the ~3-minute bay-clear→HMS gap MINT a fresh row and bind it
     (scenarios T7/T8 — "a runout release is never a glitch"), which is correct. But tier 1
     resolves its victim from the LIVE :class:`SpoolAssignment`, so the runout HMS arriving
     two minutes later stamped whatever was bound: probe result ``FRESH spent_at:
@@ -496,7 +496,7 @@ def _bound_after_the_bay_cleared(
 
     Two facts decide it, both already durable, neither of them new state:
 
-    * ``SpoolAssignment.created_at`` — the bind moment. The same wave made it meaningful:
+    * ``SpoolAssignment.created_at`` — the bind moment, and meaningful:
       a genuine MINT stamps a fresh one, while a DE-BOUNCE deliberately carries the
       incumbent's ORIGINAL moment forward (``bind_spool_to_slot(..., bind_moment=...)``,
       ``slot_pipeline._debounce_bind_moment``). That is precisely what keeps a de-bounced
@@ -616,9 +616,9 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     That release is CORRECT wire truth — an assignment claims where a roll physically IS
     (doctrine rule 9) and the bay is empty — so exhaustion attribution has to SURVIVE the
     release rather than fight it. It did not: this writer required a live assignment, and
-    from the 2026-08-10 release wave (which made bit-clear releases fire reliably for the
-    first time) until this change, every spent stamp fleet-wide was a silent no-op. The
-    dependency was never written down, which is why no review of that wave could flag it;
+    from 2026-08-10 (when bit-clear releases began to fire reliably) until
+    this change, every spent stamp fleet-wide was a silent no-op. The
+    dependency was never written down, which is why no review could flag it;
     it is written down now.
 
     **Tier 2 adjudicates THE NEWEST row and never scans past it** — deliberately NOT
@@ -632,7 +632,7 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     **Tier 1 is no longer unconditional, and the case that changed it is the one the
     paragraph above used to dismiss.** "An operator inserting a fresh roll inside the
     3-minute gap wins TIER 1 by construction: inserting it binds the slot" was true, and it
-    was the bug: the 2026-08-19 wave made that insertion MINT a fresh row (T7/T8 — a runout
+    was the bug: since 2026-08-19 that insertion MINTS a fresh row (T7/T8 — a runout
     release is never a glitch), so tier 1 stamped the brand-new roll spent at 0 g used and
     left the roll that actually ran dry un-stamped and still selectable. The eligibility
     test :func:`_bound_after_the_bay_cleared` is the fix, and it is a statement about

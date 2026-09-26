@@ -1,4 +1,4 @@
-"""Pydantic schemas for the farm production-run API (Phase 2).
+"""Pydantic schemas for the farm production-run API.
 
 A production run is a :class:`~backend.app.models.print_batch.PrintBatch` tied to
 a SKU file. All unit/plate counts on the response are DERIVED by query from the
@@ -18,7 +18,7 @@ class RunPrinterRef(BaseModel):
 
 
 class RunPrinterState(BaseModel):
-    """Live blocked-state summary for one printer a run targets (Phase 4.1).
+    """Live blocked-state summary for one printer a run targets.
 
     Fully DERIVED (never stored): quarantine from the printer row, plate gate /
     model mismatch / connectivity from the live printer manager, stall and
@@ -54,15 +54,15 @@ class RunPrinterState(BaseModel):
 
 
 class RunUnit(BaseModel):
-    """One queue item of a run, as shown on the run detail page (Phase 4.1)."""
+    """One queue item of a run, as shown on the run detail page."""
 
     id: int
     status: str
-    # 'operator_ui' / 'operator_screen' when the unit was deliberately stopped
-    # (Phase 3.1); null for normal terminals.
+    # 'operator_ui' / 'operator_screen' when the unit was deliberately stopped;
+    # null for normal terminals.
     stop_source: str | None = None
     waiting_reason: str | None = None
-    # One-time deferred start (Phase 5): when in the future the scheduler holds
+    # One-time deferred start: when in the future the scheduler holds
     # this plate until then; null = ASAP. UTC.
     scheduled_time: datetime | None = None
     printer_id: int | None = None
@@ -93,12 +93,12 @@ class RunCreate(BaseModel):
     printer_ids: list[int] | None = None
     target_model: str | None = None
     eject_profile_id: int | None = None
-    # Farm first-article + failure policy (Phase 3). All optional; numbers fall
+    # Farm first-article + failure policy. All optional; numbers fall
     # back to the global farm settings, require_first_article defaults False.
     require_first_article: bool | None = Field(default=None, description="Gate the run on first-article approval")
     retry_max_per_unit: int | None = Field(default=None, ge=0, le=10)
     escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
-    # One-time deferred start (Phase 5). A future time holds every plate until
+    # One-time deferred start. A future time holds every plate until
     # then (non-blocking — the run then competes for a free printer). A value at
     # or before now, or null, means start ASAP. UTC (ISO string with Z).
     scheduled_start_at: datetime | None = None
@@ -138,9 +138,9 @@ class RunResponse(BaseModel):
     plates_failed: int
     plates_pending: int
     status: str
-    # Why the run is held (Phase 4.1): 'operator', 'operator_stop',
-    # 'first_article_rejected', 'no_available_printers' or 'retries_exhausted'
-    # (Phase 1). Null when not held.
+    # Why the run is held: 'operator', 'operator_stop',
+    # 'first_article_rejected', 'no_available_printers' or 'retries_exhausted'.
+    # Null when not held.
     pause_reason: str | None = None
     # Pending units system-staged by the low-spool guard (manual_start AND
     # filament_short) vs staged for any other reason (manual_start alone).
@@ -154,11 +154,11 @@ class RunResponse(BaseModel):
     # same run; null on the list, which stays lean.
     printer_states: list[RunPrinterState] | None = None
     units: list[RunUnit] | None = None
-    # Farm first-article + failure policy (Phase 3).
+    # Farm first-article + failure policy.
     require_first_article: bool = True
     first_article_state: str | None = None
     first_article_reject_reason: str | None = None
-    # First-article inspection payload (Phase 4, F1): populated only while the run
+    # First-article inspection payload: populated only while the run
     # is awaiting_approval or rejected; null otherwise. The photo URL is relative
     # (same-origin) — the finished part's newest ``finish_*`` archive photo.
     first_article_photo_url: str | None = None
@@ -166,7 +166,7 @@ class RunResponse(BaseModel):
     first_article_printer_name: str | None = None
     retry_max_per_unit: int = 1
     escalate_consecutive_failures: int = 2
-    # Prefill values for "Run again" (Phase 5, F9): the run's eject profile and
+    # Prefill values for "Run again": the run's eject profile and
     # target model are uniform across its items (first non-null). Null when not
     # applicable — a specific-printer run has no target_model.
     eject_profile_id: int | None = None
@@ -179,7 +179,7 @@ class RunResponse(BaseModel):
     # median cycle × remaining plates ÷ distinct printers; null when unknown.
     eta_seconds: float | None = None
     printers: list[RunPrinterRef] = Field(default_factory=list)
-    # Derived run-level deferred start (Phase 5): the earliest not-yet-started
+    # Derived run-level deferred start: the earliest not-yet-started
     # plate's scheduled_time. Future => the run is "scheduled"; null/past => it is
     # a normal active run. Stored on the items, not the batch. UTC.
     scheduled_start_at: datetime | None = None
@@ -190,7 +190,7 @@ class RunResponse(BaseModel):
 
 
 class FarmPrinterContext(BaseModel):
-    """Fleet-scoped "why is this printer on farm work" context (Phase 3, F2).
+    """Fleet-scoped "why is this printer on farm work" context.
 
     One entry per printer assigned to an active/paused production run, surfaced on
     the Printers page so an operator sees why a printer is blocked/idle without

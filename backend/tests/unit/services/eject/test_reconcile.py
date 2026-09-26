@@ -1,4 +1,4 @@
-"""Startup reconcile of pending ejects missed during downtime (W1.2).
+"""Startup reconcile of pending ejects missed during downtime.
 
 Since the 2026-08-30 cut-over every verdict acts through the plate-occupancy
 authority: the reconciler decides only what became of the EJECT, and the PLATE
@@ -105,7 +105,7 @@ def _live_gated_eject_with_verdict(printer_id, queue_item_id, *, purpose="produc
     Not a restart: the record was minted by a live dispatch, the whole-job deadline
     fired while the printer was off the wire, both ``stop_print`` sends returned False
     and the watchdog task exited. ``hydrated`` is False, so only the runtime verdict
-    makes it ``unowned_eject`` — and that is the enrolment this wave adds.
+    makes it ``unowned_eject`` — and that verdict alone enrols it.
     """
     plate_occupancy.hydrate_plate(printer_id, "SUB-1", policy or EscalationOnly())
     assert (
@@ -446,7 +446,7 @@ class TestAStoppedSweepIsAlwaysRecoverable:
     """The 2026-09-12 001/009-H2S shape: an eject whose WATCHDOG already gave its
     verdict is enrolled by the same reconciler, with no restart involved.
 
-    Before this wave the enrolment predicate was "hydrated", so the only cure for a
+    With "hydrated" as the only enrolment predicate, the only cure for a
     watchdog whose stop went undelivered was a process restart — and 001/009 had not
     restarted: ``occupancy.eject`` read ``{production, started, age ≥ 2400 s}``,
     ``clear-plate`` answered 409 ``eject_in_flight`` six times and the operator had no

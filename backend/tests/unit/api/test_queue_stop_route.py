@@ -1,4 +1,4 @@
-"""Queue-UI stop route root-cause fix (W4b).
+"""Queue-UI stop route root-cause fix.
 
 ``POST /queue/{id}/stop`` force-cancels the item synchronously, so by the time the
 MQTT terminal callback arrives the item is already ``cancelled`` and main.py's

@@ -88,7 +88,7 @@ async def ams_weight_sync_allowed(db: AsyncSession, printer_id: int, state) -> b
     return await live_print_archive(db, printer_id) is None
 
 
-# ── Tagged-ledger DECREASE reconcile (W6) ────────────────────────────────────
+# ── Tagged-ledger DECREASE reconcile ─────────────────────────────────────────
 #
 # The push-driven weight sync in ``main.on_ams_change`` is INCREASE-ONLY by
 # design: the AMS remain% is integer-resolution (10 g steps on a 1 kg roll) and
@@ -612,7 +612,7 @@ def _print_feeder_keys(
       ignored outright. The change log and ``tray_now`` observe what is physically
       in the feed path, and a motion-only job — an eject sweep, an empty-bed dry-run
       — inherits the previous print's still-loaded tray (the log is even seeded from
-      ``tray_now`` at print start, ``bambu_mqtt`` W6.1). Naming a feeder from those
+      ``tray_now`` at print start in ``bambu_mqtt``). Naming a feeder from those
       would page the zero-gram guard after every eject on every printer. The mapping
       is a DECISION rather than an observation, and an eject decides no AMS slot.
     """

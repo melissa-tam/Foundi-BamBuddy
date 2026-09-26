@@ -308,7 +308,7 @@ class TestBareArmGuards:
         env.apply.assert_not_awaited()
 
     async def test_spent_row_stays_latched(self, db_session, printer_factory, env):
-        """E — W1: a spent ams_auto binding is the durable 'ran dry' latch; only a
+        """E — a spent ams_auto binding is the durable 'ran dry' latch; only a
         qualified physical cycle releases it, never a reconcile pass."""
         printer = await printer_factory()
         await _seed_assignment(db_session, printer.id, spent=True)
@@ -623,7 +623,7 @@ class TestOwedIdentifyArm:
     async def test_untouched_tagless_slot_is_never_read(self, db_session, printer_factory, env, monkeypatch):
         """DOCTRINE GUARD: no physical cycle ⇒ no read. A commanded RFID read on an
         untouched tagless slot can only fail, and that failure is the standing
-        0700_2X00_0001_0081 this fork spent a wave eliminating. The config re-push still
+        0700_2X00_0001_0081 this fork eliminated. The config re-push still
         happens — the slot's identity was never in question."""
         printer = await printer_factory()
         await _seed_assignment(db_session, printer.id)
@@ -879,9 +879,9 @@ class TestBoundPresenceStaleArm:
 
 
 class TestSpentSwapParkArm:
-    """WS2 — the spent-swap park must not be a SILENT deadlock.
+    """The spent-swap park must not be a SILENT deadlock.
 
-    ``slot_state`` row 4a releases the W1 spent latch on a QUALIFIED PHYSICAL CYCLE, and
+    ``slot_state`` row 4a releases the spent latch on a QUALIFIED PHYSICAL CYCLE, and
     4a′/5a on an ANSWERED no-tag read over a binding that CLAIMS a tag. A spent binding
     under a CONFIGURED, seated tray with neither can reach neither — and for a TAGLESS
     incumbent the answered-read escape does not exist by design (doctrine rule 11's
@@ -1174,7 +1174,7 @@ class TestBackupGroupHarmonise:
     3->4, none across the pair.
 
     The farm already harmonised the PRESET dimension (the 011-H2S GFG99 fix) and the
-    TEMPS dimension (W4). This arm is the third: it exists so a slot an operator edited
+    TEMPS dimension. This arm is the third: it exists so a slot an operator edited
     on the touchscreen can come back to the fleet's identity on its own."""
 
     @pytest.fixture
@@ -1256,7 +1256,7 @@ class TestBackupGroupHarmonise:
         env.apply.assert_not_awaited()
 
     async def test_spent_row_stays_latched(self, db_session, printer_factory, env):
-        """W1: a spent binding is the durable 'ran dry' latch. Harmonising a dead roll's
+        """A spent binding is the durable 'ran dry' latch. Harmonising a dead roll's
         identity would re-push config for a slot waiting on a physical swap."""
         env.settings["tagless_default_filament"] = json.dumps(_TAGLESS_DEFAULT)
         printer = await printer_factory()

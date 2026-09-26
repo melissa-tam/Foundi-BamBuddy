@@ -1,4 +1,4 @@
-"""Unit tests for the durable AMS-incident store (WS2b).
+"""Unit tests for the durable AMS-incident store.
 
 The store is what replaced ``spool_recovery``'s process-lifetime dicts, so the
 properties pinned here are the ones a restart used to destroy: ONE open incident

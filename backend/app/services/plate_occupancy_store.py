@@ -1,4 +1,4 @@
-"""The I/O half of the plate-occupancy authority: the loader and the side effects (WS2).
+"""The I/O half of the plate-occupancy authority: the loader and the side effects.
 
 ``plate_occupancy`` is I/O-free by contract — stdlib only, no session, no ``await``,
 no imports from ``backend.app``. Everything it needs from the world therefore lives

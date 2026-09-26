@@ -20,7 +20,7 @@ interface SpoolPickerCardProps {
   onSelect: () => void;
   /**
    * Set when this roll still holds a binding on some OTHER slot that reads
-   * empty (W5b) — the sentence naming where that claim lives. Picking the roll
+   * empty — the sentence naming where that claim lives. Picking the roll
    * here MOVES the binding, so the operator has to be told the claim exists.
    */
   staleClaimLabel?: string;

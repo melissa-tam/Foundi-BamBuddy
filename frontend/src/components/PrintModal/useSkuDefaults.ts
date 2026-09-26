@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { api } from '../../api/client';
 
 /**
- * SKU-derived defaults for the file the PrintModal is printing (plan 2b).
+ * SKU-derived defaults for the file the PrintModal is printing.
  * `defaultEjectProfileId` is the eject profile the linking SKU nominates;
  * `skuCode` labels where it came from for the UI hint. Both null when the file
  * isn't linked to any SKU.

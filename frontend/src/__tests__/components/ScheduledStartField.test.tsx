@@ -1,5 +1,5 @@
 /**
- * Tests for ScheduledStartField (Phase 5): the ASAP/Schedule toggle emits a UTC
+ * Tests for ScheduledStartField: the ASAP/Schedule toggle emits a UTC
  * ISO string for a future time or null for ASAP, and reports validity (blocking
  * past/malformed entries). Uses iso/24h formats so the inputs are deterministic.
  */

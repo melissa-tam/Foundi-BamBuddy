@@ -1,5 +1,5 @@
 /**
- * Shared hold-visibility pieces for production runs (Phase 4.1): the
+ * Shared hold-visibility pieces for production runs: the
  * pause-reason chip, the blocked-printers chip and the staged banner. One
  * implementation used by both the runs list card and the run detail page so
  * the two surfaces can never drift.

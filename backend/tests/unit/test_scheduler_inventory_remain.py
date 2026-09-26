@@ -115,7 +115,7 @@ class TestInternalInventoryOverrides:
 
     @pytest.mark.asyncio
     async def test_archived_flag_propagates(self):
-        """``SlotInventory.archived`` mirrors ``spool.archived_at`` (W4). A repair
+        """``SlotInventory.archived`` mirrors ``spool.archived_at``. A repair
         that archives a rotten row without rebinding the slot left that row a live
         START candidate — ``archived_at`` was never filtered anywhere in selection."""
         archived_spool = _spool(label_weight=1000, weight_used=0, archived_at=datetime(2026, 5, 1, tzinfo=timezone.utc))

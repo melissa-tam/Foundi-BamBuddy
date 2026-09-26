@@ -48,8 +48,7 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       // The printer's own plate check tripped and PAUSED the print; the farm
       // sends nothing and holds it for a human (a `plate_vision` hold). The
       // operator fixes the plate and resumes — the same job continues. A Stop
-      // instead raises a human-clear plate gate on the card. (The 2026-09-04
-      // wave had the farm stop the print here; that was reverted 2026-09-24.)
+      // instead raises a human-clear plate gate on the card.
       return t('productionRuns.detail.waiting.visionHold');
     case 'power_loss_hold':
       // The printer is sitting at the firmware's OWN power-loss prompt and the

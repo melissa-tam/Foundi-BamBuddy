@@ -407,7 +407,7 @@ class TestPlateClearGate:
 
     @pytest.mark.asyncio
     async def test_foreign_terminal_leaves_item_and_raises_gate(self, test_engine):
-        """Phase 1 P1-A: a terminal whose subtask_id matches NO printing item (a
+        """A terminal whose subtask_id matches NO printing item (a
         LOCAL print started from the touchscreen) is FOREIGN — the farm item stays
         'printing', the gate is raised keyed to the foreign subtask. The plate is not
         the farm's own file (a plain non-farm item) so identification fails and the
@@ -565,7 +565,7 @@ class TestPlateClearGate:
 
     @pytest.mark.asyncio
     async def test_genuine_foreign_terminal_still_calls_resolver(self, test_engine):
-        """W5 scope guard: the eject short-circuit skips resolve_terminal_item ONLY for
+        """Scope guard: the eject short-circuit skips resolve_terminal_item ONLY for
         eject jobs. A genuinely foreign terminal (NOT an eject) must still run the
         resolver so the foreign branch is reached exactly as before — proving the
         short-circuit did not swallow ordinary correlation."""
@@ -1582,7 +1582,7 @@ class TestEjectJobCallbacks:
 
     @pytest.mark.asyncio
     async def test_eject_named_terminal_empty_registry_never_gates_or_notifies(self, test_engine):
-        """W1 name evidence: an eject-NAMED terminal that arrives with an EMPTY pending
+        """Name evidence: an eject-NAMED terminal that arrives with an EMPTY pending
         registry (a foreign instance's sweep after our restart lost the registry, or a
         cross-instance eject) is still recognised as an eject by name — even with
         motion progress reported. It must NOT be rewritten, NOT raise the plate gate,
@@ -1643,7 +1643,7 @@ class TestEjectJobCallbacks:
 
     @pytest.mark.asyncio
     async def test_eject_terminal_skips_ams_reread_sweep(self, test_engine):
-        """W6.4: an eject-job terminal must NOT trigger the AMS RFID re-read sweep —
+        """An eject-job terminal must NOT trigger the AMS RFID re-read sweep —
         each unit cycle sweeps once at the PRINT terminal, not again at the eject."""
         from contextlib import ExitStack
 
@@ -1741,7 +1741,7 @@ class TestEjectJobCallbacks:
 
     @pytest.mark.asyncio
     async def test_claimed_eject_skips_correlation_no_false_foreign_or_archive_warning(self, test_engine, capture_logs):
-        """W5: a CLAIMED-eject terminal never calls resolve_terminal_item (so it cannot
+        """A CLAIMED-eject terminal never calls resolve_terminal_item (so it cannot
         log the false-FOREIGN warning for the farm's own sweep) and skips the archive
         lookup (which always misses for a sweep, so no "Could not find archive"
         warning). farm_policy.on_terminal still finalises the sweep as 'completed'."""
@@ -1801,7 +1801,7 @@ class TestEjectJobCallbacks:
 
     @pytest.mark.asyncio
     async def test_named_eject_no_claim_skips_correlation_and_archive_warning(self, test_engine, capture_logs):
-        """W5 + W1 name evidence: an eject-NAMED terminal with NO claimed eject
+        """Name evidence: an eject-NAMED terminal with NO claimed eject
         (is_eject_job_name path — a restart lost the claim) is still recognised as
         our sweep before correlation. resolve_terminal_item is not called and no
         FOREIGN / no "Could not find archive" warning fires; the farm hook still runs."""

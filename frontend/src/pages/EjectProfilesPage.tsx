@@ -1,5 +1,5 @@
 /**
- * Eject Profiles page (farm auto part-removal, Phase 1).
+ * Eject Profiles page (farm auto part-removal).
  *
  * Full CRUD over eject profiles plus a preview/validate panel that generates
  * the eject G-code for a chosen library file + plate through the backend and
@@ -189,7 +189,7 @@ function EjectProfileDialog({ profile, isEditing, saving, error, onSave, onClose
   );
   const [nameError, setNameError] = useState(false);
 
-  // Geometry-derived validation bounds (Phase 2): registry rows give the bed
+  // Geometry-derived validation bounds: registry rows give the bed
   // width and part-height ceiling; the GET envelope carries the server's
   // minimum sweep-band width so it is never hardcoded here. All checks degrade
   // to no-ops while the query is unavailable — the backend re-validates

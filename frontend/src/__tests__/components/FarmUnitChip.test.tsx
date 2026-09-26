@@ -1,5 +1,5 @@
 /**
- * FarmUnitChip (Phase 3, F2): the printer-card chip that explains why a printer
+ * FarmUnitChip: the printer-card chip that explains why a printer
  * is on (or blocked on) farm work — a run link plus ONE status line per state
  * (printing / staged / low-spool / waiting reason / last-unit failure), and its
  * absence when the printer holds no farm context.

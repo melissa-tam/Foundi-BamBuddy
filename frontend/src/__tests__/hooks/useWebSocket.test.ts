@@ -859,7 +859,7 @@ describe('useWebSocket hook', () => {
     });
 
     it('words the spent-swap park as its OWN situation, not the presence one', async () => {
-      // WS2. One wire event, two situations: a slot whose presence will not resolve
+      // One wire event, two situations: a slot whose presence will not resolve
       // is a wire that stopped answering, while a spent-swap park is a wire answering
       // perfectly with nothing the farm may act on — and only the second has a
       // one-click way out. Sharing a sentence would send the operator to look for a

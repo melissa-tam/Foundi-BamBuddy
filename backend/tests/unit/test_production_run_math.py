@@ -1,4 +1,4 @@
-"""Unit tests for production-run math + transition rules (Phase 2)."""
+"""Unit tests for production-run math + transition rules."""
 
 import pytest
 

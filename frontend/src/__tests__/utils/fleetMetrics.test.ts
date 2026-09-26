@@ -936,7 +936,7 @@ describe('site time', () => {
 });
 
 describe('windowPrecedesRecording', () => {
-  // Production, as of this wave: the recorder is an hour old and the window is
+  // Production at the recorder's first deploy: the recorder is an hour old and the window is
   // six weeks deep — so the tab has to say so on nearly every window an
   // operator picks, not only on a virgin instance.
   const TZ = 'Pacific/Auckland';

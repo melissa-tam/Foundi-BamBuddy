@@ -2,12 +2,12 @@
 
 Two halves of the same 001-H2S incident (2026-08-29):
 
-* **W4** — at 01:25:11 a terminal closed incident 59 with ``0700_0006`` still
+* **The gate** — at 01:25:11 a terminal closed incident 59 with ``0700_0006`` still
   standing on the wire; at 01:25:12 the scheduler dispatched item 1010 onto that
   printer, because ``_is_printer_idle`` had never looked at live HMS. For those
   three seconds NO incident row existed, which is why the gate reads the WIRE and
   not the incident store. The print never started and the printer sat out 15 h.
-* **W5** — for those 15 h the tick printed ``connected=True, state=IDLE,
+* **The log line** — for those 15 h the tick printed ``connected=True, state=IDLE,
   awaiting_plate_clear=False`` every 30 s and named nothing: not the dead claim
   holding the printer, not its age, not the fault. Every fact was in the process.
 
@@ -171,7 +171,7 @@ class TestEjectLaneStaysUngated:
 
 
 class TestBusyDiagnostic:
-    """W5: the per-printer "not available" line names the blocker.
+    """The per-printer "not available" line names the blocker.
 
     The ``dispatch_hold_printers`` argument is gone with the scheduler's private
     hold dict (2026-08-30): the occupancy causes — an eject in flight, a dispatch
@@ -452,7 +452,7 @@ class TestRefusalChangeLog:
 
 
 class TestTheRecordGate:
-    """WS7 (2026-09-11, 003-H2S): dispatch reads the EQUIPMENT RECORD beside the wire.
+    """The record gate (2026-09-11, 003-H2S): dispatch reads the EQUIPMENT RECORD beside the wire.
     The firmware wipes its HMS list at every terminal, so the wire read clean while
     filament was still stuck in the shared PTFE path — and the next unit dispatched
     into it. Three times."""

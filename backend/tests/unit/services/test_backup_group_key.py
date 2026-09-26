@@ -9,7 +9,7 @@ weeks while leaving its COLOUR split (010-H2S: slots 1+2 on ``161616FF``, slots 
 ``000000FF``, 69 auto-switches inside the first pair, 14 inside the second, none across,
 and the printer ran dry twice in 28 h with a full black roll one slot away).
 
-That same wave also gave the key a NOZZLE-TEMPERATURE dimension, on the strength of a
+The 2026-08-21 key also gained a NOZZLE-TEMPERATURE dimension, on the strength of a
 documentation line nobody had measured. The firmware states its own grouping in
 ``filam_bak``, and a raw-MQTT capture of that field on 2026-08-25 disproved the
 dimension: 010-H2S reports ``[15]`` — a single group — spanning a tagged slot reading

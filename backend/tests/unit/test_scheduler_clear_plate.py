@@ -248,7 +248,7 @@ class TestSchedulerIdleCheckWithPlateOccupied:
     @patch("backend.app.services.print_scheduler.printer_manager")
     @pytest.mark.parametrize("state", ["FINISH", "FAILED", "IDLE"])
     def test_gate_blocks_unconditionally(self, mock_pm, scheduler, state):
-        """Phase 1 (P1-B): the plate gate is UNCONDITIONAL — there is no
+        """The plate gate is UNCONDITIONAL — there is no
         require_plate_clear parameter to bypass it. Any idle-shaped state with a
         deposit on the plate is NOT idle. (The global toggle now only governs whether
         the gate is RAISED, via the terminal disposition's ``raise_gate`` — not
@@ -341,7 +341,7 @@ class TestSchedulerQueueCheckLogging:
 
 
 class TestFarmItemEnforcesPlateClearGate:
-    """Phase 1 (P1-B): the scheduler's plate gate is UNCONDITIONAL — a deposit on
+    """The scheduler's plate gate is UNCONDITIONAL — a deposit on
     the plate holds EVERY item on that printer, farm or plain, regardless of the
     global require_plate_clear setting. (The toggle now only decides whether the gate
     is RAISED by a terminal; the scheduler always honours a raised gate.) Incident
@@ -633,7 +633,7 @@ class TestDeclareDuringDispatch:
 
 
 # --------------------------------------------------------------------------- #
-# The dead dispatch claim releases BOTH claims (2026-08-29 W3 + the WS3 cut-over)
+# The dead dispatch claim releases BOTH claims (2026-08-29)
 # --------------------------------------------------------------------------- #
 
 

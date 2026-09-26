@@ -35,7 +35,7 @@ sequence:
     notification instead (2026-07-20 incident — an entry-time stamp+announce, then a
     same-spool self-heal 90 s later, misled the operator).
 
-    W1 — the feeder-stall WEDGE (009-H2S 2026-07-20, 002-H2S 2026-09-11, 012-H2S
+    The feeder-stall WEDGE (009-H2S 2026-07-20, 002-H2S 2026-09-11, 012-H2S
     2026-09-23). After a feed fault the AMS can sit mid filament-change (gcode_state
     PAUSE, ``ams_status_main == 1``) holding the PRINT's own change: 012-H2S re-ran its
     own feed on the stalled slot 48 s before any farm command (21:44:48), and every
@@ -55,7 +55,7 @@ sequence:
     swap machine directly. A swap command the AMS acknowledges and HOLDS after a release
     (the AMS re-entered a change before it ran) is never resent: ``swap_held_after_release``.
 
-    W2: a printer whose recovery escalates repeatedly within a rolling window is
+    Repeat-jam quarantine: a printer whose recovery escalates repeatedly within a rolling window is
     quarantined off the durable ``recovery_escalation`` ledger — a recurring AMS jam
     is hardware (buffer / feeder), not a spool the swap machine can fix.
 
@@ -79,8 +79,8 @@ step through ``printer_incidents.note_step``), so the give-up reason, the operat
 and a restarted driver's next lever are derived from what was sent and what the wire
 said, never from a premise.
 
-SCOPE (WS2b, 2026-08-09). Entry is :func:`on_ams_fault`, and what it acts on comes
-from the WS2a fault TAXONOMY (``hms_errors.classify_hms_entry`` over both wire
+SCOPE (2026-08-09). Entry is :func:`on_ams_fault`, and what it acts on comes
+from the fault TAXONOMY (``hms_errors.classify_hms_entry`` over both wire
 lanes), not from a hand-kept code list and not from the notification dedup:
 
 * **mechanical_feed** → the swap machine below, on ANY print. The trigger set is
@@ -96,7 +96,7 @@ lanes), not from a hand-kept code list and not from the notification dedup:
   if the firmware backup rescued the print (it never PAUSEs).
 * **physical_fault** → immediate escalation with a hold. A swap cannot fix a broken
   filament, a clogged extruder or a failed pull-back, so it never enters the loop.
-  Before WS2b nothing consumed this class at all: those faults waited on the
+  Without an incident nothing consumes this class: those faults wait on the
   generic pause-stall watchdog.
 
 ORIGIN-AGNOSTIC (2026-08-10 operator ruling). ONE machine serves every print. A
@@ -121,7 +121,7 @@ STATE IS DURABLE. The lifecycle lives in ``printer_incident`` rows (see
 ``services/printer_incidents``), not in module dicts: one OPEN incident per printer
 (a partial unique index, not a dict a restart empties), an already-handled test
 keyed by ``(printer, job, fault fingerprint)``, and a jam flap cap counted from
-resolved incidents. The pre-WS2b ``_escalated`` latch never expired inside a
+resolved incidents. The old process-lifetime ``_escalated`` latch never expired inside a
 process, so a LATER, different fault on the same job could never be recovered; and
 because the whole entry gate required a matching FARM queue item, 12 foreign-print
 runouts were spent-stamped while nothing alerted, held or resumed.
@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 # reading short codes saw "no fault" while it stood alone, and the self-heal test and
 # the repause-vs-abort choice answered on a fault they could not see.
 #
-# WIDENED 2026-08-09 (WS2b, operator-ratified partition): the swap machine triggers on
+# WIDENED 2026-08-09 (operator-ratified partition): the swap machine triggers on
 # the whole mechanical-feed class — the send-out 8005, feed-into-extruder 8006 and
 # feed-to-extruder 8028 families beside the 8010 / 801E ones. The deliberate EXCLUSIONS
 # live with the classification they qualify, in the ``hms_errors`` taxonomy tables: the
@@ -428,7 +428,7 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "Auto-recovered several times this job but the fault keeps returning — likely an "
         "extruder-side problem, not the spool. Left PAUSED for a human."
     ),
-    # WS2b: the two classes that reach escalation without ever entering the loop.
+    # The two classes that reach escalation without ever entering the loop.
     # The resume instruction is deliberately NOT here — it lives in
     # :func:`_retract_clause`, because on a latched pull-back "resume" is the wrong
     # next action and the copy must be able to say so (006-H2S 2026-09-21, incident 289).
@@ -1064,7 +1064,7 @@ def _build_incident(
 
 
 # --- Module edge state -------------------------------------------------------
-# What remains in memory after WS2b is ONLY what is cheap to rebuild and harmless
+# What remains in memory is ONLY what is cheap to rebuild and harmless
 # to lose. Every DECISION (already handled? printer already owned? flap cap spent?)
 # now reads ``printer_incident`` rows — the four dicts that used to hold them
 # (``_handled`` / ``_escalated`` / ``_success_counts`` / ``_runout_guidance_sent``)
@@ -1133,7 +1133,7 @@ _wire_sample: dict[int, tuple[str, tuple[int, int] | None, frozenset[str], int, 
 #   * its codes are no longer ALL standing (the fault cleared, wholly or partly), or
 #   * the printer transitioned INTO PAUSE (a transient close said "it never held the
 #     printer"; a pause proves that answer is now stale).
-# Losing it to a restart re-arms exactly once, which is the WS2b intent: a fault
+# Losing it to a restart re-arms exactly once, which is the intent: a fault
 # still standing across a restart deserves one incident and one alert.
 _blocked: dict[tuple[int, str], set[str]] = {}
 
@@ -1166,7 +1166,7 @@ _hold_over_since: dict[int, float] = {}
 # code constant, not an operator knob (precedent: _EVAL_THROTTLE_S).
 _HOLD_OVER_DWELL_S = 120.0
 
-# --- W2 durable repeat-jam quarantine (code constants, NOT operator knobs) ----
+# --- Durable repeat-jam quarantine (code constants, NOT operator knobs) -------
 # A printer whose recovery escalates _JAM_QUARANTINE_THRESHOLD times within
 # _JAM_QUARANTINE_WINDOW_H hours is quarantined: a recurring AMS jam is hardware
 # (buffer / feeder), not a spool the swap machine can fix. Counted from the durable
@@ -2121,8 +2121,8 @@ async def _route_fault(
     """
     if kind == KIND_PHYSICAL:
         # Hands needed: a swap cannot clear a breakage, a clog or a failed
-        # pull-back. Escalated AT ENTRY (status, not just outcome) — before WS2b
-        # nothing owned this class at all and it waited on the pause-stall watchdog.
+        # pull-back. Escalated AT ENTRY (status, not just outcome) — unowned,
+        # this class would wait on the pause-stall watchdog.
         return "physical_fault"
     if kind != KIND_JAM:
         # A runout holds for a same-slot refill; the driver escalates it after
@@ -2220,7 +2220,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
 
     Called (guarded, fire-and-forget) from ``main.on_printer_status_change`` on
     EVERY push that carries HMS — deliberately not on the notify dedup's "new
-    codes" edge, which is what made the pre-WS2b machine silent for a code standing
+    codes" edge, which is what made the old machine silent for a code standing
     at restart or flapping inside the 600 s re-notify window (9 runout episodes with
     no incident and no log line).
 
@@ -2471,7 +2471,7 @@ async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
         that mean "an incident ALREADY owns this", where suppression stays correct
         because the raw alert is the duplicate.
     (3) Foreign prints included: an incident owns EVERY class of their AMS faults —
-        runouts and physical faults since WS2b, mechanical ones since the 2026-08-10
+        runouts and physical faults since 2026-08-09, mechanical ones since the 2026-08-10
         origin-agnostic ruling — so their raw alerts are duplicates in exactly the
         same way.
 
@@ -2558,7 +2558,7 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         # on a demonstrably RUNNING printer with nothing left to close it but
         # ``sweep_open_incidents``' 120 s dwell (and, for a code the firmware leaves
         # standing, not even that): the chip lit, the hourly nag armed and the queue
-        # token held to the terminal — the pre-WS2b class.
+        # token held to the terminal — the silent class.
         #
         # Derive-don't-store: nothing records "an edge was deferred"; the LEVEL is
         # re-read once, here, where the slot is already free. A no-op when the row is
@@ -4397,7 +4397,7 @@ async def _commit_out_of_rotation(
     """THE one verb that parks a spool for this incident (pinned by AST test).
 
     It exists so "an extruder-side fault never parks a spool" is stated ONCE. The rule
-    itself is not new — the driver has applied it to the REPLACEMENT since WS2 — but it
+    itself is not new — the driver already applied it to the REPLACEMENT — but it
     lived at that one call site, so the JAMMED spool at the swap-commit boundary was
     parked by the same fault the rule says is not the spool's doing. 006-H2S 2026-09-21
     (incident 289): a ``0300_801E`` extruder overload, and 12 ms later a healthy roll
@@ -4531,7 +4531,7 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
 
     ``swapped`` (default True) is the ordinary jammed → replacement swap: rewrite
     the item's ams_mapping and fire the ``spool_recovery_succeeded`` notification
-    (its copy is swap-and-out-of-rotation framed). ``swapped=False`` is the W1
+    (its copy is swap-and-out-of-rotation framed). ``swapped=False`` is the wedge's
     no-swap self-heal (a release verb freed the wedged change on the SAME feeder,
     ``target == jammed``): the mapping is unchanged and, because the swap-framed
     template would falsely claim both a swap and an out-of-rotation donor, the
@@ -4853,7 +4853,7 @@ async def _escalate(
             except Exception:  # noqa: BLE001 — notification failure is non-fatal
                 logger.exception("spool_recovery: failed notification error for printer %s", incident.printer_id)
 
-            # W2: durably record this escalation and quarantine the printer if its
+            # Durably record this escalation and quarantine the printer if its
             # AMS keeps escalating within the window (reuse the SAME session). ONE
             # ledger row per incident: an upgrade re-escalates a row that may already
             # have paged and been recorded, and the ledger — not a flag — says so.
@@ -5065,7 +5065,7 @@ async def _clear_oor_if_resumed_on_jammed_feeder(db: AsyncSession, incident: Rec
 
 
 # --- hold lifecycle: the incident closes on ANY resume, from any source -------
-# Pre-WS2b the ONLY thing that could clear a runout hold was the farm's own
+# Without it, the ONLY thing that cleared a runout hold was the farm's own
 # auto-resume: an operator who walked to the printer and pressed Resume left
 # ``waiting_reason="filament_runout_recovery_failed"`` on the unit forever, and the
 # hourly attention reminder kept nagging about a print that had been running for
@@ -5112,8 +5112,8 @@ async def on_observed_running(printer_id: int) -> bool:
     Called (guarded) from the per-push wire sampler's transition into RUNNING, which
     covers EVERY resume source: the farm's own auto-resume, an operator pressing
     Resume on the touchscreen, a UI resume, or the firmware recovering by itself.
-    That breadth is the point — the pre-WS2b hold could only be cleared by the one
-    path that set it.
+    That breadth is the point — a hold clearable only by the one
+    path that set it strands every other resume.
 
     WHICH rows a RUNNING edge ends is :mod:`incident_resolution`'s answer, per row,
     not a class chain spelled here (a printer can hold several holds, each with its
@@ -5185,7 +5185,7 @@ async def on_job_terminal(printer_id: int, terminal: TerminalEvent) -> bool:
     holds, which is why they are passed rather than re-derived here.
 
     The farm unit's own ``waiting_reason`` hygiene stays ``farm_policy.on_terminal``'s
-    job (W4b) — this only closes incidents, so the two never fight over one row.
+    job — this only closes incidents, so the two never fight over one row.
     """
     try:
         from backend.app.core.database import async_session
@@ -5567,8 +5567,8 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
 async def _open_runout_incident(db: AsyncSession, printer_id: int):
     """The printer's OPEN runout incident, or None.
 
-    The single shared gate for both lanes below — and the WS2b widening of them:
-    the pre-WS2b gate was "a still-``printing`` FARM unit holding
+    The single shared gate for both lanes below — and the 2026-08-09 widening of them:
+    the old gate was "a still-``printing`` FARM unit holding
     WAITING_REASON_RUNOUT", so a foreign print's runout could be neither re-guided
     nor auto-resumed however clearly the wire said what it needed.
     """
@@ -5817,7 +5817,7 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
 
     ONE evidence behind TWO spawn sources — the ``ams_presence`` presence-GAIN edge
     (a roll went in) and :func:`note_demand_watch`'s wire edges (the firmware stopped
-    asking). Before WS2b only the gain edge existed, so the 006 class — a demand
+    asking). When only the gain edge existed, the 006 class — a demand
     naming a slot that was ALREADY loaded — could never resume, and auto-resume had
     never fired in production at all.
 

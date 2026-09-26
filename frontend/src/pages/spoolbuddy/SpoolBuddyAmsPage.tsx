@@ -269,7 +269,7 @@ export function SpoolBuddyAmsPage() {
     trayId: number;
   } | null>(null);
 
-  // Per-slot operator verbs (W5a), shared verbatim with the printer card:
+  // Per-slot operator verbs, shared verbatim with the printer card:
   // "Re-spool tag…" for a TAGGED slot and "New roll…" for a TAGLESS one. Both
   // reuse the app-wide modals rather than re-implementing the flows here.
   // The ONE per-slot "New roll…" verb, for a bound row of either tag-ness.
@@ -817,8 +817,8 @@ export function SpoolBuddyAmsPage() {
                   // nothing to retire and no key for the call.
                   const boundSpool = assignment?.spool ?? null;
                   // A BL-RFID tray is owned by the printer firmware, so
-                  // assign/unassign stay suppressed (Phase 14 A3) — the roll swap is
-                  // not an assignment change and stays offered (W5a parity).
+                  // assign/unassign stay suppressed — the roll swap is
+                  // not an assignment change and stays offered, as on the printer card.
                   const rfidOwned = isBambuLabSpool(slotActionPicker?.tray);
                   return (
                     <>
@@ -939,7 +939,7 @@ export function SpoolBuddyAmsPage() {
       )}
 
       {/* Per-slot operator verb — the same form the printer card opens, so the
-          flow stays canonical across kiosk and desktop (W5a). */}
+          flow stays canonical across kiosk and desktop. */}
       <NewRollModal
         context={newRollContext}
         onClose={() => setNewRollContext(null)}

@@ -1,5 +1,5 @@
 /**
- * FirstArticleBanner (farm production; self-contained in Phase 4, F1).
+ * FirstArticleBanner (farm production).
  *
  * Covers the extracted banner in isolation on the run it's handed:
  * - the finish photo renders (tap-to-open link) and falls back to a

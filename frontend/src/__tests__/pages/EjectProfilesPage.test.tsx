@@ -1,5 +1,5 @@
 /**
- * Frontend tests for the Eject Profiles page (farm auto part-removal, Phase 1).
+ * Frontend tests for the Eject Profiles page (farm auto part-removal).
  *
  * Coverage:
  * - List renders profile rows.

@@ -1,6 +1,6 @@
 """Manual "Eject plate" service — one verdict per call, pinned per outcome.
 
-Since the WS4 rewrite ``manual_eject`` RETURNS an
+``manual_eject`` RETURNS an
 :class:`~backend.app.services.eject.manual.EjectVerdict` instead of raising one of three
 exception classes, so every test here asserts a verdict's ``outcome`` and the fields that
 outcome carries. Two things that used to be errors are no longer errors at all:

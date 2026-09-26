@@ -1,4 +1,4 @@
-"""Integration tests for the first-article + quarantine + notification surface (Phase 3)."""
+"""Integration tests for the first-article + quarantine + notification surface."""
 
 import zipfile
 

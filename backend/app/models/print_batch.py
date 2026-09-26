@@ -9,7 +9,7 @@ from backend.app.core.database import Base
 class PrintBatch(Base):
     """Batch grouping for multiple queue items created from the same file.
 
-    Also serves as the farm **production run** (Phase 2) when ``sku_file_id`` is
+    Also serves as the farm **production run** when ``sku_file_id`` is
     set: a run is a batch tied to a SKU file with a unit target and per-run eject
     overrides. Non-farm/legacy batches leave the farm columns NULL.
     """
@@ -33,7 +33,7 @@ class PrintBatch(Base):
     # Status: active, completed, cancelled, paused (farm runs)
     status: Mapped[str] = mapped_column(String(20), default="active")
 
-    # --- Farm production run fields (Phase 2) ---------------------------------
+    # --- Farm production run fields -------------------------------------------
     # When set, this batch IS a production run of the linked SKU file. SET NULL
     # so deleting the SKU file leaves the run/history intact.
     sku_file_id: Mapped[int | None] = mapped_column(ForeignKey("sku_files.id", ondelete="SET NULL"), nullable=True)
@@ -43,7 +43,7 @@ class PrintBatch(Base):
     # measured shop air plus one margin, ``services/eject/shop_air``). The physical
     # ``cooldown_temp_c_override`` column stays, unread, for the rollback build.
 
-    # --- Farm first-article + failure policy (Phase 3) ------------------------
+    # --- Farm first-article + failure policy ----------------------------------
     # When True, the run holds after the first plate (first_article=True item)
     # completes and waits for operator approval before dispatching the rest.
     # Default True for new farm runs; legacy/non-farm batches leave it True but
@@ -69,8 +69,8 @@ class PrintBatch(Base):
     # approved). Persisted (not in-memory) so approval survives a restart. NULL
     # once the plan is consumed or when the run wasn't gated.
     first_article_plan: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Why the run is currently held, when it is (Phase 3, consumed more broadly in
-    # Phase 4). Event-fact only — the run's status is still derived/authoritative;
+    # Why the run is currently held, when it is.
+    # Event-fact only — the run's status is still derived/authoritative;
     # this is the human-readable reason surfaced on the run card. Set at hold sites
     # ('operator_stop' when a unit is stopped by the operator — the run stays
     # ACTIVE but shows the hold) and cleared on resume. NULL when not held.

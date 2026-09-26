@@ -1,6 +1,6 @@
-"""Derived slot state + the identity-resolution decision table (W1).
+"""Derived slot state + the identity-resolution decision table.
 
-The pre-W1 system smeared "what roll is in this tray, and which ledger row is it"
+The earlier system smeared "what roll is in this tray, and which ledger row is it"
 across six modules with different presence/identity/settle rules (main.py phase-1,
 main.py phase-2, ``spool_tagless.handle_tagless_slot``'s 7-branch tree,
 ``maybe_autoconfigure_bare_tray``, ``spool_tag_matcher``, ``ams_presence``). This
@@ -117,7 +117,7 @@ TAGLESS_DEFAULT = {
 
 class TestDeriveState:
     def test_spent_binding_latches_regardless_of_presence(self):
-        """W1: the latch is the binding + spool.spent_at, not a presence read —
+        """The latch is the binding + spool.spent_at, not a presence read —
         presence flaps at the runout instant."""
         spent = _view(spent=True)
         for present in (True, False, None):
@@ -952,7 +952,7 @@ class TestRow4TaglessLane:
     def test_a_runout_suspect_slot_mints_even_inside_the_window(self):
         """T7/T8 — operator ruling 15: a runout release is never a glitch.
 
-        The regression gate for this wave. Without it, scoping the lane to short gaps
+        The regression gate for the scoped lane. Without it, scoping the lane to short gaps
         CONCENTRATES the reclaim on exactly the refill-after-runout case, because a refill
         on a demanded slot is precisely a fast return.
         """
@@ -1041,7 +1041,7 @@ class TestRow4TaglessLane:
         """Periodic AMS pushes routinely omit tag_uid/tray_uuid — that is why the
         merge preserves them. A tagged binding must not be minted over just because
         THIS push carried config and no identity (the pre-cutover tagless branch tree's
-        (2) "not ours" return, whose owner ``handle_tagless_slot`` the W3 cutover
+        (2) "not ours" return, whose owner ``handle_tagless_slot`` the slot-pipeline cutover
         deleted)."""
         bound = _view(spool_id=37, is_tagless=False, tag_uid="1C63F1E700000100", fingerprint_type="PLA")
         obs = _obs(tray_type="PETG", tray_color="FF0000FF")
@@ -1563,7 +1563,7 @@ class TestPurity:
             assert forbidden not in source, f"slot_state must stay I/O-free: found {forbidden!r}"
 
     def test_every_emitted_reason_is_enumerated(self):
-        """``RESOLUTION_REASONS`` is the W3 orchestrator's contract — it branches on
+        """``RESOLUTION_REASONS`` is the orchestrator's contract — it branches on
         these strings (sibling KEEPs are INFO-logged, the ``*_owed_full_read`` defers
         drive the idle-identify lane, ``unknown_tag_prompt_owed`` raises the durable
         operator prompt). A reason the table can emit but the set does not name is a
@@ -1747,9 +1747,9 @@ class TestFlipFlopReplay007C194:
     is the correct local answer for each. Suppressing the storm is NOT this
     function's job:
 
-    * per-pass dedup (one decision per spool per callback) — orchestrator, W3;
+    * per-pass dedup (one decision per spool per callback) — orchestrator;
     * the move damper (``RetryWindow(10.0)`` keyed ``spool.id`` alone, MOVES only)
-      and the ``extrusion_cali_sel`` throttle — binding writer, W2.
+      and the ``extrusion_cali_sel`` throttle — binding writer.
 
     The cutover integration test asserts ONE bind per pass end-to-end; this pin
     fixes the decision SHAPES those layers will be fed.

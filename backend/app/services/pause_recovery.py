@@ -547,7 +547,7 @@ async def _origin_label(printer_id: int, subtask: str | None) -> str:
     return "farm" if item is not None else "foreign"
 
 
-# --- the lost-Z-reference hold (W6a's opening half) ---------------------------------
+# --- the lost-Z-reference hold: opening it -------------------------------------------
 
 
 def _maybe_arm_z_reference_hold(printer_id: int, anchor: float | None) -> None:

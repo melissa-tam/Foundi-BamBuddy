@@ -197,8 +197,8 @@ class TestEmptyInput:
 
 
 _CLAIMED_AT = datetime(2026, 8, 21, 9, 15, 0, tzinfo=timezone.utc)
-# The printer the dispatch ran on. Required on the claim since the 2026-09-04
-# pool-target wave: a POOL unit's row learns its printer HERE and nowhere earlier.
+# The printer the dispatch ran on. Required on the claim:
+# a POOL unit's row learns its printer HERE and nowhere earlier.
 _DISPATCH_PRINTER_ID = 4
 
 

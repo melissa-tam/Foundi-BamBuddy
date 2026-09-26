@@ -1416,8 +1416,8 @@ class NotificationService:
     ):
         """Handle plate not empty event — the plate may be occupied before/at print.
 
-        ``source_detail`` is the CALLER's full sentence saying why this one event fired
-        (Phase 3.3), rendered verbatim — prose, never a source token. Today's callers:
+        ``source_detail`` is the CALLER's full sentence saying why this one event fired,
+        rendered verbatim — prose, never a source token. Today's callers:
           - ``main`` — Bambuddy's OpenCV pre-print camera diff;
           - ``pause_recovery`` — the printer's own plate check paused the job: its
             reported words plus the operator instruction;
@@ -3033,7 +3033,7 @@ class NotificationService:
         human. ``detail`` carries the human-facing reason. A printer alarm — defaults
         ON, ``force_immediate`` — mirroring ``on_run_unit_stopped``/``on_storage_low``.
 
-        ``kind`` selects the copy, one incident kind per branch (WS2b replaced the
+        ``kind`` selects the copy, one incident kind per branch (it replaced the
         ``is_feed_fault`` boolean: a third kind arrived and a bool cannot carry it):
 
         * ``"jam"`` — the seeded ``spool_recovery_failed`` template (swap-framed).

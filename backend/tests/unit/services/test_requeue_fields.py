@@ -1,4 +1,4 @@
-"""The requeue ALLOWLIST: every ``PrintQueueItem`` column has a decided home (W10).
+"""The requeue ALLOWLIST: every ``PrintQueueItem`` column has a decided home.
 
 Before ``queue_builder.requeue_fields`` there were two partial copies of "the same
 settings" — the retry insert (then ``farm_policy.create_retry_if_absent``, now

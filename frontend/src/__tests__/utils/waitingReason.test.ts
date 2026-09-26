@@ -1,5 +1,5 @@
 /**
- * waitingReasonText (Phase 3, F2): the single implementation that maps farm
+ * waitingReasonText: the single implementation that maps farm
  * waiting-reason machine codes to i18n keys, humanizes any unmapped bare token
  * (so an operator never sees `stagger_hold`-style raw text), and passes an
  * already-human backend sentence through verbatim. Shared by the run detail
@@ -51,7 +51,7 @@ describe('waitingReasonText', () => {
   });
 
   it('maps the unread-filament hold to operator copy, not a humanized token', () => {
-    // WS4-D2: a seated-but-unidentified AMS tray is neither a shortage nor a
+    // A seated-but-unidentified AMS tray is neither a shortage nor a
     // dispatchable slot. Without the case the humanizer would render it as
     // "Filament unread pending", which reads like a shortage and hides the fact
     // that the farm is actively reading the roll.
@@ -61,7 +61,7 @@ describe('waitingReasonText', () => {
   });
 
   it('maps the two pause-recovery holds to operator copy, not a humanized token', () => {
-    // 2026-09-04 wave. Both tokens humanize into something that reads like a
+    // Both tokens humanize into something that reads like a
     // status and hides the only action that clears the hold: `power_loss_hold`
     // → "Power loss hold" (the operator must resume ON the printer — nothing in
     // this UI can), `z_reference_lost` → "Z reference lost" (reads as a

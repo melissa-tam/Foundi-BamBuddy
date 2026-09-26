@@ -800,7 +800,7 @@ export const makeFleetOverviewTodayHours = (): FleetOverview =>
 export const PRODUCTION_WINDOW_DAYS = 44;
 
 /**
- * PRODUCTION, as of this wave: a state recorder under an hour old beneath a
+ * PRODUCTION at the recorder's first deploy: a state recorder under an hour old beneath a
  * window six weeks deep.
  *
  * Forty-three `incidents_only` days carrying fault and hold seconds and a full

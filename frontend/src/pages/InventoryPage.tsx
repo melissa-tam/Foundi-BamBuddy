@@ -163,7 +163,7 @@ type LocationDisplay = {
   ams_id: number;
   tray_id: number;
   ams_label: string | null;
-  /** Tri-state LIVE presence of the bound tray (W5b). Only `false` is
+  /** Tri-state LIVE presence of the bound tray. Only `false` is
    *  actionable — the slot verifiably reads cleared, so this location is a
    *  claim on a shelf rather than filament in a printer. `true` / `null` /
    *  absent all render exactly as before, so the Spoolman branch (which has no
@@ -266,7 +266,7 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
     if (!assignment) return <span className="text-sm text-bambu-gray">-</span>;
     const printerLabel = assignment.printer_name || `Printer ${assignment.printer_id}`;
     const slotLabel = formatAssignmentSlotLabel(assignment);
-    // W5b: the slot is verifiably EMPTY, so the badge alone would read as a lie
+    // The slot is verifiably EMPTY, so the badge alone would read as a lie
     // ("in printer X slot A1" when the roll is on a shelf). Qualify it with the
     // reason. Presence is tri-state and only `false` is evidence — `true`,
     // `null` (offline / partial push / dialect that never reports presence) and
@@ -1054,7 +1054,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         ams_label: a.ams_label ?? null,
         // Carried verbatim (incl. undefined) — the LOCATION cell branches on
         // `=== false` only, so an older backend that omits the field keeps the
-        // pre-W5b rendering.
+        // presence-less rendering.
         present: a.present,
         pre_configured_at: a.pre_configured_at,
       };

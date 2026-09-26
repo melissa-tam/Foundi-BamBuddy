@@ -420,7 +420,7 @@ class TestPrintQueueAPI:
 
 
 class TestQueuePrintersPool:
-    """The PRINTERS pool on the queue API surface (2026-09-04 subset-as-pool wave).
+    """The PRINTERS pool on the queue API surface.
 
     A run over a SUBSET of the fleet no longer round-robins its plates into hard
     ``printer_id`` pins: the units carry ``target_printer_ids`` and the scheduler places
@@ -3238,7 +3238,7 @@ class TestResumeQueueAfterFailure:
     async def test_resume_matches_machine_code_and_clears_it(
         self, async_client: AsyncClient, printer_factory, archive_factory, db_session
     ):
-        """Phase 4.3f: the skip site stamps waiting_reason="previous_print_failed";
+        """The skip site stamps waiting_reason="previous_print_failed";
         restore matches THAT machine code (error_message is display-only and may
         change) and clears it so the pending row doesn't render a stale code."""
         from sqlalchemy import select

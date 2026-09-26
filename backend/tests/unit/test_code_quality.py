@@ -217,7 +217,7 @@ class TestImportShadowing:
 # ``RESOLVES_ON`` table they key are the rule's own words: the model DEFINES them, the
 # store reads them into one pure function, the rule table turns them into verdicts, and
 # the incidents read surface reports the class as data. Anybody else spelling one is a
-# SIXTH closer being born — which is the shape this wave existed to end (011-H2S
+# SIXTH closer being born — which is the shape this pin exists to end (011-H2S
 # 2026-09-17: six closers each carrying their own ``if resolution == …`` chain, so a new
 # evidence had to be added in six places and was therefore added in none).
 _RESOLUTION_VOCABULARY_OWNERS = {
@@ -1017,7 +1017,7 @@ class TestPrintRecordResolution:
         assert not stale, f"allowlisted job-id comparisons that no longer compare: {stale}"
 
     def test_the_adopted_sites_ask_the_owner(self):
-        """The liveness half of the migration: the sites this wave moved really call the owner."""
+        """The liveness half of the migration: the adopted sites really call the owner."""
         from backend.app.services import dispatch_claim, incident_resolution, plate_occupancy_store, production_run
 
         assert "print_archive_of" in _source_of(production_run.build_run_response)

@@ -480,7 +480,7 @@ class FilaSwitchResponse(BaseModel):
 
 
 class EjectWatchInfo(BaseModel):
-    """In-flight eject cooldown watch summary (Phase 4.3c): the eject line (°C) the
+    """In-flight eject cooldown watch summary: the eject line (°C) the
     watch armed with — measured shop air plus the one margin since 2026-09-25, None
     when shop air was unknown (the watch still cools and releases on the bed's own air
     or at its plateau) — and, since the cooldown prep (2026-09-10), the Z the plate is
@@ -673,15 +673,15 @@ class PrinterStatus(BaseModel):
     # after a finished/failed print. Persisted across restarts (#961).
     awaiting_plate_clear: bool = False
     # Farm failure policy: printer quarantined after consecutive failures, excluded
-    # from dispatch until an operator clears it (Phase 3).
+    # from dispatch until an operator clears it.
     quarantined: bool = False
     quarantine_reason: str | None = None
-    # Farm device reconciliation (Phase 2): the device's self-reported model differs
+    # Farm device reconciliation: the device's self-reported model differs
     # from the declared Printer.model — the scheduler blocks dispatch until the
     # declaration is corrected. Absent device report ⇒ never a mismatch.
     model_mismatch: bool = False
     model_mismatch_reason: str | None = None
-    # Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
+    # Cooldown/eject phase: the in-flight eject cooldown watch's
     # release threshold; the UI renders "Cooling to T °C (bed B °C)" while set.
     # None when no threshold-bearing watch is armed.
     eject_watch: EjectWatchInfo | None = None

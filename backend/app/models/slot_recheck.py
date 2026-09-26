@@ -25,8 +25,8 @@ row per key, enforced by a PARTIAL unique index rather than by a dict a restart 
 that key. ``resolved_at`` is the lifecycle column the partial index needs. ``minted_spool_id``
 is the intent's OUTCOME, and it is here because it cannot be derived: a click-driven mint
 and an automatic long-gap mint produce byte-identical ``spool`` rows, and only the
-click-driven one may raise the acknowledgement (the 2026-08-10 wave demoted six
-non-actionable surfaces to log lines precisely so routine roll changes stay quiet).
+click-driven one may raise the acknowledgement (six non-actionable surfaces became
+log lines on 2026-08-10 precisely so routine roll changes stay quiet).
 
 Nothing else belongs. In particular there is no stored verdict, no cached slot state and no
 copy of the previous roll: the undo re-derives its predecessor through

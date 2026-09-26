@@ -67,11 +67,11 @@ export function PrintModal({
   const isEditing = mode === 'edit-queue-item';
 
   // Single seed for every field initializer: the edited item in edit mode, or a
-  // requeued item in create mode (plan 2a). Both are full PrintQueueItems, so
+  // requeued item in create mode. Both are full PrintQueueItems, so
   // each initializer below reads `seed` exactly as edit mode read `queueItem`.
   const seed = isEditing ? queueItem : prefillFrom;
 
-  // localStorage key for the last-used choices of THIS file (plan 2c).
+  // localStorage key for the last-used choices of THIS file.
   const memoryFileKey = isLibraryFile
     ? (libraryFileId != null ? String(libraryFileId) : null)
     : (archiveId != null ? `archive:${archiveId}` : null);
@@ -251,7 +251,7 @@ export function PrintModal({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitProgress, setSubmitProgress] = useState({ current: 0, total: 0 });
 
-  // Per-dispatch errors from the last create submit (plan 2e). Rendered as an
+  // Per-dispatch errors from the last create submit. Rendered as an
   // inline list inside the modal so a partial fan-out failure is fully visible
   // (a toast would show only a count and vanish).
   const [submitErrors, setSubmitErrors] = useState<string[]>([]);
@@ -326,7 +326,7 @@ export function PrintModal({
     queryFn: api.getEjectProfiles,
   });
 
-  // SKU-derived eject default (plan 2b). Resolves only for library-file prints —
+  // SKU-derived eject default. Resolves only for library-file prints —
   // archives carry no library-file link the modal can see, so archive prints get
   // null. The value is applied to the select via the effect below.
   const { defaultEjectProfileId, skuCode } = useSkuDefaults(
@@ -1456,7 +1456,7 @@ export function PrintModal({
               </div>
             )}
 
-            {/* Per-dispatch failures from a create fan-out (plan 2e). Every
+            {/* Per-dispatch failures from a create fan-out. Every
                 failing printer/plate is listed so nothing is lost to a toast. */}
             {submitErrors.length > 0 && (
               <InlineAlert severity="error">

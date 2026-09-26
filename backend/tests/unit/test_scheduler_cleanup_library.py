@@ -216,7 +216,7 @@ async def test_cleanup_unlinks_library_file_and_removes_db_row(queue_factory):
 
 @pytest.mark.asyncio
 async def test_dispatch_stamps_dispatch_subtask_id(queue_factory):
-    """Phase 1 (P1-A): a successful dispatch stamps the item's dispatch_subtask_id
+    """A successful dispatch stamps the item's dispatch_subtask_id
     from the client's last_dispatch_subtask_id, in the same session, so a terminal
     status can later be correlated back to this exact unit."""
     ctx = await queue_factory(cleanup=False)

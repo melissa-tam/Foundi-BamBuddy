@@ -25,7 +25,7 @@ plate-clear PHASE, not connectivity: a disconnected/unreadable MQTT tick is trea
 as an unreadable bed and the watch keeps polling; it ends when the gate clears
 (the eject terminal or an operator) or on a bounded stop (plateau / cap / release).
 
-Identity (Phase 1): the watch is armed only with a positively correlated
+Identity: the watch is armed only with a positively correlated
 ``queue_item_id`` and resolves whether it may auto-eject — and its eject target — from
 THAT item, never from "the most recently started print on the printer" (S4/P1-A). A terminal
 we cannot attribute, and a gate whose persisted source we cannot tie to the eject
@@ -175,8 +175,8 @@ _CHECK_INTERVAL_S = 20
 # max-hold cap (settings-driven) are the bounded stops; escalation only nudges.
 _WATCH_ESCALATE_S = 5400
 
-# Startup reconcile of pending ejects whose terminal was missed during downtime
-# (W1.2): poll each hydrated printer until it reconnects, up to the max wait, then
+# Startup reconcile of pending ejects whose terminal was missed during downtime:
+# poll each hydrated printer until it reconnects, up to the max wait, then
 # act on the live state. Named constants per the ``_CHECK_INTERVAL_S`` precedent.
 _RECONCILE_POLL_S = 20
 _RECONCILE_MAX_WAIT_S = 900
@@ -204,7 +204,7 @@ async def notify_plate_not_empty(printer_id: int, *, source_detail: str = "") ->
 
     Opens its own session (mirroring the rest of this module) and resolves the
     printer name for the message. ``source_detail`` disambiguates the escalation
-    source (Phase 3.3) — the watches below bake in their own sentence via a
+    source — the watches below bake in their own sentence via a
     ``functools.partial`` before handing this to the loop. Kept side-effect-only;
     callers wrap it so a notification failure never kills the watch.
     """
@@ -349,7 +349,7 @@ async def watch_bed_and_clear(
     plate_not_empty; failures tolerated) with the live bed, then keeps polling.
     ``on_sample`` is handed the live ``temperatures`` map on every tick the state was
     READABLE, and is the cooldown prep's chamber-boost decision: this ONE poll feeds
-    it, so the boost ends off the same reading that decides the release and the wave
+    it, so the boost ends off the same reading that decides the release and the boost
     adds no second timer, no second cadence and no second connection check. It is
     fire-and-forget by contract — a sampler that raises is logged and the poll carries
     on, because a plate's watch is worth more than a measurement.
@@ -440,8 +440,8 @@ async def watch_bed_and_clear(
         ``"stalled"`` once THREE consecutive failures trip the stall path OR a TERMINAL
         refusal holds the plate for a human (:func:`_hold_for_human` — page then
         escalation-only, no strike, no quarantine), or ``"cleared"`` when the
-        plate-clear gate dropped between the top-of-poll check and here (W2/W3
-        hardening — never sweep an already-emptied plate)."""
+        plate-clear gate dropped between the top-of-poll check and here (never sweep
+        an already-emptied plate)."""
         nonlocal release_failures
         # Re-check the gate at the release boundary: the escalate/plateau/manual
         # branches can reach here after an await, during which an operator (or the
@@ -512,7 +512,7 @@ async def watch_bed_and_clear(
             )
             return "cleared"
 
-        # W2: an operator "Eject now" during an armed watch sets release_now → sweep
+        # An operator "Eject now" during an armed watch sets release_now → sweep
         # immediately through the SAME _do_release path (no parallel dispatch race),
         # bypassing the release predicate. The hot-bed allowance is enforced upstream
         # in the manual-eject service before the event is ever set. Deliberately NOT
@@ -1159,7 +1159,7 @@ async def _act_on_cooldown_stall(reason: str, *, printer_id: int, queue_item_id:
 
 
 # --------------------------------------------------------------------------- #
-# Startup reconcile of pending ejects (W1.2)
+# Startup reconcile of pending ejects
 # --------------------------------------------------------------------------- #
 async def _reconcile_one(
     printer_id: int,
@@ -1169,7 +1169,7 @@ async def _reconcile_one(
     max_wait_s: int,
     sleep: Callable[[float], Awaitable[None]],
 ) -> None:
-    """Reconcile ONE printer's UNOWNED pending eject against the live state (W1.2).
+    """Reconcile ONE printer's UNOWNED pending eject against the live state.
 
     Polls until the printer reconnects (<= ``max_wait_s``), then applies the decision
     table: RUNNING/PAUSE+name-match -> the sweep is still in flight, so stamp its start
@@ -1345,7 +1345,7 @@ async def reconcile_pending_ejects_on_startup(
     max_wait_s: int = _RECONCILE_MAX_WAIT_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> int:
-    """Reconcile every UNOWNED pending eject after a restart (W1.2 background task).
+    """Reconcile every UNOWNED pending eject after a restart (background task).
 
     Spawned from the lifespan AFTER ``plate_occupancy_store.hydrate()``. Returns the
     number of printers it STARTED reconciling. ``manager``/``sleep`` are injectable for
@@ -1761,7 +1761,7 @@ class EjectCooldownMonitor:
             # Arm the cooldown actuators (plate hold + cooldown fans) BEFORE the first
             # bed poll — the whole point is to shorten the wait this loop is about to
             # sit through. ``begin`` never raises: a prep failure leaves the cooldown
-            # exactly as it was before this wave, which is a slower cooldown, not a
+            # exactly as it would be with no prep, which is a slower cooldown, not a
             # stranded gate. Every input it needs is resolved HERE, once: the prep opens
             # no settings session, and the model it gates the chamber fan on comes from
             # the manager's own cache rather than a second lookup inside it.

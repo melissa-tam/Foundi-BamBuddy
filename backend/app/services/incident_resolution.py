@@ -342,7 +342,7 @@ def _wire_running_edge(row: PrinterIncident, ctx: Context) -> Verdict:
     """A PAUSE->RUNNING edge closes a wire hold, whoever produced it.
 
     Screen, UI, auto-resume or the firmware recovering by itself — the breadth is the
-    point, because the pre-WS2b hold could only be cleared by the one path that set it.
+    point, because a hold clearable only by the one path that set it strands every other resume.
 
     It stands only while a recovery DRIVER is live: a RUNNING sample taken during a
     resume the driver ITSELF published (a release lever of the wedge ladder, or the
@@ -362,7 +362,7 @@ def _wire_job_terminal(_row: PrinterIncident, ctx: Context) -> Verdict:
     wire makes that the fault it interrupted is over.
 
     It stands aside while a recovery DRIVER is live — the running edge's test, for the
-    running edge's reason (review F2, 2026-09-23 wave). A terminal the driver's OWN verb
+    running edge's reason (2026-09-23). A terminal the driver's OWN verb
     produced (a release lever that ended the print) is a reading of that procedure, and
     the driver must record it: its reader returns ``ended`` and the driver closes the row
     with its own source token (``printer_incidents.RESOLVE_DRIVER_ENDED``) and pages.

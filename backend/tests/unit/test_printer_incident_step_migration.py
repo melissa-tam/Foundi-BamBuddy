@@ -47,7 +47,7 @@ async def engine():
 
 
 async def _drop_table(engine) -> None:
-    """The pre-wave schema: everything the model set builds, minus this table."""
+    """The old schema: everything the model set builds, minus this table."""
     async with engine.begin() as conn:
         await conn.execute(text(f"DROP TABLE {_TABLE}"))
         assert not await _table_exists(conn)

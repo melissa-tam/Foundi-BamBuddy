@@ -105,7 +105,7 @@ class Spool(Base):
     # still surfaces. Stamped ONLY via POST /inventory/spools/{id}/respool-dismiss
     # (the single mutator — deliberately absent from SpoolUpdate).
     respool_dismissed_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # Durable "a tagless fresh-roll prompt (W5) is awaiting an operator answer for
+    # Durable "a tagless fresh-roll prompt is awaiting an operator answer for
     # this row" stamp — the per-CYCLE prompt's only state. Process memory could not
     # hold it: a broadcast with no client connected reached nobody, a restart wiped
     # the set, and the reconnect replay then had nothing to replay (2026-07-24).
@@ -192,8 +192,8 @@ class Spool(Base):
 
         A ``hybrid_property`` because those two call sites live on opposite sides of the
         ORM boundary — one is a WHERE clause, the other a row already in hand — and a
-        second spelling is exactly how the doctrine drifts: the same two-copies shape the
-        2026-08-19 wave deleted from ``_is_tagless``, where a later identity-column change
+        second spelling is exactly how the doctrine drifts: the same two-copies shape
+        removed from ``_is_tagless`` (2026-08-19), where a later identity-column change
         updated one copy and not the other. Derived at read time from ``spent_at``; there
         is NO stored flag, for the same reason :attr:`remaining_g` has none (rule 8 — the
         ledger stays raw, so clearing ``spent_at`` alone un-finishes the row).

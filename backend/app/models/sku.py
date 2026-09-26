@@ -1,4 +1,4 @@
-"""SKU catalog models — the farm's product/part catalog (Phase 2).
+"""SKU catalog models — the farm's product/part catalog.
 
 A :class:`Sku` is an authoritative product code (e.g. ``SKU007.01``) with an
 optional part number. Each SKU links to one or more printable library files via

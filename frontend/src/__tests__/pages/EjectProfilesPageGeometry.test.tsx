@@ -1,6 +1,5 @@
 /**
- * Geometry-registry integration on the Eject Profiles page (farm eject,
- * Phase 2):
+ * Geometry-registry integration on the Eject Profiles page (farm eject):
  * - The create/edit dialog derives validation bounds from the mocked
  *   /model-geometry API: sub-minimum or beyond-bed sweep bands are hard errors
  *   that block save; the part-height-ceiling check is a non-blocking warning.

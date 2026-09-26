@@ -1,4 +1,4 @@
-"""Verdict-matrix tests for the terminal-status → queue-item correlation (Phase 1).
+"""Verdict-matrix tests for the terminal-status → queue-item correlation.
 
 Covers all five verdicts of :func:`resolve_terminal_item` — including the
 upgrade-day NULL-key single-candidate fallback, the present-id-matches-nothing
@@ -46,7 +46,7 @@ from backend.app.services.printer_manager import printer_manager
 # reaction it protected against moved to ``pause_recovery``, and conftest's autouse
 # ``reset_plate_occupancy_authority`` already starts and leaves every test with an
 # empty, un-wired authority. A second reset of one process singleton is exactly the
-# duplication the 2026-08-30 wave removed everywhere else.
+# duplication removed everywhere else (2026-08-30).
 
 
 async def _add_item(
@@ -541,7 +541,7 @@ class TestResolveActivePlateId:
 
 
 class TestClassifyStop:
-    """Pure operator-stop classification (Phase 3.1) — no DB, no I/O. The UI stop is the
+    """Pure operator-stop classification — no DB, no I/O. The UI stop is the
     terminal's unit's DURABLE request, read by the caller (:class:`TestOperatorStopRequested`)."""
 
     def test_the_units_stop_request_is_the_ui_stop(self):
@@ -723,7 +723,7 @@ def _disposition(**overrides):
 
 
 class TestTerminalDisposition:
-    """The verdict → plate-policy ladder (WS3).
+    """The verdict → plate-policy ladder.
 
     The correlation rules live in this module, so the mapping from a VERDICT to
     "what happens to the plate next" lives here too — the occupancy authority stays

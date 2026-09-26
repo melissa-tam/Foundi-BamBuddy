@@ -738,7 +738,7 @@ class TestSampler:
 
 
 class TestOutageBurst:
-    """W6a's opening half: the discriminator is a FLEET fact, not a session boundary."""
+    """Opening the lost-Z-reference hold: the discriminator is a FLEET fact, not a session boundary."""
 
     @staticmethod
     def _fleet(anchor, n):
@@ -1064,7 +1064,7 @@ class TestPlateVisionTrip:
 class TestThePauseLaneNeverStops:
     """Module-scope AST pin (template: ``test_farm_policy.TestEscalationNeverStops``): the
     invariant is "no stop is ever sent from this lane", not "not from this one branch", and
-    an AST walk is the only assertion that covers every path a future wave adds."""
+    an AST walk is the only assertion that covers every path a future change adds."""
 
     async def test_the_pause_lane_sends_no_stop_anywhere(self):
         import ast

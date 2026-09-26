@@ -1,4 +1,4 @@
-"""Unit tests for the eject geometry accessor (Phase 2 registry).
+"""Unit tests for the eject geometry accessor (model-geometry registry).
 
 Uses the shared ``seed_geometry`` fixture (H2S validated / H2C unvalidated).
 """

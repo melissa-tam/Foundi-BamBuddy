@@ -28,7 +28,7 @@ may carry a lost-Z hold BESIDE a jam (an asset carries concurrent alarms), while
 three AMS kinds stay mutually exclusive among themselves because they are three
 readings of one AMS. Either index firing means a race, and the loser gets an
 IntegrityError which :func:`open_new` reports as "someone else owns it" instead of
-crashing. The pre-WS2b exclusivity (a process-lifetime ``_active_tasks`` dict) was
+crashing. The old exclusivity (a process-lifetime ``_active_tasks`` dict) was
 erased by every restart while the standing HMS came straight back.
 
 **The snapshot cache** mirrors EVERY open row per printer so the ~1 Hz WS serializer

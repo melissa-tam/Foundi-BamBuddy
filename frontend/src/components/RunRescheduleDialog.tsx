@@ -1,5 +1,5 @@
 /**
- * Reschedule dialog — change (or clear) a scheduled run's start time (Phase 5).
+ * Reschedule dialog — change (or clear) a scheduled run's start time.
  *
  * Shared by the production-run list (`ProductionRunsPage`) and the run detail
  * page (`ProductionRunDetailPage`) so there is one canonical implementation.

@@ -2,7 +2,7 @@
 they describe, and the `filam_bak` backup-group parser.
 
 ``tray_fields`` is the one origin every wire consumer reads (the MQTT merge, the
-observation layer, the decision table, the spool machines). The constants added in WS3
+observation layer, the decision table, the spool machines). The named constants
 change NO behavior — every non-9/10/11 value already fell through to UNKNOWN — so what
 these tests defend is that the TABLE and the CODE cannot drift apart: the named
 vocabulary is now cited by ``bambu_mqtt._normalize_cleared_trays``, and a future edit

@@ -1,7 +1,7 @@
 """Unit tests for POST /inventory/sync-ams-weights.
 
 Two layers: the pure weight arithmetic / remain validation, and the ROUTE's three
-data-safety guards (W4, 2026-08-02) exercised end to end against a seeded DB and a
+data-safety guards (2026-08-02) exercised end to end against a seeded DB and a
 faked live status — presence, remain 1..100, and the per-printer mid-print gate.
 """
 
@@ -245,7 +245,7 @@ class TestSyncSkipLogic:
         assert valid is False
 
 
-# ── Route-level guards (W4) ──────────────────────────────────────────────────
+# ── Route-level guards ───────────────────────────────────────────────────────
 
 
 class _FakeManager:

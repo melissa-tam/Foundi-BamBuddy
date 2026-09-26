@@ -1,5 +1,5 @@
 /**
- * Run detail page (Phase 4.1): loading / error / not-found / populated states,
+ * Run detail page: loading / error / not-found / populated states,
  * hold chips (pause reason + blocked printers), the staged banner, per-printer
  * blocked-state chips with reasons, and the unit table (stop attribution,
  * waiting-reason copy, retry lineage, error messages).
@@ -299,7 +299,7 @@ describe('ProductionRunDetailPage', () => {
                 waiting_reason: 'plate_not_empty_printer_detected',
                 completed_at: null,
               }),
-              // 2026-09-04 wave: the farm's OWN stop of a plate-check trip.
+              // The farm's OWN stop of a plate-check trip (stored history).
               // No human touched this printer, so it must not be attributed to
               // an operator — the lineage is what tells a reader whether a
               // plate was abandoned deliberately or re-checked by the farm.

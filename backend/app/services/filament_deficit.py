@@ -539,7 +539,7 @@ async def compute_deficit_for_queue_item(
             # there and the farm cannot say which. UNDETERMINED (None), which is the
             # opposite end from the cleared-tray branch above and deliberately so —
             # 0.0 would invent a shortfall against loaded material (the phantom "Low
-            # filament" this wave removes) while the ledger figure would quote a
+            # filament" this branch prevents) while the ledger figure would quote a
             # binding the wire never confirmed. Neither is knowledge, so this slot
             # contributes no deficit grams; ``print_scheduler`` holds the job on
             # ``filament_unread_pending`` and asks the printer to read the slot.

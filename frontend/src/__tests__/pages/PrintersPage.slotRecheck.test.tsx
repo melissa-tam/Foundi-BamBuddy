@@ -1,5 +1,5 @@
 /**
- * WS11 — "Re-check slot" (doctrine rule 12, incident shape 32).
+ * "Re-check slot" (doctrine rule 12, incident shape 32).
  *
  * The control this replaces ("Re-read RFID") could not conclude anything on a
  * tagless slot and said nothing when it didn't: an operator clicked it for 21

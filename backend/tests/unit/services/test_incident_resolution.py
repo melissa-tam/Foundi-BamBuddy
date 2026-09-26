@@ -482,7 +482,7 @@ class TestTheWireLane:
         assert verdict.source == RESOLVE_OBSERVED_RUNNING
 
     def test_a_live_driver_defers_the_job_terminal(self):
-        """Review F2 (2026-09-23 wave): a live driver owns the outcome at a job terminal
+        """A live driver owns the outcome at a job terminal
         too. A release lever can END the print, and that terminal is a reading of the
         driver's own procedure — the driver records it (``ended``) and closes its row with
         its own source; the terminal closer must not free the row from under it."""

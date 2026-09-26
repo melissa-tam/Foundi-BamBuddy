@@ -1,5 +1,5 @@
 /**
- * SKU catalog types (farm production, Phase 2).
+ * SKU catalog types (farm production).
  *
  * A SKU (stock-keeping unit) is a sellable part identified by a code. Each SKU
  * links one or more library files (a specific plate of a specific 3MF) that

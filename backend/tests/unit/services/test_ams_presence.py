@@ -119,7 +119,7 @@ def _stale_remain_tray(tray_id, **kw):
     """A SEATED (state 10) tray whose wire ``remain`` never landed (-1).
 
     THE shape the terminal's between-prints policy owes a refresh for: doctrine rule 8
-    makes wire remain% the truth for a tagged row, and usage_tracker's W6 ledger-decrease
+    makes wire remain% the truth for a tagged row, and usage_tracker's ledger-decrease
     repair has nothing to repair from until that read lands. A tagged slot reporting a
     sane remain on its ordinary AMS pushes needs no commanded read at all."""
     kw.setdefault("state", 10)
@@ -1208,8 +1208,8 @@ class TestEchoWindowBoundary:
 
 class TestPhysicalCycleNote:
     """A genuine presence GAIN whose preceding absence lasted >= _MIN_PHYSICAL_ABSENT_S
-    records a physical roll swap via spool_tagless.note_physical_cycle (the W1 latch
-    release / W5 prompt). A sub-second flap, an echo, a drying flap, and the first-push
+    records a physical roll swap via spool_tagless.note_physical_cycle (the spent latch
+    release / fresh-roll prompt). A sub-second flap, an echo, a drying flap, and the first-push
     seed all suppress it."""
 
     @pytest.fixture(autouse=True)
@@ -2016,7 +2016,7 @@ class TestProdShapeReplayThroughTheRealPredicate:
 class TestCauseBasedEdgeSuppressionWidened:
     """Phantom qualified cycles (2026-08-07). Gain/absence edges fabricated by
     NON-PHYSICAL causes were arming real actions — fresh-roll prompts for slots nobody
-    touched, never-fed ``loaded_at`` re-stamps. The 2026-07-21 wave disqualified
+    touched, never-fed ``loaded_at`` re-stamps. The 2026-07-21 identify filter disqualified
     identify-explained edges but left three leaks: a read commanded on a state-9 tray
     (``record_recheck_read`` never arms there), a firmware-autonomous read whose IDENTIFYING
     flag rises and falls between edges, and the print-start AMS engage transient.
@@ -2052,7 +2052,7 @@ class TestCauseBasedEdgeSuppressionWidened:
 
     async def test_state9_commanded_read_edge_is_not_a_qualified_cycle(self, db_session, monkeypatch):
         # LEAK (b): a read commanded while the tray reports state 9 arms no echo, and the
-        # AMS never reports IDENTIFYING on a push we see — so the 07-21 wave's two arms
+        # AMS never reports IDENTIFYING on a push we see — so the 2026-07-21 filter's two arms
         # are both blind and the ~15 s flap banked as a human roll swap.
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
@@ -2176,7 +2176,7 @@ class TestCauseBasedEdgeSuppressionWidened:
 class TestTerminalRemainRefresh:
     """D4 (2026-08-07): bound TAGGED trays stuck at wire ``remain = -1`` — the full RFID
     data read never completed — were never re-read, so
-    ``usage_tracker.maybe_reconcile_tagged_ledger_decrease`` (the W6 auto-repair) had no
+    ``usage_tracker.maybe_reconcile_tagged_ledger_decrease`` (the auto-repair) had no
     wire truth and over-label ledgers persisted (live: a spool at 1899.9 g used against a
     1000 g label). Doctrine rule 5 allows need-driven reads on RFID-bound slots; rule 8
     makes wire remain% the truth for a tagged row.
@@ -2405,7 +2405,7 @@ class TestReadAnsweredNoTag:
         permits: there is deliberately no age ceiling here, and a slot nobody has touched for
         a week still holds a perfectly good answer.
 
-        It matters because the 2026-08-19 wave widened this predicate's consumers from ONE
+        It matters because this predicate's consumers widened (2026-08-19) from ONE
         (row 5a: spent + tagged + bare) to every binding quadrant. A stamp that used to reach
         almost nothing now reaches an operator's own hand-assigned row at row 4b′, where
         ``tagged_swap_no_tag_read`` unlinks it and mints tagless in its place.
@@ -2815,7 +2815,7 @@ class TestStandingOccasionDrain:
 
 
 class TestUnboundUnreadDiscoveryArm:
-    """WS4-D3: an UNBOUND, seated, identity-less slot may buy ONE discovery read.
+    """An UNBOUND, seated, identity-less slot may buy ONE discovery read.
 
     The gap this closes: ``identify_needed`` answered None for a slot with no DB binding
     and no live identity even with an occasion open — the unanswered-cycle arm was the

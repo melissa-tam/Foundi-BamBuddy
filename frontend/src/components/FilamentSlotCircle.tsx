@@ -30,11 +30,11 @@
  *                plus an aria-label + title carry the meaning for screen readers
  *                and on hover/focus.
  *   ranOut     - True when a live filament-runout HMS names THIS AMS slot as the
- *                exhausted one (W6). Renders a distinct red badge (top-left) so
+ *                exhausted one. Renders a distinct red badge (top-left) so
  *                the operator can see remotely which slot to refill during a
  *                runout PAUSE (when the green active ring has cleared).
  *   spentCore  - True when the assigned spool is hardware-certain spent
- *                (Spool.spent_at != null; W6) — the core needs replacing.
+ *                (Spool.spent_at != null) — the core needs replacing.
  *                Renders a distinct badge (bottom-right).
  *   noBackupSlot - True when AMS Filament Backup is on and this slot has no
  *                firmware backup partner even though a same-filament roll sits

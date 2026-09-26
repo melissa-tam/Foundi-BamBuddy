@@ -1,4 +1,4 @@
-"""Pydantic schemas for the SKU catalog API (Phase 2).
+"""Pydantic schemas for the SKU catalog API.
 
 Capability facts (nozzle/filament/model/max-Z) on :class:`SkuFileResponse` are
 read live from the linked ``LibraryFile.file_metadata`` (with a 3MF-parse

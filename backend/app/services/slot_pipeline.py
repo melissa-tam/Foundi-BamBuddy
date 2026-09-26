@@ -1,6 +1,6 @@
-"""Slot pipeline (W3a) — the ONE orchestrator that turns pure decisions into state.
+"""Slot pipeline — the ONE orchestrator that turns pure decisions into state.
 
-``TrayObservation`` (W1) → :func:`slot_state.derive_state` → :func:`slot_state.resolve`
+``TrayObservation`` → :func:`slot_state.derive_state` → :func:`slot_state.resolve`
 → **this module** → ``spool_binding`` (the one binding writer). The decision table is
 pure and I/O-free by contract; everything that reads the DB, touches the wire, or
 writes a binding lives here, so there is exactly one place where a slot decision
@@ -38,7 +38,7 @@ What this module owns:
   a displaced SPENT core would otherwise linger as active inventory forever.
 * **Serialization** — one asyncio lock per printer, so two pushes for one printer can
   never interleave their read-decide-write windows. This IS the fork's assignment lock
-  now: W3b deleted ``main.py``'s ``_get_ams_assignment_lock``, because with identity
+  now (it replaced ``main.py``'s ``_get_ams_assignment_lock``), because with identity
   decided in exactly one place the lock belongs with the decider.
 
 **Never raises** (cross-cutting invariant 10): every entry point is fully guarded and a
@@ -50,7 +50,7 @@ the one structured line :func:`slot_state.format_slot_event` produces, through t
 existing log pipeline / ``support/logs`` endpoint. KEEP / DEFER / NONE are DEBUG — they
 happen on every push of every slot and would drown the lane.
 
-Feed (W3b): RAW pre-merge pushes, not the merged display state. ``bambu_mqtt``'s
+Feed: RAW pre-merge pushes, not the merged display state. ``bambu_mqtt``'s
 ``on_ams_push_raw`` hook fires inside ``_handle_ams_data`` BEFORE the tray merge;
 ``printer_manager`` builds the observations synchronously in that callback (owned frozen
 objects — the merge may mutate the wire dicts the instant it returns) and schedules this
@@ -253,7 +253,7 @@ _chimera_warned: set[tuple[int, str]] = set()
 # Per-printer dedup for ``unknown_tag`` prompts: {printer_id: {(ams, tray): (tag, uuid)}}.
 # Re-broadcast only when the tag tuple CHANGES for a slot; cleared when the slot reports
 # empty or gets bound, so remove + reinsert reliably re-prompts. Moved here from
-# ``main.py`` at the W3b cutover: the prompt is now raised by exactly one decision
+# ``main.py`` at the slot-pipeline cutover: the prompt is now raised by exactly one decision
 # (``unknown_tag_prompt_owed``) and cleared by exactly two pipeline outcomes (a released
 # / empty slot and a successful bind), so its state belongs beside them. The Spoolman
 # lane in ``main.on_ams_change`` imports the two public helpers — one origin, one dedup
@@ -707,8 +707,7 @@ def _spool_view(spool: Spool) -> SpoolView:
 def _believed_state(binding: BindingView | None) -> SlotState:
     """What the DURABLE facts alone said this slot was, before this push.
 
-    Not stored anywhere (the state machine is derived by design — plan §"Schema — NO
-    NEW TABLES"): it is re-derived from the binding row + spool flags, which is exactly
+    Not stored anywhere (the state machine is derived by design): it is re-derived from the binding row + spool flags, which is exactly
     what the previous push's answer was built from. Used only as the LEFT side of the
     audit line, so an operator reading ``OCCUPIED_ASSUMED→EMPTY release`` sees the
     change rather than a tautology.
@@ -734,8 +733,7 @@ async def _identity_candidate(db: AsyncSession, obs: TrayObservation) -> Spool |
     the uuid owner answers first; a bare tag falls back to strict equality against
     EITHER chip the row carries. Deliberately NOT ``get_spool_by_tag``: its
     suffix/first-char variance lanes exist for legacy callers, and a widened row handed
-    to the table as a certainty is the false-merge hazard (plan §"Root causes
-    confirmed"). The table re-checks whatever arrives against the observation anyway, so
+    to the table as a certainty is the false-merge hazard. The table re-checks whatever arrives against the observation anyway, so
     a widened row could not be smuggled in — this just never produces one.
 
     Matching ``sibling_tag_uid`` is exactness, not widening: the pair is the roll's
@@ -819,7 +817,7 @@ async def _debounce_candidate(db: AsyncSession, obs: TrayObservation) -> Spool |
     load-bearing job: of 52 reclaims with a matched prior release, **14 landed under five
     minutes** — four at 0.0 min across four printers inside one minute — which no human
     performs. Those are SPURIOUS releases (one glitched exist bit hard-deletes a binding
-    since wave 2), and the lane was silently repairing them. Deleting it outright would
+    since 2026-08-10, invariant 12), and the lane was silently repairing them. Deleting it outright would
     reset a part-used roll to label weight several times a day and walk it straight through
     the ``min_start_spool_g`` gate. So the lane survives, SCOPED to what it can actually
     prove: a glitch filter, never an identity oracle (doctrine rule 7 as amended
@@ -856,7 +854,7 @@ async def _debounce_candidate(db: AsyncSession, obs: TrayObservation) -> Spool |
     So each refusal is now a stated conclusion with its own log line:
 
     * ARCHIVED — retired inventory may not take a slot;
-    * SPENT — the W1 latch owns a drained row, which is why a runout whose stamp has
+    * SPENT — the spent latch owns a drained row, which is why a runout whose stamp has
       already landed MINTS (scenario T6);
     * BOUND ELSEWHERE — assumption-tier evidence may displace nothing a live binding holds
       (invariant 11; the spool-211 ping-pong, shape 26). A slot MOVE stamps the OLD slot's
@@ -920,7 +918,7 @@ def _runout_suspect(obs: TrayObservation, deps: PipelineDeps, incident: PrinterI
     (doctrine rule 6's "by cause, never by duration", applied to a decision rather than a
     read).
 
-    Without this the wave would have made things WORSE for the case it most needed to fix.
+    Without this, scoping the de-bounce would have made things WORSE for the case it most needed to fix.
     The AMS clears a drained slot's exist bit **~3 minutes BEFORE** it declares the runout
     (shape 31, three timed pairs): inside that gap the departed row is released but not yet
     spent, so the ``spent_at`` filter cannot see it, and the de-bounce would bind the
@@ -1042,7 +1040,7 @@ async def _build_context(obs: TrayObservation, deps: PipelineDeps, binding: Bind
 
 
 async def _operator_recheck_answered(obs: TrayObservation, deps: PipelineDeps, binding: BindingView | None) -> bool:
-    """Has the operator's re-check of this slot got its ANSWER? (doctrine rule 12, WS11)
+    """Has the operator's re-check of this slot got its ANSWER? (doctrine rule 12)
 
     Both halves, resolved here so ``slot_state.resolve`` stays pure — the same shape
     ``qualified_cycle_pending`` and the de-bounce's two predicates already use:
@@ -1086,7 +1084,7 @@ def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> 
     roll — in every scenario, not one lane.* Finding no chip over a binding that has one is
     the same certainty class as two disagreeing ``tray_uuid``s, and the certainty does not
     depend on whether the roll ran dry or on how much the tray happened to say about itself.
-    Two gates confined it here until this wave and both are gone:
+    Two gates once confined it here and both are gone:
 
     * **the SPENT gate.** Whether the bound roll is exhausted has nothing to do with whether
       the seated object IS that roll. This is the restriction rule 11 names by name.
@@ -1123,8 +1121,8 @@ def _no_tag_read_answered(obs: TrayObservation, binding: BindingView | None) -> 
     identity has nothing to contradict either, and the same bare core reads identically
     before and after a swap — scenario G9, the arm that must not fire). ``is_tagless`` is
     the canonical three-column test (``spool_tagless.is_tagless_spool``, sibling chip
-    included) resolved when the view was built; a two-column reading is the exact bug this
-    wave already deleted once. The table states the same refusal itself, in
+    included) resolved when the view was built; a two-column reading is an exact bug
+    already deleted once. The table states the same refusal itself, in
     ``slot_state._no_tag_answer_contradicts`` — that is where the doctrine is decided, this
     is the cheap exit that spares the ledger peek for every slot that can never conclude.
 
@@ -1663,12 +1661,12 @@ def _debounce_bind_moment(spool: Spool) -> datetime | None:
 
     The fallbacks are for rows predating the ordinal (``first_loaded_at``, then the row's
     own creation); all-NULL returns None and the writer's server default stamps now,
-    which is the pre-wave behaviour and no worse than it was.
+    which is the behaviour before the ordinal existed and no worse than it was.
     """
     return spool.loaded_at or spool.first_loaded_at or spool.created_at
 
 
-# --- release evidence (WS7 — diagnosis, never a decision) --------------------
+# --- release evidence (diagnosis, never a decision) --------------------------
 
 # How fresh the last FULL status report must be for THIS push to be read as that same
 # pushall. The AMS block rides the same ``print`` frame that carries ``sdcard``, and
@@ -1692,8 +1690,8 @@ def _presence_rule(obs: TrayObservation) -> str:
     believed six hours later by someone with no context.
 
     The two names that matter for a release are ``bit_clear`` (a TRUSTED in-push mask
-    bit said the slot is bare — the invariant-12 authority wave 2 made
-    release-authorizing, and therefore the branch a single glitched bit travels down)
+    bit said the slot is bare — the invariant-12 authority, made
+    release-authorizing on 2026-08-10, and therefore the branch a single glitched bit travels down)
     and ``cleared_shape`` (no in-push bit for this slot at all, so emptiness came from
     the fallback tier: the wire's own state-9 + asserted-empty ``tray_type``, or the
     shape ``bambu_mqtt._normalize_cleared_trays`` injects once the CACHED mask's veto
@@ -1720,7 +1718,7 @@ def _mask_facts(obs: TrayObservation, deps: PipelineDeps) -> tuple[str, str, str
     """``(mask, trusted, source)`` for the exist-bit evidence behind this release.
 
     The mask itself is only knowable from the client — ``PrinterState.ams_tray_exist_bits``
-    / ``ams_bits_trusted`` are the triage surface wave 2 added for exactly this question —
+    / ``ams_bits_trusted`` are the triage surface added for exactly this question —
     and that copy is the LAST bits-carrying push, which is not necessarily this one: the
     pipeline pass is scheduled off the raw AMS hook, so a later push can overtake it. The
     observation is what carries THIS push's answer for THIS slot (``obs.exist_bit``,
@@ -1830,7 +1828,7 @@ def _release_evidence(obs: TrayObservation, deps: PipelineDeps, spool: Spool | N
     0.0 minutes, across four different printers, inside one minute, on the same spool**.
     No human pulls and re-seats a roll that fast, so those releases were SPURIOUS: the
     tray reported absent for a push while the roll sat physically seated, and the reclaim
-    lane was silently repairing it. Since wave 2 made a cleared exist bit
+    lane was silently repairing it. Since a cleared exist bit is
     release-authorizing (invariant 12), one glitched bit hard-DELETES a binding — and a
     binding deletion is the event that starts the whole identity problem. The de-bounce
     contains the damage; it explains nothing. This line is what makes the NEXT occurrence
@@ -1931,7 +1929,7 @@ async def _apply_release(
         return decision, False
     printer_id, ams_id, tray_id = obs.slot
     spool = assignment.spool
-    # WS7: the record is BUILT here, while the binding and this push's observation still
+    # The record is BUILT here, while the binding and this push's observation still
     # sit side by side, and EMITTED after the write lands — so the line means "a release
     # happened", never "one was attempted". It reads nothing back through the session
     # afterwards, so it cannot be tripped by the commit.
@@ -2267,7 +2265,7 @@ async def _apply_replace_spent(
     decision: Decision,
     seen: set[int],
 ) -> tuple[Decision, bool]:
-    """The W1 silent spent→mint: the drained row retires, its replacement takes the slot.
+    """The silent spent→mint: the drained row retires, its replacement takes the slot.
 
     This is the WIRE lane's spent→fresh transition. ``spool_tagless._replace_row_after_cycle``
     survives as the OPERATOR lane's executor (the "New roll" verb answering a fresh-roll
@@ -2351,7 +2349,7 @@ async def _apply_replace_spent(
         )
         return decision, False
 
-    # Consume the qualified physical cycle — the ONE thing that releases the W1 latch,
+    # Consume the qualified physical cycle — the ONE thing that releases the spent latch,
     # and it is spent exactly here so a later push cannot replay the same swap. Only the
     # CYCLE-evidence reason has one to consume: the cycleless reasons rest on a READ
     # (whose one-per-epoch pacing lives in ``ams_presence``, or which is self-pacing for

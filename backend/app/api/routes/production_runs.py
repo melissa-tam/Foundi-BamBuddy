@@ -1,4 +1,4 @@
-"""REST API for farm production runs (Phase 2).
+"""REST API for farm production runs.
 
 A production run is a :class:`PrintBatch` with ``sku_file_id`` set. Creation,
 derived counts, and pause/resume/abort transitions live in

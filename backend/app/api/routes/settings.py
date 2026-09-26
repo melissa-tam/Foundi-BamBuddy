@@ -672,7 +672,7 @@ async def update_spoolman_settings(
         # Switching to Spoolman: clear built-in inventory slot assignments.
         #
         # No slot-state cleanup is needed alongside this. The AMS slot state machine is
-        # DERIVED, never stored (plan §"Schema — NO NEW TABLES"): it is recomputed from
+        # DERIVED, never stored: it is recomputed from
         # the live wire push plus the assignment row plus the spool's flags on every
         # pass, so deleting the rows IS the state reset. And ``slot_pipeline`` no-ops
         # outright while ``spoolman_enabled`` is true, so nothing re-creates them.

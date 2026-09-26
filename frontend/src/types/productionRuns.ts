@@ -1,5 +1,5 @@
 /**
- * Production run types (farm production, Phase 2).
+ * Production run types (farm production).
  *
  * A production run dispatches copies of a SKU's file/plate across one or more
  * printers until a target unit count is met. The backend owns scheduling and
@@ -33,7 +33,7 @@ export interface ProductionRunPrinter {
 }
 
 /**
- * Why a run is currently held (Phase 4.1). `operator` = manual pause,
+ * Why a run is currently held. `operator` = manual pause,
  * `operator_stop` = a unit was deliberately stopped (run stays active but
  * holds that printer), `first_article_rejected`, `no_available_printers` and
  * `retries_exhausted` (a unit failed with no retries left and no work in
@@ -138,7 +138,7 @@ export interface ProductionRun {
   plates_failed: number;
   plates_pending: number;
   status: ProductionRunStatus;
-  /** Why the run is held; null when not held (Phase 4.1). */
+  /** Why the run is held; null when not held. */
   pause_reason: RunPauseReason | null;
   /** Pending units staged by the low-spool guard (swap spool, then release). */
   staged_filament_short: number;
@@ -162,14 +162,14 @@ export interface ProductionRun {
   /** Operator's rejection reason; present when first_article_state is 'rejected'. */
   first_article_reject_reason?: string | null;
   /** Relative URL of the first article's newest finish photo — populated only
-   *  while awaiting_approval or rejected; null otherwise (Phase 4, F1). */
+   *  while awaiting_approval or rejected; null otherwise. */
   first_article_photo_url?: string | null;
   /** The printer that produced the first article (for the inline camera view);
    *  populated only while awaiting_approval or rejected. */
   first_article_printer_id?: number | null;
   first_article_printer_name?: string | null;
   /** Eject profile the run's plates use (uniform per run), or null. Seeds the
-   *  "Run again" dialog (Phase 5, F9). */
+   *  "Run again" dialog. */
   eject_profile_id: number | null;
   /** Target printer model for a model-targeted run, or null for a
    *  printers-pool run (its members are in `target_printers`). */
@@ -183,14 +183,14 @@ export interface ProductionRun {
   printers: ProductionRunPrinter[];
   /** Derived deferred start (UTC ISO): the earliest not-yet-started plate's
    *  scheduled_time. Future => the run is "scheduled"; null/past => normal
-   *  active run. Stored on the plates, not the run (Phase 5). */
+   *  active run. Stored on the plates, not the run. */
   scheduled_start_at: string | null;
   created_at: string;
 }
 
 /**
- * Seed values for re-opening the start dialog from a finished run ("Run again",
- * Phase 5, F9). Carries the run's SKU file plus the printer strategy and policy
+ * Seed values for re-opening the start dialog from a finished run ("Run again").
+ * Carries the run's SKU file plus the printer strategy and policy
  * overrides so a repeat run needs no re-entry. The dialog resolves the owning
  * SKU from `skuFileId` via its skus query; if the file was since deleted it
  * falls back to the unprefilled dialog (no dead end).
@@ -208,7 +208,7 @@ export interface RunPrefill {
 }
 
 /**
- * Fleet-scoped "why is this printer on farm work" context (Phase 3, F2).
+ * Fleet-scoped "why is this printer on farm work" context.
  *
  * One entry per printer assigned to an active/paused production run, surfaced on
  * the Printers page (`GET /production-runs/printer-states`) so an operator sees
@@ -272,6 +272,6 @@ export interface ProductionRunCreate {
   /** Consecutive per-printer failures that trip a quarantine (1–20). */
   escalate_consecutive_failures?: number;
   /** One-time deferred start (UTC ISO with Z). Future = hold all plates until
-   *  then (non-blocking); null or at/before now = start ASAP (Phase 5). */
+   *  then (non-blocking); null or at/before now = start ASAP. */
   scheduled_start_at?: string | null;
 }

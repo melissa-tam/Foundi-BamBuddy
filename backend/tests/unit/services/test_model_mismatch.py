@@ -1,4 +1,4 @@
-"""Unit tests for the device-vs-declared model-mismatch gate (Phase 2).
+"""Unit tests for the device-vs-declared model-mismatch gate.
 
 Covers ``PrinterManager.check_model_mismatch`` (the canonical-compare matrix),
 the in-memory set/clear helpers, and the scheduler idle-gate block.

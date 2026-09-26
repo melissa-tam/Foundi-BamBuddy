@@ -335,13 +335,13 @@ async def test_get_spool_by_tag_no_false_positive_different_suffix(db_session):
 
 # -- variance convergence + the tray_uuid refusal (2026-08-01 re-architecture) --
 #
-# These pins were REWRITTEN with the resolver-hygiene wave. First-char/short-UID
+# These pins were REWRITTEN for the 2026-08-01 re-architecture. First-char/short-UID
 # tolerance exists for READER quirks on the TAG, and it may never span a ``tray_uuid``
 # disagreement: both sides asserting different uuids is positive proof of a different
-# roll, so the variance match is refused there and never converged (plan §"Root causes
-# confirmed (RFID/binding lane)" — the false-merge hazard). The pre-2026-08-01 shape of
+# roll, so the variance match is refused there and never converged (the
+# false-merge hazard). The pre-2026-08-01 shape of
 # these tests — variance ACCEPTED across a drifted tray_uuid, then converged onto it —
-# is exactly the merge the wave removes.
+# is exactly the merge the refusal removes.
 #
 # The refusal is asymmetric ON PURPOSE, and the asymmetry is the correction of
 # 2026-08-01: see the sibling-tag section further down. A uuid disagreement falsifies;
@@ -2089,7 +2089,7 @@ async def test_find_matching_untagged_still_matches_unassigned_manual(db_session
 
 
 class TestFinishedRollPredicate:
-    """ONE definition, TWO opposite conclusions — ``Spool.is_finished_roll`` (WS3).
+    """ONE definition, TWO opposite conclusions — ``Spool.is_finished_roll``.
 
     "A spent row is a FINISHED roll" is a single doctrine statement (rules 3 and 8), and
     the two lanes that consume it want OPPOSITE things from it:
@@ -2100,7 +2100,7 @@ class TestFinishedRollPredicate:
       loaded tray is a new roll on a reused core (scenario G3, operator ruling 3).
 
     Spelling the ``spent_at`` test out at each site is exactly how a doctrine statement
-    drifts (the two-copies shape this wave deleted from ``_is_tagless``), so the rule is
+    drifts (the two-copies shape removed from ``_is_tagless``), so the rule is
     named once on the model and both sites call it. These three tests are that claim:
     the predicate itself, and each conclusion drawn from it.
     """

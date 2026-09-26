@@ -19,7 +19,7 @@ class TaglessDefaultFilament(BaseModel):
     subtype: str = ""
     rgba: str
     slicer_filament: str | None = None
-    # Nozzle temperature range (W4). Optional so an operator-edited blob without
+    # Nozzle temperature range. Optional so an operator-edited blob without
     # them still validates. The shipped 230/270 is Bambu STUDIO's GFG02 profile range
     # (``nozzle_temperature_range_low``/``_high`` in "Bambu PETG HF @base.json"); the
     # RFID tags themselves read 230-260 (102 of 102 temp-bearing tagged GFG02 rows,
@@ -591,7 +591,7 @@ class AppSettings(BaseModel):
         description="JSON object with 'order' key containing array of sidebar item IDs (empty = no default)",
     )
 
-    # Farm failure policy defaults (Phase 3) — applied to a production run when
+    # Farm failure policy defaults — applied to a production run when
     # the run doesn't specify its own values.
     farm_retry_max_per_unit: int = Field(
         default=1,

@@ -569,7 +569,7 @@ class TestMatchesPendingEject:
 
     async def test_a_hydrated_eject_is_matchable_too(self):
         # A record rebuilt at startup is still the identity a terminal must be matched
-        # against — that is the whole reason the name check exists (W1/R2).
+        # against — that is the whole reason the name check exists.
         plate_occupancy.hydrate_eject(9007, PendingEject("production", 1, 32))
         with patch.object(printer_manager, "get_client", return_value=None):
             assert remote.matches_pending_eject(9007, None, subtask_name="eject_production_item32") is True
@@ -624,7 +624,7 @@ class TestEjectNameHelpers:
 
 
 class TestMatchesPendingEjectNameTightening:
-    """The tightened matcher (W1/R2): a truthy subtask_name whose stem != the
+    """The tightened matcher: a truthy subtask_name whose stem != the
     pending's expected stem is a POSITIVE mismatch even when the id path is lenient
     (post-restart, no client). Name-match alone with no claimed eject is still
     False — only the pending identity gates the resolution."""
@@ -1740,7 +1740,7 @@ class TestRuntimeWatchdogSweepLane:
 
     async def test_a_sweep_running_past_its_budget_warns_once_and_never_kills_there(self, caplog):
         # Percent parked at the sweep beacon: the sweep budget line (t50 + 28 s) passes
-        # at ~34 s, and nothing may fire there this wave.
+        # at ~34 s, and nothing may fire there.
         env, clock = await self._run(90060, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0)], caplog)
         warnings = _records(caplog, "sweep phase running")
         assert len(warnings) == 1
@@ -1753,7 +1753,7 @@ class TestRuntimeWatchdogSweepLane:
 
     async def test_the_whole_job_deadline_is_still_enforced_inside_the_sweep_phase(self, caplog):
         # The complement of the epilogue's patience: while the plate may still be under
-        # the toolhead, the stuck-part timing is EXACTLY what it was before this wave.
+        # the toolhead, the stuck-part timing is EXACTLY the whole-job deadline.
         env, clock = await self._run(90061, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0)], caplog)
         assert clock.now - 1000.0 == pytest.approx(104.0)
         assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)

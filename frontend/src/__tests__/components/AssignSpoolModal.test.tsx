@@ -414,7 +414,7 @@ describe('AssignSpoolModal', () => {
       expect.anything(),
     );
   });
-  // ── W5b: a binding on a slot that reads EMPTY is a shelf claim, not filament ──
+  // ── A binding on a slot that reads EMPTY is a shelf claim, not filament ──
   //
   // Hiding those spools made the picker refuse the very roll the operator was
   // holding: a stale claim silently vetoed the assign with no way to see why.

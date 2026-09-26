@@ -1,4 +1,4 @@
-"""Integration tests for the HMS vocabulary read API (WS6).
+"""Integration tests for the HMS vocabulary read API.
 
 ``GET /api/v1/printers/{id}/hms-events`` is the audit surface over ``hms_event``: the
 codes a printer has actually emitted, newest sighting first, including the ones no

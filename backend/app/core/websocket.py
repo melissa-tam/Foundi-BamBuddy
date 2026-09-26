@@ -116,7 +116,7 @@ ws_manager = ConnectionManager()
 
 
 def broadcast_production_run_changed(run_id: int) -> None:
-    """Fire-and-forget farm event: a production run's derived state changed (Phase 4).
+    """Fire-and-forget farm event: a production run's derived state changed.
 
     ONE event type covers every run mutation (pause/resume/abort, operator stop,
     quarantine auto-pause, first-article transitions, completion, top-up, stall

@@ -314,7 +314,7 @@ class TestCooldownHook:
 class TestEjectTerminalHook:
     """``farm_policy.on_terminal`` — the sweep's own measurement, on the caller's session.
 
-    No ``ledger`` fixture here, and that is the point of the wave: the terminal awaits
+    No ``ledger`` fixture here, and that is the point: the terminal awaits
     the write on the session it already holds, so there is nothing to schedule, nothing
     to settle and no second connection to queue behind its own transaction.
     """
@@ -415,7 +415,7 @@ class TestEjectTerminalHook:
         assert await _episodes(db_session) == []
 
     async def test_the_terminal_neither_spawns_a_task_nor_opens_a_session(self, db_session, monkeypatch):
-        """THE regression this wave fixes, pinned from the outside.
+        """THE regression, pinned from the outside.
 
         A fire-and-forget write here meant a SECOND connection to the same database
         while this very handler's transaction was open — which on SQLite queues on the

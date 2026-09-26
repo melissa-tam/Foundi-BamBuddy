@@ -2704,7 +2704,7 @@ class TestPlateNotEmptySourceDetail:
 
 
 class TestFarmLifecycleNotifications:
-    """Phase 6: manual/lifecycle farm events (run aborted/resumed, FA approved).
+    """Manual/lifecycle farm events (run aborted/resumed, FA approved).
 
     Each method mirrors ``on_run_paused`` — provider-boolean gated, no
     ``force_immediate`` (run-lifecycle events, not printer alarms).

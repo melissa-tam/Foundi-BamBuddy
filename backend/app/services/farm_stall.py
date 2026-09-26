@@ -1,4 +1,4 @@
-"""Stall watches for farm units stuck in ``printing`` (Phase 3.2 + pause-stall).
+"""Stall watches for farm units stuck in ``printing`` (offline stall + pause stall).
 
 Two sibling watches, one module, one scheduler tick. Both record a per-printer
 edge timestamp, flag the unit past a grace window, fire a ONE-shot notification,
@@ -117,7 +117,7 @@ WAITING_REASON_PAUSED = "print_paused_stalled"
 # notification and deliberately left the printer PAUSED for a human (a jam that
 # couldn't be recovered, a runout needing a same-slot refill, a physical fault needing
 # hands). Re-notifying any of them through the pause-stall watch would just double up
-# on a hold a human already owns — and since WS2b the OPEN INCIDENT is the primary
+# on a hold a human already owns — and the OPEN INCIDENT is the primary
 # ownership signal (it covers a foreign print, which has no token to read).
 #
 # DERIVED from the incident store's own token set rather than re-listed, so a new hold
@@ -131,7 +131,7 @@ _ATTENDED_PAUSE_REASONS: frozenset[str] = RECOVERY_WAITING_REASONS - {WAITING_RE
 _DEFAULT_GRACE_MINUTES = 30
 _DEFAULT_PAUSE_GRACE_MINUTES = 15
 
-# W3 attention reminders: how long a down printer's ORIGINAL escalation alert may go
+# Attention reminders: how long a down printer's ORIGINAL escalation alert may go
 # un-repeated before this watch re-fires it. The offline / pause-stall / recovery /
 # runout escalations each alert EXACTLY ONCE per incident, so a printer left PAUSEd
 # for hours produced a single Discord message (2026-07-20: 009-H2S jam-escalated
@@ -828,7 +828,7 @@ async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, no
 
 
 # --------------------------------------------------------------------------- #
-# WS2b: the foreign-print pause watch
+# The foreign-print pause watch
 # --------------------------------------------------------------------------- #
 # printer_id -> the ts a FOREIGN print was first seen PAUSEd (episode start), and
 # the printers already notified for the current episode. An episode is one
@@ -919,7 +919,7 @@ async def check_foreign_paused_printers(db: AsyncSession, *, manager=printer_man
 
 
 # --------------------------------------------------------------------------- #
-# W3: hourly attention reminders for a printer left down needing a human
+# Hourly attention reminders for a printer left down needing a human
 # --------------------------------------------------------------------------- #
 # Reminder copy — a re-fire is the SAME notification EVENT the original escalation
 # produced (no new event types / templates / channels), so the operator sees a
@@ -1017,7 +1017,7 @@ def _live_runout_slot(state) -> str | None:
 # This dict IS the single source of the remindable reason set (_ATTENTION_REASONS
 # below), so adding a reason is a one-line edit that cannot drift from the pin.
 #
-# Every INCIDENT-backed hold is deliberately ABSENT: since WS2b they are reminded from
+# Every INCIDENT-backed hold is deliberately ABSENT: they are reminded from
 # their OPEN ESCALATED INCIDENT (:func:`_remind_open_incidents`), not from a queue
 # item's token. A token can only exist for a farm print, so the token lane could never
 # nag about a foreign print left holding — exactly the class of hold that sat silent for
@@ -1044,7 +1044,7 @@ async def _remind_open_incidents(
 ) -> None:
     """Hourly nag for every OPEN ESCALATED AMS incident still holding its printer.
 
-    Printer-scoped by design (WS2b): an incident is a fact about the PRINTER, so this
+    Printer-scoped by design: an incident is a fact about the PRINTER, so this
     arm reminds identically whether the held print is a farm unit or a foreign one —
     the token-driven arm it replaces could only ever see farm units, and a foreign
     hold nagged nobody. Re-fires the escalation's OWN event with kind-aware copy; no
@@ -1160,7 +1160,7 @@ async def _remind_open_incidents(
 
 
 async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
-    """Re-fire the ORIGINAL escalation notification for a printer left down (W3).
+    """Re-fire the ORIGINAL escalation notification for a printer left down.
 
     The offline / pause-stall / spool-recovery / runout escalations each alert
     EXACTLY ONCE per incident and then leave the printer PAUSED for a human, so a
@@ -1169,8 +1169,8 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
     through TWO arms that never overlap:
 
     * every OPEN ESCALATED AMS incident (:func:`_remind_open_incidents`) — printer
-      scoped, so a FOREIGN print's hold nags exactly like a farm one. Before WS2b
-      this arm read farm queue tokens, and a foreign hold had none to read;
+      scoped, so a FOREIGN print's hold nags exactly like a farm one. A queue
+      token cannot serve here: a foreign hold has none to read;
     * every still-``printing`` farm unit carrying one of the remaining non-AMS
       ESCALATED tokens in :data:`_ATTENTION_REASONS` (plate-vision, pause-stall),
       re-firing THAT reason's own notification event via :data:`_ATTENTION_DISPATCH`

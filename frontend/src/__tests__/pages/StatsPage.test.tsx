@@ -932,7 +932,7 @@ describe('StatsPage', () => {
     });
 
     /**
-     * PRODUCTION, as of this wave: a state recorder under an hour old beneath a
+     * PRODUCTION at the recorder's first deploy: a state recorder under an hour old beneath a
      * forty-four-day window, with the print log and the fault ledger going back
      * weeks. Nearly every bucket is "faults and holds only" and the newest one
      * is barely observed.

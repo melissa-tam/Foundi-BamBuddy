@@ -1355,7 +1355,7 @@ class TestAssignMovesExistingBinding:
 
 
 class TestAssignSpoolReleasesStaged:
-    """W6.3: a successful manual assign releases low-spool staged (``filament_short``)
+    """A successful manual assign releases low-spool staged (``filament_short``)
     units immediately — the deficit changes via the new DB assignment, so it must
     NOT wait for the printer's MQTT tray echo."""
 

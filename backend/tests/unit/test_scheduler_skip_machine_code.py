@@ -1,4 +1,4 @@
-"""The require_previous_success skip sites stamp a machine code (Phase 4.3f).
+"""The require_previous_success skip sites stamp a machine code.
 
 Both skip sites (assigned-printer and model-based) must set
 ``waiting_reason="previous_print_failed"`` alongside the human-readable

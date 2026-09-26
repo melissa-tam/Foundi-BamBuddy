@@ -2,8 +2,8 @@
  * InfoHint — a small, plain-English help affordance rendered beside a field
  * label (an `Info` icon that reveals a short tooltip).
  *
- * Promoted from the local copy that lived in `EjectProfilesPage` (plan item
- * F7). The original was a hover-only native `title=` on a non-focusable
+ * Promoted from the local copy that lived in `EjectProfilesPage`.
+ * The original was a hover-only native `title=` on a non-focusable
  * `<span role="img">`: invisible to keyboard and touch users. This shared
  * primitive keeps the identical look and the mouse-hover behaviour, and adds
  * the missing affordances:

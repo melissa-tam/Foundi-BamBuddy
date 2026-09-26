@@ -116,7 +116,7 @@ is clear to 100 mm, and that clearance is a PHYSICAL machine limit rather than a
 operator setting — so both numbers live in the ``printer_model_geometry`` registry as
 seed-only columns (H2S ``clear_above_mm=100.0`` MEASURED / ``keepout_y_mm=285.0``;
 every other model NULL, which means fans only). Red line 2 (the hardware ladder) was
-WAIVED by the operator for this wave: the first production cooldown + eject is the
+WAIVED by the operator for the cooldown prep: the first production cooldown + eject is the
 witness, with the eject runtime watchdog and the human-clear plate gate as the net.
 Do not re-ladder it. The standing operator rule while a plate is held: do not jog the
 toolhead from the touchscreen — the whole safety case is that the toolhead is AT the
@@ -521,7 +521,7 @@ class CooldownPrep:
     # ``end()`` runs is what the ledger records for this episode.
     outcome: WatchVerdict | None = None
     # When the chamber first read at or under the line (monotonic), or None for a
-    # cooldown whose chamber never got there. THE measurement this wave exists to take.
+    # cooldown whose chamber never got there. THE measurement the cooldown prep exists to take.
     boost_ended_at: float | None = None
     # The arm-time witness's wait, carried here (not awaited inside :func:`begin`) so
     # that NO await sits between "fans commanded ON" and the caller holding this handle:
@@ -738,7 +738,7 @@ class CooldownPrep:
             segments.append(_fan_summary(lane, observed))
         boosted = "never" if self.boost_ended_at is None else f"{self.boost_ended_at - self.started_at:.0f} s"
         elapsed_s = time.monotonic() - self.started_at
-        # THE line the wave is measured by: one per cooldown, greppable as
+        # THE line the cooldown prep is measured by: one per cooldown, greppable as
         # ``[cooldown-prep]``, carrying every decision this module made.
         logger.info(
             "[cooldown-prep] printer %s: cooldown ended after %.0f s "

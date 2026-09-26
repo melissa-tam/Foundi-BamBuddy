@@ -1,5 +1,5 @@
 /**
- * "Start ASAP / Schedule for later" control for a production run (Phase 5).
+ * "Start ASAP / Schedule for later" control for a production run.
  *
  * Reuses the queue schedule field's date/time helpers (`utils/date`) and the
  * hidden `datetime-local` `.showPicker()` pattern. Emits a UTC ISO string (with

@@ -113,7 +113,7 @@ def _resolve_nozzle_temps(
     slicer_filament: str | None,
     default: dict | None,
 ) -> tuple[int, int]:
-    """The slot's nozzle temperature range, resolved in ONE place (W4).
+    """The slot's nozzle temperature range, resolved in ONE place.
 
     Tier order, each temp independently: the spool ROW's temp when set → the configured
     tagless default's pair when the row's identity is CANONICALISABLE onto that default
@@ -183,7 +183,7 @@ async def resolve_slicer_filament(
     ``rgba`` / ``nozzle_temp_min`` / ``nozzle_temp_max``: the spool row's colour
     and its stored temps — feed the temp resolution (:func:`_resolve_nozzle_temps`)
     so the WHOLE wire identity is composed here and the two write-site consumers
-    can't diverge (W4). Optional so pre-W4 callers still type-check.
+    can't diverge. Optional so callers without them still type-check.
 
     ``generic_fallback``: opt-in rescue for a row whose stored identity names no
     filament but whose MATERIAL does. When the FINAL ``tray_info_idx`` would be

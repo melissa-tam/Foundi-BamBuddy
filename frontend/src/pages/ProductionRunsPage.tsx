@@ -1,5 +1,5 @@
 /**
- * Production runs page (farm production, Phase 2).
+ * Production runs page (farm production).
  *
  * Starts runs (SKU → file/plate → target units → printer strategy → eject
  * profile) and renders live progress with
@@ -87,7 +87,7 @@ interface StartRunDialogProps {
   /** Backend failure detail from the last start attempt; rendered inline so a
    *  rejected run (e.g. 422 policy errors) never dead-ends silently. */
   error: string | null;
-  /** Seed values from a finished run ("Run again", Phase 5, F9). When present the
+  /** Seed values from a finished run ("Run again"). When present the
    *  dialog seeds once from these instead of the first-runnable-SKU auto-seed. */
   initial?: RunPrefill;
   onStart: (data: ProductionRunCreate) => void;
@@ -130,7 +130,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
   const [fileError, setFileError] = useState(false);
   const [targetError, setTargetError] = useState(false);
   const [printerError, setPrinterError] = useState(false);
-  // One-time deferred start (Phase 5): null = start ASAP. ``scheduleValid`` blocks
+  // One-time deferred start: null = start ASAP. ``scheduleValid`` blocks
   // submit while the operator's typed date/time is in the past or malformed.
   const [scheduledStartAt, setScheduledStartAt] = useState<string | null>(null);
   const [scheduleValid, setScheduleValid] = useState(true);
@@ -165,7 +165,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
   const modelTouched = useRef(false);
   const initialSeeded = useRef(false);
 
-  // Run again (Phase 5, F9): seed the whole form from a finished run's prefill
+  // Run again: seed the whole form from a finished run's prefill
   // exactly once. Resolve the owning SKU from the prefill's file id via the skus
   // query; if that file was since deleted the prefill can't resolve — fall back
   // to the fresh-dialog auto-seed (no dead end: the SKU picker + "no files"
@@ -578,7 +578,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
               )}
             </fieldset>
 
-            {/* First-article approval (Phase 3) — stays in the primary flow;
+            {/* First-article approval — stays in the primary flow;
                 it changes what the run DOES, unlike the rarely-touched policy
                 overrides now grouped under Advanced (F5). */}
             <fieldset className="rounded-lg border border-bambu-dark-tertiary p-3">
@@ -603,7 +603,7 @@ function StartRunDialog({ saving, error, initial, onStart, onClose }: StartRunDi
               </label>
             </fieldset>
 
-            {/* One-time deferred start (Phase 5). null => start ASAP. */}
+            {/* One-time deferred start. null => start ASAP. */}
             <fieldset className="rounded-lg border border-bambu-dark-tertiary p-3">
               <legend className="px-1 text-sm font-medium text-white">
                 {t('productionRuns.schedule.sectionTitle')}
@@ -805,7 +805,7 @@ function RunCard({
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              {/* Title links to the per-unit detail page (Phase 4.1); the card
+              {/* Title links to the per-unit detail page; the card
                   itself stays a plain container so the action buttons keep
                   their own click targets. */}
               <h3 className="text-base font-semibold truncate">
@@ -845,7 +845,7 @@ function RunCard({
             </p>
           </div>
           <div className="flex items-center gap-1 shrink-0">
-            {/* Scheduled run: launch early or move the start time (Phase 5). The
+            {/* Scheduled run: launch early or move the start time. The
                 underlying status is 'active', so Pause/Abort below still apply. */}
             {scheduled && canUpdate && (
               <>
@@ -1017,10 +1017,10 @@ function RunCard({
           </div>
         </div>
 
-        {/* Staged units (low-spool / other holds, Phase 4.1) */}
+        {/* Staged units (low-spool / other holds) */}
         <RunStagedBanner run={run} />
 
-        {/* First-article approval gate (Phase 3) */}
+        {/* First-article approval gate */}
         <FirstArticleBanner run={run} />
       </CardContent>
     </Card>
@@ -1046,7 +1046,7 @@ export function ProductionRunsPage() {
   const [prefill, setPrefill] = useState<RunPrefill | null>(null);
   const [pendingAbort, setPendingAbort] = useState<ProductionRun | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ProductionRun | null>(null);
-  // The run whose start time is being edited in the reschedule dialog (Phase 5).
+  // The run whose start time is being edited in the reschedule dialog.
   const [pendingReschedule, setPendingReschedule] = useState<ProductionRun | null>(null);
   // Which run cards have their blocked-printers panel disclosed. Per VISIT and
   // deliberately not persisted: starting a run opens its own card's panel so
@@ -1183,7 +1183,7 @@ export function ProductionRunsPage() {
     // persistent role="alert" rather than a dismissible toast.
   });
 
-  // Reschedule / Start-now share one endpoint (Phase 5): a future ISO reschedules,
+  // Reschedule / Start-now share one endpoint: a future ISO reschedules,
   // null starts the run now. Start-now toasts differently and needs no dialog.
   const rescheduleMutation = useMutation({
     mutationFn: ({ id, at }: { id: number; at: string | null }) => api.rescheduleProductionRun(id, at),

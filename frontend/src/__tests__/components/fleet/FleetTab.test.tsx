@@ -127,7 +127,7 @@ describe('FleetTab', () => {
 
   describe('the recording notice', () => {
     /**
-     * PRODUCTION, as of this wave: the recorder is an hour old and the window
+     * PRODUCTION at the recorder's first deploy: the recorder is an hour old and the window
      * is six weeks deep. The notice used to fire only when NOTHING had ever
      * been observed, so in the one state it was written for it said nothing.
      */

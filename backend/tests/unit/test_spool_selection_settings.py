@@ -29,7 +29,7 @@ class TestDefaults:
         assert not hasattr(s, "auto_add_untagged")
 
     def test_tagless_default_filament_default_shape(self):
-        # W4: the shipped default carries the SPECIFIC Bambu PETG HF wire identity
+        # The shipped default carries the SPECIFIC Bambu PETG HF wire identity
         # (GFG02 + 230/270 nozzle range) so a bare-tray push is a byte-identical
         # firmware backup-group peer instead of the generic GFG99 that split the group.
         s = AppSettings()
@@ -52,7 +52,7 @@ class TestDefaults:
 
 
 class TestRespoolAutoEnabled:
-    """The W3 Tier-2 auto-respool toggle is GONE (2026-08-19, operator ruling 3).
+    """The Tier-2 auto-respool toggle is GONE (2026-08-19, operator ruling 3).
 
     It used to default OFF and make tier 2 ask instead of concluding, encoding the
     superseded directive "the farm does NOT reuse tags yet". What superseded it is not a

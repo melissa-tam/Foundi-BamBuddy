@@ -146,7 +146,7 @@ describe('ToastContext live region', () => {
   // WCAG 2.2 4.1.3 Status Messages. Toasts are status messages, and some carry
   // their entire content in the message ("Slot 2 unchanged") — without a live
   // region those are silent to a screen reader, which is the very failure mode
-  // WS11 exists to close. The region is declared once on the always-mounted
+  // this region exists to close. The region is declared once on the always-mounted
   // viewport, never per toast: a live region must pre-exist its content, and
   // per-toast regions double-announce.
   function ToastProbe() {

@@ -1,6 +1,6 @@
 """Regression tests for the cooldown-fan startup migrations.
 
-Two migrations ship with the cooldown-fan wave, and both change what an operator
+Two migrations ship with the cooldown fans, and both change what an operator
 sees, so both are pinned here:
 
 1. The retired "0 = off" encoding on ``farm_cooldown_aux_fan_percent`` is folded

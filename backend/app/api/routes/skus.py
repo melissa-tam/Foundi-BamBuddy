@@ -1,4 +1,4 @@
-"""REST API for the SKU catalog (Phase 2).
+"""REST API for the SKU catalog.
 
 CRUD over SKUs, file links (SKU ↔ library_file+plate), an auto-suggest endpoint
 that parses a code/part-number/name from a file, and a derived lifetime-stats

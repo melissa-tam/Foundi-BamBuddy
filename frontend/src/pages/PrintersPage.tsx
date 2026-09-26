@@ -1512,7 +1512,7 @@ function getStatusDisplay(state: string | null | undefined, stg_cur_name: string
 }
 
 /**
- * Registry-driven eject-qualification hint (farm eject, Phase 2), rendered
+ * Registry-driven eject-qualification hint (farm eject), rendered
  * under the printer model dropdowns. A model whose geometry row is missing or
  * not hardware-validated cannot run production auto-eject — the hint tells the
  * operator up front instead of surprising them at dispatch time. Renders
@@ -1837,7 +1837,7 @@ function PrinterCard({
   bedTempPresets?: readonly [number, number, number];
   chamberTempPresets?: readonly [number, number, number];
   fanSpeedPresets?: readonly [number, number, number];
-  /** Farm production context for this printer (Phase 3, F2); absent when the
+  /** Farm production context for this printer; absent when the
    *  printer isn't on a farm run or the fleet query is unavailable/403. */
   farmContext?: FarmPrinterContext | null;
 }) {
@@ -1913,7 +1913,7 @@ function PrinterCard({
     trayId: number;
     trayInfo: { type: string; color: string; location: string; material?: string; profile?: string };
   } | null>(null);
-  // The ONE manual "New roll…" slot verb (W5a), for a bound row of either
+  // The ONE manual "New roll…" slot verb, for a bound row of either
   // tag-ness — the operator states the swap, the backend picks the ledger lane.
   const [newRollContext, setNewRollContext] = useState<NewRollContext | null>(null);
   const [configureSlotModal, setConfigureSlotModal] = useState<{
@@ -2137,7 +2137,7 @@ function PrinterCard({
     : cachedTrayNow.current;
   // Tray that WAS feeding this job while the active green ring has cleared (a
   // runout PAUSE flips tray_now to 255) — drives the dimmed "was feeding" ring so
-  // the operator can still see which slot to refill (W6). Undefined when no hint.
+  // the operator can still see which slot to refill. Undefined when no hint.
   const wasFeedingTray = wasFeedingTrayId(status?.state, effectiveTrayNow, status?.last_loaded_tray);
 
   // Fetch smart plug for this printer
@@ -2203,7 +2203,7 @@ function PrinterCard({
   // the eject affordances ONLY — every other consumer keeps isPrintingOrPaused,
   // whose narrower meaning ("a print is showing progress") they depend on.
   const isActivePrintState = ACTIVE_PRINT_STATES.includes(status?.state ?? '');
-  // Phase 1 (P1-B): the plate gate now blocks dispatch unconditionally, so the
+  // The plate gate now blocks dispatch unconditionally, so the
   // clear-plate affordance must appear whenever the gate is raised — not only when
   // the global require_plate_clear convenience toggle is on. A raised gate always
   // means dispatch is held pending a manual clear.
@@ -2212,7 +2212,7 @@ function PrinterCard({
   // A refused plate: the operator stopped a print the printer's own plate check
   // had paused. The stop wiped the printer's words, so the gate carries them.
   const plateRefusal = status?.occupancy?.plate.refusal;
-  // W3: while a cooldown eject watch is armed, marking the plate cleared cancels
+  // While a cooldown eject watch is armed, marking the plate cleared cancels
   // the pending auto-eject (the watch exits without sweeping). Surface that as a
   // hint on the mark-cleared button so the operator isn't surprised.
   const ejectWatchActive = !!status?.eject_watch;
@@ -2271,7 +2271,7 @@ function PrinterCard({
       };
     }
     if (status.awaiting_plate_clear) {
-      // Cooldown/eject phase (Phase 4.3c): while the farm's cooldown watch is
+      // Cooldown/eject phase: while the farm's cooldown watch is
       // armed the hold is EXPECTED — show the target vs live bed temperature
       // instead of the alarming "not cleared" copy. The sweep runs inside the
       // print file, so it's folded into this phase rather than shown apart.
@@ -3319,7 +3319,7 @@ function PrinterCard({
 
   /**
    * "New roll…" — THE verb for "the roll on this slot was physically replaced",
-   * for a bound row of EITHER tag-ness (W5a).
+   * for a bound row of EITHER tag-ness.
    *
    * It replaced two verbs ("Re-spool tag…" on tagged rows, "New roll…" on tagless
    * ones) that asked the operator the same question and differed only in the
@@ -3367,7 +3367,7 @@ function PrinterCard({
     assignment?.recheck_pending ? t('printers.rfid.recheckPending') : undefined;
 
   /**
-   * A binding that outlived the filament, for the EMPTY-slot hover card (W5a).
+   * A binding that outlived the filament, for the EMPTY-slot hover card.
    * Maps the API rows onto the card's flags; the card owns the wording. Returns
    * `null` when the slot has no inventory binding at all (the common case).
    *
@@ -3811,7 +3811,7 @@ function PrinterCard({
         </div>
       )}
       <CardContent className={`${cardSize >= 3 ? 'p-5' : ''} flex flex-1 flex-col`}>
-        {/* Quarantine banner (farm auto-recovery, Phase 3) — the scheduler skips
+        {/* Quarantine banner (farm auto-recovery) — the scheduler skips
             a quarantined printer until an operator clears it. */}
         {printer.quarantined && (
           <div className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 p-2.5">
@@ -3833,7 +3833,7 @@ function PrinterCard({
                 ) : null}
               </div>
             </div>
-            {/* Phase 4.3h: Recover & resume is the primary path (lifts the
+            {/* Recover & resume is the primary path (lifts the
                 quarantine AND resumes the paused run); Mark plate cleared is
                 the narrower secondary — it only releases the plate gate.
                 Offered on the same derived verdict as the menu, so this banner
@@ -3922,7 +3922,7 @@ function PrinterCard({
             )}
           </div>
         )}
-        {/* Model-mismatch banner (farm device reconciliation, Phase 2) — the
+        {/* Model-mismatch banner (farm device reconciliation) — the
             device self-reported a different model than the one declared here;
             the scheduler blocks dispatch until the declaration is corrected
             (edit the printer's model). */}
@@ -3948,7 +3948,7 @@ function PrinterCard({
             </div>
           </div>
         )}
-        {/* Farm production chip (Phase 3, F2) — why this printer is on (or blocked
+        {/* Farm production chip — why this printer is on (or blocked
             on) farm work: the owning run link + one status line. Absent for
             non-farm printers. */}
         <FarmUnitChip ctx={farmContext} />
@@ -4292,7 +4292,7 @@ function PrinterCard({
                 </span>
               )}
 
-              {/* Open AMS incident (WS2b): a jam / runout / physical fault holding
+              {/* Open AMS incident: a jam / runout / physical fault holding
                   this printer. Rendered from the printer's OWN state, not from a
                   queue unit — a foreign print's hold has no queue row, so without
                   this chip it is invisible in the UI entirely (12 foreign runouts
@@ -5688,7 +5688,7 @@ function PrinterCard({
                                 const activePrintSlotLabel = activePrintSlotIdx >= 0
                                   ? `P${activePrintSlotIdx + 1}`
                                   : null;
-                                // W6 status badges/ring for this slot.
+                                // Status badges/ring for this slot.
                                 const wasFeeding = !isActive && wasFeedingTray === globalTrayId;
                                 const slotRanOutFlag = slotRanOut(status.hms_errors, ams.id, slotIdx);
                                 const spentCoreFlag = !!inventoryAssignment?.spool?.spent_at;
@@ -5981,7 +5981,7 @@ function PrinterCard({
                         const htActivePrintSlotLabel = htActivePrintSlotIdx >= 0
                           ? `P${htActivePrintSlotIdx + 1}`
                           : null;
-                        // W6 status badges/ring for this HT slot.
+                        // Status badges/ring for this HT slot.
                         const htWasFeeding = !isActive && wasFeedingTray === globalTrayId;
                         const htSlotRanOut = slotRanOut(status.hms_errors, ams.id, htSlotId);
                         const htSpentCore = !!htInventoryAssignment?.spool?.spent_at;
@@ -7121,7 +7121,7 @@ function PrinterCard({
         />
       )}
 
-      {/* W2 hot-bed eject confirmation: the backend refused the eject because
+      {/* Hot-bed eject confirmation: the backend refused the eject because
           the bed is above the release threshold — or because nothing (no eject
           line, no chamber reading) says it is cool enough; the operator
           explicitly confirms sweeping while hot, and we re-call with
@@ -7241,7 +7241,7 @@ function PrinterCard({
         />
       )}
 
-      {/* Stop Print Confirmation. Farm-aware copy (Phase 4.3g / deferred 3.1):
+      {/* Stop Print Confirmation. Farm-aware copy:
           when the printing item belongs to a production run, spell out the
           operator-stop consequence — no auto-retry, run holds this printer. */}
       {showStopConfirm && (
@@ -7443,7 +7443,7 @@ function PrinterCard({
         />
       )}
 
-      {/* "New roll…" — the one manual slot verb, both ledger lanes (W5a) */}
+      {/* "New roll…" — the one manual slot verb, both ledger lanes */}
       <NewRollModal
         context={newRollContext}
         onClose={() => setNewRollContext(null)}
@@ -8890,7 +8890,7 @@ export function PrintersPage() {
     queryFn: api.getPrinters,
   });
 
-  // Fleet-scoped farm context per printer (Phase 3, F2) — powers the FarmUnitChip
+  // Fleet-scoped farm context per printer — powers the FarmUnitChip
   // on each card. Rides the existing `production_run_changed` WS prefix
   // invalidation of ['production-runs'] (useWebSocket.ts) so chips update live;
   // the 15 s refetch is a fallback. On error/403 `data` is undefined and the

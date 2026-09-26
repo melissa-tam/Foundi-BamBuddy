@@ -1,4 +1,4 @@
-"""Per-push AMS tray observations — the epistemic contract (W1).
+"""Per-push AMS tray observations — the epistemic contract.
 
 Every assertion here defends ONE property: an observation states only what THIS
 push said. Fields the push omitted are UNKNOWN, never inherited, never inferred.
@@ -330,7 +330,7 @@ class TestPresence:
         assert observe_tray(1, 0, tray).occupancy_signal is expected
 
 
-# --- the SHARED presence rule (W4): one origin for every consumer -----------
+# --- the SHARED presence rule: one origin for every consumer ----------------
 
 
 class TestSharedPresenceRule:
@@ -518,7 +518,7 @@ class TestObserveAmsPush:
         assert [(o.ams_id, o.tray_id, o.present) for o in obs] == [(0, 0, True), (1, 0, False)]
 
     def test_tray_without_id_warns_and_falls_back_to_position(self, caplog):
-        """The pre-W1 call sites silently defaulted to 0 — that writes slot 0's
+        """The earlier call sites silently defaulted to 0 — that writes slot 0's
         identity from another slot's data. Position fallback + a WARNING instead."""
         payload = {"ams": [{"id": 0, "tray": [{"state": 11, "tray_type": "PETG"}, {"state": 9, "tray_type": ""}]}]}
         with caplog.at_level(logging.WARNING):

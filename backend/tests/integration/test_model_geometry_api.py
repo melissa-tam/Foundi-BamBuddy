@@ -1,4 +1,4 @@
-"""Integration tests for the model-geometry registry API (Phase 2)."""
+"""Integration tests for the model-geometry registry API."""
 
 import logging
 

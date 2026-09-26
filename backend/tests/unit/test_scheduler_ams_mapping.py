@@ -195,7 +195,7 @@ class TestBuildLoadedFilaments:
 
 
 class TestPresentCandidates:
-    """W4: the dispatch-candidate presence gate at the two matcher call sites.
+    """The dispatch-candidate presence gate at the two matcher call sites.
 
     Deliberately NOT inside ``_build_loaded_filaments`` — ``spool_recovery`` reads
     the JAMMED tray's identity out of that same builder and must keep seeing it.

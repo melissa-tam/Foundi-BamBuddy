@@ -1,5 +1,5 @@
 /**
- * Phase derivation for the farm loop (Phase 4.3c): printing / eject deferred /
+ * Phase derivation for the farm loop: printing / eject deferred /
  * cooling (eject line, or none) / awaiting plate clear / nothing. Pure function
  * — the printer card pill and the run-detail chips both consume it, and both
  * word a cooling watch through `coolingLabel`.

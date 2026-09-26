@@ -1,4 +1,4 @@
-"""Tagged-ledger DECREASE reconcile (W6) — ``usage_tracker``.
+"""Tagged-ledger DECREASE reconcile — ``usage_tracker``.
 
 The push-driven weight sync is INCREASE-ONLY, so a ledger that over-counts can
 never heal itself. Production spool 37 (003-H2S T3) sat at 899.28 g used against a
@@ -370,7 +370,7 @@ class TestPromptAccessor:
 @pytest.mark.asyncio
 class TestSpentRowsAreLeftToTheirOwnMachine:
     async def test_a_spent_row_reading_full_still_reconciles(self, db_session, clock, notify, trusted):
-        """The spent LATCH is the runout state machine's business (W1); the gram
+        """The spent LATCH is the runout state machine's business; the gram
         ledger is this lane's. A spent row whose chip now reads full has had a fresh
         roll put on it — the re-spool lane owns the identity question, and this lane
         only corrects grams, so it does not special-case ``spent_at``.
@@ -519,7 +519,7 @@ class TestIdentityAgreement:
         assert spool.weight_used == SPOOL_37_USED
 
 
-# ── WS4: the SAME identity gate on the INCREASE-only lane ────────────────────
+# ── The SAME identity gate on the INCREASE-only lane ─────────────────────────
 #
 # ``wire_identity_is_the_bound_row`` is one contract with two writers, and until now
 # only the decrease lane above asked it. The increase-only sync in ``main.on_ams_change``

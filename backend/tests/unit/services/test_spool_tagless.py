@@ -1,8 +1,8 @@
 """Tests for the tagless (non-RFID) spool SUPPORT lanes — services.spool_tagless.
 
-Scope after the W3b cutover: minting from both sources, the bare-tray auto-config
+Scope after the slot-pipeline cutover: minting from both sources, the bare-tray auto-config
 (D3b) with its retry dedup and wire-safety defers, the stale-config
-firmware-leftover override, the W5 fresh-roll prompt + its "New roll" executor, and
+firmware-leftover override, the fresh-roll prompt + its "New roll" executor, and
 provisional disposal on RFID takeover.
 
 Slot IDENTITY is no longer decided here — the ``handle_tagless_slot`` branch tree and
@@ -597,7 +597,7 @@ class TestDryingDefers:
         assert env.apply.await_count == 1  # processed immediately — window was never armed
 
 
-# --- W4: mint temp stamping + canonical-identity adoption ------------------
+# --- Mint temp stamping + canonical-identity adoption ----------------------
 
 # The production tagless default (verified live 2026-07-25) — ONE shape for the mint
 # cases and the predicate cases below.
@@ -908,7 +908,7 @@ class TestDefaultRowIdentity:
         ) == spool_tagless.DefaultRowIdentity(None, None)
 
 
-# --- W1: bare-tray spent-binding guard -------------------------------------
+# --- Bare-tray spent-binding guard -----------------------------------------
 
 
 class TestBareTraySpentGuard:
@@ -947,7 +947,7 @@ class TestBareTraySpentGuard:
         assert (printer.id, 0, 0) not in spool_tagless._pending_physical_cycles  # consumed
 
 
-# --- W5: fresh-roll prompt --------------------------------------------------
+# --- Fresh-roll prompt ------------------------------------------------------
 
 
 async def _seed_fresh_prompt_spool(db_session, printer_id, *, used, spent=False):
@@ -1033,8 +1033,8 @@ class TestFreshRollPrompt:
         key = (printer.id, 0, 0)
         spool_tagless._pending_physical_cycles.add(key)
         await spool_tagless._maybe_prompt_fresh_roll(db_session, printer.id, 0, 0)
-        env.ws.assert_not_awaited()  # spent -> silent (the W1 spent->mint transition owns it)
-        assert key in spool_tagless._pending_physical_cycles  # left for W1
+        env.ws.assert_not_awaited()  # spent -> silent (the spent->mint transition owns it)
+        assert key in spool_tagless._pending_physical_cycles  # left for the spent->mint transition
 
     async def test_sub_threshold_pops_no_prompt(self, db_session, printer_factory, env, seated):
         printer = await printer_factory()
@@ -1131,7 +1131,7 @@ class TestNotePhysicalCycle:
         await _seed_fresh_prompt_spool(db_session, printer.id, used=700, spent=True)
         await spool_tagless.note_physical_cycle(printer.id, 0, 0)
         env.ws.assert_not_awaited()  # spent -> silent
-        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # left for the W1 transition
+        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # left for the transition
 
     async def test_records_pending_unbound_leaves_it_for_the_pipeline(self, db_session, printer_factory, env, sessions):
         """2026-08-19 (shape 32, layer 2): an UNBOUND slot no longer discards here.
@@ -1198,7 +1198,7 @@ class TestTaglessReplay:
         await self._stamp(db_session, sid)
         spool = await db_session.get(Spool, sid)
         if invalidate == "spent":
-            spool.spent_at = datetime.utcnow()  # W1 owns it silently, no prompt
+            spool.spent_at = datetime.utcnow()  # the spent latch owns it silently, no prompt
         elif invalidate == "archived":
             spool.archived_at = datetime.utcnow()
         elif invalidate == "tagged":
@@ -1600,7 +1600,7 @@ class TestMidPrintIsNotGated:
         the slot NOW so the roll joins the firmware backup pool and the print can resume;
         deferring a recoverable state to a human is doctrine rule 1's whole prohibition.
 
-        Gain age 8 s clears the pre-existing F1 mint settle (5 s, untouched by this wave)
+        Gain age 8 s clears the pre-existing mint settle (5 s)
         and sits deep INSIDE the 30 s config-settle window — so this pins the carve-out
         and nothing else."""
         printer = await printer_factory()
@@ -1656,7 +1656,7 @@ class TestMidPrintIsNotGated:
 
 
 def test_marker_machinery_removed():
-    """W1: the stale-config marker machinery is deleted outright - every symbol gone."""
+    """The stale-config marker machinery is deleted outright - every symbol gone."""
     for name in (
         "record_stale_marker",
         "record_stale_marker_for_spool",
@@ -1687,7 +1687,7 @@ class TestLoadedAtStamp:
         assert spool.loaded_at is not None
 
 
-# --- W1: the spent latch is decided by the RUNOUT, not by the row's origin ---
+# --- The spent latch is decided by the RUNOUT, not by the row's origin -------
 
 
 class TestBareTraySpentGuardOutranksTheOriginVeto:
@@ -1768,7 +1768,7 @@ class TestBareTraySpentGuardOutranksTheOriginVeto:
         assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # not consumed either
 
 
-# --- W1: a SPENT binding's release SIGNAL survives any tag-ness ---------------
+# --- A SPENT binding's release SIGNAL survives any tag-ness -------------------
 
 
 class TestSpentCycleSurvivesAnyTagness:
@@ -1818,7 +1818,7 @@ class TestSpentCycleSurvivesAnyTagness:
 
         await spool_tagless.note_physical_cycle(printer.id, 0, 0)
 
-        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # left for W1
+        assert (printer.id, 0, 0) in spool_tagless._pending_physical_cycles  # left for the spent->mint transition
         env.ws.assert_not_awaited()  # spent -> silent, never a fresh-roll prompt
 
     async def test_non_spent_tagged_row_discards_the_cycle(self, db_session, printer_factory, env, sessions, seated):

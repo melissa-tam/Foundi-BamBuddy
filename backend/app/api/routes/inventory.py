@@ -1270,7 +1270,7 @@ async def dismiss_respool_prompt(
 
 
 class FreshRollDismissRequest(BaseModel):
-    """Body for ``POST /inventory/spools/{id}/fresh-roll-dismiss`` (W5).
+    """Body for ``POST /inventory/spools/{id}/fresh-roll-dismiss``.
 
     The operator's "Same roll" answer to the tagless fresh-roll prompt. The slot
     triple is required — it is echoed on the dismissal broadcast so every open
@@ -1289,7 +1289,7 @@ async def dismiss_fresh_roll_prompt(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
 ):
-    """Answer the W5 tagless fresh-roll prompt with "Same roll".
+    """Answer the tagless fresh-roll prompt with "Same roll".
 
     NULLs the row's ``fresh_prompt_pending_at`` stamp and broadcasts
     ``tagless_fresh_prompt_dismissed`` so open clients drop the toast. NO permanent
@@ -1966,7 +1966,7 @@ async def assign_spool(
         }
     )
 
-    # W6.3: release low-spool staged units immediately on a manual assign,
+    # Release low-spool staged units immediately on a manual assign,
     # without waiting for the printer's MQTT echo. A manual assign changes the
     # deficit via the new DB assignment WITHOUT changing any tray field, so the
     # tray-signature-debounced `maybe_release_on_ams_change` would no-op — call
@@ -2239,7 +2239,7 @@ async def sync_weights_from_ams(
     Overwrites the database weight_used for every assigned spool using the
     current AMS remain% from connected printers.  This is a manual recovery
     tool — it bypasses the normal "only increase" guard, but NOT the three
-    guards that keep it from destroying data (W4, 2026-08-02):
+    guards that keep it from destroying data (2026-08-02):
 
     * **Presence** — a slot whose live tray reads the cleared-tray shape
       (``tray_presence`` ``is False``) is skipped. Its binding is a stale

@@ -1,4 +1,4 @@
-"""REST API for the printer model-geometry registry (Phase 2).
+"""REST API for the printer model-geometry registry.
 
 Makes the eject bed/envelope DB-config (red line #3): geometry that used to be
 two in-code dicts is now editable per model without a code change, and the

@@ -791,7 +791,7 @@ async def test_donor_falls_back_to_the_archive_copy_when_the_library_bytes_are_g
 async def test_a_file_less_archive_row_is_never_offered_as_a_donor(db_session, printer_factory, tmp_path, monkeypatch):
     """``base_dir / ""`` is the base DIRECTORY, and ``exists()`` says yes to it.
 
-    The no-3MF archive row this whole wave is about carries exactly that empty
+    The no-3MF archive row this file is about carries exactly that empty
     ``file_path``, so an ``exists()`` check would hand the eject builder and the
     archive capture a directory to open.
     """

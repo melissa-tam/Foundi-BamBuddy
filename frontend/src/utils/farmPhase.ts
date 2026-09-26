@@ -1,5 +1,5 @@
 /**
- * Farm cooldown/eject phase derivation (Phase 4.3c).
+ * Farm cooldown/eject phase derivation.
  *
  * The loop between two units looks idle without this: the printer sits in
  * FINISH with the plate gate raised while the server-side cooldown watch waits

@@ -1,5 +1,5 @@
 /**
- * Pure derivations for the per-AMS-slot status badges/rings on PrintersPage (W6).
+ * Pure derivations for the per-AMS-slot status badges/rings on PrintersPage.
  * Kept side-effect-free and dependency-light so the branchy UI logic is unit-
  * testable in isolation (the render sites just call these and compare ids).
  */

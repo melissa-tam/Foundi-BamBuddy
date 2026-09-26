@@ -1,4 +1,4 @@
-"""WS11 — "Re-check slot": the operator's click as the farm's second identity oracle.
+"""The "Re-check slot" verb: the operator's click as the farm's second identity oracle.
 
 Doctrine rule 12 (operator-ratified 2026-08-19, incident shape 32). Rule 6 has always named
 TWO identity oracles — "an RFID tag **or a human answer**" — and only the tag was ever wired
@@ -485,8 +485,8 @@ async def test_r8_mint_raises_the_acknowledgement_and_the_undo_restores_the_prio
 async def test_an_automatic_mint_raises_no_acknowledgement(db_session, env):
     """Only a CLICK-driven mint may offer an undo.
 
-    WS1's automatic long-gap mints must stay quiet: roll changes are routine on this fleet,
-    and the 2026-08-10 wave demoted six non-actionable surfaces to log lines for exactly
+    Automatic long-gap mints must stay quiet: roll changes are routine on this fleet,
+    and six non-actionable surfaces became log lines (2026-08-10) for exactly
     that reason. The scoping is structural — ``minted_spool_id`` is only ever written by the
     re-check conclusion — so this pins that the ordinary tagless mint leaves no offer.
     """
@@ -653,7 +653,7 @@ async def test_the_offer_lookup_reads_only_the_newest_intent_per_slot(db_session
 async def test_an_operator_assign_of_a_tagged_row_is_never_unlinked_by_a_stale_no_tag_answer(db_session, env):
     """The operator hand-assigns a TAGGED roll, and a read from before it is still on file.
 
-    The 2026-08-19 wave widened ``_no_tag_answer_contradicts`` from one quadrant to all four,
+    ``_no_tag_answer_contradicts`` was widened from one quadrant to all four (2026-08-19),
     so a stale discovery stamp now reaches row 4b′ — where a TAGGED binding under a
     configured, identity-less tray is ``tagged_swap_no_tag_read``: the operator's row is
     UNLINKED and a tagless row minted over it. (The manual assign's own

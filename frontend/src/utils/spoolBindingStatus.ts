@@ -1,7 +1,6 @@
 /**
  * The ONE derivation of "a spool binding sits on a slot with no readable
- * filament in it — what should the operator be told?" (W5a/W5b; presence
- * context added 2026-08-10).
+ * filament in it — what should the operator be told?"
  *
  * Two surfaces render this state and they must agree on both the precedence
  * and the wording: the printer card's `EmptySlotHoverCard` (slot-side) and the

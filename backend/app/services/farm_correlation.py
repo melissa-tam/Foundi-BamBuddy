@@ -1,4 +1,4 @@
-"""Terminal-status → queue-item correlation for the farm loop (Phase 1, P1-A).
+"""Terminal-status → queue-item correlation for the farm loop.
 
 The terminal-status callback used to find "the finished queue item" by
 ``printer_id`` + ``status == "printing"`` alone. That silently misattributes when
@@ -779,7 +779,7 @@ def classify_stop(
 async def resolve_printing_farm_item(db: AsyncSession, printer_id: int) -> PrintQueueItem | None:
     """The FARM unit currently ``printing`` on ``printer_id``, or None.
 
-    "Farm" here is the loop's own test, unchanged since Phase 3.3: the item carries an
+    "Farm" here is the loop's own test: the item carries an
     ``eject_profile_id``, or its batch carries a ``sku_file_id``. Distinct from
     :func:`resolve_printing_item`, which asks the IDENTITY question (which unit is this
     echoed job?) — this one asks the OWNERSHIP question (is the farm loop responsible

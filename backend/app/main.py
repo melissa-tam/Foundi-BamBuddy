@@ -466,7 +466,7 @@ _PRINTER_OFFLINE_NOTIFY_DEBOUNCE_SECONDS = 60.0
 # Per-printer serialisation of AMS-driven assignment writes now lives with the writer:
 # ``slot_pipeline`` holds one asyncio lock per printer around its whole
 # read-decide-write window. The old ``_get_ams_assignment_lock`` here guarded two
-# inline phases that no longer exist (W3b cutover) — and the consumer loop below needs
+# inline phases that no longer exist (slot-pipeline cutover) — and the consumer loop below needs
 # no lock, because it only touches disjoint per-spool columns and never binds.
 #
 # The ``unknown_tag`` prompt + its per-slot dedup moved to ``slot_pipeline`` for the
@@ -882,7 +882,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 name=f"eject-pending-reconcile-{printer_id}",
             )
 
-    # Device-vs-declared model reconciliation (Phase 2). Evaluated on any connected
+    # Device-vs-declared model reconciliation. Evaluated on any connected
     # status change; acted on only at a STATE TRANSITION so the one-shot
     # notification fires once per mismatch (not every tick). An absent device
     # report (the live H2S reports no model field) ⇒ check returns None ⇒ no-op,
@@ -1116,7 +1116,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
             )
 
-        # Native plate-occupancy capture (Phase 3.3). The H2-series pre-print plate
+        # Native plate-occupancy capture. The H2-series pre-print plate
         # check surfaces as an HMS code and PAUSEs the job on the printer. The reaction
         # is the pause-recovery lane's: it records a ``job_pause`` hold (the chip, the
         # unit's waiting reason, one page in the printer's own words) and sends NOTHING —
@@ -1193,12 +1193,12 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     except Exception as _bse:  # noqa: BLE001 — sampling must never crash the status flow
         logging.getLogger(__name__).warning("[RESPOOL] backup-swap sampler failed for printer %s: %s", printer_id, _bse)
 
-    # AMS-incident wire sampler (WS2b). Sync, in-memory and session-free like the
+    # AMS-incident wire sampler. Sync, in-memory and session-free like the
     # backup-swap sampler above, and OUTSIDE the "HMS present" branch on purpose: the
     # two edges it watches are the DISAPPEARANCE of a fault (the firmware stopped
     # demanding filament) and the printer running again — both of which are pushes
     # where hms may be empty. It owns the refill auto-resume's second spawn source
-    # and the close that ends a hold whoever resumed the printer, which before WS2b
+    # and the close that ends a hold whoever resumed the printer, which before the incident store
     # only the farm's own auto-resume could do (a screen resume left the unit holding
     # "filament_runout_recovery_failed" forever).
     try:
@@ -1356,7 +1356,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         from backend.app.services.spool_recovery import on_ams_fault, owned_short_codes
 
         # Codes an AMS INCIDENT speaks for, derived from ALL live HMS entries through
-        # the WS2a taxonomy — not from ``new_error_codes``. That decoupling is the WS2b
+        # the fault taxonomy — not from ``new_error_codes``. That decoupling is the
         # fix for the silent class: a code standing at restart (seed_standing marks it
         # already-seen) or flapping inside the 600 s re-notify window never entered
         # ``new_error_codes``, so the old spawn never fired and never logged — 9 runout
@@ -1671,7 +1671,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
     except Exception as e:
         logger.warning("Failed to broadcast AMS change for printer %s: %s", printer_id, e)
 
-    # ---- LEDGER / WIRE CONSUMERS (W3b) -------------------------------------
+    # ---- LEDGER / WIRE CONSUMERS -------------------------------------------
     #
     # Identity and binding are decided in exactly ONE place: ``slot_pipeline``, fed by
     # the RAW pre-merge push (``printer_manager.on_ams_push_raw``). What runs here READS
@@ -1850,7 +1850,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
                                     existing_assignment.spool.weight_used = new_used
                                     await db.commit()
 
-                        # DECREASE lane (W6) — the increase-only sync above cannot
+                        # DECREASE lane — the increase-only sync above cannot
                         # heal a ledger that over-counts, so a tagged row whose WIRE
                         # remain contradicts it stays wrong forever (prod spool 37:
                         # 899 g used against a wire-full roll, grams misattributed
@@ -2135,7 +2135,7 @@ async def on_ams_change(printer_id: int, ams_data: list):
     except Exception as e:
         logging.getLogger(__name__).error("Spoolman AMS sync failed for printer %s: %s", printer_id, e)
 
-    # Farm low-spool staging release (Phase 4.2): a tray change (spool swap /
+    # Farm low-spool staging release: a tray change (spool swap /
     # refill) re-checks system-staged items targeting this printer. Debounced by
     # a tray-signature hash inside farm_staging; guarded — the AMS path must
     # never break on a farm-side failure.
@@ -2391,7 +2391,7 @@ async def on_print_start(printer_id: int, data: dict):
     _start_subtask_id = str(_start_subtask_id).strip() if _start_subtask_id is not None else None
     if _start_subtask_id in ("", "0"):
         _start_subtask_id = None
-    # Name evidence (W1): an eject-named start is our sweep even with an empty/lost
+    # Name evidence: an eject-named start is our sweep even with an empty/lost
     # registry — never archive/notify it. OR'd with the registry match so a live
     # dispatch (name not yet echoed) is still caught by the id path.
     _start_eject_name = data.get("subtask_name") or data.get("filename")
@@ -3681,7 +3681,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # would find zero printing units and log a false-FOREIGN warning for the farm's
     # own job (11× per production run, live 2026-07-20), and the archive lookup can
     # never resolve a sweep ("Could not find archive for print complete"). Registry
-    # match (id / name) OR name evidence (W1: an eject-named terminal is ours even
+    # match (id / name) OR name evidence (an eject-named terminal is ours even
     # when a restart lost the registry). Everything downstream that must treat an
     # eject specially — the no-deposit-rewrite exemption, the never-gate branch, the
     # notification suppression, farm_policy.on_terminal finalisation — keys on THIS
@@ -3700,7 +3700,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             _raw_status,
         )
 
-    # Close the incidents this terminal answers (WS2b, extended 2026-09-17). A JOB hold
+    # Close the incidents this terminal answers (extended 2026-09-17). A JOB hold
     # cannot outlive the job; an EQUIPMENT fault can — and since 011-H2S a ``repair``
     # hold IS answered by the job the fault interrupted reaching ``completed``, because
     # that means filament fed through the repaired path to the end of that print.
@@ -3711,8 +3711,8 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # word, captured before any reading of it. And it runs AFTER the classification
     # inputs above were captured — this is the closer that empties them.
     #
-    # The farm unit's own waiting_reason hygiene stays farm_policy.on_terminal's job
-    # (W4b), so the two never fight over one row.
+    # The farm unit's own waiting_reason hygiene stays farm_policy.on_terminal's job,
+    # so the two never fight over one row.
     try:
         from backend.app.services.incident_resolution import TerminalEvent
         from backend.app.services.spool_recovery import on_job_terminal
@@ -3724,7 +3724,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
         logger.warning("[SPOOL-RECOVERY] incident close failed on print complete for printer %s: %s", printer_id, _ite)
 
-    # Terminal-status correlation (Phase 1, P1-A). Resolve WHICH queue item this
+    # Terminal-status correlation. Resolve WHICH queue item this
     # finish belongs to ONCE, up front, and thread the verdict to BOTH the plate-
     # clear gate below and the queue-status update later. The old printer_id-only
     # lookup pinned a foreign/local print's FINISH onto whatever farm unit was
@@ -3754,7 +3754,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
         )
 
         if _is_eject_job:
-            # W5: skip the correlation read entirely for our own sweep — it has no
+            # Skip the correlation read entirely for our own sweep — it has no
             # queue item to bind and resolve_terminal_item would log a false FOREIGN
             # warning. Short-circuit to the 'eject' sentinel: deliberately NOT in
             # ATTRIBUTED_VERDICTS / AUTO_CLEAR_VERDICTS and NOT 'foreign', so
@@ -3819,7 +3819,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # ungated plates, six units recorded cancelled though they completed).
     from backend.app.services.plate_occupancy import DepositEvidence, plate_occupancy
 
-    # W6.4: auto RFID re-read sweep at the PRINT terminal so a mid-print AMS
+    # Auto RFID re-read sweep at the PRINT terminal so a mid-print AMS
     # refill (the firmware does not auto-read spools inserted during a print) is
     # recognized within seconds with zero operator clicks. Skipped for eject-job
     # terminals — each unit cycle sweeps once at the print terminal, not again at
@@ -3835,7 +3835,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             logger.warning("AMS terminal re-read sweep failed to schedule for printer %s: %s", printer_id, _swe)
 
         # The terminal-time slot-IDENTITY reconcile that used to run here
-        # (``spool_tagless.reconcile_bound_slot_identities``) is gone at the W3b cutover.
+        # (``spool_tagless.reconcile_bound_slot_identities``) is gone at the slot-pipeline cutover.
         # Its intent — a bound slot whose live identity has drifted gets re-decided while
         # the printer is idle — is now the pipeline's: the sweep above produces the FULL
         # RFID reads its DEFERs are waiting for, and the next raw push re-runs the whole
@@ -4104,7 +4104,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
 
         async def _update_queue_status(db):
             nonlocal queue_item_id, queue_status, queue_auto_off
-            # Terminal correlation (Phase 1): only touch the queue item the finish was
+            # Terminal correlation: only touch the queue item the finish was
             # positively attributed to (matched / matched_by_name / fallback). A
             # foreign/none verdict updates NOTHING — a print Bambuddy did not dispatch
             # never marks a farm unit done; that unit stays 'printing' and is re-
@@ -5783,7 +5783,7 @@ async def lifespan(app: FastAPI):
     await plate_occupancy_store.hydrate()
     await printer_manager.load_quarantine_from_db()
 
-    # Plate-gate startup hygiene (Phase 1, P1-B): the plate gate now blocks dispatch
+    # Plate-gate startup hygiene: the plate gate now blocks dispatch
     # unconditionally. If the global require_plate_clear toggle is OFF, a historic
     # gate left on a NON-farm printer would strand it forever. Clear those stale
     # gates once at startup; a printer that farm work targets keeps its gate (the
@@ -5849,7 +5849,7 @@ async def lifespan(app: FastAPI):
     except Exception as _hpe:  # noqa: BLE001 — hygiene must never block startup
         logging.getLogger(__name__).warning("HMS vocabulary prune failed: %s", _hpe)
 
-    # AMS incidents (WS2b): reconcile holds left open by the restart, then rehydrate
+    # AMS incidents: reconcile holds left open by the restart, then rehydrate
     # the printer-card projection. A printer now running was resumed while we were
     # down (close it — a stale open row would block every future incident there); one
     # still PAUSEd keeps its hold and its hourly reminder. Fully self-guarded.

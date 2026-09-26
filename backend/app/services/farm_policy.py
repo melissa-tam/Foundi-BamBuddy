@@ -1,4 +1,4 @@
-"""Farm first-article + failure/quarantine policy (Phase 3).
+"""Farm first-article + failure/quarantine policy.
 
 Every run-lifecycle reaction to a terminal print status lives here so main.py
 keeps a *single* hook call (``on_terminal``) and no farm logic leaks into the
@@ -272,9 +272,9 @@ async def on_terminal(
     ``completed_subtask_id`` / ``completed_subtask_name`` are the terminal payload's
     subtask id + name, used to confirm that a terminal is really the server-dispatched
     eject job Bambuddy started before consuming the pending eject — a foreign terminal
-    must not finalise / clear someone else's plate (Phase 1). After a restart the id
+    must not finalise / clear someone else's plate. After a restart the id
     check turns lenient (the client's ``last_dispatch_subtask_id`` is gone), so the
-    name check re-establishes positive identity for a HYDRATED pending (W1/R2).
+    name check re-establishes positive identity for a HYDRATED pending.
 
     ``hms_errors`` is the terminal payload's live HMS list (the same one
     ``main.on_print_complete`` writes ``error_message`` from). It is the printer's own
@@ -564,7 +564,7 @@ async def on_unit_terminal(
         if batch is None or batch.sku_file_id is None:
             return  # non-farm batch — leave it alone
 
-        # Terminal-transition hygiene (W4b): a farm unit reaching a terminal status
+        # Terminal-transition hygiene: a farm unit reaching a terminal status
         # must not keep a stale hold token. The 2026-07-20 incident left completed/
         # cancelled rows flagged spool_jam_recovery_failed / printer_offline_stalled /
         # print_paused_stalled forever. The unit's END writers (``queue_transitions``)
@@ -594,7 +594,7 @@ async def on_unit_terminal(
         elif final_status == "cancelled":
             # A farm unit that ended WITHOUT producing its plate and without failing.
             # NOT a failure: no retry, no quarantine contribution — a visible hold +
-            # notification, and RESUME tops the deficit back up (Phase 3.1).
+            # notification, and RESUME tops the deficit back up.
             #
             # An attributed stop (`operator_ui` / `operator_screen`) is the ordinary
             # case. A `cancelled` with NO ``stop_source`` takes the SAME disposition
@@ -748,7 +748,7 @@ async def _on_item_failed(db: AsyncSession, batch: PrintBatch, item: PrintQueueI
 
 
 async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
-    """A farm unit ended without its plate and without failing (Phase 3.1).
+    """A farm unit ended without its plate and without failing.
 
     Called from :func:`on_terminal` for EVERY farm item that lands terminal
     ``cancelled`` — the operator's stop (``stop_source`` set) and, since 2026-09-19,
@@ -1187,7 +1187,7 @@ async def _maybe_pause_run_no_printers(db: AsyncSession, batch: PrintBatch) -> N
         return
 
     batch.status = "paused"
-    # Machine-readable hold reason (Phase 4.1): the run card must distinguish this
+    # Machine-readable hold reason: the run card must distinguish this
     # auto-pause from a manual one. Cleared on resume (transition_run).
     batch.pause_reason = "no_available_printers"
     await db.commit()
@@ -1228,7 +1228,7 @@ async def _maybe_pause_run_exhausted(db: AsyncSession, batch: PrintBatch) -> Non
         return
 
     batch.status = "paused"
-    # Machine-readable hold reason (Phase 1): distinguishes retry-exhaustion from the
+    # Machine-readable hold reason: distinguishes retry-exhaustion from the
     # other auto-pauses on the run card. Cleared on resume (transition_run).
     batch.pause_reason = "retries_exhausted"
     await db.commit()
@@ -1379,7 +1379,7 @@ async def approve_first_article(db: AsyncSession, run_id: int, eject_remotely: b
         printer_name = printer.name if printer is not None else None
     run = await _load_run(db, run_id)
     await create_remaining_plates(db, run)
-    # Close the loop on the on_first_article_pending alert (Phase 6): the plates
+    # Close the loop on the on_first_article_pending alert: the plates
     # are released. Reload so sku_file/sku are fresh, then read the identity args
     # before on_first_article_approved's internal commit expires the row.
     run = await _load_run(db, run_id)
@@ -1405,7 +1405,7 @@ async def reject_first_article(db: AsyncSession, run_id: int, reason: str) -> Pr
     run.first_article_state = "rejected"
     run.first_article_reject_reason = reason
     run.status = "paused"
-    # Machine-readable hold reason (Phase 4.1); cleared on resume (which
+    # Machine-readable hold reason; cleared on resume (which
     # re-dispatches a fresh first article).
     run.pause_reason = "first_article_rejected"
     await db.commit()
@@ -1431,7 +1431,7 @@ async def _finalize_remote_eject(db: AsyncSession, run_id: int, printer_id: int)
     printer_name = printer.name if printer is not None else None
     run = await _load_run(db, run_id)
     await create_remaining_plates(db, run)
-    # Same loop-closing notification as the physical-approve path (Phase 6).
+    # Same loop-closing notification as the physical-approve path.
     run = await _load_run(db, run_id)
     await notification_service.on_first_article_approved(
         run.name, _sku_code(run), printer_name, db, printer_id=printer_id

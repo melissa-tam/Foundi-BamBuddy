@@ -1,4 +1,4 @@
-"""Offline-stall watch tests (Phase 3.2).
+"""Offline-stall watch tests.
 
 ``check_stalled_prints`` flags a farm unit still ``printing`` whose printer has
 been offline past the grace window — a one-shot ``on_print_stalled`` notification
@@ -406,7 +406,7 @@ async def _add_paused_held(db, printer_id, reason, pos=1):
 
 
 async def _add_incident_held(db, printer_id, kind, *, pos=1, slot_global_tray=None, item=True, code=None):
-    """A printer held by an ESCALATED AMS incident (WS2b).
+    """A printer held by an ESCALATED AMS incident.
 
     The AMS holds (jam / runout / physical) are reminded from their INCIDENT, not
     from a queue token: an incident is a fact about the PRINTER, so a FOREIGN print's
@@ -434,7 +434,7 @@ async def _add_incident_held(db, printer_id, kind, *, pos=1, slot_global_tray=No
 
 
 class TestAttentionReminders:
-    """W3: an unresolved escalated hold on a still-PAUSEd printer re-fires its OWN
+    """An unresolved escalated hold on a still-PAUSEd printer re-fires its OWN
     notification once per window until a human clears it (the 2026-07-20 5-hour
     single-alert incident). First reminder lands ONE window after first-seen."""
 
@@ -529,7 +529,7 @@ class TestAttentionReminders:
             assert mock_n.await_args.kwargs["kind"] == "runout"
 
     async def test_a_foreign_print_hold_reminds_too(self, db_session):
-        """The WS2b reason the reminder moved off queue tokens: a print the farm did
+        """Why the reminder moved off queue tokens: a print the farm did
         not dispatch has NO unit to carry one, so a foreign hold nagged nobody."""
         await _add_incident_held(db_session, 11, "runout", item=False)
         mgr = _FakeManager({11: True}, {11: _FakeState("PAUSE")})
@@ -563,7 +563,7 @@ class TestAttentionReminders:
         """The LAST token-driven reminder went with the incident route (2026-09-04).
 
         A token can only exist for a farm unit, so the token lane could never nag about
-        a foreign print left holding — the same blind spot WS2b removed for the AMS
+        a foreign print left holding — the same blind spot the incident store removed for the AMS
         kinds. The plate-vision nag now comes from the incident (below), which is what
         gives it foreign-print parity."""
         await _add_paused_held(db_session, 9, "plate_not_empty_printer_detected")
@@ -591,7 +591,7 @@ class TestAttentionReminders:
 
     async def test_reason_set_membership_pinned(self):
         # async only to satisfy the module-level asyncio mark; no awaits needed.
-        # WS2b moved the AMS holds OUT of the token lane; 2026-09-04 moved the last one
+        # 2026-08-09 moved the AMS holds OUT of the token lane; 2026-09-04 moved the last one
         # (plate vision) with them, when the plate check became an incident kind. What
         # remains is the generic pause-stall pager — the catch-all for a PAUSE nobody
         # claimed, which by definition has no incident to read.
@@ -738,7 +738,7 @@ class TestRunoutReminderNamesTheLiveSlot:
 
 
 class TestForeignPausedPrinters:
-    """WS2b: the R1 minimum for a print the farm did NOT dispatch.
+    """The R1 minimum for a print the farm did NOT dispatch.
 
     Every other watch in this module starts from a ``printing`` farm queue item, so a
     LAN print, a screen restart or a USB re-run that PAUSEs — a vision trip, a

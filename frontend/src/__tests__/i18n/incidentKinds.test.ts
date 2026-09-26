@@ -22,7 +22,7 @@ const INCIDENT_KINDS: Record<PrinterIncidentKind, true> = {
   jam: true,
   runout: true,
   physical: true,
-  // The 2026-09-04 pause-recovery wave's three pause causes.
+  // The three pause-recovery causes.
   power_loss: true,
   plate_vision: true,
   z_reference_lost: true,

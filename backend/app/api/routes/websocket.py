@@ -121,7 +121,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = Query(def
         except Exception:  # noqa: BLE001 — reconnect must never break on the replay hook
             logger.warning("respool_prompt reconnect re-broadcast failed", exc_info=True)
 
-        # Replay any unresolved tagless fresh-roll prompts too (W5). Same fire-once
+        # Replay any unresolved tagless fresh-roll prompts too. Same fire-once
         # gap as the respool prompt above; the service re-validates each unanswered
         # slot against live + durable state before re-sending. Fully guarded.
         try:

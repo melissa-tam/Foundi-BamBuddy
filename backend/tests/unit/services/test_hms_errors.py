@@ -622,10 +622,10 @@ _SWAP_8010_MODULES = (
     "12FF",
 )
 
-# The mechanical-feed class. Since the 2026-08-09 operator-ratified partition (WS2b)
-# this IS the jam-swap machine's trigger vocabulary — the WS2a ``legacy_swap`` marker
+# The mechanical-feed class. Since the 2026-08-09 operator-ratified partition
+# this IS the jam-swap machine's trigger vocabulary — the ``legacy_swap`` marker
 # that held the machine at the 8010/801E subset was scaffolding for a
-# behavior-neutral relocation and was deleted by the consumer wave that widened it.
+# behavior-neutral relocation and was deleted by the change that widened it.
 # The EXTERNAL spool holder's module prefixes. BOTH sides since 2026-08-11: 07FF is
 # the main/right holder and 07FE the second one dual-nozzle hardware carries, and the
 # catalog gives 07FE the same sentences naming the left extruder.
@@ -847,8 +847,8 @@ class TestAmsFaultTaxonomyShortLane:
     def test_the_send_out_families_are_swap_triggers(self):
         """The 2026-08-09 operator-ratified widening: these classify mechanical_feed
         AND the swap machine acts on them. The ``legacy_swap`` marker that held them
-        out during WS2a is deleted — a "do not act on this classification yet" flag
-        must not outlive the wave that acts on it."""
+        out is deleted — a "do not act on this classification yet" flag
+        must not outlive the change that acts on it."""
         from backend.app.services import hms_errors
         from backend.app.services.hms_errors import classify_short_code, mechanical_feed_short_codes
 

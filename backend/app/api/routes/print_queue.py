@@ -215,7 +215,7 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
         # Batch grouping
         "batch_id": item.batch_id,
         "batch_name": item.batch.name if item.batch else None,
-        # Farm run identity (Phase 4.3g): a batch with sku_file_id IS a
+        # Farm run identity: a batch with sku_file_id IS a
         # production run; derived, no column. Drives the queue "Run" badge/link
         # and the farm-aware destructive confirms.
         "production_run_id": item.batch_id if (item.batch and item.batch.sku_file_id is not None) else None,
@@ -603,7 +603,7 @@ async def add_to_queue(
 
     ams_mapping_json = json.dumps(data.ams_mapping) if data.ams_mapping else None
     # Position allocation + row construction is shared with the production-run
-    # creator via services.queue_builder so the two never drift (#Phase2).
+    # creator via services.queue_builder so the two never drift.
     items = await create_queue_items(
         db,
         count=quantity,
@@ -1193,7 +1193,7 @@ async def release_staged_items(
 ):
     """Re-check system-staged (low-spool) queue items and release the resolved ones.
 
-    Thin wrapper over ``farm_staging.release_filament_staged`` (Phase 4.2): every
+    Thin wrapper over ``farm_staging.release_filament_staged``: every
     pending item flagged ``manual_start`` + ``filament_short`` gets its filament
     deficit recomputed against live spool state; items whose deficit cleared are
     un-staged so the next scheduler tick dispatches them. Items still short stay
@@ -1264,7 +1264,7 @@ async def resume_queue_after_failure(
     for failed_item in to_ack:
         failed_item.gate_acknowledged = True
 
-    # Machine code first (Phase 4.3f); the English error_message match keeps
+    # Machine code first; the English error_message match keeps
     # items skipped by builds before waiting_reason was stamped restorable.
     restore_result = await db.execute(
         select(PrintQueueItem)
@@ -1398,7 +1398,7 @@ async def stop_queue_item(
     # NULLs any stale hold token in the same statement: a terminal unit must not keep a
     # spool_jam_recovery_failed / print_paused_stalled reason.
     #
-    # Root-cause fix (W4b): this route ends the item HERE, so by the time the MQTT terminal
+    # Root-cause fix: this route ends the item HERE, so by the time the MQTT terminal
     # callback arrives the item is no longer 'printing' — the stop_source is stamped in the
     # SAME transition (prod item 219 landed 'cancelled' with stop_source NULL). This IS the
     # queue-UI stop, i.e. classify_stop's 'operator_ui' verdict. The printer's terminal still

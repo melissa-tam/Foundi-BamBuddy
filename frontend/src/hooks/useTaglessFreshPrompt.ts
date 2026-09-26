@@ -15,7 +15,7 @@ import {
 } from './useSlotPrompt';
 
 /**
- * Fresh-roll prompting for tagless (non-RFID) slots, one entry per AMS slot (W5).
+ * Fresh-roll prompting for tagless (non-RFID) slots, one entry per AMS slot.
  *
  * A tagless roll consumed past half its label weight (after a qualified physical
  * cycle) can't be told apart from a swapped-in fresh roll by RFID remain — there

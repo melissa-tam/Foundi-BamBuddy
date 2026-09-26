@@ -1,5 +1,5 @@
 /**
- * Printer model-geometry registry types (farm eject, Phase 2).
+ * Printer model-geometry registry types (farm eject).
  *
  * The backend owns the geometry registry (bed size, travel envelope, part
  * height ceiling, hardware-validation flag per printer model); the frontend

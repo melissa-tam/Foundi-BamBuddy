@@ -174,7 +174,7 @@ def ended_payload(state: PrinterState, archive: PrintArchive) -> dict:
     """The terminal an ``ended`` verdict synthesises — the payload the MQTT client would have sent.
 
     FINISH / FAILED of THIS job is real evidence of the outcome, so the TRUE status rides with
-    the live progress and layer (Phase 3.4) and the one normal terminal path runs on it (the gate,
+    the live progress and layer and the one normal terminal path runs on it (the gate,
     the identity cooldown watch, the farm policy). The job's consumption evidence rides with it in
     the MQTT terminal's own key set (``bambu_mqtt.job_consumption_evidence``): the verdict is
     ``ended`` only when the live job id is the archive's, so the live state IS this job's record —

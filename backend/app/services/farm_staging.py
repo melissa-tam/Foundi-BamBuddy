@@ -1,4 +1,4 @@
-"""Low-spool staging release (Phase 4.2).
+"""Low-spool staging release.
 
 The dispatch scheduler's filament-deficit pre-flight (#1496) silently promotes
 an item to ``manual_start=True`` + ``filament_short=True`` when the assigned

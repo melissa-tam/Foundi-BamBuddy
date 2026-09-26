@@ -1,5 +1,5 @@
 /**
- * Phase 1 (P1-B): the clear-plate affordance must appear whenever a printer's
+ * The clear-plate affordance must appear whenever a printer's
  * awaiting_plate_clear flag is set — even when the global require_plate_clear
  * convenience toggle is OFF. The plate gate now blocks dispatch unconditionally,
  * so the operator always needs the recovery control when the gate is raised.

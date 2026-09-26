@@ -78,7 +78,7 @@ class NotificationProviderBase(BaseModel):
     on_queue_job_failed: bool = Field(default=True, description="Notify when job fails to start")
     on_queue_completed: bool = Field(default=False, description="Notify when all queue jobs finish")
 
-    # Event triggers - Farm production (Phase 3)
+    # Event triggers - Farm production
     on_first_article_pending: bool = Field(default=True, description="Notify when a first article awaits approval")
     on_printer_quarantined: bool = Field(default=True, description="Notify when a printer is quarantined")
     on_run_paused: bool = Field(default=True, description="Notify when a production run is paused")
@@ -99,7 +99,7 @@ class NotificationProviderBase(BaseModel):
         default=True, description="Notify when a printer's USB fills up and the farm runs auto-cleanup"
     )
 
-    # Event triggers - Farm production (Phase 6: manual/lifecycle events)
+    # Event triggers - Farm production (manual/lifecycle events)
     on_run_aborted: bool = Field(default=True, description="Notify when a production run is aborted by the operator")
     on_run_resumed: bool = Field(default=False, description="Notify when a paused production run is resumed")
     on_first_article_approved: bool = Field(default=True, description="Notify when a run's first article is approved")
@@ -188,7 +188,7 @@ class NotificationProviderUpdate(BaseModel):
     on_queue_job_failed: bool | None = None
     on_queue_completed: bool | None = None
 
-    # Event triggers - Farm production (Phase 3)
+    # Event triggers - Farm production
     on_first_article_pending: bool | None = None
     on_printer_quarantined: bool | None = None
     on_run_paused: bool | None = None
@@ -199,7 +199,7 @@ class NotificationProviderUpdate(BaseModel):
     on_print_stalled: bool | None = None
     on_storage_low: bool | None = None
 
-    # Event triggers - Farm production (Phase 6: manual/lifecycle events)
+    # Event triggers - Farm production (manual/lifecycle events)
     on_run_aborted: bool | None = None
     on_run_resumed: bool | None = None
     on_first_article_approved: bool | None = None

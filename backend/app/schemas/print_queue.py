@@ -230,7 +230,7 @@ class PrintQueueItemResponse(BaseModel):
     # Batch grouping
     batch_id: int | None = None
     batch_name: str | None = None
-    # Farm run identity (Phase 4.3g): set (= batch_id) when the item's batch is a
+    # Farm run identity: set (= batch_id) when the item's batch is a
     # production run (batch.sku_file_id non-null). Derived in the route — no
     # column. Null for plain batches and standalone items.
     production_run_id: int | None = None

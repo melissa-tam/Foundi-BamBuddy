@@ -102,7 +102,7 @@ class NotificationProvider(Base):
     on_queue_job_failed = Column(Boolean, default=True)  # Job failed to start
     on_queue_completed = Column(Boolean, default=False)  # All pending jobs finished
 
-    # Event triggers - Farm production (Phase 3)
+    # Event triggers - Farm production
     on_first_article_pending = Column(Boolean, default=True)  # First article printed, awaiting approval
     on_printer_quarantined = Column(Boolean, default=True)  # Printer quarantined after consecutive failures
     on_run_paused = Column(Boolean, default=True)  # Production run paused (reject / no printers)
@@ -157,7 +157,7 @@ class NotificationProvider(Base):
         Boolean, default=True
     )  # Post-print eject cooldown running long (bed still above threshold past the escalation window)
 
-    # Event triggers - Farm production (Phase 6: manual/lifecycle events)
+    # Event triggers - Farm production (manual/lifecycle events)
     on_run_aborted = Column(Boolean, default=True)  # Production run aborted by the operator (destructive)
     on_run_resumed = Column(Boolean, default=False)  # Paused production run resumed by the operator (informational)
     on_first_article_approved = Column(Boolean, default=True)  # First article approved (physical or remote eject)

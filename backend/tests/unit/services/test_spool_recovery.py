@@ -468,7 +468,7 @@ def _repause_after_running(times=1, *, hms=None):
 
     THE RE-JAM SHAPE, and it is not interchangeable with ``resume_repauses``: there
     the resume never takes at all (the driver never sees RUNNING), here it takes and
-    the fault re-PAUSEs the print underneath it. The two are what WS2 separates —
+    the fault re-PAUSEs the print underneath it. The driver separates the two —
     only the second is evidence against the replacement spool. Flipping on the FIRST
     RUNNING poll would script the first shape while claiming the second, because
     ``_wire`` runs this hook BEFORE handing the state back.
@@ -1090,7 +1090,7 @@ async def test_escalation_hold_does_not_outlive_its_job(db_session, printer_fact
     """An escalated hold is scoped to its job: once that job reaches a terminal the
     incident CLOSES, and the next job on the same printer recovers normally.
 
-    Pre-WS2b this was a process-lifetime ``_escalated`` latch keyed (printer, job),
+    This used to be a process-lifetime ``_escalated`` latch keyed (printer, job),
     which never expired — finding (c): a later, different fault on the SAME job could
     never be recovered. Now the hold is an open incident and the lifecycle ends it."""
     install_settings()
@@ -1205,7 +1205,7 @@ async def test_runout_rescued_by_firmware_transient_close(db_session, printer_fa
 
 
 async def test_runout_escalates_immediately_zero_loads(db_session, printer_factory, install_settings, monkeypatch):
-    """W2: a stuck runout PAUSE escalates IMMEDIATELY with the runout token and
+    """A stuck runout PAUSE escalates IMMEDIATELY with the runout token and
     ZERO ams_change_filament (load) sends — firmware refuses cross-slot loads in the
     8011 insert-same-slot state, so the swap machine never runs. Even with an
     eligible replacement present, recovery does not try to load it."""
@@ -1253,7 +1253,7 @@ async def test_runout_escalation_detail_names_slot_refill(db_session, printer_fa
     assert "same" in failed.call_args.kwargs["detail"].lower()  # "insert into the SAME slot"
 
 
-# --- WS2b: the escalation carries the DURABLE spent stamp --------------------
+# --- The escalation carries the DURABLE spent stamp --------------------------
 #
 # The wire-edge spent lanes are re-seeded by every restart, so a hold spanning a deploy
 # would never stamp. The escalation is the durable, incident-anchored event, so it hands
@@ -1405,7 +1405,7 @@ async def test_inside_the_protected_layers_a_sub_floor_roll_is_still_reserved(
 
 
 # ===========================================================================
-# W2 presence filter: a seated-but-unsensed candidate (state 9) is excluded;
+# Presence filter: a seated-but-unsensed candidate (state 9) is excluded;
 # a None/unparseable state fails OPEN (kept).
 # ===========================================================================
 
@@ -1452,7 +1452,7 @@ async def test_state_none_candidate_kept(db_session, printer_factory, install_se
 
 
 # ===========================================================================
-# W3: every recovery load send is marked as ours (note_commanded_load) so the
+# Every recovery load send is marked as ours (note_commanded_load) so the
 # backup-swap detector can't spend the departed spool.
 # ===========================================================================
 
@@ -1491,7 +1491,7 @@ async def test_restart_clean_state_skips_unload(db_session, printer_factory, ins
     install_settings()
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
-    # No feed-fault code STANDING — which is the whole premise, and since WS2b the
+    # No feed-fault code STANDING — which is the whole premise, and the
     # entry gate derives its candidates from the live wire, so this state can only be
     # reached by an incident already in flight. Driven through the driver directly.
     state = _make_state(tray_now=255, ams_status_main=0, hms=[])
@@ -2059,7 +2059,7 @@ async def test_unload_confirms_only_after_the_ams_returns_to_idle(
     """A filament-change cycle observed going non-idle confirms only on its return
     to idle — and NO load is published while the AMS is still busy.
 
-    The round BEGINS with the AMS idle (``ams_status_main=0``) so the W1 stuck-change
+    The round BEGINS with the AMS idle (``ams_status_main=0``) so the wedge stuck-change
     reset is a no-op (a wedged AMS at round-top is now the reset's domain, covered by
     its own tests); it is the UNLOAD itself (``unload_stuck``) that drives the AMS
     non-idle here, which is exactly what ``_confirm_unloaded`` must wait out."""
@@ -2456,7 +2456,7 @@ async def test_jam_attributed_to_live_tray_when_attr_carries_no_slot(
 
 
 # ===========================================================================
-# W1: the release ladder (009-H2S 2026-07-20, 002-H2S 2026-09-11, 012-H2S 2026-09-23).
+# The wedge release ladder (009-H2S 2026-07-20, 002-H2S 2026-09-11, 012-H2S 2026-09-23).
 #
 # After a feed fault the AMS can sit mid filament-change (PAUSE + ams_status_main 1),
 # holding the PRINT's own change. A command sent into it is acknowledged and HELD, so
@@ -2493,7 +2493,7 @@ class _WedgedClient(FakeClient):
 async def test_incident_pin_resume_first_then_hung_self_pause_then_swap(
     db_session, printer_factory, install_settings, monkeypatch
 ):
-    """THE W1 LIVE-INCIDENT PIN (009-H2S 2026-07-20): PAUSE + tray_now 255 +
+    """THE WEDGE LIVE-INCIDENT PIN (009-H2S 2026-07-20): PAUSE + tray_now 255 +
     ams_status_main 1 + a standing 0700_8010. The FIRST published command is the
     reset RESUME (before any unload). The change stays hung RUNNING, so recovery
     self-PAUSEs at the reset deadline, then the normal unload → select → load →
@@ -2684,7 +2684,7 @@ async def test_incident_pin_engaged_feeder_assist_fault_skips_reset_and_swaps(
     """THE 006-H2S INCIDENT PIN (2026-07-21 04:14): an extruder-side 0300_801E feed
     fault mid-print with the feeder still ENGAGED — gcode_state PAUSE, tray_now 3,
     ams_status_main 3 (assist). There is no interrupted filament-change for a resume
-    to continue, so the W1 reset MUST be skipped: the first command on the wire is the
+    to continue, so the wedge reset MUST be skipped: the first command on the wire is the
     unload (not a resume), and the proven unload → load → resume swap machine runs —
     exactly the sequence the operator used to recover by hand. Zero human touch.
 
@@ -2776,7 +2776,7 @@ async def test_confirm_unloaded_ok_after_engaged_assist_returns_to_idle(monkeypa
 
 
 # ===========================================================================
-# W2: durable repeat-jam quarantine off the recovery_escalation ledger.
+# Durable repeat-jam quarantine off the recovery_escalation ledger.
 # ===========================================================================
 
 
@@ -2849,7 +2849,7 @@ async def test_two_escalations_outside_window_no_quarantine(db_session, printer_
 
 
 class TestQuarantineReasonAllowlist:
-    """W2 counting is an ALLOWLIST (003-H2S 2026-08-11).
+    """Counting is an ALLOWLIST (003-H2S 2026-08-11).
 
     The quarantine prints a DIAGNOSIS — "Repeated AMS jam escalations (N in 24h) —
     AMS hardware suspected (buffer/feeder)" — so only the jam machine's own
@@ -3098,7 +3098,7 @@ async def test_extruder_side_commits_the_swap_and_parks_nothing(
     order), because fresh filament often clears the immediate overload. What it must not
     do is blame a spool: neither the one that was feeding when the extruder overloaded
     nor the replacement that re-jams behind it. The driver had applied that rule to the
-    replacement since WS2 and stamped the feeding roll anyway — one fault, two opposite
+    replacement and stamped the feeding roll anyway — one fault, two opposite
     conclusions about the same evidence. Both now read `_commit_out_of_rotation`.
 
     No stamp means no page: the out-of-rotation notification fires inside the stamp.
@@ -3267,10 +3267,10 @@ async def test_will_own_false_when_the_fault_was_already_closed_as_aborted(db_se
 
 
 async def test_will_own_true_for_a_foreign_print(db_session, printer_factory):
-    """WS2b: an incident owns a foreign print's AMS fault too, so its raw per-code
+    """An incident owns a foreign print's AMS fault too, so its raw per-code
     alert is the duplicate and must still be suppressed.
 
-    This assertion is INVERTED from the pre-WS2b pin, deliberately: requiring a farm
+    This assertion INVERTS the old pin, deliberately: requiring a farm
     queue item here is exactly what left 12 foreign-print runouts spent-stamped with
     no alert, no hold and no resume."""
     printer = await printer_factory()
@@ -3486,7 +3486,7 @@ async def _runout_held_item(db, printer_id, *, subtask="task-1"):
     item = await _farm_item(db, printer_id, subtask=subtask)
     item.waiting_reason = WAITING_REASON_RUNOUT
     await db.commit()
-    # The hold itself is the durable INCIDENT since WS2b; the token on the unit is
+    # The hold itself is the durable INCIDENT; the token on the unit is
     # only its projection. Both guidance lanes and the auto-resume gate on the
     # incident, which is what lets them work for a foreign print too.
     await _seed_incident(db, printer_id, job_id=subtask, item_id=item.id)
@@ -3763,10 +3763,10 @@ async def test_assist_never_raises_on_a_broken_client(db_session, printer_factor
 # membership of the taxonomy's own views independently of its data, so a taxonomy edit
 # that would change what this machine ACTS on fails here rather than moving with it.
 #
-# WIDENED 2026-08-09 (WS2b, operator-ratified partition): the swap machine's trigger
-# vocabulary is now the WHOLE mechanical-feed class. WS2a had pinned it to the
+# WIDENED 2026-08-09 (operator-ratified partition): the swap machine's trigger
+# vocabulary is now the WHOLE mechanical-feed class. An earlier pin held it to the
 # ``legacy_swap`` subset (8010 family + 0300_801E) purely to stay behavior-neutral
-# while the taxonomy landed; this wave spends that marker, so the send-out (8005),
+# while the taxonomy landed; that marker is now spent, so the send-out (8005),
 # feed-into-extruder (8006) and feed-to-extruder (8028) families — the same physical
 # obstruction one step further along the path, and all PAUSE-raising — join it.
 
@@ -3892,7 +3892,7 @@ def test_an_attr_lane_only_feeder_stall_is_a_live_feed_fault():
 
 
 def test_the_legacy_swap_marker_is_gone():
-    """Hard cutover: the WS2a behavior pin must not survive its consumer wave."""
+    """Hard cutover: the legacy_swap behavior pin must not survive its consumer."""
     import backend.app.services.hms_errors as hms_errors
 
     assert not hasattr(hms_errors, "legacy_swap_short_codes")
@@ -3909,10 +3909,10 @@ def test_external_spool_runouts_are_not_recoverable():
 
 
 # ===========================================================================
-# WS2b — the incident lanes: foreign prints, physical faults, hold lifecycle,
+# The incident lanes: foreign prints, physical faults, hold lifecycle,
 # the widened swap set, and the two-source refill auto-resume.
 #
-# Everything below exists because the pre-WS2b machine could only be reached
+# Everything below exists because the old machine could only be reached
 # through a matching FARM queue item and only ever spawned on the NOTIFICATION
 # dedup's new-code edge. In production that meant: 12 foreign-print runouts
 # spent-stamped with no alert / no hold / no resume, 9 runout episodes that never
@@ -4153,7 +4153,7 @@ async def test_physical_fault_escalates_immediately_and_never_swaps(
     """Broken filament / a clog / a failed pull-back needs hands: no swap is
     attempted, the unit takes its own token, and the alert says so.
 
-    Before WS2b this whole class was consumed by NOTHING — those faults waited on
+    Before the incident store this whole class was consumed by NOTHING — those faults waited on
     the generic pause-stall watchdog."""
     install_settings()
     printer = await printer_factory()
@@ -4200,7 +4200,7 @@ async def test_physical_outranks_a_mechanical_sibling(db_session, printer_factor
 
 
 async def test_a_send_out_fault_now_enters_the_swap_loop(db_session, printer_factory, install_settings, monkeypatch):
-    """0700_8005 was classified mechanical_feed by WS2a and owned by NOTHING. Since
+    """0700_8005 was classified mechanical_feed by the taxonomy and owned by NOTHING. Since
     the 2026-08-09 operator-ratified partition it is a swap trigger like the 8010
     family — same physical obstruction, one step further along the path."""
     install_settings()
@@ -4645,7 +4645,7 @@ async def test_a_terminal_closes_the_hold(db_session, printer_factory, monkeypat
 async def test_demand_clearing_while_paused_resumes(db_session, printer_factory, monkeypatch, _fast_resume):
     """Spawn source 2 (NEW): the firmware stops asking for filament.
 
-    Nothing watched for this before WS2b — auto-resume rode the presence-GAIN edge
+    Nothing watched for this before the incident store — auto-resume rode the presence-GAIN edge
     alone, and in production it had never fired."""
     printer = await printer_factory()
     item = await _runout_held_item(db_session, printer.id)
@@ -5305,7 +5305,7 @@ class TestRefillReadyUnderThePowerLossPrompt:
 # this printer owned" (the DB partial unique index enforces it) and ``driver_live``
 # answers "is the machine ACTING right now". The observed-running closer only ever
 # asked the first. While a driver is in flight a RUNNING sample is an intermediate
-# reading of ITS OWN procedure — the W1 reset publishes a resume whose documented
+# reading of ITS OWN procedure — the wedge reset publishes a resume whose documented
 # outcomes include "re-faults and auto-PAUSEs after moving", and the swap round's
 # ``_resume_and_confirm`` publishes one too — so the closer freed the row from under
 # a live task, the re-PAUSE found no open incident, and a SECOND driver spawned onto
@@ -5460,7 +5460,7 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
         """THE INCIDENT PIN (17:22:31 → 17:26:58).
 
         PAUSE, ``ams_status_main == 1`` (wedged mid filament-change), tray_now 0,
-        ``0700_0021`` + ``0700_8006`` standing, a farm unit printing. The W1 reset
+        ``0700_0021`` + ``0700_8006`` standing, a farm unit printing. The wedge reset
         publishes its resume, the printer goes RUNNING for a moment and re-PAUSEs
         with the fault still standing — and the per-push sampler turns that RUNNING
         into an ``on_observed_running`` while the driver is still inside its reset
@@ -5755,9 +5755,9 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
     async def test_a_second_driver_over_a_live_one_is_logged_as_an_invariant_violation(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
     ):
-        """F4. Observability, not a gate: entry exclusivity stays the DB's partial
+        """Observability, not a gate: entry exclusivity stays the DB's partial
         unique index (the module's own design statement). But 17:23:55 produced no
-        line at all, and the 08-29 W5 lesson is that the one line naming the moment is
+        line at all, and the 2026-08-29 001-H2S lesson is that the one line naming the moment is
         what turns a 15 h triage into a grep."""
         install_settings(step_timeout_s=0.05)
         printer = await printer_factory()
@@ -5783,7 +5783,7 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
 # never sent.
 #
 # A layer-0 jam left the AMS PAUSEd mid filament-change (`ams_status_main == 1`).
-# The W1 reset published `print.resume`; the printer retried the same slot, stalled
+# The wedge reset published `print.resume`; the printer retried the same slot, stalled
 # and re-PAUSEd STILL in the change — and the reader called that "ok" without a line
 # saying the AMS never left it. The swap round's two unloads went out with nothing
 # loaded (an undecidable posture: nothing physical can move), and it escalated
@@ -5798,7 +5798,7 @@ class TestTheDriverOwnsItsOutcomeWhileItLives:
 
 
 class TestTheDriverIsBoundToItsJob:
-    """WS1: ONE takeover predicate, asked once per poll by every step."""
+    """ONE takeover predicate, asked once per poll by every step."""
 
     async def test_operator_stop_mid_unload_confirm_ends_the_driver(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
@@ -5903,7 +5903,7 @@ class TestTheDriverIsBoundToItsJob:
     async def test_the_drivers_own_verbs_are_never_a_takeover(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
     ):
-        """The regression guard the predicate needs: the W1 reset moves PAUSE→RUNNING,
+        """The regression guard the predicate needs: the wedge reset moves PAUSE→RUNNING,
         the self-pause moves RUNNING→PAUSE and the swap's repause cycle does both —
         all inside the allowed pair, so a full wedge→swap recovery logs NO takeover at
         all."""
@@ -5926,7 +5926,7 @@ class TestTheDriverIsBoundToItsJob:
 
 
 class TestTheResumeVocabulary:
-    """WS2: "the resume never took" and "the replacement re-jammed" are different
+    """Two failures: "the resume never took" and "the replacement re-jammed" are different
     statements, and only the second is evidence against a spool."""
 
     async def test_a_resume_that_never_took_keeps_the_replacement_in_rotation(
@@ -7227,7 +7227,7 @@ class TestTheConfirmWindow:
         failed.assert_not_awaited()
 
 
-# --- WS7: an AMS physical fault is an EQUIPMENT record (2026-09-11, 003-H2S) -------
+# --- An AMS physical fault is an EQUIPMENT record (2026-09-11, 003-H2S) ------------
 
 
 class TestPhysicalHoldsOutliveTheJob:
@@ -7355,7 +7355,7 @@ class TestPhysicalHoldsOutliveTheJob:
         rows = await _incident_rows(db_session, printer.id)
         assert rows[0].resolved_at is not None
         assert rows[0].resolve_source == "repair_completed"
-        # The point of the whole wave: dispatch is unblocked without a human.
+        # The point: dispatch is unblocked without a human.
         assert printer_incidents.hold_blocks_dispatch(printer.id) is False
 
     async def test_an_aborted_terminal_after_the_same_resume_keeps_it(
@@ -8800,8 +8800,8 @@ def test_every_give_up_inside_the_loop_goes_through_one_boundary():
 
 def test_no_second_slot_rendering_in_the_module():
     """One origin for the human slot name. The owner is `printer_incidents.runout_slot_desc`
-    (the incident-resolution wave moved it there, 2026-09-17), so NO f-string in this module
-    may spell a slot — three 0-indexed renderings here were the defect this wave closed."""
+    (moved there 2026-09-17), so NO f-string in this module
+    may spell a slot — three 0-indexed renderings here were the defect this pin closes."""
     module = _module_ast()
     offenders = [
         ast.unparse(n) for n in ast.walk(module) if isinstance(n, ast.JoinedStr) and "slot {" in ast.unparse(n)
@@ -8814,7 +8814,7 @@ def test_only_the_commit_verb_parks_a_spool():
     """ONE home for "an extruder-side fault never parks a spool" (006-H2S 2026-09-21,
     incident 289).
 
-    The rule is not new — the driver has applied it to the REPLACEMENT since WS2 — but
+    The rule is not new — the driver already applied it to the REPLACEMENT — but
     it lived at that one call site, so the three OTHER call sites of the stamp writer
     drew the opposite conclusion from the same fault and parked a healthy roll. A
     SOURCE pin, because a fourth direct call would be a perfectly well-formed stamp

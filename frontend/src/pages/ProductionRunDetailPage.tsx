@@ -1,5 +1,5 @@
 /**
- * Production run detail page (Phase 4.1) — answers "what is this run doing and
+ * Production run detail page — answers "what is this run doing and
  * why" at a glance: header with status + hold reason, plate progress, one
  * blocked-state chip per printer (with the live cooldown phase), the staged
  * banner, and the per-unit table (stop attribution, waiting reasons, retry
@@ -107,7 +107,7 @@ function PrinterStateChip({ state, status }: { state: RunPrinterState; status?: 
   if (state.capability_reason) reasons.push(state.capability_reason);
   if (!state.connected) reasons.push(t('productionRuns.detail.printerState.offline'));
 
-  // Cooldown/eject phase (Phase 4.3c) from the live status cache.
+  // Cooldown/eject phase from the live status cache.
   const phase = deriveFarmPhase({
     state: status?.state,
     awaiting_plate_clear: state.awaiting_plate_clear,
@@ -198,8 +198,8 @@ const OPERATOR_STOP_LABEL: StopSourceLabel = {
  * - `plate_refused` — the printer's own plate check paused the print and it
  *   ended without printing. The label names the plate check, not who pressed
  *   Stop: the lineage question is why this plate went back in the queue.
- * - `farm_vision_abort` — the farm's own stop of a plate-check trip (the
- *   2026-09-04 wave). The farm no longer stops on a trip (the print stays paused
+ * - `farm_vision_abort` — the farm's own stop of a plate-check trip.
+ *   The farm no longer stops on a trip (the print stays paused
  *   for a human), so nothing writes this token now; the row renders STORED
  *   history and stays until no unit carries it.
  * - `reconcile_unknown` — the downtime reconcile found a print it could not
@@ -357,7 +357,7 @@ export function ProductionRunDetailPage() {
     },
   });
 
-  // Reschedule / Start-now share one endpoint (Phase 5): a future ISO
+  // Reschedule / Start-now share one endpoint: a future ISO
   // reschedules, null starts the run now (Start-now toasts differently).
   const rescheduleMutation = useMutation({
     mutationFn: (at: string | null) => api.rescheduleProductionRun(runId, at),
@@ -547,7 +547,7 @@ export function ProductionRunDetailPage() {
 
               <RunStagedBanner run={run} />
 
-              {/* First-article approval gate (Phase 4, F1): self-contained here
+              {/* First-article approval gate: self-contained here
                   with the part photo + collapsible camera so a remote approver
                   can act without leaving the run detail. */}
               <FirstArticleBanner run={run} />

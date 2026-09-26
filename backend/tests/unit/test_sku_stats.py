@@ -1,4 +1,4 @@
-"""Unit tests for derived SKU stats (Phase 2)."""
+"""Unit tests for derived SKU stats."""
 
 from datetime import datetime, timedelta
 

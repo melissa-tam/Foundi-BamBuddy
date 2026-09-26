@@ -106,8 +106,8 @@ async def legacy():
     """An install that predates both tables and the two window indexes.
 
     Built by SUBTRACTION from the owner's full-schema engine rather than by a
-    hand-picked ``create_all``: the old shape is "today's schema minus this wave", and
-    subtracting the four things the wave adds says that in four lines that cannot
+    hand-picked ``create_all``: the old shape is "today's schema minus the fleet-activity tables", and
+    subtracting the four things the migration adds says that in four lines that cannot
     silently fall behind the model. Dropping a table takes its indexes with it, so the
     span and episode indexes need no separate statement.
     """

@@ -122,7 +122,7 @@ async def fresh_engine():
 
 @pytest.fixture
 async def placeholder_engine():
-    """The REAL upgrade shape: an install that already ran the first cooldown-hold wave.
+    """The REAL upgrade shape: an install that already ran the first cooldown-hold seed.
 
     Its geometry table has both columns and H2S carries the 51 mm placeholder, which the
     seed's ``IS NULL`` guard will never touch — so without the one-time migration such an

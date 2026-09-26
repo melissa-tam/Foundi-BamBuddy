@@ -127,7 +127,7 @@ export function Layout() {
   useUnknownTagPrompt();
   const respoolPrompt = useRespoolPrompt();
   // Tagless fresh-roll prompt — raises a per-slot persistent toast when a
-  // non-RFID roll is consumed past half its label weight (W5). Side-effect only;
+  // non-RFID roll is consumed past half its label weight. Side-effect only;
   // the hook owns its toasts, and its review modal is rendered below.
   const taglessFreshPrompt = useTaglessFreshPrompt();
   // Prompt recovery lane — replays every still-unanswered per-slot prompt on

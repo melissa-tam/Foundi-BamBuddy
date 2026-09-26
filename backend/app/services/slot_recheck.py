@@ -1,4 +1,4 @@
-"""The operator's "Re-check slot" verb — doctrine rule 12's lane (WS11, incident shape 32).
+"""The operator's "Re-check slot" verb — doctrine rule 12's lane (incident shape 32).
 
 **What was wrong.** The control existed and could conclude nothing. The endpoint called
 ``ams_presence.command_identify`` with no ``reason``, so ``_discovery_read_at`` was never
@@ -338,7 +338,7 @@ async def maybe_ask(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int
         ams_id,
         tray_id,
         source="recheck_intent",
-        # ``reason="discovery"`` is the fix at the heart of WS11: the old endpoint passed
+        # ``reason="discovery"`` is the heart of this verb: the old endpoint passed
         # NONE, so ``command_identify`` never stamped ``_discovery_read_at``, so
         # ``read_answered_no_tag`` was False forever and no lane could ever conclude. The
         # read happened and its answer was thrown away.
@@ -555,8 +555,8 @@ async def pending_undo(db: AsyncSession, printer_id: int, ams_id: int, tray_id: 
     dissolves the offer by cause. There is nothing to expire and no constant to justify.
 
     Scoped to CLICK-DRIVEN mints by construction — ``minted_spool_id`` is only ever set by the
-    re-check conclusion. WS1's automatic long-gap mints raise nothing: roll changes are routine
-    on this fleet and the 2026-08-10 wave demoted six non-actionable surfaces to log lines for
+    re-check conclusion. Automatic long-gap mints raise nothing: roll changes are routine
+    on this fleet and six non-actionable surfaces became log lines (2026-08-10) for
     exactly that reason.
     """
     intent = (await newest_minting_intents(db, [(printer_id, ams_id, tray_id)])).get((printer_id, ams_id, tray_id))

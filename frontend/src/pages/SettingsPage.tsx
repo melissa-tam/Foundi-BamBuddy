@@ -5147,7 +5147,7 @@ export function SettingsPage() {
       {activeTab === 'farm' && localSettings && (
         <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
           <div className="lg:w-1/2 space-y-3">
-          {/* Farm Production defaults (Phase 3) */}
+          {/* Farm Production defaults */}
           <Card id="card-farm-production">
             <CardHeader>
               <h3 className="text-base font-semibold text-white flex items-center gap-2">
@@ -5290,7 +5290,7 @@ export function SettingsPage() {
           </Card>
 
           {/* Eject Cooldown — the measured shop air and the one margin that set the
-              eject line, then server-dispatched eject stall detection (plan 4b). */}
+              eject line, then server-dispatched eject stall detection. */}
           <Card id="card-farm-cooldown">
             <CardHeader>
               <h3 className="text-base font-semibold text-white flex items-center gap-2">
@@ -5909,7 +5909,7 @@ export function SettingsPage() {
                 })()}
                 {/* Reused-tag re-spool OBSERVATION threshold. Named for what it governs:
                     tier 3 was demoted to a log line 2026-08-10 and the tier-2 toggle that
-                    once made "prompt" true of this card went with WS3 (2026-08-19), so a
+                    once made "prompt" true of this card was removed 2026-08-19, so a
                     label promising a prompt would now have no referent on the page. */}
                 <div>
                   <label htmlFor="respool-prompt-threshold" className="block text-white mb-1">

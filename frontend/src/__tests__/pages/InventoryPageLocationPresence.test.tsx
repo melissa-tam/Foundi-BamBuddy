@@ -1,5 +1,5 @@
 /**
- * LOCATION column presence qualifier (W5b).
+ * LOCATION column presence qualifier.
  *
  * The assignments API returns a tri-state `present` per binding. When it is
  * verifiably `false` the slot reads cleared, so the bare "Printer X A1" badge

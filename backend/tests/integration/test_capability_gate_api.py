@@ -1,4 +1,4 @@
-"""Integration tests for the Phase 4 dispatch gate + power-stagger consumer.
+"""Integration tests for the capability dispatch gate + power-stagger consumer.
 
 - A farm queue item BLOCKED by the capability gate surfaces its reason on
   ``waiting_reason`` (visible via the queue API, no frontend change).

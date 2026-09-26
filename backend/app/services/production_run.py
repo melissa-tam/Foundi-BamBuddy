@@ -1,4 +1,4 @@
-"""Farm production-run orchestration (Phase 2).
+"""Farm production-run orchestration.
 
 A production run is a :class:`PrintBatch` tied to a SKU file. This service owns:
 - run creation (batch + N queue items via the shared queue-builder);
@@ -269,7 +269,7 @@ async def create_production_run(db: AsyncSession, data: RunCreate, current_user:
         "required_filament_types": required_filament_types,
         "created_by_id": current_user.id if current_user else None,
     }
-    # One-time deferred start (Phase 5): stamp the operator's chosen start onto
+    # One-time deferred start: stamp the operator's chosen start onto
     # every plate item's scheduled_time so the existing scheduler gate holds
     # dispatch until then (non-blocking; None => ASAP). ``plate_fields`` — the
     # FA-plan template passed to build_first_article_plan below — deliberately
@@ -335,7 +335,7 @@ _WAIT_STALLED = "printer_offline_stalled"
 
 
 def _derive_printer_unit_context(printer_id: int, items: list[PrintQueueItem]) -> dict:
-    """Resolve a printer's representative farm unit from a run's items (Phase 3).
+    """Resolve a printer's representative farm unit from a run's items.
 
     Shared by ``_build_printer_states`` (run detail) and
     ``build_farm_printer_contexts`` (Printers page) so the unit/waiting-reason
@@ -403,7 +403,7 @@ def _derive_printer_unit_context(printer_id: int, items: list[PrintQueueItem]) -
 
 
 def _build_printer_states(printer_rows: list[Printer], items: list[PrintQueueItem]) -> tuple[list[dict], bool]:
-    """Derive the per-printer blocked-state entries for a run (Phase 4.1).
+    """Derive the per-printer blocked-state entries for a run.
 
     Everything here is DERIVED per 3NF — DB flags (quarantine) plus the live
     ``printer_manager`` flags the scheduler actually gates on (plate-clear gate,
@@ -562,7 +562,7 @@ async def _build_printer_eligibility(
 async def build_farm_printer_contexts(db: AsyncSession) -> list[dict]:
     """Fleet-scoped "why is this printer doing (or not doing) farm work" contexts.
 
-    Answers finding F2 (Phase 3): the Printers page can explain a printer sitting
+    The Printers page can explain a printer sitting
     idle on a blocked farm unit without opening the run detail. ONE query over the
     active/paused farm runs (a run is a ``PrintBatch`` with ``sku_file_id`` set),
     with queue items and the SKU eager-loaded, resolves per assigned printer: the
@@ -667,7 +667,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     plates_pending = counts.get("pending", 0) + uncreated
     plates_printing = counts.get("printing", 0)
 
-    # System-staged split (Phase 4.1): manual_start marks a held pending item;
+    # System-staged split: manual_start marks a held pending item;
     # filament_short distinguishes the scheduler's low-spool staging (swap the
     # spool, then Resume/re-check) from any other hold (pause, operator staging).
     pending_items = [it for it in items if it.status == "pending"]
@@ -718,7 +718,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
             for st in printer_states
         )
 
-    # First-article inspection payload (Phase 4, F1): only while the run is
+    # First-article inspection payload: only while the run is
     # awaiting approval or after a reject does the operator need the finished
     # part's photo + the printer to view its camera. Fetch the FA item's archive
     # ONLY in those states (cheap on the common path). The photo URL is relative
@@ -747,7 +747,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
                 if finish_photos:
                     first_article_photo_url = f"/api/v1/archives/{archive.id}/photos/{finish_photos[-1]}"
 
-    # Prefill values for "Run again" (Phase 5, F9): the eject profile and target
+    # Prefill values for "Run again": the eject profile and target
     # model are uniform across a run's items — take the first non-null; the
     # cooldown override is a batch-level column. Surfaced on BOTH the list and
     # detail responses so a terminal run card can reopen the dialog pre-filled.
@@ -787,7 +787,7 @@ async def build_run_response(db: AsyncSession, run: PrintBatch, *, detail: bool 
     if median_cycle is not None and distinct_printers > 0 and remaining_plates > 0:
         eta_seconds = median_cycle * remaining_plates / distinct_printers
 
-    # Derived run-level scheduled start (Phase 5): the earliest not-yet-started
+    # Derived run-level scheduled start: the earliest not-yet-started
     # plate's scheduled_time. STORED on the items (scheduled_time), never on the
     # batch — the run-level view is derived like every other count here. Null once
     # the run has started (its remaining pending plates carry a past time or none).
@@ -887,7 +887,7 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         broadcast_production_run_changed(run_id)
         return await _load_run(db, run_id)
 
-    # Low-spool staging re-check (Phase 4.2): BEFORE force-clearing manual_start
+    # Low-spool staging re-check: BEFORE force-clearing manual_start
     # below, re-run the deficit check for the run's printers so items whose spool
     # was swapped also drop their filament_short flag (the loop alone would clear
     # manual_start but leave the stale low-spool badge until the next tick).
@@ -904,7 +904,7 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         # run 112 / item 865 on 010-H2S). `cancel_pending_items` re-checks `pending`
         # inside the UPDATE, so a unit that dispatched in the gap stays `printing` —
         # which is what "abort cancels the run's PENDING items" always claimed to
-        # mean. Terminal-transition hygiene (W4b — waiting_reason cleared so no
+        # mean. Terminal-transition hygiene (waiting_reason cleared so no
         # scheduler hold token survives on a terminal row) lives in the primitive.
         cancelled_ids = await cancel_pending_items(
             db, item_ids=[it.id for it in run.queue_items if it.status == "pending"]
@@ -935,7 +935,7 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         await db.commit()
         broadcast_production_run_changed(run_id)
         run = await _load_run(db, run_id)
-        # FA-zombie guard (Phase 1): a gated run whose entire first-article chain
+        # FA-zombie guard: a gated run whose entire first-article chain
         # died at max retries paused with its remaining plates still deferred to the
         # plan. Resuming must re-dispatch a fresh first article from that plan, else
         # the run goes 'active' with zero live items and never progresses (top_up is
@@ -949,7 +949,7 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
             await db.commit()
             run = await _load_run(db, run_id)
         topped_up = await top_up_run(db, run)
-        # Lifecycle notification (Phase 6): tell the other operator the run is
+        # Lifecycle notification: tell the other operator the run is
         # progressing again. Reload first so sku_file/sku are fresh, then read the
         # identity args BEFORE on_run_resumed's internal commit expires the row
         # (same ordering the farm_policy notify sites rely on).
@@ -968,12 +968,12 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
         return await _load_run(db, run_id)
     else:
         if action == "pause":
-            # Machine-readable hold reason (Phase 4.1): a manual pause is
+            # Machine-readable hold reason: a manual pause is
             # distinguishable from the auto-pauses. Cleared on resume above.
             run.pause_reason = "operator"
         await db.commit()
         broadcast_production_run_changed(run_id)
-        # Lifecycle notifications (Phase 6): a manual pause reuses the existing
+        # Lifecycle notifications: a manual pause reuses the existing
         # on_run_paused event; an abort fires the destructive on_run_aborted so the
         # other operator knows the run is over. Reload for fresh sku_file/sku.
         run = await _load_run(db, run_id)
@@ -985,7 +985,7 @@ async def transition_run(db: AsyncSession, run_id: int, action: str) -> PrintBat
 
 
 async def reschedule_run(db: AsyncSession, run_id: int, scheduled_start_at: datetime | None) -> PrintBatch:
-    """Change (or clear) a not-yet-started run's deferred start time (Phase 5).
+    """Change (or clear) a not-yet-started run's deferred start time.
 
     Unifies **Start now** (``scheduled_start_at`` None/past → clear the gate) and
     **Reschedule** (a future time → re-stamp). The start time is STORED on the
@@ -1021,7 +1021,7 @@ async def reschedule_run(db: AsyncSession, run_id: int, scheduled_start_at: date
 
 
 async def top_up_run(db: AsyncSession, run: PrintBatch) -> int:
-    """Create replacement queue items for units consumed WITHOUT output (Phase 3.1).
+    """Create replacement queue items for units consumed WITHOUT output.
 
     A unit that was cancelled/stopped — or failed with its retry chain exhausted —
     leaves the run short of its planned plate count. This recomputes the shortfall

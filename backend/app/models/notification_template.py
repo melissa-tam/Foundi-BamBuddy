@@ -174,7 +174,7 @@ DEFAULT_TEMPLATES = [
         "title_template": "Queue Complete",
         "body_template": "All {completed_count} queued jobs have finished",
     },
-    # Farm production run notifications (Phase 3)
+    # Farm production run notifications
     {
         "event_type": "first_article_pending",
         "name": "First Article Pending Approval",
@@ -235,7 +235,7 @@ DEFAULT_TEMPLATES = [
         "title_template": "Print paused — {printer_name}",
         "body_template": "{printer_name} has been PAUSEd {minutes} min with '{job_name}' still printing, and nothing is recovering it. Check the printer — it will not resolve on its own.",
     },
-    # WS2b: the same hold on a print the farm did NOT dispatch. A separate event from
+    # The same hold on a print the farm did NOT dispatch. A separate event from
     # print_paused_stalled because there is no queue unit to name and no run to hold —
     # the copy must not promise a farm reaction that cannot happen.
     {
@@ -244,7 +244,7 @@ DEFAULT_TEMPLATES = [
         "title_template": "Foreign print paused — {printer_name}",
         "body_template": "{printer_name} has been PAUSEd {minutes} min on '{job_name}', a print Bambuddy did not dispatch. Nothing is recovering it — check the printer.",
     },
-    # WS3: the ledger says this roll is exhausted; the wire says it is still in the
+    # The ledger says this roll is exhausted; the wire says it is still in the
     # slot and substantially full. Both cannot be true, and the ledger is the one the
     # farm ACTS on (a spent row is hard-excluded from selection). Deliberately no
     # instruction to un-spend — there is no such lane by operator ruling; the message
@@ -255,7 +255,7 @@ DEFAULT_TEMPLATES = [
         "title_template": "Spool marked spent is still loaded — {printer_name}",
         "body_template": "Spool #{spool_id} ({spool_label}) is marked SPENT but is still seated in {slot} on {printer_name}, and the AMS reports it {remain}% full. A spent spool is excluded from every print, so this roll is out of service. Check whether the spent stamp was correct.",
     },
-    # WS6: a print COMPLETED and charged nothing while a TAGLESS roll fed it. A
+    # A print COMPLETED and charged nothing while a TAGLESS roll fed it. A
     # tagless tray reports remain: -1 forever, so the slicer 3MF is the only thing
     # that can price it — and a lost 3MF makes the charge silently ZERO instead of
     # failing. The copy names the roll and the file, because the fix is always the
@@ -350,7 +350,7 @@ DEFAULT_TEMPLATES = [
         "title_template": "Cooldown running long — {printer}",
         "body_template": "{printer}: {detail}",
     },
-    # Farm production run notifications (Phase 6: manual / lifecycle events)
+    # Farm production run notifications (manual / lifecycle events)
     {
         "event_type": "run_aborted",
         "name": "Production Run Aborted",

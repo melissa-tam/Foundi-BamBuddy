@@ -732,7 +732,7 @@ class TestFilamentDeficitSpentGuard:
 
 
 class TestFilamentDeficitPresenceGate:
-    """W4: a binding on a tray that reads EMPTY prices as 0, not as its ledger.
+    """A binding on a tray that reads EMPTY prices as 0, not as its ledger.
 
     Five prod slots held a stale binding on a physically empty tray (003-T2 spool
     140 at 932 g the worst). Pricing those grams as "available" is how a stale spool
@@ -823,7 +823,7 @@ class TestFilamentDeficitPresenceGate:
 
 
 class TestFilamentDeficitUnreadSlots:
-    """WS4-D1: a SEATED-but-UNIDENTIFIED tray prices as UNDETERMINED, never as empty.
+    """A SEATED-but-UNIDENTIFIED tray prices as UNDETERMINED, never as empty.
 
     Twelve fleet trays sat in state 10/11 with no ``tray_type``, no ``tray_info_idx``
     and no tag. Every backend layer read them as empty slots, so the pricer quoted a
@@ -995,7 +995,7 @@ class TestFilamentDeficitUnreadSlots:
 
 
 class TestUnreadReadRequest:
-    """WS4-D4: the ask that resolves an unread slot, paced ONCE PER EPISODE.
+    """The ask that resolves an unread slot, paced ONCE PER EPISODE.
 
     Pricing the slot as undetermined removes the phantom deficit but leaves it unknown
     forever unless something asks. Asking every tick is the 2026-08-02 read-storm shape

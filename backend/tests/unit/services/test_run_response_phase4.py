@@ -1,4 +1,4 @@
-"""Run-visibility derived fields + hold lifecycle (Phase 4.1).
+"""Run-visibility derived fields + hold lifecycle.
 
 ``build_run_response`` must DERIVE (never store) the hold summary — pause_reason
 passthrough, the staged split, per-printer blocked states, has_blocked_printers —
@@ -516,7 +516,7 @@ async def _add_fa_attempt(db, batch, printer, photos, *, job="FA-1", status="com
 
 
 class TestFirstArticlePhoto:
-    """build_run_response first-article inspection payload (Phase 4, F1).
+    """build_run_response first-article inspection payload.
 
     Only ``awaiting_approval`` / ``rejected`` runs carry the finish-photo URL +
     the producing printer; the newest ``finish_*`` archive photo is selected,
@@ -905,7 +905,7 @@ class TestPrinterEligibility:
 
 
 class TestRunAgainPrefillFields:
-    """build_run_response surfaces the "Run again" prefill fields (Phase 5, F9):
+    """build_run_response surfaces the "Run again" prefill fields:
     eject_profile_id + target_model derived from the items (first non-null,
     uniform per run). Present on BOTH the list and detail shapes so a terminal run
     card can reopen the dialog pre-filled. FK enforcement is off in the test engine,

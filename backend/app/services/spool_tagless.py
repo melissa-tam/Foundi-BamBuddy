@@ -1,6 +1,6 @@
 """Tagless (non-RFID) spool support lanes — wire config, minting, operator verbs.
 
-**Scope after the W3b cutover.** Deciding WHAT is in a tray and WHICH ledger row it
+**Scope after the slot-pipeline cutover.** Deciding WHAT is in a tray and WHICH ledger row it
 is belongs to ``slot_state`` (the decision table) and ``slot_pipeline`` (the one
 orchestrator). This module no longer decides identity: its 7-branch
 ``handle_tagless_slot`` tree, the in-place ``_maybe_move_tagless_assignment`` rebind
@@ -13,7 +13,7 @@ everything AROUND that decision, in three groups:
   :func:`canonical_default_identity` is the ONE predicate for "is this the fleet's
   default filament, spelled non-canonically?" — it replaced the three overlapping
   helpers (``override_generic_identity``, ``default_temps_for_fingerprint`` and the
-  mint's inline override) in the 2026-08-21 backup-group wave, and it now covers the
+  mint's inline override) on 2026-08-21, and it now covers the
   COLOUR dimension the earlier helpers left split. Its ROW-side twin
   :func:`default_row_identity` answers the other half — the ``brand``/``subtype`` pair
   the wire never states for a tagless tray — so both mint arms emit ONE identity for
@@ -30,7 +30,7 @@ everything AROUND that decision, in three groups:
   BOUNDED by a per-slot write epoch fed from the firmware's own ACKs
   (:func:`on_ams_command_result`): the wire refusing, or three attempts it never
   reflects, stops the lane for that slot until a presence/identity edge re-arms it.
-* **Operator verbs + the prompts behind them** — the W5 fresh-roll prompt
+* **Operator verbs + the prompts behind them** — the fresh-roll prompt
   (:func:`note_physical_cycle` → :func:`_maybe_prompt_fresh_roll`, durable on
   ``Spool.fresh_prompt_pending_at``) and its executor :func:`apply_fresh_roll`, which
   answers "New roll" by archiving the current row and minting its replacement through
@@ -39,7 +39,7 @@ everything AROUND that decision, in three groups:
   :func:`dispose_provisional_on_tag` retires an auto-minted provisional row when a
   real RFID tag claims its slot (hard-delete with no usage ledger, else archive).
 
-The W1 spent latch itself is unchanged and now lives in the table (``spool.spent_at``
+The spent latch itself is unchanged and now lives in the table (``spool.spent_at``
 + the binding IS the durable "this tray ran dry" state); this module still owns the
 qualified-physical-cycle signal that releases it
 (:func:`qualified_cycle_pending` / :func:`consume_qualified_cycle`).
@@ -115,7 +115,7 @@ DATA_ORIGIN = "ams_auto"
 
 # Generic (GFx99) slicer ids — the fallback a bare-tray auto-config writes when no
 # specific id is configured. A tray re-reporting one of these is untrustworthy for
-# minting a fresh identity (W4 generic-id override).
+# minting a fresh identity (the generic-id override).
 _GENERIC_ID_VALUES = frozenset(GENERIC_FILAMENT_IDS.values())
 
 # Release reason for the OPERATOR lane's roll swap (:func:`_replace_row_after_cycle`):
@@ -246,7 +246,7 @@ _debounce_preserved_cycles: set[tuple[int, int, int]] = set()
 _settle_concluded_logged: set[tuple[int, int, int]] = set()
 
 # Fraction of a tagless row's label weight consumed past which a physical cycle
-# raises the over-consumption / fresh-roll prompt (W5). 0.7 = the roll is ≥70 %
+# raises the over-consumption / fresh-roll prompt. 0.7 = the roll is ≥70 %
 # consumed (≤300 g left on a 1000 g label) — operator setting 2026-07-20: a swap
 # earlier in a roll's life is routine (drying, slot juggling) and asking then is
 # noise.
@@ -310,7 +310,7 @@ class _SpentSwapParkEpisode(NamedTuple):
 # SEPARATE map from :data:`_presence_stale_episodes`: the two arms watch opposite
 # predicates (spent vs non-spent, present vs absent-or-unknown, configured vs any) and
 # folding them into one keyed state would make "which situation is this slot in?"
-# unanswerable — the same conflation the 2026-08-19 wave deleted from ``_is_tagless``.
+# unanswerable — the same conflation removed from ``_is_tagless`` on 2026-08-19.
 _spent_swap_park_episodes: dict[tuple[int, int, int], _SpentSwapParkEpisode] = {}
 
 # How long ONE presence-stale reading must stand before the farm stops waiting for the
@@ -419,7 +419,7 @@ def _tray_loaded(tray: dict) -> bool:
 
 
 def tray_loaded(tray: dict) -> bool:
-    """Public read-only view of :func:`_tray_loaded` for the slot pipeline (W3a).
+    """Public read-only view of :func:`_tray_loaded` for the slot pipeline.
 
     The spent→mint transition must not fire on a dead roll that was re-seated without
     filament being fed, and that gate is this predicate — so the orchestrator asks the
@@ -850,7 +850,7 @@ async def mint_tagless_spool(
         core_weight = 250
         slicer_filament = default_filament.get("slicer_filament") or None
         slicer_filament_name = None
-        # W4: stamp the configured default's canonical nozzle range onto the row so
+        # Stamp the configured default's canonical nozzle range onto the row so
         # the resolver emits it verbatim (a byte-identical backup-group peer).
         nozzle_temp_min = default_filament.get("nozzle_temp_min")
         nozzle_temp_max = default_filament.get("nozzle_temp_max")
@@ -1064,7 +1064,7 @@ async def push_config_for_spool(
 ) -> bool:
     """Public entry to the module's ONE wire-write funnel (:func:`_push_config`).
 
-    Used by the slot pipeline (W3a) for the two writes it owns — the pre-configured
+    Used by the slot pipeline for the two writes it owns — the pre-configured
     one-shot apply and a default-minted row's first identity push — so those go through
     the same settle gate and the same failure handling as every existing config write.
     No logic is duplicated at the call site: this is a delegation, nothing else.
@@ -1095,7 +1095,7 @@ async def _broadcast_auto_assigned(
     await ws_manager.broadcast(payload)
 
 
-# --- W1 spent-binding release / fresh-roll transition ----------------------
+# --- Spent-binding release / fresh-roll transition -------------------------
 
 
 def _apply_new_fields(spool: Spool, fields: dict | None) -> None:
@@ -1133,10 +1133,10 @@ async def _replace_row_after_cycle(
     *,
     new_fields: dict | None = None,
 ) -> Spool:
-    """Archive a departed tagless row and mint+bind+push its replacement (W1/W5).
+    """Archive a departed tagless row and mint+bind+push its replacement.
 
     The OPERATOR lane's spent-binding / fresh-roll transition, shared by
-    :func:`maybe_autoconfigure_bare_tray` and the W5 new-roll route
+    :func:`maybe_autoconfigure_bare_tray` and the new-roll route
     (:func:`apply_fresh_roll` — the "New roll" verb). The WIRE lane's equivalent is the
     pipeline's ``REPLACE_SPENT`` arm (``slot_pipeline._apply_replace_spent``), which
     mirrors this behaviour with one documented difference (it disposes a pristine
@@ -1601,7 +1601,7 @@ async def replace_bound_row_with_successor(
       ``require_positive_moved=False``; and the departing row gets ``spent_at`` because it
       physically ran dry. That last one is a direct write outside
       ``spool_respool._mark_tray_spent``, the single live spent writer, and it is the
-      **sanctioned repair exception** (plan ``003-h2s-ran-out-of-eventual-harbor.md`` WS6):
+      **sanctioned repair exception**:
       a repair asserts a fact about a past the wire will never re-assert, so routing it
       through a lane that resolves LIVE tray state would have nothing to resolve.
 
@@ -1926,7 +1926,7 @@ async def _reattribute_early_runout(
 
     Every exit before question 3 is SILENT on purpose: those describe every ordinary runout
     on the fleet, and an INFO line per runout saying "this was a normal runout" is the kind
-    of noise the 2026-08-10 wave demoted six surfaces to remove. From the point a candidate
+    of noise removed from six surfaces on 2026-08-10. From the point a candidate
     exists, BOTH outcomes log — the stand-down is a decision this lane made and C4 is the
     arm that matters most.
     """
@@ -2041,7 +2041,7 @@ async def _reattribute_early_runout(
     return departed
 
 
-# --- W5 tagless fresh-roll prompt ------------------------------------------
+# --- Tagless fresh-roll prompt ---------------------------------------------
 
 
 def _live_tray(printer_id: int, ams_id: int, tray_id: int) -> dict | None:
@@ -2079,7 +2079,7 @@ def _live_tray(printer_id: int, ams_id: int, tray_id: int) -> dict | None:
 
 
 def _tagless_fresh_payload(printer_id: int, ams_id: int, tray_id: int, spool: Spool) -> dict:
-    """Frozen ``tagless_fresh_prompt`` WS payload (W5) — one origin for the live
+    """Frozen ``tagless_fresh_prompt`` WS payload — one origin for the live
     broadcast and the reconnect replay. Matches the frontend useWebSocket bridge +
     TaglessFreshPromptMessage: {printer_id, ams_id, tray_id, spool_id, remaining_g,
     material, rgba}."""
@@ -2100,7 +2100,7 @@ async def _broadcast_tagless_fresh_prompt(printer_id: int, ams_id: int, tray_id:
 
 
 async def broadcast_tagless_fresh_dismissed(printer_id: int, ams_id: int, tray_id: int) -> None:
-    """Cross-client clear of a tagless fresh-roll prompt (either answer, W5)."""
+    """Cross-client clear of a tagless fresh-roll prompt (either answer)."""
     await ws_manager.broadcast(
         {
             "type": "tagless_fresh_prompt_dismissed",
@@ -2125,10 +2125,10 @@ async def clear_fresh_prompt(db: AsyncSession, spool: Spool) -> None:
 
 
 async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: int, tray_id: int) -> None:
-    """W5 over-consumption / fresh-roll prompt for a physical cycle on a tagless slot.
+    """Over-consumption / fresh-roll prompt for a physical cycle on a tagless slot.
 
     Reads the slot's kept assignment. A SPENT bound row **of any tag-ness** leaves the
-    pending cycle for the W1 spent→mint transition (certain fresh roll — silent, no
+    pending cycle for the spent→mint transition (certain fresh roll — silent, no
     prompt). An UNBOUND slot leaves it too, for the pipeline to settle per outcome (see
     the branch comment — 2026-08-19, shape 32 layer 2). A NON-spent BOUND row whose tray
     is STILL PRESENT and is consumed past :data:`_FRESH_ROLL_PROMPT_USED_FRAC` of its
@@ -2167,7 +2167,7 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
     # the deadlocked slot (2026-08-07 #2, spool 226 / 001-H2S slot 1: a spent tagged row
     # latching its slot against the fresh roll physically seated in it).
     if spool is not None and spool.spent_at is not None:
-        return  # leave the pending cycle for the W1 spent→mint transition (silent)
+        return  # leave the pending cycle for the spent→mint transition (silent)
     if spool is None:
         # UNBOUND — and this lane may not decide what happens to the cycle, because it
         # runs BEFORE the outcome exists. It used to discard here, which is exactly
@@ -2222,14 +2222,14 @@ async def _maybe_prompt_fresh_roll(db: AsyncSession, printer_id: int, ams_id: in
 
 
 async def note_physical_cycle(printer_id: int, ams_id: int, tray_id: int) -> None:
-    """Record a QUALIFIED physical roll swap on a slot — the W1 latch release + W5 prompt.
+    """Record a QUALIFIED physical roll swap on a slot — the spent latch release + fresh-roll prompt.
 
     Called (guarded, awaited) from ``ams_presence.on_tray_observations`` on a genuine presence
     GAIN whose preceding absence lasted ≥ ``ams_presence._MIN_PHYSICAL_ABSENT_S``. Arms
     :data:`_pending_physical_cycles` (the spent-binding latch's release signal that the
     pipeline's REPLACE_SPENT arm / :func:`maybe_autoconfigure_bare_tray` consume on the
     next push) then
-    runs the W5 over-consumption prompt in its OWN session (mirrors
+    runs the over-consumption prompt in its OWN session (mirrors
     ``ams_presence.on_printer_terminal``). Never raises — a farm-side failure must never
     break the AMS callback chain.
     """
@@ -2265,7 +2265,7 @@ def qualified_cycle_pending(printer_id: int, ams_id: int, tray_id: int) -> bool:
 def consume_qualified_cycle(printer_id: int, ams_id: int, tray_id: int) -> bool:
     """Spend this slot's pending physical cycle. True when there was one to spend.
 
-    The W1 spent-latch RELEASE, popped exactly once — the same discard the branch-(3) /
+    The spent-latch RELEASE, popped exactly once — the same discard the branch-(3) /
     bare-tray transitions perform, exposed for the slot pipeline.
 
     ONE pop, two intents, and the difference lives in the caller's log line rather than in
@@ -2371,7 +2371,7 @@ async def apply_fresh_roll(
     cost_per_kg: float | None = None,
     note: str | None = None,
 ) -> Spool:
-    """Answer a W5 fresh-roll prompt with "Fresh roll" — archive the current tagless
+    """Answer a fresh-roll prompt with "Fresh roll" — archive the current tagless
     row and mint+bind+push a replacement (default-vs-tray via the shared transition),
     applying the operator's optional brand/label_weight/cost_per_kg/note to the new row.
     Clears the departed row's pending stamp. Returns the new spool. Raises ``ValueError``
@@ -2394,7 +2394,7 @@ async def apply_fresh_roll(
 
 
 async def pending_fresh_prompts(db: AsyncSession) -> list[dict]:
-    """Every still-open tagless fresh-roll prompt, as ready-to-send WS payloads (W5).
+    """Every still-open tagless fresh-roll prompt, as ready-to-send WS payloads.
 
     The ONE snapshot of the durable ``fresh_prompt_pending_at`` stamp, consumed by both
     the reconnect replay (:func:`rebroadcast_unresolved_tagless_prompts`) and the REST
@@ -2430,7 +2430,7 @@ async def pending_fresh_prompts(db: AsyncSession) -> list[dict]:
 
 
 async def rebroadcast_unresolved_tagless_prompts(db: AsyncSession, send) -> int:
-    """Replay unresolved ``tagless_fresh_prompt`` events to a (re)connecting client (W5).
+    """Replay unresolved ``tagless_fresh_prompt`` events to a (re)connecting client.
 
     Sibling of ``spool_respool.rebroadcast_unresolved_respool_prompts``. The prompt WS
     event is fire-once (``ws_manager.broadcast`` keeps no backlog and no-ops entirely
@@ -2677,7 +2677,7 @@ def _own_tagless_slot(tray: dict, assignment: SpoolAssignment | None) -> bool:
       :data:`DATA_ORIGIN` — an operator- or RFID-bound row is somebody's STATEMENT
       about that slot and is never overwritten;
     * not spent — a spent row is the durable "ran dry" latch, released only by a
-      qualified physical cycle (W1). The bare arm reaches that transition ABOVE this
+      qualified physical cycle. The bare arm reaches that transition ABOVE this
       predicate, which is why it can call it afterwards without losing the branch.
 
     Deliberately NOT here: everything that needs a printer id or the DB (the
@@ -2707,7 +2707,7 @@ async def maybe_autoconfigure_bare_tray(
 
     Trigger: tray PRESENT (state 10/11) AND tray_type empty AND no valid tag AND
     a non-empty ``tagless_default_filament`` setting — clearing that setting is the
-    ONE off switch (the 2026-08-10 wave retired the separate kill-switch setting;
+    ONE off switch (the separate kill-switch setting was retired 2026-08-10;
     tagless gram tracking is load-bearing, not a preference).
     The config push self-heals through TWO service lanes (gated by
     :data:`_AUTOCONFIG_RETRY_S` either way) until the firmware reports a non-empty
@@ -2781,7 +2781,7 @@ async def maybe_autoconfigure_bare_tray(
     )
     assignment = res.scalar_one_or_none()
 
-    # W1: a SPENT binding is the "ran dry" latch — never re-push a spent row's config.
+    # A SPENT binding is the "ran dry" latch — never re-push a spent row's config.
     # Only a QUALIFIED physical roll swap (a pending cycle recorded by
     # note_physical_cycle) releases it into the archive→unlink→default-mint→push
     # transition. Checked BEFORE stamping the retry window so a latched slot never burns
@@ -2937,7 +2937,7 @@ async def maybe_harmonize_backup_identity(
     inside 1↔2, 14 inside 3→4, and none across. The printer ran dry on slot 2 twice in
     28 h with a full black roll one slot away and AMS Filament Backup ON. The farm had
     been harmonising the PRESET dimension since the 011-H2S ``GFG99`` fix, and the
-    temperature range since W4 (which groups nothing — measured 2026-08-25); the colour
+    temperature range (which groups nothing — measured 2026-08-25); the colour
     dimension had no lane at all, and a slot the operator edited on the touchscreen
     could never come back.
 
@@ -3193,7 +3193,7 @@ async def _age_spent_swap_park(
     """Make the spent-swap park LOUD. Sibling of :func:`_age_bound_presence_stale`, not a
     branch of it.
 
-    THE PARK. ``slot_state`` row 4a releases the W1 spent latch on a QUALIFIED PHYSICAL
+    THE PARK. ``slot_state`` row 4a releases the spent latch on a QUALIFIED PHYSICAL
     CYCLE, and 4a′/5a release it on an ANSWERED no-tag read over a binding that CLAIMS a
     tag. A spent binding sitting under a CONFIGURED, seated tray with neither of those can
     reach neither: the cycle already happened (or never will), and for a TAGLESS incumbent

@@ -671,7 +671,7 @@ class TestSlotRunoutSpentHook:
 
 @pytest.mark.asyncio
 class TestStandingCodesStillReachTheIncidentMachine:
-    """THE silent-class reproduction (WS2b finding (b)).
+    """THE silent-class reproduction.
 
     The recovery spawn used to be nested inside ``if new_error_codes:`` — the
     NOTIFICATION dedup's edge. Two everyday shapes therefore never reached it, and
@@ -684,7 +684,7 @@ class TestStandingCodesStillReachTheIncidentMachine:
         for notification purposes, but a fresh physical fault for the machine.
 
     The spawn is now derived from the LIVE hms list and fires per push. Running these
-    cases against the pre-WS2b pipeline produced zero calls (reference only — the old
+    cases against the old pipeline produced zero calls (reference only — the old
     code is deleted, so the contrast is documented rather than executed).
     """
 
@@ -823,7 +823,7 @@ class TestAutoSwitchNotificationSuppression:
         assert h.notify.on_printer_error.await_count == 1
 
 
-# --- the edge-triggered STATE consumers (W1c) --------------------------------
+# --- the edge-triggered STATE consumers --------------------------------------
 # Five consumers used to ride ``new_error_codes`` — notify_dedup's 600 s re-NOTIFY
 # window. That window is a level-triggered ALERT policy: it deliberately calls a code
 # flapping out-and-back inside it ONE continuing incident, and pre-marks every code

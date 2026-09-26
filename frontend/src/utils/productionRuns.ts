@@ -8,7 +8,7 @@ import { parseUTCDate } from './date';
 
 /**
  * Whether a run is in its one-time deferred-start window: still `active` and its
- * derived start time is in the future (Phase 5). Gates the "Scheduled" badge and
+ * derived start time is in the future. Gates the "Scheduled" badge and
  * the Start-now / Reschedule actions. A paused run reports its own status, not
  * "scheduled" — the operator's hold wins.
  */

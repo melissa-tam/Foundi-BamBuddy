@@ -55,7 +55,7 @@ def _settings(**overrides) -> monitor_mod.CooldownWatchSettings:
     the real settings DB would couple it to a table it never writes.
 
     The fans are off by their SWITCHES, not by a zero speed: the switch is the one
-    on/off owner since the two-fan wave, and a speed of 0 is no longer an encoding of
+    on/off owner, and a speed of 0 is no longer an encoding of
     "off" anywhere."""
     defaults = {
         "stall_window_s": 0,
@@ -100,7 +100,7 @@ class _PrepRecorder:
         # The operator's two hold inputs as they arrived — the wiring this double exists
         # to prove, since what ``begin`` DOES with them is pinned in test_cooldown_prep.
         self.holds: list[tuple[bool | None, int | None]] = []
-        # The other two resolve-once inputs of the two-fan wave: the printer's model
+        # The other two resolve-once inputs of the two-fan cooldown: the printer's model
         # (the chamber lane's capability gate) and the eject line (its step-down line).
         # Both are the watch's to resolve, never the prep's to look up.
         self.models: list[str | None] = []
@@ -1216,7 +1216,7 @@ class TestPolicyDriverFailure:
 class TestUnitReleasableFirstArticle:
     """`_unit_releasable` must answer False for a first-article item even though it
     carries an eject profile — and it keys off the SPECIFIC item id (db.get), not the
-    most-recently-started item on the printer (Phase 1)."""
+    most-recently-started item on the printer."""
 
     async def test_first_article_is_not_releasable(self, db_session, monkeypatch):
         import contextlib
@@ -1981,7 +1981,7 @@ class TestNotifyPlateNotEmpty:
 # The armed watch's own resolution (threshold publication + release binding)
 # --------------------------------------------------------------------------- #
 class TestArmedWatchResolution:
-    """Phase 4.3c: the armed watch publishes that it is COOLING, and the eject line it
+    """The armed watch publishes that it is COOLING, and the eject line it
     armed with, so the UI can render the cooldown phase. An escalation-only hold and a
     still-resolving watch expose None. The record is dropped when the watch exits."""
 
@@ -2321,7 +2321,7 @@ class TestResolveStallSettings:
         setting in the app is read with — anything else is OFF, which is the safe
         direction for a value nothing here wrote. Parametrized across ALL three switches
         because each one is now the sole on/off owner of its actuator: a speed of 0 is
-        not an off anywhere since the two-fan wave."""
+        not an off anywhere."""
         from backend.app.api.routes.settings import set_setting
 
         self._patch_session(monkeypatch, db_session)
@@ -3024,7 +3024,7 @@ class TestPlateZThreading:
 
 
 class TestManualReleaseNow:
-    """W2: an armed watch's release_now event drives an immediate manual eject
+    """An armed watch's release_now event drives an immediate manual eject
     through the SAME _do_release path, bypassing the cooldown threshold."""
 
     async def test_preset_event_releases_even_hot(self):
@@ -3062,7 +3062,7 @@ class TestManualReleaseNow:
 
 
 class TestDoReleaseGateGuard:
-    """W2/W3 hardening: _do_release re-checks the plate-clear gate at the release
+    """Hardening: _do_release re-checks the plate-clear gate at the release
     boundary. If the gate dropped between the top-of-poll check and here, the watch
     exits 'cleared' and NEVER sweeps an already-emptied plate."""
 

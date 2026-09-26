@@ -1,4 +1,4 @@
-"""Per-push, per-tray AMS observations with EXPLICIT epistemic status (W1).
+"""Per-push, per-tray AMS observations with EXPLICIT epistemic status.
 
 An observation answers three questions separately and honestly for ONE tray in ONE
 push: *is something in the slot* (``present``), *what identity did this push
@@ -172,7 +172,7 @@ def observe_tray(
     TRUST-FILTERED and unit-gated by the caller (``None`` when this push offers the
     slot no bit evidence). ``index`` is the tray's position in its unit's list, used
     only as the fallback tray id when the dict omits ``id`` — with a WARNING, because
-    a silent default-to-0 (what the pre-W1 call sites did) writes slot 0's identity
+    a silent default-to-0 (what the earlier call sites did) writes slot 0's identity
     from another slot's data.
     """
     tray_id = parse_int_field(tray.get("id"))

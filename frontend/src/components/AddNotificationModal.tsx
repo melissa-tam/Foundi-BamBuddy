@@ -46,7 +46,7 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
   const [onStockBreakAlert, setOnStockBreakAlert] = useState(provider?.on_stock_break_alert ?? false);
   const [onBedCooled, setOnBedCooled] = useState(provider?.on_bed_cooled ?? false);
   const [onFirstLayerComplete, setOnFirstLayerComplete] = useState(provider?.on_first_layer_complete ?? false);
-  // Farm production events (Phase 6)
+  // Farm production events
   const [onPlateNotEmpty, setOnPlateNotEmpty] = useState(provider?.on_plate_not_empty ?? true);
   const [onFirstArticlePending, setOnFirstArticlePending] = useState(provider?.on_first_article_pending ?? true);
   const [onFirstArticleApproved, setOnFirstArticleApproved] = useState(provider?.on_first_article_approved ?? true);
@@ -600,7 +600,7 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
               </div>
             </div>
 
-            {/* Farm Production Events (Phase 6) */}
+            {/* Farm Production Events */}
             <div className="space-y-2 p-3 bg-bambu-dark rounded-lg">
               <p className="text-xs text-bambu-gray uppercase tracking-wide mb-2">{t('notifications.events.farm.sectionTitle')}</p>
               <div className="grid grid-cols-2 gap-2">

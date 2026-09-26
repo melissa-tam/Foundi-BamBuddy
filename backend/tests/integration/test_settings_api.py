@@ -321,7 +321,7 @@ class TestSettingsAPI:
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_respool_auto_enabled_is_gone_and_unsettable(self, async_client: AsyncClient):
-        """The Tier-2 toggle cannot be re-introduced through the API (WS3, 2026-08-19).
+        """The Tier-2 toggle cannot be re-introduced through the API (2026-08-19).
 
         It used to round-trip False → True → back through the boolean-parse whitelist.
         Operator ruling 3 superseded what it encoded — a FINISHED roll reading LOADED can

@@ -1,5 +1,5 @@
 /**
- * Frontend tests for the SKU catalog page (farm production, Phase 2).
+ * Frontend tests for the SKU catalog page (farm production).
  *
  * Coverage:
  * - List renders SKU rows (code, name, part number, file count, stats).

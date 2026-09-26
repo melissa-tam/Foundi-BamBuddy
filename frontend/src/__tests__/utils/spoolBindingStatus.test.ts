@@ -1,6 +1,6 @@
 /**
  * The one binding-status derivation shared by the printer card's
- * EmptySlotHoverCard and the Inventory LOCATION column (W5a/W5b).
+ * EmptySlotHoverCard and the Inventory LOCATION column.
  *
  * Two rules are worth pinning. Precedence: `spent` outranks `preConfigured`,
  * because `pre_configured_at` is a bind-time stamp that an insert-then-run-dry

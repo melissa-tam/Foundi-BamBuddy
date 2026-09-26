@@ -1,4 +1,4 @@
-"""Deficit-math tests for ``production_run.top_up_run`` (Phase 3.1).
+"""Deficit-math tests for ``production_run.top_up_run``.
 
 Top-up recomputes, from LIVE queue state, how many plate slots ended WITHOUT
 output (cancelled/stopped, or failed with an exhausted retry chain) and has
@@ -309,7 +309,7 @@ class TestTransitionResumeWiring:
         assert await _pending_count(db_session, batch.id) == 1  # only the original pending
 
     async def test_abort_cancels_pending_and_clears_waiting_reason(self, db_session):
-        """W4b terminal hygiene: a run-abort cancels PENDING items outside
+        """Terminal hygiene: a run-abort cancels PENDING items outside
         farm_policy.on_terminal, so its own transition must clear any scheduler
         hold token — a cancelled row must never keep e.g. filament_short."""
         batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)
@@ -325,7 +325,7 @@ class TestTransitionResumeWiring:
         assert held.waiting_reason is None
 
     async def test_resume_after_retries_exhausted_tops_up_deficit(self, db_session):
-        """Phase 1 R3: a run paused with retries_exhausted resumes and tops up
+        """A run paused with retries_exhausted resumes and tops up
         exactly the dead-chain deficit."""
         batch, _lib, _prof = await _mk_run(db_session, quantity=2, printer_id=3)
         batch.status = "paused"

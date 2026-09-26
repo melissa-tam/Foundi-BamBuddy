@@ -1,5 +1,5 @@
 /**
- * Frontend tests for the Production Runs page (farm production, Phase 2).
+ * Frontend tests for the Production Runs page (farm production).
  *
  * Coverage:
  * - List renders run cards with progress, status badge, and ETA.
@@ -290,7 +290,7 @@ describe('ProductionRunsPage', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Phase 4.1: run-card hold visibility + detail link
+  // Run-card hold visibility + detail link
   // -------------------------------------------------------------------------
 
   it('links the run card title to the detail page and shows hold chips', async () => {
@@ -373,7 +373,7 @@ describe('ProductionRunsPage', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Phase 5 (F5): H2C-ready model selection + Advanced section
+  // H2C-ready model selection + Advanced section
   // -------------------------------------------------------------------------
 
   const twoModelFleet = http.get('*/api/v1/printers/', () =>
@@ -558,7 +558,7 @@ describe('ProductionRunsPage', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Phase 5 (F9): Run again
+  // Run again
   // -------------------------------------------------------------------------
 
   it('shows Run again on terminal runs only (permission-gated)', async () => {
@@ -796,7 +796,7 @@ describe('ProductionRunsPage', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Phase 5: scheduled runs (one-time deferred start)
+  // Scheduled runs (one-time deferred start)
   // -------------------------------------------------------------------------
 
   it('shows the Scheduled badge and Start-now / Reschedule actions on a scheduled run', async () => {

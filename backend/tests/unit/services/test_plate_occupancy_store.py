@@ -1,4 +1,4 @@
-"""Tests for ``plate_occupancy_store`` — the I/O half of the occupancy authority (WS2).
+"""Tests for ``plate_occupancy_store`` — the I/O half of the occupancy authority.
 
 Two halves, two shapes of test:
 

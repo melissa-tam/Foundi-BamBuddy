@@ -175,8 +175,8 @@ _STOP_RETRY_DELAY_S = 5.0
 # sweep beacon did arrive, but only after the drop phase had already overrun; "epilogue"
 # = the sweep was OBSERVED complete and the job then failed to finish its firmware tail.
 #
-# There is deliberately no "sweep" token: the sweep lane MEASURES this wave and does not
-# kill (the P50→P75 distribution it logs is what arms a calibrated sweep kill next wave),
+# There is deliberately no "sweep" token: the sweep lane MEASURES and does not
+# kill (the P50→P75 distribution it logs is what will arm a calibrated sweep kill),
 # so a job overrunning its sweep budget is still stopped by the whole-job deadline under
 # "total" — today's timing, unchanged.
 #
@@ -231,7 +231,7 @@ def _sweep_margin_s(sweep_span_s: float) -> float:
     — the five kills that read 50% were "mid-sweep or stale", indistinguishable before
     the park beacon was consumed — so no calibrated figure exists yet and inventing one
     would be a third constant with no evidence behind it. Nothing is stopped on this
-    number this wave: it only decides when a WARNING is worth emitting, and the
+    number: it only decides when a WARNING is worth emitting, and the
     distribution those warnings produce is what a calibrated floor will be set from.
     """
     return _clamped_margin_s(sweep_span_s, EJECT_DROP_MARGIN_FRAC, EJECT_DROP_MARGIN_MIN_S, EJECT_DROP_MARGIN_MAX_S)
@@ -1153,7 +1153,7 @@ async def _watch_phase_edges(
             # sweep overrun — so it is never given patience: the whole-job deadline
             # selected above stays binding here, which is today's stuck-part timing
             # unchanged, and this lane only MEASURES (no calibrated floor exists yet:
-            # the P50→P75 span had never been observed before this wave). That backstop
+            # the P50→P75 span had never been observed before this lane logged it). That backstop
             # also bounds the fabricated-late-t50 shape: a link blind from P5 that comes
             # back at P50 anchors t50 late and would otherwise hand a nearly-finished
             # sweep a whole fresh budget.
@@ -1225,7 +1225,7 @@ def matches_pending_eject(
       truthy AND unequal (the historical id check — a missing id on either side is a
       lenient match, since a standalone eject file can echo nothing / "0"); OR
     * ``subtask_name`` is truthy AND its stem does not equal ``expected_eject_stem``
-      of the pending. This closes the post-restart hole (W1/R2): after a restart the
+      of the pending. This closes the post-restart hole: after a restart the
       client's ``last_dispatch_subtask_id`` is gone, so id-matching turns lenient and
       ANY terminal would otherwise consume a HYDRATED pending and clear our gate — the
       name check re-establishes positive identity from the echoed job name.
@@ -1288,8 +1288,8 @@ class EjectDispatchError(RuntimeError):
 
 # The refusal → operator sentence map for the eject lane. The authority speaks only
 # in tokens (no English in the core — the 2026-08-20 ``slot_recheck`` precedent), so
-# the copy lives here, at the boundary that raises. WS4 folds this into the route's
-# one verdict→copy map; until then the message rides the error and the token rides
+# the copy lives here, at the boundary that raises. The route's one verdict→copy map
+# is its intended home; until then the message rides the error and the token rides
 # ``EjectDispatchError.code``, so the wire contract is already the final one.
 _EJECT_REFUSAL_MESSAGES: dict[str, str] = {
     "job_active": "Printer is running a job; wait for it to finish or stop it, then eject",
@@ -1382,7 +1382,7 @@ def _live_evidence(printer_id: int) -> Evidence:
     LEASE is the seconds-long window an eject can physically collide with, and the
     authority derives that from its own record.
 
-    The eject lane is also ungated by live HMS, deliberately (2026-08-29 W4): an
+    The eject lane is also ungated by live HMS, deliberately (2026-08-29): an
     eject is filament-less, and holding the plate behind an AMS fault would deadlock
     the very plate that holds the printer. ``z_reference`` is the deliberate exception
     and is not an HMS gate at all: it is a durable HOLD saying the machine's own
@@ -1764,7 +1764,7 @@ async def dispatch_identified_foreign_eject(*, printer_id: int, profile_id: int)
     It lives HERE, beside the dispatcher it calls, rather than in ``eject.manual``:
     with it there, the cooldown monitor had to reach into the manual-eject service at
     call time while that service imports the monitor at module load — a cycle held
-    open by a lazy import. Since the WS4 donor extraction the resolution it needs is
+    open by a lazy import. Since the donor extraction the resolution it needs is
     not the manual lane's at all: it walks :data:`AUTO_DONOR_CHAIN` — the gate-archive
     tier ALONE. The operator lane's assumed (last-farm-item) and anonymous (container)
     tiers must never reach an unattended sweep, and declaring that as a composition

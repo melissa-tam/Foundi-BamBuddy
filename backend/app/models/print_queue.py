@@ -95,7 +95,7 @@ class PrintQueueItem(Base):
     # Plate ID for multi-plate 3MF files (1-indexed, None = auto-detect/plate 1)
     plate_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    # --- Farm first-article + retry policy (Phase 3) --------------------------
+    # --- Farm first-article + retry policy ------------------------------------
     # True for the run's first-article plate: the eject block is NOT injected (the
     # part stays on the plate for inspection) and the plate-clear monitor never
     # auto-clears the gate for it. Cleared (False) on every other plate.
@@ -114,7 +114,7 @@ class PrintQueueItem(Base):
     # SET NULL so deleting the original leaves the retry standing. UNIQUE (NULLs
     # allowed) so the check-then-insert retry guard is backed by a DB constraint —
     # a race that tried to create two retries for one failure fails the second
-    # insert instead of silently double-printing (#C7 idempotency, Phase 1).
+    # insert instead of silently double-printing (#C7 idempotency).
     retry_of_id: Mapped[int | None] = mapped_column(
         ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True, unique=True
     )
@@ -178,7 +178,7 @@ class PrintQueueItem(Base):
     # by construction); resolution (terminal / reconcile) NULLs it. A timestamp
     # rather than a boolean so the startup hydrator can drop stale stamps past the
     # 24h TTL. Survives a restart between eject dispatch and eject terminal so the
-    # plate-clear gate can still auto-clear on the eject's FINISH (W1).
+    # plate-clear gate can still auto-clear on the eject's FINISH.
     eject_dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Shortest-job-first scheduling

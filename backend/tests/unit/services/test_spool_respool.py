@@ -551,7 +551,7 @@ async def test_mark_spent_ignores_non_runout_codes(db_session, printer_factory):
 # The AMS clears a drained slot's exist bit ~3 min BEFORE it declares the runout, so on a
 # natural runout the binding is ALREADY released when the evidence lands (2026-08-13, three
 # timed pairs). Requiring a live assignment made every stamp fleet-wide a silent no-op from
-# the 2026-08-10 release wave onward; these pin the resolver that survives the release.
+# 2026-08-10 onward; these pin the resolver that survives the release.
 
 _RESPOOL_LOGGER = "backend.app.services.spool_respool"
 
@@ -658,7 +658,7 @@ async def test_mark_spent_stands_aside_when_the_incumbent_was_seated_after_the_b
 ):
     """T7/T8 — the 2026-08-19 regression, inverted.
 
-    The spool-identity wave made a refill inside the ~3-minute bay-clear→HMS gap MINT a fresh
+    The 2026-08-19 spool-identity change made a refill inside the ~3-minute bay-clear→HMS gap MINT a fresh
     row and bind it ("a runout release is never a glitch"), which is correct — and it changed
     the precondition tier 1 rests on. Tier 1 resolved its victim from the LIVE assignment, so
     the runout arriving two minutes later stamped the operator's brand-new roll: probe output
@@ -756,7 +756,7 @@ async def test_a_clear_older_than_the_episode_window_leaves_tier_1_alone(db_sess
 async def test_a_debounced_roll_that_came_back_keeps_the_stamp(db_session, printer_factory):
     """T8b — the same roll re-bound after a spurious release is still tier 1's victim.
 
-    Two independent facts keep it eligible, and both are the 2026-08-19 wave's own work: the
+    Two independent facts keep it eligible, and both date from 2026-08-19: the
     de-bounce carries the incumbent's ORIGINAL bind moment forward
     (``bind_spool_to_slot(..., bind_moment=...)``), so its binding predates the clear; and its
     breadcrumb records that IT vacated this bay more recently than the stranger residue did,
@@ -1708,7 +1708,7 @@ async def test_respool_prompt_payload_carries_provenance(db_session, printer_fac
     remain %, the ledger-implied remain %, and when the roll became bound."""
     printer = await printer_factory()
     # Spent, loaded, NOT dismissed, and NO brand anywhere: Tier 2's conclusion stands but
-    # cannot be executed, which is the one arm that still raises this prompt (WS3).
+    # cannot be executed, which is the one arm that still raises this prompt.
     donor = await _make_donor(db_session, spent=True, weight_used=990.0)  # ledger 1% of a 1000 g label
     await _clear_respool_brands(db_session)
     await db_session.commit()
@@ -2942,7 +2942,7 @@ async def test_rebroadcast_noop_in_spoolman_mode(db_session, printer_factory, mo
     assert sent == []
 
 
-# -- WS3: Tier 2 CONCLUDES on a reused core; it never asks --------------------
+# -- Tier 2 CONCLUDES on a reused core; it never asks -------------------------
 
 
 @pytest.mark.asyncio
@@ -3000,7 +3000,7 @@ async def test_gate_spent_but_not_loaded_still_concludes_nothing(db_session, pri
     assert (await db_session.get(Spool, donor.id)).archived_at is None  # donor untouched
 
 
-# -- W3: firmware slot attribution outranks tray_now/mapping inference ----------
+# -- Firmware slot attribution outranks tray_now/mapping inference --------------
 
 
 @pytest.mark.asyncio
@@ -3072,7 +3072,7 @@ async def test_resolve_8011_prefers_current_demand_over_first_decode_hit(db_sess
     assert (await db_session.get(Spool, rescued.id)).spent_at is None  # first-hit target untouched
 
 
-# -- Fix 1: the firmware AUTO-SWITCH runout (a RESCUED runout stamps spent too) --
+# -- The firmware AUTO-SWITCH runout (a RESCUED runout stamps spent too) ---------
 # ``RUNOUT_HMS_CODES`` is the UNRESCUED vocabulary, so a successful AMS auto-refill
 # raised only the slot-attributed 0700_2X00 family and stamped nothing (fleet evidence
 # 2026-07-30: four confirmed auto-refills, zero stamps). The un-stamped rows then
@@ -3238,7 +3238,7 @@ async def test_pullback_then_auto_switch_same_slot_stamps_once(db_session, print
     assert (await db_session.get(Spool, exhausted.id)).spent_at == stamped_at
 
 
-# -- WS2b: the DURABLE, incident-anchored stamp for HELD runouts ---------------
+# -- The DURABLE, incident-anchored stamp for HELD runouts ---------------------
 #
 # Every lane above rides an ``hms_edges`` APPEARANCE edge, and those are ephemeral by
 # construction: the first frame a process consumes seeds instead of edging, so a deploy
@@ -3271,7 +3271,7 @@ _SILENT_TRAY: dict = {}  # a partial push asserting neither state nor type → p
 async def test_runout_hold_stamp_stamps_wire_empty_slot(db_session, printer_factory, own_session_factory, caplog):
     """The 003-H2S shape: the demanded slot reads wire-asserted EMPTY (its bay cleared
     minutes before the firmware admitted why), and the roll that was released from it is
-    the victim — resolved through WS1's tier 2, not a live binding."""
+    the victim — resolved through tier 2, not a live binding."""
     printer = await printer_factory()
     spool = await _seed_released_row(db_session, printer.id, 0, 3, weight_used=990.0)
 
@@ -3600,7 +3600,7 @@ async def test_slot_runout_ams_ht_attr_fails_closed(db_session, printer_factory)
     assert (await db_session.get(Spool, spool.id)).spent_at is None
 
 
-# -- Fix 2: Path B per-push sampling + the deleted open-time absence veto --------
+# -- Path B per-push sampling + the deleted open-time absence veto ---------------
 # The backup-swap detector used to hang off the AMS-change callback, which fires only
 # on an AMS HASH change — and tray_now is deliberately not hashed. The switch therefore
 # became visible only when the drained slot's exist-bit wipe moved the hash, and at that

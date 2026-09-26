@@ -8,7 +8,7 @@ resurrection then happened on seven printers in one evening.
 The mechanism was an interaction, not a bug in any one lane. The AMS clears a drained
 slot's exist bit ~3 MINUTES BEFORE it declares the runout (the tail is still traversing the
 feed path — three timed pairs that day: 03:55:46 → 03:58:20, 06:41:47 → 06:44:44,
-07:02:52 → 07:05:33). Since the 2026-08-10 wave made bit-clear releases fire reliably,
+07:02:52 → 07:05:33). Since bit-clear releases fire reliably (2026-08-10),
 every natural runout's binding is therefore GONE by the time the exhaustion evidence lands
 — and the spent writer required a live binding, so all three stamp lanes became silent
 no-ops, while the release's ``last_location_*`` residue is exactly what the reclaim lane
@@ -522,7 +522,7 @@ async def test_gap_refill_debounces_then_self_heals_on_the_spent_stamp(
     lands, tier 1 stamps the row now bound to the slot, and the very next push hits row 4a
     with a cycle still pending: ``REPLACE_SPENT``, one second, no operator action.
 
-    Before this wave the prompt lane discarded that cycle the moment it found the slot
+    The prompt lane used to discard that cycle the moment it found the slot
     unbound, so the stamp landed on a latch nothing could release and the slot parked until
     a human pulled and re-seated the roll (CLAUDE.md's 2026-08-13 gotcha (b)).
     """
@@ -725,9 +725,9 @@ async def test_a_refill_inside_the_gap_never_takes_the_drained_rolls_spent_stamp
     """The other half of ⑥: the runout HMS arrives once the fresh roll is ALREADY bound.
 
     ⑥ proves the refill mints its own row. This proves the exhaustion evidence that follows
-    still names the roll that ran dry — the regression the spool-identity wave shipped, and a
-    textbook case of a wave changing a lane's precondition without re-checking the consumer
-    (memory ``liveness-paired-verification``; the 08-13 wave starved every spent stamp the
+    still names the roll that ran dry — the 2026-08-19 regression, and a
+    textbook case of a change altering a lane's precondition without re-checking the consumer
+    (memory ``liveness-paired-verification``; the 2026-08-13 regression starved every spent stamp the
     same way). ``_mark_tray_spent`` tier 1 reads the LIVE assignment, so with a fresh row
     bound it stamped that: probe output ``FRESH spent_at: 2026-08-20 10:29:14 used: 0.0`` /
     ``DRAINED spent_at: None used: 900.0``. A brand-new roll reading 0 g remaining is

@@ -328,7 +328,7 @@ async def claim_pending_for_dispatch(
 
     ``printer_id`` is the printer THIS dispatch is running on, and this write is where
     the column changes meaning. On a ``pending`` row ``printer_id`` is an operator PIN
-    and nothing else (2026-09-04 pool-target wave; the four target kinds and the
+    and nothing else (the four target kinds and the
     invariant live in ``services/dispatch_target.py``). From this write on it is the
     RECORD of the printer the dispatch actually ran on: for a PINNED unit the two are
     the same value, and for a POOL unit — one targeting a model or a printer subset —

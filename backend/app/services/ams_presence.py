@@ -9,17 +9,15 @@ spool inserted while idle or mid-print that the firmware never auto-reads:
 
 * :func:`on_tray_observations` — presence-transition tracking, called from
   ``printer_manager._run_slot_pipeline_pass`` on the RAW observation stream, one pass
-  ahead of the slot pipeline that resolves the same push (E1, 2026-08-07: the merged
-  lane could be BLIND to a genuine insert, so presence edges moved to the lane that
-  already owns identity). A genuine presence
-  GAIN is a CHANGE: it records the physical cycle that becomes the discovery lane's
-  evidence, and while the printer is idle it immediately spends that evidence on one
-  read so a Bambu spool resolves via the normal tag path within seconds. It NEVER
-  prompts: a
-  tagless spool is now silently minted/configured by ``services.spool_tagless``
-  (there is no more ``new_spool_detected`` event). A presence LOSS only updates
-  the last-presence map — NO silent auto-unassign (a spool pulled for drying keeps
-  its assignment and gram history).
+  ahead of the slot pipeline that resolves the same push (the merged lane can be BLIND
+  to a genuine insert, 2026-08-07, so presence edges ride the lane that owns
+  identity). A genuine presence GAIN is a CHANGE: it records the physical cycle that
+  becomes the discovery lane's evidence, and while the printer is idle it immediately
+  spends that evidence on one read so a Bambu spool resolves via the normal tag path
+  within seconds. It NEVER prompts: a tagless spool is silently minted/configured by
+  ``services.spool_tagless`` (there is no ``new_spool_detected`` event). A presence
+  LOSS only updates the last-presence map — NO silent auto-unassign (a spool pulled
+  for drying keeps its assignment and gram history).
 
 * :func:`on_printer_terminal` — the NEED-DRIVEN reconcile sweep, called from
   ``main.on_print_complete`` (skipped for eject-job terminals). Production runs are
@@ -29,7 +27,7 @@ spool inserted while idle or mid-print that the firmware never auto-reads:
 
   - ``"rfid_refresh"`` — the slot is live-tagged, or DB-bound to a spool that carries a
     tag identity, AND a read OCCASION is open for it. The read SUCCEEDS and restores
-    ``remain`` (rule 8's wire truth for a tagged row, which the W6 ledger-decrease
+    ``remain`` (rule 8's wire truth for a tagged row, which the ledger-decrease
     repair has nothing to work from without). A healthy tagged slot publishes ``remain``
     on every ordinary AMS push, so the occasion — a qualified physical cycle, or the
     terminal's between-prints policy (:func:`_terminal_read_occasion`: wire remain
@@ -45,8 +43,8 @@ spool inserted while idle or mid-print that the firmware never auto-reads:
     read. A commanded RFID read on a slot with no tag can only fail, and the firmware
     reports that failure as HMS ``0700_2X00_0001_0081`` / ``0700_4025`` ("the AMS main
     board may be malfunctioning") — which can NEVER self-clear on a tagless slot.
-    Re-reading untouched tagless slots after every print was the standing-error
-    factory this module previously was; it is gone.
+    Re-reading untouched tagless slots after every print is the standing-error
+    factory doctrine rule 5 forbids.
 
   Results flow the normal RFID pipeline; this module does not duplicate it.
 
@@ -120,8 +118,8 @@ _last_presence: dict[tuple[int, int, int], bool] = {}
 # (printer_id, ams_id, tray_id) -> time.monotonic() at which the slot last went
 # PRESENT→ABSENT. On a later genuine GAIN the elapsed absence tells a real physical
 # roll swap (≥ _MIN_PHYSICAL_ABSENT_S) apart from the runout-instant state flap that
-# a firmware backup switch produces (sub-second). Drives the W1 spent-binding latch
-# release / W5 fresh-roll prompt via spool_tagless.note_physical_cycle.
+# a firmware backup switch produces (sub-second). Drives the spent-binding latch
+# release / fresh-roll prompt via spool_tagless.note_physical_cycle.
 _absent_since: dict[tuple[int, int, int], float] = {}
 
 # A physical roll swap keeps the slot empty for at least this long (pull the old
@@ -164,7 +162,7 @@ _absent_under_identify: dict[tuple[int, int, int], bool] = {}
 # (printer_id, ams_id, tray_id) -> whether the slot was the ACTIVE FEEDER of a LIVE
 # print at the PRESENT→ABSENT edge (:func:`_slot_was_active_feeder`, evaluated at that
 # edge while the wire evidence is freshest). The third stamp beside the two above, and
-# the reason it exists is the ~3-minute gap the 2026-08-13 wave measured: **the AMS
+# the reason it exists is the ~3-minute gap measured 2026-08-13: **the AMS
 # clears a drained slot's exist bit ~3 min BEFORE it declares the runout**. Inside that
 # gap the departed row is released but not yet ``spent_at``-stamped, so nothing in the
 # de-bounce donor query excludes it and a refill made during the gap would re-bind the
@@ -514,7 +512,7 @@ def _identify_explains_absence(printer_id: int, ams_id: int, tray_id: int) -> bo
     PRESENT again: a gain whose preceding absence clears the ≥ ``_MIN_PHYSICAL_ABSENT_S``
     flap filter yet moved no roll. Recorded at the PRESENT→ABSENT edge (where the signal
     is freshest) and re-checked at the GAIN edge, so such a gain is never banked as a
-    QUALIFIED physical cycle — the discovery / W1-mint / FIFO-restamp evidence a HUMAN
+    QUALIFIED physical cycle — the discovery / spent→mint / FIFO-restamp evidence a HUMAN
     roll swap leaves. This narrows what counts as a human roll movement; it never widens
     it, and it never overrides the ≥5 s duration filter — the two gate the gain together.
 
@@ -565,7 +563,7 @@ def _identify_explains_gain(
     The suppression is BY CAUSE and never by duration (doctrine rule 6 / invariant 6):
     an edge with a machine explanation is disqualified however long its absence ran, and
     an edge with none is judged on the ordinary ≥5 s flap filter alone. Four causes, each
-    closing a leak the 2026-07-21 wave left open:
+    closing a leak the 2026-07-21 identify filter left open:
 
     a. an identify is explaining the absence RIGHT NOW — the slot-scoped echo flag or the
        unit's live ``AMS_STATUS_IDENTIFYING`` (:func:`_identify_explains_absence`, kept
@@ -1297,20 +1295,18 @@ async def broadcast_standing_unknown(
       i.e. the farm no longer knows whether the roll it thinks it has is there;
     * ``_age_spent_swap_park`` (``case="spent_swap_park"``, 2026-08-19) — a SPENT binding
       under a tray that IS answering (present and configured) with no qualified cycle and
-      no answered read to release the W1 latch, so ``slot_state`` row 4a keeps returning
+      no answered read to release the spent latch, so ``slot_state`` row 4a keeps returning
       ``spent_latch`` and the slot parks silently forever.
 
     They are siblings, not one lane with a flag: their predicates are opposite on
     spent-ness, on presence and on configuration, and only the SURFACE is shared so the
     console keeps one vocabulary for "this slot is standing unresolved". ``case`` is
     REQUIRED and names WHAT is unresolved so the frontend can word the toast for the
-    situation rather than for the event; the owed-read lane that used to pass a third case
-    is log-only now (:func:`_warn_owed_read_blocked`).
+    situation rather than for the event; the owed-read lane is log-only
+    (:func:`_warn_owed_read_blocked`).
 
-    NO dedup here, deliberately. The hourly per-slot gate this function used to carry
-    existed to fold two lanes' toasts into ONE signal for one physical slot by TIME; both
-    surviving lanes pace themselves by EPISODE instead, which is stricter and honest about
-    who owns the pacing — the presence ladder needs a full ladder (maturity at 900 s, then
+    NO dedup here, deliberately: both lanes pace themselves by EPISODE, which is stricter
+    than a per-slot time gate and honest about who owns the pacing — the presence ladder needs a full ladder (maturity at 900 s, then
     +600 s and +3600 s) to reach its rung, and the park alerts exactly once for as long as
     the same spent row holds the same seated slot. A gate that can never fire is a lie
     about where the pacing lives.
@@ -1348,8 +1344,7 @@ def _warn_owed_read_blocked(printer_id: int, ams_id: int, tray_id: int, blocker:
     the whole window — the 2026-07-25 shape, where the read stayed owed for six hours
     behind a permanently-engaged extruder and said nothing.
 
-    LOG-ONLY: the operator ruling of 2026-08-11 demoted the toast this lane used to raise,
-    because the mid-job blocker is non-actionable — the read physically cannot run until
+    LOG-ONLY (operator ruling 2026-08-11), because the mid-job blocker is non-actionable — the read physically cannot run until
     the printer idles, so a toast could only nag someone who has nothing to do about it.
     79 of the 80 firings in the week before the ruling carried exactly that blocker (38 in
     one day, across four printers, after ordinary roll swaps). Nothing is broken meanwhile:
@@ -1485,12 +1480,10 @@ _NO_TAG_ANSWER_SETTLE_S = 15.0
 def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_seated: bool, tray_bare: bool) -> bool:
     """Hardware evidence that the seated object is NOT the bound tagged roll.
 
-    The other half of the 2026-08-07 spool 226 deadlock. The owed discovery read DID
-    eventually fire (20:03 prod) and answered NO TAG — the expected answer for the tagless
-    roll the operator had inserted — and nothing consumed it: the tray stayed bare, so the
-    tagless lane's row 4 was unreachable, and the slot parked with the spent tagged binding
-    forever. This is the accessor that turns that silence into a fact the decision table can
-    conclude on (``spent_swap_no_tag_read``).
+    Turns an answered no-tag read into a fact the decision table can conclude on
+    (``spent_swap_no_tag_read``). Unconsumed, that answer — the expected one for a tagless
+    roll — leaves the tray bare, the tagless lane's row 4 unreachable and the slot parked
+    with the spent tagged binding forever (2026-08-07, spool 226).
 
     True iff ALL of:
 
@@ -1502,8 +1495,8 @@ def read_answered_no_tag(printer_id: int, ams_id: int, tray_id: int, *, tray_sea
       a different one in makes it an answer about an object that is no longer there. This is
       an invalidation BY CAUSE, which is the only kind rule 7 permits — expressly NOT an age
       ceiling, because a duration can decide no identity and a slot nobody has touched for a
-      week still holds a perfectly good answer. It matters because the 2026-08-19 wave
-      widened the consumers of this predicate from one (row 5a, spent + tagged + bare) to
+      week still holds a perfectly good answer. It matters because the consumers of this predicate
+      widened (2026-08-19) from one (row 5a, spent + tagged + bare) to
       every binding quadrant, so a stamp that used to reach almost nothing now reaches an
       operator's own hand-assigned row. Note the pairing with :func:`close_answered_read`,
       which POPS the cycle on the pass that consumes an answer: an answered read therefore
@@ -1586,10 +1579,9 @@ def close_answered_read(printer_id: int, ams_id: int, tray_id: int, *, tray_seat
     """A commanded read that answered NO TAG closes the entitlements that bought it.
 
     "No tag" is an ANSWER, not a failure to answer — for a tagless roll it is the only
-    answer there is — and an answered question must stop being a reason to ask. Before
-    this, exactly one consumer concluded on it (``slot_state`` row 5a, spent + TAGGED
-    bindings) and every other constellation went on re-earning reads from the same
-    evidence. The loop is self-feeding, which is what made it expensive: an identify
+    answer there is — and an answered question must stop being a reason to ask, in every
+    binding constellation, or each one re-earns reads from the same evidence. That loop
+    is self-feeding, which is what makes it expensive: an identify
     cycle flaps the tray present→9→present, and any flap the echo-swallow and the
     identify-explains suppression do not catch is banked as a fresh qualified gain — a
     new cycle AND a new occasion, manufactured by the read itself (2026-08-07: 419
@@ -1675,7 +1667,7 @@ def is_expected_read_failure(printer_id: int, attr: int, code: int) -> bool:
 
 
 async def on_tray_observations(printer_id: int, observations: list[TrayObservation], db: AsyncSession) -> None:
-    """Track presence transitions for a printer's AMS trays, from the RAW push (E1).
+    """Track presence transitions for a printer's AMS trays, from the RAW push.
 
     Called from ``printer_manager._run_slot_pipeline_pass`` with the observations of
     ONE raw push and an open session, immediately BEFORE ``run_slot_pipeline`` resolves
@@ -1684,23 +1676,19 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
     refills are handled by the terminal sweep). Never raises — a farm-side failure must
     never break the AMS callback chain.
 
-    WHY THE RAW LANE (2026-08-07, 001-H2S slot 1). Presence edges used to be fed from
-    ``main.on_ams_change`` with the MERGED payload, which runs only when bambu_mqtt's
-    change hash flips — and the merged view can be BLIND: a stale ``tray_exist_bits``
-    cache demoted a genuinely inserted roll back to "empty" on every push for 38
-    minutes, so the operator's insert AND their pull+reinsert produced NO edges at all
-    (no qualified cycle, no read occasion, no FIFO stamp) while the raw observation
-    lane — which has owned identity and binding since the 2026-08-02 cutover — saw the
-    roll the whole time. That cutover moved identity to the raw lane but left presence
-    behind; this finishes it. Edges and binding decisions now read the SAME push, so
-    they can no longer disagree about what the wire said, and the merged lane keeps
-    display + ledger-consumer duties only.
+    WHY THE RAW LANE. The MERGED payload (``main.on_ams_change``) runs only when
+    bambu_mqtt's change hash flips, and the merged view can be BLIND: a stale
+    ``tray_exist_bits`` cache demoted a genuinely inserted roll to "empty" on every push
+    for 38 minutes (2026-08-07, 001-H2S slot 1), so the operator's insert AND their
+    pull+reinsert produced NO edges at all (no qualified cycle, no read occasion, no
+    FIFO stamp) while the raw observation lane, which owns identity and binding, saw the
+    roll the whole time. Edges and binding decisions read the SAME push, so they cannot
+    disagree about what the wire said; the merged lane keeps display + ledger-consumer
+    duties only.
 
-    PRESENCE IS TRI-STATE HERE, and that is new-and-correct rather than a port defect.
-    The merged lane's ``_tray_present`` answered a BOOLEAN for every tray, so "this push
-    said nothing about the slot" was indistinguishable from "the slot is empty" and a
-    reduced mid-print push could manufacture a loss edge out of silence.
-    ``obs.present is None`` now means UNKNOWN: the tray's presence duties are skipped
+    PRESENCE IS TRI-STATE HERE. A BOOLEAN presence cannot tell "this push said nothing
+    about the slot" from "the slot is empty", so a reduced mid-print push would
+    manufacture a loss edge out of silence. ``obs.present is None`` means UNKNOWN: the tray's presence duties are skipped
     entirely — ``_last_presence`` is left exactly as it was and NO edge is derived, so a
     later real edge still has an honest ``prev`` to compare against. Unknown never
     manufactures an edge (the doctrine's gate-on-``is False``-only rule, applied to
@@ -1712,9 +1700,8 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
     first APPEARS in a LATER partial with ``prev`` unset and ``present is True`` is a
     genuine gain whose absence START was never observed: ``absent_at`` is None, so it
     takes the existing ``qualified=True, physical_cycle=False`` path — it OPENS a read
-    occasion but banks no measured cycle. That closes the boot-seeding hole (such a
-    gain used to fire nothing at all) without letting an unmeasured absence mint a
-    spool row or prompt the operator.
+    occasion but banks no measured cycle, so a boot-time gain still earns its read
+    without letting an unmeasured absence mint a spool row or prompt the operator.
     """
     try:
         is_first = printer_id not in _primed
@@ -1902,7 +1889,7 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
                             tray_id,
                         )
 
-                    # W1/W5 spent-binding-latch release + fresh-roll prompt fire ONLY on
+                    # Spent-binding-latch release + fresh-roll prompt fire ONLY on
                     # the STRICT ``physical_cycle`` (a MEASURED >= 5 s absence). Minting a
                     # spool row or prompting on a false positive is expensive, so the
                     # unknown-duration case is deliberately excluded here. Guarded like
@@ -1964,13 +1951,13 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
             # by which time the slot is emitting steady-state pushes. Non-destructive to
             # the row-5a conclusion the pipeline draws from the same fact one step later.
             #
-            # BARE-NESS IS THE RFID PAIR, and nothing else (2026-08-20). This lane used to
-            # hand over ``tray_identity_asserted``, which ALSO counts ``tray_type`` and
-            # ``tray_info_idx`` — so for the commonest physical shape on this fleet (a
+            # BARE-NESS IS THE RFID PAIR, and nothing else (2026-08-20). NOT
+            # ``tray_identity_asserted``, which ALSO counts ``tray_type`` and
+            # ``tray_info_idx`` — for the commonest physical shape on this fleet (a
             # third-party PETG roll: ``tray_type: "PETG"``, ``tray_info_idx: "GFG02"``,
-            # ``tag_uid: null`` — scenario G7) the close lane could never fire: the
-            # entitlements stayed unspent, ``_physical_cycle_at`` / ``_read_occasion_at``
-            # lingered, and the next ``rfid_refresh`` read on a chipless tray raised an
+            # ``tag_uid: null`` — scenario G7) the close lane would never fire: the
+            # entitlements stay unspent, ``_physical_cycle_at`` / ``_read_occasion_at``
+            # linger, and the next ``rfid_refresh`` read on a chipless tray raises an
             # UNSUPPRESSED ``0700_0081`` that can never self-clear (invariant 4). The
             # question this predicate answers is "did the read find a CHIP?", and only the
             # atomic tag/uuid pair can answer it — configuration is what the farm or the
@@ -2043,7 +2030,7 @@ async def _terminal_read_occasion(
       ``remain`` (the full RFID data read did not complete: the tray reports ``-1`` /
       nothing, often together with no ``tag_uid`` at all) or the ledger has run PAST the
       label. Doctrine rule 8 makes wire remain% the truth for a tagged row, and
-      ``usage_tracker.maybe_reconcile_tagged_ledger_decrease`` (the W6 auto-repair) has
+      ``usage_tracker.maybe_reconcile_tagged_ledger_decrease`` (the auto-repair) has
       nothing to repair FROM until that read lands — which is how a live spool reached
       1899.9 g used against a 1000 g label. A healthy tagged slot publishes ``remain`` on
       every ordinary AMS push, so it needs no commanded read at all: that routine refresh

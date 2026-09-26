@@ -1,4 +1,4 @@
-"""Dispatch-time failures must enter farm policy (Phase 1, R5).
+"""Dispatch-time failures must enter farm policy.
 
 `_start_print`'s pre-print failure sites route through
 `PrintScheduler._fail_queue_item`, which marks the item terminally failed AND
@@ -117,7 +117,7 @@ class TestFailQueueItemHook:
         assert (await db_session.get(PrintQueueItem, waiting.id)).position == 2
 
     async def test_clears_stale_waiting_reason_on_failure(self, db_session):
-        """W4b: a dispatch-time failure NULLs a stale hold token in the SAME update
+        """A dispatch-time failure NULLs a stale hold token in the SAME update
         that sets the terminal status (on_terminal mocked to isolate this clear)."""
         item = PrintQueueItem(printer_id=5, status="printing", plate_id=1, position=1, waiting_reason="no_usb_drive")
         db_session.add(item)

@@ -1,4 +1,4 @@
-"""SKU catalog domain logic (Phase 2).
+"""SKU catalog domain logic.
 
 Pure, unit-testable helpers for:
 - auto-suggesting a SKU code/part-number/name from a file's object names and

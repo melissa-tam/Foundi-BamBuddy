@@ -1,4 +1,4 @@
-"""Tests for ``plate_occupancy`` — the plate + printer-ownership authority (WS1).
+"""Tests for ``plate_occupancy`` — the plate + printer-ownership authority.
 
 Named after the incidents they pin, so a future triage that reproduces one of
 these shapes finds the test by grepping the date or the symptom:

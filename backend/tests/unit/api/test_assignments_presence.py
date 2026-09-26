@@ -1,4 +1,4 @@
-"""GET /inventory/assignments — the additive tri-state ``present`` field (W4).
+"""GET /inventory/assignments — the additive tri-state ``present`` field.
 
 An assignment row is a LOCATION CLAIM, not evidence that a roll is in the slot.
 Five prod slots proved the gap (003-T2 spool 140 at 932 g bound to a tray the

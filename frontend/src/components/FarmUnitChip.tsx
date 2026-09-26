@@ -1,5 +1,5 @@
 /**
- * FarmUnitChip (Phase 3, F2) — on a printer card, explains why the printer is
+ * FarmUnitChip — on a printer card, explains why the printer is
  * doing (or blocked on) farm work without opening the run detail.
  *
  * Renders the owning run as a link to its detail page plus ONE status line: the

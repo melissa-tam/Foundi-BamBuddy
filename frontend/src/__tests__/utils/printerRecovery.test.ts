@@ -4,7 +4,7 @@
  * banner, confirm dialog), so these pin the whole vocabulary rather than the
  * shape of any one of them.
  *
- * The case that started the wave: printer 011-H2S sat with an escalated
+ * The case behind this util: printer 011-H2S sat with an escalated
  * `physical` row, no quarantine, no plate gate, no lease and no eject — every
  * pre-util predicate said "nothing to recover" while the backend verb was the
  * only thing that could close the row. `equipment_fault` therefore comes from

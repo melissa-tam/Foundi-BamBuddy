@@ -309,14 +309,14 @@ def env(monkeypatch) -> _Env:
 
 
 def _summary(caplog) -> str:
-    """The ONE end-of-cooldown line — the record the whole wave is measured by."""
+    """The ONE end-of-cooldown line — the record the cooldown prep is measured by."""
     lines = [r.getMessage() for r in caplog.records if "cooldown ended after" in r.getMessage()]
     assert len(lines) == 1, f"expected exactly one summary line, got {lines}"
     return lines[0]
 
 
 def _boost_lines(caplog) -> list[str]:
-    """Every ``chamber boost ended`` line — THE measurement this wave exists to take."""
+    """Every ``chamber boost ended`` line — THE measurement the cooldown prep exists to take."""
     return [r.getMessage() for r in caplog.records if "chamber boost ended" in r.getMessage()]
 
 
@@ -1170,7 +1170,7 @@ class TestEnd:
         assert "cooldown ended after" in caplog.text
 
     async def test_summary_line_shape_when_the_plate_was_held(self, env, caplog):
-        """The ONE greppable line the wave is measured by, pinned whole. Every other
+        """The ONE greppable line the cooldown prep is measured by, pinned whole. Every other
         summary assertion in this file reads a FIELD of it — one whole-string pin is
         enough to own the shape, and more would make the format unchangeable."""
         env.manager.fan = 100
@@ -1187,7 +1187,7 @@ class TestEnd:
         )
 
     async def test_the_summary_names_the_boost_window_it_measured(self, env, caplog):
-        """THE number this wave exists to take: how long the exhaust needed to bring the
+        """THE number the cooldown prep exists to take: how long the exhaust needed to bring the
         chamber air to the eject line. Unmeasured before production, so the line is the
         instrument."""
         with caplog.at_level(logging.INFO, logger=cooldown_prep.__name__):

@@ -4,7 +4,7 @@
 `reseat_within_window` directly. That proves the table branches correctly and proves nothing
 about whether the pipeline ever computes those booleans as True — and a predicate that never
 fires is indistinguishable from one that is working, which is the exact failure class this
-whole wave exists to close (memory `liveness-paired-verification`).
+file exists to close (memory `liveness-paired-verification`).
 
 So these cases drive `run_slot_pipeline` and seed only what the WIRE would have produced:
 the presence lane's loss→gain ledger and, for the post-HMS arm, a real `PrinterIncident` row.
@@ -324,8 +324,8 @@ async def test_a_short_uncaused_absence_still_de_bounces(db_session, printer_fac
     """T1 — the liveness arm. The lane's ONE real job must still fire end to end.
 
     Deliberately first in the file: every case below asserts a MINT, and a suite of
-    absence assertions is exactly how the 2026-08-07 wave shipped a starved deadlock
-    that its own metrics called a cured storm.
+    absence assertions is exactly how a starved deadlock shipped on 2026-08-07
+    while its own metrics called it a cured storm.
     """
     printer = await printer_factory()
     donor = await _departed_roll(db_session, printer.id, 0, 3)
@@ -380,7 +380,7 @@ async def test_an_idle_swap_inside_the_window_de_bounces_and_that_cost_is_accept
 
 @pytest.mark.asyncio
 async def test_a_refill_inside_the_gap_mints_when_the_slot_was_feeding(db_session, printer_factory):
-    """T7 — the hole this wave exists to close, and the case scoping ALONE made worse.
+    """T7 — the hole this cause filter exists to close, and the case scoping ALONE made worse.
 
     The AMS clears a drained slot's exist bit ~3 min BEFORE it declares the runout, so the
     departed row is released but not yet spent and the `spent_at` filter is blind. The

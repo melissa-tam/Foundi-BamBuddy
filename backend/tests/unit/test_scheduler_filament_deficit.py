@@ -856,7 +856,7 @@ async def test_every_send_carries_the_item_dedup_key(scheduler, db_session, queu
 
 
 class TestUnreadHoldDispatchOutcome:
-    """WS4-D2: an uncovered requirement + a seated-but-UNIDENTIFIED tray is a
+    """An uncovered requirement + a seated-but-UNIDENTIFIED tray is a
     "read the slot" outcome, not a "stage the job" one.
 
     The verified production shape: 12 fleet trays held rolls in state 10/11 with no

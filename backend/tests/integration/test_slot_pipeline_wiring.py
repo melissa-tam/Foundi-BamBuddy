@@ -1,4 +1,4 @@
-"""The W3b wiring: RAW AMS push → MQTT client hook → printer_manager → slot pipeline.
+"""The wiring: RAW AMS push → MQTT client hook → printer_manager → slot pipeline.
 
 The pipeline's decisions are pinned by ``test_slot_pipeline.py`` and the table by
 ``test_slot_state.py``. What is pinned HERE is the thing neither of those can see: that

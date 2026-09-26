@@ -410,14 +410,14 @@ class PrinterManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         # Track who started the current print (Issue #206)
         self._current_print_user: dict[int, dict] = {}  # {printer_id: {"user_id": int, "username": str}}
-        # Printers quarantined by the farm failure policy (Phase 3). DB-backed
+        # Printers quarantined by the farm failure policy. DB-backed
         # (printers.quarantined) is the source of truth; this set is the fast
         # in-memory cache the synchronous scheduler idle-gate consults. Kept in
         # sync by farm_policy / the clear-quarantine route via set_quarantined,
         # and rehydrated from the DB on startup via load_quarantine_from_db().
         self._quarantined: set[int] = set()
-        # Printers whose device-reported model differs from the registered model
-        # (Phase 2). In-memory only ({printer_id: reason}) — re-derived from the
+        # Printers whose device-reported model differs from the registered model.
+        # In-memory only ({printer_id: reason}) — re-derived from the
         # live device report on every connected edge, so no DB persistence is
         # needed. The synchronous scheduler idle-gate consults it like quarantine.
         self._model_mismatch: dict[int, str] = {}
@@ -1204,7 +1204,7 @@ def resolve_plate_id(state) -> int | None:
 
 def _eject_watch_payload(printer_id: int | None) -> dict | None:
     """``{"threshold_c": t, "hold_z": z, "deferred": b}`` for the printer's in-flight eject
-    cooldown watch, or None when no watch is COOLING (Phase 4.3c).
+    cooldown watch, or None when no watch is COOLING.
 
     ``threshold_c`` is the eject line the watch armed with — measured shop air plus the
     one margin (``services/eject/shop_air``) — and is None on a cooling watch when shop
@@ -1299,7 +1299,7 @@ def open_incident_payload(printer_id: int | None) -> dict | None:
     """The printer's highest-precedence OPEN incident as a wire dict, or None.
 
     ``{id, kind, status, slot_desc, created_at, operator_exits}`` — a projection of the
-    durable row, read from the incident store's in-memory cache (WS2b). A cache miss
+    durable row, read from the incident store's in-memory cache. A cache miss
     renders no chip and can never invent a hold.
 
     PUBLIC, and ONE builder for all three construction sites (the WS serializer below
@@ -1652,11 +1652,11 @@ def printer_state_to_dict(
         # "Clear Plate" button only appears when the 30 s REST fallback poll runs.
         "awaiting_plate_clear": printer_manager.is_awaiting_plate_clear(printer_id) if printer_id else False,
         "quarantined": printer_manager.is_quarantined(printer_id) if printer_id else False,
-        # Device-vs-declared model mismatch (Phase 2): blocks farm dispatch and
+        # Device-vs-declared model mismatch: blocks farm dispatch and
         # drives the printer-card banner. reason is null when there is no mismatch.
         "model_mismatch": printer_manager.is_model_mismatch(printer_id) if printer_id else False,
         "model_mismatch_reason": printer_manager.model_mismatch_reason(printer_id) if printer_id else None,
-        # Cooldown/eject phase (Phase 4.3c): the in-flight eject cooldown watch's
+        # Cooldown/eject phase: the in-flight eject cooldown watch's
         # release threshold, so the UI can render "Cooling to T °C (bed B °C)"
         # instead of an opaque plate hold. Null when no watch (or an
         # escalation-only watch) is armed. Lazy import: the monitor imports this
@@ -1667,7 +1667,7 @@ def printer_state_to_dict(
         # whether an eject is in flight and has actually started. STORED fields only —
         # see occupancy_payload for why there is no owner here.
         "occupancy": occupancy_payload(printer_id),
-        # Open incident (WS2b): {id, kind, status, slot_desc, created_at,
+        # Open incident: {id, kind, status, slot_desc, created_at,
         # operator_exits} or null. Same builder as BOTH /status branches.
         # A FOREIGN print's hold has no queue row and therefore no waiting_reason
         # chip anywhere in the UI — this is the only place it can be seen. Read from

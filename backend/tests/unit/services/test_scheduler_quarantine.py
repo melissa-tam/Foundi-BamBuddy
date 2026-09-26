@@ -1,4 +1,4 @@
-"""Scheduler must exclude quarantined printers from dispatch (Phase 3)."""
+"""Scheduler must exclude quarantined printers from dispatch."""
 
 from types import SimpleNamespace
 

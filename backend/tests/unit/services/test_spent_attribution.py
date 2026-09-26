@@ -1,5 +1,5 @@
 """Spent-attribution safety: the topology gate, the backup-swap corroboration,
-the contradiction detector, and ledger-corrupt-aware prompts (WS3).
+the contradiction detector, and ledger-corrupt-aware prompts.
 
 The incident these pin: spools 185 and 205 on printer 12 — an H2C running THREE AMS
 units behind a dual nozzle — were stamped SPENT on 2026-07-31 with ``weight_used = 0``

@@ -514,7 +514,7 @@ async def test_retry_gives_up_loudly_when_the_file_is_gone(db_session, printer_f
 
 
 # ---------------------------------------------------------------------------
-# Charge liveness — the claim the whole wave exists for
+# Charge liveness — the claim this file exists for
 # ---------------------------------------------------------------------------
 
 

@@ -1,5 +1,5 @@
 /**
- * SKU catalog page (farm production, Phase 2).
+ * SKU catalog page (farm production).
  *
  * Full CRUD over SKUs (sellable part codes) plus per-SKU file-link management.
  * In create mode, picking a file in the add-row (or arriving via the

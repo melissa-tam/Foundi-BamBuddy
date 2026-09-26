@@ -265,8 +265,8 @@ Z_REFERENCE_FEED_MM_MIN = 1200
 # _6_Half_Shell_PCO-M18-2656_top_surface_gcode.3mf → Metadata/plate_3.gcode), the
 # segment from the feedrate/acc/time resets through the final `M73 P100 R0`.
 #
-# The eject sweep is now a STANDALONE, server-dispatched motion-only job whose file
-# REPLACES the plate G-code entirely — it no longer splices after a real print's
+# The eject sweep is a STANDALONE, server-dispatched motion-only job whose file
+# REPLACES the plate G-code entirely — it does not splice after a real print's
 # stock machine-end block. A standalone file WITHOUT that block ends FAILED at EOF
 # even after clean motion (cosmetic, live-observed on a real H2S 2026-07-04). This
 # tail is the firmware's job-completion handshake — progress/feedrate/accel resets,
@@ -975,8 +975,8 @@ def estimate_runtime_segments(
         tail_s=tail_s,
         # Summed in this exact left-to-right order, with the new span as a leading 0.0
         # when it is absent: adding zero is exact, so a block without the re-reference
-        # phase yields the SAME float — to the bit — that it did before this phase
-        # existed. ``sum()`` over the slot list does not (it differs by one ULP), and the
+        # phase yields the SAME float — to the bit — as the sum of its other spans.
+        # ``sum()`` over the slot list does not (it differs by one ULP), and the
         # invariant "the total IS the sum of the spans" is asserted with exact equality.
         total_s=(reference_s or 0.0) + pre_s + drop_span_s + sweep_span_s + tail_s + EJECT_RUNTIME_OVERHEAD_S,
         reference_s=reference_s,
@@ -1144,7 +1144,7 @@ def generate_eject_gcode(
     lines.append(f"{PHASE_BEACON_LIFTED} ; phase beacon: drop phase begins - eject runtime watchdog")
 
     # --- bed heater off, cooldown fans off --------------------------------
-    # Command the bed heater off defensively. The cooldown WAIT is no longer in
+    # Command the bed heater off defensively. The cooldown WAIT is not in
     # the G-code — the eject monitor already held the plate gate until the live
     # bed met the eject line before dispatching this motion-only job — so no
     # M190 R loop is emitted here.

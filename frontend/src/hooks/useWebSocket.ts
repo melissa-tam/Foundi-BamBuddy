@@ -26,7 +26,7 @@ interface WebSocketMessage {
   printer_name?: string;
 }
 
-/** Farm flags whose set/clear must refetch the ['printers'] list (Phase 4.3b):
+/** Farm flags whose set/clear must refetch the ['printers'] list:
  *  the list never refetches on its own, so quarantine / plate-gate /
  *  model-mismatch badges rendered from it go stale without this. */
 const FARM_BADGE_FLAGS = ['quarantined', 'awaiting_plate_clear', 'model_mismatch'] as const;
@@ -265,7 +265,7 @@ export function useWebSocket() {
     switch (message.type) {
       case 'printer_status':
         if (message.printer_id !== undefined && message.data) {
-          // Farm badge liveness (Phase 4.3b): compare the incoming farm flags
+          // Farm badge liveness: compare the incoming farm flags
           // against the caches BEFORE merging. The three flags flip rarely, so
           // a debounced ['printers'] refetch on a real delta is cheap and keeps
           // list-driven badges (quarantine card, blocked chips) live without
@@ -562,8 +562,8 @@ export function useWebSocket() {
 
       case 'tagless_fresh_prompt': {
         // A tagless roll has been consumed past half its label weight after a
-        // qualified physical cycle — ask whether a FRESH roll is now on the slot
-        // (W5). Mirrors the `respool_prompt` window-event bridge; the backend
+        // qualified physical cycle — ask whether a FRESH roll is now on the slot.
+        // Mirrors the `respool_prompt` window-event bridge; the backend
         // ships the slot + spool + material data so `useTaglessFreshPrompt` needs
         // no cache lookup.
         const m = message as unknown as TaglessFreshPromptMessage;

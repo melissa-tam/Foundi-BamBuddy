@@ -128,7 +128,7 @@ def _fake_state(**overrides):
         "tray_now": None,
         "tray_tar": None,  # the AMS's own target tray, recorded raw as movement evidence for services/ams_command
         # printer_state_to_dict reads state.last_loaded_tray unconditionally beside
-        # tray_now (W6.1 was-feeding ring); the real PrinterState always has it.
+        # tray_now (the was-feeding ring); the real PrinterState always has it.
         "last_loaded_tray": -1,
         "wifi_signal": None,
         "wired_network": None,
@@ -136,7 +136,7 @@ def _fake_state(**overrides):
         # USB/SD presence — printer_state_to_dict reads state.sdcard unconditionally
         # (#F8). Omitting it raised AttributeError before reaching send_printer_status.
         "sdcard": None,
-        # Session boundary (2026-09-04 pause-recovery wave): printer_state_to_dict
+        # Session boundary: printer_state_to_dict
         # reads both unconditionally; the real PrinterState defaults them to 0 / None.
         "connection_epoch": 0,
         "disconnected_at": None,

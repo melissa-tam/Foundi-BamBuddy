@@ -2979,7 +2979,7 @@ async def clear_plate(
         raise HTTPException(400, "Printer is not awaiting plate-clear acknowledgment")
 
     # The operator's clear IS the resolution of the hold a human owns — a Z reference
-    # lost to a reboot (2026-09-04 pause-recovery wave). A paused plate check is answered
+    # lost to a reboot (2026-09-04 fleet outage). A paused plate check is answered
     # by resuming or stopping its job, wire-resolved holds by their own lanes, and a
     # filament-path hold needs Recover, not this. What it DID close is reported rather
     # than swallowed: an operator whose click ended nothing must be able to see that.

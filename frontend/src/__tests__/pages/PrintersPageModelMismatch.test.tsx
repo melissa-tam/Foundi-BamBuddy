@@ -1,6 +1,5 @@
 /**
- * Device-vs-declared model reconciliation surfacing on the Printers page
- * (farm Phase 2):
+ * Device-vs-declared model reconciliation surfacing on the Printers page:
  * - A printer whose live status reports `model_mismatch` shows a warning
  *   banner with the reason and the dispatch-blocked explanation.
  * - The add-printer model dropdown shows the registry-driven "eject not

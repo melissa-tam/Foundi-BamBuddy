@@ -4255,7 +4255,7 @@ class TestTrayNowH2SExternalSpoolOverride:
 
 
 class TestOperatorCancelEcho:
-    """Cancel-echo capture (Phase 3.1) + native plate-occupancy retention (3.3).
+    """Cancel-echo capture + native plate-occupancy retention.
 
     The firmware emits HMS cancel echoes (0300_400C / 0500_400E) during a normal
     user cancel. They stay OUT of ``state.hms_errors`` (they're not faults) but now
