@@ -145,8 +145,8 @@ class AppSettings(BaseModel):
         le=1000,
         description=(
             "Layer threshold for mid-print replacement spools: below it a replacement must clear "
-            "min_start_spool_g; at or after it only a 5 g hard minimum applies, so a nearly-empty "
-            "donor may finish the print"
+            "min_start_spool_g; at or after it no gram floor applies, so any matching present spool "
+            "that is not spent, out of rotation or archived may finish the print"
         ),
     )
     # A filament RUNOUT escalates for a SAME-slot refill and leaves the print
