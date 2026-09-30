@@ -141,6 +141,12 @@ _COMMAND_ACK_KEEP = 64
 # still the same job.
 _ACTIVE_JOB_STATES = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
 
+# The ACK ``result`` spellings that mean success, compared lower-cased — the wire has shown
+# both ``result=success`` (the motion echoes) and ``result=SUCCESS`` (the ``ams_control
+# resume`` echo), 012-H2S 2026-09-23. Anything else is a failure. Read through
+# ``CommandAck.succeeded``.
+_ACK_SUCCESS_RESULTS = frozenset({"success", "ok"})
+
 
 @dataclass(frozen=True)
 class CommandAck:
@@ -158,8 +164,8 @@ class CommandAck:
     ``sequence_id`` is ``str()``-normalised so a numeric echo compares equal to the
     string the publisher sent (an absent id is ``""``, a number no send carries).
     ``result`` / ``reason`` are the wire's values as strings, ``None`` when null or
-    absent — reading them (``success`` vs ``SUCCESS`` vs ``fail``) is the reader's job,
-    not the transport's. ``at`` is :func:`time.monotonic` at receipt.
+    absent, kept verbatim; :attr:`succeeded` is the one reading of ``result``.
+    ``at`` is :func:`time.monotonic` at receipt.
     """
 
     command: str
@@ -167,6 +173,48 @@ class CommandAck:
     result: str | None
     reason: str | None
     at: float
+
+    @property
+    def succeeded(self) -> bool:
+        """Did the firmware answer success? ``result`` lower-cased in
+        :data:`_ACK_SUCCESS_RESULTS`; anything else (``fail``, a null result) is a failure."""
+        return self.result is not None and self.result.lower() in _ACK_SUCCESS_RESULTS
+
+
+@dataclass(frozen=True)
+class SentCommand:
+    """What one publish put on the wire — the handle its firmware ACK is read by
+    (:meth:`BambuMQTTClient.await_ack`, over :meth:`BambuMQTTClient.ack_for`).
+
+    ``command`` is the wire command name the ACK will carry (``"resume"``, ``"ignore"``,
+    ``"idle_ignore"``, ``"ams_control"``, ``"clean_print_error"``, …) and ``sequence_id``
+    the id the frame carried. ``sequence_id`` is ``None`` only for a frame whose echo is
+    never recorded as an ACK — the system-topic ``uiop`` dialog close
+    (:meth:`BambuMQTTClient._record_command_ack` reads the ``print`` topic only) — so a
+    reader answers "sent, no readable answer" instead of waiting for one.
+    """
+
+    command: str
+    sequence_id: str | None
+
+
+# The hex digits an 8-char dialog ``err`` may spell (see ``_decimal_dialog_err``).
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _decimal_dialog_err(print_error: object) -> str | None:
+    """The ``err`` of a printer-dialog button frame: the DECIMAL string of the 32-bit
+    ``print_error`` (BambuStudio ``DeviceErrorDialog.cpp`` passes
+    ``std::to_string(m_error_code)``; upstream Bambuddy #1869 found a HEX ``err`` is
+    silently dropped). ``"0500808C"`` → ``"83918988"``.
+
+    Only the 8-hex-char ``print_error`` form is accepted. ``None`` for anything else — a
+    16-char ``hms[]`` code names no dialog the firmware can match, and a malformed one
+    names nothing; the caller refuses the press.
+    """
+    if not isinstance(print_error, str) or len(print_error) != 8 or not set(print_error) <= _HEX_DIGITS:
+        return None
+    return str(int(print_error, 16))
 
 
 def _wire_str(value: object) -> str | None:
@@ -484,29 +532,6 @@ _HMS_USER_ACTION_CODES: frozenset[str] = frozenset(
     }
 )
 
-# H2-series NATIVE pre-print vision checks (single origin for the main.py capture
-# hook, the failure-reason attribution, and the tests). Unlike the cancel echoes
-# above these are ACTIONABLE faults — the printer PAUSEs the job and waits for the
-# operator to clear the bed and Resume — so they stay in ``state.hms_errors``
-# (they drive the printer card's fault badge). The farm layer only needs to detect
-# their ARRIVAL to raise a plate-clear gate; it does NOT filter them.
-#   0300_8017 — foreign objects detected on the heatbed
-#   0300_8006 — build-plate marker check
-#   0500_806E — foreign objects detected on the heatbed (H2S live-observed 2026-07-20,
-#               printer 8 / fw 01.01.02.00, text "Foreign objects detected on heatbed";
-#               the sibling 808C was already seeded, but the H2S actually emits 806E —
-#               it PAUSEd at layer 0, same human-clear-then-Resume reaction)
-#   0500_808C — build-plate offset / debris detected (H2-series; PAUSEs at layer 0,
-#               human must clear + realign the plate before Resume — same reaction)
-_HMS_PLATE_OCCUPANCY_CODES: frozenset[str] = frozenset(
-    {
-        "0300_8017",
-        "0300_8006",
-        "0500_806E",
-        "0500_808C",
-    }
-)
-
 
 @dataclass
 class KProfile:
@@ -635,6 +660,11 @@ class PrinterState:
     raw_data: dict = field(default_factory=dict)
     gcode_file: str | None = None
     subtask_id: str | None = None
+    # The printer's CURRENT dialog code: the 32-bit `print_error` word as the last push
+    # carrying the field reported it, 0 = no dialog. Set from EVERY such push, 0 included,
+    # so it never outlives its dialog — unlike `hms_errors`, where the same code is also
+    # merged (non-zero words only) and can linger. Read by `hms_errors.plate_check_paused`.
+    print_error: int = 0
     hms_errors: list = field(default_factory=list)  # List of HMSError
     # Monotonic time of the last push that carried wire HMS evidence; local clears never stamp it.
     hms_wire_at: float = 0.0
@@ -1877,6 +1907,32 @@ class BambuMQTTClient:
             if ack.command == command and ack.sequence_id == sequence_id:
                 return ack
         return None
+
+    async def await_ack(self, sent: SentCommand, budget_s: float, poll_s: float) -> CommandAck | None:
+        """Wait up to ``budget_s`` for the firmware's ACK of ``sent`` — the one wait every
+        reader of a published command's answer shares (the ``/hms/execute-action`` route,
+        the plate-check driver), over :meth:`ack_for` (invariant 14: a reader finds its OWN
+        ACK by sequence id).
+
+        Polls every ``poll_s`` — the log is appended on the MQTT network thread, so polling
+        is the whole mechanism — and reads once before the first sleep, so an ACK that
+        landed between the publish and this call is found at once. Returns the ACK
+        (:attr:`CommandAck.succeeded` reads it), or ``None`` when none arrived within the
+        budget: the silent drop. A ``sent`` without a ``sequence_id`` (the system-topic
+        ``uiop`` close) has no readable ACK and returns ``None`` at once; a caller that must
+        tell "sent" from "dropped" checks ``sent.sequence_id`` first.
+        """
+        if sent.sequence_id is None:
+            return None
+        deadline = time.monotonic() + budget_s
+        while True:
+            ack = self.ack_for(sent.command, sent.sequence_id)
+            if ack is not None:
+                return ack
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(poll_s, remaining))
 
     def _next_sequence_id(self) -> str:
         """Allocate the next ``sequence_id`` for a publish: increment this client's counter
@@ -4043,6 +4099,12 @@ class BambuMQTTClient:
         # Format on printer screen: [0500-8061] -> short code: 0500_8061
         if "print_error" in data:
             print_error = data["print_error"]
+            # The wire fact first, 0 included — the merge below skips 0 and sub-0x4000
+            # words, so `hms_errors` cannot say "the dialog is gone"; this field can.
+            try:
+                self.state.print_error = int(print_error or 0) & 0xFFFFFFFF
+            except (TypeError, ValueError):
+                logger.debug("[%s] unparseable print_error %r left unread", self.serial_number, print_error)
             if print_error and print_error != 0:
                 # Extract components: MMMMEEEE -> MMMM_EEEE
                 module = (print_error >> 16) & 0xFFFF  # High 16 bits (e.g., 0x0500)
@@ -7246,128 +7308,132 @@ class BambuMQTTClient:
         logger.info("[%s] Set liveview %s", self.serial_number, "enabled" if enable else "disabled")
         return True
 
-    def execute_hms_action(self, print_error: str, action: str, job_id: str | None = None) -> bool:
-        """Dispatch the user's choice from the HMS-error modal as a printer command.
+    def execute_hms_action(self, print_error: str, action: str, job_id: str) -> SentCommand | None:
+        """Press one of the printer's dialog buttons — the ONE owner of the dialog-button
+        frames (AST-pinned: ``test_code_quality.TestHmsDialogFrameOwnership``).
 
-        Args:
-            print_error: Canonical hex identifier for the fault — 8 chars for the
-                32-bit `print_error` path, 16 chars for the 64-bit `hms[]` path
-                (HMSError.full_code). Carried through unchanged from the route.
-                Only the `idle_ignore` branch puts it on the wire; resume uses
-                BambuStudio's plain shape (verified against a live H2D, the
-                `err`-bearing shape is silently rejected by the firmware).
-            action: One of HMSAction's string values.
-            job_id: The `subtask_id` snapshotted onto the HMSError at parse-time.
-                Preserved for symmetry with the catalog but no longer sent —
-                BambuStudio's actual resume command is plain and the
-                firmware doesn't echo `job_id` back on the response either.
+        The frames are BambuStudio's own (``DeviceErrorDialog.cpp`` picks the command,
+        ``DeviceManager.cpp`` builds it):
 
-        ``STOP_PRINTING`` is deliberately NOT dispatched here (2026-09-24): an operator
-        stopping a print from the HMS dialog is the operator's Stop, whose one owner is
-        ``print_control.stop_as_operator`` (the durable stop request AND the stop) — the
-        route sends it there, and this dispatcher answers False for it like any other
-        action it does not own.
+        * "Problem solved, resume" — ``PROBLEM_SOLVED_RESUME``,
+          ``RESUME_PRINTING_PROBELM_SOLVED`` (sic) → ``command_hms_resume``:
+          ``{"print": {"command": "resume", "err": "<decimal>", "param": "reserve",
+          "job_id": <job_id>, "sequence_id": <n>}}``.
+        * "Ignore" — ``IGNORE_RESUME``, ``IGNORE_NO_REMINDER_NEXT_TIME``,
+          ``DONT_REMIND_NEXT_TIME`` → ``command_hms_ignore``: the same frame with
+          ``"command": "ignore"``, which suppresses the printer's re-check (upstream
+          Bambuddy #1869: a plain resume re-checks, which is why a wrong-plate dialog came
+          straight back after "Ignore" while it sent one).
+        * "No reminder next time" — ``NO_REMINDER_NEXT_TIME`` →
+          ``command_hms_idle_ignore(err, 0)``: ``{"print": {"command": "idle_ignore",
+          "err": "<decimal>", "type": 0, "sequence_id": <n>}}``.
+        * The plain resume — ``RESUME_PRINTING``, ``RESUME_PRINTING_DEFECTS``,
+          ``FILAMENT_LOAD_RESUME``, ``PROCEED``, ``DBL_CHECK_RESUME`` → :meth:`resume_print`,
+          the one publisher of that frame (``command_task_resume``'s verb). It is the frame
+          the power-loss driver presses for ``0300_8007``.
 
-        Returns False when the MQTT client is offline or when `action` is unknown
-        so the route surfaces it as a 4xx rather than a silent no-op.
+        ``err`` is the DECIMAL string of the 32-bit ``print_error`` (Studio passes
+        ``std::to_string(m_error_code)``). #1869 found the firmware silently drops a HEX
+        ``err``; the earlier "the err-bearing shape is rejected" verdict (#1830) was
+        measured with hex. Only the 8-hex-char ``print_error`` form is accepted for it: a
+        16-char ``hms[]`` code names no dialog the firmware can match, so it — or anything
+        unparseable — REFUSES the press (a WARNING naming why, nothing published).
+        ``job_id`` has ONE rule: the ``subtask_id`` of the job whose dialog is being
+        pressed, passed by the caller (``""`` when that job has none) — the modal sends the
+        snapshot on ``HMSError.job_id``, the farm the paused job's live ``subtask_id``.
+        That is the value upstream #1869 field-tested the err-bearing frames with, and on
+        a farm dispatch ``task_id`` == ``subtask_id`` == ``project_id``. The push's own
+        ``job_id`` field is deliberately NOT read: what it carries on a LAN print has
+        never been observed on this fleet.
+
+        Every print-topic frame carries a real ``sequence_id`` (:meth:`_next_sequence_id`,
+        recorded under its command for :meth:`last_sent_sequence_id`) and is followed by a
+        pushall, so the modal's status query reflects the printer's answer. The answer
+        itself is read with :meth:`await_ack`.
+
+        ``STOP_PRINTING`` is refused here (2026-09-24): an operator stopping a print from
+        the HMS dialog is the operator's Stop, whose one owner is
+        ``print_control.stop_as_operator`` (the durable stop request AND the stop); the
+        route sends it there.
+
+        Returns the :class:`SentCommand` whose ACK answers the press, or ``None`` when
+        nothing went out: offline, an unknown or refused action, a refused ``err``, or a
+        button the printer's own screen handles (``CHECK_ASSISTANT`` and the like).
         """
 
         if not self._client or not self.state.connected:
             logger.warning("[%s] Cannot execute HMS action: not connected", self.serial_number)
-            return False
+            return None
 
         # Always re-push the full state after a command so the modal's underlying
         # status query reflects the new error list (or absence) on the next tick.
-        def pushall():
+        def pushall() -> None:
             self._client.publish(
                 self.topic_publish, json.dumps({"pushing": {"command": "pushall", "sequence_id": "0"}}), qos=1
             )
 
-        def publish(payload: dict):
-            self._client.publish(self.topic_publish, json.dumps(payload), qos=1)
+        def send(frame: dict) -> SentCommand:
+            # One print-topic frame with a real sequence id, recorded like the other
+            # controls, then the pushall.
+            seq = self._next_sequence_id()
+            command = frame["command"]
+            self._client.publish(self.topic_publish, json.dumps({"print": {**frame, "sequence_id": seq}}), qos=1)
+            self._last_sent_sequence[command] = seq
             pushall()
+            logger.info("[%s] HMS action %s sent %s (seq=%s)", self.serial_number, action, frame, seq)
+            return SentCommand(command=command, sequence_id=seq)
 
-        def hms_resume():
-            # BambuStudio's actual shape — plain resume, no err / no job_id.
-            # The `err`-bearing shape (`err`, `param: "reserve"`, `job_id`) is
-            # silently rejected by Bambu firmware on print_error- and hms[]-sourced
-            # faults alike; verified by injecting candidate shapes against a live
-            # H2D paused on a wrong-plate HMS. See #1830 §(2).
-            publish(
-                {
-                    "print": {
-                        "command": "resume",
-                        "param": "",
-                        "sequence_id": "0",
-                    }
-                }
-            )
+        def sent_by(published: bool, command: str) -> SentCommand | None:
+            # A frame one of the sequenced publishers sent: the id it recorded is this send's.
+            if not published:
+                return None
+            return SentCommand(command=command, sequence_id=self.last_sent_sequence_id(command))
 
-        def hms_ignore(persistent: bool = False):
-            # `idle_ignore` is BambuStudio's "dismiss this warning" command for
-            # non-pause warnings. type=0 dismisses once, type=1 hides the same
-            # warning permanently.
-            #
-            # For HMS-paused state, `idle_ignore` is silently rejected by the
-            # firmware regardless of `err` (verified on a live H2D — see
-            # #1830 §(2)). The user-facing intent of "Ignore and resume" on a
-            # paused print is to continue, so we dispatch a plain resume
-            # instead. The `persistent` flag is informational in that branch —
-            # firmware can't honour "don't remind" through a resume — but the
-            # button still does what the user expects.
-            #
-            # NB: PrinterState's `state` field carries the MQTT `gcode_state`
-            # value verbatim — line 2144 stores `data["gcode_state"]` onto it.
-            if self.state.state == "PAUSE":
-                hms_resume()
-                return
-            publish(
-                {
-                    "print": {
-                        "command": "idle_ignore",
-                        "err": print_error,
-                        "type": 1 if persistent else 0,
-                        "sequence_id": "0",
-                    }
-                }
-            )
-
-        def uiop_close():
-            # `err` is the 8-char hex short code (already a string from the
-            # frontend), uppercased for consistency with how BambuStudio sends it.
-            publish(
-                {
-                    "system": {
-                        "command": "uiop",
-                        "name": "print_error",
-                        "action": "close",
-                        "source": 1,
-                        "type": "dialog",
-                        "err": print_error.upper(),
-                        "sequence_id": "0",
-                    }
-                }
-            )
+        def dialog_err() -> str | None:
+            err = _decimal_dialog_err(print_error)
+            if err is None:
+                logger.warning(
+                    "[%s] HMS action %s refused: err must be the 8-hex-char print_error dialog code, got %r "
+                    "(a 16-char hms[] code names no dialog) — nothing sent",
+                    self.serial_number,
+                    action,
+                    print_error,
+                )
+            return err
 
         match action:
             case (
                 HMSAction.RESUME_PRINTING
                 | HMSAction.RESUME_PRINTING_DEFECTS
-                | HMSAction.RESUME_PRINTING_PROBELM_SOLVED
-                | HMSAction.PROBLEM_SOLVED_RESUME
                 | HMSAction.FILAMENT_LOAD_RESUME
                 | HMSAction.PROCEED
+                | HMSAction.DBL_CHECK_RESUME
             ):
-                hms_resume()
+                sent = sent_by(self.resume_print(), "resume")
+                if sent is not None:
+                    pushall()
+                return sent
 
-            case HMSAction.IGNORE_RESUME | HMSAction.NO_REMINDER_NEXT_TIME:
-                hms_ignore(persistent=False)
+            case HMSAction.PROBLEM_SOLVED_RESUME | HMSAction.RESUME_PRINTING_PROBELM_SOLVED:
+                err = dialog_err()
+                if err is None:
+                    return None
+                return send({"command": "resume", "err": err, "param": "reserve", "job_id": job_id})
 
-            case HMSAction.IGNORE_NO_REMINDER_NEXT_TIME | HMSAction.DONT_REMIND_NEXT_TIME:
-                hms_ignore(persistent=True)
+            case HMSAction.IGNORE_RESUME | HMSAction.IGNORE_NO_REMINDER_NEXT_TIME | HMSAction.DONT_REMIND_NEXT_TIME:
+                err = dialog_err()
+                if err is None:
+                    return None
+                return send({"command": "ignore", "err": err, "param": "reserve", "job_id": job_id})
+
+            case HMSAction.NO_REMINDER_NEXT_TIME:
+                err = dialog_err()
+                if err is None:
+                    return None
+                return send({"command": "idle_ignore", "err": err, "type": 0})
 
             case HMSAction.FILAMENT_EXTRUDED | HMSAction.DBL_CHECK_DONE:
-                self.ams_control("done", request_pushall=True)
+                return sent_by(self.ams_control("done", request_pushall=True), "ams_control")
 
             case (
                 HMSAction.RETRY_FILAMENT_EXTRUDED
@@ -7375,45 +7441,65 @@ class BambuMQTTClient:
                 | HMSAction.RETRY_PROBLEM_SOLVED
                 | HMSAction.DBL_CHECK_RETRY
             ):
-                self.ams_control("resume", request_pushall=True)
+                return sent_by(self.ams_control("resume", request_pushall=True), "ams_control")
 
             case HMSAction.ABORT:
-                self.ams_control("abort", request_pushall=True)
+                return sent_by(self.ams_control("abort", request_pushall=True), "ams_control")
 
             # The dialog's OK: the ONE clean-print-error publisher (frame only — the
             # modal re-reads the printer's own list off the pushall), then the pushall.
             case HMSAction.OK_BUTTON:
-                self.clean_print_error()
-                pushall()
+                sent = sent_by(self.clean_print_error(), "clean_print_error")
+                if sent is not None:
+                    pushall()
+                return sent
 
             case HMSAction.DBL_CHECK_OK:
-                self.clean_print_error()
+                if not self.clean_print_error():
+                    return None
                 pushall()
-                uiop_close()
-
-            case HMSAction.DBL_CHECK_RESUME:
-                # Plain resume — not HMS-aware, no err/job_id.
-                publish(
-                    {
-                        "print": {
-                            "command": "resume",
-                            "param": "",
-                            "sequence_id": "0",
+                # The dialog close rides the SYSTEM topic, whose echo is never recorded as an
+                # ACK, so this press answers "sent". `err` is the 8-char short code as the
+                # frontend sent it, uppercased the way BambuStudio sends it.
+                self._client.publish(
+                    self.topic_publish,
+                    json.dumps(
+                        {
+                            "system": {
+                                "command": "uiop",
+                                "name": "print_error",
+                                "action": "close",
+                                "source": 1,
+                                "type": "dialog",
+                                "err": print_error.upper(),
+                                "sequence_id": "0",
+                            }
                         }
-                    }
+                    ),
+                    qos=1,
                 )
+                pushall()
+                return SentCommand(command="uiop", sequence_id=None)
 
             case HMSAction.REFRESH_NOZZLE:
-                publish({"print": {"command": "refresh_nozzle", "sequence_id": "0"}})
+                return send({"command": "refresh_nozzle"})
 
             case HMSAction.TURN_OFF_FIRE_ALARM:
-                publish({"print": {"command": "buzzer_ctrl", "mode": 0, "sequence_id": "0"}})
+                return send({"command": "buzzer_ctrl", "mode": 0})
 
             case HMSAction.STOP_DRYING:
-                publish({"print": {"command": "auto_stop_ams_dry", "sequence_id": "0"}})
+                return send({"command": "auto_stop_ams_dry"})
 
             case HMSAction.DISABLE_PURIFICATION:
-                publish({"print": {"command": "close_air_filt", "sequence_id": "0"}})
+                return send({"command": "close_air_filt"})
+
+            case HMSAction.STOP_PRINTING:
+                logger.warning(
+                    "[%s] HMS action STOP_PRINTING refused here: the operator's Stop is "
+                    "print_control.stop_as_operator's — nothing sent",
+                    self.serial_number,
+                )
+                return None
 
             case (
                 HMSAction.CHECK_ASSISTANT
@@ -7424,12 +7510,11 @@ class BambuMQTTClient:
                 | HMSAction.CANCLE
                 | HMSAction.DBL_CHECK_CANCEL
             ):
-                # UI-only actions — the printer's own screen handles these; the
-                # modal still surfaces them so the user has parity with Studio.
-                pass
+                # UI-only actions — the printer's own screen handles these; the modal
+                # still surfaces them so the user has parity with Studio. No frame exists.
+                logger.info("[%s] HMS action %s is screen-only — nothing sent", self.serial_number, action)
+                return None
 
             case _:
                 logger.warning("[%s] Unknown HMS action '%s'", self.serial_number, action)
-                return False
-
-        return True
+                return None

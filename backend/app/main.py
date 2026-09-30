@@ -90,10 +90,11 @@ from backend.app.services import job_terminal, notify_dedup, print_reconcile
 from backend.app.services.archive import ArchiveService
 from backend.app.services.archive_purge import archive_purge_service
 from backend.app.services.bambu_ftp import clear_3mf_cache
-from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES, PrinterState
+from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.fleet_activity import fleet_activity_recorder
 from backend.app.services.foreign_archive import locate_3mf_for_print, maybe_schedule_foreign_3mf_retry
 from backend.app.services.github_backup import github_backup_service
+from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
 from backend.app.services.homeassistant import homeassistant_service
 from backend.app.services.library_integrity import library_integrity_service
 from backend.app.services.library_trash import library_trash_service
@@ -1127,7 +1128,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # status flow must not wait on either. Strong-referenced (spawn_background_task)
         # for the same reason the runout hook above is — a weakly-held task can vanish
         # mid-await with no traceback.
-        _new_occupancy = edges.appeared_short & _HMS_PLATE_OCCUPANCY_CODES
+        _new_occupancy = edges.appeared_short & PLATE_CHECK_HMS_CODES
         if _new_occupancy:
             try:
                 from backend.app.services.pause_recovery import on_plate_vision_trip
