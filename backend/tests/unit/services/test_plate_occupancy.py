@@ -1368,3 +1368,111 @@ class TestGatePriorities:
             )
             _occupy(1)
             po.plate_occupancy._records[1].lease.revoked = False
+
+
+# ---------------------------------------------------------------------------
+# The farm's own bed motion (the held-bed lift)
+# ---------------------------------------------------------------------------
+
+
+class TestBedMotion:
+    """The held-bed lift is a CLAIMED motion (operator ruling 2026-09-29: the bed off the
+    release aid, and the printer released to dispatch only after the lift's motion time).
+    Without the claim the terminal's own dispatch kick could send a new print onto a printer
+    whose bed is still travelling — on the retry path nothing else holds the printer."""
+
+    @pytest.mark.parametrize(
+        ("label", "setup", "ev", "expected"),
+        [
+            ("a lease is in flight", "lease", po.Evidence(), "dispatch_in_flight"),
+            ("a printing row claims the printer", None, po.Evidence(db_claim=True), "dispatch_in_flight"),
+            ("the wire says a job runs", None, po.Evidence(live_state=RUNNING), "job_active"),
+            ("the wire says a job is paused", None, po.Evidence(live_state="PAUSE"), "job_active"),
+            ("a LIVE eject owns the printer", "live_eject", po.Evidence(), "eject_in_flight"),
+            ("a HYDRATED eject owns the printer", "hydrated_eject", po.Evidence(), "eject_in_flight"),
+            ("a motion is already claimed", "motion", po.Evidence(), "bed_motion_in_flight"),
+            ("an occupied plate is exactly what the lift is for", "plate", po.Evidence(live_state=IDLE), None),
+            ("an idle, clear printer", None, po.Evidence(live_state=IDLE), None),
+        ],
+    )
+    def test_the_claim_refusal_table(self, label, setup, ev, expected, clock):
+        if setup == "lease":
+            po.plate_occupancy.claim_for_dispatch(
+                1, 3, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=po.Evidence()
+            )
+        elif setup == "live_eject":
+            _hold_live_eject(1)
+        elif setup == "hydrated_eject":
+            po.plate_occupancy.hydrate_eject(1, _pending(hydrated=True))
+        elif setup == "motion":
+            assert po.plate_occupancy.claim_bed_motion(1, po.Evidence(), hold_s=2.2) is None
+        elif setup == "plate":
+            _occupy(1)
+
+        assert po.plate_occupancy.claim_bed_motion(1, ev, hold_s=2.2) == expected, label
+
+    def test_a_granted_claim_refuses_dispatch_until_its_window_lapses(self, clock):
+        assert po.plate_occupancy.claim_bed_motion(1, po.Evidence(live_state=IDLE), hold_s=2.2) is None
+        idle = po.Evidence(live_state=IDLE)
+
+        assert po.plate_occupancy.dispatchable(1, idle) == "bed_motion_in_flight"
+        assert po.plate_occupancy.snapshot(1).bed_motion_active is True
+        # The dispatch claim is gated by the same rule, so nothing mints a lease under it.
+        refused = po.plate_occupancy.claim_for_dispatch(
+            1, 9, pre_state=IDLE, pre_subtask=None, min_hold_s=2.0, max_hold_s=60.0, ev=idle
+        )
+        assert refused == "bed_motion_in_flight"
+
+        clock.advance(2.1)
+        assert po.plate_occupancy.dispatchable(1, idle) == "bed_motion_in_flight"
+
+        clock.advance(0.2)  # past the window's own deadline: a read-time expiry, no transition
+        assert po.plate_occupancy.dispatchable(1, idle) is None
+        assert po.plate_occupancy.snapshot(1).bed_motion_active is False
+        assert po.plate_occupancy._records[1].bed_motion_until_mono is None  # pruned on read
+
+    def test_the_window_outranks_the_wire_but_not_the_plate(self, clock):
+        """Its place in the dispatch priority: behind the plate (which needs a human), ahead
+        of the wire — a lift in flight is the fact that explains an idle printer's refusal."""
+        _occupy(1)
+        assert po.plate_occupancy.claim_bed_motion(1, po.Evidence(live_state=IDLE), hold_s=2.2) is None
+        assert po.plate_occupancy.dispatchable(1, po.Evidence(live_state=IDLE)) == "plate_occupied"
+
+        assert po.plate_occupancy.clear_plate(1) is None
+        assert po.plate_occupancy.dispatchable(1, po.Evidence(live_state=RUNNING)) == "bed_motion_in_flight"
+
+    def test_a_release_frees_dispatch_at_once_and_is_idempotent(self, clock):
+        assert po.plate_occupancy.claim_bed_motion(1, po.Evidence(), hold_s=2.2) is None
+
+        po.plate_occupancy.release_bed_motion(1)
+        po.plate_occupancy.release_bed_motion(1)
+        po.plate_occupancy.release_bed_motion(2)  # never claimed
+
+        assert po.plate_occupancy.dispatchable(1, po.Evidence(live_state=IDLE)) is None
+        assert po.plate_occupancy.snapshot(1).bed_motion_active is False
+
+    def test_the_claim_notifies_without_a_kick_and_the_release_kicks(self, clock):
+        """A claim makes the printer LESS available (no kick); an early release is a release
+        edge (kick). The window lapsing is a read, so it notifies nothing at all."""
+        rec = _Recorder()
+        rec.wire()
+
+        assert po.plate_occupancy.claim_bed_motion(1, po.Evidence(), hold_s=2.2) is None
+        assert rec.calls == [("persist", ""), ("broadcast", ""), ("policy", "claim_bed_motion")]
+
+        rec.calls.clear()
+        po.plate_occupancy.release_bed_motion(1)
+        assert rec.calls == [
+            ("persist", ""),
+            ("broadcast", ""),
+            ("kick", "release_bed_motion"),
+            ("policy", "release_bed_motion"),
+        ]
+
+        rec.calls.clear()
+        assert po.plate_occupancy.claim_bed_motion(1, po.Evidence(), hold_s=2.2) is None
+        rec.calls.clear()
+        clock.advance(5.0)
+        assert po.plate_occupancy.dispatchable(1, po.Evidence(live_state=IDLE)) is None
+        po.plate_occupancy.release_bed_motion(1)  # nothing left to release
+        assert rec.calls == []

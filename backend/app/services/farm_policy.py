@@ -50,7 +50,7 @@ from backend.app.services.eject import geometry as eject_geometry, remote as eje
 from backend.app.services.eject.generator import Z_REFERENCE_FEED_MM_MIN
 from backend.app.services.hms_errors import format_hms_error_summary
 from backend.app.services.notification_service import notification_service
-from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
+from backend.app.services.plate_occupancy import Evidence, FirstArticleEject, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_builder import create_queue_items
 from backend.app.services.sku_catalog import plate_units
@@ -516,9 +516,10 @@ async def on_terminal(
         #    plate, the terminal's one plate call) or retried by the farm (no gate). Either
         #    way what is owed here is the one motion — the bed lifted off the plate-release
         #    aid, where the firmware parked it for the whole pause — farm unit or foreign
-        #    print alike; a farm unit is then requeued below. The lift returns only after
-        #    its own motion time, and step 3's requeue runs after it, so the requeued unit
-        #    cannot be released to the printer while its bed is still moving.
+        #    print alike; a farm unit is then requeued below. The lift is a CLAIMED bed
+        #    motion (no dispatch lands on the printer while it moves) and returns only after
+        #    its own motion time, so step 3's requeue — and its dispatch kick — come after
+        #    the window.
         if (
             printer_id is not None
             and outcome is not None
@@ -918,14 +919,29 @@ async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
     ``PARK_Z_MM``, a start block pushes ~50 mm down, a pause parks at the bottom), and
     a move that assumes otherwise is the 002-H2S bed-into-the-floor shape.
 
-    **It returns only after the lift's own motion time** once the printer accepted it:
-    both guarded moves at their full commanded distance over the one feed,
+    **The lift is a CLAIMED bed motion** on the plate authority
+    (``plate_occupancy.claim_bed_motion``), for the lift's own motion time: both guarded
+    moves at their full commanded distance over the one feed,
     ``(VISION_HOLD_PROBE_MM + hold_lift_mm) / (Z_REFERENCE_FEED_MM_MIN / 60)`` seconds —
     counted in full, as the eject runtime model counts a ``G380`` (a guarded move that
-    stops early only finishes sooner). :func:`on_terminal` runs this as its step 2, BEFORE
-    step 3's requeue, so the requeue can no longer race the lift: a retried plate is put
-    back in line only once the bed has stopped moving. No wait when the lift was skipped
-    or refused — nothing is moving.
+    stops early only finishes sooner). While the window is open ``dispatchable`` refuses
+    ``bed_motion_in_flight``, so no print — the terminal's own dispatch kick included — can
+    be sent onto a printer whose bed is still travelling. The claim is taken BEFORE the
+    send:
+
+    * refused — a print is already on its way here (a lease or a ``printing`` row), a job
+      runs, an eject owns the printer, or a motion is already claimed: the lift is SKIPPED
+      with an INFO line naming the refusal. A print starting on this printer drives the
+      bed off the stop with its own start block, so the bed does not sit on the aid;
+    * granted, and the printer refuses the command — the claim is RELEASED at once, so
+      dispatch is not held off for a motion that never happens.
+
+    **After an accepted lift it also WAITS that motion time before returning.**
+    :func:`on_terminal` runs this as its step 2, BEFORE step 3's requeue, so a retried
+    plate is put back in line only once the window has lapsed: the requeue's own dispatch
+    kick then lands on a printer ``dispatchable`` accepts, instead of being refused
+    ``bed_motion_in_flight`` and left for the scheduler's next fallback tick. No wait when
+    the lift was skipped or refused — nothing is moving.
 
     Skipped on a bedslinger (the gantry carries Z — there is no bed travel to lift) and
     on a model with no geometry row or no ``z_travel_mm`` (no proven Z axis to move).
@@ -952,13 +968,34 @@ async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
             return
         lift = geometry.hold_lift_mm
         feed = Z_REFERENCE_FEED_MM_MIN
+        motion_s = (VISION_HOLD_PROBE_MM + lift) / (feed / 60.0)
+        status = printer_manager.get_status(printer_id)
+        printing_row = await db.scalar(
+            select(PrintQueueItem.id)
+            .where(PrintQueueItem.printer_id == printer_id)
+            .where(PrintQueueItem.status == "printing")
+            .limit(1)
+        )
+        refusal = plate_occupancy.claim_bed_motion(
+            printer_id,
+            Evidence(live_state=getattr(status, "state", None), db_claim=printing_row is not None),
+            hold_s=motion_s,
+        )
+        if refusal is not None:
+            logger.info(
+                "farm_policy: held-bed lift skipped on printer %s — bed motion refused (%s): the printer is "
+                "already taken by a motion of its own (a print's start block, a sweep or another lift)",
+                printer_id,
+                refusal,
+            )
+            return
         ok = client.send_gcode(
             f"M17\nG91\nG380 S2 Z{VISION_HOLD_PROBE_MM:.1f} F{feed}\nG380 S2 Z-{lift:.1f} F{feed}\nG90\nM400\nM18"
         )
         if not ok:
+            plate_occupancy.release_bed_motion(printer_id)
             logger.warning("farm_policy: held-bed lift command refused on printer %s", printer_id)
             return
-        motion_s = (VISION_HOLD_PROBE_MM + lift) / (feed / 60.0)
         logger.info(
             "farm_policy: held-bed lift sent on printer %s (%.1f mm off the bottom stop) — waiting %.1fs for its motion",
             printer_id,
