@@ -1342,6 +1342,10 @@ class AmsFaultClass(str, Enum):
     PHYSICAL_FAULT = "physical_fault"  # breakage/clog/hardware — needs physical work, never a swap
     RFID_READ = "rfid_read"  # the tag could not be read (expected on a tagless slot)
     INFORMATIONAL = "informational"  # a progress notice or a precursor — no farm action
+    # The printer's own pre-print vision check PAUSEd the job over the build plate. Not an
+    # AMS fault: outside ACTIONABLE_CLASSES, so no AMS incident lane ever sees it. The
+    # pause lane reads it through :data:`PLATE_CHECK_HMS_CODES` / :func:`plate_check_paused`.
+    PLATE_CHECK = "plate_check"
 
 
 @dataclass(frozen=True)
@@ -1737,6 +1741,27 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # 07xx_2X00_0002_0025). Classified so the precursor can never be mistaken for
     # a swap trigger; see the code-word row for the evidence.
     ((*_AMS_UNITS,), "0025", _ShortRow(_INFO)),
+    # -- PLATE_CHECK: the H2-series NATIVE pre-print vision check -------------
+    # The printer PAUSEs the job at layer 0 and shows the dialog on its screen. Production
+    # (hms-events, all 6 tripped printers) sees these ONLY on the 32-bit ``print_error``
+    # lane — ``0500806E`` (83918958) and ``0500808C`` (83918988) — which is why the pause
+    # predicate reads ``PrinterState.print_error``, not the merged HMS list. The two 0300
+    # rows are set members never yet observed on this fleet.
+    # "Foreign objects detected on heatbed. Please check and clean the heatbed. Then,
+    # select "Resume" to resume the print job."
+    (("0300",), "8017", _ShortRow(AmsFaultClass.PLATE_CHECK)),
+    # "The build plate marker was not detected. Please confirm the build plate is
+    # correctly positioned on the heatbed with all four corners aligned, and the marker
+    # is visible."
+    (("0300",), "8006", _ShortRow(AmsFaultClass.PLATE_CHECK)),
+    # "Foreign objects detected on heatbed; please check and clean up the heatbed."
+    # (H2S live-observed 2026-07-20, printer 8 / fw 01.01.02.00.)
+    (("0500",), "806E", _ShortRow(AmsFaultClass.PLATE_CHECK)),
+    # "Detected build plate offset or debris. Please align the build plate with the
+    # heatbed and remove all debris from the plate surface before continuing." The
+    # dominant production trip; it also fires on an EMPTY, unseated plate (003-H2S
+    # 2026-09-24). Catalog actions: IGNORE_RESUME, PROBLEM_SOLVED_RESUME.
+    (("0500",), "808C", _ShortRow(AmsFaultClass.PLATE_CHECK)),
 )
 
 
@@ -1770,6 +1795,11 @@ _RUNOUT_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFau
 _RUNOUT_EXTERNAL_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.RUNOUT_EXTERNAL)
 _MECHANICAL_FEED_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is _MECHANICAL)
 _EXTRUDER_SIDE_SHORTS: frozenset[str] = _shorts_where(lambda r: r.extruder_side)
+
+# The printer's own pre-print plate check — the single origin for the pause lane, the
+# failure-reason category and the HMS-edge capture. A VIEW of the taxonomy rows, never a
+# second literal.
+PLATE_CHECK_HMS_CODES: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.PLATE_CHECK)
 
 # ``retract_failure`` deliberately gets NO set of its own here. A short-lane view is
 # blind to the two code-word members (0x00020011 / 0x00020024), so a consumer reading
@@ -2212,10 +2242,10 @@ def runout_hold_active(state) -> bool:
 # code suffix is not kinship (the same ruling that keeps ``0300_8003``, AI spaghetti
 # detection, out of it). So the "never write a new HMS frozenset literal, add a taxonomy
 # row" rule does not reach here; the prior art for a non-AMS literal set is
-# ``bambu_mqtt._HMS_PLATE_OCCUPANCY_CODES`` and ``usb_storage.HMS_STORAGE_LOW_FULL_CODES``.
+# ``usb_storage.HMS_STORAGE_LOW_FULL_CODES``.
 #
-# Matched on the SHORT code (``hms_short_code``), the same shape the plate-occupancy set
-# is matched on.
+# Matched on the SHORT code (``hms_short_code``), the same shape
+# :data:`PLATE_CHECK_HMS_CODES` is matched on.
 POWER_LOSS_PROMPT_CODES: frozenset[str] = frozenset({"0300_8007"})
 
 # "Resume failed after power loss." — the catalog's own failure answer to a resume issued
@@ -2278,6 +2308,40 @@ def power_loss_hold_active(state) -> bool:
         if (getattr(state, "state", None) or "") != "PAUSE":
             return False
         return power_loss_prompt_standing(getattr(state, "hms_errors", None) or [])
+    except Exception:  # noqa: BLE001 — a gate predicate must never raise into a callback/route
+        return False
+
+
+def print_error_short_code(print_error: int) -> str:
+    """The ``MMMM_EEEE`` short code of a 32-bit ``print_error`` word: high 16 bits, low 16.
+
+    The ``print_error`` lane has no separate code word — one integer carries both halves —
+    so it is :func:`hms_short_code` with that integer on both sides (one spelling of the
+    format). ``0x0500808C`` → ``"0500_808C"``.
+    """
+    return hms_short_code(print_error, print_error)
+
+
+def plate_check_paused(state) -> bool:
+    """True when the printer is PAUSEd on its own pre-print plate check, right now.
+
+    The sibling of :func:`power_loss_hold_active`, and the same two-leg shape, with one
+    difference that is the point: the dialog leg is read off ``state.print_error`` — the
+    printer's CURRENT dialog as the wire reports it on every push (0 = no dialog) — never
+    off ``hms_errors``, where a code can outlive the dialog that raised it. Production sees
+    the plate codes only on that 32-bit lane (``0500806E`` / ``0500808C``).
+
+    * live ``gcode_state == "PAUSE"``, and
+    * ``print_error``'s short code is in :data:`PLATE_CHECK_HMS_CODES`.
+
+    Fails closed (False) on a malformed/absent state — a predicate that errors must never
+    make the farm press a printer's dialog button.
+    """
+    try:
+        if (getattr(state, "state", None) or "") != "PAUSE":
+            return False
+        print_error = int(getattr(state, "print_error", 0) or 0)
+        return print_error != 0 and print_error_short_code(print_error) in PLATE_CHECK_HMS_CODES
     except Exception:  # noqa: BLE001 — a gate predicate must never raise into a callback/route
         return False
 

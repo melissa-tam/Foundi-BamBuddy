@@ -660,6 +660,10 @@ _EXPECTED_PHYSICAL = (
 _EXPECTED_RFID = _family(_AMS_UNIT_MODULES, "4025")
 _EXPECTED_INFORMATIONAL = _family(_AMS_UNIT_MODULES, "0025")
 _EXPECTED_EXTRUDER_SIDE = {"0300_801E"}
+# The printer's own pre-print plate check — the four members of the retired
+# ``bambu_mqtt._HMS_PLATE_OCCUPANCY_CODES`` literal, copied verbatim: the move into the
+# taxonomy must neither widen nor narrow what the pause lane trips on.
+_EXPECTED_PLATE_CHECK = {"0300_8017", "0300_8006", "0500_806E", "0500_808C"}
 
 # Every short code whose verdict must carry ``retract_failure=True`` — "the printer is
 # LATCHED in a pull-back it could not finish", which is what makes the touchscreen's
@@ -705,6 +709,7 @@ _EXPECTED_SHORT_CLASSES = {
     "physical_fault": _EXPECTED_PHYSICAL,
     "rfid_read": _EXPECTED_RFID,
     "informational": _EXPECTED_INFORMATIONAL,
+    "plate_check": _EXPECTED_PLATE_CHECK,
 }
 
 # The pre-relocation literal from spool_respool.py, copied verbatim. RUNOUT_HMS_CODES
@@ -858,9 +863,12 @@ class TestAmsFaultTaxonomyShortLane:
         assert not hasattr(hms_errors, "legacy_swap_short_codes")
 
     def test_an_unclassified_short_code_is_none(self):
+        """CHANGED 2026-09-29: the example was ``0500_808C``, which now has its own
+        PLATE_CHECK row (the plan that retired ``bambu_mqtt``'s literal plate set).
+        ``0300_8003`` (AI spaghetti detection) is the documented unclassified sibling."""
         from backend.app.services.hms_errors import classify_short_code
 
-        assert classify_short_code("0500_808C") is None
+        assert classify_short_code("0300_8003") is None
         assert classify_short_code("0300_400C") is None
 
     def test_lookup_is_case_insensitive(self):
@@ -1401,6 +1409,85 @@ class TestPowerLossVocabulary:
 
         assert classify_short_code("0300_8007") is None
         assert classify_short_code("0300_400D") is None
+
+
+class TestPlateCheckVocabulary:
+    """The printer's own pre-print plate check: ONE code set (a taxonomy view) and the
+    predicate the pause lane reads — ``PAUSE`` plus the CURRENT ``print_error`` dialog."""
+
+    def test_the_set_is_the_taxonomy_view_with_the_retired_literals_members(self):
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, AmsFaultClass, _shorts_where
+
+        assert PLATE_CHECK_HMS_CODES == _EXPECTED_PLATE_CHECK
+        derived = _shorts_where(lambda r: r.fault_class is AmsFaultClass.PLATE_CHECK)
+        assert derived == PLATE_CHECK_HMS_CODES
+
+    def test_the_retired_literal_is_gone_and_every_reader_holds_the_one_set(self):
+        from backend.app import main
+        from backend.app.services import bambu_mqtt, terminal_outcome
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
+
+        assert not hasattr(bambu_mqtt, "_HMS_PLATE_OCCUPANCY_CODES")
+        assert main.PLATE_CHECK_HMS_CODES is PLATE_CHECK_HMS_CODES
+        assert terminal_outcome.PLATE_CHECK_HMS_CODES is PLATE_CHECK_HMS_CODES
+        # The failure category still names every member.
+        for code in PLATE_CHECK_HMS_CODES:
+            assert terminal_outcome._HMS_FAILURE_REASONS[code] == "Plate not empty (printer vision)"
+
+    def test_a_plate_check_is_never_an_actionable_ams_fault(self):
+        """The class is outside ACTIONABLE_CLASSES, so classifying the codes hands them to
+        no AMS lane: the jam machine, the dispatch gate and the incident sweep read only
+        ``live_candidates``."""
+        from backend.app.services.bambu_mqtt import HMSError
+        from backend.app.services.hms_errors import ACTIONABLE_CLASSES, AmsFaultClass, live_candidates
+
+        assert AmsFaultClass.PLATE_CHECK not in ACTIONABLE_CLASSES
+        # The print_error-lane shape the parser stores: attr = the whole 32-bit word.
+        entry = HMSError(code="0x808c", attr=0x0500808C, module=5, severity=3, full_code="0500808C")
+        assert live_candidates(SimpleNamespace(hms_errors=[entry])) == frozenset()
+
+    @pytest.mark.parametrize(
+        ("print_error", "short"),
+        [(0x0500808C, "0500_808C"), (0x0500806E, "0500_806E"), (0x03008017, "0300_8017"), (0, "0000_0000")],
+    )
+    def test_print_error_short_code_splits_the_word(self, print_error, short):
+        from backend.app.services.hms_errors import print_error_short_code
+
+        assert print_error_short_code(print_error) == short
+
+    @pytest.mark.parametrize(
+        ("gcode_state", "print_error", "expected"),
+        [
+            pytest.param("PAUSE", 0x0500808C, True, id="pause+808C"),
+            pytest.param("PAUSE", 83918958, True, id="pause+806E_decimal"),
+            pytest.param("PAUSE", 0x03008017, True, id="pause+0300_8017"),
+            pytest.param("RUNNING", 0x0500808C, False, id="running+808C"),
+            pytest.param("PAUSE", 0x03008007, False, id="pause+power_loss_prompt"),
+            pytest.param("PAUSE", 0, False, id="pause+no_dialog"),
+            pytest.param("FAILED", 0x0500808C, False, id="failed+808C"),
+        ],
+    )
+    def test_plate_check_paused_truth_table(self, gcode_state, print_error, expected):
+        from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.hms_errors import plate_check_paused
+
+        assert plate_check_paused(PrinterState(state=gcode_state, print_error=print_error)) is expected
+
+    def test_a_lingering_hms_entry_does_not_trip_it(self):
+        """The dialog leg is the CURRENT ``print_error``, never the merged HMS list — a
+        plate code left in ``hms_errors`` after the dialog closed is not a trip."""
+        from backend.app.services.bambu_mqtt import HMSError, PrinterState
+        from backend.app.services.hms_errors import plate_check_paused
+
+        leftover = HMSError(code="0x808c", attr=0x0500808C, module=5, severity=3, full_code="0500808C")
+        assert plate_check_paused(PrinterState(state="PAUSE", print_error=0, hms_errors=[leftover])) is False
+
+    def test_a_malformed_state_never_raises(self):
+        from backend.app.services.hms_errors import plate_check_paused
+
+        assert plate_check_paused(None) is False
+        assert plate_check_paused(SimpleNamespace(state="PAUSE")) is False
+        assert plate_check_paused(SimpleNamespace(state="PAUSE", print_error="not-a-number")) is False
 
 
 class TestFingerprintTokens:

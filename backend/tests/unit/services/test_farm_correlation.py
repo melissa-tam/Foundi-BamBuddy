@@ -675,9 +675,9 @@ class TestPlateOccupancyCodeSet:
     """The vision codes the capture hook and the failure-reason attribution share."""
 
     def test_the_four_native_vision_codes_are_pinned_members(self):
-        from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
 
-        assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= _HMS_PLATE_OCCUPANCY_CODES
+        assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= PLATE_CHECK_HMS_CODES
 
 
 async def _add_eject_item(db, *, printer_id, status="printing", eject_profile_id=None, batch_id=None):

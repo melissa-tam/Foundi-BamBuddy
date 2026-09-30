@@ -1439,6 +1439,71 @@ class TestRecoveryDriverOwnership:
         assert builds_from_row
 
 
+_BAMBU_MQTT = ("services", "bambu_mqtt.py")
+_DIALOG_FRAME_OWNER = "execute_hms_action"
+
+
+def _dialog_frame_kind(node: ast.Dict) -> str | None:
+    """Which printer-dialog button frame a dict literal builds: ``"ignore"`` /
+    ``"idle_ignore"`` for those commands, ``"resume+err"`` for a ``resume`` that carries
+    ``err``; ``None`` for any other dict (a plain resume is ``resume_print``'s)."""
+    fields = {
+        key.value: value
+        for key, value in zip(node.keys, node.values, strict=True)
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    command = fields.get("command")
+    if not (isinstance(command, ast.Constant) and isinstance(command.value, str)):
+        return None
+    if command.value in ("ignore", "idle_ignore"):
+        return command.value
+    if command.value == "resume" and "err" in fields:
+        return "resume+err"
+    return None
+
+
+class TestHmsDialogFrameOwnership:
+    """``BambuMQTTClient.execute_hms_action`` is the ONE builder of the printer-dialog
+    button frames — BambuStudio's ``command_hms_resume`` ("Problem solved, resume"),
+    ``command_hms_ignore`` and ``command_hms_idle_ignore`` (2026-09-29). A second builder
+    would be a press of the printer's dialog that no sequence id names and no ACK read
+    answers, with its own opinion of the ``err`` form (decimal, 8-hex ``print_error``
+    only — a hex ``err`` is silently dropped, upstream #1869)."""
+
+    def test_the_dialog_frames_are_built_only_in_execute_hms_action(self):
+        built: set[str] = set()
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if not isinstance(node, ast.Dict):
+                    continue
+                kind = _dialog_frame_kind(node)
+                if kind is None:
+                    continue
+                if parts == _BAMBU_MQTT and _DIALOG_FRAME_OWNER in scope:
+                    built.add(kind)
+                else:
+                    strays.append(
+                        f"  - {'/'.join(parts)}:{node.lineno} builds a {kind} frame in {'.'.join(scope) or '<module>'}"
+                    )
+        assert not strays, "A printer-dialog button frame is built outside execute_hms_action:\n" + "\n".join(strays)
+        # Liveness: the owner still builds all three, so the pin cannot pass by scanning nothing.
+        assert built == {"ignore", "idle_ignore", "resume+err"}
+
+    def test_the_scan_recognises_each_frame_shape(self):
+        """The recogniser itself, on literal source: a plain resume is not a dialog frame,
+        an err-bearing one is, and a ``**`` spread key is skipped rather than crashing."""
+        source = (
+            'a = {"command": "resume", "sequence_id": "1"}\n'
+            'b = {"command": "resume", "err": "83918988", "param": "reserve"}\n'
+            'c = {"command": "ignore", **extra}\n'
+            'd = {"command": "idle_ignore", "type": 0}\n'
+            'e = {"command": "pause"}\n'
+        )
+        kinds = [_dialog_frame_kind(n) for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Dict)]
+        assert kinds == [None, "resume+err", "ignore", "idle_ignore", None]
+
+
 def _scan_resolution_vocabulary(py_file: Path) -> list[tuple[str, int]]:
     """Every USE (never a mention in prose) of a class literal or ``resolution_class``.
 

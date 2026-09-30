@@ -92,10 +92,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["printers"])
 
-# Seconds the /hms/execute-action route waits for a printer status push
-# confirming the command landed before reporting 502 to the UI. Module-level
-# so tests can monkeypatch a near-zero value instead of mocking asyncio.sleep.
+# Seconds the /hms/execute-action route waits for the firmware's ACK of the frame it
+# sent before reporting 502 to the UI, and how often it re-reads the ACK log inside that
+# budget. Module-level so tests can monkeypatch a near-zero value.
 HMS_ACTION_ACK_WAIT_SECONDS = 2.5
+HMS_ACTION_ACK_POLL_SECONDS = 0.1
 
 
 async def _caller_can_view_printer_secrets(user: User | None, db: AsyncSession) -> bool:
@@ -4216,7 +4217,17 @@ async def execute_hms_action(
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
-    """Execute an HMS action on the printer."""
+    """Press an HMS dialog button on the printer and answer from the firmware's own ACK.
+
+    ``BambuMQTTClient.execute_hms_action`` publishes the button's frame and names it
+    (``SentCommand``); ``await_ack`` reads the firmware's echo of THAT send by sequence id
+    (invariant 14). 200 on a success ACK; 502 on a refusing ACK (naming the firmware's
+    answer) or on no ACK within the budget — publish success is not printer acceptance,
+    the firmware drops a frame it does not accept (#1830). A frame whose echo is never
+    recorded (the system-topic ``uiop`` close) answers 200 "sent". This replaces a
+    before/after diff of ``gcode_state`` + the HMS-list length, which read a printer that
+    accepted, resumed and re-paused inside the window as a refusal (upstream #1869).
+    """
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
     if not printer:
@@ -4226,45 +4237,27 @@ async def execute_hms_action(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    # Snapshot pre-state so we can verify the printer actually acted on the
-    # command. publish() success is NOT the same as printer-ack: Bambu's
-    # firmware silently rejects malformed HMS commands at QoS 1 (the broker
-    # ACKs the publish, but the printer drops it). Verified end-to-end against
-    # a live H2D — see #1830 §(3). We sample (gcode_state, hms_errors length)
-    # because every accepted HMS action mutates at least one of them.
-    #
-    # PrinterState.state carries the MQTT `gcode_state` value verbatim (see
-    # bambu_mqtt.py line 2144); the raw `print_error` int isn't preserved on
-    # state, only the derived HMSError entries are.
-    pre_gcode = client.state.state
-    pre_hms_count = len(client.state.hms_errors)
-
     if body.action == HMSAction.STOP_PRINTING:
         # The printer's own dialog offering "Stop printing" is an operator pressing Stop,
         # and the operator's Stop has ONE owner (``print_control.stop_as_operator``): the
         # durable stop request on the running unit, then the MQTT stop. Sent through the
         # dialog dispatcher it went out WITHOUT the request, so the terminal read as a
         # genuine failure — retry, quarantine count — for a print a human stopped on purpose.
-        success = await stop_as_operator(printer_id)
-    else:
-        success = client.execute_hms_action(body.print_error, body.action, body.job_id)
-    if not success:
+        # Its answer is "sent": the stop frame carries no sequence id, so no ACK names it.
+        if not await stop_as_operator(printer_id):
+            raise HTTPException(400, "Failed to execute HMS action")
+        return {"success": True, "message": "HMS action sent"}
+
+    sent = client.execute_hms_action(body.print_error, body.action, body.job_id)
+    if sent is None:
         raise HTTPException(400, "Failed to execute HMS action")
+    if sent.sequence_id is None:
+        return {"success": True, "message": "HMS action sent"}
 
-    # Give the printer time to push a state update. The dispatch helper already
-    # publishes a pushall after every command, so a fresh status should arrive
-    # within ~1s; the default 2.5s covers slower firmware variants without
-    # making the UI feel hung. Plain sleep is fine — paho's MQTT callback
-    # runs in its own thread and updates state regardless of whether this
-    # coroutine is awaiting.
-    await asyncio.sleep(HMS_ACTION_ACK_WAIT_SECONDS)
-
-    acked = client.state.state != pre_gcode or len(client.state.hms_errors) != pre_hms_count
-    if not acked:
-        # Publish succeeded but the printer's state didn't move. Almost always
-        # firmware-side silent rejection (err mismatch, command/state mismatch).
-        # 502 makes it visible at the UI instead of the 200-but-broken loop
-        # #1830 reported.
-        raise HTTPException(502, "Printer did not acknowledge HMS action within 2.5s")
-
+    ack = await client.await_ack(sent, HMS_ACTION_ACK_WAIT_SECONDS, HMS_ACTION_ACK_POLL_SECONDS)
+    if ack is None:
+        raise HTTPException(502, f"Printer did not acknowledge HMS action within {HMS_ACTION_ACK_WAIT_SECONDS}s")
+    if not ack.succeeded:
+        answer = f"result={ack.result}" + (f", reason={ack.reason}" if ack.reason else "")
+        raise HTTPException(502, f"Printer rejected HMS action {sent.command}: {answer}")
     return {"success": True, "message": "HMS action executed"}

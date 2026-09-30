@@ -31,14 +31,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from backend.app.models.printer_incident import FAULT_KINDS, KIND_PLATE_VISION
-from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
 from backend.app.services.farm_correlation import (
     OPERATOR_STOP_VERDICTS,
     STOP_SOURCE_RECONCILE_UNKNOWN,
     STOP_VERDICT_PLATE_REFUSED,
     StopVerdict,
 )
-from backend.app.services.hms_errors import PrinterMessage, messages_from_payload, summary_of, unique_messages
+from backend.app.services.hms_errors import (
+    PLATE_CHECK_HMS_CODES,
+    PrinterMessage,
+    messages_from_payload,
+    summary_of,
+    unique_messages,
+)
 from backend.app.services.plate_occupancy import PlateRefusal
 
 if TYPE_CHECKING:
@@ -82,9 +87,9 @@ _HMS_FAILURE_REASONS: dict[str, str] = {
     "0701_8013": "Clogged nozzle",
     "0702_8003": "Clogged nozzle",
 }
-# The printer's own pre-print plate check, from the one code set the wire
-# layer defines, so the category and the trip lane can never name different codes.
-for _occupancy_code in _HMS_PLATE_OCCUPANCY_CODES:
+# The printer's own pre-print plate check, from the one code set the HMS taxonomy
+# defines, so the category and the trip lane can never name different codes.
+for _occupancy_code in PLATE_CHECK_HMS_CODES:
     _HMS_FAILURE_REASONS.setdefault(_occupancy_code, "Plate not empty (printer vision)")
 
 # The category for a stop a HUMAN attributed and the printer explained nothing about.
