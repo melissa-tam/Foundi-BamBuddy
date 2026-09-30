@@ -992,11 +992,17 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
         "The printer is not paused — it is idle and will take no work until a filament change completes "
         "through the path (load a slot on the printer) or an operator presses Recover."
     ),
-    # The three pause-cause kinds hold an IDLE printer as their NORMAL shape — the farm
-    # stopped the print (plate check) or never had one running (a lost Z reference on an
-    # idle machine) — so their unpaused copy is not a variant of a paused sentence and
-    # deliberately does not borrow the "until the fault clears on the wire" suffix: no
-    # wire fact ends either hold, only the operator does.
+    # The pause-cause kinds' unpaused copy is not a variant of a paused sentence and
+    # deliberately does not borrow the "until the fault clears on the wire" suffix: no wire
+    # fact ends these holds. A lost Z reference holds an IDLE printer as its NORMAL shape
+    # (there may never have been a print running), and only the operator ends it. A
+    # plate-check episode is a PAUSE hold that ends with its job: the farm re-checks in
+    # place, and on a failed re-check STOPS the print (retry, or escalate on the retry's own
+    # failure) — the terminal of that stop closes the row, and an escalated plate is then
+    # nagged from its refused-plate GATE (the third arm below), not from this row. So a
+    # plate-check row still open on a printer that is not paused is only ever the short gap
+    # before that terminal or the sweep's job-ended-unseen close; its copy says only what is
+    # true then.
     KIND_POWER_LOSS: (
         "This printer is STILL held at its power-loss prompt and will take no work until the prompt is answered."
     ),
@@ -1163,6 +1169,73 @@ async def _remind_open_incidents(
             logger.exception("farm_stall: incident attention reminder failed for printer %s", pid)
 
 
+async def _remind_refused_plates(
+    db: AsyncSession,
+    *,
+    manager,
+    now: float,
+    held_keys: set[tuple[int, str]],
+) -> None:
+    """Hourly nag for every plate the printer's plate check REFUSED and a human must clear.
+
+    The escalation end of the plate-check ladder (operator ruling 2026-09-29: "escalate …
+    make sure the bed is not at the bottom"): the terminal gated the plate with the
+    printer's words (``EscalationOnly`` carrying a ``PlateRefusal``), the eject monitor sent
+    the FIRST page at once (``eject.monitor.escalation_first_page_s``), and this arm repeats
+    it once per :data:`_ATTENTION_REMINDER_S` until the gate clears. The plate-check ROW was
+    closed by that terminal, so the incident arm cannot see this hold; the GATE is the fact,
+    read off the plate authority's view.
+
+    Same contract as the other two arms: remindable only on a connected printer; the first
+    sighting SEEDS the ``"attention"`` window (the monitor delivered the first page), then
+    one page per window; tracking resets when the gate clears or its refusal is gone. One
+    key per GATE (``plate_since``), so a gate cleared and raised again between two ticks is
+    a new episode rather than a continuation. The sentence is the monitor's own
+    (:func:`eject.monitor.escalation_sentence`) — one origin for the words — and a printer
+    in maintenance mode is skipped, as the monitor withholds its own page there.
+    """
+    from backend.app.models.printer import Printer
+    from backend.app.services import printer_incidents
+    from backend.app.services.eject.monitor import escalation_sentence, notify_plate_not_empty
+    from backend.app.services.plate_occupancy import EscalationOnly
+
+    result = await db.execute(select(Printer).where(Printer.is_active.is_(True)))
+    for printer in result.scalars().all():
+        pid = printer.id
+        try:
+            view = plate_occupancy.snapshot(pid)
+            policy = view.plate_policy
+            if not view.plate_occupied or not isinstance(policy, EscalationOnly) or policy.refusal is None:
+                continue
+            if printer_incidents.automation_held(pid) or not manager.is_connected(pid):
+                continue
+            since = view.plate_since.isoformat() if view.plate_since is not None else ""
+            key = (pid, f"plate_refused:{since}")
+            held_keys.add(key)
+
+            akey = f"{pid}:plate_refused:{since}"
+            first = _attention_first_seen.get(key)
+            if first is None:
+                # First remindable sighting: seed the window so the first reminder lands one
+                # full window later (the monitor paged the refusal the moment it was gated).
+                _attention_first_seen[key] = now
+                notify_dedup.allow("attention", akey, now, _ATTENTION_REMINDER_S)
+                continue
+            if not notify_dedup.allow("attention", akey, now, _ATTENTION_REMINDER_S):
+                continue
+
+            await notify_plate_not_empty(
+                pid, source_detail=escalation_sentence(farm_source=False, refusal=policy.refusal)
+            )
+            logger.warning(
+                "farm_stall: printer %s refused plate STILL gated (%d min) — attention reminder re-fired",
+                pid,
+                int((now - first) // 60),
+            )
+        except Exception:  # noqa: BLE001 — one bad printer must not abort the watch
+            logger.exception("farm_stall: refused-plate attention reminder failed for printer %s", pid)
+
+
 async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
     """Re-fire the ORIGINAL escalation notification for a printer left down.
 
@@ -1170,11 +1243,13 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
     EXACTLY ONCE per incident and then leave the printer PAUSED for a human, so a
     hold that a human doesn't clear for hours produced a single Discord message —
     the 2026-07-20 incident sat 5+ h that way on two printers. This watch nags,
-    through TWO arms that never overlap:
+    through THREE arms that never overlap:
 
     * every OPEN ESCALATED AMS incident (:func:`_remind_open_incidents`) — printer
       scoped, so a FOREIGN print's hold nags exactly like a farm one. A queue
       token cannot serve here: a foreign hold has none to read;
+    * every plate the printer's plate check REFUSED (:func:`_remind_refused_plates`) —
+      the gate, not a row: the terminal that refused the plate closed its plate-check row;
     * every still-``printing`` farm unit carrying one of the remaining non-AMS
       ESCALATED tokens in :data:`_ATTENTION_REASONS` (plate-vision, pause-stall),
       re-firing THAT reason's own notification event via :data:`_ATTENTION_DISPATCH`
@@ -1187,7 +1262,8 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
     SEEDS the window the first tick it sees the condition and the first REMINDER
     lands one full window later — then once per window while still held. Tracking
     resets the moment the condition lifts (pause ends, the unit is no longer
-    ``printing``, or the reason changes) so a future incident nags afresh.
+    ``printing``, the reason changes, or a refused plate's gate clears) so a future
+    incident nags afresh.
 
     Never writes a terminal status and mutates no queue item — a reminder is purely
     a re-notification. Per-printer guarded (one bad printer must not kill the tick).
@@ -1205,6 +1281,7 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
     # shares the ledger, keyed ``incident:{id}`` — one reset pass, one contract.
     held_keys: set[tuple[int, str]] = set()
     await _remind_open_incidents(db, notification_service, manager=manager, now=now, held_keys=held_keys)
+    await _remind_refused_plates(db, manager=manager, now=now, held_keys=held_keys)
 
     for item in list(result.scalars().all()):
         pid = item.printer_id

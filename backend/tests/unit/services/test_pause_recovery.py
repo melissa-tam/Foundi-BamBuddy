@@ -36,6 +36,7 @@ from backend.app.services import pause_recovery, printer_incidents
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
 from backend.app.services.plate_occupancy import EscalationOnly, Evidence, PendingEject, plate_occupancy
 from backend.app.services.printer_incidents import WAITING_REASON_POWER_LOSS
+from backend.app.services.terminal_outcome import PLATE_RECHECK_WINDOW_S, PlateCheckFacts
 
 pytestmark = pytest.mark.asyncio
 
@@ -1256,3 +1257,192 @@ class TestMaintenanceModeStandsAside:
         kinds = [row.kind for row in await _open_incidents(db_session, 43)]
         assert kinds.count(KIND_Z_REFERENCE_LOST) == 1
         assert page.await_count == 1
+
+
+# --- the plate-check episode: its step vocabulary and its terminal facts -----
+
+
+async def _episode(db, printer_id, *, job_id, steps=(), created_at=None, close=False):
+    """One ``plate_vision`` episode of ``job_id`` whose driver sent ``steps`` — seeded through
+    the episode's own evidence log, the ledger's one writer. ``close`` ends it the way its
+    terminal does, so another episode can open on the same printer."""
+    from backend.app.models.printer_incident import STATUS_RESOLVED
+
+    row = await printer_incidents.open_new(
+        db,
+        printer_id=printer_id,
+        job_id=job_id,
+        item_id=None,
+        kind=KIND_PLATE_VISION,
+        code="0500_808C",
+        codes="0500_808C",
+        slot_global_tray=None,
+        hms_full_codes=["0500808C"],
+        status=STATUS_RECOVERING,
+    )
+    log = await pause_recovery._PlateCheckEvidence.from_row(db, row.id)
+    for step in steps:
+        await log.note(step)
+    if created_at is not None:
+        row.created_at = created_at
+        await db.commit()
+    if close:
+        await printer_incidents.close(db, row.id, status=STATUS_RESOLVED, source="terminal")
+    return row
+
+
+class TestPlateCheckStepVocabulary:
+    """The episode's two ledger kinds and their closed answers — the vocabulary the episode
+    driver writes and re-entry reads (operator ruling 2026-09-29)."""
+
+    async def test_the_ladder_presses_problem_solved_resume_and_stops(self):
+        press = pause_recovery.PlateCheckStep.dialog()
+        stop = pause_recovery.PlateCheckStep.stop()
+        assert (press.kind, press.name) == ("dialog", "PROBLEM_SOLVED_RESUME")
+        assert (stop.kind, stop.name) == ("stop", "stop")
+
+    async def test_ignore_is_never_a_ladder_press(self):
+        """ "Ignore and resume" suppresses the re-check the ladder exists to run."""
+        with pytest.raises(LookupError):
+            pause_recovery.PlateCheckStep.dialog("IGNORE_RESUME")
+
+    @pytest.mark.parametrize(
+        ("kind", "accepted", "refused"),
+        [
+            ("dialog", ["success", "fail", "no_ack", "not_sent"], ["taken", "not_taken", "maybe"]),
+            ("stop", ["taken", "not_taken", "not_sent"], ["success", "fail", "no_ack"]),
+        ],
+    )
+    async def test_each_kind_answers_only_in_its_own_vocabulary(self, kind, accepted, refused):
+        step = pause_recovery.PlateCheckStep.dialog() if kind == "dialog" else pause_recovery.PlateCheckStep.stop()
+        for token in accepted:
+            assert step.answered(token).outcome == token
+        for token in refused:
+            with pytest.raises(LookupError):
+                step.answered(token)
+
+    async def test_the_log_round_trips_and_re_entry_reads_what_was_sent(self, db_session):
+        await _printer(db_session, 60)
+        row = await _episode(db_session, 60, job_id="JOB-1")
+        log = await pause_recovery._PlateCheckEvidence.from_row(db_session, row.id)
+
+        pressed = await log.note(pause_recovery.PlateCheckStep.dialog())
+        await log.answer(pressed, "fail")
+        await log.note(pause_recovery.PlateCheckStep.stop())
+
+        rebuilt = await pause_recovery._PlateCheckEvidence.from_row(db_session, row.id)
+        assert [(s.seq, s.kind, s.name, s.outcome) for s in rebuilt.steps] == [
+            (1, "dialog", "PROBLEM_SOLVED_RESUME", "fail"),
+            (2, "stop", "stop", None),
+        ]
+        assert rebuilt.has_step("dialog") and rebuilt.has_step("stop")
+
+    @pytest.mark.parametrize(
+        ("kind", "name", "outcome"),
+        [("lever", "resume", None), ("dialog", "IGNORE_RESUME", None), ("stop", "stop", "success")],
+        ids=["another-drivers-kind", "a-button-the-ladder-never-presses", "a-dialog-answer-on-a-stop"],
+    )
+    async def test_a_ledger_row_the_lane_cannot_name_raises_at_hydration(self, db_session, kind, name, outcome):
+        await _printer(db_session, 61)
+        row = await _episode(db_session, 61, job_id="JOB-1")
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind=kind, name=name)
+        if outcome is not None:
+            await printer_incidents.answer_step(db_session, row.id, 1, outcome=outcome)
+
+        with pytest.raises(LookupError):
+            await pause_recovery._PlateCheckEvidence.from_row(db_session, row.id)
+
+
+class TestPlateCheckFacts:
+    """``plate_check_facts`` — what a terminal owes its plate-check episode, read off the
+    snapshot ``main.on_print_complete`` took before any closer: did the FARM stop this job,
+    and how many OTHER episodes did it stop on this printer inside the window."""
+
+    async def test_a_job_with_no_episode_has_no_facts(self, db_session):
+        await _printer(db_session, 62)
+        assert await pause_recovery.plate_check_facts(62, [], "JOB-1") is None
+        # Another job's episode, and a hold of another kind, say nothing about this terminal.
+        await _episode(db_session, 62, job_id="JOB-OTHER", steps=(pause_recovery.PlateCheckStep.stop(),))
+        runout = {"id": 99, "kind": KIND_RUNOUT, "job_id": "JOB-1"}
+        snapshot = [*printer_incidents.snapshots(62), runout]
+        assert await pause_recovery.plate_check_facts(62, snapshot, "JOB-1") is None
+
+    async def test_a_farm_stop_step_is_farm_stopped(self, db_session):
+        await _printer(db_session, 63)
+        await _episode(
+            db_session,
+            63,
+            job_id="JOB-1",
+            steps=(pause_recovery.PlateCheckStep.dialog(), pause_recovery.PlateCheckStep.stop()),
+        )
+
+        facts = await pause_recovery.plate_check_facts(63, printer_incidents.snapshots(63), "JOB-1")
+
+        assert facts == PlateCheckFacts(farm_stopped=True, stops_in_window=0)
+
+    @pytest.mark.parametrize(
+        ("answer", "farm_stopped"),
+        [(None, True), ("taken", True), ("not_taken", False), ("not_sent", False)],
+        ids=["unanswered", "taken", "not_taken", "not_sent"],
+    )
+    async def test_only_a_stop_that_ended_the_job_is_the_farms(self, db_session, answer, farm_stopped):
+        """The terminal usually lands while the driver is still watching for its stop's answer,
+        so an UNANSWERED stop is the farm's. A stop answered as not having ended the job made
+        the driver hand the paused print to a human — whoever ends it later is that human, and
+        the terminal escalates rather than retries."""
+        await _printer(db_session, 67)
+        row = await _episode(db_session, 67, job_id="JOB-1", steps=(pause_recovery.PlateCheckStep.dialog(),))
+        log = await pause_recovery._PlateCheckEvidence.from_row(db_session, row.id)
+        seq = await log.note(pause_recovery.PlateCheckStep.stop())
+        if answer is not None:
+            await log.answer(seq, answer)
+
+        facts = await pause_recovery.plate_check_facts(67, printer_incidents.snapshots(67), "JOB-1")
+
+        assert facts == PlateCheckFacts(farm_stopped=farm_stopped, stops_in_window=0)
+
+    async def test_a_press_alone_is_not_a_farm_stop(self, db_session):
+        """An operator who stops the print mid-episode leaves the farm's press on the log and
+        no farm ``stop`` — so the terminal escalates."""
+        await _printer(db_session, 64)
+        await _episode(db_session, 64, job_id="JOB-1", steps=(pause_recovery.PlateCheckStep.dialog(),))
+
+        facts = await pause_recovery.plate_check_facts(64, printer_incidents.snapshots(64), "JOB-1")
+
+        assert facts == PlateCheckFacts(farm_stopped=False, stops_in_window=0)
+
+    async def test_another_jobs_stopped_episode_counts_inside_the_window_only(self, db_session):
+        from datetime import timedelta
+
+        await _printer(db_session, 65)
+        stop = pause_recovery.PlateCheckStep.stop()
+        long_ago = datetime.utcnow() - timedelta(seconds=PLATE_RECHECK_WINDOW_S + 600)
+        await _episode(db_session, 65, job_id="JOB-OLD", steps=(stop,), created_at=long_ago, close=True)
+        await _episode(db_session, 65, job_id="JOB-PASSED", steps=(pause_recovery.PlateCheckStep.dialog(),), close=True)
+        await _episode(db_session, 65, job_id="JOB-PREV", steps=(stop,), close=True)  # the retry's parent
+        await _episode(db_session, 65, job_id="JOB-1", steps=(stop,))
+
+        facts = await pause_recovery.plate_check_facts(65, printer_incidents.snapshots(65), "JOB-1")
+
+        # Only JOB-PREV: JOB-OLD is outside the window, JOB-PASSED was never stopped, and
+        # JOB-1 is this terminal's own episode.
+        assert facts == PlateCheckFacts(farm_stopped=True, stops_in_window=1)
+
+    async def test_an_unreadable_ledger_fails_closed_to_facts_that_escalate(self, db_session, monkeypatch, caplog):
+        import logging
+
+        import backend.app.core.database as core_db
+
+        await _printer(db_session, 66)
+        await _episode(db_session, 66, job_id="JOB-1", steps=(pause_recovery.PlateCheckStep.stop(),))
+        snapshot = printer_incidents.snapshots(66)
+
+        def _broken():
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(core_db, "async_session", _broken)
+        with caplog.at_level(logging.WARNING, logger=pause_recovery.logger.name):
+            facts = await pause_recovery.plate_check_facts(66, snapshot, "JOB-1")
+
+        assert facts is not None and facts.farm_stopped is False
+        assert "plate-check facts for job JOB-1 unreadable" in caplog.text

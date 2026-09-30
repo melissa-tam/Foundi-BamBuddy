@@ -2820,6 +2820,23 @@ async def _open_vision_incident(db, printer_id, *, item_id=None, codes="0500_806
     )
 
 
+@pytest.fixture
+def lift_waits(monkeypatch):
+    """The held-bed lift's motion wait, RECORDED instead of slept, as ``("wait", seconds)``.
+
+    ``farm_policy`` reaches ``asyncio`` for that one sleep, so its module reference is
+    replaced rather than the process-wide ``asyncio.sleep`` — nothing else a test runs is
+    fast-forwarded. The list is shared, so a test can append its own events to read ORDER.
+    """
+    events: list[tuple] = []
+
+    async def _sleep(delay):
+        events.append(("wait", delay))
+
+    monkeypatch.setattr(farm_policy, "asyncio", SimpleNamespace(sleep=_sleep))
+    return events
+
+
 def _outcome(verdict=None, *, recorded="cancelled", faults=frozenset(), refusal=None):
     """The terminal's ONE classification, as ``main.on_print_complete`` hands it over.
 
@@ -2843,6 +2860,7 @@ def _outcome(verdict=None, *, recorded="cancelled", faults=frozenset(), refusal=
     )
 
 
+@pytest.mark.usefixtures("lift_waits")
 class TestGracefulRequeue:
     """A plate the printer REFUSED, or one an operator stopped on a fault-held
     printer, is queued again with its settings — lineage only, no quarantine, no run pause.
@@ -3191,16 +3209,134 @@ class TestRefusedPlateTerminal:
     paused the job and the job then ended without printing.
 
     The plate is the authority's — the terminal's one plate call already holds it for a
-    human with the printer's words — so the policy owes exactly two things: the bed lifted
-    off the plate-release aid (farm or foreign alike) and, for a farm unit, the requeue.
-    It opens, escalates and closes no incident, raises no gate and sends no page.
+    human with the printer's words, or leaves it ungated when the farm retries — so the
+    policy owes exactly two things: the bed lifted off the plate-release aid (farm or
+    foreign alike) and, for a farm unit, the requeue. It opens, escalates and closes no
+    incident, raises no gate and sends no page.
     """
 
     @pytest.fixture(autouse=True)
-    def _clean_incidents(self):
+    def _clean_incidents(self, lift_waits):
         printer_incidents._reset_state()
         yield
         printer_incidents._reset_state()
+
+    @pytest.mark.parametrize("escalated", [True, False], ids=["escalated", "retried"])
+    async def test_the_lift_waits_for_its_own_motion_before_the_requeue(self, db_session, lift_waits, escalated):
+        """Operator ruling 2026-09-29: the bed off the release aid, and the printer released
+        only after the lift's motion time — both guarded moves at their full distance over the
+        one feed. The requeue (the printer's release) comes strictly after the wait."""
+        printer = await _mk_printer_row(db_session, f"PVW{int(escalated)}")
+        await _seed_hold_geometry(db_session, hold_lift=15.0)
+        batch, item = await self._refused_unit(db_session, printer)
+        real_requeue = requeue.requeue_attempt
+
+        async def _requeue(*args, **kwargs):
+            lift_waits.append(("requeue",))
+            return await real_requeue(*args, **kwargs)
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=_ParkClient()),
+            patch.object(farm_policy.requeue, "requeue_attempt", _requeue),
+        ):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                item.id,
+                "cancelled",
+                # The retry (no refusal) and the escalation share the verdict, and the lift.
+                outcome=dataclasses.replace(
+                    _outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED),
+                    plate_refusal=PlateRefusal(messages=()) if escalated else None,
+                ),
+            )
+
+        motion_s = (farm_policy.VISION_HOLD_PROBE_MM + 15.0) / (1200 / 60)
+        assert lift_waits == [("wait", pytest.approx(motion_s)), ("requeue",)]
+        assert motion_s == pytest.approx(2.35)
+
+    @pytest.mark.parametrize("skipped", ["refused", "bedslinger", "no_client"])
+    async def test_no_wait_when_nothing_moved(self, db_session, lift_waits, skipped):
+        model = "A1" if skipped == "bedslinger" else "H2S"
+        printer = await _mk_printer_row(db_session, f"PVN-{skipped}", model=model)
+        await _seed_hold_geometry(db_session, model_key=model)
+        client = None if skipped == "no_client" else _ParkClient(ok=skipped != "refused")
+
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=client):
+            await farm_policy.on_terminal(
+                db_session, printer.id, None, "cancelled", outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED)
+            )
+
+        assert lift_waits == []
+
+    async def test_an_accepted_lift_holds_dispatch_off_for_its_motion_time(self, db_session, lift_waits, monkeypatch):
+        """The lift is a CLAIMED bed motion on the plate authority: from the send until its
+        own motion time has passed, no print may be dispatched onto the printer."""
+        from backend.app.services import plate_occupancy as po
+
+        now = [5_000.0]
+        monkeypatch.setattr(po, "_now_mono", lambda: now[0])
+        printer = await _mk_printer_row(db_session, "PVC1")
+        await _seed_hold_geometry(db_session, hold_lift=12.0)
+
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=_ParkClient()):
+            await farm_policy.on_terminal(
+                db_session, printer.id, None, "cancelled", outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED)
+            )
+
+        idle = Evidence(live_state="IDLE")
+        assert plate_occupancy.dispatchable(printer.id, idle) == "bed_motion_in_flight"
+        now[0] += (farm_policy.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60) + 0.01
+        assert plate_occupancy.dispatchable(printer.id, idle) is None
+
+    @pytest.mark.parametrize(
+        ("label", "wire", "printing_row", "refusal"),
+        [
+            ("a print is already on its way", "IDLE", True, "dispatch_in_flight"),
+            ("a job runs on the wire", "RUNNING", False, "job_active"),
+        ],
+    )
+    async def test_the_lift_is_skipped_and_logged_when_the_motion_is_refused(
+        self, db_session, lift_waits, caplog, label, wire, printing_row, refusal
+    ):
+        """A print starting on the printer drives the bed off the stop with its own start
+        block — the lift is not owed, and sending it would put two motions on one bed."""
+        printer = await _mk_printer_row(db_session, f"PVS-{refusal}")
+        await _seed_hold_geometry(db_session)
+        if printing_row:
+            batch, prof = await _mk_run(db_session, quantity=1, printer_ids=[printer.id], require_fa=False)
+            await _mk_live_unit(db_session, batch, prof, printer_id=printer.id, status="printing")
+        client = _ParkClient()
+
+        with (
+            patch.object(farm_policy.printer_manager, "get_client", return_value=client),
+            patch.object(farm_policy.printer_manager, "get_status", return_value=SimpleNamespace(state=wire)),
+            caplog.at_level(logging.INFO, logger=farm_policy.logger.name),
+        ):
+            await farm_policy.on_terminal(
+                db_session, printer.id, None, "cancelled", outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED)
+            )
+
+        assert client.sent == [], label
+        assert lift_waits == []
+        assert f"held-bed lift skipped on printer {printer.id} — bed motion refused ({refusal})" in caplog.text
+        assert plate_occupancy.snapshot(printer.id).bed_motion_active is False
+
+    async def test_a_refused_send_releases_the_claim(self, db_session, lift_waits):
+        """The printer did not take the lift, so nothing moves: dispatch is not held off."""
+        printer = await _mk_printer_row(db_session, "PVR1")
+        await _seed_hold_geometry(db_session)
+        client = _ParkClient(ok=False)
+
+        with patch.object(farm_policy.printer_manager, "get_client", return_value=client):
+            await farm_policy.on_terminal(
+                db_session, printer.id, None, "cancelled", outcome=_outcome(farm_correlation.STOP_VERDICT_PLATE_REFUSED)
+            )
+
+        assert len(client.sent) == 1  # the lift was attempted...
+        assert plate_occupancy.snapshot(printer.id).bed_motion_active is False  # ...and released
+        assert plate_occupancy.dispatchable(printer.id, Evidence(live_state="IDLE")) is None
+        assert lift_waits == []
 
     async def _refused_unit(self, db, printer, *, model_targeted=False):
         batch, prof = await _mk_run(
