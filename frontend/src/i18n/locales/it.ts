@@ -170,6 +170,7 @@ export default {
       timeCol: 'Terminata / avviata',
       stoppedByOperator: 'Fermata dall\'operatore',
       stoppedAtPlateCheck: 'Fermata al controllo del piatto',
+      stoppedByFarmFeedStall: "Fermata dalla farm: blocco dell'alimentazione all'avvio della stampa",
       stoppedByFarmVision: 'Fermata dalla farm: controllo del piatto',
       stoppedByReconcileUnknown: 'Esito sconosciuto dopo la riconnessione',
       firstArticleBadge: 'Primo pezzo',

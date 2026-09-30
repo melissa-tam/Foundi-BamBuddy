@@ -750,9 +750,12 @@ async def _on_item_failed(db: AsyncSession, batch: PrintBatch, item: PrintQueueI
 async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
     """A farm unit ended without its plate and without failing.
 
-    Called from :func:`on_terminal` for EVERY farm item that lands terminal
-    ``cancelled`` — the operator's stop (``stop_source`` set) and, since 2026-09-19,
-    an outcome the farm could not learn at all (``reconcile_unknown``, or no stamp).
+    Called from :func:`on_unit_terminal` for a farm item that lands terminal
+    ``cancelled`` and does NOT requeue — :func:`_requeues_gracefully` is asked first,
+    and a refused plate, the farm's own restart stop and an operator stop over an open
+    fault go back in the queue instead. What is left: the operator's stop
+    (``stop_source`` set) and, since 2026-09-19, an outcome the farm could not learn at
+    all (``reconcile_unknown``, or no stamp).
     The name is the common case, not the whole set: what unites them is that the unit
     produced no part and nothing failed, so the run must HOLD for a human rather than
     count it either way. Deliberately does the OPPOSITE of a failure:
@@ -796,11 +799,18 @@ def _requeues_gracefully(outcome: TerminalOutcome | None) -> bool:
     """Does this terminal mean "do this plate again" rather than "it failed/was cancelled"?
 
     Read off the terminal's ONE classification — its verdict and the fault kinds it
-    captured BEFORE any closer ran — never off the store afterwards. Two routes, and only
-    two:
+    captured BEFORE any closer ran — never off the store afterwards. Three routes, and only
+    three:
 
     * the printer REFUSED the plate (``plate_refused``): its own plate check paused the
       job, and the job ended without printing. Nothing was consumed and nothing failed.
+    * the FARM stopped the job to restart it (``fault_restart``): a feed stall on the first
+      filament load of a job that had deposited nothing, every release verb spent, so the
+      recovery driver ended the job with its last release rung (operator ruling
+      2026-09-29). The unit goes back next in line and the dispatcher maps it to the
+      backup slot. Without this route the terminal would land in
+      :func:`on_operator_stop` and hold the run for a human over the farm's own recovery;
+      the driver pages on its own escalations, so nothing is paged from here.
     * an OPERATOR stopped a print while the printer held an open EQUIPMENT FAULT
       (runout, jam, physical, power loss, …). The machine was already holding and the
       human stopping it is finishing what the hold started — the plate still has to be
@@ -818,7 +828,7 @@ def _requeues_gracefully(outcome: TerminalOutcome | None) -> bool:
     """
     if outcome is None:
         return False
-    if outcome.verdict == farm_correlation.STOP_VERDICT_PLATE_REFUSED:
+    if outcome.verdict in farm_correlation.REQUEUE_VERDICTS:
         return True
     return outcome.operator_stopped and bool(outcome.faults_open)
 
@@ -826,7 +836,8 @@ def _requeues_gracefully(outcome: TerminalOutcome | None) -> bool:
 async def on_farm_requeue(
     db: AsyncSession, batch: PrintBatch, item: PrintQueueItem, *, outcome: TerminalOutcome | None
 ) -> None:
-    """The plate was REFUSED, not failed: queue it again with the same settings.
+    """The plate was refused, restarted by the farm, or stopped over a fault — not failed:
+    queue it again with the same settings.
 
     The third disposition beside completed / failed / operator-stop, and deliberately
     unlike all three:
@@ -834,17 +845,20 @@ async def on_farm_requeue(
     - **lineage only.** The requeue carries ``retry_of_id`` / ``retry_count`` so the
       run-detail chain reads as one plate, but it never consumes
       ``farm_retry_max_per_unit``: the cap counts the FAILED ancestors of the chain
-      (``requeue.failed_ancestor_count``), and this row is ``cancelled`` — a refused
-      first article included (``terminal_outcome`` records it so).
+      (``requeue.failed_ancestor_count``), and this row is ``cancelled`` — a refused or
+      farm-restarted first article included (``terminal_outcome`` records it so).
     - **not quarantine-counted.** ``cancelled`` is outside ``_TERMINAL_RUN_OUTCOMES``
       by design, so ``recent_terminal_farm_items`` never sees it.
     - **it does not pause the run.** Neither ``_maybe_pause_run_no_printers`` nor
       ``_maybe_pause_run_exhausted`` is evaluated: nothing was exhausted and no printer
       became unavailable.
     - **the plate is the authority's.** A refused plate was gated by the terminal's one
-      plate call (``note_terminal`` with the refusal); a fault stop leaves the plate to
-      the terminal's own deposit evidence, exactly as ``_on_item_failed`` does. No
-      second plate write lives here.
+      plate call (``note_terminal`` with the refusal); a fault stop and a farm restart leave
+      the plate to the terminal's own deposit evidence, exactly as ``_on_item_failed``
+      does (a restart deposited nothing, so it gates nothing). No second plate write
+      lives here.
+    - **no page.** A farm restart is the recovery driver's own act, and the driver pages
+      on its own escalations; the operator-stop page belongs to :func:`on_operator_stop`.
 
     The requeue itself is ``requeue.requeue_attempt``'s: the plate lands NEXT in line
     (the head of its scope), a pool unit returns to the pool (so the scheduler
@@ -871,14 +885,20 @@ async def on_farm_requeue(
     retry = await requeue.requeue_attempt(
         item.id, cause="plate_check" if refused else "fault_stop", stage_manual=batch.status == "paused"
     )
+    if refused:
+        why = "the printer's plate check refused the plate"
+    elif verdict == farm_correlation.STOP_VERDICT_FAULT_RESTART:
+        why = "the farm stopped a job that had deposited nothing to restart it on the backup spool"
+    else:
+        why = (
+            f"operator stopped a print its printer was already holding ({verdict}, faults "
+            f"{sorted(outcome.faults_open) if outcome is not None else []})"
+        )
     logger.info(
         "farm_policy: unit %s requeued as %s — %s; lineage only, no quarantine count, run %s stays %s",
         item.id,
         retry.item_id if retry is not None else "nothing (see the requeue line)",
-        "the printer's plate check refused the plate"
-        if refused
-        else f"operator stopped a print its printer was already holding ({verdict}, faults "
-        f"{sorted(outcome.faults_open) if outcome is not None else []})",
+        why,
         batch.id,
         batch.status,
     )

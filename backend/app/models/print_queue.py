@@ -137,6 +137,10 @@ class PrintQueueItem(Base):
     #   'plate_refused'     the printer's own plate check PAUSED the job and it ended
     #                       without printing (usually an operator stopping the paused
     #                       print) — the plate is held for a human and the unit requeued;
+    #   'fault_restart'     the recovery driver stopped a job that had deposited nothing,
+    #                       over a feed stall on its first filament load, with its last
+    #                       release rung — the unit requeued next in line onto the
+    #                       backup slot, no retry spent;
     #   'farm_vision_abort' HISTORY only (2026-09-04 → 2026-09-24): the retired lane that
     #                       stopped a paused plate check itself. No writer remains; the
     #                       run-detail lineage still renders stored rows;

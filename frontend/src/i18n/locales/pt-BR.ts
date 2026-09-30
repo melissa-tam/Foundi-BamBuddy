@@ -170,6 +170,7 @@ export default {
       timeCol: 'Concluída / iniciada',
       stoppedByOperator: 'Parada pelo operador',
       stoppedAtPlateCheck: 'Parada na verificação da placa',
+      stoppedByFarmFeedStall: 'Parada pela fazenda: travamento da alimentação no início da impressão',
       stoppedByFarmVision: 'Parada pela fazenda: verificação da placa',
       stoppedByReconcileUnknown: 'Resultado desconhecido após a reconexão',
       firstArticleBadge: 'Primeira peça',

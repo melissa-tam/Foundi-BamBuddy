@@ -170,6 +170,7 @@ export default {
       timeCol: 'Bitti / başladı',
       stoppedByOperator: 'Operatör tarafından durduruldu',
       stoppedAtPlateCheck: 'Plaka kontrolünde durduruldu',
+      stoppedByFarmFeedStall: 'Çiftlik tarafından durduruldu: baskı başlangıcında besleme sıkışması',
       stoppedByFarmVision: 'Çiftlik tarafından durduruldu: plaka kontrolü',
       stoppedByReconcileUnknown: 'Yeniden bağlantı sonrası sonuç bilinmiyor',
       firstArticleBadge: 'İlk parça',
