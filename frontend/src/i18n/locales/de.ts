@@ -170,6 +170,7 @@ export default {
       timeCol: 'Fertig / gestartet',
       stoppedByOperator: 'Vom Bediener gestoppt',
       stoppedAtPlateCheck: 'Bei der Plattenprüfung gestoppt',
+      stoppedByFarmFeedStall: 'Von der Farm gestoppt: Förderstau beim Druckstart',
       stoppedByFarmVision: 'Von der Farm gestoppt: Plattenprüfung',
       stoppedByReconcileUnknown: 'Ergebnis nach Wiederverbindung unbekannt',
       firstArticleBadge: 'Erstmuster',

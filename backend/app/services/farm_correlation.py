@@ -87,6 +87,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer_incident import KIND_PLATE_VISION
 from backend.app.services.dispatch_target import target_of
+from backend.app.services.job_identity import same_job
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     DepositEvidence,
@@ -97,6 +98,7 @@ from backend.app.services.plate_occupancy import (
     TerminalDisposition,
     plate_occupancy,
 )
+from backend.app.services.printer_incidents import PAYLOAD_FAULT_RESTART_STOP
 from backend.app.utils.filename import print_identity_key
 from backend.app.utils.threemf_tools import list_gcode_plate_ids, resolve_plate_id
 
@@ -122,13 +124,23 @@ Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 # run-detail lineage still renders it; nothing writes it any more.
 STOP_VERDICT_PLATE_REFUSED = "plate_refused"
 
+# "The farm stopped this job to restart it on the backup spool." A terminal of the job an
+# OPEN AMS row's recovery driver stopped with its last release rung — a feed stall on the
+# first filament load of a job that had deposited nothing (operator ruling 2026-09-29).
+# Read off the open-row projection's ``printer_incidents.PAYLOAD_FAULT_RESTART_STOP``, never
+# off the printer's cancel echo (H2S echoes a remote stop; H2C echoes nothing). The unit is
+# recorded ``cancelled`` (a first article included) and requeued next in line with no retry
+# spent; ``requeue`` reads the token back to allow ONE such restart per unit lineage.
+# 13 characters — inside ``print_queue.stop_source``'s VARCHAR(20).
+STOP_VERDICT_FAULT_RESTART = "fault_restart"
+
 # "The farm never learned how this print ended." Stamped when the DOWNTIME reconcile
 # synthesises a terminal for a print whose outcome the wire cannot supply — the printer
 # came back IDLE, or echoing a different job, so there is no FINISH/FAILED to believe.
 # Nobody stopped it and nothing failed; the OUTCOME is simply unknown, and the honest
 # disposition for an unknown outcome is the operator-stop one (the run holds, a human is
 # paged, RESUME tops the deficit back up) rather than the silent no-op that let a run
-# finish one plate short. Its own token beside the three above because it is the only
+# finish one plate short. Its own token beside the actor verdicts because it is the only
 # verdict no ACTOR produced, exactly as ``RESOLVE_WIRE_CLEAR`` is on the incident side.
 # 17 characters — inside ``print_queue.stop_source``'s VARCHAR(20).
 STOP_SOURCE_RECONCILE_UNKNOWN = "reconcile_unknown"
@@ -142,13 +154,21 @@ PAYLOAD_KEY_OUTCOME_UNKNOWN = "outcome_unknown"
 # Why a terminal happened, as a CLOSED set. The disposition is selected from this
 # verdict once, ahead of the ``final_status`` fork, so a new reason for a print to end
 # has to be added here rather than sniffed out of a status string downstream.
-StopVerdict = Literal["plate_refused", "operator_ui", "operator_screen", "reconcile_unknown"]
+StopVerdict = Literal["plate_refused", "fault_restart", "operator_ui", "operator_screen", "reconcile_unknown"]
 
 # The two verdicts a HUMAN produced by pressing Stop — the UI button (the unit's durable
 # stop request) or the printer's own screen (the cancel echo). One origin for "was this stop an
 # operator's", read by the terminal outcome's failure attribution and the farm policy's
 # fault-stop requeue.
 OPERATOR_STOP_VERDICTS: frozenset[str] = frozenset({"operator_ui", "operator_screen"})
+
+# The two verdicts that mean "this plate was never printed — make it again", whoever pressed
+# the button: the printer's own plate check refused the plate, or the farm stopped a job that
+# had deposited nothing to restart it on the backup spool. One origin for the set, read by the
+# terminal outcome (recorded ``cancelled``, a first article included — never a failure, so no
+# retry is spent and quarantine is not fed) and the farm policy (requeued next in line with
+# its settings; the run is not held).
+REQUEUE_VERDICTS: frozenset[str] = frozenset({STOP_VERDICT_PLATE_REFUSED, STOP_VERDICT_FAULT_RESTART})
 
 # ``WAITING_REASON_PLATE_VISION`` used to be defined here. Its ORIGIN moved to
 # ``printer_incidents`` (2026-09-04) when the plate check became an incident KIND: the
@@ -736,6 +756,18 @@ def classify_stop(
       both operator signals: the operator pressing Stop on a paused plate check is how
       this verdict is USUALLY produced, and what it means for the plate and the unit is
       the refusal, not the button.
+    - ``fault_restart``     — the terminal is NOT ``completed`` and names the job an open
+      row's recovery driver stopped with its last release rung: that row's projection
+      carries ``printer_incidents.PAYLOAD_FAULT_RESTART_STOP`` (the step ledger holds a
+      ``FAULT_RESTART_STEP``), and its ``job_id`` is the SAME job as the payload's
+      ``subtask_id`` (``job_identity.same_job``; an id-less side is ``unknown``, which is
+      not this row's stop — the ledger names the job it stopped). Operator ruling
+      2026-09-29: a feed stall on the first filament load of a job that deposited nothing
+      is the farm's to restart. Ranked ABOVE both operator signals because the LEDGER, not
+      the echo, says who ended the job: H2S echoes the farm's own remote stop as a cancel
+      echo, H2C echoes nothing, and an operator Stop pressed while the driver's stop was
+      already out ends the same job the same way. Below ``plate_refused``: a refused plate
+      is the printer's statement about the plate, and it holds the plate for a human.
     - ``operator_ui``       — ``operator_stop_requested``: Stop was pressed in the Bambuddy
       UI (the printer card, the queue page, the printer's HMS dialog, the API) for THIS
       job's unit. A FOREIGN job has no unit and no request; a UI stop of one falls through
@@ -745,9 +777,9 @@ def classify_stop(
       on the printer's own touchscreen.
     - ``reconcile_unknown`` — LAST, and the only verdict no actor produced: the payload
       carries ``outcome_unknown``, the flag the downtime reconcile sets on the branch
-      that could not learn how the print ended. It ranks below all three signals on
-      purpose — a reconciled terminal that DOES carry a hold or an echo has a real
-      cause, and the unknown is what is left when none of them speaks.
+      that could not learn how the print ended. It ranks below every other signal on
+      purpose — a reconciled terminal that DOES carry a hold, a ledgered stop or an echo
+      has a real cause, and the unknown is what is left when none of them speaks.
     - ``None``              — none of them (a genuine failure, or a normal finish).
 
     CAVEAT (observed live 2026-07-12, 007-H2C): H2C firmware emitted NO cancel-echo
@@ -755,7 +787,8 @@ def classify_stop(
     a genuine failure that feeds retry + quarantine accounting. Pending a deliberate
     wire-capture session hunting an alternative echo code on this firmware line,
     prefer stopping H2C farm units from the Bambuddy UI (the request wins). A screen
-    stop of a PAUSED plate check is unaffected: ``plate_refused`` needs no echo.
+    stop of a PAUSED plate check is unaffected: ``plate_refused`` needs no echo, and
+    neither does the farm's own restart stop — ``fault_restart`` reads the ledger.
 
     Pure — no DB, no I/O — so it is directly unit-testable; the caller captures its
     inputs once, before any consumer of the terminal mutates state.
@@ -767,6 +800,11 @@ def classify_stop(
         for incident in open_incidents
     ):
         return STOP_VERDICT_PLATE_REFUSED
+    if status != "completed" and any(
+        incident.get(PAYLOAD_FAULT_RESTART_STOP) and same_job(job, str(incident.get("job_id") or "")) == "same"
+        for incident in open_incidents
+    ):
+        return STOP_VERDICT_FAULT_RESTART
     if operator_stop_requested:
         return "operator_ui"
     if payload.get("user_cancel_observed"):

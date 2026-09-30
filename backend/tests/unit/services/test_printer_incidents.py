@@ -267,6 +267,34 @@ class TestAlreadyHandledAndFlapCap:
         assert await printer_incidents.count_resolved(db_session, printer.id, "task-1", KIND_JAM) == 1
         assert await printer_incidents.count_resolved(db_session, printer.id, "task-2", KIND_JAM) == 0
 
+    async def test_last_closed_by_is_the_printers_latest_close_of_that_source(self, db_session, printer_factory):
+        """The recovery driver's printer bound: this printer's LAST ``driver_restart`` close.
+        Another source, another printer, or a row still open is not it."""
+        from datetime import timedelta
+
+        from backend.app.models.printer_incident import RESOLVE_DRIVER_RESTART
+
+        printer, other = await printer_factory(), await printer_factory()
+        assert await printer_incidents.last_closed_by(db_session, printer.id, RESOLVE_DRIVER_RESTART) is None
+        closed: list[PrinterIncident] = []
+        for hours_ago in (3, 1):
+            row = await _open(db_session, printer.id, kind=KIND_JAM, codes=f"jam:{hours_ago}")
+            row = await printer_incidents.close(
+                db_session, row.id, status=STATUS_RESOLVED, source=RESOLVE_DRIVER_RESTART
+            )
+            row.resolved_at = row.resolved_at - timedelta(hours=hours_ago)
+            await db_session.commit()
+            closed.append(row)
+        swap = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:swap")
+        await printer_incidents.close(db_session, swap.id, status=STATUS_RESOLVED, source="driver_swap")
+        elsewhere = await _open(db_session, other.id, kind=KIND_JAM, codes="jam:other")
+        await printer_incidents.close(db_session, elsewhere.id, status=STATUS_RESOLVED, source=RESOLVE_DRIVER_RESTART)
+        await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:open")
+
+        latest = await printer_incidents.last_closed_by(db_session, printer.id, RESOLVE_DRIVER_RESTART)
+
+        assert latest is not None and latest.id == closed[1].id
+
 
 class TestSnapshotProjection:
     async def test_open_populates_and_close_clears_the_cache(self, db_session, printer_factory):
@@ -1179,6 +1207,27 @@ class TestOutcomeDerivation:
             == "human_resolved"
         )
 
+    def test_a_restart_is_the_farms_own_recovery(self):
+        """``driver_restart`` (operator ruling 2026-09-29): the driver stopped a job that had
+        deposited nothing, unloaded and parked the stalled spool, and the unit went back to
+        the queue. A farm close — ``auto_recovered`` unpaged, ``human_resolved`` once a page
+        went out, like the swap and the self-heal beside it."""
+        from backend.app.models.printer_incident import RESOLVE_DRIVER_RESTART
+
+        column = PrinterIncident.__table__.c.resolve_source
+
+        assert len(RESOLVE_DRIVER_RESTART) <= column.type.length
+        assert (
+            printer_incidents.outcome_of(self._row(status=STATUS_RESOLVED, source=RESOLVE_DRIVER_RESTART))
+            == "auto_recovered"
+        )
+        assert (
+            printer_incidents.outcome_of(
+                self._row(status=STATUS_RESOLVED, escalated=True, source=RESOLVE_DRIVER_RESTART)
+            )
+            == "human_resolved"
+        )
+
     async def test_the_driver_ended_token_is_new_and_fits_its_column(self):
         import backend.app.models.printer_incident as model
 
@@ -1845,3 +1894,72 @@ class TestStepLedgerCascade:
                 assert (await db.execute(text("SELECT COUNT(*) FROM printer_incident_step"))).scalar() == 0
         finally:
             await engine.dispose()
+
+
+class TestTheRestartStopProjection:
+    """``PAYLOAD_FAULT_RESTART_STOP`` on the open-row projection (operator ruling 2026-09-29):
+    True once the recovery driver has SENT its restart stop on the row, so the terminal
+    classifier reads the farm's own stop off the DB-free projection — never off the cancel
+    echo H2S sends for any remote stop and H2C never sends. A projection of the step ledger,
+    never a column: the ledger's one writer sets it at the send, ``rehydrate`` derives it
+    after a restart, and every re-projection of the row keeps it."""
+
+    @staticmethod
+    async def _jam(db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010", status=STATUS_RECOVERING)
+        return printer.id, row.id
+
+    @staticmethod
+    def _flag(printer_id):
+        return printer_incidents.snapshot(printer_id)[printer_incidents.PAYLOAD_FAULT_RESTART_STOP]
+
+    async def test_the_payload_defaults_false(self, db_session, printer_factory):
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+
+        assert self._flag(printer_id) is False
+        row = await db_session.get(PrinterIncident, row_id)
+        assert printer_incidents._payload(row)[printer_incidents.PAYLOAD_FAULT_RESTART_STOP] is False
+
+    async def test_the_one_step_writer_sets_it_at_the_send_of_the_restart_stop(self, db_session, printer_factory):
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_LEVER, name="resume")
+        await printer_incidents.note_step(
+            db_session, row_id, seq=2, kind=STEP_KIND_COMMAND, name=printer_incidents.FAULT_RESTART_STEP
+        )
+        assert self._flag(printer_id) is False  # a release lever, or a COMMAND of that name, is not the stop
+
+        await printer_incidents.note_step(
+            db_session, row_id, seq=3, kind=STEP_KIND_LEVER, name=printer_incidents.FAULT_RESTART_STEP
+        )
+
+        assert self._flag(printer_id) is True
+
+    async def test_rehydrate_derives_it_from_the_rows_steps(self, db_session, printer_factory):
+        stopped_printer, stopped_row = await self._jam(db_session, printer_factory)
+        other_printer, other_row = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(
+            db_session, stopped_row, seq=1, kind=STEP_KIND_LEVER, name=printer_incidents.FAULT_RESTART_STEP
+        )
+        await printer_incidents.note_step(db_session, other_row, seq=1, kind=STEP_KIND_LEVER, name="resume")
+        printer_incidents._reset_state()  # a restart: the projection is gone, the ledger is not
+
+        assert await printer_incidents.rehydrate(db_session) == 2
+
+        assert self._flag(stopped_printer) is True
+        assert self._flag(other_printer) is False
+
+    async def test_a_re_projection_of_the_row_keeps_it(self, db_session, printer_factory):
+        """An escalation or an upgrade rebuilds the row's projection from the row; the flag is
+        re-derived from the ledger there, so a give-up after the stop still reads it."""
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(
+            db_session, row_id, seq=1, kind=STEP_KIND_LEVER, name=printer_incidents.FAULT_RESTART_STEP
+        )
+
+        await printer_incidents.upgrade(
+            db_session, row_id, kind=KIND_PHYSICAL, code="0700_8010", codes="jam:0700_8010", slot_global_tray=2
+        )
+        assert self._flag(printer_id) is True
+        await printer_incidents.mark_escalated(db_session, row_id)
+        assert self._flag(printer_id) is True

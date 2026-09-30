@@ -45,11 +45,13 @@ sequence:
     mid-print, so the farm sends NO swap command into the change. While the AMS's own
     state word (``bambu_mqtt.ams_mid_filament_change``, the one predicate) reads
     mid-change, a round runs the RELEASE LADDER instead (:data:`_LEVERS` — every verb the
-    wire offers, in evidence order, each pulled at most once per incident and read by ONE
-    reader, :func:`_read_after`): the firmware may self-heal on the jammed feeder (no
+    wire offers, in evidence order, each pulled up to its own budget per incident and read
+    by ONE reader, :func:`_read_after`): the firmware may self-heal on the jammed feeder (no
     swap), release the AMS (the swap goes out at once), re-hold (the next verb), or end
-    the print (the driver records that itself). Every verb spent with the change still
-    held is ``wedge_unreleased``, with NOTHING sent. A non-``1`` non-idle state is NOT a
+    the print (the driver records that itself). The last rung stops a FARM job that has
+    deposited nothing and restarts it (:func:`_restart`: unload, park, requeue — operator
+    ruling 2026-09-29); every verb spent with the change still held is
+    ``wedge_unreleased``, with NOTHING sent. A non-``1`` non-idle state is NOT a
     wedge: 006-H2S 2026-07-21 faulted at ``ams_status_main == 3`` (assist) with the
     feeder still engaged and the unload was accepted immediately — that round runs the
     swap machine directly. A swap command the AMS acknowledges and HOLDS after a release
@@ -163,6 +165,7 @@ from backend.app.models.printer_incident import (
     KIND_PHYSICAL,
     KIND_RUNOUT,
     RESOLVE_AUTO_RESUME,
+    RESOLVE_DRIVER_RESTART,
     RESOLVE_DRIVER_SELF_HEAL,
     RESOLVE_DRIVER_SWAP,
     RESOLVE_OPERATOR,
@@ -187,24 +190,31 @@ from backend.app.services import (
 )
 from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, ams_mid_filament_change
 from backend.app.services.hms_errors import (
+    ACTIONABLE_CLASSES,
     AmsFaultClass,
     FaultCandidate,
     candidate_fingerprint,
+    classify_full_code,
     current_runout_demand,
     fault_tokens,
     fingerprint_tokens,
-    full_codes_of,
     live_candidates,
+    live_notices,
     power_loss_prompt_standing,
+    short_code_ambiguous,
+    slot_runout_full_codes,
 )
 from backend.app.services.incident_resolution import (
+    _JOB_OVER_STATES,
     _REPAIR_EVIDENCE_LOAD,
     Context,
     TerminalEvent,
     driver_owns,
     ledger,
 )
+from backend.app.services.plate_occupancy import DepositEvidence
 from backend.app.services.printer_incidents import (
+    FAULT_RESTART_STEP,
     RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
     runout_slot_desc,
@@ -309,16 +319,6 @@ def _outranks(fault_class: AmsFaultClass, kind: str) -> bool:
 _POLL_INTERVAL_S = 1.0  # live-state poll spacing during every confirm wait
 _POST_RESUME_STABLE_S = 60  # a quiet RUNNING on a real feeder must hold this long = success
 _MAX_CANDIDATES = 3  # distinct replacement trays tried before escalating
-# How many times each lever of the release ladder (:data:`_LEVERS`) may be pulled per
-# INCIDENT, judged from the durable evidence log (:class:`_RecoveryEvidence`): a second
-# pull of the same verb against the same wedge measures nothing the first did not
-# (012-H2S 2026-09-23: both CONTINUE spellings re-ran the stalled feed and re-held).
-# Spent is a STEP on the incident's log, never a process-lifetime counter — the
-# counters that preceded it were keyed by (printer, job), so 003-H2S 2026-09-19 04:31
-# met a second fault 69 s after a self-heal on the same job and gave up with ZERO
-# CONTINUEs sent — and never an in-memory list either, which a restart emptied and so
-# re-ground the stalled feeder from the first lever. A new incident is a new log.
-_MAX_LEVER_PULLS = 1
 
 # Refill auto-resume timing (code constants, NOT operator knobs — precedent
 # ``ams_command.UNLOAD_GRACE_S``). The AMS needs to register the freshly-inserted
@@ -414,6 +414,32 @@ _ESCALATE_DETAIL: dict[str, str] = {
     # A release verb with an unmeasured effect ENDED the print inside its own read window
     # (the reader's ``ended``). The terminal's own disposition handles the unit.
     "wedge_ended_print": "A release verb ended the print.",
+    # The restart rung's give-ups (:func:`_restart`, operator ruling 2026-09-29). The farm
+    # STOPPED a job that had deposited nothing, so there is no print to resume and the copy
+    # says so: the job's state, the path's, the plate's, the unit's, and the one physical
+    # exit — the row is held as a PHYSICAL fault from here (:func:`_give_up`), which a
+    # completed load, a print running through the path, or Recover ends. No feeder clause
+    # (:data:`_JOB_ENDED_REASONS`): its "then resume on the printer" names a print that is over.
+    "restart_unload_failed": (
+        "Feed stall at layer 0: the farm stopped the job, and the unload of the stalled feeder did not "
+        "complete, so filament may still be in the path. The plate is clear and the unit is back in the queue. "
+        "Free the filament path, then load a slot on the printer or press Recover."
+    ),
+    "restart_no_candidate": (
+        "Feed stall at layer 0: the farm stopped the job and unloaded the stalled feeder; no other loaded spool "
+        "matches the job's filament. The path is empty, the plate is clear and the unit is back in the queue. "
+        "Load a matching spool on the printer or press Recover."
+    ),
+    # The bound tripped — this plate was already restarted once, or this printer's path
+    # stalled again with no print completed since its last restart (013-H2S 2026-09-28:
+    # slot 4 stalled in the same tube segment slot 3 had). The path is the suspect, so no
+    # spool is parked.
+    "restart_refaulted": (
+        "Feed stall at layer 0 after a restart: the farm stopped the job and unloaded the stalled feeder, and "
+        "parked no spool — the filament path is the suspect, not the spool. The path is empty, the plate is "
+        "clear and the unit is back in the queue. Inspect the PTFE path and buffer, then load a slot on the "
+        "printer or press Recover."
+    ),
     # The printer stopped reporting on a live session while the driver worked: either it
     # stayed off past ``farm_offline_stall_minutes`` (:class:`_PrinterOffline`), or the
     # rounds ran out on commands whose answers were lost with their session
@@ -474,30 +500,83 @@ class RecoverySettings:
 
 # --- the release ladder: every verb the wire offers, pulled in evidence order ------
 
+# ``"print_stop"`` is ``printer_incidents.FAULT_RESTART_STEP`` — the table is keyed by that
+# constant, and a Literal can only spell a literal; ``test_spool_recovery`` pins the two equal.
 Lever = Literal[
     "resume",
     "resume_then_pause",
     "ams_control_resume",
     "clean_print_error",
+    "retry_after_clear",
     "ams_control_abort",
     "ams_control_reset",
     "ams_control_pause",
+    "print_stop",
 ]
 
 
 @dataclass(frozen=True)
 class LeverSpec:
-    """One release verb: the frame it publishes, whether its read pauses the print on
-    the first RUNNING sample with NOTHING at the feeder (the firmware's retract), and the
-    page's one-line name of it.
+    """One rung of the release ladder: the frame it publishes, whether its read pauses the
+    print on the first RUNNING sample with NOTHING at the feeder (the firmware's retract),
+    the page's one-line name of it, how many times it may be pulled, when it may be pulled
+    at all, and whether its verb ends the job.
 
     ``publish`` is the wire verb and nothing else — True when the client sent the frame.
     What the wire answered is :func:`_read_after`'s alone, for every verb.
+
+    ``pulls`` — the rung's budget per INCIDENT, pulled back to back before the ladder moves
+    on, and spent from the durable step log (:meth:`_RecoveryEvidence.lever_spent`): a
+    restarted driver resumes mid-budget, never re-grinding the stalled feeder from the
+    first pull. One pull is the rule; the Retry after the dialog is cleared
+    (``retry_after_clear``) takes two — why is that rung's own entry in the table's notes.
+    Spent is a STEP on the incident's log, never a process-lifetime counter — the counters
+    that preceded it were keyed by (printer, job), so 003-H2S 2026-09-19 04:31 met a second
+    fault 69 s after a self-heal on the same job and gave up with ZERO CONTINUEs sent — and
+    never an in-memory list either, which a restart emptied. A new incident is a new log.
+
+    ``pull_rule`` — asked when the ladder REACHES the rung: ``None`` pulls it, a sentence
+    says why not, and a rung it refuses is skipped, NOT spent (:func:`_release_ladder`).
+
+    ``ends_job`` — the verb ends the print by design (the restart rung), so a terminal
+    inside its window is the rung's release (``stopped``), never ``ended`` and never the
+    operator's cancel echo, which H2S sends for the farm's own remote stop
+    (:func:`_terminal_read`).
     """
 
     publish: Callable[[BambuMQTTClient], bool]
     pause_on_empty_path: bool
     text: str
+    pulls: int
+    pull_rule: Callable[[RecoveryIncident], str | None]
+    ends_job: bool = False
+
+
+def _pull_always(_incident: RecoveryIncident) -> str | None:
+    """The pull rule of every release verb: pulled whenever the ladder reaches it."""
+    return None
+
+
+def _restart_refusal(incident: RecoveryIncident) -> str | None:
+    """The restart rung's pull rule (operator ruling 2026-09-29): a FARM unit, and a job
+    that has deposited NOTHING. ``None`` pulls the rung; a sentence says why it is skipped.
+
+    A foreign print has no unit to hand back to the queue (``item_id`` None). What is on
+    the plate is ``plate_occupancy.DepositEvidence``'s one predicate over the client's one
+    peaks reader (``BambuMQTTClient.job_peaks``), read LIVE: this driver compares no layer
+    number of its own. The predicate fails closed — peaks that are not a measurement (a
+    client that attached mid-job) read as deposited, and so does no client at all — so a
+    stall past the first layer, or one nobody can vouch for, still exhausts the ladder to
+    ``wedge_unreleased``: stopping there destroys a part and leaves one on the plate.
+    """
+    if incident.item_id is None:
+        return "a foreign print — no farm unit to hand back to the queue"
+    client = printer_manager.get_client(incident.printer_id)
+    if client is None:
+        return "no client to read the job's peaks from"
+    if DepositEvidence.live(client.job_peaks()).deposited:
+        return "the job has deposited, or its peaks are not a measurement"
+    return None
 
 
 # THE LADDER, in pull order — the dict's order IS the ladder's. Explicit, every lever
@@ -537,6 +616,19 @@ class LeverSpec:
 # * ``clean_print_error`` — the dialog's OK / close ("clears whatever error dialog is
 #   currently active"). The FRAME only (``BambuMQTTClient.clean_print_error``): a local
 #   HMS wipe would fake the quiet reading this ladder is judged by. Unmeasured.
+# * ``retry_after_clear`` — ``ams_control("resume")`` again, now with the error dialog
+#   cleared, pulled TWICE back to back (:attr:`LeverSpec.pulls`): the order 011-H2S
+#   2026-09-29 (incident 419) released in — the dialog's Retry (``ams_control_resume``)
+#   re-held, the dialog was cleared (``clean_print_error``), and the next Retry fed slot 3.
+#   That Retry was the operator's, at the touchscreen; whether they pressed Resume or Retry
+#   is indistinguishable in the logs, and both re-run the same feed of slot 3 — the farm's
+#   bare ``print.resume`` had already re-held twice (the first two rungs), so the repeated
+#   verb is the dialog's Retry. The vendor catalog offers exactly that button for the codes
+#   this ladder meets: ``backend/app/data/hms_actions.json`` maps ``07008006`` and
+#   ``07008010`` to CONTINUE (with CHECK_ASSISTANT), and CONTINUE is ``ams_control("resume")``.
+#   Two pulls, because 011 needed one after the clear and the second bounds the grinding at
+#   one more step window. It sits right after ``clean_print_error``, before the verbs with no
+#   vendor call site.
 # * ``ams_control_abort`` — the extruder-switch panel's "Quit"
 #   (``ExtruderSwithingStatus::on_quit``); the catalog maps it for ``07008036`` only, and
 #   its effect on a paused print is undocumented. Unmeasured.
@@ -544,46 +636,88 @@ class LeverSpec:
 #   allowlist) with no vendor UI call site. The fork's former claim that it "ends the
 #   change the paused print is waiting on" was unsourced and is retracted. Unmeasured.
 # * ``ams_control_pause`` — a valid firmware param with no vendor UI call site. Unmeasured.
+# * ``print_stop`` (:data:`printer_incidents.FAULT_RESTART_STEP`) — ``print.stop``
+#   (``BambuMQTTClient.stop_print``, the raw stop the eject lane ends its own sweep with).
+#   The LAST rung, and the only one whose verb ends the job: the job terminal is the one
+#   measured release of a loaded stall (013-H2S 2026-09-28, incidents 410/411: all seven
+#   verbs wedged at layer 0, ``1/5``, ``tray_now=2``, and the job sat ~19 h having printed
+#   nothing). Pulled only for a FARM unit that has deposited NOTHING
+#   (:func:`_restart_refusal`); its terminal is read ``stopped`` and continues into
+#   :func:`_restart` — unload the stalled feeder, park its spool, and let the unit's
+#   terminal hand it back to the queue for the backup slot.
 #
 # ``ams_control("done")`` is deliberately NOT a lever: it is the manual-feed dialog's
 # "Filament extruded", a claim that a feed succeeded, and the runout-class hold it
 # produces refuses cross-slot loads (2026-07-19, 10 of 10). The job terminal — the one
-# measured release — is forbidden by ruling: the driver never ends a print.
+# measured release — is the driver's to cause ONLY through ``print_stop``, on a job that
+# has deposited nothing (operator ruling 2026-09-29, 013-H2S incidents 410/411): a stop
+# past the first layer destroys a part and leaves it on the plate, so a mid-print stall
+# still exhausts the ladder to ``wedge_unreleased``, and a terminal any OTHER verb
+# produces is still read ``ended`` — a release verb is not supposed to end a print.
 _LEVERS: dict[Lever, LeverSpec] = {
     "resume": LeverSpec(
         publish=lambda client: client.resume_print(),
         pause_on_empty_path=False,
         text="resume",
+        pulls=1,
+        pull_rule=_pull_always,
     ),
     "resume_then_pause": LeverSpec(
         publish=lambda client: client.resume_print(),
         pause_on_empty_path=True,
         text="resume then pause",
+        pulls=1,
+        pull_rule=_pull_always,
     ),
     "ams_control_resume": LeverSpec(
         publish=lambda client: client.ams_control("resume"),
         pause_on_empty_path=False,
         text="ams_control resume",
+        pulls=1,
+        pull_rule=_pull_always,
     ),
     "clean_print_error": LeverSpec(
         publish=lambda client: client.clean_print_error(),
         pause_on_empty_path=False,
         text="clean_print_error",
+        pulls=1,
+        pull_rule=_pull_always,
+    ),
+    "retry_after_clear": LeverSpec(
+        publish=lambda client: client.ams_control("resume"),
+        pause_on_empty_path=False,
+        text="retry after clear",
+        pulls=2,
+        pull_rule=_pull_always,
     ),
     "ams_control_abort": LeverSpec(
         publish=lambda client: client.ams_control("abort"),
         pause_on_empty_path=False,
         text="ams_control abort",
+        pulls=1,
+        pull_rule=_pull_always,
     ),
     "ams_control_reset": LeverSpec(
         publish=lambda client: client.ams_control("reset"),
         pause_on_empty_path=False,
         text="ams_control reset",
+        pulls=1,
+        pull_rule=_pull_always,
     ),
     "ams_control_pause": LeverSpec(
         publish=lambda client: client.ams_control("pause"),
         pause_on_empty_path=False,
         text="ams_control pause",
+        pulls=1,
+        pull_rule=_pull_always,
+    ),
+    FAULT_RESTART_STEP: LeverSpec(
+        publish=lambda client: client.stop_print(),
+        pause_on_empty_path=False,
+        text="print stop",
+        pulls=1,
+        pull_rule=_restart_refusal,
+        ends_job=True,
     ),
 }
 
@@ -602,11 +736,13 @@ def _lever(name: Lever) -> LeverSpec:
 # ``self_healed`` / ``swapped`` — the print RUNS (or FINISHED) on a quiet path with the
 #   jammed / another tray feeding, held stable; ``wedged`` / ``released`` — back at PAUSE
 #   with the AMS still in / out of the change; ``ended`` — a terminal inside the window
-#   that the operator's Stop did not produce; ``no_pause`` — the reader's own pause
-#   never landed; ``not_sent`` — the client did not publish the verb; ``abort`` /
-#   ``handover`` — :func:`_takeover` (an operator Stop's terminal is ``abort``).
+#   that the operator's Stop did not produce; ``stopped`` — the terminal of a rung whose
+#   verb ends the job (:attr:`LeverSpec.ends_job`, the restart rung): its release;
+#   ``no_pause`` — the reader's own pause never landed; ``not_sent`` — the client did not
+#   publish the verb; ``abort`` / ``handover`` — :func:`_takeover` (an operator Stop's
+#   terminal is ``abort``).
 LeverReading = Literal[
-    "self_healed", "swapped", "wedged", "released", "ended", "no_pause", "not_sent", "abort", "handover"
+    "self_healed", "swapped", "wedged", "released", "ended", "stopped", "no_pause", "not_sent", "abort", "handover"
 ]
 _LEVER_READINGS: frozenset[str] = frozenset(get_args(LeverReading))
 
@@ -925,10 +1061,34 @@ class _RecoveryEvidence:
         return False
 
     def lever_spent(self, lever: Lever) -> bool:
-        """Has ``lever`` been pulled its :data:`_MAX_LEVER_PULLS` times on this incident?
-        A step counts from its SEND: a lever sent and never read (a crash between the two)
-        is spent."""
-        return sum(1 for s in self.lever_steps if s.lever == lever) >= _MAX_LEVER_PULLS
+        """Has ``lever`` been pulled its own budget (:attr:`LeverSpec.pulls`) on this
+        incident? A step counts from its SEND: a lever sent and never read (a crash between
+        the two) is spent, so a restarted driver resumes mid-budget."""
+        return sum(1 for s in self.lever_steps if s.lever == lever) >= _lever(lever).pulls
+
+    @property
+    def restart_stop(self) -> LeverStep | None:
+        """The restart rung's step (:data:`printer_incidents.FAULT_RESTART_STEP`) once it was
+        SENT — from here the job is over by the farm's own act, and the incident's work is
+        the restart continuation (:func:`_restart`)."""
+        return next((s for s in self.lever_steps if s.lever == FAULT_RESTART_STEP), None)
+
+    @property
+    def restart_unloaded(self) -> bool:
+        """Did an unload sent AFTER the restart stop answer ``complete``? The continuation's
+        first half, read off the log so a re-entered driver does not send it again."""
+        stop = self.restart_stop
+        return stop is not None and any(
+            s.command == "unload" and s.answer == "complete" and s.seq > stop.seq for s in self.command_steps
+        )
+
+    @property
+    def committed_before_restart(self) -> bool:
+        """Had this incident crossed the swap-commit boundary (:attr:`swap_committed`)
+        BEFORE the restart stop went out? Then its jammed spool was already parked there,
+        and the continuation's own unload is not a second crossing."""
+        stop = self.restart_stop
+        return stop is not None and any(s.seq < stop.seq for s in self.command_steps)
 
     def exhaustion_reason(self) -> str:
         """The honest escalation reason for running out of candidates/rounds."""
@@ -977,8 +1137,11 @@ class RecoveryIncident:
     # overloaded). A re-jam then keeps the replacement in rotation — the extruder,
     # not the spool, is the common factor, and since 006-H2S 2026-09-21 (incident 289)
     # neither does the JAMMED spool get parked: :func:`_commit_out_of_rotation` is the
-    # one place that rule lives.
-    extruder_side_only: bool
+    # one place that rule lives. None when no mechanical-feed code is in the candidate set
+    # it was built from — a startup re-entry whose wire and recorded codes name none — and
+    # then nothing is parked either: which side faulted is unknown, and a missed stamp heals
+    # forward while a false one is permanent (invariant 11).
+    extruder_side_only: bool | None
     # True when ANY physical-fault candidate is a pull-back the firmware could not
     # finish (``hms_errors`` ``retract_failure``). FROZEN at entry from the candidate
     # set that opened the incident, like every other fact here: the escalation copy is
@@ -1051,7 +1214,7 @@ def _build_incident(
         jammed_global_tray=tray,
         kind=kind,
         external=external,
-        extruder_side_only=bool(mechanical) and all(c.extruder_side for c in mechanical),
+        extruder_side_only=all(c.extruder_side for c in mechanical) if mechanical else None,
         # Read off the PHYSICAL candidates only: the flag answers "is the printer
         # holding a failed pull-back", and only that class can be one. A mechanical
         # sibling standing beside it (006's ``0700_0017``) says nothing about it.
@@ -1196,6 +1359,8 @@ _JAM_QUARANTINE_REASONS: frozenset[str] = frozenset(
         "repeated_jams",  # recovered repeatedly this job and the fault keeps returning
         "candidates_exhausted",  # every replacement loaded and none held a stable resume
         "candidate_loads_failed",  # eligible spools were found and none of them would load
+        "restart_unload_failed",  # the job was stopped and the AMS did not unload the stalled feeder
+        "restart_refaulted",  # the path stalled again at layer 0 after a restart — the path, not the spool
     }
 )
 
@@ -1217,6 +1382,8 @@ _NON_QUARANTINE_REASONS: frozenset[str] = frozenset(
         "service_hold",  # the farm never tried: a human holds the printer, and the AMS is not the suspect
         "wedge_ended_print",  # a release verb ended the print — the verb's effect, not the feeder's
         "printer_offline",  # the printer stopped reporting — a network / power gap, not AMS hardware
+        # inventory, as ``no_eligible_spool``: the path unloaded cleanly and nothing matched
+        "restart_no_candidate",
     }
 )
 
@@ -1270,7 +1437,7 @@ async def _fault_already_closed(db: AsyncSession, printer_id: int, job_id: str, 
     """Did we already finish with THIS fault, and is it still the same standing one?
 
     ONE predicate, two clauses that must both hold — used by the entry gate and by
-    :func:`will_own` so a suppressed alert and a refused entry can never disagree:
+    :func:`owned_full_codes` so a suppressed alert and a refused entry can never disagree:
 
     * the durable half: a CLOSED incident for this ``(printer, job, fingerprint)``
       whose status is ABORTED. An aborted close means an external actor took over or
@@ -1366,9 +1533,15 @@ def _dominant_class(candidates) -> AmsFaultClass | None:
 
 
 def _primary_candidate(candidates, fault_class: AmsFaultClass) -> FaultCandidate | None:
-    """The representative candidate of the deciding class — lowest short code wins,
-    so the code the operator is told is stable across pushes."""
-    members = sorted((c for c in candidates if c.fault_class is fault_class), key=lambda c: c.short_code)
+    """The representative candidate of the deciding class: an AMS fault before a holder
+    fault, then an UNAMBIGUOUS short code (``hms_errors.short_code_ambiguous``), then the
+    lowest — so the code the operator is told is stable across pushes and names ONE fault.
+    011-H2S 2026-09-29: the slot overload renders ``0700_0001``, which is also that slot's
+    runout demand, so beside ``0700_8010`` the 8010 names the incident."""
+    members = sorted(
+        (c for c in candidates if c.fault_class is fault_class),
+        key=lambda c: (c.external, short_code_ambiguous(c.short_code), c.short_code),
+    )
     return members[0] if members else None
 
 
@@ -1902,9 +2075,37 @@ def _feeder_position(state, jammed_global_tray: int | None, printer_id: int | No
 # copy's own last sentence (Retry) is the one action and a "then resume" beside it would
 # contradict it — the ``_retract_clause`` lesson.
 _CLAUSE_WITHOUT_INSTRUCTION: frozenset[str] = frozenset({"wedge_unreleased", "swap_held_after_release"})
-# The reasons that carry no feeder clause at all: the print is over, so where the
-# filament sits is the next job's question, never an instruction about this one.
-_NO_FEEDER_CLAUSE: frozenset[str] = frozenset({"wedge_ended_print"})
+# The reasons that are only ever reached after the job ENDED: a release verb ended the print
+# (``wedge_ended_print``), or the restart rung's stop did (the three restart give-ups). The
+# other half of "the job is over" is the step ledger's — any give-up once the restart stop
+# is on it (:func:`_job_ended`).
+_JOB_ENDED_REASONS: frozenset[str] = frozenset(
+    {"wedge_ended_print", "restart_unload_failed", "restart_no_candidate", "restart_refaulted"}
+)
+
+# A reason reachable on EITHER side of the job's end has a second copy for the ended side,
+# because its paused copy's instruction ("resume on the printer") names a print that is
+# over. ``printer_offline`` is the one today: the offline bound can be met inside the
+# restart continuation, after the driver's own stop.
+_ENDED_JOB_DETAIL: dict[str, str] = {
+    "printer_offline": (
+        "The printer stopped reporting after the farm stopped the job at layer 0, so the farm could not read "
+        "what the AMS did. The plate is clear and the unit is back in the queue. Check the printer's connection "
+        "and the filament path, then load a slot on the printer or press Recover."
+    ),
+}
+
+
+def _job_ended(reason: str, evidence: _RecoveryEvidence | None) -> bool:
+    """Is this page composed after the job ENDED? DERIVED, from the reason and the step
+    ledger: a reason that is only reached after the end (:data:`_JOB_ENDED_REASONS`), or any
+    give-up once the restart stop is on the ledger (the printer_offline bound met inside the
+    continuation). Such a page says neither "left PAUSED" nor "resume on the printer": it
+    carries no feeder clause (the filament's place is the copy's own, and the next job's
+    question), its reason copy is the ended-side one where there are two
+    (:data:`_ENDED_JOB_DETAIL`), and the notification wrapper is told so
+    (``on_spool_recovery_failed(job_ended=True)``)."""
+    return reason in _JOB_ENDED_REASONS or (evidence is not None and evidence.restart_stop is not None)
 
 
 def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None, *, reason: str) -> str | None:
@@ -1919,11 +2120,10 @@ def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None, *, 
     give-up that unloaded nothing renders nothing about unloading. Runout / physical /
     external kinds get no clause at all (their copy already carries the slot
     instruction, and the swap machine never moved their filament). ``reason`` gates the
-    instruction half (:data:`_CLAUSE_WITHOUT_INSTRUCTION`, :data:`_NO_FEEDER_CLAUSE`),
-    the ``_retract_clause`` pattern — one instruction per page, never two.
+    instruction half (:data:`_CLAUSE_WITHOUT_INSTRUCTION`), the ``_retract_clause`` pattern
+    — one instruction per page, never two. A page composed after the job ended asks for no
+    clause at all (:func:`_job_ended`, :func:`_compose_detail`).
     """
-    if reason in _NO_FEEDER_CLAUSE:
-        return None
     instruct = reason not in _CLAUSE_WITHOUT_INSTRUCTION
     slot = runout_slot_desc(position.global_tray) or f"tray {position.global_tray}"
     if position.kind == "jammed":
@@ -2077,8 +2277,13 @@ def _compose_detail(
     minted by the startup re-entry when the wire has NO actionable fault left — the
     flag is False by construction there, and appending the otherwise-arm printed "and
     resume on the printer. Then resume on the printer." One instruction, once.
+
+    A page composed after the job ENDED (:func:`_job_ended`) takes the ended-side copy of
+    its reason and no feeder clause: every clause instruction ends "resume on the printer",
+    and the print is over.
     """
-    detail = _ESCALATE_DETAIL.get(reason, reason)
+    ended = _job_ended(reason, evidence)
+    detail = (_ENDED_JOB_DETAIL.get(reason) if ended else None) or _ESCALATE_DETAIL.get(reason, reason)
     clauses: list[str] = []
     if incident.is_feed_fault:
         sent = _evidence_sentence(evidence) if evidence is not None else None
@@ -2086,10 +2291,14 @@ def _compose_detail(
         # printer off its session still carries its last session's cached ``tray_now``,
         # and a clause read from it would describe a printer the farm cannot see.
         st = _get_state(incident.printer_id)
-        feeder = _feeder_clause(
-            _feeder_position(st if _reads_live(st) else None, incident.jammed_global_tray, incident.printer_id),
-            restore,
-            reason=reason,
+        feeder = (
+            None
+            if ended
+            else _feeder_clause(
+                _feeder_position(st if _reads_live(st) else None, incident.jammed_global_tray, incident.printer_id),
+                restore,
+                reason=reason,
+            )
         )
         clauses = [clause for clause in (sent, feeder) if clause is not None]
     elif incident.kind == KIND_PHYSICAL and reason == "physical_fault":
@@ -2181,7 +2390,7 @@ def _new_fault_verdict(row: PrinterIncident, state, printer_id: int) -> incident
 
     The rule table's ``new_fault`` occasion, asked with the entry's own live state and
     the ONE liveness store. One spelling for the entry gate (:func:`on_ams_fault`) and
-    its mirror (:func:`will_own`), so a suppressed raw alert and an opened incident can
+    its mirror (:func:`owned_full_codes`), so a suppressed raw alert and an opened incident can
     never disagree about whether the open row still owns the printer.
     """
     return incident_resolution.resolve(
@@ -2268,15 +2477,17 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         # The HARDWARE the deciding fault sits on, taken from the taxonomy's verdict
         # for the very candidate whose code the operator is told about — so the copy,
         # the routing and the message can never name different hardware. When AMS and
-        # external faults stand together, ``_primary_candidate``'s lowest-short-code
-        # order picks the AMS one (``0700_…`` < ``07FF_…``), which is correct: a real
-        # AMS fault beside a holder fault is still an AMS fault to recover.
+        # external faults stand together, ``_primary_candidate`` picks the AMS one,
+        # which is correct: a real AMS fault beside a holder fault is still an AMS fault
+        # to recover.
         external = primary.external if primary is not None else False
         code = primary.short_code if primary is not None else ""
         # The printer's own words for the faults this incident will speak for, recorded
         # now: a release lever, a stop or the next job clears them off the printer while
-        # the hold they explain still stands.
-        full_codes = full_codes_of(getattr(state, "hms_errors", None) or [], {c.short_code for c in candidates})
+        # the hold they explain still stands. The candidates' OWN full codes, never a
+        # short-code round trip: ``0700_0001`` would sweep a runout demand standing
+        # beside an owned overload into the incident's words.
+        full_codes = sorted({c.full_code for c in candidates} - {""})
 
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer
@@ -2322,7 +2533,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 # new AMS incident is opened while that question stands: the human's
                 # resume ends the job pause, and a fault still standing then is owned on
                 # the very next push (and its raw alert reaches them meanwhile —
-                # ``will_own`` mirrors this gate). An AMS row ALREADY open keeps its
+                # ``owned_full_codes`` mirrors this gate). An AMS row ALREADY open keeps its
                 # owner; the upgrade below only re-classifies it and resumes nothing.
                 _note_outcome(
                     printer_id,
@@ -2360,7 +2571,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 # MAINTENANCE MODE: hands are in this machine, so the farm records the
                 # fault and touches nothing. The row still OPENS — that is what makes
                 # ``hold_blocks_dispatch`` refuse work after the hold lifts, until the
-                # fault resolves by its own wire/repair rule — and ``will_own`` still
+                # fault resolves by its own wire/repair rule — and ``owned_full_codes`` still
                 # suppresses the duplicate raw HMS page, because this incident is the
                 # record of that fault. What a hold removes is the ACT: no ``_run_recovery``
                 # driver, no swap, no auto-resume. Read HERE, right after the routing
@@ -2458,62 +2669,87 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         return None
 
 
-async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
-    """Would an incident own the AMS faults standing on this printer right now?
+async def owned_full_codes(db: AsyncSession, printer_id: int, state) -> frozenset[str]:
+    """The FULL codes an AMS incident speaks for on this printer right now.
 
     (1) It exists so the HMS notify pipeline (main.py) can SUPPRESS the raw per-code
-        alert for a fault an incident carries — the incident's lifecycle
-        notifications (recovering / succeeded / self-healed / out-of-rotation /
-        failed / auto-resumed) are the operator-facing signal, and a duplicate raw
-        alert would double-notify (one 2026-07-20 feed fault produced 4 Discord
-        messages).
-    (2) It MIRRORS :func:`on_ams_fault`'s durable entry gates — including the ones
-        that mean "an incident ALREADY owns this", where suppression stays correct
-        because the raw alert is the duplicate.
-    (3) Foreign prints included: an incident owns EVERY class of their AMS faults —
-        runouts and physical faults since 2026-08-09, mechanical ones since the 2026-08-10
-        origin-agnostic ruling — so their raw alerts are duplicates in exactly the
-        same way.
-
-    Fails toward NOTIFYING: any exception returns False (never suppress a raw alert
-    on the strength of a predicate that errored).
+        alert for a code an incident carries — ``error.full_code in owned`` and nothing
+        else. The incident's lifecycle notifications (recovering / succeeded /
+        self-healed / out-of-rotation / failed / auto-resumed) are the operator-facing
+        signal, and a duplicate raw alert double-notifies (one 2026-07-20 feed fault
+        produced 4 Discord messages; 011-H2S 2026-09-29, incident 419, paged twice
+        while the driver owned its jam).
+    (2) FULL codes, never short codes. The short form is many-to-one: ``0700_0001`` is
+        the slot-3 overload ``0700_6200_0002_0001`` AND the slot-3 runout demand
+        ``0700_2200_0002_0001`` (and, on H2C, "a new AMS detected"), so a short-code set
+        owning the overload would silence a runout demand on the same printer. Both wire
+        lanes carry a full code (16 hex ``hms[]``, 8 hex ``print_error``); an entry with
+        none is never owned.
+    (3) Three arms, one authority each:
+        * the ACTIONABLE candidates — when an incident owns them, which MIRRORS
+          :func:`on_ams_fault`'s durable entry gates: a standing AMS row (the raw alert
+          is the duplicate), or the gates a new row opens past (no job paused for a
+          human, no aborted close of this exact fault). Foreign prints
+          included — an incident owns every class of their AMS faults (runouts and
+          physical faults since 2026-08-09, mechanical since the 2026-08-10
+          origin-agnostic ruling);
+        * the slot-attributed RUNOUT words (``hms_errors.slot_runout_full_codes``) —
+          only when the incident speaks for a runout: a RUNOUT candidate among the
+          owned, or a standing runout row. A jam's messages never speak for a "fill
+          slot N" demand, so beside a jam that demand still pages;
+        * INFORMATIONAL notices (``hms_errors.live_notices``) on the AMS unit the
+          STANDING row names (``slot_global_tray``). The authority is the open row, not
+          same-push candidates: the operator's Retry is exactly the push on which the
+          actionable code clears and the feed-resistance notice appears (011-H2S
+          17:59:18). A row that names no slot names no unit, and its notices page.
+    (4) Fails toward NOTIFYING (invariant 10): recovery disabled, or any exception,
+        returns the empty set — never suppress on the strength of a predicate that
+        errored. A push with neither a candidate nor a notice costs no DB read.
     """
     try:
         candidates = live_candidates(state)
-        if not candidates:
-            return False
+        notices = live_notices(state)
+        if not candidates and not notices:
+            return frozenset()
         if not await _read_bool(db, "spool_recovery_enabled", _DEFAULT_ENABLED):
-            return False
+            return frozenset()
         # The AMS-kind row: a pause-cause hold is not an AMS fault's owner, and a
         # plate-vision row standing beside a jam must not silence the jam's raw alert.
-        # A row that STANDS on this fault owns the printer (or is upgraded by it), so the
-        # raw alert is the duplicate; a row the fault ENDS is closed by the entry, which
-        # then runs the gates below — so this falls through to them too.
-        existing = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
-        if existing is not None and not _new_fault_verdict(existing, state, printer_id).close:
-            return True
-        # Mirrors the entry gate: while the printer's job is paused for a human (its own
-        # plate check), no NEW AMS incident is opened, so nothing speaks for this fault
-        # and its raw alert is the only word the operator gets about it.
-        if printer_incidents.job_pause_held(printer_id):
-            return False
-        job_id = (getattr(state, "subtask_id", None) or "").strip()
-        # A barred fault will never be owned again — let the raw alert through
-        # rather than suppressing into silence.
-        return not await _fault_already_closed(db, printer_id, job_id, candidate_fingerprint(candidates))
+        # A row the live fault ENDS is closed by the entry and speaks for nothing; the
+        # entry then runs its remaining gates, so the candidates fall through to them.
+        row = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
+        if row is not None and _new_fault_verdict(row, state, printer_id).close:
+            row = None
+        owned: set[str] = set()
+        if candidates and (row is not None or await _entry_would_open(db, printer_id, state, candidates)):
+            owned.update(c.full_code for c in candidates)
+            if (row is not None and row.kind == KIND_RUNOUT) or any(
+                c.fault_class is AmsFaultClass.RUNOUT for c in candidates
+            ):
+                owned.update(slot_runout_full_codes(getattr(state, "hms_errors", None) or []))
+        if row is not None:
+            row_unit, _tray = decode_global_tray(row.slot_global_tray)
+            if row_unit is not None:
+                owned.update(n.full_code for n in notices if n.ams_unit == row_unit)
+        owned.discard("")
+        return frozenset(owned)
     except Exception:  # noqa: BLE001 — a suppression predicate must never crash the notify path
-        logger.exception("spool_recovery: will_own predicate failed for printer %s", printer_id)
-        return False
+        logger.exception("spool_recovery: owned-codes predicate failed for printer %s", printer_id)
+        return frozenset()
 
 
-def owned_short_codes(state) -> frozenset[str]:
-    """The short codes an incident speaks for — what the notify lane suppresses.
+async def _entry_would_open(db: AsyncSession, printer_id: int, state, candidates: frozenset[FaultCandidate]) -> bool:
+    """With no standing AMS row, would :func:`on_ams_fault` open one for ``candidates``?
 
-    Exact rather than "everything recoverable": only the codes THIS push classified
-    as actionable are covered by an incident's messages, so an unrelated fault
-    standing beside them still raises its own alert.
+    Its remaining durable gates, mirrored: while the printer's job is paused for a human
+    (its own plate check) no NEW AMS incident opens, so nothing speaks for the fault and
+    its raw alert is the only word the operator gets; and a fault an ABORTED close barred
+    will never be owned again — its raw alert goes through rather than into silence.
     """
-    return frozenset(c.short_code for c in live_candidates(state))
+    if printer_incidents.job_pause_held(printer_id):
+        return False
+    job_id = (getattr(state, "subtask_id", None) or "").strip()
+    return not await _fault_already_closed(db, printer_id, job_id, candidate_fingerprint(candidates))
 
 
 # --- driver -----------------------------------------------------------------
@@ -2580,7 +2816,15 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
     #     its client connects, and a session can drop between the push that raised the
     #     fault and this task starting. Not a close — a wait (:func:`_live_reading`);
     #     past the offline bound it is the ``printer_offline`` give-up.
-    await _live_reading(incident)
+    st, _waited = await _live_reading(incident)
+
+    # A driver re-entered on an incident whose restart stop already went out (a deploy
+    # mid-restart): the job is over, so there is no PAUSE to wait for and no lever left —
+    # the continuation picks up from the log. A job still live under the stop step (the
+    # stop never landed) falls through: every rung is spent, and the ladder reads it.
+    if evidence.restart_stop is not None and _live_state(st) in _JOB_OVER_STATES:
+        await _restart(incident, evidence=evidence)
+        return
 
     # (1) The fault PAUSEs the print; a runout the firmware backup rescued never
     #     PAUSEs → close silently as TRANSIENT. Closed as ``aborted`` with no
@@ -2675,6 +2919,11 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
                     return
                 case "ended":
                     await _close_ended_by_driver(incident, evidence=evidence)
+                    return
+                case "stopped":
+                    # The restart rung ended a farm job that had deposited nothing — its
+                    # release. The row stays open through the continuation.
+                    await _restart(incident, evidence=evidence)
                     return
                 case "abort":
                     await _abort(incident)
@@ -2825,6 +3074,8 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
             case "handover":
                 _hand_over(incident)
                 return
+            case "stopped":
+                raise LookupError("the swap round's resume read 'stopped' — only a rung that ends the job can")
             case _:
                 assert_never(first.reading)
 
@@ -2876,6 +3127,8 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
             case "handover":
                 _hand_over(incident)
                 return
+            case "stopped":
+                raise LookupError("the swap round's resume read 'stopped' — only a rung that ends the job can")
             case _:
                 assert_never(retry.reading)
 
@@ -3006,17 +3259,29 @@ async def _await_live_state(incident: RecoveryIncident, states: frozenset[str], 
 # itself (``ended``) — unless the operator's Stop mark says the terminal was theirs.
 _DRIVER_STATES: tuple[str, ...] = ("PAUSE", "RUNNING")
 
+# The live states in which the printer positively holds NO job — the rule table's own set
+# (``incident_resolution._JOB_OVER_STATES``, imported above) is what the restart
+# continuation (:func:`_restart`) works in once the driver's own stop has ended the job;
+# anything else (a job preparing, running or paused) on that printer is somebody else's.
+
 
 TakeoverToken = Literal[
     "reclassified", "job_changed", "job_ended", "hijacked_load", "operator_command", "resumed", "paused_elsewhere"
 ]
+
+# What a poll loop is waiting in, so :func:`_takeover` can tell the loop's own readings from
+# somebody else's act: ``"PAUSE"`` — a step of the swap round, the job paused under it;
+# ``None`` — a release verb's window (RUNNING is its expected reading); ``"job_over"`` — the
+# restart continuation, where a terminal is the driver's OWN doing (its stop) and a job on
+# the printer is not.
+Awaiting = Literal["PAUSE", "job_over"] | None
 
 
 def _takeover(
     incident: RecoveryIncident,
     st: PrinterState,
     *,
-    awaiting: str | None,
+    awaiting: Awaiting,
     target: int | None = None,
     after_contract_resume: bool = False,
 ) -> TakeoverToken | None:
@@ -3038,8 +3303,8 @@ def _takeover(
     they are "not evidence yet", and that is the gate's wait, not a token here (the retired
     ``state_lost`` token aborted on it and barred the fault).
 
-    ``awaiting`` is the state THIS step is waiting for, so a loop can tell its own
-    intermediate reading from someone else's action; ``target`` is the tray this step
+    ``awaiting`` is the state THIS step is waiting for (:data:`Awaiting`), so a loop can tell
+    its own intermediate reading from someone else's action; ``target`` is the tray this step
     commanded, when it commanded one; ``after_contract_resume`` is the reader's PHASE,
     passed in so this stays a function of its arguments: True only inside the swap
     contract's own resume read (``_read_after(budgeted=False)``) once that resume LEFT
@@ -3053,12 +3318,16 @@ def _takeover(
         token that is NOT an abort; see :func:`_hand_over`.
     ``job_changed``
         The printer is echoing a different ``subtask_id``. Whatever this driver was
-        recovering, it is not what is on the wire now.
+        recovering, it is not what is on the wire now. In the restart continuation
+        (``awaiting == "job_over"``) also ANY job on the printer (:data:`_JOB_OVER_STATES`
+        read otherwise): the job the driver stopped cannot run again, and the unit's
+        requeue cannot dispatch while this row holds the printer.
     ``job_ended``
         The live state is neither PAUSE nor RUNNING — IDLE / FINISH / FAILED / PREPARE.
-        Somebody else's act in every loop that asks this predicate; the one window where
-        a terminal can be the driver's own doing — a release verb's read — tests it
-        BEFORE asking (:func:`_read_after`, :data:`_DRIVER_STATES`).
+        Somebody else's act in every loop that asks this predicate; the windows where a
+        terminal can be the driver's own doing — a release verb's read, which tests it
+        BEFORE asking (:func:`_read_after`, :data:`_DRIVER_STATES`), and the restart
+        continuation, whose own stop produced it — never read it as a takeover.
     ``hijacked_load``
         The firmware is honouring a load for a tray that is not the one we commanded.
     ``operator_command``
@@ -3091,7 +3360,10 @@ def _takeover(
     job = (getattr(st, "subtask_id", None) or "").strip()
     if incident.job_id and job and job != incident.job_id:
         return "job_changed"
-    if live not in _DRIVER_STATES:
+    if awaiting == "job_over":
+        if live not in _JOB_OVER_STATES:
+            return "job_changed"
+    elif live not in _DRIVER_STATES:
         return "job_ended"
     ptt = getattr(st, "pending_tray_target", None)
     if target is not None and ptt is not None and ptt != target:
@@ -3117,7 +3389,7 @@ def _note_takeover(incident: RecoveryIncident, token: TakeoverToken, step: str) 
     return "handover" if token == "reclassified" else "abort"
 
 
-async def _takeover_exit(incident: RecoveryIncident, *, awaiting: str | None, step: str) -> bool:
+async def _takeover_exit(incident: RecoveryIncident, *, awaiting: Awaiting, step: str) -> bool:
     """Ask :func:`_takeover` at a driver BOUNDARY and, when it answers, end the driver.
 
     True means the caller must ``return``: the takeover was logged, and the row was
@@ -3236,15 +3508,18 @@ def _success_reading(
             assert_never(position.kind)
 
 
-async def _operator_stopped(incident: RecoveryIncident, st, *, published_at: float) -> bool:
-    """Did the OPERATOR stop this print? Read at the terminal inside a verb's window. Two
-    witnesses, either one sufficient:
+async def _operator_stopped(incident: RecoveryIncident, st, *, published_at: float | None) -> bool:
+    """Did the OPERATOR stop this print? Read at the terminal inside a verb's window — and,
+    for a rung whose own verb ends the job, once BEFORE its send (``published_at`` None).
+    Two witnesses, either one sufficient:
 
     * the touchscreen's Stop — the firmware's cancel echo, which the client stamps as
       ``PrinterState.user_cancel_seen_at`` (wall clock, ``time.time()``; cleared at the next
       print start). Only a stamp NEWER than the verb's publish counts: an older one is an
-      echo this verb's window did not produce. The H2C emits no cancel echo (a screen
-      stop there classifies as a genuine failure), so this witness is H2S-family only;
+      echo this verb's window did not produce. Before a send (``published_at`` None) any
+      stamp this job carries is the operator's — the farm has sent no stop yet. The H2C
+      emits no cancel echo (a screen stop there classifies as a genuine failure), so this
+      witness is H2S-family only;
     * the Bambuddy UI's Stop — the DURABLE stop request on the job's unit
       (``farm_correlation.operator_stop_requested``, the terminal classifier's own reader),
       which ``print_control.stop_as_operator`` commits BEFORE the stop is sent. It is a fact
@@ -3254,7 +3529,7 @@ async def _operator_stopped(incident: RecoveryIncident, st, *, published_at: flo
       echo alone.
     """
     cancel_at = getattr(st, "user_cancel_seen_at", None)
-    if cancel_at is not None and cancel_at > published_at:
+    if cancel_at is not None and (published_at is None or cancel_at > published_at):
         return True
     from backend.app.core.database import async_session
 
@@ -3282,12 +3557,27 @@ def _terminal_read(
 ) -> LeverRead:
     """A terminal inside a verb's window.
 
+    A rung whose verb ENDS the job (:attr:`LeverSpec.ends_job` — the restart rung) reads its
+    terminal as its release, ``stopped``, whatever else the wire says: the durable step on
+    the ledger says the farm sent the stop, and the firmware's cancel echo is no witness
+    against it — H2S echoes the farm's OWN remote stop as ``user_cancel_seen_at`` after the
+    publish, and H2C echoes nothing. An operator Stop recorded BEFORE that rung was sent is
+    asked at the send instead (:func:`_read_after`), where it still reads as theirs.
+
     FINISH is the print COMPLETING right after the verb: read like RUNNING, with the
     feeder the window last SAW fed standing in for a live one the end-of-print unload
     already emptied. Any other terminal is the operator's Stop when a Stop witness says so
     (:func:`_operator_stopped` — today's ``job_ended`` abort), and otherwise the driver's own
     verb ended the print — ``ended``, which the driver records itself.
     """
+    if _lever(lever).ends_job:
+        logger.info(
+            "spool_recovery: printer %s reached %s inside the %s window — the restart rung's stop ended the job",
+            incident.printer_id,
+            live,
+            lever,
+        )
+        return LeverRead("stopped", moved=True, position=position)
     if live == "FINISH":
         fed = position if position.kind in ("jammed", "other") else last_fed
         success = _success_reading(fed, quiet=quiet, budgeted=budgeted) if fed is not None else None
@@ -3368,12 +3658,13 @@ async def _watch_lever(
         if live not in _DRIVER_STATES:
             # Asked AT the terminal, once: both witnesses are durable for the job's life (the
             # request on the unit row, the echo stamp until the next print starts), so nothing
-            # a poll could miss has to be latched between polls.
+            # a poll could miss has to be latched between polls. Not asked of a rung whose own
+            # verb ends the job: its operator witness was read before its send.
             return _terminal_read(
                 incident,
                 lever,
                 live,
-                stopped=await _operator_stopped(incident, st, published_at=published_at),
+                stopped=not spec.ends_job and await _operator_stopped(incident, st, published_at=published_at),
                 quiet=incident_resolution.path_quiet(st),
                 position=position,
                 last_fed=last_fed,
@@ -3423,7 +3714,10 @@ async def _watch_lever(
             holding = None
             if getattr(st, "ams_status_main", None) != entry_ams:
                 left = True
-            if left or at_deadline:
+            # A rung whose verb ends the job waits for its terminal: the AMS leaving the
+            # change on the way there (the stop ends the change) is not a release, and only
+            # a stop that never landed is read off the PAUSE, at the deadline.
+            if (left and not spec.ends_job) or at_deadline:
                 return LeverRead(_pause_reading(st), moved=left, position=position)
         await asyncio.sleep(_POLL_INTERVAL_S)
 
@@ -3446,7 +3740,7 @@ async def _paused_read(
             incident,
             lever,
             live,
-            stopped=await _operator_stopped(incident, st, published_at=published_at),
+            stopped=not _lever(lever).ends_job and await _operator_stopped(incident, st, published_at=published_at),
             quiet=incident_resolution.path_quiet(st),
             position=position,
             last_fed=None,
@@ -3491,6 +3785,12 @@ async def _read_after(
     on that model a touchscreen Stop inside a lever window still reads ``ended``, and the
     driver closes the row as its own and pages ``wedge_ended_print``.
 
+    A rung whose verb ENDS the job (:attr:`LeverSpec.ends_job`, the restart rung) asks the
+    operator's witnesses ONCE, before anything is noted or sent: a Stop recorded before the
+    farm's own stop — or a job already at a terminal — is somebody else's, and the rung is
+    not pulled (the ``job_ended`` abort). After its send, every terminal in its window is its
+    release (``stopped``).
+
     Logs ONE ``[spool_recovery] lever=<lever> outcome=<reading>`` line per read — the
     measurement the next wedge is triaged by, greppable per verb.
 
@@ -3500,6 +3800,17 @@ async def _read_after(
     """
     spec = _lever(lever)
     pid = incident.printer_id
+    if spec.ends_job:
+        # A job already at a terminal before this verb goes out ended by somebody else's act
+        # (H2C sends no cancel echo, so the state is the only witness there).
+        st, _waited = await _live_reading(incident)
+        if _live_state(st) not in _DRIVER_STATES or await _operator_stopped(incident, st, published_at=None):
+            return LeverRead(
+                _note_takeover(incident, "job_ended", f"lever={lever}"),
+                moved=False,
+                position=_feeder_position(st, incident.jammed_global_tray, pid),
+                takeover="job_ended",
+            )
     seq = await evidence.note(LeverStep.draft(lever)) if budgeted else None
     st, _waited = await _live_reading(incident)
     entry_ams = getattr(st, "ams_status_main", None)
@@ -3566,18 +3877,27 @@ async def _read_after(
     return read
 
 
-# How the release ladder ended (:func:`_release_ladder`). Closed.
-LadderExit = Literal["self_healed", "swapped", "released", "unreleased", "withheld", "ended", "abort", "handover"]
+# How the release ladder ended (:func:`_release_ladder`). Closed. ``stopped`` is the
+# restart rung's release: the continuation (:func:`_restart`) takes the incident from there.
+LadderExit = Literal[
+    "self_healed", "swapped", "released", "unreleased", "withheld", "ended", "stopped", "abort", "handover"
+]
 
 
 async def _release_ladder(incident: RecoveryIncident, *, evidence: _RecoveryEvidence) -> LadderExit:
     """Pull every UNSPENT lever of :data:`_LEVERS`, in table order, until one reads a
     self-heal, a release or a terminal. Called only while the AMS holds a filament change.
 
-    ``wedged`` / ``no_pause`` / ``not_sent`` → the next lever (each is recorded on the
-    log, so each is spent). Every lever spent — this driver's or a previous one's on the
-    same incident — with the change still held is ``unreleased``: the caller gives up
-    ``wedge_unreleased`` with NOTHING sent into the change.
+    Each rung is pulled back to back until its own budget is spent
+    (:attr:`LeverSpec.pulls`, counted off the log — a restarted driver resumes mid-budget):
+    ``wedged`` / ``no_pause`` / ``not_sent`` → the next pull, then the next rung (each pull
+    is recorded on the log, so each is spent). A rung's pull rule is asked when the ladder
+    REACHES it (:attr:`LeverSpec.pull_rule`), and a rung it refuses is skipped, NOT spent —
+    the restart rung on a print that has deposited, or a foreign one. The restart rung's
+    terminal is ``stopped``, the caller's continuation (:func:`_restart`). Every lever
+    spent or refused — this driver's or a previous one's on the same incident — with the
+    change still held is ``unreleased``: the caller gives up ``wedge_unreleased`` with
+    NOTHING sent into the change.
 
     ``withheld``: no lever is pulled while the incident's last COMPLETED motion is an
     unload (:attr:`_RecoveryEvidence.extruder_emptied_by_farm`) — a resume over an
@@ -3602,18 +3922,23 @@ async def _release_ladder(incident: RecoveryIncident, *, evidence: _RecoveryEvid
             getattr(st, "tray_now", None),
         )
         return "withheld"
-    for lever in _LEVERS:
+    for lever, spec in _LEVERS.items():
         if evidence.lever_spent(lever):
             continue
-        read = await _read_after(incident, lever, evidence=evidence, budgeted=True)
-        reading = read.reading
-        match reading:
-            case "self_healed" | "swapped" | "released" | "ended" | "abort" | "handover":
-                return reading
-            case "wedged" | "no_pause" | "not_sent":
-                continue
-            case _:
-                assert_never(reading)
+        refusal = spec.pull_rule(incident)
+        if refusal is not None:
+            logger.info("[spool_recovery] lever=%s skipped printer=%s — %s (not spent)", lever, pid, refusal)
+            continue
+        while not evidence.lever_spent(lever):
+            read = await _read_after(incident, lever, evidence=evidence, budgeted=True)
+            reading = read.reading
+            match reading:
+                case "self_healed" | "swapped" | "released" | "ended" | "stopped" | "abort" | "handover":
+                    return reading
+                case "wedged" | "no_pause" | "not_sent":
+                    continue
+                case _:
+                    assert_never(reading)
     st, _waited = await _live_reading(incident)
     token = _takeover(incident, st, awaiting="PAUSE")
     if token is not None:
@@ -3684,6 +4009,7 @@ async def _close_ended_by_driver(incident: RecoveryIncident, *, evidence: _Recov
                     kind=incident.kind,
                     runout_slot=runout_slot_desc(incident.jammed_global_tray),
                     foreign=incident.item_id is None,
+                    job_ended=_job_ended("wedge_ended_print", evidence),
                 )
             except Exception:  # noqa: BLE001 — notification failure is non-fatal
                 logger.exception("spool_recovery: ended-print notification failed for printer %s", incident.printer_id)
@@ -3696,6 +4022,173 @@ async def _close_ended_by_driver(incident: RecoveryIncident, *, evidence: _Recov
         )
     except Exception:  # noqa: BLE001 — never crash the driver
         logger.exception("spool_recovery: ended-print close failed for printer %s", incident.printer_id)
+
+
+async def _restart(incident: RecoveryIncident, *, evidence: _RecoveryEvidence) -> None:
+    """The restart rung's release — the driver's own stop ENDED a farm job that had
+    deposited nothing (operator ruling 2026-09-29, 013-H2S incidents 410/411). Unload the
+    stalled feeder; with a replacement in hand and neither bound tripped, park the jammed
+    spool and close the row ``driver_restart``. The unit is the terminal's: the stop's
+    terminal classifies ``fault_restart`` off the open row's projection and ``farm_policy``
+    requeues it next in line, where the dispatcher maps it to the backup slot (the parked
+    spool is out of rotation).
+
+    The row stays OPEN throughout, and the driver live on it: the row is what keeps the
+    dispatcher off this printer (``printer_incidents.hold_blocks_dispatch``) until the path
+    is shown empty, and a live driver is what stands the terminal and running-edge closers
+    aside (``incident_resolution._wire_job_terminal``).
+
+    1. The stopped job's first fresh reports (:func:`_live_reading`), until the AMS reads out
+       of the print's change — the terminal ends it — or the step window runs out: the unload
+       is measured whatever it reads. From here the printer is read in the ``job_over``
+       phase (:data:`Awaiting`): its terminal is the driver's own, and a job on it is not.
+    2. The unload of the stalled feeder, through the swap round's own helper
+       (:func:`_unload_and_confirm` → ``ams_command.unload``, dual-nozzle aware, answered by
+       ``ams_command.classify``), NEVER skipped (``after_stop``). It goes out before any
+       candidate scan: invariant 8's "with no candidate to load there is no unload" rests on
+       shape 39 — an extruder emptied under a PAUSED print that a resume then prints air
+       from — and a stopped job has no resume, so the tube is emptied whatever follows; the
+       out-of-rotation stamp still waits for a replacement in hand (invariant 7's commit
+       boundary, step 5). Anything but ``complete`` gives up ``restart_unload_failed``. A
+       re-entered driver whose log already holds a completed unload after the stop does not
+       send it again (:attr:`_RecoveryEvidence.restart_unloaded`).
+    3. The bounds (:func:`_restart_refault`) — this plate's lineage was restarted once
+       already, or this printer's path stalled again with no print completed since its last
+       restart — give up ``restart_refaulted``: the path, not the spool, so nothing is parked.
+    4. A replacement in hand (:func:`_select_replacement`, the swap's own selection; at layer
+       0 the first-layer gram floor applies) — else ``restart_no_candidate``, nothing parked.
+    5. The swap-commit boundary (:func:`_commit_out_of_rotation` — an extruder-side fault
+       parks nothing), crossed once per incident: a swap round that committed before the
+       stop parked the jammed spool then (:attr:`_RecoveryEvidence.committed_before_restart`).
+       Then the close, ``RESOLVE_DRIVER_RESTART`` (a farm close: ``auto_recovered``). Every
+       give-up routes through :func:`_give_up`, which restores nothing after the stop and
+       re-classifies the row a physical hold.
+    """
+    pid = incident.printer_id
+    await _await_stop_settled(incident)
+    if await _takeover_exit(incident, awaiting="job_over", step="restart"):
+        return
+
+    if not evidence.restart_unloaded:
+        unload = await _unload_and_confirm(
+            incident, evidence=evidence, attempts=incident.settings.max_attempts, after_stop=True
+        )
+        match unload:
+            case "complete":
+                pass
+            case "abort":
+                await _abort(incident)
+                return
+            case "handover":
+                _hand_over(incident)
+                return
+            case (
+                "acted" | "no_movement" | "held" | "undecidable" | "session_changed" | "skipped" | "drying" | "refused"
+            ):
+                _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"restart_unload_{unload}")
+                await _give_up(incident, "restart_unload_failed", evidence=evidence)
+                return
+            case _:
+                assert_never(unload)
+
+    refault = await _restart_refault(incident)
+    if refault is not None:
+        logger.info("spool_recovery: printer %s restart bound tripped — %s", pid, refault)
+        await _give_up(incident, "restart_refaulted", evidence=evidence)
+        return
+
+    target, _only_low = await _select_replacement(incident, evidence.tried, awaiting="job_over")
+    if target is None:
+        if await _takeover_exit(incident, awaiting="job_over", step="select_replacement"):
+            return
+        await _give_up(incident, "restart_no_candidate", evidence=evidence)
+        return
+
+    jammed = incident.jammed_global_tray
+    if jammed is not None and not evidence.committed_before_restart:
+        await _commit_out_of_rotation(incident, jammed, role="jammed")
+    if not await _close_incident(incident, status=STATUS_RESOLVED, source=RESOLVE_DRIVER_RESTART):
+        logger.warning(
+            "spool_recovery: printer %s incident %s closed under the driver — the restart close stands down",
+            pid,
+            incident.incident_id,
+        )
+        return
+    from backend.app.core.database import async_session
+
+    spool = "unknown spool"
+    try:
+        async with async_session() as db:
+            await _clear_hold_projection(db, incident.item_id)
+            spool = await _describe_slot(db, pid, jammed)
+    except Exception:  # noqa: BLE001 — the close stands; only its log line's detail is lost
+        logger.exception("spool_recovery: restart bookkeeping failed for printer %s", pid)
+    if incident.extruder_side_only is False:
+        parked = f"parked spool {spool}"
+    elif incident.extruder_side_only:
+        parked = f"kept spool {spool} in rotation (extruder-side fault)"
+    else:
+        parked = f"kept spool {spool} in rotation (the fault's side is unknown)"
+    # The unit's requeue is its terminal's (``farm_policy`` on the restart stop verdict); the
+    # driver states the hand-back it relies on, not a requeue it did not see.
+    logger.info(
+        "spool_recovery: printer %s RESTARTED at layer %s — stopped job %s, unloaded tray %s, %s; unit %s handed "
+        "back through its terminal (replacement tray %s in hand)",
+        pid,
+        incident.layer_at_fault,
+        incident.job_id or "-",
+        jammed,
+        parked,
+        incident.item_id,
+        target,
+    )
+
+
+async def _await_stop_settled(incident: RecoveryIncident) -> None:
+    """Read the stopped job's first fresh reports until the AMS is out of the print's
+    change (the job's terminal ends it — 013-H2S's loaded ``1/5`` was held until one), or the
+    step window runs out. Returns either way: the unload that follows is measured by
+    ``ams_command.classify`` in whatever posture it finds, and a ``held`` answer there is a
+    give-up, never a resend."""
+    deadline = _now() + incident.settings.step_timeout_s
+    while True:
+        st, waited = await _live_reading(incident)
+        deadline += waited
+        if not ams_mid_filament_change(st) or _now() >= deadline:
+            return
+        await asyncio.sleep(_POLL_INTERVAL_S)
+
+
+async def _restart_refault(incident: RecoveryIncident) -> str | None:
+    """The restart's two bounds — the sentence of the one that trips, or None. Both DERIVED,
+    never stored.
+
+    * The UNIT (operator ruling 2026-09-29: once per unit): an ancestor of this plate ended
+      with the restart verdict (``requeue.fault_restart_spent``, the lineage walk's owner).
+    * The PRINTER — the path, not the spool (013-H2S 2026-09-28: after slot 3 stalled, slot 4
+      stalled in the same tube segment): its last ``driver_restart`` close
+      (``printer_incidents.last_closed_by``), with no print COMPLETED on it since
+      (``print_binding.completed_since`` — a completed archive; an eject sweep makes none).
+      Not ``incident_resolution.ledger.path_ran_at``: that sighting is process memory a
+      deploy empties, and a stalled job's own pre-stall RUNNING samples (heating, levelling on
+      a quiet path) qualify as one, so it could never bound a second stall.
+    """
+    from backend.app.core.database import async_session
+    from backend.app.services import print_binding, requeue
+
+    async with async_session() as db:
+        item = await db.get(PrintQueueItem, incident.item_id) if incident.item_id is not None else None
+        if item is not None and await requeue.fault_restart_spent(db, item):
+            return f"unit {item.id}'s plate was already restarted once"
+        last_restart = await printer_incidents.last_closed_by(db, incident.printer_id, RESOLVE_DRIVER_RESTART)
+        if last_restart is None or last_restart.resolved_at is None:
+            return None
+        if not await print_binding.completed_since(db, incident.printer_id, last_restart.resolved_at):
+            return (
+                f"no print completed on this printer since its last restart (incident {last_restart.id}, "
+                f"{last_restart.resolved_at.isoformat()})"
+            )
+    return None
 
 
 def _unload_skippable(state) -> bool:
@@ -3759,7 +4252,9 @@ def _feeder_kind(incident: RecoveryIncident) -> str:
     return _feeder_position(_get_state(incident.printer_id), incident.jammed_global_tray, incident.printer_id).kind
 
 
-async def _unload_and_confirm(incident: RecoveryIncident, *, evidence: _RecoveryEvidence, attempts: int) -> UnloadStep:
+async def _unload_and_confirm(
+    incident: RecoveryIncident, *, evidence: _RecoveryEvidence, attempts: int, after_stop: bool = False
+) -> UnloadStep:
     """Unload the feeder through ``ams_command.unload`` and read the wire's answer.
 
     ``skipped`` (nothing to unload — :func:`_unload_skippable`) / ``drying`` (the AMS is
@@ -3779,9 +4274,16 @@ async def _unload_and_confirm(incident: RecoveryIncident, *, evidence: _Recovery
     The unload is sent even when ``tray_now`` already reads 255 — the client encodes
     that as ``ams_id/slot_id/target = 255``, byte-for-byte the operator's proven manual
     recovery command (invariant 8: unconditional before a load).
+
+    ``after_stop`` — the restart continuation's unload (:func:`_restart`), once the driver's
+    own stop has ended the job: it is NEVER skipped, because the stop's terminal wiped the
+    printer's HMS list and :func:`_unload_skippable`'s "no live feed fault" then proves
+    nothing (255 is "nothing is feeding", not "the path is clear" — invariant 8), and its
+    confirm poll reads the printer in the ``job_over`` phase (:data:`Awaiting`), where the
+    terminal is the driver's own.
     """
     st, _waited = await _live_reading(incident)
-    if _unload_skippable(st):
+    if not after_stop and _unload_skippable(st):
         return "skipped"
 
     unit = _ams_unit_for_tray(getattr(st, "tray_now", None))
@@ -3801,7 +4303,7 @@ async def _unload_and_confirm(incident: RecoveryIncident, *, evidence: _Recovery
             verdict = "refused"
             continue
         seq = await evidence.note(CommandStep.draft("unload", None, _feeder_kind(incident)))
-        answer = await _confirm_unloaded(incident, sent)
+        answer = await _confirm_unloaded(incident, sent, awaiting="job_over" if after_stop else "PAUSE")
         match answer:
             case "acted" | "no_movement":
                 await evidence.answer(seq, answer)
@@ -3823,6 +4325,7 @@ async def _observe_command(
     sent: ams_command.Sent,
     *,
     step: str,
+    awaiting: Awaiting = "PAUSE",
 ) -> ams_command.Answer | StepTakeover:
     """THE driver's confirm loop for one published AMS motion command.
 
@@ -3840,6 +4343,9 @@ async def _observe_command(
     OUT of ``elapsed_s`` — measured on the snapshots' own clock (``ams_command.clock``) —
     so a gap never burns the command's window. A reconnect is answered by the classifier
     itself, on the new session's first fresh report (``ams_command._across_sessions``).
+
+    ``awaiting`` is the phase the command runs in (:data:`Awaiting`): the swap round's, the
+    job PAUSEd under it, or the restart continuation's, the job ended by the driver's stop.
     """
     observation = ams_command.Observation()
     entry = sent.entry
@@ -3848,7 +4354,7 @@ async def _observe_command(
     while True:
         st, waited = await _live_reading(incident, clock=ams_command.clock)
         blocked_s += waited
-        token = _takeover(incident, st, awaiting="PAUSE", target=target)
+        token = _takeover(incident, st, awaiting=awaiting, target=target)
         if token is not None:
             return _note_takeover(incident, token, step)
         observation.fold_ack(ams_command.ack_of(incident.printer_id, sent))
@@ -3872,8 +4378,10 @@ async def _observe_command(
         await asyncio.sleep(_POLL_INTERVAL_S)
 
 
-async def _confirm_unloaded(incident: RecoveryIncident, sent: ams_command.Sent) -> ams_command.Answer | StepTakeover:
-    """Read what the wire answered the unload ``sent``.
+async def _confirm_unloaded(
+    incident: RecoveryIncident, sent: ams_command.Sent, *, awaiting: Awaiting = "PAUSE"
+) -> ams_command.Answer | StepTakeover:
+    """Read what the wire answered the unload ``sent``, in the ``awaiting`` phase.
 
     ``tray_now == 255`` alone is never completion — after a feed fault it already reads
     255 before the unload (009-H2S 2026-07-20). Completion, and every other answer, is
@@ -3882,10 +4390,12 @@ async def _confirm_unloaded(incident: RecoveryIncident, sent: ams_command.Sent) 
     feeder loaded, the feeder leaving for 255 and holding — or ``held`` when the firmware
     acknowledged it and nothing moved; mid-change with nothing loaded, ``undecidable``
     (nothing physical can answer)."""
-    return await _observe_command(incident, "unload", None, sent, step="confirm_unloaded")
+    return await _observe_command(incident, "unload", None, sent, step="confirm_unloaded", awaiting=awaiting)
 
 
-async def _select_replacement(incident: RecoveryIncident, tried: set[int]) -> tuple[int | None, bool]:
+async def _select_replacement(
+    incident: RecoveryIncident, tried: set[int], *, awaiting: Awaiting = "PAUSE"
+) -> tuple[int | None, bool]:
     """Pick the next eligible loaded tray for the jammed filament, reusing the
     dispatcher's own selection functions. Returns ``(global_tray_id | None,
     only_low)`` — ``only_low`` True when the only match was withheld by the
@@ -3922,7 +4432,7 @@ async def _select_replacement(incident: RecoveryIncident, tried: set[int]) -> tu
         # The token is the sweep's own reason for stopping (already logged); the
         # driver re-derives the takeover from LIVE state at its own check below, so
         # nothing here acts on a reading this old.
-        status2, _token = await _await_bare_tray_configured(incident, forced_slots)
+        status2, _token = await _await_bare_tray_configured(incident, forced_slots, awaiting=awaiting)
         if status2 is not None:
             pick2, only_low2 = await _match_candidates(incident, status2, requirement, tried)
             if pick2 is not None:
@@ -4211,8 +4721,12 @@ def _any_slot_configured(status, slots: list[tuple[int, int]]) -> bool:
     return False
 
 
-async def _await_bare_tray_configured(incident: RecoveryIncident, forced_slots: list[tuple[int, int]]):
-    """Poll (≤ ``step_timeout_s``) for a forced bare slot to gain a ``tray_type``.
+async def _await_bare_tray_configured(
+    incident: RecoveryIncident, forced_slots: list[tuple[int, int]], *, awaiting: Awaiting = "PAUSE"
+):
+    """Poll (≤ ``step_timeout_s``) for a forced bare slot to gain a ``tray_type``, read in
+    the caller's phase (``awaiting`` — the swap round's PAUSE, or the restart
+    continuation's ended job).
 
     Returns ``(live state, takeover token)``: the state on success, else ``(None,
     token)`` when :func:`_takeover` ended the wait and ``(None, None)`` on a plain
@@ -4224,7 +4738,7 @@ async def _await_bare_tray_configured(incident: RecoveryIncident, forced_slots: 
     while True:
         st, waited = await _live_reading(incident)
         deadline += waited
-        token = _takeover(incident, st, awaiting="PAUSE")
+        token = _takeover(incident, st, awaiting=awaiting)
         if token is not None:
             _note_takeover(incident, token, "await_bare_tray_configured")
             return None, token
@@ -4418,6 +4932,18 @@ async def _commit_out_of_rotation(
         logger.info(
             "spool_recovery: printer %s %s tray %s kept IN rotation — extruder-side fault %s is the "
             "common factor, not the spool",
+            incident.printer_id,
+            role,
+            global_tray,
+            incident.code,
+        )
+        return
+    if incident.extruder_side_only is None:
+        # A re-entered incident whose live wire and recorded codes name no mechanical-feed
+        # fault: which side faulted is unknown, and a false stamp is permanent (invariant 11).
+        logger.info(
+            "spool_recovery: printer %s %s tray %s kept IN rotation — the fault's side is unknown (no "
+            "mechanical-feed code on the wire or on record for %s)",
             incident.printer_id,
             role,
             global_tray,
@@ -4728,6 +5254,16 @@ async def _give_up(incident: RecoveryIncident, reason: str, *, evidence: _Recove
 
     :func:`_abort` and :func:`_hand_over` deliberately leave the extruder as it is —
     another actor owns the printer, and a takeover is never a give-up.
+
+    A give-up AFTER the restart stop (:attr:`_RecoveryEvidence.restart_stop` — the restart
+    continuation's, or the offline bound met inside it) differs twice, both because the
+    job is over by the farm's own act. It restores nothing: the restore exists so a PAUSED
+    print is never handed over an extruder the farm emptied, which a resume would print
+    air from (shape 39, invariants 7/8), and a stopped job has no resume — so an unload the
+    continuation completed stays done, the path empty. And the row is re-classified a
+    PHYSICAL hold before it pages (:func:`_hold_the_path`): a jam row is a wire-class JOB
+    hold, which the sweep closes on an idle quiet printer, and the job it held is already
+    over — the printer must stay held until the path is shown clear.
     """
     # The counters are read BEFORE the restore: the restore reload is not a candidate
     # and must not feed the numbers the reason was chosen from.
@@ -4744,7 +5280,7 @@ async def _give_up(incident: RecoveryIncident, reason: str, *, evidence: _Recove
     # already refills the extruder there.
     verdict = (
         await _restore_jammed_feeder(incident, evidence=evidence)
-        if evidence.unload_moved_ams and evidence.held_command is None
+        if evidence.unload_moved_ams and evidence.held_command is None and evidence.restart_stop is None
         else None
     )
     if verdict == "abort":
@@ -4769,7 +5305,49 @@ async def _give_up(incident: RecoveryIncident, reason: str, *, evidence: _Recove
         loads_confirmed,
         ",".join(f"{s.lever}:{s.outcome}" for s in evidence.lever_steps) or "-",
     )
+    if evidence.restart_stop is not None:
+        await _hold_the_path(incident)
     await _escalate(incident, reason, restore=verdict, evidence=evidence)
+
+
+async def _hold_the_path(incident: RecoveryIncident) -> None:
+    """Re-classify the open row a PHYSICAL hold, before a give-up after the restart stop.
+
+    The row is a jam — a WIRE-class hold, a job hold: it closes when its printer runs
+    again, when its job ends, and on the sweep once the printer reads positive and quiet
+    (``incident_resolution._wire_sweep_tick``). After the driver's own stop the job has
+    ENDED and the printer reads IDLE and quiet, so a wire row would close 120 s after the
+    page and hand the dispatcher the path the continuation could not clear — or the one
+    that just stalled twice. A physical row is the EQUIPMENT hold, closed by the repair
+    evidence (a completed load, a print running through the path) or by Recover, which is
+    exactly what the restart give-ups' copy names. Same row, same id and ``created_at``,
+    through the store's one re-classification verb (``printer_incidents.upgrade``), keeping
+    the fault's own code, fingerprint, slot and recorded words. Best-effort: the page must
+    still go out if this write fails. A driver that re-reads its row after this sees
+    ``reclassified`` — none does: the give-up is its last act.
+    """
+    from backend.app.core.database import async_session
+
+    try:
+        async with async_session() as db:
+            row = await printer_incidents.get_open(db, incident.printer_id, kinds=AMS_FAULT_KINDS)
+            if row is None or row.id != incident.incident_id or row.kind == KIND_PHYSICAL:
+                return
+            await printer_incidents.upgrade(
+                db,
+                row.id,
+                kind=KIND_PHYSICAL,
+                code=row.code,
+                codes=row.codes,
+                slot_global_tray=row.slot_global_tray,
+                hms_full_codes=(row.hms_full_codes or "").split(","),
+            )
+    except Exception:  # noqa: BLE001 — a re-classification must never cost the page
+        logger.exception(
+            "spool_recovery: printer %s incident %s could not be held as a physical fault after the restart stop",
+            incident.printer_id,
+            incident.incident_id,
+        )
 
 
 async def _escalate(
@@ -4834,7 +5412,12 @@ async def _escalate(
                 )
                 return
             item = await db.get(PrintQueueItem, incident.item_id) if incident.item_id is not None else None
-            if item is not None:
+            # The hold token belongs on the unit the printer is HOLDING. A unit that is no
+            # longer printing has no hold to show — the restart give-ups come after the
+            # driver's own stop ended the job and its terminal handed the unit back to the
+            # queue, and a "recovery failed" token on that ended row would be a claim about
+            # a print that is over.
+            if item is not None and item.status == "printing":
                 item.waiting_reason = token
                 await db.commit()
             printer = await db.get(Printer, incident.printer_id)
@@ -4849,6 +5432,7 @@ async def _escalate(
                     kind=incident.kind,
                     runout_slot=slot_hint,
                     foreign=incident.item_id is None,
+                    job_ended=_job_ended(reason, evidence),
                 )
             except Exception:  # noqa: BLE001 — notification failure is non-fatal
                 logger.exception("spool_recovery: failed notification error for printer %s", incident.printer_id)
@@ -4858,7 +5442,12 @@ async def _escalate(
             # ledger row per incident: an upgrade re-escalates a row that may already
             # have paged and been recorded, and the ledger — not a flag — says so.
             await _record_escalation_and_maybe_quarantine(db, incident, reason, opened_at=row.created_at)
-        logger.warning("spool_recovery: printer %s ESCALATED (%s) — left PAUSED", incident.printer_id, reason)
+        logger.warning(
+            "spool_recovery: printer %s ESCALATED (%s) — %s",
+            incident.printer_id,
+            reason,
+            "the job has ended; the printer is held" if _job_ended(reason, evidence) else "left PAUSED",
+        )
         # A HELD runout's escalation IS the durable exhaustion record. The three
         # edge-driven spent lanes hang off `hms_edges` appearance edges, which every
         # restart re-seeds, so a hold that spans a deploy (or a standing PAUSE code
@@ -5408,10 +5997,22 @@ async def rearm_incidents_on_startup() -> int:
             for incident in await printer_incidents.all_open(db):
                 pid = incident.printer_id
                 live = printer_incidents.driver_live(pid)
+                # The row's step ledger answers the one question the wire cannot: did the
+                # driver STOP this job to restart it? A deploy mid-restart then finds the
+                # printer IDLE — "not PAUSE" to the wire cell — and must re-enter the
+                # continuation, which finishes what the log says is left (the unload, or
+                # only the park and the close), never close the row ``startup_rearm``.
+                try:
+                    restart_owed = (await _RecoveryEvidence.from_row(db, incident.id)).restart_stop is not None
+                except LookupError:
+                    # A ledger the driver cannot read is drift (``_step_of``); it must not
+                    # cost every other row its startup verdict.
+                    logger.exception("spool_recovery: startup — incident %s has an unreadable step ledger", incident.id)
+                    restart_owed = False
                 verdict = incident_resolution.resolve(
                     incident,
                     "startup",
-                    Context(state=_get_state(pid), ledger=ledger, driver_live=live),
+                    Context(state=_get_state(pid), ledger=ledger, driver_live=live, restart_owed=restart_owed),
                 )
                 if not verdict.close:
                     if driver_owns(incident, live=live):
@@ -5444,6 +6045,25 @@ async def rearm_incidents_on_startup() -> int:
     return closed
 
 
+def _recorded_candidates(full_codes: str | None) -> frozenset[FaultCandidate]:
+    """The actionable fault candidates a row's RECORDED full codes
+    (``printer_incident.hms_full_codes``) classify to.
+
+    A startup re-entry meets a wire with no actionable code left — a CONTINUE, or the
+    driver's own stop, emptied it — while the incident's shape (which side faulted, a
+    latched pull-back) is a fact about the fault the row opened on. The firmware's own
+    identifiers were recorded then, so the fault is re-read from them through the one
+    reader of a recorded code (``hms_errors.classify_full_code``), never re-guessed — the
+    actionable ones, as the live entry gate would have kept them. An empty set when nothing
+    was recorded or nothing classifies: the caller's fields then speak alone, and no side
+    is claimed (:attr:`RecoveryIncident.extruder_side_only` None — nothing is parked).
+    Applied on EVERY re-entry whose wire names no actionable fault — the restart
+    continuation's and the mid-change re-entry's alike (coordinator ruling 2026-09-29).
+    """
+    recorded = (classify_full_code(code) for code in (full_codes or "").split(","))
+    return frozenset(c for c in recorded if c is not None and c.fault_class in ACTIONABLE_CLASSES)
+
+
 async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asyncio.Task | None:
     """Give a driver back to an incident a restart left mid-swap. Never raises.
 
@@ -5464,6 +6084,11 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
     loaded in its place — so it escalates ``recovery_interrupted`` rather than closing,
     carrying the hydrated log. The lifecycle closes it for free the moment the printer is
     seen RUNNING.
+
+    One incident is not the wire's to decide: one whose log holds the restart stop
+    (:attr:`_RecoveryEvidence.restart_stop`). Its job was ended by the driver itself, so
+    it re-enters on the row's own facts and the driver resumes the restart continuation
+    (a deploy mid-restart must not leave the stalled filament in the tube).
     """
     try:
         state = _get_state(printer_id)
@@ -5481,8 +6106,26 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
             item = await _resolve_farm_item(db, printer_id, job_id)
             evidence = await _RecoveryEvidence.from_row(db, incident_id)
             fault_class = _dominant_class(candidates)
-            if fault_class is None:
-                # No actionable candidate: the row's facts are the evidence left.
+            item_id = item.id if item is not None else None
+            if evidence.restart_stop is not None:
+                # The driver had STOPPED this job to restart it, and the restart of this
+                # process interrupted the continuation. The job is over: its terminal wiped
+                # the HMS list, so the wire has nothing left to re-classify, and its unit is
+                # no longer printing, so none resolves. The ROW's facts are the incident —
+                # its fault (the codes it recorded, through the taxonomy), its slot, its
+                # unit — and the driver picks the continuation up from the log
+                # (:func:`_drive_recovery`), whatever of it is left.
+                candidates = _recorded_candidates(row.hms_full_codes)
+                kind, external = row.kind, False
+                code, fingerprint = row.code, row.codes
+                tray = row.slot_global_tray
+                job_id, item_id = row.job_id, row.item_id
+                escalate_reason = None
+            elif fault_class is None:
+                # No actionable candidate: the row's facts are the evidence left — its
+                # recorded codes through the taxonomy for the fault's shape (which side, a
+                # latched pull-back), its fields for the rest.
+                candidates = _recorded_candidates(row.hms_full_codes)
                 kind, external = row.kind, False
                 code, fingerprint = row.code, row.codes
                 tray = row.slot_global_tray
@@ -5529,7 +6172,7 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                 printer_id=printer_id,
                 job_id=job_id,
                 settings=settings,
-                item_id=item.id if item is not None else None,
+                item_id=item_id,
                 kind=kind,
                 code=code,
                 fingerprint=fingerprint,

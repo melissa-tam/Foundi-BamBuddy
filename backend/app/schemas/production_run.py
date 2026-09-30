@@ -58,8 +58,9 @@ class RunUnit(BaseModel):
 
     id: int
     status: str
-    # 'operator_ui' / 'operator_screen' when the unit was deliberately stopped;
-    # null for normal terminals.
+    # How the unit reached 'cancelled': a token of the closed
+    # ``farm_correlation.StopVerdict`` set (the one origin), or the stored-history
+    # 'farm_vision_abort'; null for a genuine failure or a normal completion.
     stop_source: str | None = None
     waiting_reason: str | None = None
     # One-time deferred start: when in the future the scheduler holds

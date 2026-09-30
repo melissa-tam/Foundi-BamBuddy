@@ -442,20 +442,40 @@ class TestHmsAggregation:
         assert h.ledger_keys == [notify_dedup.hms_ledger_key(5, _MAIN_BOARD.full_code)]
 
 
+def _owned(*full_codes: str) -> AsyncMock:
+    """Stand in for ``spool_recovery.owned_full_codes`` answering exactly these codes."""
+    return AsyncMock(return_value=frozenset(full_codes))
+
+
+# The 011-H2S 2026-09-29 pair (incident 419): the slot-3 OVERLOAD and the slot-3 runout
+# DEMAND share one code word and one short form ("0700_0001"), and differ only in the attr
+# submodule byte (0x62 vs 0x22) — which only the full code keeps.
+_OVERLOAD_SLOT3 = _err(code="0x20001", attr=0x07006200, module=0x07, full_code="0700620000020001")
+_DEMAND_SLOT3 = _err(code="0x20001", attr=0x07002200, module=0x07, full_code="0700220000020001")
+# The same jam on the print_error lane: attr IS the 32-bit word, its full code the 8 hex.
+_FEED_FAULT_PRINT_ERROR = _err(code="0x8010", attr=0x07008010, module=0x07, full_code="07008010", severity=3)
+
+
 @pytest.mark.asyncio
 class TestRecoveryOwnedSuppression:
+    """``main`` drops exactly the FULL codes the owner (``spool_recovery.owned_full_codes``)
+    answers, stamps them in the durable ledger, and compares nothing else — which codes an
+    incident speaks for is pinned at the owner (``test_recovery_owned_codes.py``)."""
+
     async def test_recovery_owned_suppression(self):
-        """When recovery will own the incident, the raw feed-fault + slot-attributed
-        companion alerts are suppressed (only the unrelated code notifies), yet ALL
+        """The owned codes are suppressed (only the unrelated code notifies), yet ALL
         three full codes are stamped so a standing owned code can't re-blast."""
         with (
             _Harness() as h,
-            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=True)) as will_own,
+            patch(
+                "backend.app.services.spool_recovery.owned_full_codes",
+                new=_owned(_FEED_FAULT.full_code, _RUNOUT_COMPANION.full_code),
+            ) as owner,
             patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
         ):
             await main_module.on_printer_status_change(5, _state([_FEED_FAULT, _RUNOUT_COMPANION, _UNRELATED]))
 
-        will_own.assert_awaited_once()
+        owner.assert_awaited_once()
         assert h.notify.on_printer_error.await_count == 1
         body = h.sent_bodies[0]
         assert "0700_4025" in body
@@ -467,10 +487,47 @@ class TestRecoveryOwnedSuppression:
             for code in (_FEED_FAULT.full_code, _RUNOUT_COMPANION.full_code, _UNRELATED.full_code)
         }
 
-    async def test_suppression_fails_open_when_predicate_returns_false(self):
+    async def test_an_owned_overload_never_silences_the_demand_sharing_its_short_code(self):
+        """THE collision the full-code compare closes: the owner speaks for the slot-3
+        overload, and the slot-3 runout demand standing beside it — the same "0700_0001"
+        — still reaches the operator in its own words."""
+        catalog = {
+            _OVERLOAD_SLOT3.full_code: "The AMS A Slot 3 is overloaded.",
+            _DEMAND_SLOT3.full_code: "AMS A Slot 3 filament has run out.",
+        }
+        with (
+            _Harness(catalog=catalog) as h,
+            patch("backend.app.services.spool_recovery.owned_full_codes", new=_owned(_OVERLOAD_SLOT3.full_code)),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
+        ):
+            await main_module.on_printer_status_change(5, _state([_OVERLOAD_SLOT3, _DEMAND_SLOT3]))
+
+        assert h.sent_bodies == ["0700_0001 — AMS A Slot 3 filament has run out."]
+        # Both stamped: the overload as recovery-owned, the demand as actually sent.
+        assert set(h.ledger_keys) == {
+            notify_dedup.hms_ledger_key(5, _OVERLOAD_SLOT3.full_code),
+            notify_dedup.hms_ledger_key(5, _DEMAND_SLOT3.full_code),
+        }
+
+    async def test_the_print_error_lanes_8_hex_full_code_is_compared_as_is(self):
         with (
             _Harness() as h,
-            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=False)),
+            patch(
+                "backend.app.services.spool_recovery.owned_full_codes",
+                new=_owned(_FEED_FAULT_PRINT_ERROR.full_code),
+            ),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
+        ):
+            await main_module.on_printer_status_change(5, _state([_FEED_FAULT_PRINT_ERROR, _UNRELATED]))
+
+        assert h.notify.on_printer_error.await_count == 1
+        assert "0700_8010" not in h.sent_bodies[0]
+        assert notify_dedup.hms_ledger_key(5, "07008010") in h.ledger_keys
+
+    async def test_suppression_fails_open_when_predicate_returns_nothing(self):
+        with (
+            _Harness() as h,
+            patch("backend.app.services.spool_recovery.owned_full_codes", new=_owned()),
             patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
         ):
             await main_module.on_printer_status_change(5, _state([_FEED_FAULT, _RUNOUT_COMPANION, _UNRELATED]))
@@ -482,11 +539,14 @@ class TestRecoveryOwnedSuppression:
         assert "0700_4025" in body
 
     async def test_suppression_fails_open_when_predicate_raises(self):
-        """will_own already fails closed; the call-site guard is belt-and-braces so a
-        crashed predicate never silences the raw alerts."""
+        """The owner already fails toward notifying; the call-site guard is
+        belt-and-braces so a crashed predicate never silences the raw alerts."""
         with (
             _Harness() as h,
-            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(side_effect=RuntimeError("boom"))),
+            patch(
+                "backend.app.services.spool_recovery.owned_full_codes",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
             patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
         ):
             await main_module.on_printer_status_change(5, _state([_FEED_FAULT, _RUNOUT_COMPANION, _UNRELATED]))
@@ -497,16 +557,68 @@ class TestRecoveryOwnedSuppression:
         assert "0700_0001" in body
         assert "0700_4025" in body
 
-    async def test_will_own_skipped_without_recoverable_codes(self):
-        """No recoverable code in the push ⇒ the predicate is never awaited (no db
-        work) and both ordinary codes still aggregate into one message."""
+    async def test_no_incident_read_without_an_actionable_code_or_a_notice(self):
+        """No actionable code and no notice in the push ⇒ the REAL owner reads no
+        incident row (no DB work) and both ordinary codes still aggregate into one
+        message."""
         with (
             _Harness() as h,
-            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=True)) as will_own,
+            patch("backend.app.services.printer_incidents.get_open", new=AsyncMock()) as get_open,
         ):
             await main_module.on_printer_status_change(5, _state([_hms(_READ_FAIL), _hms(_MAIN_BOARD)]))
 
-        will_own.assert_not_awaited()
+        get_open.assert_not_awaited()
+        assert h.notify.on_printer_error.await_count == 1
+
+
+@pytest.mark.asyncio
+class TestTheOperatorsRetryPushIsOwnedByTheOpenRow:
+    """011-H2S 2026-09-29 17:59:18, end to end on a real database: the operator's Retry
+    on the held jam cleared the actionable code and raised ``0700_2200_0002_0025`` (feed
+    resistance, INFORMATIONAL). No candidate stands on that push; the OPEN jam row on
+    AMS 0 is what speaks for the notice."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_recovery(self):
+        from backend.app.services import spool_recovery
+
+        spool_recovery._reset_state()
+        yield
+        spool_recovery._reset_state()
+
+    _RESISTANCE_SLOT3 = _err(code="0x20025", attr=0x07002200, module=0x07, full_code="0700220000020025")
+
+    async def _open_jam(self, db, printer_id: int, *, slot_global_tray: int | None) -> None:
+        from backend.app.services import printer_incidents
+
+        row = await printer_incidents.open_new(
+            db,
+            printer_id=printer_id,
+            job_id="",
+            item_id=None,
+            kind="jam",
+            code="0700_8010",
+            codes="mechanical_feed:0700_8010",
+            slot_global_tray=slot_global_tray,
+        )
+        assert row is not None
+
+    async def test_the_notice_is_suppressed_and_stamped(self, db_session, printer_factory, own_session_factory):
+        printer = await printer_factory()
+        await self._open_jam(db_session, printer.id, slot_global_tray=2)  # AMS 0, slot 3
+
+        with _Harness(session_factory=own_session_factory) as h:
+            await main_module.on_printer_status_change(printer.id, _state([self._RESISTANCE_SLOT3]))
+
+        h.notify.on_printer_error.assert_not_awaited()
+        assert h.ledger_keys == [notify_dedup.hms_ledger_key(printer.id, self._RESISTANCE_SLOT3.full_code)]
+
+    async def test_with_no_open_row_the_notice_pages(self, db_session, printer_factory, own_session_factory):
+        printer = await printer_factory()
+
+        with _Harness(session_factory=own_session_factory) as h:
+            await main_module.on_printer_status_change(printer.id, _state([self._RESISTANCE_SLOT3]))
+
         assert h.notify.on_printer_error.await_count == 1
 
 
@@ -694,7 +806,7 @@ class TestStandingCodesStillReachTheIncidentMachine:
         runout = SimpleNamespace(code="0x8011", attr=0x07000000, module=0x07, severity=2, full_code="0700000000008011")
         with (
             _Harness() as h,
-            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=True)),
+            patch("backend.app.services.spool_recovery.owned_full_codes", new=_owned(runout.full_code)),
             patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()) as spawn,
         ):
             # Exactly what startup does: the live code is pre-marked as already
@@ -714,7 +826,7 @@ class TestStandingCodesStillReachTheIncidentMachine:
         runout = SimpleNamespace(code="0x8011", attr=0x07000000, module=0x07, severity=2, full_code="0700000000008011")
         with (
             _Harness(),
-            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=True)),
+            patch("backend.app.services.spool_recovery.owned_full_codes", new=_owned(runout.full_code)),
             patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()) as spawn,
         ):
             await main_module.on_printer_status_change(5, _state([_hms(runout)], layer_num=1))
@@ -815,7 +927,7 @@ class TestAutoSwitchNotificationSuppression:
         overload = _err(code="0x20002", attr=0x07001000, module=0x07, full_code="0700100000020002")
         with (
             _Harness() as h,
-            patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=False)),
+            patch("backend.app.services.spool_recovery.owned_full_codes", new=_owned()),
             patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()),
         ):
             await main_module.on_printer_status_change(5, _state([_hms(overload)]))
@@ -980,7 +1092,7 @@ def _runout_lane_on(session_factory):
 
     stack = ExitStack()
     stack.enter_context(patch("backend.app.core.database.async_session", session_factory))
-    stack.enter_context(patch("backend.app.services.spool_recovery.will_own", new=AsyncMock(return_value=False)))
+    stack.enter_context(patch("backend.app.services.spool_recovery.owned_full_codes", new=_owned()))
     stack.enter_context(patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()))
     return stack
 

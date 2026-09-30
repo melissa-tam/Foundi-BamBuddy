@@ -284,10 +284,16 @@ _OPERATOR_STOP_CALLERS = {
 }
 
 # WHO may send a RAW ``stop_print`` — the MQTT ``print.stop`` WITHOUT the operator's request.
-# A bare stop is the FARM ending a job it owns, and there are exactly two such acts:
+# A bare stop is the FARM ending a job it owns, and there are exactly three such acts:
 #   * ``print_control``   — the operator verb itself (the request, then the stop);
 #   * ``eject/remote``    — the eject lane's kill of its OWN sweep (the runtime watchdog,
-#                           the start deadline, the re-drive).
+#                           the start deadline, the re-drive);
+#   * ``spool_recovery``  — the recovery driver's LAST release rung, ``print_stop``: a farm
+#                           unit stalled on its first filament load, every release verb
+#                           spent, nothing deposited — the driver ends the job and restarts
+#                           it on the backup spool (operator ruling 2026-09-29, 013-H2S
+#                           incidents 410/411). Published by the ``_LEVERS`` table alone
+#                           (``TestRecoveryDriverOwnership``).
 # ``printer_manager`` is the per-printer facade that forwards to the client.
 # ``pause_recovery``'s plate-check stop is gone (2026-09-24: the printer's plate check
 # PAUSES the job for a human, and the farm sends nothing), and so is every route's bare
@@ -296,6 +302,7 @@ _RAW_STOP_CALLERS = {
     ("services", "print_control.py"),
     ("services", "eject", "remote.py"),
     ("services", "printer_manager.py"),
+    ("services", "spool_recovery.py"),
 }
 
 
@@ -337,7 +344,7 @@ def _scan_raw_stops(py_file: Path) -> list[tuple[str, int]]:
 
 
 class TestRawStopOwnership:
-    """A bare ``print.stop`` is the FARM ending its own job — only two lanes may send one."""
+    """A bare ``print.stop`` is the FARM ending its own job — only the allowlisted lanes may send one."""
 
     def test_only_the_allowlisted_lanes_send_a_raw_stop(self):
         strays: list[str] = []
@@ -514,6 +521,8 @@ class TestOperatorStopRequestOwnership:
 # three callers each released a claim with their own ideas of position and run state,
 # and the retry insert lived in farm_policy beside its decisions.
 _REQUEUE_OWNER = ("services", "requeue.py")
+# The one module that DECIDES a new attempt of a plate (``requeue.requeue_attempt``'s only caller).
+_REQUEUE_DECIDER = ("services", "farm_policy.py")
 _QUEUE_BUILDER = ("services", "queue_builder.py")
 _LINEAGE_FIELD = "retry_of_id"
 
@@ -624,9 +633,35 @@ class TestRequeueOwnership:
                 "lock and the head/tail rule live there and nowhere else."
             )
 
+    def test_only_the_farm_policy_requeues_an_attempt(self):
+        """WHETHER a plate goes back is the terminal disposition's (``farm_policy``: the stop
+        verdict, the genuine-failure cap, the run's state); HOW it goes back is ``requeue``'s.
+        A second caller is a second decision — the recovery driver requeueing the unit it
+        stopped would mint a row the terminal's own disposition mints again, or one no
+        terminal ever classified."""
+        strays = [
+            f"  - {'/'.join(parts)}:{node.lineno}"
+            for parts, tree in _app_trees()
+            if parts != _REQUEUE_DECIDER
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _called_attr(node) == "requeue_attempt"
+        ]
+        if strays:
+            pytest.fail(
+                "requeue.requeue_attempt is called outside services/farm_policy.py:\n"
+                + "\n".join(strays)
+                + "\n\nA terminal's disposition is farm_policy's (on_unit_terminal, read off the "
+                "terminal's ONE classification). A new reason to put a plate back is a verdict "
+                "(farm_correlation.StopVerdict) the policy routes, not a second requeue call."
+            )
+
     def test_the_owners_still_do_it(self):
         """The liveness half: pins that scan for strays pass on an empty tree too."""
         trees = dict(_app_trees())
+        assert any(
+            isinstance(node, ast.Call) and _called_attr(node) == "requeue_attempt"
+            for node in ast.walk(trees[_REQUEUE_DECIDER])
+        )
         requeue_tree = trees[_REQUEUE_OWNER]
         assert any(
             isinstance(node, ast.Call) and _called_attr(node) == "release_unstarted_claim"
@@ -1271,8 +1306,10 @@ _PRINTER_INCIDENTS = ("services", "printer_incidents.py")
 # The frames a release verb publishes. In ``spool_recovery`` they are published by the
 # lever table's own lambdas, by THE reader's pause arms, and by the runout refill /
 # path-repair auto-resume lane (a different feature: ``_resume_after_evidence``) — and
-# nowhere else, so no second reading of a verb's effect can grow beside the reader.
-_RELEASE_FRAMES = {"resume_print", "pause_print", "ams_control", "clean_print_error"}
+# nowhere else, so no second reading of a verb's effect can grow beside the reader. The
+# restart rung's ``stop_print`` is one of them, and its home is narrower still: the table
+# alone (``test_the_restart_stop_is_published_by_its_rung_alone``).
+_RELEASE_FRAMES = {"resume_print", "pause_print", "ams_control", "clean_print_error", "stop_print"}
 _RELEASE_FRAME_SCOPES = {"_LEVERS", "_read_after", "_resume_after_evidence"}
 
 
@@ -1415,6 +1452,135 @@ class TestRecoveryDriverOwnership:
                 seen.add(home)
         assert not strays, "A release frame is published outside its owners:\n" + "\n".join(strays)
         assert seen == _RELEASE_FRAME_SCOPES
+
+    def test_the_restart_stop_is_published_by_its_rung_alone(self):
+        """The driver ends a job ONLY through the last rung of ``_LEVERS`` (operator ruling
+        2026-09-29) — never from a reader arm or another lane — so the stop is pulled by the
+        rung's own pull rule (a farm unit, nothing deposited) and read by THE reader."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
+        homes = [
+            (node.lineno, scope)
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Call) and _called(node.func)[1] == "stop_print"
+        ]
+        assert len(homes) == 1, f"spool_recovery must publish print.stop exactly once, found {homes}"
+        assert homes[0][1] == ("_LEVERS",), f"the restart stop is published outside the lever table: {homes}"
+        # ...and it is the ``publish`` of the rung keyed ``FAULT_RESTART_STEP`` — the one rung
+        # whose pull rule requires a farm unit and nothing deposited, not any other row.
+        table = next(
+            node.value
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(t, ast.Name) and t.id == "_LEVERS"
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            )
+        )
+        assert isinstance(table, ast.Dict)
+        (spec,) = [
+            value
+            for key, value in zip(table.keys, table.values, strict=True)
+            if isinstance(key, ast.Name) and key.id == "FAULT_RESTART_STEP"
+        ]
+        publish = next(kw.value for kw in spec.keywords if kw.arg == "publish")
+        assert any(
+            isinstance(node, ast.Call) and _called(node.func)[1] == "stop_print" for node in ast.walk(publish)
+        ), "the restart stop is not _LEVERS[FAULT_RESTART_STEP].publish"
+
+    def test_the_restart_rung_reads_the_deposit_predicate_and_no_peak(self):
+        """ "Has this job deposited anything" is ``plate_occupancy.DepositEvidence``'s one
+        predicate over the client's one peaks reader: the driver reads ``.deposited`` and
+        compares no layer number or percent of its own for the decision."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
+        peak_fields = {"last_layer_num", "last_progress", "peak_layer_num", "peak_progress", "peaks_reliable"}
+        strays = [
+            f"  - spool_recovery:{node.lineno} reads .{node.attr}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr in peak_fields
+        ]
+        assert not strays, "The restart rung re-derives the deposit decision:\n" + "\n".join(strays)
+        reads = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "deposited"
+            and isinstance(node.value, ast.Call)
+            and _called(node.value.func) == ("DepositEvidence", "live")
+        ]
+        assert len(reads) == 1, "the restart rung reads DepositEvidence.live(...).deposited once"
+
+    def test_the_restart_bounds_read_their_owners(self):
+        """The printer bound's two facts are their owners' reads — the last ``driver_restart``
+        close (``printer_incidents.last_closed_by``) and a completed print since
+        (``print_binding.completed_since``) — so the driver names no archive table and
+        selects no incident row of its own."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
+        strays = [
+            f"  - spool_recovery:{node.lineno}"
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Name) and node.id == "PrintArchive")
+            or (
+                isinstance(node, ast.Call)
+                and _called(node.func) == (None, "select")
+                and any(isinstance(arg, ast.Name) and arg.id == "PrinterIncident" for arg in ast.walk(node))
+            )
+        ]
+        assert not strays, "The driver reads another owner's table:\n" + "\n".join(strays)
+        calls = {_called(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        assert {("printer_incidents", "last_closed_by"), ("print_binding", "completed_since")} <= calls
+
+
+# --- The deposit predicate and the lineage walk keep their one owner each --------------
+
+_PLATE_OCCUPANCY = ("services", "plate_occupancy.py")
+_REQUEUE = ("services", "requeue.py")
+
+
+class TestDepositEvidenceConstruction:
+    """``plate_occupancy.DepositEvidence`` — "did this job leave something on the plate" —
+    is built ONLY by its own classmethods (``from_terminal_payload`` / ``unknown`` /
+    ``live``), each of which states where its facts come from and fails closed. A literal
+    construction elsewhere is a second reading of the peaks (and a way to hand the plate
+    gate a ``peaks_reliable`` nobody measured)."""
+
+    def test_only_its_classmethods_construct_it(self):
+        strays: list[str] = []
+        builders: set[str] = set()
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                _owner, name = _called(node.func)
+                if name == "DepositEvidence":
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} constructs DepositEvidence")
+                if parts == _PLATE_OCCUPANCY and name == "cls" and scope[:1] == ("DepositEvidence",):
+                    builders.add(scope[-1])
+        assert not strays, "DepositEvidence is constructed outside its classmethods:\n" + "\n".join(strays)
+        assert builders == {"from_terminal_payload", "unknown", "live"}
+
+
+class TestLineageWalkOwnership:
+    """``requeue._ancestors`` is THE walk up a ``retry_of_id`` chain; the lineage questions
+    — the root, the genuine-failure cap, the one fault restart — are asked of ``requeue``,
+    never walked a second time elsewhere."""
+
+    def test_the_walk_is_referenced_only_in_requeue(self):
+        strays = [
+            f"  - {'/'.join(parts)}:{node.lineno}"
+            for parts, tree in _app_trees()
+            if parts != _REQUEUE
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Name) and node.id == "_ancestors")
+            or (isinstance(node, ast.Attribute) and node.attr == "_ancestors")
+        ]
+        assert not strays, "The lineage walk is referenced outside requeue.py:\n" + "\n".join(strays)
+        (tree,) = [t for parts, t in _app_trees() if parts == _REQUEUE]
+        callers = {
+            scope[-1]
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Name) and node.id == "_ancestors" and scope
+        }
+        assert {"lineage_root", "failed_ancestor_count", "fault_restart_spent"} <= callers
 
     def test_the_evidence_log_is_built_only_from_the_ledger(self):
         """``_RecoveryEvidence`` is constructed ONLY by ``from_row`` — the one constructor

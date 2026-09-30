@@ -170,6 +170,7 @@ export default {
       timeCol: 'Terminada / iniciada',
       stoppedByOperator: 'Detenida por el operador',
       stoppedAtPlateCheck: 'Detenida en la comprobación de la cama',
+      stoppedByFarmFeedStall: 'Detenida por la granja: atasco de alimentación al inicio de la impresión',
       stoppedByFarmVision: 'Detenida por la granja: comprobación de la cama',
       stoppedByReconcileUnknown: 'Resultado desconocido tras la reconexión',
       firstArticleBadge: 'Primera pieza',

@@ -170,6 +170,7 @@ export default {
       timeCol: '完成 / 開始',
       stoppedByOperator: '已由操作員停止',
       stoppedAtPlateCheck: '已在列印板偵測處停止',
+      stoppedByFarmFeedStall: '農場停止：列印開始時送料卡滯',
       stoppedByFarmVision: '農場停止：列印板偵測',
       stoppedByReconcileUnknown: '重新連線後結果未知',
       firstArticleBadge: '首件',

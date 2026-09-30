@@ -87,6 +87,9 @@ export interface RunPrinterState {
  * - `plate_refused` — the printer's own plate check PAUSED the print and it
  *   ended without printing (usually an operator stopping the paused print);
  *   the plate is held and the unit requeued.
+ * - `fault_restart` — the farm's recovery driver stopped a job that had
+ *   deposited nothing, over a feed stall on its first filament load, and the
+ *   unit was requeued next in line onto the backup spool.
  * - `farm_vision_abort` — HISTORY only: the farm's own stop on a plate-check
  *   trip, 2026-09-04 → 2026-09-24; no writer remains.
  * - `reconcile_unknown` — the downtime reconcile could not read this print's
@@ -96,6 +99,7 @@ export type UnitStopSource =
   | 'operator_ui'
   | 'operator_screen'
   | 'plate_refused'
+  | 'fault_restart'
   | 'farm_vision_abort'
   | 'reconcile_unknown';
 
