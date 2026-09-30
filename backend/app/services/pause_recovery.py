@@ -61,7 +61,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
+from typing import Literal, TypeGuard, get_args
 
 from backend.app.models.printer_incident import (
     AMS_FAULT_KINDS,
@@ -71,7 +74,9 @@ from backend.app.models.printer_incident import (
     STATUS_ESCALATED,
     STATUS_RESOLVED,
 )
+from backend.app.models.printer_incident_step import STEP_KIND_DIALOG, STEP_KIND_STOP, PrinterIncidentStep, StepKind
 from backend.app.services import incident_resolution, printer_incidents
+from backend.app.services.hms_actions import HMSAction
 from backend.app.services.hms_errors import (
     POWER_LOSS_PROMPT_CODES,
     POWER_LOSS_RESUME_FAILED_CODES,
@@ -83,8 +88,10 @@ from backend.app.services.hms_errors import (
     summary_of,
 )
 from backend.app.services.incident_resolution import ClearedEvent, Context, ledger
+from backend.app.services.job_identity import is_held_job
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.terminal_outcome import PLATE_RECHECK_WINDOW_S, PlateCheckFacts
 
 logger = logging.getLogger(__name__)
 
@@ -678,6 +685,211 @@ async def _open_z_reference_hold(printer_id: int, *, cause: str) -> bool:
         cause,
     )
     return True
+
+
+# --- the plate-check episode: its step vocabulary and its terminal facts ------------
+#
+# The plate-check ladder (operator ruling 2026-09-29): press the printer's own "Problem
+# solved, resume"; if that re-check fails, stop the print and retry the same print; if the
+# retry's re-check fails too, escalate. The episode's durable memory is the incident's step
+# ledger (``printer_incidents.EvidenceLog``, its one writer), because the wire cannot restate
+# it: the PAUSE reads the same before and after the press, and after a restart a second press
+# is exactly what re-entry must never send. Two kinds are written, each with its own closed
+# name and answer vocabulary below.
+
+# The dialog buttons the ladder presses, named by the action ``execute_hms_action`` takes — one
+# spelling for the press and its ledger row. Only "Problem solved, resume": "Ignore" would skip
+# the re-check the ladder exists to run.
+_PLATE_CHECK_BUTTONS: frozenset[str] = frozenset({HMSAction.PROBLEM_SOLVED_RESUME})
+# The stop verb the ladder's second rung sends (``printer_manager.stop_print``, the raw stop).
+PLATE_CHECK_STOP_VERB = "stop"
+
+# What the READ of a dialog press answered. Closed.
+#   ``success`` / ``fail`` — the firmware's ACK of the press (``CommandAck.succeeded``);
+#   ``no_ack``             — the press went out and no ACK arrived within the budget;
+#   ``not_sent``           — nothing went out (``execute_hms_action`` returned ``None``).
+PlateCheckDialogAnswer = Literal["success", "fail", "no_ack", "not_sent"]
+# What the READ of the farm's stop answered. Closed.
+#   ``taken``     — the job left PAUSE (the stop reached a terminal) within the budget;
+#   ``not_taken`` — the job was still PAUSEd when the budget ran out;
+#   ``not_sent``  — the raw stop never went out (``stop_print`` returned False).
+# The last two are the stop that did NOT end the job: the driver then hands the paused print
+# to a human (the escalated hold and its page), so a later end of that job is the human's —
+# never the farm's stop (:meth:`_PlateCheckEvidence.farm_stopped`).
+PlateCheckStopNotTaken = Literal["not_taken", "not_sent"]
+PlateCheckStopAnswer = Literal["taken", PlateCheckStopNotTaken]
+_STOP_NOT_TAKEN: frozenset[str] = frozenset(get_args(PlateCheckStopNotTaken))
+
+# The two ledger kinds this lane writes (``StepKind``'s own values), each with its names...
+_PLATE_CHECK_NAMES: dict[str, frozenset[str]] = {
+    STEP_KIND_DIALOG: _PLATE_CHECK_BUTTONS,
+    STEP_KIND_STOP: frozenset({PLATE_CHECK_STOP_VERB}),
+}
+# ...and its answers.
+_PLATE_CHECK_ANSWERS: dict[str, frozenset[str]] = {
+    STEP_KIND_DIALOG: frozenset(get_args(PlateCheckDialogAnswer)),
+    STEP_KIND_STOP: frozenset(get_args(PlateCheckStopAnswer)),
+}
+
+
+def _is_plate_check_kind(token: str) -> TypeGuard[StepKind]:
+    return token in _PLATE_CHECK_NAMES
+
+
+@dataclass(frozen=True)
+class PlateCheckStep:
+    """One thing the plate-check episode's driver sent: a dialog button pressed, or the stop.
+
+    ``outcome`` is ``None`` from the send until the read (a crash between the two leaves it
+    ``None`` for good — the press or the stop went out and nobody saw what it did, which is
+    exactly the fact re-entry needs). Its token is the kind's own closed vocabulary
+    (:data:`PlateCheckDialogAnswer` / :data:`PlateCheckStopAnswer`).
+    """
+
+    seq: int
+    kind: StepKind
+    name: str
+    outcome: str | None
+    at: datetime | None
+
+    @classmethod
+    def dialog(cls, button: str = HMSAction.PROBLEM_SOLVED_RESUME) -> PlateCheckStep:
+        """An unsent press of ``button``; the log's ``note`` assigns its ``seq`` and ``at``."""
+        if button not in _PLATE_CHECK_BUTTONS:
+            raise LookupError(f"pause_recovery: the plate-check ladder presses no {button!r}")
+        return cls(seq=0, kind=STEP_KIND_DIALOG, name=str(button), outcome=None, at=None)
+
+    @classmethod
+    def stop(cls) -> PlateCheckStep:
+        """An unsent stop; the log's ``note`` assigns its ``seq`` and ``at``."""
+        return cls(seq=0, kind=STEP_KIND_STOP, name=PLATE_CHECK_STOP_VERB, outcome=None, at=None)
+
+    def entry(self) -> printer_incidents.StepEntry:
+        """The ledger row this step is written as: its kind and name, no tray, no feeder."""
+        return printer_incidents.StepEntry(kind=self.kind, name=self.name)
+
+    def sent(self, seq: int, at: datetime) -> PlateCheckStep:
+        return replace(self, seq=seq, at=at)
+
+    def answered(self, outcome: str) -> PlateCheckStep:
+        """The read's answer. A token outside THIS kind's vocabulary RAISES."""
+        if outcome not in _PLATE_CHECK_ANSWERS[self.kind]:
+            raise LookupError(f"pause_recovery: plate-check {self.kind} step {self.seq} answered with {outcome!r}")
+        return replace(self, outcome=outcome)
+
+
+class _PlateCheckEvidence(printer_incidents.EvidenceLog[PlateCheckStep]):
+    """THE evidence log of one plate-check episode: every press and stop its driver sent, in
+    send order, with what the wire answered.
+
+    The store's :class:`~backend.app.services.printer_incidents.EvidenceLog` (noted at the send,
+    answered at the read, built only by ``from_row``, the ledger's one writer) bound to this
+    lane's vocabulary, :class:`PlateCheckStep`. Two readings hang off it: the rung a re-entered
+    driver owes (no ``dialog`` step → press; a ``dialog`` step → never press again), and
+    :meth:`farm_stopped`, the terminal's reading of who ended the job.
+    """
+
+    def farm_stopped(self) -> bool:
+        """Did the FARM's stop end this episode's job?
+
+        True for a ``stop`` step that is ``taken`` OR still unanswered: the job's terminal
+        usually lands while the driver is still watching the wire for its answer, and a stop
+        the farm sent that nobody has read yet is still the farm's stop. False when the only
+        stop steps were answered as NOT having ended the job (:data:`PlateCheckStopNotTaken`):
+        the driver then handed the paused print to a human, so whoever ends it later — a
+        human's Stop, most likely — ended it, not the farm. False with no stop step at all:
+        an operator who stops the print mid-episode writes none.
+        """
+        return any(step.kind == STEP_KIND_STOP and step.outcome not in _STOP_NOT_TAKEN for step in self.steps)
+
+    @classmethod
+    def _step_of(cls, row: PrinterIncidentStep) -> PlateCheckStep:
+        """Hydrate ONE ledger row. A token this lane's vocabulary cannot name RAISES — a
+        ledger that says something the driver cannot read is drift, never a skipped row."""
+        if not _is_plate_check_kind(row.kind):
+            raise LookupError(f"pause_recovery: incident {row.incident_id} step {row.seq} has kind {row.kind!r}")
+        if row.name not in _PLATE_CHECK_NAMES[row.kind]:
+            raise LookupError(
+                f"pause_recovery: incident {row.incident_id} step {row.seq} names no plate-check {row.kind}: "
+                f"{row.name!r}"
+            )
+        if row.outcome is not None and row.outcome not in _PLATE_CHECK_ANSWERS[row.kind]:
+            raise LookupError(f"pause_recovery: incident {row.incident_id} step {row.seq} answers {row.outcome!r}")
+        return PlateCheckStep(seq=row.seq, kind=row.kind, name=row.name, outcome=row.outcome, at=row.sent_at)
+
+
+async def plate_check_facts(
+    printer_id: int, open_incidents: Sequence[Mapping[str, object]], job_id: str | None
+) -> PlateCheckFacts | None:
+    """What the terminal of ``job_id`` owes to its plate-check episode — or ``None`` when that
+    job had none. Never raises.
+
+    ``open_incidents`` is the printer's open-hold projection ``main.on_print_complete`` took
+    ONCE, ahead of every closer (the episode's row is one of the holds this terminal closes).
+    The episode is the ``plate_vision`` row that paused THIS job (``job_identity.is_held_job``);
+    another job's row explains nothing about this terminal.
+
+    * ``farm_stopped`` — the farm's stop ended the job because its re-check failed
+      (:meth:`_PlateCheckEvidence.farm_stopped`: a ``stop`` step taken, or not yet answered).
+      A stop answered as not taken hands the print to a human, and an operator's own Stop
+      writes no step at all — both escalate.
+    * ``stops_in_window`` — how many of this printer's OTHER plate-check episodes, opened within
+      ``terminal_outcome.PLATE_RECHECK_WINDOW_S``, the farm already stopped (one store read,
+      ``printer_incidents.count_rows_with_step``, excluding this job's own rows).
+
+    Its own session, through ``run_with_retry``. Fails CLOSED: an unreadable ledger returns
+    facts that escalate (``farm_stopped=False``) and logs a WARNING — a retry nobody could
+    justify is the one outcome this read must never produce.
+    """
+    episode = next(
+        (
+            incident
+            for incident in open_incidents
+            if incident.get("kind") == KIND_PLATE_VISION and is_held_job(job_id, str(incident.get("job_id") or ""))
+        ),
+        None,
+    )
+    if episode is None:
+        return None
+    try:
+        from backend.app.core.database import run_with_retry
+
+        incident_id = episode.get("id")
+        if not isinstance(incident_id, int):
+            raise LookupError(f"the plate-check row's projection carries no id: {incident_id!r}")
+        since = datetime.utcnow() - timedelta(seconds=PLATE_RECHECK_WINDOW_S)
+
+        async def _read(db) -> PlateCheckFacts:
+            log = await _PlateCheckEvidence.from_row(db, incident_id)
+            stops = await printer_incidents.count_rows_with_step(
+                db,
+                printer_id=printer_id,
+                kind=KIND_PLATE_VISION,
+                step_kind=STEP_KIND_STOP,
+                since=since,
+                exclude_job_id=job_id,
+            )
+            return PlateCheckFacts(farm_stopped=log.farm_stopped(), stops_in_window=stops)
+
+        facts = await run_with_retry(_read, label="plate-check facts")
+    except Exception:  # noqa: BLE001 — the terminal must go on; an unread episode escalates
+        logger.warning(
+            "[pause-recovery] printer %s plate-check facts for job %s unreadable — the terminal escalates",
+            printer_id,
+            job_id or "-",
+            exc_info=True,
+        )
+        return PlateCheckFacts(farm_stopped=False, stops_in_window=0)
+    logger.info(
+        "[pause-recovery] printer %s plate-check episode %s at the terminal of job %s: farm_stopped=%s "
+        "stops_in_window=%s",
+        printer_id,
+        incident_id,
+        job_id or "-",
+        facts.farm_stopped,
+        facts.stops_in_window,
+    )
+    return facts
 
 
 # --- entry point 2: the plate-vision trip -------------------------------------------

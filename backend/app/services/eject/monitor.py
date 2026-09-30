@@ -728,12 +728,31 @@ def _plateau_reference(chamber_c: float | None, line_c: float | None) -> tuple[s
     return "floor (no chamber reading, no eject line)", None
 
 
+def escalation_first_page_s(*, refusal: PlateRefusal | None) -> int:
+    """How long a plate only a human may clear waits before its FIRST page — ONE origin,
+    beside :func:`escalation_sentence`, because the cause decides both.
+
+    * The printer REFUSED the plate → 0 s. The plate-check ladder already ran its course
+      (operator ruling 2026-09-29: the farm's re-check failed, its retry's re-check failed
+      too, or a human stopped the print mid-episode) and the bed is lifted off the release
+      aid: there is nothing left to wait for, and the ruling says page "right away".
+    * A deposit — a farm unit's part whose eject never ran, or a foreign print's part — keeps
+      :data:`_WATCH_ESCALATE_S`: the same patience the cooldown watch gets, because a human
+      often clears a finished part on their own well inside it.
+
+    The hourly nag after the first page is ``farm_stall.check_attention_reminders``', not
+    this watch's.
+    """
+    return 0 if refusal is not None else _WATCH_ESCALATE_S
+
+
 def escalation_sentence(*, farm_source: bool, refusal: PlateRefusal | None) -> str:
     """The escalation page's sentence for a plate only a human may clear — ONE origin.
 
     Three causes, most specific first: the printer REFUSED the plate (its plate check
     paused the job and the job was stopped — the printer's own words ride in); a farm
     unit's own part whose eject never ran; a part a print the farm did not dispatch left.
+    The same cause decides when the first page goes out (:func:`escalation_first_page_s`).
     """
     if refusal is not None:
         words = summary_of(refusal.messages)
@@ -751,7 +770,7 @@ def escalation_sentence(*, farm_source: bool, refusal: PlateRefusal | None) -> s
 async def watch_gate_escalation_only(
     printer_id: int,
     *,
-    escalate_s: int = _WATCH_ESCALATE_S,
+    escalate_s: int | None = None,
     check_interval_s: int = _CHECK_INTERVAL_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     notify: Callable[[int], Awaitable[None]] | None = None,
@@ -765,9 +784,11 @@ async def watch_gate_escalation_only(
 
     Unlike :func:`watch_bed_and_clear` this NEVER releases the gate: the plate is
     held by an unknown job and only a human clearing it (which NULLs the gate) may
-    resume dispatch. Same poll cadence and escalation constant as the cooldown
-    watch; fires ONE plate-not-empty notification at ``escalate_s`` then keeps
-    polling. Exits ``"cleared"`` when the gate is cleared externally (operator).
+    resume dispatch. Same poll cadence as the cooldown watch; fires ONE plate-not-empty
+    notification at ``escalate_s`` then keeps polling. ``escalate_s`` is the CAUSE's
+    first-page delay (:func:`escalation_first_page_s`: a refused plate pages on the first
+    tick, a deposit after the cooldown watch's own escalation constant) unless a caller
+    passes one. Exits ``"cleared"`` when the gate is cleared externally (operator).
 
     ``farm_source`` selects the default page's SENTENCE, and nothing else: a plate the
     farm itself deposited must not be paged as "a print the farm did not dispatch"
@@ -799,6 +820,8 @@ async def watch_gate_escalation_only(
     event for a held printer, so the page would be logged, suppressed, and never sent
     again after the hold lifted. Holding the page keeps it for the moment it can be read.
     """
+    if escalate_s is None:
+        escalate_s = escalation_first_page_s(refusal=refusal)
     if notify is None:
         # Escalation source, distinct from cooldown_timeout: the plate is held and no
         # sweep is coming. WHY it is held decides the sentence.
@@ -818,9 +841,10 @@ async def watch_gate_escalation_only(
         if not escalated and elapsed >= escalate_s and not (held() if held is not None else False):
             escalated = True
             logger.warning(
-                "Eject monitor: printer %s foreign deposit still gated after %ss — escalating "
+                "Eject monitor: printer %s %s still gated after %ss — escalating "
                 "(plate-not-empty), gate stays set until an operator clears it",
                 printer_id,
+                "refused plate" if refusal is not None else "deposit",
                 escalate_s,
             )
             try:

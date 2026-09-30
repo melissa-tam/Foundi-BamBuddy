@@ -1938,6 +1938,78 @@ class TestWatchGateEscalationOnly:
         ]
 
 
+class TestEscalationFirstPage:
+    """The CAUSE decides when the first page goes out, beside the sentence it decides
+    (``escalation_first_page_s`` next to ``escalation_sentence``): a plate the printer's plate
+    check REFUSED pages at once — the ladder already ran its course (operator ruling
+    2026-09-29: escalate, "a page right away") — while a deposit keeps the cooldown watch's
+    own 5400 s of patience."""
+
+    @staticmethod
+    async def _first_page_after(printer_id: int, **kwargs) -> float:
+        """Run the watch on a virtual clock and return the watch time its ONE page fired at."""
+        _gate_up(printer_id)
+        slept: list[float] = []
+        paged_at: list[float] = []
+
+        async def _sleep(seconds):
+            slept.append(seconds)
+            if paged_at:
+                plate_occupancy.clear_plate(printer_id)
+
+        async def _notify(pid):
+            paged_at.append(sum(slept))
+
+        outcome = await watch_gate_escalation_only(printer_id, sleep=_sleep, notify=_notify, **kwargs)
+
+        assert outcome == "cleared"
+        assert len(paged_at) == 1
+        return paged_at[0]
+
+    async def test_a_refused_plate_pages_at_once(self):
+        from backend.app.services.plate_occupancy import PlateRefusal
+
+        assert await self._first_page_after(3, refusal=PlateRefusal(messages=())) == 0
+
+    @pytest.mark.parametrize("farm_source", [False, True], ids=["foreign", "farm"])
+    async def test_a_deposit_pages_after_the_cooldown_watchs_escalation(self, farm_source):
+        assert await self._first_page_after(3, farm_source=farm_source) == 5400
+
+    def test_the_timing_has_one_origin(self):
+        from backend.app.services.plate_occupancy import PlateRefusal
+
+        assert monitor_mod.escalation_first_page_s(refusal=PlateRefusal(messages=())) == 0
+        assert monitor_mod.escalation_first_page_s(refusal=None) == monitor_mod._WATCH_ESCALATE_S == 5400
+
+    async def test_the_driver_armed_refusal_pages_in_the_printers_words_at_once(self, monkeypatch):
+        """End to end through the authority: a refused plate's gate arms the monitor's own
+        escalation watch, whose FIRST tick pages — no delay bolted onto the arm."""
+        from backend.app.services.hms_errors import PrinterMessage
+        from backend.app.services.plate_occupancy import PlateRefusal
+
+        pages: list[tuple[int, str]] = []
+
+        async def _page(printer_id, *, source_detail=""):
+            pages.append((printer_id, source_detail))
+
+        monkeypatch.setattr(monitor_mod, "notify_plate_not_empty", _page)
+        mon = EjectCooldownMonitor()
+        _wire(mon)
+        refusal = PlateRefusal(messages=(PrinterMessage(short_code="0500_808C", description="Offset."),))
+
+        _occupy(9, EscalationOnly(refusal=refusal), source=None)
+        for _ in range(10):
+            if pages:
+                break
+            await asyncio.sleep(0)
+        task = mon.stand_down(9, "test over")
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert pages == [(9, monitor_mod.escalation_sentence(farm_source=False, refusal=refusal))]
+
+
 class TestNotifyPlateNotEmpty:
     """``notify_plate_not_empty`` is PUBLIC since the cut-over: three lanes outside
     this module page through it (the escalation hold, the runtime watchdog's stop,

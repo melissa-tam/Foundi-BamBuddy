@@ -12,7 +12,12 @@ import pytest
 
 from backend.app.services.hms_errors import PrinterMessage
 from backend.app.services.plate_occupancy import DepositEvidence, PlateRefusal
-from backend.app.services.terminal_outcome import build_terminal_outcome, open_holds_at_terminal
+from backend.app.services.terminal_outcome import (
+    PLATE_RECHECK_WINDOW_S,
+    PlateCheckFacts,
+    build_terminal_outcome,
+    open_holds_at_terminal,
+)
 
 _JOB = "JOB-1"
 _VISION_WORDS = {"short_code": "0500_808C", "description": "Detected build plate offset."}
@@ -251,3 +256,81 @@ class TestChargeBasis:
 
         outcome = unobserved_outcome(SimpleNamespace(subtask_id="J1"), SimpleNamespace(first_article=False))
         assert outcome.charge == "none"
+
+
+def _refused(plate_check, *, farm_unit, deposited):
+    """A ``plate_refused`` terminal of THIS job, whose plate-check hold recorded the printer's words."""
+    hold = {"kind": "plate_vision", "job_id": _JOB, "printer_messages": [_VISION_WORDS]}
+    return build_terminal_outcome(
+        raw_status="failed",
+        verdict="plate_refused",
+        open_incidents=[hold],
+        job_id=_JOB,
+        evidence=_evidence(deposited=deposited),
+        first_article=False,
+        is_eject=False,
+        hms_errors=[],
+        plate_check=plate_check,
+        farm_unit=farm_unit,
+    )
+
+
+class TestPlateCheckRetryOrEscalate:
+    """The ladder's terminal verdict (operator ruling 2026-09-29): a re-check that failed is
+    STOPPED by the farm and the same print RETRIED; the retry's own failed re-check — a second
+    farm stop on the printer within the hour — ESCALATES, and so does everything the farm did
+    not stop itself. Retry = ``plate_refusal`` None (no gate, no page); escalate = the refusal
+    carrying the printer's words. The verdict and the recorded word never change."""
+
+    @pytest.mark.parametrize("deposited", [False, True], ids=["empty", "deposited"])
+    @pytest.mark.parametrize("stops_in_window", [0, 1], ids=["first", "second"])
+    @pytest.mark.parametrize("farm_unit", [True, False], ids=["farm_unit", "not_farm"])
+    @pytest.mark.parametrize("farm_stopped", [True, False], ids=["farm_stop", "no_farm_stop"])
+    def test_the_truth_table(self, farm_stopped, farm_unit, stops_in_window, deposited):
+        facts = PlateCheckFacts(farm_stopped=farm_stopped, stops_in_window=stops_in_window)
+
+        outcome = _refused(facts, farm_unit=farm_unit, deposited=deposited)
+
+        retries = farm_stopped and farm_unit and stops_in_window == 0 and not deposited
+        assert (outcome.plate_refusal is None) is retries
+        if not retries:
+            assert outcome.plate_refusal.messages[0].short_code == "0500_808C"
+        # The verdict and the unit's word are the same either way: cancelled, requeued.
+        assert outcome.verdict == "plate_refused"
+        assert outcome.recorded_status == "cancelled"
+        assert outcome.failure_category == "Plate not empty (printer vision)"
+
+    @pytest.mark.parametrize("farm_unit", [True, False])
+    def test_a_job_with_no_plate_check_episode_escalates(self, farm_unit):
+        assert _refused(None, farm_unit=farm_unit, deposited=False).plate_refusal is not None
+
+    def test_the_defaults_escalate(self):
+        """A caller with no plate-check facts (the reconcile's unobserved job phase) can never retry."""
+        outcome = _build("failed", "plate_refused", holds=[{"kind": "plate_vision", "job_id": _JOB}], deposited=False)
+        assert outcome.plate_refusal is not None
+
+    def test_an_operators_stop_mid_episode_escalates(self):
+        """The operator pressed Stop while the farm was still re-checking: the episode's log
+        holds the farm's press but no farm ``stop`` step, so the human owns the plate."""
+        facts = PlateCheckFacts(farm_stopped=False, stops_in_window=0)
+        assert _refused(facts, farm_unit=True, deposited=False).plate_refusal is not None
+
+    def test_the_facts_decide_nothing_without_the_verdict(self):
+        facts = PlateCheckFacts(farm_stopped=True, stops_in_window=0)
+        outcome = build_terminal_outcome(
+            raw_status="failed",
+            verdict="operator_ui",
+            open_incidents=(),
+            job_id=_JOB,
+            evidence=_evidence(deposited=False),
+            first_article=False,
+            is_eject=False,
+            hms_errors=[],
+            plate_check=facts,
+            farm_unit=True,
+        )
+        assert outcome.plate_refusal is None
+        assert outcome.verdict == "operator_ui"
+
+    def test_the_window_is_the_2026_09_04_derivation(self):
+        assert PLATE_RECHECK_WINDOW_S == 3600.0

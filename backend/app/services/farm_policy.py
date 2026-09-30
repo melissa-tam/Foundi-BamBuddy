@@ -26,6 +26,7 @@ hand-rolled MQTT.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -46,6 +47,7 @@ from backend.app.services import farm_correlation, pause_recovery, requeue
 from backend.app.services.cycle_episodes import record_episode
 from backend.app.services.dispatch_target import DispatchTarget
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
+from backend.app.services.eject.generator import Z_REFERENCE_FEED_MM_MIN
 from backend.app.services.hms_errors import format_hms_error_summary
 from backend.app.services.notification_service import notification_service
 from backend.app.services.plate_occupancy import FirstArticleEject, plate_occupancy
@@ -69,7 +71,9 @@ _TERMINAL_RUN_OUTCOMES = ("completed", "failed")
 # a bed already sitting on the stop truncates it to ~0 and a bed above the stop simply
 # moves AWAY from the nozzle — either way it cannot touch a part. 32 mm is the vendor's
 # figure, kept rather than re-derived: its only job is to reach the stop from wherever
-# the firmware parked the bed after the pause.
+# the firmware parked the bed after the pause. The FEED of both moves is the same stock
+# block's F1200, whose one origin is ``eject.generator.Z_REFERENCE_FEED_MM_MIN`` (the
+# guarded drive's vendor feed): the lift's G-code and its motion wait read that constant.
 VISION_HOLD_PROBE_MM = 32.0
 
 
@@ -508,11 +512,13 @@ async def on_terminal(
                 return
 
         # 2. A REFUSED plate: the printer's own plate check paused this job and it ended
-        #    without printing. The plate authority already holds the plate for a human
-        #    (the terminal's one plate call), so what is owed here is the one motion — the
-        #    bed lifted off the plate-release aid, where the firmware parked it for the
-        #    whole pause — farm unit or foreign print alike; a farm unit is then requeued
-        #    below.
+        #    without printing — handed to a human (the plate authority already holds the
+        #    plate, the terminal's one plate call) or retried by the farm (no gate). Either
+        #    way what is owed here is the one motion — the bed lifted off the plate-release
+        #    aid, where the firmware parked it for the whole pause — farm unit or foreign
+        #    print alike; a farm unit is then requeued below. The lift returns only after
+        #    its own motion time, and step 3's requeue runs after it, so the requeued unit
+        #    cannot be released to the printer while its bed is still moving.
         if (
             printer_id is not None
             and outcome is not None
@@ -912,6 +918,15 @@ async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
     ``PARK_Z_MM``, a start block pushes ~50 mm down, a pause parks at the bottom), and
     a move that assumes otherwise is the 002-H2S bed-into-the-floor shape.
 
+    **It returns only after the lift's own motion time** once the printer accepted it:
+    both guarded moves at their full commanded distance over the one feed,
+    ``(VISION_HOLD_PROBE_MM + hold_lift_mm) / (Z_REFERENCE_FEED_MM_MIN / 60)`` seconds —
+    counted in full, as the eject runtime model counts a ``G380`` (a guarded move that
+    stops early only finishes sooner). :func:`on_terminal` runs this as its step 2, BEFORE
+    step 3's requeue, so the requeue can no longer race the lift: a retried plate is put
+    back in line only once the bed has stopped moving. No wait when the lift was skipped
+    or refused — nothing is moving.
+
     Skipped on a bedslinger (the gantry carries Z — there is no bed travel to lift) and
     on a model with no geometry row or no ``z_travel_mm`` (no proven Z axis to move).
     Cosmetic-lane discipline like the idle deep-park: every failure is a log line and
@@ -936,13 +951,21 @@ async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
             logger.warning("farm_policy: held-bed lift skipped on printer %s — no MQTT client", printer_id)
             return
         lift = geometry.hold_lift_mm
+        feed = Z_REFERENCE_FEED_MM_MIN
         ok = client.send_gcode(
-            f"M17\nG91\nG380 S2 Z{VISION_HOLD_PROBE_MM:.1f} F1200\nG380 S2 Z-{lift:.1f} F1200\nG90\nM400\nM18"
+            f"M17\nG91\nG380 S2 Z{VISION_HOLD_PROBE_MM:.1f} F{feed}\nG380 S2 Z-{lift:.1f} F{feed}\nG90\nM400\nM18"
         )
-        if ok:
-            logger.info("farm_policy: held-bed lift sent on printer %s (%.1f mm off the bottom stop)", printer_id, lift)
-        else:
+        if not ok:
             logger.warning("farm_policy: held-bed lift command refused on printer %s", printer_id)
+            return
+        motion_s = (VISION_HOLD_PROBE_MM + lift) / (feed / 60.0)
+        logger.info(
+            "farm_policy: held-bed lift sent on printer %s (%.1f mm off the bottom stop) — waiting %.1fs for its motion",
+            printer_id,
+            lift,
+            motion_s,
+        )
+        await asyncio.sleep(motion_s)
     except Exception:  # noqa: BLE001 — cosmetic lane: never raises into the terminal chain
         logger.warning("farm_policy: held-bed lift failed on printer %s", printer_id, exc_info=True)
 
