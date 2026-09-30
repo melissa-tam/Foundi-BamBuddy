@@ -196,9 +196,11 @@ from backend.app.services.hms_errors import (
     current_runout_demand,
     fault_tokens,
     fingerprint_tokens,
-    full_codes_of,
     live_candidates,
+    live_notices,
     power_loss_prompt_standing,
+    short_code_ambiguous,
+    slot_runout_full_codes,
 )
 from backend.app.services.incident_resolution import (
     _JOB_OVER_STATES,
@@ -1433,7 +1435,7 @@ async def _fault_already_closed(db: AsyncSession, printer_id: int, job_id: str, 
     """Did we already finish with THIS fault, and is it still the same standing one?
 
     ONE predicate, two clauses that must both hold — used by the entry gate and by
-    :func:`will_own` so a suppressed alert and a refused entry can never disagree:
+    :func:`owned_full_codes` so a suppressed alert and a refused entry can never disagree:
 
     * the durable half: a CLOSED incident for this ``(printer, job, fingerprint)``
       whose status is ABORTED. An aborted close means an external actor took over or
@@ -1529,9 +1531,15 @@ def _dominant_class(candidates) -> AmsFaultClass | None:
 
 
 def _primary_candidate(candidates, fault_class: AmsFaultClass) -> FaultCandidate | None:
-    """The representative candidate of the deciding class — lowest short code wins,
-    so the code the operator is told is stable across pushes."""
-    members = sorted((c for c in candidates if c.fault_class is fault_class), key=lambda c: c.short_code)
+    """The representative candidate of the deciding class: an AMS fault before a holder
+    fault, then an UNAMBIGUOUS short code (``hms_errors.short_code_ambiguous``), then the
+    lowest — so the code the operator is told is stable across pushes and names ONE fault.
+    011-H2S 2026-09-29: the slot overload renders ``0700_0001``, which is also that slot's
+    runout demand, so beside ``0700_8010`` the 8010 names the incident."""
+    members = sorted(
+        (c for c in candidates if c.fault_class is fault_class),
+        key=lambda c: (c.external, short_code_ambiguous(c.short_code), c.short_code),
+    )
     return members[0] if members else None
 
 
@@ -2380,7 +2388,7 @@ def _new_fault_verdict(row: PrinterIncident, state, printer_id: int) -> incident
 
     The rule table's ``new_fault`` occasion, asked with the entry's own live state and
     the ONE liveness store. One spelling for the entry gate (:func:`on_ams_fault`) and
-    its mirror (:func:`will_own`), so a suppressed raw alert and an opened incident can
+    its mirror (:func:`owned_full_codes`), so a suppressed raw alert and an opened incident can
     never disagree about whether the open row still owns the printer.
     """
     return incident_resolution.resolve(
@@ -2467,15 +2475,17 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         # The HARDWARE the deciding fault sits on, taken from the taxonomy's verdict
         # for the very candidate whose code the operator is told about — so the copy,
         # the routing and the message can never name different hardware. When AMS and
-        # external faults stand together, ``_primary_candidate``'s lowest-short-code
-        # order picks the AMS one (``0700_…`` < ``07FF_…``), which is correct: a real
-        # AMS fault beside a holder fault is still an AMS fault to recover.
+        # external faults stand together, ``_primary_candidate`` picks the AMS one,
+        # which is correct: a real AMS fault beside a holder fault is still an AMS fault
+        # to recover.
         external = primary.external if primary is not None else False
         code = primary.short_code if primary is not None else ""
         # The printer's own words for the faults this incident will speak for, recorded
         # now: a release lever, a stop or the next job clears them off the printer while
-        # the hold they explain still stands.
-        full_codes = full_codes_of(getattr(state, "hms_errors", None) or [], {c.short_code for c in candidates})
+        # the hold they explain still stands. The candidates' OWN full codes, never a
+        # short-code round trip: ``0700_0001`` would sweep a runout demand standing
+        # beside an owned overload into the incident's words.
+        full_codes = sorted({c.full_code for c in candidates} - {""})
 
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer
@@ -2521,7 +2531,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 # new AMS incident is opened while that question stands: the human's
                 # resume ends the job pause, and a fault still standing then is owned on
                 # the very next push (and its raw alert reaches them meanwhile —
-                # ``will_own`` mirrors this gate). An AMS row ALREADY open keeps its
+                # ``owned_full_codes`` mirrors this gate). An AMS row ALREADY open keeps its
                 # owner; the upgrade below only re-classifies it and resumes nothing.
                 _note_outcome(
                     printer_id,
@@ -2559,7 +2569,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 # MAINTENANCE MODE: hands are in this machine, so the farm records the
                 # fault and touches nothing. The row still OPENS — that is what makes
                 # ``hold_blocks_dispatch`` refuse work after the hold lifts, until the
-                # fault resolves by its own wire/repair rule — and ``will_own`` still
+                # fault resolves by its own wire/repair rule — and ``owned_full_codes`` still
                 # suppresses the duplicate raw HMS page, because this incident is the
                 # record of that fault. What a hold removes is the ACT: no ``_run_recovery``
                 # driver, no swap, no auto-resume. Read HERE, right after the routing
@@ -2657,62 +2667,87 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         return None
 
 
-async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
-    """Would an incident own the AMS faults standing on this printer right now?
+async def owned_full_codes(db: AsyncSession, printer_id: int, state) -> frozenset[str]:
+    """The FULL codes an AMS incident speaks for on this printer right now.
 
     (1) It exists so the HMS notify pipeline (main.py) can SUPPRESS the raw per-code
-        alert for a fault an incident carries — the incident's lifecycle
-        notifications (recovering / succeeded / self-healed / out-of-rotation /
-        failed / auto-resumed) are the operator-facing signal, and a duplicate raw
-        alert would double-notify (one 2026-07-20 feed fault produced 4 Discord
-        messages).
-    (2) It MIRRORS :func:`on_ams_fault`'s durable entry gates — including the ones
-        that mean "an incident ALREADY owns this", where suppression stays correct
-        because the raw alert is the duplicate.
-    (3) Foreign prints included: an incident owns EVERY class of their AMS faults —
-        runouts and physical faults since 2026-08-09, mechanical ones since the 2026-08-10
-        origin-agnostic ruling — so their raw alerts are duplicates in exactly the
-        same way.
-
-    Fails toward NOTIFYING: any exception returns False (never suppress a raw alert
-    on the strength of a predicate that errored).
+        alert for a code an incident carries — ``error.full_code in owned`` and nothing
+        else. The incident's lifecycle notifications (recovering / succeeded /
+        self-healed / out-of-rotation / failed / auto-resumed) are the operator-facing
+        signal, and a duplicate raw alert double-notifies (one 2026-07-20 feed fault
+        produced 4 Discord messages; 011-H2S 2026-09-29, incident 419, paged twice
+        while the driver owned its jam).
+    (2) FULL codes, never short codes. The short form is many-to-one: ``0700_0001`` is
+        the slot-3 overload ``0700_6200_0002_0001`` AND the slot-3 runout demand
+        ``0700_2200_0002_0001`` (and, on H2C, "a new AMS detected"), so a short-code set
+        owning the overload would silence a runout demand on the same printer. Both wire
+        lanes carry a full code (16 hex ``hms[]``, 8 hex ``print_error``); an entry with
+        none is never owned.
+    (3) Three arms, one authority each:
+        * the ACTIONABLE candidates — when an incident owns them, which MIRRORS
+          :func:`on_ams_fault`'s durable entry gates: a standing AMS row (the raw alert
+          is the duplicate), or the gates a new row opens past (no job paused for a
+          human, no aborted close of this exact fault). Foreign prints
+          included — an incident owns every class of their AMS faults (runouts and
+          physical faults since 2026-08-09, mechanical since the 2026-08-10
+          origin-agnostic ruling);
+        * the slot-attributed RUNOUT words (``hms_errors.slot_runout_full_codes``) —
+          only when the incident speaks for a runout: a RUNOUT candidate among the
+          owned, or a standing runout row. A jam's messages never speak for a "fill
+          slot N" demand, so beside a jam that demand still pages;
+        * INFORMATIONAL notices (``hms_errors.live_notices``) on the AMS unit the
+          STANDING row names (``slot_global_tray``). The authority is the open row, not
+          same-push candidates: the operator's Retry is exactly the push on which the
+          actionable code clears and the feed-resistance notice appears (011-H2S
+          17:59:18). A row that names no slot names no unit, and its notices page.
+    (4) Fails toward NOTIFYING (invariant 10): recovery disabled, or any exception,
+        returns the empty set — never suppress on the strength of a predicate that
+        errored. A push with neither a candidate nor a notice costs no DB read.
     """
     try:
         candidates = live_candidates(state)
-        if not candidates:
-            return False
+        notices = live_notices(state)
+        if not candidates and not notices:
+            return frozenset()
         if not await _read_bool(db, "spool_recovery_enabled", _DEFAULT_ENABLED):
-            return False
+            return frozenset()
         # The AMS-kind row: a pause-cause hold is not an AMS fault's owner, and a
         # plate-vision row standing beside a jam must not silence the jam's raw alert.
-        # A row that STANDS on this fault owns the printer (or is upgraded by it), so the
-        # raw alert is the duplicate; a row the fault ENDS is closed by the entry, which
-        # then runs the gates below — so this falls through to them too.
-        existing = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
-        if existing is not None and not _new_fault_verdict(existing, state, printer_id).close:
-            return True
-        # Mirrors the entry gate: while the printer's job is paused for a human (its own
-        # plate check), no NEW AMS incident is opened, so nothing speaks for this fault
-        # and its raw alert is the only word the operator gets about it.
-        if printer_incidents.job_pause_held(printer_id):
-            return False
-        job_id = (getattr(state, "subtask_id", None) or "").strip()
-        # A barred fault will never be owned again — let the raw alert through
-        # rather than suppressing into silence.
-        return not await _fault_already_closed(db, printer_id, job_id, candidate_fingerprint(candidates))
+        # A row the live fault ENDS is closed by the entry and speaks for nothing; the
+        # entry then runs its remaining gates, so the candidates fall through to them.
+        row = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
+        if row is not None and _new_fault_verdict(row, state, printer_id).close:
+            row = None
+        owned: set[str] = set()
+        if candidates and (row is not None or await _entry_would_open(db, printer_id, state, candidates)):
+            owned.update(c.full_code for c in candidates)
+            if (row is not None and row.kind == KIND_RUNOUT) or any(
+                c.fault_class is AmsFaultClass.RUNOUT for c in candidates
+            ):
+                owned.update(slot_runout_full_codes(getattr(state, "hms_errors", None) or []))
+        if row is not None:
+            row_unit, _tray = decode_global_tray(row.slot_global_tray)
+            if row_unit is not None:
+                owned.update(n.full_code for n in notices if n.ams_unit == row_unit)
+        owned.discard("")
+        return frozenset(owned)
     except Exception:  # noqa: BLE001 — a suppression predicate must never crash the notify path
-        logger.exception("spool_recovery: will_own predicate failed for printer %s", printer_id)
-        return False
+        logger.exception("spool_recovery: owned-codes predicate failed for printer %s", printer_id)
+        return frozenset()
 
 
-def owned_short_codes(state) -> frozenset[str]:
-    """The short codes an incident speaks for — what the notify lane suppresses.
+async def _entry_would_open(db: AsyncSession, printer_id: int, state, candidates: frozenset[FaultCandidate]) -> bool:
+    """With no standing AMS row, would :func:`on_ams_fault` open one for ``candidates``?
 
-    Exact rather than "everything recoverable": only the codes THIS push classified
-    as actionable are covered by an incident's messages, so an unrelated fault
-    standing beside them still raises its own alert.
+    Its remaining durable gates, mirrored: while the printer's job is paused for a human
+    (its own plate check) no NEW AMS incident opens, so nothing speaks for the fault and
+    its raw alert is the only word the operator gets; and a fault an ABORTED close barred
+    will never be owned again — its raw alert goes through rather than into silence.
     """
-    return frozenset(c.short_code for c in live_candidates(state))
+    if printer_incidents.job_pause_held(printer_id):
+        return False
+    job_id = (getattr(state, "subtask_id", None) or "").strip()
+    return not await _fault_already_closed(db, printer_id, job_id, candidate_fingerprint(candidates))
 
 
 # --- driver -----------------------------------------------------------------

@@ -114,9 +114,14 @@ def install_settings(monkeypatch):
 # --- scripted printer ------------------------------------------------------
 
 
+# The feed fault's lossless identity, as the parser builds it (``f"{attr:08X}{code:08X}"``)
+# — what ``owned_full_codes`` answers and the notify lane compares.
+_FEED_FAULT_FULL_CODE = "0700000000008010"
+
+
 def _feed_fault_hms():
     # attr>>16 == 0x0700, code == 0x8010 -> short code "0700_8010" (feed fault).
-    return HMSError(code="8010", attr=0x07000000, module=7, severity=2)
+    return HMSError(code="8010", attr=0x07000000, module=7, severity=2, full_code=_FEED_FAULT_FULL_CODE)
 
 
 def _runout_hms():
@@ -3270,22 +3275,22 @@ async def test_ams_drying_escalation_keeps_commit_stamp(
 
 
 # ===========================================================================
-# will_own: the public predicate the HMS notify pipeline uses to SUPPRESS a raw
-# per-code alert for a fault recovery will OWN (its lifecycle notifications carry the
-# incident). Mirrors only the on_feed_fault_hms entry gates whose failure means
-# "nobody will notify".
+# owned_full_codes: the owner the HMS notify pipeline asks which FULL codes to
+# SUPPRESS — the raw per-code alerts for faults recovery OWNS (its lifecycle
+# notifications carry the incident). Mirrors only the on_ams_fault entry gates whose
+# failure means "nobody will notify".
 # ===========================================================================
 
 
-async def test_will_own_true_when_enabled_and_farm_item_printing(db_session, printer_factory):
+async def test_owned_codes_true_when_enabled_and_farm_item_printing(db_session, printer_factory):
     printer = await printer_factory()
     await _farm_item(db_session, printer.id, subtask="task-1")
     state = _make_state(subtask="task-1")
 
-    assert await spool_recovery.will_own(db_session, printer.id, state) is True
+    assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == {_FEED_FAULT_FULL_CODE}
 
 
-async def test_will_own_false_when_setting_disabled(db_session, printer_factory, monkeypatch):
+async def test_owned_codes_false_when_setting_disabled(db_session, printer_factory, monkeypatch):
     printer = await printer_factory()
     await _farm_item(db_session, printer.id, subtask="task-1")
     state = _make_state(subtask="task-1")
@@ -3295,10 +3300,10 @@ async def test_will_own_false_when_setting_disabled(db_session, printer_factory,
 
     monkeypatch.setattr(spool_recovery, "_read_bool", _disabled)
 
-    assert await spool_recovery.will_own(db_session, printer.id, state) is False
+    assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == frozenset()
 
 
-async def test_will_own_false_when_the_fault_was_already_closed_as_aborted(db_session, printer_factory):
+async def test_owned_codes_false_when_the_fault_was_already_closed_as_aborted(db_session, printer_factory):
     """A fault an ABORTED close barred will never be owned again — so the raw alert
     must be let through rather than suppressed into silence."""
     printer = await printer_factory()
@@ -3313,10 +3318,10 @@ async def test_will_own_false_when_the_fault_was_already_closed_as_aborted(db_se
     await printer_incidents.close(db_session, incident.id, status="aborted", source="operator")
     spool_recovery._blocked[(printer.id, "task-1")] = {fingerprint}
 
-    assert await spool_recovery.will_own(db_session, printer.id, state) is False
+    assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == frozenset()
 
 
-async def test_will_own_true_for_a_foreign_print(db_session, printer_factory):
+async def test_owned_codes_true_for_a_foreign_print(db_session, printer_factory):
     """An incident owns a foreign print's AMS fault too, so its raw per-code
     alert is the duplicate and must still be suppressed.
 
@@ -3327,10 +3332,10 @@ async def test_will_own_true_for_a_foreign_print(db_session, printer_factory):
     # No farm item dispatched for this subtask → a foreign / non-farm job.
     state = _make_state(subtask="foreign-task")
 
-    assert await spool_recovery.will_own(db_session, printer.id, state) is True
+    assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == {_FEED_FAULT_FULL_CODE}
 
 
-async def test_will_own_false_when_db_read_raises(db_session, printer_factory, monkeypatch):
+async def test_owned_codes_false_when_db_read_raises(db_session, printer_factory, monkeypatch):
     """Fail toward notifying: any exception in the predicate returns False so a raw
     alert is never suppressed on the strength of a read that errored."""
     printer = await printer_factory()
@@ -3341,7 +3346,7 @@ async def test_will_own_false_when_db_read_raises(db_session, printer_factory, m
 
     monkeypatch.setattr(spool_recovery.printer_incidents, "get_open", _boom)
 
-    assert await spool_recovery.will_own(db_session, printer.id, state) is False
+    assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == frozenset()
 
 
 # ===========================================================================
@@ -7643,7 +7648,7 @@ class TestPhysicalHoldsOutliveTheJob:
             for r in caplog.records
         )
         # The mirror agrees: the standing row speaks for the printer.
-        assert await spool_recovery.will_own(db_session, printer.id, state) is True
+        assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == {_FEED_FAULT_FULL_CODE}
 
     async def test_a_drivers_own_resume_is_not_the_path_running(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
@@ -7666,10 +7671,10 @@ class TestPhysicalHoldsOutliveTheJob:
         rows = await _incident_rows(db_session, printer.id)
         assert [(r.id, r.resolved_at) for r in rows] == [(physical.id, None)]
 
-    async def test_will_own_mirrors_the_close_then_the_job_pause_gate(
+    async def test_owned_codes_mirrors_the_close_then_the_job_pause_gate(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
     ):
-        """``will_own`` must read the same verdict the entry acts on. Here the new fault ENDS
+        """``owned_full_codes`` must read the same verdict the entry acts on. Here the new fault ENDS
         the physical row, and the entry's next gate — the printer's plate check holding its
         job for a human — then opens nothing: no incident speaks for the jam, so its raw
         alert must reach the operator. An AMS row being open is no longer enough to say an
@@ -7697,7 +7702,7 @@ class TestPhysicalHoldsOutliveTheJob:
         )
         state.hms_errors = [_feed_fault_hms()]
 
-        assert await spool_recovery.will_own(db_session, printer.id, state) is False
+        assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == frozenset()
 
         assert await self._jam_arrives(printer, state, caplog) is None
         rows = {row.kind: row for row in await _incident_rows(db_session, printer.id)}
@@ -7859,7 +7864,9 @@ class TestPhysicalHoldsOutliveTheJob:
         physical = next(r for r in rows if r.kind == "physical")
         assert physical.resolved_at is None, "the hold suppresses the ACT; the fault record stands"
 
-    async def test_will_own_ignores_a_pause_cause_row(self, db_session, printer_factory, install_settings, monkeypatch):
+    async def test_owned_codes_ignores_a_pause_cause_row(
+        self, db_session, printer_factory, install_settings, monkeypatch
+    ):
         """A lost-Z hold beside a jam is not the jam's owner — the jam still will be."""
         from backend.app.models.printer_incident import KIND_Z_REFERENCE_LOST, STATUS_ESCALATED
 
@@ -7883,14 +7890,14 @@ class TestPhysicalHoldsOutliveTheJob:
 
         # Nothing AMS-side owns the printer, so the predicate falls through to the
         # aborted-close bar — which is empty — and answers True (it WILL own it).
-        assert await spool_recovery.will_own(db_session, printer.id, state) is True
+        assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == {_FEED_FAULT_FULL_CODE}
 
-    async def test_will_own_mirrors_the_job_pause_gate(
+    async def test_owned_codes_mirrors_the_job_pause_gate(
         self, db_session, printer_factory, install_settings, monkeypatch
     ):
         """While the printer's job is PAUSED at its plate check, no new AMS incident is
         opened (``on_ams_fault``'s entry gate) — so nothing speaks for the fault and its
-        raw alert must reach the operator: ``will_own`` answers False."""
+        raw alert must reach the operator: ``owned_full_codes`` answers nothing."""
         from backend.app.models.printer_incident import STATUS_ESCALATED
 
         install_settings()
@@ -7911,7 +7918,7 @@ class TestPhysicalHoldsOutliveTheJob:
         )
         state = _make_state(hms=[_feed_fault_hms()])
 
-        assert await spool_recovery.will_own(db_session, printer.id, state) is False
+        assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == frozenset()
 
 
 class TestAJobPauseStandsTheAmsEntryAside:
@@ -7999,7 +8006,7 @@ class TestMaintenanceModeRecordsAndStandsDown:
 
     The hold removes the ACT, never the RECORD: the row still opens — that is what makes
     ``hold_blocks_dispatch`` refuse work after the hold lifts, until the fault resolves by
-    its own wire/repair rule — and ``will_own`` still answers True, so the duplicate raw
+    its own wire/repair rule — and ``owned_full_codes`` still answers its codes, so the duplicate raw
     HMS page stays suppressed. What must not happen is a swap, an unload, a resume or a
     driver at all, on a machine somebody has their hands in.
 
@@ -8105,7 +8112,7 @@ class TestMaintenanceModeRecordsAndStandsDown:
         assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_RUNOUT
 
     async def test_the_raw_hms_page_stays_suppressed(self, db_session, printer_factory, install_settings, monkeypatch):
-        """``will_own`` is unchanged by the hold. It answers "does an incident own these
+        """``owned_full_codes`` is unchanged by the hold. It answers "does an incident own these
         codes", and one does — the row this lane just opened."""
         install_settings()
         printer = await printer_factory()
@@ -8113,7 +8120,7 @@ class TestMaintenanceModeRecordsAndStandsDown:
         await self._hold(db_session, printer.id)
         state = _make_state()
 
-        assert await spool_recovery.will_own(db_session, printer.id, state) is True
+        assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == {_FEED_FAULT_FULL_CODE}
 
     async def test_the_startup_reentry_hands_back_no_driver(
         self, db_session, printer_factory, install_settings, monkeypatch

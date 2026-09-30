@@ -1212,28 +1212,54 @@ def is_notify_suppressed(attr: int, code: int | str) -> bool:
         return False
 
 
-def ams_slot_from_attr(attr: int) -> tuple[int, int] | None:
-    """Decode the AMS unit + slot a slot-attributed HMS ``attr`` names, or ``None``.
+# Slots per AMS unit: every per-slot attr family spans this many consecutive submodule
+# bytes from its base (``base + tray``, tray 0..3).
+_SLOTS_PER_AMS_UNIT = 4
+# The submodule byte of tray 0 in the per-slot TRAY family (``0x20``..``0x23``) — the
+# layout the runout, spent-evidence and read-failure words speak in.
+_TRAY_SLOT_BASE = 0x20
 
-    Pure layout decode, shared by every slot-attributed AMS fault family: the high
-    byte is the module class (``0x07`` = AMS), the next byte is the AMS unit id, and
-    the third byte encodes the slot as ``0x20 + tray`` (``0x20``..``0x23`` → tray
-    0..3). Fails closed (``None``) for a non-AMS module, an attr that carries no slot
-    byte, or an out-of-range unit — so callers fall back to their own attribution.
 
-    The CODE word decides whether a given fault family actually uses this layout;
-    that judgement stays with the per-family predicates (:func:`runout_slot_from_hms`,
-    :func:`filament_read_failure_slot`), never here.
+def _ams_slot(attr: int, slot_base: int) -> tuple[int, int] | None:
+    """Decode ``(ams_id, tray)`` from an AMS attr whose submodule byte is ``slot_base + tray``.
+
+    THE layout reader every per-slot family shares: the high byte is the module class
+    (``0x07`` = AMS), the next byte the AMS unit id, the third the family's slot byte.
+    Fails closed (``None``) for a non-AMS module, a byte outside the family's four slots,
+    or an out-of-range unit — the external holder's ``0xFE``/``0xFF`` included — so
+    callers fall back to their own attribution.
     """
     if (attr >> 24) & 0xFF != 0x07:  # not an AMS-module fault
         return None
-    slot_byte = (attr >> 8) & 0xFF
-    if not (0x20 <= slot_byte <= 0x23):  # not a slot-attributed attr
+    tray = ((attr >> 8) & 0xFF) - slot_base
+    if not (0 <= tray < _SLOTS_PER_AMS_UNIT):  # not this family's slot byte
         return None
     ams_id = (attr >> 16) & 0xFF
     if not (0 <= ams_id <= 7):
         return None
-    return (ams_id, slot_byte - 0x20)
+    return (ams_id, tray)
+
+
+def ams_slot_from_attr(attr: int) -> tuple[int, int] | None:
+    """Decode the AMS unit + slot a TRAY-attributed HMS ``attr`` names, or ``None``.
+
+    Pure layout decode for the tray family: the third byte encodes the slot as
+    ``0x20 + tray`` (``0x20``..``0x23`` → tray 0..3). Fails closed (``None``) for a
+    non-AMS module, an attr that carries no tray byte, or an out-of-range unit — so
+    callers fall back to their own attribution.
+
+    The CODE word decides whether a given fault family actually uses this layout;
+    that judgement stays with the per-family predicates (:func:`runout_slot_from_hms`,
+    :func:`filament_read_failure_slot`), never here.
+
+    TRAY bytes ONLY, deliberately. The per-slot OVERLOAD family (``0x60``..``0x63``,
+    "The AMS A Slot 3 is overloaded…") rides the runout DEMAND's own code word
+    ``0x00020001``, and every demand reader (:func:`current_runout_demand`,
+    :func:`runout_slot_from_hms`) decodes through this function — so an overload can
+    never read as "fill slot 3". The taxonomy decodes that family through its own row
+    (:class:`_AttrFamily`).
+    """
+    return _ams_slot(attr, _TRAY_SLOT_BASE)
 
 
 def ams_unit_from_attr(attr: int) -> int | None:
@@ -1355,9 +1381,9 @@ class ClassifiedAmsFault:
     unload met a filament that would not come out, and the screen's Retry repeats
     that pull-back rather than offering "Resume"). It is orthogonal to the class in
     principle but every member is PHYSICAL_FAULT today — see the taxonomy rows.
-    ``slot`` is the ``(ams_id, tray_id)`` the attr names via :func:`ams_slot_from_attr`,
-    and is always ``None`` on the short-code lane — the short form discards the attr
-    low byte that carries it.
+    ``slot`` is the ``(ams_id, tray_id)`` the attr names, decoded by the row's own attr
+    family (:meth:`_AttrFamily.slot`), and is always ``None`` on the short-code lane —
+    the short form discards the attr low byte that carries it.
     ``external`` marks a fault on the EXTERNAL spool holder rather than inside an AMS
     (see :data:`_EXTERNAL_UNIT_BYTES`). It is orthogonal to the class — the holder can
     run out, fail to feed or need hands — and it is always paired with ``slot=None``,
@@ -1378,12 +1404,42 @@ class ClassifiedAmsFault:
 # :func:`is_filament_read_failure` uses.
 _AMS_MODULES: frozenset[int] = frozenset({0x07, 0x12, 0x18})
 
-# The attr SUBMODULE byte (``(attr >> 8) & 0xFF``) that scopes a code word's meaning.
-# 0x00020002 is the proof this scoping is required, not decoration — the ONE code
-# word carries three unrelated faults under three submodules (rows below).
-_TRAY_ATTR_BYTES: frozenset[int] = frozenset({0x20, 0x21, 0x22, 0x23})  # per-slot faults
-_MOTOR_ATTR_BYTES: frozenset[int] = frozenset({0x01, 0x10, 0x11, 0x12, 0x13})  # assist + feeder motors
-_RFID_ATTR_BYTES: frozenset[int] = frozenset({0x30, 0x31, 0x32, 0x33})  # per-slot RFID reader
+
+@dataclass(frozen=True)
+class _AttrFamily:
+    """One attr SUBMODULE family (``(attr >> 8) & 0xFF``) — the bytes a code word's meaning
+    is scoped to — and, for a per-slot family, its own slot decoder.
+
+    ``slot_base`` is the byte of tray 0 (tray = byte − base). A row names its slot in the
+    layout its catalog text was read under, never in another family's: the overload family
+    is 0x60-based where the tray family is 0x20-based. ``None`` = the verdict carries no
+    slot.
+    """
+
+    submodules: frozenset[int]
+    slot_base: int | None = None
+
+    @classmethod
+    def per_slot(cls, slot_base: int) -> "_AttrFamily":
+        """A per-slot family: :data:`_SLOTS_PER_AMS_UNIT` consecutive bytes from ``slot_base``."""
+        return cls(frozenset(range(slot_base, slot_base + _SLOTS_PER_AMS_UNIT)), slot_base)
+
+    def slot(self, attr: int) -> tuple[int, int] | None:
+        """The ``(ams_id, tray)`` this family's byte names in ``attr``, or ``None``."""
+        return None if self.slot_base is None else _ams_slot(attr, self.slot_base)
+
+
+# The attr SUBMODULE families that scope a code word's meaning. 0x00020002 is the proof
+# this scoping is required, not decoration — the ONE code word carries three unrelated
+# faults under three submodules (rows below) — and 0x00020001 is the second: the runout
+# DEMAND under the tray family, a per-slot OVERLOAD under the 0x60 family.
+_TRAY_ATTRS = _AttrFamily.per_slot(_TRAY_SLOT_BASE)  # per-slot faults, 0x20–0x23
+_MOTOR_ATTRS = _AttrFamily(frozenset({0x01, 0x10, 0x11, 0x12, 0x13}))  # assist + feeder motors
+_RFID_ATTRS = _AttrFamily(frozenset({0x30, 0x31, 0x32, 0x33}))  # per-slot RFID reader
+# Per-slot OVERLOAD, 0x60–0x63: "The AMS A Slot 1..4 is overloaded. The filament may be
+# tangled or the filament buffer may be stuck." (vendored catalog, AMS units A–H and AMS-HT
+# alike). The byte names the slot one family over from the tray layout.
+_OVERLOAD_ATTRS = _AttrFamily.per_slot(0x60)
 
 # The AMS-UNIT byte (``(attr >> 16) & 0xFF``) an EXTERNAL SPOOL HOLDER speaks under.
 # It is not an AMS unit at all: the firmware reuses the unit field to say "this fault
@@ -1397,9 +1453,13 @@ _EXTERNAL_UNIT_BYTES: frozenset[int] = frozenset({0xFE, 0xFF})
 
 @dataclass(frozen=True)
 class _CodeWordRow:
-    """One (code word × submodule) classification in the ``hms[]`` lane."""
+    """One (code word × submodule family) classification in the ``hms[]`` lane.
 
-    attr_bytes: frozenset[int]
+    The row carries its FAMILY, not bare bytes, so the slot its verdict names is decoded
+    by the family whose catalog text the row was read from (:meth:`_AttrFamily.slot`).
+    """
+
+    family: _AttrFamily
     fault_class: AmsFaultClass
     extruder_side: bool = False
     retract_failure: bool = False
@@ -1413,15 +1473,16 @@ _INFO = AmsFaultClass.INFORMATIONAL
 # --- The hms[] code-word table ---------------------------------------------
 # Scoped to the submodules whose text was read; catalog sentence quoted per row.
 #
-# FOUR code words are deliberately ABSENT so they classify None — each is owned by
-# a dedicated decoder and routing it through the generic taxonomy would regress a
-# ratified design:
+# FOUR code words deliberately classify None UNDER THE TRAY ATTRS — each is owned by
+# a dedicated decoder there, and routing it through the generic taxonomy would regress
+# a ratified design:
 #   * 0x00020001 (tray attrs) — "AMS A Slot 3 filament has run out. Please insert a
 #     new filament." The DEMAND, owned by :func:`current_runout_demand`. Doctrine
 #     rule 9: runouts escalate for a SAME-slot refill, jams swap — a demand that
 #     reached a fault classifier could route a runout into the swap machine. It is
 #     also NOT spent evidence: 006-H2S 2026-07-26 proved the firmware latches a
-#     BOGUS demand for a slot that never ran dry.
+#     BOGUS demand for a slot that never ran dry. (The same code word under the
+#     OVERLOAD family is a different fault and IS classified — its row is below.)
 #   * 0x00030001 and 0x00030002 (tray attrs) — "…has run out. Please wait while old
 #     filament is purged." / "…has run out and automatically switched to the slot with
 #     the same filament." THE per-event spent evidence, owned by
@@ -1442,103 +1503,114 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
         # "The AMS A assist motor is overloaded. The filament may be tangled or
         # stuck." / "The AMS A slot 1 motor is overloaded. The filament may be
         # tangled or stuck." — the 16-hex twin of the 8010 swap trigger.
-        _CodeWordRow(_MOTOR_ATTR_BYTES, _MECHANICAL),
+        _CodeWordRow(_MOTOR_ATTRS, _MECHANICAL),
         # "The RFID-tag on AMS A Slot1 is damaged, or its content cannot be identified."
-        _CodeWordRow(_RFID_ATTR_BYTES, _RFID),
+        _CodeWordRow(_RFID_ATTRS, _RFID),
     ),
+    # -- 0x00020001, the demand's code word under the OVERLOAD family ---------
+    # tray attrs: "AMS A Slot 3 filament has run out. Please insert a new filament." ->
+    # None (the DEMAND, above). Overload attrs 0x60–0x63: "The AMS A Slot 3 is
+    # overloaded. The filament may be tangled or the filament buffer may be stuck." —
+    # the per-slot twin of the 8010 swap trigger (same stuck-spool text, and it names
+    # the slot: 0x62 = slot 3). 011-H2S 2026-09-29, incident 419: 0700_6200_0002_0001
+    # stood at 17:55:24 beside the 0700_8010 jam the recovery driver owned and, read by
+    # no row, paged the operator raw. Its slot decodes through the row's own family,
+    # never through :func:`ams_slot_from_attr`, so no demand reader can take it for a
+    # "fill slot 3" ask.
+    0x00020001: (_CodeWordRow(_OVERLOAD_ATTRS, _MECHANICAL),),
     # -- MECHANICAL_FEED: the path is obstructed or slipping ------------------
     # "Failed to adjust the buffer position. The AMS A Slot 1 filament or the
     # buffer itself may be jammed."
-    0x0002000A: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x0002000A: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
     # "AMS A slot 1 feeds filament out of AMS timeout."
-    0x00020010: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020010: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
     # "AMS A slot 1 feeder unit motor is stalled, cannot rotate the spool."
-    0x00020012: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020012: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
     # "AMS A slot 1 assist motor has slipped. Please pull out the filament, cut
     # off the worn part, and then try again."
-    0x00020016: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020016: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
     # The tube-resistance ladder — one code word per tube segment, AMS side:
     # "…assist motor is stalled，due to excessive resistance in the tube
     # between AMS and the printer / near AMS / between AMS and the filament
     # buffer / near the filament buffer."
-    0x00020017: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
-    0x00020018: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
-    0x00020019: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
-    0x00020020: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020017: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
+    0x00020018: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
+    0x00020019: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
+    0x00020020: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
     # …and the two toolhead-side segments of the same ladder: "…in the tube
     # between the filament buffer and the toolhead" / "…in the tube near the
     # toolhead". Past the buffer the EXTRUDER is the common factor, not the spool.
-    0x00020021: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL, extruder_side=True),),
-    0x00020022: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL, extruder_side=True),),
+    0x00020021: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL, extruder_side=True),),
+    0x00020022: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL, extruder_side=True),),
     # "AMS A slot 1 assist motor overloaded. Excessive resistance in the filament
     # tube between the AMS and the filament track switch / between the filament
     # track switch and the filament buffer." (FTS-equipped models.)
-    0x00020026: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
-    0x00020027: (_CodeWordRow(_TRAY_ATTR_BYTES, _MECHANICAL),),
+    0x00020026: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
+    0x00020027: (_CodeWordRow(_TRAY_ATTRS, _MECHANICAL),),
     # -- PHYSICAL_FAULT: breakage / clog / hardware — a swap cannot fix it -----
     # "AMS A Slot 1's filament may be broken in AMS."
-    0x00020003: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020003: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "AMS A Slot 1 filament may be broken in the tool head."
-    0x00020004: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020004: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "AMS A Slot 1 filament has run out, and purging the old filament went
     # abnormally; please check whether the filament is stuck in the tool head."
     # A runout ENTANGLED with a tool-head fault: the ask is an inspection, which is
     # why it is neither RUNOUT nor spent evidence (see _RUNOUT_SLOT_SPENT_CODE32).
-    0x00020005: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020005: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "AMS A has detected a breakage of the PTFE tube during filament loading…"
-    0x00020006: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020006: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "Failed to extrude AMS A Slot 1 filament; the extruder may be clogged or the
     # filament may be too thin, causing the extruder to slip."
-    0x00020009: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020009: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "AMS A slot 1 pulls filament back to AMS timeout." Pull-BACK, the family an
     # auto-load can grind (see the swap set's exclusion note). ``retract_failure``:
     # the firmware is LATCHED in a pull-back it could not finish, so the screen's
     # Retry repeats that pull-back (006-H2S 2026-09-21, incident 289).
-    0x00020011: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL, retract_failure=True),),
+    0x00020011: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL, retract_failure=True),),
     # "AMS A slot 1 feeder unit motor has no signal, which may be due to poor
     # contact in the motor connector or a motor fault." Wiring/motor hardware —
     # NOT a feed obstruction, so fresh filament cannot clear it.
-    0x00020013: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020013: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "AMS A slot 1 filament status is abnormal, which may be due to a filament
     # breakage inside the AMS."
-    0x00020015: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020015: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "AMS A slot 1 the tube inside the AMS is broken, or feed-out hall sensor is
     # faulty and cannot detect the filament."
-    0x00020023: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020023: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "AMS A slot 1 failed to rotate the filament spool when pulling filament back to
     # AMS." The other half of the pull-BACK family, so it carries ``retract_failure``
     # for the same reason 0x00020011 does.
-    0x00020024: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL, retract_failure=True),),
+    0x00020024: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL, retract_failure=True),),
     # -- RFID_READ: the tag could not be read ---------------------------------
     # "Failed to read the filament information from AMS A slot 1. …" — one code
     # word per cause: AMS main board malfunction (0081, the code a commanded read
     # on a tagless slot mints and that can never self-clear), third-party tag
     # (0082), damaged tag (0083), tag at the edge of the reader (0084), tag
     # verification failed (0085), tag cannot rotate due to a jam (0086).
-    0x00010081: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
-    0x00010082: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
-    0x00010083: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
-    0x00010084: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
-    0x00010085: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
-    0x00010086: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    0x00010081: (_CodeWordRow(_TRAY_ATTRS, _RFID),),
+    0x00010082: (_CodeWordRow(_TRAY_ATTRS, _RFID),),
+    0x00010083: (_CodeWordRow(_TRAY_ATTRS, _RFID),),
+    0x00010084: (_CodeWordRow(_TRAY_ATTRS, _RFID),),
+    0x00010085: (_CodeWordRow(_TRAY_ATTRS, _RFID),),
+    0x00010086: (_CodeWordRow(_TRAY_ATTRS, _RFID),),
     # "The RFID-tag on AMS A Slot 1 cannot be identified."
-    0x00020057: (_CodeWordRow(_TRAY_ATTR_BYTES, _RFID),),
+    0x00020057: (_CodeWordRow(_TRAY_ATTRS, _RFID),),
     # "RFID cannot be read because of a hardware or structural error." Carried on
     # the RFID submodule attr, which names no tray — so ``slot`` decodes to None.
-    0x00030003: (_CodeWordRow(_RFID_ATTR_BYTES, _RFID),),
+    0x00030003: (_CodeWordRow(_RFID_ATTRS, _RFID),),
     # -- INFORMATIONAL: a notice or a precursor, never a trigger --------------
     # "AMS A slot 1 feed resistance is too high. Please reduce spool rotation
     # resistance and avoid over-bent or over-long filament tubes." Observed
     # 2026-07-20 07:48 on 009-H2S ~5 min BEFORE the 8010 that actually wedged the
     # change — one incident is not a lead-time proof, and the 8010 always follows
     # and IS the trigger, so acting on this would only widen the surface.
-    0x00020025: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+    0x00020025: (_CodeWordRow(_TRAY_ATTRS, _INFO),),
     # 0x00030001 ("…has run out. Please wait while old filament is purged.") had its
     # INFORMATIONAL row HERE until 2026-08-13. It is now per-event spent evidence
     # (:data:`_RUNOUT_SLOT_SPENT_CODE32`) and so joins 0x00030002 in the deliberate
     # absence listed in this table's header — one consumer per word.
     # "Checking the filament location of all AMS slots, please wait."
-    0x00030007: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+    0x00030007: (_CodeWordRow(_TRAY_ATTRS, _INFO),),
 }
 
 
@@ -1553,7 +1625,7 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
 #
 # Scoped by the SAME submodule byte the AMS rows use: every row below was read from
 # the ``…2000…`` form, i.e. the holder presents as its unit's first "tray", so
-# :data:`_TRAY_ATTR_BYTES` is the scope and no second literal for 0x20 is minted.
+# :data:`_TRAY_ATTRS` is the scope and no second literal for 0x20 is minted.
 # The scoping is load-bearing, not decoration — the external unit byte also carries
 # whole families this table must NOT claim (``07FF_8000_0002_0002`` is "The position
 # of left hotend is abnormal during printing", ``07FF_6000_0002_0001`` is "External
@@ -1565,28 +1637,83 @@ _CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
 _EXTERNAL_CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
     # -- RUNOUT_EXTERNAL: the holder has nothing to feed ----------------------
     # "External filament has run out; please load a new filament."
-    0x00020001: (_CodeWordRow(_TRAY_ATTR_BYTES, AmsFaultClass.RUNOUT_EXTERNAL),),
+    0x00020001: (_CodeWordRow(_TRAY_ATTRS, AmsFaultClass.RUNOUT_EXTERNAL),),
     # "External filament is missing; please load a new filament." (0xFE: "No
     # filament was detected in the left extruder from the external spool; please
     # load the new filament.") — THE 003-H2S code. It is the holder's twin of the
     # AMS "slot is empty" ask, and unlike that one it HAS a farm consumer: the
     # external lane holds the print and guides the operator to the holder.
-    0x00020002: (_CodeWordRow(_TRAY_ATTR_BYTES, AmsFaultClass.RUNOUT_EXTERNAL),),
+    0x00020002: (_CodeWordRow(_TRAY_ATTRS, AmsFaultClass.RUNOUT_EXTERNAL),),
     # -- PHYSICAL_FAULT: hands at the printer, never a swap -------------------
     # "Filament remains were detected in the PTFE tube between the Auxiliary
     # Extruder and the Toolhead. Please refer to the Wiki for removal instructions."
-    0x00020003: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020003: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "Please pull the external filament from the extruder."
-    0x00020004: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020004: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # "Auxiliary extruder feeding failed, possibly due to a clogged filament tube or
     # worn filament, causing the extruder to slip. Please remove the filament, clear
     # the tube, trim the worn section, and try again."
-    0x00020009: (_CodeWordRow(_TRAY_ATTR_BYTES, _PHYSICAL),),
+    0x00020009: (_CodeWordRow(_TRAY_ATTRS, _PHYSICAL),),
     # -- INFORMATIONAL --------------------------------------------------------
     # "Flushing the remaining filament between the Auxiliary Extruder and the
     # Toolhead. Please wait." An in-progress notice; no farm action.
-    0x00030007: (_CodeWordRow(_TRAY_ATTR_BYTES, _INFO),),
+    0x00030007: (_CodeWordRow(_TRAY_ATTRS, _INFO),),
 }
+
+
+def _ambiguous_suffixes(
+    table: dict[int, tuple[_CodeWordRow, ...]], unclassified: frozenset[tuple[int, _AttrFamily]]
+) -> frozenset[int]:
+    """The low-16 code suffixes whose SHORT form names more than one fault in ``table``.
+
+    One meaning is one ``(code word, attr family)`` pair: every row of the table plus the
+    ``unclassified`` meanings it deliberately leaves to a dedicated decoder. The short form
+    keeps only the code word's low 16 bits and none of the submodule byte, so two meanings
+    sharing a suffix share every ``MMMM_CCCC`` of a unit.
+    """
+    meanings: dict[int, set[tuple[int, _AttrFamily]]] = {}
+    for word, rows in table.items():
+        for row in rows:
+            meanings.setdefault(word & 0xFFFF, set()).add((word, row.family))
+    for word, family in unclassified:
+        meanings.setdefault(word & 0xFFFF, set()).add((word, family))
+    return frozenset(suffix for suffix, found in meanings.items() if len(found) > 1)
+
+
+# Derived once at import, per table. The AMS side counts the slot-runout family (the
+# demand, purge-abnormal, pull-back and auto-switch words under the tray attrs) as
+# meanings, because they ride the same shorts though no row classifies them — which is
+# what makes ``07xx_0001`` (a slot's overload, its runout demand, its pull-back notice)
+# and ``07xx_0002`` (the motor overload, the RFID tag, the auto-switch report) ambiguous.
+_AMBIGUOUS_SUFFIXES: frozenset[int] = _ambiguous_suffixes(
+    _CODE_WORD_TAXONOMY, frozenset((word, _TRAY_ATTRS) for word in _RUNOUT_SLOT_CODE32)
+)
+_AMBIGUOUS_EXTERNAL_SUFFIXES: frozenset[int] = _ambiguous_suffixes(_EXTERNAL_CODE_WORD_TAXONOMY, frozenset())
+
+
+def short_code_ambiguous(short: str) -> bool:
+    """Does this ``MMMM_CCCC`` short code name more than one AMS fault?
+
+    Read off the code-word tables (:func:`_ambiguous_suffixes`), never a list: a code word
+    classified under more than one attr family, or one whose suffix a slot-runout word
+    also carries. ``0700_0001`` is the case that matters — 011-H2S 2026-09-29's
+    ``0700_6200_0002_0001`` overload renders as it, and so does the slot's runout demand —
+    so a consumer that must NAME a fault by its short (the incident's representative
+    code) prefers an unambiguous one. The unit byte picks the table, as
+    :func:`classify_ams_fault` does; a non-AMS module or a malformed code is ``False``.
+    """
+    head, sep, tail = (short or "").strip().upper().partition("_")
+    if not sep or len(head) != 4 or len(tail) != 4:
+        return False
+    try:
+        module_unit, suffix = int(head, 16), int(tail, 16)
+    except ValueError:
+        return False
+    if module_unit >> 8 not in _AMS_MODULES:
+        return False
+    if module_unit & 0xFF in _EXTERNAL_UNIT_BYTES:
+        return suffix in _AMBIGUOUS_EXTERNAL_SUFFIXES
+    return suffix in _AMBIGUOUS_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -1620,7 +1747,8 @@ _EXTERNAL_SPOOL: tuple[str, ...] = ("07FF", "07FE")
 # so a short-code match would route runouts into the jam-swap machine (doctrine
 # rule 9). Telling the two apart needs the attr-aware code-word lane above, which
 # is exactly where that decision lives. On H2C the same short code means "A new AMS
-# detected" — a second reason a bare match is meaningless.
+# detected" — a second reason a bare match is meaningless — and the per-slot overload
+# 0700_6X00_0002_0001 (a jam) is a third meaning behind the same four digits.
 _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # -- MECHANICAL_FEED ------------------------------------------------------
     # "The AMS assist motor is overloaded. This could be due to entangled filament
@@ -1839,7 +1967,10 @@ def classify_ams_fault(attr: int, code: int) -> ClassifiedAmsFault | None:
     else entirely, so it is read from :data:`_EXTERNAL_CODE_WORD_TAXONOMY` alone —
     borrowing an AMS row for it is what made ``07FF_2000_0002_0002`` invisible on
     003-H2S. Every external verdict carries ``external=True`` and ``slot=None`` (a
-    holder has no slot, which :func:`ams_slot_from_attr` already enforces).
+    holder has no slot, which the family decoder's unit range already enforces).
+
+    The SLOT comes from the matching row's attr family (:meth:`_AttrFamily.slot`), so
+    each per-slot family is read in its own layout (tray 0x20-based, overload 0x60-based).
     """
     if (attr >> 24) & 0xFF not in _AMS_MODULES:
         return None
@@ -1849,11 +1980,11 @@ def classify_ams_fault(attr: int, code: int) -> ClassifiedAmsFault | None:
         return None
     attr_byte = (attr >> 8) & 0xFF
     for row in rows:
-        if attr_byte in row.attr_bytes:
+        if attr_byte in row.family.submodules:
             return ClassifiedAmsFault(
                 fault_class=row.fault_class,
                 extruder_side=row.extruder_side,
-                slot=ams_slot_from_attr(attr),
+                slot=row.family.slot(attr),
                 retract_failure=row.retract_failure,
                 external=external,
             )
@@ -1955,6 +2086,14 @@ class FaultCandidate:
     and whether the hardware is the EXTERNAL spool holder rather than an AMS
     (``external``, straight from the taxonomy's verdict — never re-derived from the
     code string here, doctrine invariant 1).
+
+    ``full_code`` is the entry's own lossless identifier (``HMSError.full_code``: 16 hex
+    on the ``hms[]`` lane, 8 hex on ``print_error``), the key for every "is THIS the
+    code" comparison. The short form is many-to-one — ``0700_0001`` is a slot's runout
+    demand, a slot's overload and, on H2C, "a new AMS detected" — so a set of short codes
+    can never say which entry an incident speaks for. ``ams_unit`` is the AMS unit the
+    attr names (:func:`ams_unit_from_attr`, both lanes), the one location an entry with
+    no slot still carries.
     """
 
     fault_class: AmsFaultClass
@@ -1963,6 +2102,40 @@ class FaultCandidate:
     extruder_side: bool
     retract_failure: bool = False
     external: bool = False
+    full_code: str = ""
+    ams_unit: int | None = None
+
+
+def _live_classified(state, classes: frozenset[AmsFaultClass]) -> frozenset[FaultCandidate]:
+    """Every live ``state.hms_errors`` entry the taxonomy puts in one of ``classes``.
+
+    Through :func:`classify_hms_entry`, which resolves the two wire lanes. Pure and
+    DB-free: it runs on every status push, and a malformed entry is skipped rather than
+    raised (invariant 10).
+    """
+    out: set[FaultCandidate] = set()
+    for e in getattr(state, "hms_errors", None) or []:
+        verdict = classify_hms_entry(e)
+        if verdict is None or verdict.fault_class not in classes:
+            continue
+        try:
+            short = hms_short_code(e.attr, e.code)
+            unit = ams_unit_from_attr(int(e.attr or 0))
+        except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the scan
+            continue
+        out.add(
+            FaultCandidate(
+                fault_class=verdict.fault_class,
+                short_code=short,
+                slot=verdict.slot,
+                extruder_side=verdict.extruder_side,
+                retract_failure=verdict.retract_failure,
+                external=verdict.external,
+                full_code=getattr(e, "full_code", "") or "",
+                ams_unit=unit,
+            )
+        )
+    return frozenset(out)
 
 
 def live_candidates(state) -> frozenset[FaultCandidate]:
@@ -1979,26 +2152,27 @@ def live_candidates(state) -> frozenset[FaultCandidate]:
     Pure and DB-free: this runs on every status push, and a malformed entry is
     skipped rather than raised (invariant 10).
     """
-    out: set[FaultCandidate] = set()
-    for e in getattr(state, "hms_errors", None) or []:
-        verdict = classify_hms_entry(e)
-        if verdict is None or verdict.fault_class not in ACTIONABLE_CLASSES:
-            continue
-        try:
-            short = hms_short_code(e.attr, e.code)
-        except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the scan
-            continue
-        out.add(
-            FaultCandidate(
-                fault_class=verdict.fault_class,
-                short_code=short,
-                slot=verdict.slot,
-                extruder_side=verdict.extruder_side,
-                retract_failure=verdict.retract_failure,
-                external=verdict.external,
-            )
-        )
-    return frozenset(out)
+    return _live_classified(state, ACTIONABLE_CLASSES)
+
+
+# The class an OPEN incident speaks for without ever opening one: a progress notice or a
+# precursor names no action, so it holds nothing — but the operator's Retry on a held jam
+# raises exactly one (011-H2S 2026-09-29 17:59:18, ``0700_2200_0002_0025`` feed resistance,
+# the push on which the actionable code cleared), and its raw page mid-recovery is noise.
+NOTICE_CLASSES: frozenset[AmsFaultClass] = frozenset({AmsFaultClass.INFORMATIONAL})
+
+
+def live_notices(state) -> frozenset[FaultCandidate]:
+    """Every INFORMATIONAL AMS notice standing on the printer right now.
+
+    The taxonomy's INFORMATIONAL rows over both lanes — the code-word rows
+    (``0x00020025`` feed resistance, ``0x00030007`` checking filament location, and the
+    external holder's flushing notice) and the ``07xx_0025`` short row — in the same
+    shape as :func:`live_candidates`, so a consumer reads ``full_code`` and ``ams_unit``
+    off one type. Never an incident trigger (:data:`ACTIONABLE_CLASSES` excludes the
+    class). Pure and DB-free; malformed entries are skipped (invariant 10).
+    """
+    return _live_classified(state, NOTICE_CLASSES)
 
 
 def fault_tokens(candidates) -> frozenset[str]:
@@ -2147,6 +2321,34 @@ def runout_standing_for_slot(hms_list, ams_id: int, tray_id: int) -> bool:
         if verdict is not None and verdict.fault_class is AmsFaultClass.RUNOUT and verdict.slot == target:
             return True
     return False
+
+
+def slot_runout_full_codes(hms_list) -> frozenset[str]:
+    """The full codes of the live SLOT-ATTRIBUTED runout words in ``hms_list``.
+
+    The ``0700_2X00`` family (:data:`_RUNOUT_SLOT_CODE32` under a TRAY attr, decoded by
+    :func:`runout_slot_from_hms`): the demand, the purge-abnormal runout, the pull-back
+    notice and the auto-switch report. They are the words a RUNOUT incident speaks for
+    beside its own class code — three of the four are taxonomy-absent by design (one
+    consumer per word, see the code-word table's header), so no candidate carries them.
+
+    Attr-exact, never by short code: the per-slot overload ``0700_6X00_0002_0001``
+    shares the demand's code word AND its short form, and is not one of these.
+
+    Pure decode over any HMSError-shaped sequence; an entry with no full code or a
+    malformed one is skipped, never raised (invariant 10).
+    """
+    found: set[str] = set()
+    for e in hms_list or []:
+        try:
+            if runout_slot_from_hms(int(getattr(e, "attr", 0) or 0), _code_word(getattr(e, "code", 0))) is None:
+                continue
+        except (TypeError, ValueError):  # a malformed HMS entry must not break the decode
+            continue
+        full = getattr(e, "full_code", "") or ""
+        if full:
+            found.add(full)
+    return frozenset(found)
 
 
 def runout_hold_active(state) -> bool:
