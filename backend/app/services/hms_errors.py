@@ -1661,6 +1661,61 @@ _EXTERNAL_CODE_WORD_TAXONOMY: dict[int, tuple[_CodeWordRow, ...]] = {
 }
 
 
+def _ambiguous_suffixes(
+    table: dict[int, tuple[_CodeWordRow, ...]], unclassified: frozenset[tuple[int, _AttrFamily]]
+) -> frozenset[int]:
+    """The low-16 code suffixes whose SHORT form names more than one fault in ``table``.
+
+    One meaning is one ``(code word, attr family)`` pair: every row of the table plus the
+    ``unclassified`` meanings it deliberately leaves to a dedicated decoder. The short form
+    keeps only the code word's low 16 bits and none of the submodule byte, so two meanings
+    sharing a suffix share every ``MMMM_CCCC`` of a unit.
+    """
+    meanings: dict[int, set[tuple[int, _AttrFamily]]] = {}
+    for word, rows in table.items():
+        for row in rows:
+            meanings.setdefault(word & 0xFFFF, set()).add((word, row.family))
+    for word, family in unclassified:
+        meanings.setdefault(word & 0xFFFF, set()).add((word, family))
+    return frozenset(suffix for suffix, found in meanings.items() if len(found) > 1)
+
+
+# Derived once at import, per table. The AMS side counts the slot-runout family (the
+# demand, purge-abnormal, pull-back and auto-switch words under the tray attrs) as
+# meanings, because they ride the same shorts though no row classifies them — which is
+# what makes ``07xx_0001`` (a slot's overload, its runout demand, its pull-back notice)
+# and ``07xx_0002`` (the motor overload, the RFID tag, the auto-switch report) ambiguous.
+_AMBIGUOUS_SUFFIXES: frozenset[int] = _ambiguous_suffixes(
+    _CODE_WORD_TAXONOMY, frozenset((word, _TRAY_ATTRS) for word in _RUNOUT_SLOT_CODE32)
+)
+_AMBIGUOUS_EXTERNAL_SUFFIXES: frozenset[int] = _ambiguous_suffixes(_EXTERNAL_CODE_WORD_TAXONOMY, frozenset())
+
+
+def short_code_ambiguous(short: str) -> bool:
+    """Does this ``MMMM_CCCC`` short code name more than one AMS fault?
+
+    Read off the code-word tables (:func:`_ambiguous_suffixes`), never a list: a code word
+    classified under more than one attr family, or one whose suffix a slot-runout word
+    also carries. ``0700_0001`` is the case that matters — 011-H2S 2026-09-29's
+    ``0700_6200_0002_0001`` overload renders as it, and so does the slot's runout demand —
+    so a consumer that must NAME a fault by its short (the incident's representative
+    code) prefers an unambiguous one. The unit byte picks the table, as
+    :func:`classify_ams_fault` does; a non-AMS module or a malformed code is ``False``.
+    """
+    head, sep, tail = (short or "").strip().upper().partition("_")
+    if not sep or len(head) != 4 or len(tail) != 4:
+        return False
+    try:
+        module_unit, suffix = int(head, 16), int(tail, 16)
+    except ValueError:
+        return False
+    if module_unit >> 8 not in _AMS_MODULES:
+        return False
+    if module_unit & 0xFF in _EXTERNAL_UNIT_BYTES:
+        return suffix in _AMBIGUOUS_EXTERNAL_SUFFIXES
+    return suffix in _AMBIGUOUS_SUFFIXES
+
+
 @dataclass(frozen=True)
 class _ShortRow:
     """One classification in the lossy ``MMMM_CCCC`` short-code lane.

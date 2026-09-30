@@ -271,3 +271,116 @@ class TestALoneOverloadDrivesAJam:
         ]
         assert rows[0].codes == f"mechanical_feed:070{ams_id}_0001@{ams_id}-{tray}"
         assert rows[0].hms_full_codes == overload.full_code
+        # The only candidate names the incident, ambiguous short or not.
+        assert rows[0].code == f"070{ams_id}_0001"
+
+
+def _capture_driver(monkeypatch) -> list[spool_recovery.RecoveryIncident]:
+    """Stand in for the driver task and record the incident the entry built for it."""
+    built: list[spool_recovery.RecoveryIncident] = []
+
+    async def _fake_run(incident: spool_recovery.RecoveryIncident) -> None:
+        built.append(incident)
+
+    monkeypatch.setattr(spool_recovery, "_run_recovery", _fake_run)
+    return built
+
+
+async def _seat_spool(db, printer_id: int, ams_id: int, tray_id: int):
+    """A spool bound to one AMS slot of ``printer_id``."""
+    from backend.app.models.spool import Spool
+    from backend.app.models.spool_assignment import SpoolAssignment
+
+    spool = Spool(material="PETG", label_weight=1000, core_weight=250, weight_used=100)
+    spool.k_profiles = []
+    spool.assignments = []
+    db.add(spool)
+    await db.flush()
+    db.add(SpoolAssignment(spool_id=spool.id, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id))
+    await db.commit()
+    return spool
+
+
+@pytest.mark.asyncio
+class TestTheIncidentNamesOneFault:
+    """The incident's representative code and recorded words name the fault it holds for,
+    never a second fault that shares its short form."""
+
+    @pytest.fixture(autouse=True)
+    def _own_sessions(self, own_session_factory, monkeypatch):
+        import backend.app.core.database as core_db
+
+        monkeypatch.setattr(core_db, "async_session", own_session_factory)
+
+    async def _open(self, db, printer_id: int, hms: list[HMSError], monkeypatch) -> tuple:
+        built = _capture_driver(monkeypatch)
+        task = await spool_recovery.on_ams_fault(printer_id, _state(hms))
+        assert task is not None
+        await task
+        row = (await db.execute(select(PrinterIncident))).scalars().one()
+        return row, built[0]
+
+    async def test_the_011_push_is_named_by_its_8010(self, db_session, printer_factory, monkeypatch):
+        """0700_8010 beside 0700_6200_0002_0001: the overload renders "0700_0001" and sorts
+        first, but that short is also the slot's runout demand — the 8010 names the jam,
+        on the row, on the driver's incident, and on the spool it parks."""
+        from unittest.mock import AsyncMock
+
+        from backend.app.core import websocket
+        from backend.app.services import notification_service
+
+        printer = await printer_factory()
+        row, incident = await self._open(db_session, printer.id, [_ASSIST_OVERLOAD, _OVERLOAD_SLOT3], monkeypatch)
+
+        assert (row.code, incident.code) == ("0700_8010", "0700_8010")
+        assert row.slot_global_tray == 2  # the overload still names the slot
+
+        spool = await _seat_spool(db_session, printer.id, 0, 2)
+        monkeypatch.setattr(websocket.ws_manager, "broadcast", AsyncMock())
+        page = AsyncMock()
+        monkeypatch.setattr(notification_service.notification_service, "on_spool_out_of_rotation", page)
+        await spool_recovery._commit_out_of_rotation(incident, 2, role="jammed")
+
+        await db_session.refresh(spool)
+        assert spool.feed_fault_code == "0700_8010"
+        assert page.await_args.kwargs["code"] == "0700_8010"
+
+    async def test_the_013_push_keeps_its_tube_code(self, db_session, printer_factory, monkeypatch):
+        """0700_2200_0002_0019 beside 0700_8006: both unambiguous, so the lowest wins as before."""
+        printer = await printer_factory()
+
+        row, _incident = await self._open(
+            db_session, printer.id, [_TUBE_RESISTANCE_SLOT3, _print_error(0x07008006)], monkeypatch
+        )
+
+        assert row.code == "0700_0019"
+
+    async def test_a_demand_beside_the_overload_is_never_recorded_as_its_words(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        printer = await printer_factory()
+
+        row, _incident = await self._open(db_session, printer.id, [_OVERLOAD_SLOT3, _DEMAND_SLOT3], monkeypatch)
+
+        assert row.hms_full_codes == _OVERLOAD_SLOT3.full_code
+
+    async def test_the_words_are_every_candidates_own_full_code_sorted(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+
+        row, _incident = await self._open(db_session, printer.id, [_ASSIST_OVERLOAD, _OVERLOAD_SLOT3], monkeypatch)
+
+        assert row.hms_full_codes == "0700620000020001,07008010"
+
+
+def test_an_ams_fault_outranks_a_holder_fault_before_ambiguity():
+    """The AMS-before-holder order ``on_ams_fault`` relies on survives the ambiguity key:
+    an ambiguous AMS overload still beats an unambiguous holder feed fault."""
+    from backend.app.services.hms_errors import AmsFaultClass, FaultCandidate
+
+    overload = FaultCandidate(AmsFaultClass.MECHANICAL_FEED, "0700_0001", (0, 2), False)
+    holder = FaultCandidate(AmsFaultClass.MECHANICAL_FEED, "07FF_8006", None, False, external=True)
+    assist = FaultCandidate(AmsFaultClass.MECHANICAL_FEED, "0700_8010", None, False)
+
+    pick = spool_recovery._primary_candidate
+    assert pick(frozenset({overload, holder}), AmsFaultClass.MECHANICAL_FEED) is overload
+    assert pick(frozenset({overload, holder, assist}), AmsFaultClass.MECHANICAL_FEED) is assist

@@ -193,10 +193,10 @@ from backend.app.services.hms_errors import (
     current_runout_demand,
     fault_tokens,
     fingerprint_tokens,
-    full_codes_of,
     live_candidates,
     live_notices,
     power_loss_prompt_standing,
+    short_code_ambiguous,
     slot_runout_full_codes,
 )
 from backend.app.services.incident_resolution import (
@@ -1368,9 +1368,15 @@ def _dominant_class(candidates) -> AmsFaultClass | None:
 
 
 def _primary_candidate(candidates, fault_class: AmsFaultClass) -> FaultCandidate | None:
-    """The representative candidate of the deciding class — lowest short code wins,
-    so the code the operator is told is stable across pushes."""
-    members = sorted((c for c in candidates if c.fault_class is fault_class), key=lambda c: c.short_code)
+    """The representative candidate of the deciding class: an AMS fault before a holder
+    fault, then an UNAMBIGUOUS short code (``hms_errors.short_code_ambiguous``), then the
+    lowest — so the code the operator is told is stable across pushes and names ONE fault.
+    011-H2S 2026-09-29: the slot overload renders ``0700_0001``, which is also that slot's
+    runout demand, so beside ``0700_8010`` the 8010 names the incident."""
+    members = sorted(
+        (c for c in candidates if c.fault_class is fault_class),
+        key=lambda c: (c.external, short_code_ambiguous(c.short_code), c.short_code),
+    )
     return members[0] if members else None
 
 
@@ -2270,15 +2276,17 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         # The HARDWARE the deciding fault sits on, taken from the taxonomy's verdict
         # for the very candidate whose code the operator is told about — so the copy,
         # the routing and the message can never name different hardware. When AMS and
-        # external faults stand together, ``_primary_candidate``'s lowest-short-code
-        # order picks the AMS one (``0700_…`` < ``07FF_…``), which is correct: a real
-        # AMS fault beside a holder fault is still an AMS fault to recover.
+        # external faults stand together, ``_primary_candidate`` picks the AMS one,
+        # which is correct: a real AMS fault beside a holder fault is still an AMS fault
+        # to recover.
         external = primary.external if primary is not None else False
         code = primary.short_code if primary is not None else ""
         # The printer's own words for the faults this incident will speak for, recorded
         # now: a release lever, a stop or the next job clears them off the printer while
-        # the hold they explain still stands.
-        full_codes = full_codes_of(getattr(state, "hms_errors", None) or [], {c.short_code for c in candidates})
+        # the hold they explain still stands. The candidates' OWN full codes, never a
+        # short-code round trip: ``0700_0001`` would sweep a runout demand standing
+        # beside an owned overload into the incident's words.
+        full_codes = sorted({c.full_code for c in candidates} - {""})
 
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer

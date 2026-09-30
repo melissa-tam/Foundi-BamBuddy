@@ -1230,6 +1230,46 @@ class TestTheSlotOverloadWord:
         }
 
 
+class TestShortCodeAmbiguity:
+    """Which shorts name more than one fault — derived from the code-word tables and the
+    slot-runout family, never listed. The incident's representative code prefers an
+    unambiguous one (011-H2S: ``0700_8010`` over the overload's ``0700_0001``)."""
+
+    def test_the_derived_suffixes(self):
+        from backend.app.services.hms_errors import _AMBIGUOUS_EXTERNAL_SUFFIXES, _AMBIGUOUS_SUFFIXES
+
+        # 0001: a slot's overload (0x60 family) vs its demand and pull-back notice (tray).
+        # 0002: the motor overload vs the RFID tag (two rows) vs the auto-switch report.
+        # 0003: "filament may be broken in AMS" (tray) vs "RFID cannot be read" (RFID).
+        assert {0x0001, 0x0002, 0x0003} == _AMBIGUOUS_SUFFIXES
+        # Every holder code word has one row, and no unclassified meaning shares one.
+        assert not _AMBIGUOUS_EXTERNAL_SUFFIXES
+
+    @pytest.mark.parametrize(
+        ("short", "ambiguous"),
+        [
+            ("0700_0001", True),
+            ("0701_0001", True),
+            ("1800_0001", True),  # AMS-HT speaks the same code words
+            ("0700_0002", True),
+            ("0700_0003", True),
+            ("0700_8010", False),
+            ("0700_0019", False),
+            ("0700_0005", False),  # purge-abnormal: its row and its runout meaning are one fault
+            ("07FF_0001", False),  # the holder's own table
+            ("0300_0001", False),  # not an AMS module
+            ("0700_001", False),
+            ("bogus", False),
+            ("", False),
+        ],
+    )
+    def test_the_reader(self, short, ambiguous):
+        from backend.app.services.hms_errors import short_code_ambiguous
+
+        assert short_code_ambiguous(short) is ambiguous
+        assert short_code_ambiguous(short.lower()) is ambiguous
+
+
 class TestCandidatesCarryTheirOwnIdentity:
     """Every classified entry carries its LOSSLESS full code and the AMS unit its attr
     names, on both wire lanes — what "does an incident speak for THIS code" compares."""
