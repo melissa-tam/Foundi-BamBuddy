@@ -959,16 +959,24 @@ class PrinterMessage:
         return f"[{self.short_code}] {self.description}" if self.description else f"[{self.short_code}]"
 
 
-def printer_message_from_full_code(full_code: str) -> PrinterMessage | None:
-    """Render one stored full code — the lookup :func:`hms_error_payload` uses.
+@dataclass(frozen=True)
+class _RecordedEntry:
+    """A RECORDED full code split back into the fields a live ``HMSError`` carries, so the
+    live readers (:func:`classify_hms_entry`, the candidate builder) read it as they read
+    the wire."""
 
-    Both wire lanes decode back to the canonical short code: a 16-hex ``hms[]`` code is
-    ``attr`` (8) + ``code`` (8), so the short code is its first four and last four hex
-    digits; an 8-hex ``print_error`` code IS the 32-bit word, its first four and last
-    four. The description prefers the lossless full code against the vendored catalog
-    and falls back to the short-code table (:func:`lookup_description_any`). ``None``
-    for anything that is not one of those two shapes — a stored value nobody can decode
-    is not a message.
+    attr: int
+    code: str
+    full_code: str
+
+
+def _split_full_code(full_code: str | None) -> _RecordedEntry | None:
+    """THE split of a stored full code back into its wire fields, or None.
+
+    The two shapes the MQTT client records (``BambuMQTTClient`` ``HMSError.full_code``): a
+    16-hex ``hms[]`` code is ``attr`` (8) + the 32-bit code word (8); an 8-hex ``print_error``
+    code IS the 32-bit word, stored whole as ``attr`` with its low 16 bits the error.
+    Anything else — a truncated value, a non-hex token — is no code and splits to None.
     """
     raw = (full_code or "").strip().upper()
     if len(raw) not in (8, 16):
@@ -977,11 +985,27 @@ def printer_message_from_full_code(full_code: str) -> PrinterMessage | None:
         value = int(raw, 16)
     except ValueError:
         return None
-    if len(raw) == 16:
-        attr, code = value >> 32, value & 0xFFFFFFFF
-    else:
-        attr, code = value, value & 0xFFFF
-    return PrinterMessage(short_code=hms_short_code(attr, code), description=lookup_description_any(attr, code) or "")
+    attr, code = (value >> 32, value & 0xFFFFFFFF) if len(raw) == 16 else (value, value & 0xFFFF)
+    return _RecordedEntry(attr=attr, code=f"0x{code:x}", full_code=raw)
+
+
+def printer_message_from_full_code(full_code: str) -> PrinterMessage | None:
+    """Render one stored full code — the lookup :func:`hms_error_payload` uses.
+
+    Both wire lanes decode back to the canonical short code (:func:`_split_full_code`): a
+    16-hex ``hms[]`` code's short code is its first four and last four hex digits; an 8-hex
+    ``print_error`` code IS the 32-bit word, its first four and last four. The description
+    prefers the lossless full code against the vendored catalog and falls back to the
+    short-code table (:func:`lookup_description_any`). ``None`` for anything that is not
+    one of those two shapes — a stored value nobody can decode is not a message.
+    """
+    entry = _split_full_code(full_code)
+    if entry is None:
+        return None
+    code = _code_word(entry.code)
+    return PrinterMessage(
+        short_code=hms_short_code(entry.attr, code), description=lookup_description_any(entry.attr, code) or ""
+    )
 
 
 def printer_message_from_short_code(short_code: str) -> PrinterMessage | None:
@@ -2113,29 +2137,46 @@ def _live_classified(state, classes: frozenset[AmsFaultClass]) -> frozenset[Faul
     DB-free: it runs on every status push, and a malformed entry is skipped rather than
     raised (invariant 10).
     """
-    out: set[FaultCandidate] = set()
-    for e in getattr(state, "hms_errors", None) or []:
-        verdict = classify_hms_entry(e)
-        if verdict is None or verdict.fault_class not in classes:
-            continue
-        try:
-            short = hms_short_code(e.attr, e.code)
-            unit = ams_unit_from_attr(int(e.attr or 0))
-        except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the scan
-            continue
-        out.add(
-            FaultCandidate(
-                fault_class=verdict.fault_class,
-                short_code=short,
-                slot=verdict.slot,
-                extruder_side=verdict.extruder_side,
-                retract_failure=verdict.retract_failure,
-                external=verdict.external,
-                full_code=getattr(e, "full_code", "") or "",
-                ams_unit=unit,
-            )
-        )
-    return frozenset(out)
+    candidates = (_candidate_of(e) for e in getattr(state, "hms_errors", None) or [])
+    return frozenset(c for c in candidates if c is not None and c.fault_class in classes)
+
+
+def _candidate_of(e) -> FaultCandidate | None:
+    """ONE entry — a live ``HMSError`` or a recorded one (:func:`classify_full_code`) — as the
+    taxonomy classifies it, whatever its class; None when it classifies to nothing or is
+    malformed (invariant 10: never raised into a callback)."""
+    verdict = classify_hms_entry(e)
+    if verdict is None:
+        return None
+    try:
+        short = hms_short_code(e.attr, e.code)
+        unit = ams_unit_from_attr(int(e.attr or 0))
+    except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the scan
+        return None
+    return FaultCandidate(
+        fault_class=verdict.fault_class,
+        short_code=short,
+        slot=verdict.slot,
+        extruder_side=verdict.extruder_side,
+        retract_failure=verdict.retract_failure,
+        external=verdict.external,
+        full_code=getattr(e, "full_code", "") or "",
+        ams_unit=unit,
+    )
+
+
+def classify_full_code(full_code: str | None) -> FaultCandidate | None:
+    """THE classifier of a RECORDED full code (``printer_incident.hms_full_codes``), or None.
+
+    What the fault an incident opened on WAS, re-read from the firmware's own identifier
+    through the same taxonomy and candidate shape the live wire gets
+    (:func:`classify_hms_entry` over both lanes) — for a reader that meets a wire with nothing
+    left on it (the recovery driver re-entered after its own stop, when it must know which
+    side faulted before it parks a spool). Any class; the caller picks the ones it acts on.
+    None for a value that is no full code (:func:`_split_full_code`) or classifies to nothing.
+    """
+    entry = _split_full_code(full_code)
+    return _candidate_of(entry) if entry is not None else None
 
 
 def live_candidates(state) -> frozenset[FaultCandidate]:

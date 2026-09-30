@@ -3480,13 +3480,19 @@ class TestRecoverClosesOperatorResolvedHolds:
 
 class TestEscalationNeverStops:
     """Operator decision 2026-09-04: an unrecoverable filament fault stays PAUSED and
-    RESUMABLE. ``spool_recovery`` escalates and holds; it never stops the print — the
-    graceful half of that decision is :func:`farm_policy.on_farm_requeue`, which turns
-    the operator's OWN stop of a held print into a requeue.
+    RESUMABLE. ``spool_recovery`` escalates and holds — the graceful half of that decision
+    is :func:`farm_policy.on_farm_requeue`, which turns the operator's OWN stop of a held
+    print into a requeue.
 
-    Pinned at MODULE scope by parsing the recovery lane: the invariant is "no stop is
-    ever sent from this lane", not "not from this one branch", and an AST walk is the
-    only assertion that covers every path including the ones a future change adds.
+    Amended by operator ruling R1 (2026-09-29, 013-H2S incidents 410/411): the recovery
+    lane ends a job in exactly ONE place — its last release rung,
+    ``_LEVERS[printer_incidents.FAULT_RESTART_STEP]``, pulled only for a farm unit that has
+    deposited nothing — and never as the operator: a mid-print stall still escalates and
+    holds. Where that one stop lives is pinned by
+    ``test_code_quality.TestRecoveryDriverOwnership.test_the_restart_stop_is_published_by_its_rung_alone``;
+    this case pins the rest at MODULE scope by parsing the recovery lane — the operator's
+    stop verbs never, and the raw stop once — because an AST walk is the only assertion that
+    covers every path, including the ones a future change adds.
     """
 
     async def test_the_recovery_lane_sends_no_stop_anywhere(self):
@@ -3496,10 +3502,13 @@ class TestEscalationNeverStops:
         from backend.app.services import spool_recovery
 
         tree = ast.parse(inspect.getsource(spool_recovery))
-        called = {
+        called = [
             node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
-        }
-        forbidden = {"stop_print", "stop_as_operator", "stamp_operator_stop"}
-        assert called & forbidden == set(), f"spool_recovery must never stop a print: {called & forbidden}"
+        ]
+        operator_verbs = {"stop_as_operator", "stamp_operator_stop"}
+        assert set(called) & operator_verbs == set(), (
+            f"spool_recovery must never stop a print as the operator: {set(called) & operator_verbs}"
+        )
+        assert called.count("stop_print") == 1, "the recovery lane's one raw stop is its restart rung (R1)"

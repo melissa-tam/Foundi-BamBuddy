@@ -188,11 +188,13 @@ from backend.app.services import (
     spool_respool,
     tray_fields,
 )
-from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, HMSError, ams_mid_filament_change
+from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, ams_mid_filament_change
 from backend.app.services.hms_errors import (
+    ACTIONABLE_CLASSES,
     AmsFaultClass,
     FaultCandidate,
     candidate_fingerprint,
+    classify_full_code,
     current_runout_demand,
     fault_tokens,
     fingerprint_tokens,
@@ -6043,39 +6045,23 @@ async def rearm_incidents_on_startup() -> int:
     return closed
 
 
-@dataclass(frozen=True)
-class _RecordedWire:
-    """The ``hms_errors`` list a row RECORDED at open, in the shape ``live_candidates`` reads."""
-
-    hms_errors: list[HMSError]
-
-
 def _recorded_candidates(full_codes: str | None) -> frozenset[FaultCandidate]:
-    """The fault candidates a row's RECORDED full codes (``printer_incident.hms_full_codes``)
-    classify to, through the one taxonomy (``hms_errors.live_candidates``).
+    """The actionable fault candidates a row's RECORDED full codes
+    (``printer_incident.hms_full_codes``) classify to.
 
     A startup re-entry meets a wire with no actionable code left — a CONTINUE, or the
     driver's own stop, emptied it — while the incident's shape (which side faulted, a
     latched pull-back) is a fact about the fault the row opened on. The firmware's own
-    identifiers were recorded then, so the fault is re-read from them, never re-guessed:
-    a 16-hex ``hms[]`` code is ``attr`` + the 32-bit code word, an 8-hex ``print_error`` code
-    is the word itself (its low 16 bits the error) — the shapes the client records
-    (``BambuMQTTClient`` ``full_code``). An empty set when nothing was recorded or nothing
-    classifies: the caller's fields then speak alone, and no side is claimed
-    (:attr:`RecoveryIncident.extruder_side_only` None — nothing is parked).
+    identifiers were recorded then, so the fault is re-read from them through the one
+    reader of a recorded code (``hms_errors.classify_full_code``), never re-guessed — the
+    actionable ones, as the live entry gate would have kept them. An empty set when nothing
+    was recorded or nothing classifies: the caller's fields then speak alone, and no side
+    is claimed (:attr:`RecoveryIncident.extruder_side_only` None — nothing is parked).
+    Applied on EVERY re-entry whose wire names no actionable fault — the restart
+    continuation's and the mid-change re-entry's alike (coordinator ruling 2026-09-29).
     """
-    entries: list[HMSError] = []
-    for raw in (full_codes or "").split(","):
-        code = raw.strip().upper()
-        if len(code) not in (8, 16):
-            continue
-        try:
-            value = int(code, 16)
-        except ValueError:
-            continue
-        attr, word = (value >> 32, value & 0xFFFFFFFF) if len(code) == 16 else (value, value & 0xFFFF)
-        entries.append(HMSError(code=f"0x{word:x}", attr=attr, module=(attr >> 24) & 0xFF, severity=2, full_code=code))
-    return live_candidates(_RecordedWire(entries))
+    recorded = (classify_full_code(code) for code in (full_codes or "").split(","))
+    return frozenset(c for c in recorded if c is not None and c.fault_class in ACTIONABLE_CLASSES)
 
 
 async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asyncio.Task | None:

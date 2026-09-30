@@ -1312,6 +1312,51 @@ class TestCandidatesCarryTheirOwnIdentity:
         assert live_notices(SimpleNamespace(hms_errors=[SimpleNamespace(attr="bogus", code=None)])) == frozenset()
 
 
+class TestTheRecordedFullCodeReader:
+    """``classify_full_code`` — THE reader of a code an incident RECORDED
+    (``printer_incident.hms_full_codes``): the same taxonomy and candidate shape the live
+    wire gets, from the firmware's own identifier. The recovery driver re-entered after its
+    own stop reads which side faulted from it (coordinator ruling 2026-09-29)."""
+
+    def test_a_recorded_code_reads_as_the_live_entry_it_was_recorded_from(self):
+        from backend.app.services.hms_errors import classify_full_code, live_candidates
+
+        word = _word_entry(_tray_attr(ams_id=1, tray=2), 0x00020019)
+        short = _fake_hms_error(code="0x8010", attr=0x07008010, module=7, severity=3, full_code="07008010")
+
+        for entry in (word, short):
+            (live,) = live_candidates(SimpleNamespace(hms_errors=[entry]))
+            assert classify_full_code(entry.full_code) == live
+            assert classify_full_code(entry.full_code.lower()) == live  # case of the stored text is not identity
+
+    def test_the_side_and_the_class_survive_the_record(self):
+        from backend.app.services.hms_errors import AmsFaultClass, classify_full_code
+
+        extruder = classify_full_code("0300801E")  # print_error lane: main extruder overloaded
+        assert extruder is not None
+        assert (extruder.short_code, extruder.fault_class, extruder.extruder_side) == (
+            "0300_801E",
+            AmsFaultClass.MECHANICAL_FEED,
+            True,
+        )
+        notice = classify_full_code(_word_entry(_tray_attr(ams_id=0, tray=2), 0x00020025).full_code)
+        assert notice is not None and notice.fault_class is AmsFaultClass.INFORMATIONAL  # any class; caller filters
+
+    @pytest.mark.parametrize("value", ["", None, "ZZZ", "0700800", "07008010X", "0700000000008010FF"])
+    def test_a_value_that_is_no_full_code_reads_none(self, value):
+        from backend.app.services.hms_errors import classify_full_code
+
+        assert classify_full_code(value) is None
+
+    def test_the_renderer_splits_through_the_same_reader(self):
+        """One split: the printer-message renderer and the classifier read a stored code the
+        same way — the renderer's short code is the classifier's."""
+        from backend.app.services.hms_errors import classify_full_code, printer_message_from_full_code
+
+        for code in ("0701220000020019", "07008010", "0300801E"):
+            assert printer_message_from_full_code(code).short_code == classify_full_code(code).short_code
+
+
 def _external_attr(unit_byte: int = 0xFF, submodule: int = 0x20, module: int = 0x07) -> int:
     """An EXTERNAL spool-holder attr — the ``07FF_2000`` / ``07FE_2000`` shape."""
     return (module << 24) | (unit_byte << 16) | (submodule << 8)

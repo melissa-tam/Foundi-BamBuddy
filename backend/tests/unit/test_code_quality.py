@@ -1465,6 +1465,27 @@ class TestRecoveryDriverOwnership:
         ]
         assert len(homes) == 1, f"spool_recovery must publish print.stop exactly once, found {homes}"
         assert homes[0][1] == ("_LEVERS",), f"the restart stop is published outside the lever table: {homes}"
+        # ...and it is the ``publish`` of the rung keyed ``FAULT_RESTART_STEP`` — the one rung
+        # whose pull rule requires a farm unit and nothing deposited, not any other row.
+        table = next(
+            node.value
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(t, ast.Name) and t.id == "_LEVERS"
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            )
+        )
+        assert isinstance(table, ast.Dict)
+        (spec,) = [
+            value
+            for key, value in zip(table.keys, table.values, strict=True)
+            if isinstance(key, ast.Name) and key.id == "FAULT_RESTART_STEP"
+        ]
+        publish = next(kw.value for kw in spec.keywords if kw.arg == "publish")
+        assert any(
+            isinstance(node, ast.Call) and _called(node.func)[1] == "stop_print" for node in ast.walk(publish)
+        ), "the restart stop is not _LEVERS[FAULT_RESTART_STEP].publish"
 
     def test_the_restart_rung_reads_the_deposit_predicate_and_no_peak(self):
         """ "Has this job deposited anything" is ``plate_occupancy.DepositEvidence``'s one
