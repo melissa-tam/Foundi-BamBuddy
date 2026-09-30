@@ -2196,7 +2196,8 @@ def runout_hold_active(state) -> bool:
 
 # The H2-series NATIVE pre-print plate check: the printer PAUSEs the job at layer 0 and
 # shows the dialog on its screen. The single origin for the pause lane
-# (:func:`plate_check_paused`), the failure-reason category and the HMS-edge capture.
+# (:func:`plate_check_paused`, the plate-check episode's only trigger) and the
+# failure-reason category.
 #
 # Production (hms-events, all 6 tripped printers) sees these ONLY on the 32-bit
 # ``print_error`` lane — ``0500806E`` (83918958) and ``0500808C`` (83918988) — which is
@@ -2316,6 +2317,20 @@ def power_loss_hold_active(state) -> bool:
         return power_loss_prompt_standing(getattr(state, "hms_errors", None) or [])
     except Exception:  # noqa: BLE001 — a gate predicate must never raise into a callback/route
         return False
+
+
+# The low half of a ``print_error`` word below which the firmware is reporting a status or
+# phase, not a dialog: every dialog code is 0x4xxx (fatal), 0x8xxx (warning) or 0xCxxx
+# (prompt), and some firmware sends low values such as 0x0002 while printing normally. One
+# origin for ``bambu_mqtt``'s merge (which skips such words) and the pause lane's reading of
+# "a dialog that is not the plate check".
+_PRINT_ERROR_DIALOG_MIN = 0x4000
+
+
+def print_error_dialog(print_error: int) -> int:
+    """``print_error`` when it names a printer DIALOG, else 0 — no dialog, or a status/phase
+    word (:data:`_PRINT_ERROR_DIALOG_MIN`)."""
+    return print_error if (print_error & 0xFFFF) >= _PRINT_ERROR_DIALOG_MIN else 0
 
 
 def print_error_short_code(print_error: int) -> str:

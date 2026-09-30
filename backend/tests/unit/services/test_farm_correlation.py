@@ -674,28 +674,40 @@ class TestClassifyStopPlateRefused:
 
 
 class TestResolvePrintingFarmItem:
-    """The ownership question, extracted from the deleted ``on_native_plate_detection``:
-    is the farm loop responsible for what is on this printer?"""
+    """Which FARM unit is printing this job? Identity first (``resolve_printing_item``), then
+    ownership — is the farm loop responsible for it? What a plate-check episode binds."""
 
     async def test_an_eject_profile_makes_it_a_farm_unit(self, db_session):
         item = await _add_eject_item(db_session, printer_id=55, eject_profile_id=7)
-        assert (await resolve_printing_farm_item(db_session, 55)).id == item.id
+        assert (await resolve_printing_farm_item(db_session, 55, None)).id == item.id
 
     async def test_a_sku_batch_makes_it_a_farm_unit(self, db_session):
         batch = await _add_farm_batch(db_session)
         item = await _add_eject_item(db_session, printer_id=56, batch_id=batch.id)
-        assert (await resolve_printing_farm_item(db_session, 56)).id == item.id
+        assert (await resolve_printing_farm_item(db_session, 56, None)).id == item.id
 
     async def test_a_plain_print_is_not_a_farm_unit(self, db_session):
         await _add_eject_item(db_session, printer_id=57)
-        assert await resolve_printing_farm_item(db_session, 57) is None
+        assert await resolve_printing_farm_item(db_session, 57, None) is None
 
     async def test_nothing_printing_is_none(self, db_session):
-        assert await resolve_printing_farm_item(db_session, 58) is None
+        assert await resolve_printing_farm_item(db_session, 58, None) is None
+
+    async def test_the_unit_of_the_echoed_job_is_bound_not_the_newest_farm_row(self, db_session):
+        """Two printing rows on one printer: the job identity decides, and a plain (non-farm)
+        unit printing THAT job is no farm unit — it is never swapped for another farm row."""
+        farm = await _add_eject_item(db_session, printer_id=59, eject_profile_id=7)
+        farm.dispatch_subtask_id = "JOB-FARM"
+        plain = await _add_eject_item(db_session, printer_id=59)
+        plain.dispatch_subtask_id = "JOB-PLAIN"
+        await db_session.commit()
+
+        assert (await resolve_printing_farm_item(db_session, 59, "JOB-FARM")).id == farm.id
+        assert await resolve_printing_farm_item(db_session, 59, "JOB-PLAIN") is None
 
 
 class TestPlateOccupancyCodeSet:
-    """The vision codes the capture hook and the failure-reason attribution share."""
+    """The vision codes the pause lane and the failure-reason attribution share."""
 
     def test_the_four_native_vision_codes_are_pinned_members(self):
         from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES

@@ -207,7 +207,6 @@ from backend.app.services.incident_resolution import (
 )
 from backend.app.services.job_identity import same_job
 from backend.app.services.printer_incidents import (
-    RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
     runout_slot_desc,
     waiting_reason_for,
@@ -515,8 +514,10 @@ class LeverSpec:
 #   CHECK_ASSISTANT only, and CONTINUE is ``ams_control resume`` (``ams_control_resume``
 #   below; the fork's own dialog dispatcher, ``bambu_mqtt`` ``HMSAction.CONTINUE``, maps
 #   it so). Nor is it Studio's ``command_hms_resume`` / ``command_hms_ignore``, which carry
-#   ``err`` + ``param: "reserve"`` + ``job_id``: no fork publisher has ever sent that shape
-#   (the ``bambu_mqtt`` dialog helper NAMED ``hms_resume`` sends the plain resume). Freed
+#   ``err`` + ``param: "reserve"`` + ``job_id``: since 2026-09-29 ``bambu_mqtt.execute_hms_action``
+#   publishes those for the dialog's "Problem solved, resume" / "Ignore" buttons (the modal,
+#   and the plate-check episode's press in ``pause_recovery``), and no lever here sends
+#   either — a feed fault's dialog offers neither button. Freed
 #   009-H2S 2026-07-20 (an EMPTY path) — the one measured remote release, so it stays
 #   first; on a LOADED stalled feeder it re-runs the print's own change and re-holds
 #   (002-H2S 2026-09-11; 012-H2S 2026-09-23, re-PAUSEd in 47 s; 012-H2S 2026-09-25,
@@ -2163,7 +2164,7 @@ async def _close_for_new_fault(db: AsyncSession, row: PrinterIncident, verdict: 
     """End the open AMS row the new fault answered — the closers' own two steps.
 
     ``printer_incidents.close`` (the store's one closer, which logs the ``CLOSED …
-    source=`` line) and the unit's hold projection (:func:`_clear_hold_projection`), in
+    source=`` line) and the unit's hold projection (``printer_incidents.clear_hold_projection``), in
     that order, as every lifecycle closer does; the new incident stamps its own token
     when it opens. A close somebody else won leaves nothing to clear: that closer
     cleared it.
@@ -2171,7 +2172,7 @@ async def _close_for_new_fault(db: AsyncSession, row: PrinterIncident, verdict: 
     incident_id, printer_id, item_id, kind, status = row.id, row.printer_id, row.item_id, row.kind, row.status
     if await printer_incidents.close(db, incident_id, status=STATUS_RESOLVED, source=verdict.source) is None:
         return
-    cleared = await _clear_hold_projection(db, item_id)
+    cleared = await printer_incidents.clear_hold_projection(db, item_id)
     logger.info(
         "spool_recovery: printer %s new fault — %s incident %s closed (was %s) — %s%s",
         printer_id,
@@ -2283,20 +2284,21 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 return None
 
             if existing is None and printer_incidents.job_pause_held(printer_id):
-                # The printer PAUSED this job to ask a human about the plate (its own
-                # pre-print check), and every act this machine owns ends in a resume — a
-                # release lever, the swap round's resume, the refill auto-resume. Any of
-                # them would restart the print onto the plate the printer refused. So no
-                # new AMS incident is opened while that question stands: the human's
-                # resume ends the job pause, and a fault still standing then is owned on
-                # the very next push (and its raw alert reaches them meanwhile —
-                # ``will_own`` mirrors this gate). An AMS row ALREADY open keeps its
-                # owner; the upgrade below only re-classifies it and resumes nothing.
+                # The printer PAUSED this job at its own pre-print plate check, and every
+                # act this machine owns ends in a resume — a release lever, the swap round's
+                # resume, the refill auto-resume. Any of them would restart the print onto
+                # the plate the printer refused with no re-check. So no new AMS incident is
+                # opened while that question stands: the plate-check episode answers it
+                # (``pause_recovery`` — its re-check press, then a stop; a human in its
+                # fallback), and a fault still standing after the job pause ends is owned on
+                # the very next push (its raw alert reaches the operator meanwhile —
+                # ``will_own`` mirrors this gate). An AMS row ALREADY open keeps its owner;
+                # the upgrade below only re-classifies it and resumes nothing.
                 _note_outcome(
                     printer_id,
                     job_id,
                     fingerprint,
-                    "not owned — the printer paused this job for a human (plate check); the answer comes first",
+                    "not owned — the printer paused this job at its plate check; that answer comes first",
                 )
                 return None
 
@@ -2460,9 +2462,9 @@ async def will_own(db: AsyncSession, printer_id: int, state) -> bool:
         existing = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
         if existing is not None and not _new_fault_verdict(existing, state, printer_id).close:
             return True
-        # Mirrors the entry gate: while the printer's job is paused for a human (its own
-        # plate check), no NEW AMS incident is opened, so nothing speaks for this fault
-        # and its raw alert is the only word the operator gets about it.
+        # Mirrors the entry gate: while the printer's job is paused at its own plate check,
+        # no NEW AMS incident is opened, so nothing speaks for this fault and its raw alert
+        # is the only word the operator gets about it.
         if printer_incidents.job_pause_held(printer_id):
             return False
         job_id = (getattr(state, "subtask_id", None) or "").strip()
@@ -5052,28 +5054,6 @@ async def _clear_oor_if_resumed_on_jammed_feeder(db: AsyncSession, incident: Rec
 # happened: a human took the printer, not "recovery succeeded".
 
 
-def _clearable(reason: str | None) -> bool:
-    """May this hold token be cleared by an incident close?
-
-    Only the tokens this module owns (:data:`RECOVERY_WAITING_REASONS`). A unit
-    holding for a plate-vision trip or a filament deficit keeps its own reason — a
-    resume observed on the wire says nothing about those.
-    """
-    return reason in RECOVERY_WAITING_REASONS
-
-
-async def _clear_hold_projection(db: AsyncSession, item_id: int | None) -> bool:
-    """Drop the incident's ``waiting_reason`` projection from a farm unit."""
-    if item_id is None:
-        return False
-    item = await db.get(PrintQueueItem, item_id)
-    if item is None or not _clearable(item.waiting_reason):
-        return False
-    item.waiting_reason = None
-    await db.commit()
-    return True
-
-
 async def on_observed_running(printer_id: int) -> bool:
     """The printer is RUNNING again — close whatever incident it was holding.
 
@@ -5115,7 +5095,9 @@ async def on_observed_running(printer_id: int) -> bool:
                     continue
                 item_id, kind, status = incident.item_id, incident.kind, incident.status
                 if await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source):
-                    closed.append((incident.id, kind, status, await _clear_hold_projection(db, item_id)))
+                    closed.append(
+                        (incident.id, kind, status, await printer_incidents.clear_hold_projection(db, item_id))
+                    )
         for incident_id, kind, status, cleared in closed:
             logger.info(
                 "spool_recovery: printer %s observed RUNNING — %s incident %s closed (was %s)%s",
@@ -5276,7 +5258,7 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
                         first = now
 
                     await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source)
-                    cleared = await _clear_hold_projection(db, incident.item_id)
+                    cleared = await printer_incidents.clear_hold_projection(db, incident.item_id)
                     _hold_over_since.pop(incident.id, None)
                     _repair_resume_sent.discard(incident.id)
                     closed += 1
@@ -5385,7 +5367,7 @@ async def rearm_incidents_on_startup() -> int:
                         driverless.append((incident.id, pid))
                     continue
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source)
-                await _clear_hold_projection(db, incident.item_id)
+                await printer_incidents.clear_hold_projection(db, incident.item_id)
                 closed += 1
                 logger.info(
                     "spool_recovery: startup — printer %s incident %s (%s) closed — %s",
@@ -5823,13 +5805,14 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
             return False
 
         if printer_incidents.job_pause_held(printer_id):
-            # The printer ALSO paused this job to ask a human about the plate. A refill
-            # resume would answer that question too, onto the plate it refused — the one
-            # predicate every job-resuming lane reads. The runout hold stays open and the
-            # human's resume closes both.
+            # The printer ALSO paused this job at its plate check. A refill resume would
+            # answer that question too, onto the plate it refused with no re-check — the one
+            # predicate every job-resuming lane reads. The runout hold stays open: the
+            # plate-check episode's own press (``pause_recovery``) or, in its fallback, a
+            # human's resume answers both.
             logger.info(
                 "spool_recovery: printer %s is held at a job pause (the printer's plate check) — refill seen, "
-                "not resuming; the operator resumes on the printer",
+                "not resuming; the plate-check episode answers that pause",
                 printer_id,
             )
             return False
@@ -5901,11 +5884,11 @@ async def _resume_after_repair(printer_id: int, incident_id: int) -> bool:
             return False
 
         if printer_incidents.job_pause_held(printer_id):
-            # Same rule as the refill lane: the printer paused this job for a human's
-            # answer about the plate, and a repair resume would answer it for them.
+            # Same rule as the refill lane: the printer paused this job at its plate check,
+            # and a repair resume would answer that pause with no re-check.
             logger.info(
                 "spool_recovery: printer %s is held at a job pause (the printer's plate check) — repair seen, "
-                "not resuming; the operator resumes on the printer",
+                "not resuming; the plate-check episode answers that pause",
                 printer_id,
             )
             return False
@@ -6083,7 +6066,7 @@ async def _close_runout_hold_and_notify(printer_id: int, slot: tuple[int, int] |
             slot_desc = runout_slot_desc(tray) or "the filament slot"
             if incident is not None:
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_AUTO_RESUME)
-            await _clear_hold_projection(db, item_id)
+            await printer_incidents.clear_hold_projection(db, item_id)
             printer = await db.get(Printer, printer_id)
             printer_name = (printer.name if printer else None) or f"printer {printer_id}"
             st = _get_state(printer_id)
