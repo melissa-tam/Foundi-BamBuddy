@@ -649,6 +649,29 @@ class TestClassifyStopPlateRefused:
     def test_no_holds_is_the_pre_existing_behaviour(self):
         assert classify_stop({"status": "failed", "subtask_id": "JOB-7"}, operator_stop_requested=True) == "operator_ui"
 
+    @pytest.mark.parametrize(
+        ("echo", "recorded", "refused"),
+        [
+            ("0", "", True),  # a LAN print's "0" IS the id-less job the hold recorded
+            ("", "0", True),
+            ("", "", True),
+            ("0", "0", True),
+            ("JOB-7", "", False),  # an id on one side only is another job
+            ("0", "JOB-7", False),
+        ],
+        ids=["zero-vs-empty", "empty-vs-zero", "both-empty", "both-zero", "echo-named", "hold-named"],
+    )
+    def test_the_hold_binds_its_job_by_the_held_job_rule(self, echo, recorded, refused):
+        """``job_identity.is_held_job`` (2026-09-29): a foreign plate-check trip whose
+        terminal echoes ``"0"`` over a hold that recorded ``""`` is the same id-less job — the
+        hand ``str(...).strip() ==`` it replaced called them different, so that stop would
+        have classified as no refusal at all."""
+        hold = {"kind": "plate_vision", "job_id": recorded, "printer_messages": []}
+        verdict = classify_stop(
+            {"status": "failed", "subtask_id": echo}, operator_stop_requested=False, open_incidents=[hold]
+        )
+        assert (verdict == STOP_VERDICT_PLATE_REFUSED) is refused
+
 
 class TestResolvePrintingFarmItem:
     """The ownership question, extracted from the deleted ``on_native_plate_detection``:

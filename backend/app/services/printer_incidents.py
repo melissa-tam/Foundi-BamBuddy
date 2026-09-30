@@ -59,27 +59,30 @@ time and never cached — the projection is filled at open and at rehydrate, and
 stale the moment a driver spawned or exited), the resolution closers through
 ``incident_resolution.Context.driver_live``, and the stall watchdog.
 ``incident_resolution.driver_owns`` keeps taking ``live`` as a PARAMETER, so the rule
-table stays a pure function of what it is handed. Registration is observability, never a
-gate — entry exclusivity stays the partial unique index above. The slot used to live in
-``spool_recovery``, and it moved for the reason this module exists at all: a status
-serializer must not import the recovery machine to ask whether the machine is running.
+table stays a pure function of what it is handed. For the AMS driver registration is
+observability, never a gate — entry exclusivity stays the partial unique index above; the
+plate-check episode driver's re-entry gates on it (:func:`register_driver`). The slot used
+to live in ``spool_recovery``, and it moved for the reason this module exists at all: a
+status serializer must not import the recovery machine to ask whether the machine is running.
 
 **The step ledger is written here as well** (:func:`note_step` / :func:`answer_step`, the
-ONE writer of ``printer_incident_step``): what a driver SENT against an incident, one row
-per lever pulled or command sent. The wire cannot restate it — a stalled feeder answers
-every release lever with the same re-PAUSE in the same change — so a restart must read it
-here to resume the ladder at the next unpulled lever instead of re-grinding the feeder.
+ONE writer of ``printer_incident_step``, called only by :class:`EvidenceLog`): what a
+driver SENT against an incident, one row per step. The wire cannot restate it — a stalled
+feeder answers every release lever with the same re-PAUSE in the same change, and a plate
+check reads PAUSE before and after the farm pressed its re-check — so a restart must read it
+here to resume at the next unsent step instead of re-sending what already went out.
 """
 
 from __future__ import annotations
 
 import logging
 import statistics
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
-from sqlalchemy import func as sa_func, or_, select
+from sqlalchemy import exists, func as sa_func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.models.printer_incident import (
@@ -99,6 +102,8 @@ from backend.app.models.printer_incident import (
     RESOLVE_AUTO_RESUME,
     RESOLVE_DRIVER_SELF_HEAL,
     RESOLVE_DRIVER_SWAP,
+    RESOLVE_PLATE_REFUSED,
+    RESOLVE_RECHECK_PASSED,
     RESOLVE_TERMINAL,
     RESOLVES_ON,
     STATUS_ABORTED,
@@ -113,9 +118,13 @@ from backend.app.models.printer_incident_step import PrinterIncidentStep, StepKi
 # renderer is imported at module level — no cycle can form through it.
 from backend.app.services.hms_errors import PrinterMessage, messages_from_full_codes
 
+# ``job_identity`` is stdlib-only by construction, so the held-job rule is imported the same way.
+from backend.app.services.job_identity import is_held_job
+
 if TYPE_CHECKING:
     import asyncio
     from collections.abc import Iterable
+    from typing import Self
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -570,16 +579,19 @@ def automation_held(printer_id: int | None) -> bool:
 
 
 def job_pause_held(printer_id: int | None) -> bool:
-    """Is this printer's job PAUSED waiting on a human's answer? Pure, DB-free, sync.
+    """Is this printer's job PAUSED at a plate check that only its OWN answerers may answer? Pure, DB-free, sync.
 
     THE one predicate every lane that RESUMES a job reads — the :func:`automation_held`
     idiom, and for the same reason (it is asked from the ~1 Hz sampler's drivers and from
     the AMS entry gate, neither of which may wait on the DB). True while an open row's
     class is ``job_pause`` — today the printer's own pre-print plate check
-    (``plate_vision``): the printer said the plate is wrong and paused the job, and the
-    only answers are a human's — fix the plate and resume, or stop. A power-loss resume,
-    an AMS release lever or a refill auto-resume answering that pause instead would
-    restart the print onto the plate the printer just refused (2026-09-24, 003-H2S).
+    (``plate_vision``): the printer said the plate is wrong and paused the job. Its
+    answerers are named (2026-09-29): the farm's plate-check episode driver
+    (``pause_recovery`` — the printer's own "Problem solved, resume", which RE-CHECKS the
+    plate, then a stop) and a human (fix the plate and resume, or stop). A power-loss
+    resume, an AMS release lever or a refill auto-resume answering that pause instead
+    would restart the print onto the plate the printer just refused with no re-check at
+    all (2026-09-24, 003-H2S) — so every OTHER resume lane stands aside on this.
 
     It is deliberately NOT :func:`automation_held`: a job pause stands the farm's
     RESUMES down and nothing else — the printer still takes its HMS pages, its reminders
@@ -617,12 +629,21 @@ def cached_kind(printer_id: int, incident_id: int) -> str | None:
 def register_driver(printer_id: int, task: asyncio.Task[object], *, incident_id: int) -> None:
     """Take this printer's liveness slot for a freshly spawned recovery driver.
 
-    OBSERVABILITY, not a gate. Entry exclusivity stays the DB's partial unique index, so
-    no liveness check guards the spawn — the durable row is the authority and a second,
-    in-memory one would only drift from it. But a driver spawning over a LIVE one means a
-    closer freed the open row from under that one, so if it ever happens it must be one
-    grep away: 006-H2S 17:23:55 (2026-09-04) produced no line at all, and the single line
-    naming the moment is the difference between a grep and a 15 h triage.
+    For the AMS recovery driver it is OBSERVABILITY, not a gate: entry exclusivity stays
+    the DB's partial unique index, so no liveness check guards that spawn — the durable
+    row is the authority and a second, in-memory one would only drift from it.
+
+    For the plate-check episode driver (``pause_recovery``, 2026-09-29) :func:`driver_live`
+    IS a gate. That lane re-enters an open ``recovering`` row after a restart, and its
+    episode row already exists when it does, so the unique index cannot refuse a second
+    driver: the lane refuses to spawn while :func:`driver_live` holds, and a
+    ``recovering`` ``job_pause`` row is owned only while a driver is live
+    (``incident_resolution.driver_owns``). It stays one slot per printer for both lanes.
+
+    Either way a driver spawning over a LIVE one means a closer freed the open row from
+    under that one, so if it ever happens it must be one grep away: 006-H2S 17:23:55
+    (2026-09-04) produced no line at all, and the single line naming the moment is the
+    difference between a grep and a 15 h triage.
     """
     live = _drivers.get(printer_id)
     if live is not None and not live.done():
@@ -1057,11 +1078,11 @@ async def close_open_for_printer(
 
 # --- the step ledger (2026-09-23) --------------------------------------------------
 #
-# What a recovery driver SENT against an incident, one ``printer_incident_step`` row per
-# lever pulled or command sent (the model docstring has the why). This module is its ONE
-# writer: a step is noted at the SEND and answered at the READ, so a crash between the
-# two leaves "sent, never read" on disk — exactly what re-entry must know, because that
-# lever is spent and nobody saw what it did.
+# What a driver SENT against an incident, one ``printer_incident_step`` row per step (the
+# model docstring has the why). This module is its ONE writer, and :class:`EvidenceLog`
+# the one caller of that writer: a step is noted at the SEND and answered at the READ, so
+# a crash between the two leaves "sent, never read" on disk — exactly what re-entry must
+# know, because that step is spent and nobody saw what it did.
 
 
 async def note_step(
@@ -1132,6 +1153,181 @@ async def steps_of(db: AsyncSession, incident_id: int) -> list[PrinterIncidentSt
     return list(result.scalars().all())
 
 
+async def count_rows_with_step(
+    db: AsyncSession,
+    *,
+    printer_id: int,
+    kind: str,
+    step_kind: StepKind,
+    since: datetime,
+    exclude_job_id: str | None,
+) -> int:
+    """How many rows of ``kind`` on this printer, opened at or after ``since``, hold at
+    least one step of ``step_kind`` on the ledger — leaving out the row(s) of the job
+    ``exclude_job_id``.
+
+    The store read behind "how many OTHER plate-check episodes on this printer did the farm
+    already stop in the window" (``pause_recovery.plate_check_facts``): the retry-or-escalate
+    verdict counts the farm's own ``stop`` steps, so an operator's stop or a foreign
+    terminal — neither of which writes one — never counts. Open and closed rows alike: an
+    episode is counted by what the farm SENT in it, not by how it ended.
+
+    The excluded job is decided by :func:`~backend.app.services.job_identity.is_held_job`,
+    in Python — the held-job rule has one spelling, and SQL cannot spell its ``unknown``
+    arm. So ``None`` / ``""`` / ``"0"`` all name the id-less job, and exclude the rows that
+    recorded none. The step test is an ``EXISTS`` over the ledger, so a row with several
+    steps of that kind is counted once.
+    """
+    has_step = (
+        exists()
+        .where(PrinterIncidentStep.incident_id == PrinterIncident.id)
+        .where(PrinterIncidentStep.kind == step_kind)
+    )
+    rows = (
+        await db.execute(
+            select(PrinterIncident.job_id)
+            .where(PrinterIncident.printer_id == printer_id)
+            .where(PrinterIncident.kind == kind)
+            .where(PrinterIncident.created_at >= since)
+            .where(has_step)
+        )
+    ).scalars()
+    return sum(1 for job in rows if not is_held_job(job, exclude_job_id))
+
+
+# --- the evidence log: the step ledger's ONE writer --------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class StepEntry:
+    """The ledger columns a step is WRITTEN with at the send (``note_step``'s arguments)."""
+
+    kind: StepKind
+    name: str
+    target: int | None = None
+    feeder: str | None = None
+
+
+class LoggedStep(Protocol):
+    """What :class:`EvidenceLog` needs of a driver's own step type.
+
+    A step is a frozen value the driver drafts (``seq`` 0, unsent); the log places it
+    (:meth:`sent`: its ``seq`` and send time), writes it as :meth:`entry`, and fills its
+    read (:meth:`answered`, which RAISES ``LookupError`` for a token the driver's own
+    vocabulary cannot name — an answer the driver cannot read back is drift, never data).
+    """
+
+    @property
+    def seq(self) -> int: ...
+
+    def entry(self) -> StepEntry: ...
+
+    def sent(self, seq: int, at: datetime) -> Self: ...
+
+    def answered(self, outcome: str) -> Self: ...
+
+
+S = TypeVar("S", bound=LoggedStep)
+
+
+@dataclass
+class EvidenceLog(ABC, Generic[S]):
+    """THE evidence log of one incident: every step a driver sent against it, in send
+    order, with what the wire answered — the RECORDS a driver's next step, its give-up
+    reason and its page are derived from.
+
+    Durable, because the wire cannot restate it: on a feeder-stall wedge every release
+    verb's consequence is identical (012-H2S 2026-09-23 — both CONTINUE spellings re-ran
+    the stalled feed and re-held in ``1/5``), and a plate check's PAUSE reads the same
+    before and after the farm pressed "Problem solved, resume" — so a driver restarted
+    from the wire alone re-sends what it already sent. Every step is persisted at the
+    SEND (:meth:`note`) and answered at the READ (:meth:`answer`) through
+    :func:`note_step` / :func:`answer_step` — this class is their ONE caller — and a log
+    is built ONLY by :meth:`from_row` (AST-pinned), so a driver never starts from an
+    in-memory log that forgot what the incident already sent.
+
+    Generic over the driver's step type, because the VOCABULARY is the driver's (a lever
+    and its reading, an AMS command and its answer, a dialog button and its ACK) while
+    the write discipline is the store's. A driver binds its vocabulary by subclassing and
+    implementing :meth:`_step_of`; everything it derives from its log (budgets, the
+    give-up reason, the rung it owes) lives on that subclass, as projections of
+    :attr:`steps`, never as a second count.
+
+    Moved here from ``spool_recovery`` on 2026-09-29, when the plate-check episode
+    driver became the ledger's second driver: a second writer is exactly what the
+    single-writer pin forbids, so the writer moved to the store both drivers already use.
+    """
+
+    incident_id: int
+    steps: list[S] = field(default_factory=list)
+
+    @classmethod
+    async def from_row(cls, db: AsyncSession, incident_id: int) -> Self:
+        """The log of ``incident_id`` as the ledger holds it — empty for a fresh incident,
+        the previous driver's steps for a re-entered one. Hydration RAISES (through
+        :meth:`_step_of`) on a row the driver's vocabulary cannot name."""
+        return cls(incident_id=incident_id, steps=[cls._step_of(row) for row in await steps_of(db, incident_id)])
+
+    @classmethod
+    @abstractmethod
+    def _step_of(cls, row: PrinterIncidentStep) -> S:
+        """Hydrate ONE ledger row into the driver's step type. A token the driver's
+        vocabulary cannot name RAISES ``LookupError`` — a ledger that says something the
+        driver cannot read is drift, never a skipped row."""
+
+    async def note(self, step: S) -> int:
+        """Append ``step`` (a driver's unsent draft) with the next ``seq`` and PERSIST it,
+        in its own session, at the send. Returns the seq.
+
+        Best-effort on the write: a failed commit is logged and the in-memory step stands,
+        so the live driver's own budget still holds — what is lost is only the durability
+        a re-entry would read. A ledger write must never crash a driver.
+        """
+        from backend.app.core.database import async_session
+
+        seq = max((s.seq for s in self.steps), default=0) + 1
+        at = datetime.utcnow()
+        entry = step.entry()
+        try:
+            async with async_session() as db:
+                row = await note_step(
+                    db,
+                    self.incident_id,
+                    seq=seq,
+                    kind=entry.kind,
+                    name=entry.name,
+                    target=entry.target,
+                    feeder=entry.feeder,
+                )
+                at = row.sent_at
+        except Exception:  # noqa: BLE001 — a ledger write must never crash the driver
+            logger.exception("printer_incidents: incident %s step %s could not be persisted", self.incident_id, seq)
+        self.steps.append(step.sent(seq, at))
+        return seq
+
+    async def answer(self, seq: int, outcome: str) -> None:
+        """Fill step ``seq``'s outcome in memory AND on the ledger. The step validates the
+        token (:meth:`LoggedStep.answered`) before anything is written."""
+        from backend.app.core.database import async_session
+
+        index = next((i for i, s in enumerate(self.steps) if s.seq == seq), None)
+        if index is None:
+            raise LookupError(f"printer_incidents: incident {self.incident_id} has no step {seq} to answer")
+        self.steps[index] = self.steps[index].answered(outcome)
+        try:
+            async with async_session() as db:
+                await answer_step(db, self.incident_id, seq, outcome=outcome)
+        except Exception:  # noqa: BLE001 — a ledger write must never crash the driver
+            logger.exception(
+                "printer_incidents: incident %s step %s answer could not be persisted", self.incident_id, seq
+            )
+
+    def has_step(self, kind: StepKind) -> bool:
+        """Does this log hold a step of ``kind`` — sent, answered or not? The per-episode
+        reading of :func:`count_rows_with_step`'s ledger test."""
+        return any(step.entry().kind == kind for step in self.steps)
+
+
 # --- the outcome ledger (2026-09-11) ------------------------------------------------
 #
 # WHAT a closed row means, derived from three stored facts and nothing else:
@@ -1159,8 +1355,12 @@ OUTCOMES: tuple[str, ...] = (
 
 # The closes the FARM performed. A refill auto-resume on a row that was never paged
 # cannot happen today (a runout escalates before its refill lane can fire), so its
-# membership here is the rule, not an observed count.
-_FARM_CLOSES: frozenset[str] = frozenset({RESOLVE_DRIVER_SWAP, RESOLVE_DRIVER_SELF_HEAL, RESOLVE_AUTO_RESUME})
+# membership here is the rule, not an observed count. ``recheck_passed`` (2026-09-29) is
+# the plate-check driver's: it pressed the printer's own "Problem solved, resume" and the
+# same job printed on.
+_FARM_CLOSES: frozenset[str] = frozenset(
+    {RESOLVE_DRIVER_SWAP, RESOLVE_DRIVER_SELF_HEAL, RESOLVE_AUTO_RESUME, RESOLVE_RECHECK_PASSED}
+)
 
 
 def outcome_of(incident: PrinterIncident) -> str:
@@ -1171,7 +1371,7 @@ def outcome_of(incident: PrinterIncident) -> str:
     stopped the print, or pressed Recover). Only a row that closed WITHOUT paging can
     be the farm's own recovery, and only when the close came from the farm's own act
     (:data:`_FARM_CLOSES`) or, for a plate-vision trip, from the terminal of the stop
-    the farm itself sent — the first-trip re-check that requeues without a page.
+    the farm itself sent — the stop-and-retry that requeues without a page.
     Everything else that closed unpaged closed on evidence nobody produced (a wire
     edge, a job ending, a restart) and is counted honestly as neither.
 
@@ -1183,11 +1383,24 @@ def outcome_of(incident: PrinterIncident) -> str:
     construction; only a source-less abort (the fault never held the printer) is
     ``transient``.
 
-    The ``plate_vision`` / ``terminal`` arm is a RENDERER OF HISTORY only (2026-09-24):
-    it buckets the rows the retired 2026-09-04 lane closed at the terminal of its own
-    stop. No writer produces that shape any more — a plate-check hold opens ESCALATED, so
-    every close of one is ``human_resolved`` — and the arm stays so the ledger keeps
-    reading those rows the way it always did.
+    The ``plate_vision`` arms are LIVE (2026-09-29, the plate-check ladder). A plate-check
+    episode opens ``recovering`` and the farm's driver acts, so an unpaged row is read by
+    who answered it:
+
+    * ``recheck_passed`` — the farm's re-check press let the job print on: in
+      :data:`_FARM_CLOSES`, ``auto_recovered``.
+    * ``terminal`` — the paused job's terminal with no refusal: the farm's own stop and
+      its retry (the unit requeued next in line, no gate, no page), so ``auto_recovered``.
+      The rows the retired 2026-09-04 lane closed at the terminal of its own stop read
+      the same way, as they always did.
+    * ``plate_refused`` — the terminal REFUSED the plate: a human-clear gate and a page
+      follow, the printer is a human's to clear, so ``human_resolved`` whether or not the
+      row itself was escalated first (the page rides the plate gate, not this row).
+      ``human_resolved`` rather than ``held``: the row is closed, and ``held`` is an open
+      row's bucket.
+    * ``handed_over`` — the job paused for another owner (the power-loss prompt); nobody
+      recovered anything, so it falls through to ``resolved_unpaged`` like any close on
+      evidence nobody produced.
     """
     if incident.resolved_at is None:
         return OUTCOME_HELD if incident.status == STATUS_ESCALATED else OUTCOME_RECOVERING
@@ -1199,6 +1412,8 @@ def outcome_of(incident: PrinterIncident) -> str:
         return OUTCOME_AUTO_RECOVERED
     if incident.kind == KIND_PLATE_VISION and incident.resolve_source == RESOLVE_TERMINAL:
         return OUTCOME_AUTO_RECOVERED
+    if incident.kind == KIND_PLATE_VISION and incident.resolve_source == RESOLVE_PLATE_REFUSED:
+        return OUTCOME_HUMAN_RESOLVED
     return OUTCOME_RESOLVED_UNPAGED
 
 

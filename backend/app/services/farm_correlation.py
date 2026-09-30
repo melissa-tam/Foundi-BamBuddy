@@ -87,6 +87,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer_incident import KIND_PLATE_VISION
 from backend.app.services.dispatch_target import target_of
+from backend.app.services.job_identity import is_held_job
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     DepositEvidence,
@@ -731,7 +732,8 @@ def classify_stop(
     In precedence order:
 
     - ``plate_refused``     — the terminal is NOT ``completed`` and names the job an open
-      ``plate_vision`` hold paused (same ``job_id``). The printer's own plate check
+      ``plate_vision`` hold paused (``job_identity.is_held_job``: an id-less echo is the
+      id-less job the hold recorded, ``""`` and ``"0"`` alike). The printer's own plate check
       refused the plate and the job ended without printing. Highest precedence, above
       both operator signals: the operator pressing Stop on a paused plate check is how
       this verdict is USUALLY produced, and what it means for the plate and the unit is
@@ -761,9 +763,9 @@ def classify_stop(
     inputs once, before any consumer of the terminal mutates state.
     """
     status = str(payload.get("status") or "")
-    job = (payload.get("subtask_id") or "").strip()
+    job = str(payload.get("subtask_id") or "")
     if status != "completed" and any(
-        incident.get("kind") == KIND_PLATE_VISION and str(incident.get("job_id") or "").strip() == job
+        incident.get("kind") == KIND_PLATE_VISION and is_held_job(job, str(incident.get("job_id") or ""))
         for incident in open_incidents
     ):
         return STOP_VERDICT_PLATE_REFUSED

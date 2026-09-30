@@ -66,11 +66,11 @@ from backend.app.models.printer_incident import (
     KIND_RUNOUT,
     KIND_Z_REFERENCE_LOST,
     STATUS_ESCALATED,
-    STATUS_RECOVERING,
 )
 from backend.app.services import notify_dedup
 from backend.app.services.dispatch_claim import ClaimEvidence, has_live_start_watchdog, judge
 from backend.app.services.hms_errors import current_runout_demand
+from backend.app.services.incident_resolution import driver_owns
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.printer_incidents import (
     RECOVERY_WAITING_REASONS,
@@ -670,15 +670,19 @@ async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manage
                 live_subtask=(getattr(st, "subtask_id", None) or "").strip(),
                 claim_age_s=None if started_at is None else (wall - started_at).total_seconds(),
                 watchdog_live=has_live_start_watchdog(item.id),
-                # Stand down only while somebody is ACTING on the printer — a
-                # ``recovering`` row (a driver, or the startup re-entry's own lane) or a
-                # live recovery task. An ESCALATED hold is a human's, not an actor that
-                # can land a print, and under the equipment-fault model it can be
-                # PERMANENT: 003-H2S's item 1988 (dispatched, never started, behind a
-                # physical hold the terminal no longer launders) must still be released.
+                # Stand down only while somebody is ACTING on the printer — a live
+                # recovery task, or an open row a driver owns without one
+                # (``incident_resolution.driver_owns``, the ONE spelling: an AMS
+                # ``recovering`` row is the startup re-entry's promise; a ``job_pause`` row
+                # is owned only while its driver lives). An ESCALATED hold is a human's,
+                # not an actor that can land a print, and under the equipment-fault model
+                # it can be PERMANENT: 003-H2S's item 1988 (dispatched, never started,
+                # behind a physical hold the terminal no longer launders) must still be
+                # released. The live task is asked first and on its own, because a driver
+                # finishing after its row closed is still acting on the printer.
                 recovery_acting=(
-                    any(row.status == STATUS_RECOVERING for row in await printer_incidents.open_rows(db, pid))
-                    or printer_incidents.driver_live(pid)
+                    printer_incidents.driver_live(pid)
+                    or any(driver_owns(row, live=False) for row in await printer_incidents.open_rows(db, pid))
                 ),
             )
             verdict = judge(evidence)

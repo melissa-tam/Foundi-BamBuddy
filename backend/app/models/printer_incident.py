@@ -293,6 +293,15 @@ RESOLVE_DRIVER_SELF_HEAL = "driver_self_heal"
 # The startup rearm found the printer positive and closed the row: a RESTART's
 # reconciliation, not a witnessed resume — the edge itself was never observed.
 RESOLVE_REARM = "startup_rearm"
+# The plate-check episode's closes (the 2026-09-29 ladder, ``pause_recovery``). Each fits
+# ``resolve_source``'s VARCHAR(24) and is free text, so none needs a migration.
+#
+# The farm pressed the printer's "Problem solved, resume" and the re-check passed: the job printed on.
+RESOLVE_RECHECK_PASSED = "recheck_passed"
+# The paused job's terminal, with the plate REFUSED at it: a human-clear gate and a page follow.
+RESOLVE_PLATE_REFUSED = "plate_refused"
+# The job paused for something other than the plate check; the episode handed the pause to its owner.
+RESOLVE_HANDED_OVER = "handed_over"
 # A JOB PAUSE whose job the printer POSITIVELY reports over — a terminal / idle state, or
 # another job on the printer — without the farm ever seeing that job's own terminal (a
 # restart or a dropped session swallowed it, and no reconcile synthesised one). A job

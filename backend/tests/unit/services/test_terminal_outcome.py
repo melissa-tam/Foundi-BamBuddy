@@ -121,6 +121,28 @@ class TestThePrintersEvidence:
         assert outcome.printer_message is None
         assert outcome.failure_category is None
 
+    @pytest.mark.parametrize(
+        ("echo", "recorded", "explains"),
+        [("0", "", True), ("", "0", True), ("", "", True), (_JOB, "", False), ("0", _JOB, False)],
+        ids=["zero-vs-empty", "empty-vs-zero", "both-empty", "echo-named", "hold-named"],
+    )
+    def test_the_hold_binds_its_job_by_the_held_job_rule(self, echo, recorded, explains):
+        """``job_identity.is_held_job`` (2026-09-29): an id-less foreign trip's ``"0"`` echo is
+        the id-less job its hold recorded as ``""``, so the hold's words explain its terminal."""
+        hold = {"kind": "plate_vision", "job_id": recorded, "printer_messages": [_VISION_WORDS]}
+        outcome = build_terminal_outcome(
+            raw_status="failed",
+            verdict="plate_refused",
+            open_incidents=[hold],
+            job_id=echo,
+            evidence=_evidence(deposited=False),
+            first_article=False,
+            is_eject=False,
+            hms_errors=[],
+        )
+        assert (outcome.printer_message == "[0500_808C] Detected build plate offset.") is explains
+        assert (outcome.plate_refusal is not None and bool(outcome.plate_refusal.messages)) is explains
+
     def test_the_holds_words_lead_and_the_live_list_follows_deduplicated(self):
         runout = {"code": "0x8011", "attr": 0x07FF_0000, "module": 7, "severity": 2}
         vision_again = {"code": "0x808c", "attr": 0x0500_0000, "module": 5, "severity": 2}

@@ -1129,6 +1129,42 @@ class TestDeadDispatchClaims:
         db_session.expunge_all()
         assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
 
+    @pytest.mark.parametrize(("live", "released"), [(False, True), (True, False)])
+    async def test_a_recovering_plate_check_episode_acts_only_through_a_live_driver(
+        self, db_session, monkeypatch, live, released
+    ):
+        """``recovery_acting`` asks ``incident_resolution.driver_owns`` per open row — the
+        ONE spelling, class-aware since 2026-09-29: a ``recovering`` job-pause row is a
+        promise only a LIVE driver keeps, so with no driver it holds no claim, while the AMS
+        ``recovering`` row above still does."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION, STATUS_RECOVERING
+        from backend.app.services import printer_incidents
+
+        class _Live:
+            def done(self) -> bool:
+                return False
+
+        item = await _add_claim(db_session, 33)
+        await printer_incidents.open_new(
+            db_session,
+            printer_id=33,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="plate_vision:0500_808C",
+            slot_global_tray=None,
+            status=STATUS_RECOVERING,
+        )
+        if live:
+            monkeypatch.setitem(printer_incidents._drivers, 33, _Live())  # noqa: SLF001
+        mgr = _FakeManager({33: True}, {33: _FakeState("IDLE")})
+
+        await _mature(db_session, mgr)
+
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).status == ("pending" if released else "printing")
+
     async def test_an_offline_printer_is_left_to_the_offline_watch(self, db_session):
         item = await _add_claim(db_session, 31)
         mgr = _FakeManager({31: False}, {31: _FakeState("IDLE")})
