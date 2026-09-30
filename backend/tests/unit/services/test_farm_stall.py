@@ -1143,6 +1143,42 @@ class TestDeadDispatchClaims:
         db_session.expunge_all()
         assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
 
+    @pytest.mark.parametrize(("live", "released"), [(False, True), (True, False)])
+    async def test_a_recovering_plate_check_episode_acts_only_through_a_live_driver(
+        self, db_session, monkeypatch, live, released
+    ):
+        """``recovery_acting`` asks ``incident_resolution.driver_owns`` per open row — the
+        ONE spelling, class-aware since 2026-09-29: a ``recovering`` job-pause row is a
+        promise only a LIVE driver keeps, so with no driver it holds no claim, while the AMS
+        ``recovering`` row above still does."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION, STATUS_RECOVERING
+        from backend.app.services import printer_incidents
+
+        class _Live:
+            def done(self) -> bool:
+                return False
+
+        item = await _add_claim(db_session, 33)
+        await printer_incidents.open_new(
+            db_session,
+            printer_id=33,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_PLATE_VISION,
+            code="0500_808C",
+            codes="plate_vision:0500_808C",
+            slot_global_tray=None,
+            status=STATUS_RECOVERING,
+        )
+        if live:
+            monkeypatch.setitem(printer_incidents._drivers, 33, _Live())  # noqa: SLF001
+        mgr = _FakeManager({33: True}, {33: _FakeState("IDLE")})
+
+        await _mature(db_session, mgr)
+
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).status == ("pending" if released else "printing")
+
     async def test_an_offline_printer_is_left_to_the_offline_watch(self, db_session):
         item = await _add_claim(db_session, 31)
         mgr = _FakeManager({31: False}, {31: _FakeState("IDLE")})
@@ -1501,6 +1537,123 @@ class TestPauseCauseIncidentReminders:
 
         mock_pl.assert_not_awaited()
         mock_ams.assert_awaited_once()
+
+
+def _refuse_plate(printer_id: int):
+    """Gate ``printer_id``'s plate the way a REFUSED plate-check terminal does (the one plate
+    call, through the correlation module's disposition factory); returns the refusal."""
+    from backend.app.services import farm_correlation
+    from backend.app.services.hms_errors import PrinterMessage
+    from backend.app.services.plate_occupancy import DepositEvidence, PlateRefusal, plate_occupancy
+
+    refusal = PlateRefusal(
+        messages=(PrinterMessage(short_code="0500_808C", description="Detected build plate offset."),)
+    )
+    plate_occupancy.note_terminal(
+        printer_id,
+        farm_correlation.terminal_disposition(
+            verdict="matched",
+            item_id=None,
+            eject_profile_id=None,
+            first_article=False,
+            batch_id=None,
+            source_subtask_id="SUB-V",
+            evidence=DepositEvidence(
+                final_status="cancelled", is_dry_run=False, peaks_reliable=True, last_layer_num=0, last_progress=0
+            ),
+            raise_gate=True,
+            refusal=refusal,
+        ),
+    )
+    return refusal
+
+
+class TestRefusedPlateReminders:
+    """The escalation end of the plate-check ladder (operator ruling 2026-09-29): "a page right
+    away, then hourly". The eject monitor sends the first page the moment the refused plate is
+    gated; THIS arm repeats it once per window until a human clears the plate. The plate-check
+    row was closed by the terminal that refused the plate, so the GATE is the fact read here."""
+
+    @pytest.fixture
+    def pages(self, monkeypatch):
+        from backend.app.services.eject import monitor as monitor_mod
+
+        sent: list[tuple[int, str]] = []
+
+        async def _page(printer_id, *, source_detail=""):
+            sent.append((printer_id, source_detail))
+
+        monkeypatch.setattr(monitor_mod, "notify_plate_not_empty", _page)
+        return sent
+
+    @staticmethod
+    def _sentence(refusal) -> str:
+        from backend.app.services.eject.monitor import escalation_sentence
+
+        return escalation_sentence(farm_source=False, refusal=refusal)
+
+    async def test_it_seeds_then_repages_once_per_window_in_the_monitors_words(self, db_session, pages):
+        printer = await _add_printer(db_session, "003-H2S")
+        refusal = _refuse_plate(printer.id)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _FakeState("IDLE")})
+
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)  # seed: the monitor paged
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W - 1)
+        assert pages == []
+
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W + 60)  # inside the window
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=2 * _W)
+
+        assert pages == [(printer.id, self._sentence(refusal))] * 2
+        assert "Detected build plate offset" in pages[0][1]
+
+    async def test_the_gate_clearing_resets_it_and_a_new_refusal_nags_afresh(self, db_session, pages):
+        from backend.app.services.plate_occupancy import plate_occupancy
+
+        printer = await _add_printer(db_session, "004-H2S")
+        _refuse_plate(printer.id)
+        mgr = _FakeManager({printer.id: True}, {printer.id: _FakeState("IDLE")})
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+        assert len(pages) == 1
+
+        # A human cleared the plate: the tracking resets, and nothing is paged.
+        assert plate_occupancy.clear_plate(printer.id) is None
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W + 1)
+        assert not [key for key in farm_stall._attention_first_seen if key[0] == printer.id]
+        assert len(pages) == 1
+
+        # The next refusal on the same printer is a new episode: seeded, then one window later.
+        _refuse_plate(printer.id)
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W + 2)
+        assert len(pages) == 1
+        await farm_stall.check_attention_reminders(db_session, manager=mgr, now=2 * _W + 2)
+        assert len(pages) == 2
+
+    async def test_a_gate_that_carries_no_refusal_is_not_this_arms(self, db_session, pages):
+        """A deposit's escalation gate has its own cause and its own page — not a refused plate."""
+        from backend.app.services.plate_occupancy import EscalationOnly, plate_occupancy
+
+        printer = await _add_printer(db_session, "005-H2S")
+        plate_occupancy.hydrate_plate(printer.id, "SUB-1", EscalationOnly())
+        mgr = _FakeManager({printer.id: True}, {printer.id: _FakeState("IDLE")})
+
+        for now in (0.0, _W, 2 * _W):
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=now)
+
+        assert pages == []
+
+    async def test_a_disconnected_printer_is_not_nagged_and_not_tracked(self, db_session, pages):
+        printer = await _add_printer(db_session, "006-H2S")
+        _refuse_plate(printer.id)
+        mgr = _FakeManager({printer.id: False})
+
+        for now in (0.0, _W, 2 * _W):
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=now)
+
+        assert pages == []
+        assert not [key for key in farm_stall._attention_first_seen if key[0] == printer.id]
 
 
 class TestAttendedPauseDerivation:

@@ -655,6 +655,29 @@ class TestClassifyStopPlateRefused:
     def test_no_holds_is_the_pre_existing_behaviour(self):
         assert classify_stop({"status": "failed", "subtask_id": "JOB-7"}, operator_stop_requested=True) == "operator_ui"
 
+    @pytest.mark.parametrize(
+        ("echo", "recorded", "refused"),
+        [
+            ("0", "", True),  # a LAN print's "0" IS the id-less job the hold recorded
+            ("", "0", True),
+            ("", "", True),
+            ("0", "0", True),
+            ("JOB-7", "", False),  # an id on one side only is another job
+            ("0", "JOB-7", False),
+        ],
+        ids=["zero-vs-empty", "empty-vs-zero", "both-empty", "both-zero", "echo-named", "hold-named"],
+    )
+    def test_the_hold_binds_its_job_by_the_held_job_rule(self, echo, recorded, refused):
+        """``job_identity.is_held_job`` (2026-09-29): a foreign plate-check trip whose
+        terminal echoes ``"0"`` over a hold that recorded ``""`` is the same id-less job — the
+        hand ``str(...).strip() ==`` it replaced called them different, so that stop would
+        have classified as no refusal at all."""
+        hold = {"kind": "plate_vision", "job_id": recorded, "printer_messages": []}
+        verdict = classify_stop(
+            {"status": "failed", "subtask_id": echo}, operator_stop_requested=False, open_incidents=[hold]
+        )
+        assert (verdict == STOP_VERDICT_PLATE_REFUSED) is refused
+
 
 class TestClassifyStopFaultRestart:
     """``fault_restart``: a non-completed terminal of the job an open row's recovery driver
@@ -746,33 +769,45 @@ class TestClassifyStopFaultRestart:
 
 
 class TestResolvePrintingFarmItem:
-    """The ownership question, extracted from the deleted ``on_native_plate_detection``:
-    is the farm loop responsible for what is on this printer?"""
+    """Which FARM unit is printing this job? Identity first (``resolve_printing_item``), then
+    ownership — is the farm loop responsible for it? What a plate-check episode binds."""
 
     async def test_an_eject_profile_makes_it_a_farm_unit(self, db_session):
         item = await _add_eject_item(db_session, printer_id=55, eject_profile_id=7)
-        assert (await resolve_printing_farm_item(db_session, 55)).id == item.id
+        assert (await resolve_printing_farm_item(db_session, 55, None)).id == item.id
 
     async def test_a_sku_batch_makes_it_a_farm_unit(self, db_session):
         batch = await _add_farm_batch(db_session)
         item = await _add_eject_item(db_session, printer_id=56, batch_id=batch.id)
-        assert (await resolve_printing_farm_item(db_session, 56)).id == item.id
+        assert (await resolve_printing_farm_item(db_session, 56, None)).id == item.id
 
     async def test_a_plain_print_is_not_a_farm_unit(self, db_session):
         await _add_eject_item(db_session, printer_id=57)
-        assert await resolve_printing_farm_item(db_session, 57) is None
+        assert await resolve_printing_farm_item(db_session, 57, None) is None
 
     async def test_nothing_printing_is_none(self, db_session):
-        assert await resolve_printing_farm_item(db_session, 58) is None
+        assert await resolve_printing_farm_item(db_session, 58, None) is None
+
+    async def test_the_unit_of_the_echoed_job_is_bound_not_the_newest_farm_row(self, db_session):
+        """Two printing rows on one printer: the job identity decides, and a plain (non-farm)
+        unit printing THAT job is no farm unit — it is never swapped for another farm row."""
+        farm = await _add_eject_item(db_session, printer_id=59, eject_profile_id=7)
+        farm.dispatch_subtask_id = "JOB-FARM"
+        plain = await _add_eject_item(db_session, printer_id=59)
+        plain.dispatch_subtask_id = "JOB-PLAIN"
+        await db_session.commit()
+
+        assert (await resolve_printing_farm_item(db_session, 59, "JOB-FARM")).id == farm.id
+        assert await resolve_printing_farm_item(db_session, 59, "JOB-PLAIN") is None
 
 
 class TestPlateOccupancyCodeSet:
-    """The vision codes the capture hook and the failure-reason attribution share."""
+    """The vision codes the pause lane and the failure-reason attribution share."""
 
     def test_the_four_native_vision_codes_are_pinned_members(self):
-        from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
 
-        assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= _HMS_PLATE_OCCUPANCY_CODES
+        assert {"0300_8017", "0300_8006", "0500_806E", "0500_808C"} <= PLATE_CHECK_HMS_CODES
 
 
 async def _add_eject_item(db, *, printer_id, status="printing", eject_profile_id=None, batch_id=None):

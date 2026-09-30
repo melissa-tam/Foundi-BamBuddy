@@ -618,6 +618,76 @@ class TestAJobPauseCannotOutliveItsJob:
         assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 0
         assert await _row(db_session, printer.id) is not None
 
+    async def test_a_driverless_recovering_episode_whose_job_ended_is_closed(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """``driver_owns`` is class-aware (2026-09-29): a ``recovering`` plate-check episode
+        is a promise only a LIVE driver keeps. Read by the promise alone, a row whose job
+        ended while no driver lived was skipped by this sweep forever — blocking dispatch
+        on its printer. With no driver it is adjudicated like any other job pause."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION, RESOLVE_JOB_ENDED_UNSEEN
+
+        printer = await printer_factory()
+        await _held(
+            db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", job_id="task-1", status=STATUS_RECOVERING
+        )
+        _wire(monkeypatch, _state("IDLE"))
+
+        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0  # first sighting seeds the dwell
+        assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 1
+
+        db_session.expunge_all()
+        from sqlalchemy import select
+
+        from backend.app.models.printer_incident import PrinterIncident
+
+        row = (
+            await db_session.execute(select(PrinterIncident).where(PrinterIncident.printer_id == printer.id))
+        ).scalar_one()
+        assert row.resolve_source == RESOLVE_JOB_ENDED_UNSEEN
+        assert printer_incidents.hold_blocks_dispatch(printer.id) is False
+
+    async def test_a_live_episode_driver_keeps_its_row(self, db_session, printer_factory, monkeypatch):
+        """While the driver lives the outcome is its to write — the sweep neither closes the
+        row nor even starts its dwell."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        class _Live:
+            def done(self) -> bool:
+                return False
+
+        printer = await printer_factory()
+        await _held(
+            db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", job_id="task-1", status=STATUS_RECOVERING
+        )
+        monkeypatch.setitem(printer_incidents._drivers, printer.id, _Live())  # noqa: SLF001
+        _wire(monkeypatch, _state("IDLE"))
+
+        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
+        assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 0
+        assert await _row(db_session, printer.id) is not None
+        assert spool_recovery._hold_over_since == {}
+
+    async def test_the_startup_rearm_never_hands_an_episode_to_the_ams_re_entry(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """At startup no driver is live, so a ``recovering`` episode is not "owned" — and the
+        AMS driver's re-entry, which drives only AMS rows, is never asked to take it."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+
+        printer = await printer_factory()
+        await _held(
+            db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", job_id="task-1", status=STATUS_RECOVERING
+        )
+        _wire(monkeypatch, _state("PAUSE"))
+        reenter = AsyncMock()
+        monkeypatch.setattr(spool_recovery, "_reenter_recovering_incident", reenter)
+
+        assert await spool_recovery.rearm_incidents_on_startup() == 0
+
+        reenter.assert_not_awaited()
+        assert await _row(db_session, printer.id) is not None
+
     async def test_the_startup_rearm_leaves_it_for_the_reconcile(self, db_session, printer_factory, monkeypatch):
         """No unseen-end close at startup: the downtime reconcile's synthesised terminal
         classifies a job stopped during the outage as a refused plate only while the row

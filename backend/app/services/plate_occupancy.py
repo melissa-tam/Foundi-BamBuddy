@@ -31,6 +31,7 @@ into one record per printer and one set of transitions over it.
       plate: PlateOccupied | None,   # a deposit is on the plate, plus what happens next
       lease: DispatchLease | None,   # a unit dispatch DECIDED but not yet settled on the wire
       eject: PendingEject | None,    # an eject dispatched, until its terminal
+      bed_motion_until_mono,         # a farm bed motion (the held-bed lift) until this deadline
     )
 
 Everything else is **evidence the caller supplies** and is never stored, never
@@ -64,6 +65,11 @@ self-expiring shape of the scheduler's old ``_printer_in_dispatch_hold``. Making
 settle a transition would fan persist/broadcast/kick out for a non-event, on a tick
 that returns early on an empty queue, so an idle queue could strand a lease past its
 own ceiling.
+
+**A bed-motion window ends the same way.** The held-bed lift is a CLAIMED motion
+(:meth:`PlateOccupancy.claim_bed_motion`): it holds the printer for exactly its own
+motion time, and the end of that window is read, never notified — the same shape, for the
+same reason, as a lease that settles.
 """
 
 from __future__ import annotations
@@ -128,6 +134,8 @@ TransitionRefusal = Literal[
     # The printer's Z frame is fiction (it rebooted with a part on the plate), so
     # every absolute Z move an eject makes would run against a fabricated datum.
     "z_unreferenced",
+    # The farm's own bed motion (the held-bed lift) is moving the bed right now.
+    "bed_motion_in_flight",
 ]
 
 # Who holds the printer. A projection, never stored — see :class:`OccupancyView`.
@@ -154,6 +162,8 @@ NotifyCause = Literal[
     "drop_unowned_eject",
     "revoke_lease",
     "set_policy",
+    "claim_bed_motion",
+    "release_bed_motion",
 ]
 
 # The one cause whose fan-out must not echo back to the DB it was just read from.
@@ -503,11 +513,19 @@ class TerminalDisposition:
 
 @dataclass
 class OccupancyRecord:
-    """The three stored facts for one printer. Internal — callers read views."""
+    """The four stored facts for one printer. Internal — callers read views.
+
+    ``bed_motion_until_mono`` is the MONOTONIC deadline of a farm-commanded bed motion in
+    flight (:meth:`PlateOccupancy.claim_bed_motion`), or None. Memory-only; its rehydrate
+    story is that nothing is left to rehydrate: the window is the motion's own few seconds
+    and a restart outlasts it, so a bed that was moving when the process died has stopped
+    by the time it is back.
+    """
 
     plate: PlateOccupied | None = None
     lease: DispatchLease | None = None
     eject: PendingEject | None = None
+    bed_motion_until_mono: float | None = None
 
 
 @dataclass(frozen=True)
@@ -541,6 +559,10 @@ class OccupancyView:
     # (never re-derived) so the operator surfaces and the reconciler read the same
     # fact the authority holds — see :meth:`PlateOccupancy.unowned_eject`.
     eject_runtime_exceeded: bool
+    # A farm bed motion is in flight (its window read open at this instant). Carried so
+    # the fan-out can see its RELEASE edge — :meth:`PlateOccupancy.release_bed_motion` is
+    # a change that makes a printer newly dispatchable, exactly like a plate clearing.
+    bed_motion_active: bool
     owner: OccupancyOwner
 
     @property
@@ -651,9 +673,9 @@ class PlateOccupancy:
     1. ``persist(printer_id, view)`` — the durable mirror;
     2. ``broadcast(printer_id)`` — the websocket status push;
     3. ``kick(printer_id, cause)`` — the scheduler wake-up, on RELEASE EDGES ONLY
-       (plate OCCUPIED→CLEAR, or an eject dropped): those are the only two changes
-       that can make a printer newly dispatchable, and kicking on the others would
-       wake the scheduler into a printer it must not touch;
+       (plate OCCUPIED→CLEAR, an eject dropped, or a bed motion released early): those
+       are the only changes that can make a printer newly dispatchable, and kicking on
+       the others would wake the scheduler into a printer it must not touch;
     4. ``policy_driver(printer_id, view, cause)`` — the eject cooldown monitor.
 
     (1)-(3) swallow their exceptions with a WARNING: a failed broadcast must not
@@ -1186,6 +1208,72 @@ class PlateOccupancy:
         self._notify(printer_id, before, self._view(printer_id, None), "drop_unowned_eject")
         return True
 
+    # -- farm bed motion ----------------------------------------------------
+
+    def claim_bed_motion(self, printer_id: int, ev: Evidence, hold_s: float) -> TransitionRefusal | None:
+        """Claim the printer for a farm-commanded BED MOTION lasting ``hold_s`` seconds.
+
+        The held-bed lift (``farm_policy._maybe_lift_held_bed``) moves the bed off the
+        plate-release aid after a refused plate check. A lift is a MOTION on a printer the
+        terminal has just freed, and on the retry path nothing else holds it — no gate, the
+        plate-check row closed — so the terminal's own dispatch kick could otherwise send a
+        new print onto the printer while its bed is still travelling. The claim is what
+        makes the lift and a dispatch mutually exclusive, in the one place that answers
+        "may a print go on this plate now".
+
+        Refused, in the order a refusal is useful:
+
+        * ``job_active`` — the wire says a job runs: its own motion owns the bed;
+        * ``dispatch_in_flight`` — a live lease OR ``ev.db_claim``: a print is already on
+          its way, and its own start block drives the bed off the stop, so the lift is not
+          owed;
+        * ``eject_in_flight`` — any registered eject, live or hydrated (as for
+          :meth:`dispatchable`: a hydrated one means the startup reconciler owns the printer);
+        * ``bed_motion_in_flight`` — a motion is already claimed.
+
+        NOT refused on an occupied plate: the lift exists for exactly the plate a human must
+        clear. And ``z_reference`` is not read: the lift is two bottom-stop-GUARDED relative
+        moves and never an absolute Z, so it runs no coordinate against the firmware's frame.
+
+        On grant the window is recorded as a monotonic deadline, ``now + hold_s``;
+        :meth:`dispatchable` refuses ``bed_motion_in_flight`` until it passes. Its end is a
+        READ-TIME expiry (:meth:`_bed_motion_in_flight`), never a transition — like a lease's
+        settlement — so nothing is notified when it lapses. A caller whose motion never went
+        out ends it early with :meth:`release_bed_motion`.
+        """
+        if ev.live_state in ACTIVE_PRINT_STATES:
+            return "job_active"
+        if self._lease_in_flight(printer_id, ev) or ev.db_claim:
+            return "dispatch_in_flight"
+        record = self._records.get(printer_id)
+        if record is not None and record.eject is not None:
+            return "eject_in_flight"
+        if self._bed_motion_in_flight(printer_id):
+            return "bed_motion_in_flight"
+
+        before = self._view(printer_id, None)
+        self._record(printer_id).bed_motion_until_mono = _now_mono() + max(0.0, hold_s)
+        logger.info("[occupancy] p%d: bed motion claimed for %.1fs", printer_id, hold_s)
+        self._notify(printer_id, before, self._view(printer_id, None), "claim_bed_motion")
+        return None
+
+    def release_bed_motion(self, printer_id: int) -> None:
+        """End a claimed bed motion early — the printer did not accept it, so nothing moves.
+
+        Idempotent and never refuses, like :meth:`release_dispatch`: a release must always be
+        reachable, and releasing nothing (no claim, or a window already lapsed) is silent.
+        A release IS a transition and notifies — the printer becomes dispatchable NOW, so the
+        fan-out kicks the scheduler on this release edge instead of leaving the printer held
+        off for a window in which nothing moves.
+        """
+        if not self._bed_motion_in_flight(printer_id):
+            return
+
+        before = self._view(printer_id, None)
+        self._records[printer_id].bed_motion_until_mono = None
+        logger.info("[occupancy] p%d: bed motion released (the printer did not take it)", printer_id)
+        self._notify(printer_id, before, self._view(printer_id, None), "release_bed_motion")
+
     # -- policy -------------------------------------------------------------
 
     def set_policy(self, printer_id: int, policy: OccupancyPolicy) -> TransitionRefusal | None:
@@ -1249,7 +1337,8 @@ class PlateOccupancy:
         plate first (a deposit blocks everything and needs a human or an eject), then
         an eject (LIVE **or** HYDRATED — a hydrated eject still means "the startup
         reconciler owns this printer", and dispatching under it would race the
-        verdict), then a dispatch already in flight, then the wire.
+        verdict), then a dispatch already in flight, then the farm's own bed motion (the
+        held-bed lift, for its few seconds — :meth:`claim_bed_motion`), then the wire.
 
         ``db_claim`` is honoured here and ONLY here: during the IDLE→RUNNING lag the
         queue row is the only witness that a unit is already on its way.
@@ -1261,6 +1350,8 @@ class PlateOccupancy:
             return "eject_in_flight"
         if self._lease_in_flight(printer_id, ev) or ev.db_claim:
             return "dispatch_in_flight"
+        if self._bed_motion_in_flight(printer_id):
+            return "bed_motion_in_flight"
         if ev.live_state in ACTIVE_PRINT_STATES:
             return "job_active"
         return None
@@ -1391,6 +1482,21 @@ class PlateOccupancy:
             record.lease = None
         return active
 
+    def _bed_motion_in_flight(self, printer_id: int) -> bool:
+        """Is a claimed bed motion still in its window? Pruned on READ once it lapses.
+
+        Like :meth:`_lease_in_flight`, the prune is the expiry itself, not a state change,
+        so it notifies nothing: the window is the motion's own time, and fanning a kick out
+        for a motion that simply finished would write on a tick that may have no work.
+        """
+        record = self._records.get(printer_id)
+        if record is None or record.bed_motion_until_mono is None:
+            return False
+        if _now_mono() < record.bed_motion_until_mono:
+            return True
+        record.bed_motion_until_mono = None
+        return False
+
     @staticmethod
     def _escalation_plate(plate: PlateOccupied | None) -> PlateOccupied:
         """An escalation-only plate, keeping an existing gate's source id and ``since``.
@@ -1407,8 +1513,10 @@ class PlateOccupancy:
     def _view(self, printer_id: int, ev: Evidence | None) -> OccupancyView:
         """Project the record (settled against *ev*) into an immutable snapshot."""
         effective = ev if ev is not None else Evidence()
-        # Settle FIRST: a spent lease must not appear in the view it was pruned from.
+        # Settle FIRST: a spent lease (or a lapsed bed motion) must not appear in the view
+        # it was pruned from.
         lease_in_flight = self._lease_in_flight(printer_id, effective)
+        bed_motion_active = self._bed_motion_in_flight(printer_id)
         record = self._records.get(printer_id)
         plate = record.plate if record is not None else None
         lease = record.lease if record is not None else None
@@ -1442,6 +1550,7 @@ class PlateOccupancy:
             ),
             eject_hydrated=eject is not None and eject.hydrated,
             eject_runtime_exceeded=eject is not None and eject.runtime_exceeded_at is not None,
+            bed_motion_active=bed_motion_active,
             owner=owner,
         )
 
@@ -1494,10 +1603,13 @@ class PlateOccupancy:
             except Exception:
                 logger.warning("[occupancy] p%d: broadcast failed (%s)", printer_id, cause, exc_info=True)
 
-            # Release edges only: these are the two changes that can make a printer
-            # newly dispatchable.
-            released = (before.plate_occupied and not after.plate_occupied) or (
-                before.eject_present and not after.eject_present
+            # Release edges only: these are the changes that can make a printer newly
+            # dispatchable. A bed motion's window LAPSING is a read, not a transition,
+            # so only an early release reaches this edge.
+            released = (
+                (before.plate_occupied and not after.plate_occupied)
+                or (before.eject_present and not after.eject_present)
+                or (before.bed_motion_active and not after.bed_motion_active)
             )
             if released:
                 try:

@@ -12,6 +12,8 @@ The migration is exercised against a throwaway engine, twice, because
 
 import asyncio
 import logging
+from dataclasses import dataclass, replace
+from datetime import datetime
 
 import pytest
 from sqlalchemy import text
@@ -1193,6 +1195,43 @@ class TestOutcomeDerivation:
         row = self._row(status=STATUS_RESOLVED, source=RESOLVE_TERMINAL, kind=KIND_JAM)
         assert printer_incidents.outcome_of(row) == "resolved_unpaged"
 
+    def test_the_plate_check_episodes_closes(self):
+        """The 2026-09-29 ladder's closes, unpaged: the re-check passing and the farm's own
+        stop-and-retry are the farm's; a refused plate is handed to a human (a gate and a
+        page follow, whether or not the row itself was escalated); a hand-over to another
+        owner recovered nothing."""
+        from backend.app.models.printer_incident import (
+            RESOLVE_HANDED_OVER,
+            RESOLVE_PLATE_REFUSED,
+            RESOLVE_RECHECK_PASSED,
+            RESOLVE_TERMINAL,
+        )
+
+        def outcome(source, *, kind=KIND_PLATE_VISION, escalated=False):
+            return printer_incidents.outcome_of(
+                self._row(status=STATUS_RESOLVED, source=source, kind=kind, escalated=escalated)
+            )
+
+        assert outcome(RESOLVE_RECHECK_PASSED) == "auto_recovered"
+        assert outcome(RESOLVE_TERMINAL) == "auto_recovered"
+        assert outcome(RESOLVE_PLATE_REFUSED) == "human_resolved"
+        assert outcome(RESOLVE_PLATE_REFUSED, escalated=True) == "human_resolved"
+        assert outcome(RESOLVE_HANDED_OVER) == "resolved_unpaged"
+        # The refusal arm is the plate check's: the same token on another kind is nobody's act.
+        assert outcome(RESOLVE_PLATE_REFUSED, kind=KIND_JAM) == "resolved_unpaged"
+        # Every paged close is a human's, the farm's own included.
+        assert outcome(RESOLVE_RECHECK_PASSED, escalated=True) == "human_resolved"
+
+    def test_the_plate_check_tokens_are_new_and_fit_their_column(self):
+        import backend.app.models.printer_incident as model
+
+        column = PrinterIncident.__table__.c.resolve_source
+        tokens = (model.RESOLVE_RECHECK_PASSED, model.RESOLVE_PLATE_REFUSED, model.RESOLVE_HANDED_OVER)
+        assert tokens == ("recheck_passed", "plate_refused", "handed_over")
+        assert all(len(token) <= column.type.length for token in tokens)
+        assert model.RESOLVE_RECHECK_PASSED in printer_incidents._FARM_CLOSES
+        assert not {model.RESOLVE_PLATE_REFUSED, model.RESOLVE_HANDED_OVER} & printer_incidents._FARM_CLOSES
+
     async def test_a_print_the_drivers_own_verb_ended_is_not_a_recovery(self):
         """``driver_ended`` (2026-09-23) is the driver's close when a release lever ENDED
         the print. The farm acted, but nothing was recovered — the unit is requeued — so
@@ -1894,6 +1933,232 @@ class TestStepLedgerCascade:
                 assert (await db.execute(text("SELECT COUNT(*) FROM printer_incident_step"))).scalar() == 0
         finally:
             await engine.dispose()
+
+
+class TestStepKinds:
+    """The closed step vocabulary gained two decided kinds on 2026-09-29: ``dialog`` (a
+    printer dialog button the farm pressed) and ``stop`` (the farm ended the job)."""
+
+    def test_the_vocabulary_is_the_four_decided_kinds(self):
+        from typing import get_args
+
+        from backend.app.models.printer_incident_step import (
+            STEP_KIND_DIALOG,
+            STEP_KIND_STOP,
+            PrinterIncidentStep,
+            StepKind,
+        )
+
+        assert set(get_args(StepKind)) == {"lever", "command", "dialog", "stop"}
+        assert (STEP_KIND_DIALOG, STEP_KIND_STOP) == ("dialog", "stop")
+        # Every kind fits the column, so no migration: ``kind`` is VARCHAR(8), unconstrained.
+        assert all(len(kind) <= PrinterIncidentStep.__table__.c.kind.type.length for kind in get_args(StepKind))
+
+    @pytest.mark.parametrize(("kind", "name"), [("dialog", "PROBLEM_SOLVED_RESUME"), ("stop", "stop")])
+    async def test_a_dialog_and_a_stop_step_persist_and_read_back(self, db_session, printer_factory, kind, name):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="plate:0500_808C")
+
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind=kind, name=name)
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="success")
+
+        (step,) = await printer_incidents.steps_of(db_session, row.id)
+        assert (step.kind, step.name, step.outcome) == (kind, name, "success")
+
+
+@dataclass(frozen=True)
+class _PlateStep:
+    """A driver's own step type as a second driver would bring it: the plain ledger shape
+    with a closed outcome vocabulary, so the log's validation has something to refuse."""
+
+    seq: int
+    kind: str
+    name: str
+    outcome: str | None
+    at: datetime | None
+
+    _OUTCOMES = frozenset({"success", "fail"})
+
+    @classmethod
+    def draft(cls, kind: str, name: str) -> "_PlateStep":
+        return cls(seq=0, kind=kind, name=name, outcome=None, at=None)
+
+    def entry(self) -> printer_incidents.StepEntry:
+        return printer_incidents.StepEntry(kind=self.kind, name=self.name)
+
+    def sent(self, seq: int, at: datetime) -> "_PlateStep":
+        return replace(self, seq=seq, at=at)
+
+    def answered(self, outcome: str) -> "_PlateStep":
+        if outcome not in self._OUTCOMES:
+            raise LookupError(f"no such answer: {outcome!r}")
+        return replace(self, outcome=outcome)
+
+
+class _PlateLog(printer_incidents.EvidenceLog[_PlateStep]):
+    """A second driver's binding of the store's log — the shape ``pause_recovery`` takes."""
+
+    @classmethod
+    def _step_of(cls, row) -> _PlateStep:
+        if row.kind not in ("dialog", "stop"):
+            raise LookupError(f"not a plate-check step: {row.kind!r}")
+        return _PlateStep(seq=row.seq, kind=row.kind, name=row.name, outcome=row.outcome, at=row.sent_at)
+
+
+class TestEvidenceLog:
+    """THE evidence log (moved from ``spool_recovery`` 2026-09-29): the step ledger's one
+    writer, generic over a driver's step vocabulary, built only from the ledger."""
+
+    @pytest.fixture(autouse=True)
+    def _own_sessions(self, own_session_factory, monkeypatch):
+        """The log writes in its OWN session (the driver convention) — point it at the test engine."""
+        import backend.app.core.database as core_db
+
+        monkeypatch.setattr(core_db, "async_session", own_session_factory)
+
+    @staticmethod
+    async def _episode(db_session, printer_factory) -> int:
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="plate:0500_808C")
+        return row.id
+
+    async def test_steps_round_trip_through_the_ledger(self, db_session, printer_factory):
+        incident_id = await self._episode(db_session, printer_factory)
+        log = await _PlateLog.from_row(db_session, incident_id)
+        assert log.steps == [] and not log.has_step("dialog")
+
+        pressed = await log.note(_PlateStep.draft("dialog", "PROBLEM_SOLVED_RESUME"))
+        await log.answer(pressed, "fail")
+        stopped = await log.note(_PlateStep.draft("stop", "stop"))
+
+        assert (pressed, stopped) == (1, 2)
+        assert [(s.seq, s.kind, s.outcome) for s in log.steps] == [(1, "dialog", "fail"), (2, "stop", None)]
+        assert all(isinstance(s.at, datetime) for s in log.steps)
+        # A re-entered driver reads exactly what the first one sent — its own type, in send order.
+        rebuilt = await _PlateLog.from_row(db_session, incident_id)
+        assert rebuilt.steps == log.steps
+        assert rebuilt.has_step("dialog") and rebuilt.has_step("stop") and not rebuilt.has_step("lever")
+        # ...and the next step continues the sequence rather than colliding with it.
+        assert await rebuilt.note(_PlateStep.draft("dialog", "PROBLEM_SOLVED_RESUME")) == 3
+
+    async def test_a_token_the_driver_cannot_name_is_refused_before_the_write(self, db_session, printer_factory):
+        incident_id = await self._episode(db_session, printer_factory)
+        log = await _PlateLog.from_row(db_session, incident_id)
+        seq = await log.note(_PlateStep.draft("dialog", "PROBLEM_SOLVED_RESUME"))
+
+        with pytest.raises(LookupError):
+            await log.answer(seq, "maybe")
+        with pytest.raises(LookupError):
+            await log.answer(seq + 1, "success")
+
+        (stored,) = await printer_incidents.steps_of(db_session, incident_id)
+        assert stored.outcome is None  # nothing was written for a refused answer
+
+    async def test_a_ledger_row_the_driver_cannot_read_raises_at_hydration(self, db_session, printer_factory):
+        incident_id = await self._episode(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, incident_id, seq=1, kind=STEP_KIND_LEVER, name="resume")
+
+        with pytest.raises(LookupError):
+            await _PlateLog.from_row(db_session, incident_id)
+
+    async def test_a_failed_write_never_crashes_the_driver(self, db_session, printer_factory, monkeypatch, caplog):
+        """Best-effort durability: the in-memory step stands, the loss is one ERROR line."""
+        import backend.app.core.database as core_db
+
+        incident_id = await self._episode(db_session, printer_factory)
+        log = await _PlateLog.from_row(db_session, incident_id)
+
+        def _broken():
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(core_db, "async_session", _broken)
+        with caplog.at_level(logging.ERROR, logger=printer_incidents.logger.name):
+            seq = await log.note(_PlateStep.draft("stop", "stop"))
+            await log.answer(seq, "success")
+
+        assert [(s.seq, s.kind, s.outcome) for s in log.steps] == [(1, "stop", "success")]
+        assert f"incident {incident_id} step 1 could not be persisted" in caplog.text
+        assert await printer_incidents.steps_of(db_session, incident_id) == []
+
+    def test_the_log_is_only_ever_a_drivers_binding(self):
+        """The store class carries no vocabulary of its own: a log is always a driver's."""
+        with pytest.raises(TypeError):
+            printer_incidents.EvidenceLog(incident_id=1)
+
+
+class TestCountRowsWithStep:
+    """``count_rows_with_step`` — the store read behind the plate-check verdict's
+    "other episodes the farm already stopped in the window"."""
+
+    @staticmethod
+    async def _episode(db, printer_id, *, job_id, steps=(), created_at=None, kind=KIND_PLATE_VISION):
+        """One CLOSED row of ``kind`` carrying ``steps`` (closed, so the next can open)."""
+        row = await _open(db, printer_id, kind=kind, job_id=job_id, code="0500_808C", codes=f"{kind}:{job_id}")
+        for seq, step_kind in enumerate(steps, start=1):
+            await printer_incidents.note_step(db, row.id, seq=seq, kind=step_kind, name=step_kind)
+        if created_at is not None:
+            row.created_at = created_at
+            await db.commit()
+        await printer_incidents.close(db, row.id, status=STATUS_RESOLVED, source="terminal")
+        return row
+
+    async def _count(self, db, printer_id, *, since, exclude_job_id="JOB-NOW", kind=KIND_PLATE_VISION):
+        return await printer_incidents.count_rows_with_step(
+            db, printer_id=printer_id, kind=kind, step_kind="stop", since=since, exclude_job_id=exclude_job_id
+        )
+
+    async def test_counts_only_the_rows_holding_the_step(self, db_session, printer_factory):
+        from datetime import datetime, timedelta
+
+        printer = await printer_factory()
+        since = datetime.utcnow() - timedelta(hours=1)
+        await self._episode(db_session, printer.id, job_id="JOB-1", steps=("dialog", "stop"))
+        await self._episode(db_session, printer.id, job_id="JOB-2", steps=("dialog",))  # the re-check passed
+        await self._episode(db_session, printer.id, job_id="JOB-3", steps=())  # an operator's own stop
+        await self._episode(db_session, printer.id, job_id="JOB-4", steps=("stop", "stop"))  # counted ONCE
+
+        assert await self._count(db_session, printer.id, since=since) == 2
+
+    async def test_excludes_the_given_job_by_the_held_job_rule(self, db_session, printer_factory):
+        from datetime import datetime, timedelta
+
+        printer = await printer_factory()
+        since = datetime.utcnow() - timedelta(hours=1)
+        await self._episode(db_session, printer.id, job_id="JOB-NOW", steps=("dialog", "stop"))
+        await self._episode(db_session, printer.id, job_id="", steps=("stop",))
+
+        assert await self._count(db_session, printer.id, since=since, exclude_job_id="JOB-NOW") == 1
+        # An id-less episode IS the id-less job, "" and "0" alike — never "another" one.
+        assert await self._count(db_session, printer.id, since=since, exclude_job_id="0") == 1
+        assert await self._count(db_session, printer.id, since=since, exclude_job_id=None) == 1
+        assert await self._count(db_session, printer.id, since=since, exclude_job_id="JOB-OTHER") == 2
+
+    async def test_respects_since_the_printer_and_the_kind(self, db_session, printer_factory):
+        from datetime import datetime, timedelta
+
+        printer = await printer_factory()
+        other = await printer_factory()
+        now = datetime.utcnow()
+        since = now - timedelta(hours=1)
+        await self._episode(
+            db_session, printer.id, job_id="JOB-OLD", steps=("stop",), created_at=now - timedelta(hours=2)
+        )
+        await self._episode(db_session, printer.id, job_id="JOB-EDGE", steps=("stop",), created_at=since)
+        await self._episode(db_session, other.id, job_id="JOB-ELSEWHERE", steps=("stop",))
+        await self._episode(db_session, printer.id, job_id="JOB-JAM", steps=("stop",), kind=KIND_JAM)
+
+        assert await self._count(db_session, printer.id, since=since) == 1  # the edge row: at-or-after
+        assert await self._count(db_session, printer.id, since=since, kind=KIND_JAM) == 1
+        assert await self._count(db_session, other.id, since=since) == 1
+
+    async def test_an_open_episode_counts_by_what_the_farm_sent(self, db_session, printer_factory):
+        from datetime import datetime, timedelta
+
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, job_id="JOB-OPEN", code="0500_808C")
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind="stop", name="stop")
+
+        assert await self._count(db_session, printer.id, since=datetime.utcnow() - timedelta(hours=1)) == 1
 
 
 class TestTheRestartStopProjection:

@@ -166,6 +166,58 @@ class TestPeaksReliableInCompletionPayload:
         assert evidence.deposited is True
 
 
+def _push(client, **fields) -> None:
+    client._process_message({"print": fields})
+
+
+class TestThePlateCheckLayerReading:
+    """The per-job layer the plate-check episode reads for its pass (RUNNING at layer >= 1 of
+    THIS job) — ``pause_recovery._job_layer``, read off the client's ONE peaks reader
+    (``job_peaks``), so it has the terminal payload's source and reliability flag: a
+    predecessor's republish or a restart baseline is never a reading of this job."""
+
+    @staticmethod
+    def _layer(client) -> int | None:
+        from backend.app.services.pause_recovery import _job_layer
+
+        return _job_layer(client)
+
+    def test_a_restart_attach_reads_no_measurement(self, mqtt_client):
+        """Born mid-job: whatever layer the printer reports is a baseline, not a measurement."""
+        mqtt_client.on_print_running_observed = lambda data: None
+
+        _push(mqtt_client, gcode_state="PAUSE", gcode_file=RUNNING_FILE)
+        _push(mqtt_client, gcode_state="RUNNING", layer_num=5)
+
+        assert mqtt_client.state.layer_num == 5
+        assert mqtt_client.job_peaks().reliable is False
+        assert self._layer(mqtt_client) is None
+
+    def test_a_predecessors_republished_layer_is_not_this_jobs(self, mqtt_client):
+        """The firmware keeps republishing the previous job's final layer while this one heats,
+        levels and pauses at its plate check: the reading stays 0 until this job's own layer."""
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_running_observed = lambda data: None
+        mqtt_client.on_print_complete = lambda data: None
+        # The predecessor, first met RUNNING (the #1304 guard: an attach), ends at layer 167.
+        _push(mqtt_client, gcode_state="RUNNING", gcode_file="/data/Metadata/prev.gcode")
+        for layer in (100, 167):
+            _push(mqtt_client, layer_num=layer)
+        _push(mqtt_client, gcode_state="FINISH")
+
+        _push(mqtt_client, gcode_state="RUNNING", gcode_file=RUNNING_FILE)  # this job starts
+        _push(mqtt_client, layer_num=167)  # the stale republish
+        _push(mqtt_client, gcode_state="PAUSE", layer_num=167)  # its plate check
+
+        assert self._layer(mqtt_client) == 0
+
+        _push(mqtt_client, gcode_state="RUNNING", layer_num=0)  # this job's own first reading
+        assert self._layer(mqtt_client) == 0
+        _push(mqtt_client, layer_num=1)
+
+        assert self._layer(mqtt_client) == 1
+
+
 class TestTheOnePeaksReader:
     """``job_peaks`` — THE read of how far the tracked job got, shared by the terminal
     payload and the recovery driver's LIVE deposit read (operator ruling 2026-09-29). It

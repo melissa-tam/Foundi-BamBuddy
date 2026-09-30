@@ -2106,9 +2106,11 @@ class PrintScheduler:
         # 003-H2S the firmware wiped its HMS list at every terminal, so the wire read
         # clean while filament was still physically stuck in the shared PTFE path, and
         # the next unit dispatched into it. Three times. ``hold_blocks_dispatch`` is
-        # the ONE origin (every open kind blocks: a plate-vision or lost-Z row is
-        # already plate-gated, a power-loss row is an unanswered prompt, an AMS row is
-        # a fault the wire may have stopped reporting). This also holds the auto-drying
+        # the ONE origin (every open kind blocks: a plate-vision row is a job PAUSED at
+        # the printer's plate check — no plate gate stands while its episode runs, so
+        # this row is what keeps work off the printer; a lost-Z row is already
+        # plate-gated, a power-loss row is an unanswered prompt, an AMS row is a fault
+        # the wire may have stopped reporting). This also holds the auto-drying
         # idle arm off a held printer. The eject lane stays UNGATED (08-29 gotcha d):
         # ``plate_occupancy.ejectable`` never consults this — a sweep is filament-less,
         # and gating it behind a filament fault would deadlock the plate that holds

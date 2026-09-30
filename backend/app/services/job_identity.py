@@ -5,7 +5,8 @@ dispatcher minted (``PrintQueueItem.dispatch_subtask_id``), echoed back on every
 terminal. Every question of the form "is this the job that …" is this one comparison, and it has
 three answers, not two — an absent id is not evidence of a DIFFERENT job, so each caller decides
 what ``unknown`` is worth to it instead of inheriting a ``""`` string equality that silently
-calls two id-less jobs the same one.
+calls two id-less jobs the same one. The one caller-independent reading of ``unknown`` —
+"is this the job a hold recorded" — is :func:`is_held_job`, so a hold's question is asked one way.
 
 **Dependency-free by construction** (stdlib only), so a leaf may take it at module level:
 ``dispatch_claim`` (a leaf that imports no farm service) and ``incident_resolution`` (which must
@@ -47,3 +48,24 @@ def same_job(live: str | None, record: str | None) -> JobIdentity:
     if live_id is None or record_id is None:
         return "unknown"
     return "same" if live_id == record_id else "other"
+
+
+def is_held_job(live: str | None, recorded: str | None) -> bool:
+    """Is ``live`` the job a HOLD recorded — the one reading every held-job question shares?
+
+    :func:`same_job`, with ``unknown`` read the way a hold reads a missing id: a hold that
+    recorded no job (the printer named none when it paused — a LAN or screen print) is held
+    by an echo that names none either, because both sides describe the same id-less job;
+    an id on only ONE side is a different job, never a match. ``""`` and ``"0"`` are the
+    same "names no job" on either side.
+
+    The rule's one owner (2026-09-29). It was spelled three ways — the rule table's own
+    helper, and a hand ``str(...).strip() ==`` in the terminal classifier and in the
+    outcome builder — and the hand spellings called a ``"0"`` echo a different job from a
+    ``""`` record, so an id-less trip whose terminal echoed ``"0"`` over a hold recorded as
+    ``""`` would read as another job's terminal.
+    """
+    verdict = same_job(live, recorded)
+    if verdict == "unknown":
+        return job_id(live) is None and job_id(recorded) is None
+    return verdict == "same"

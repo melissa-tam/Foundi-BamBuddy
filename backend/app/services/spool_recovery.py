@@ -76,8 +76,9 @@ Every AMS load and unload goes through ``services/ams_command`` (the verbs publi
 ``ams_command.classify`` is the ONE reading of what the wire answered, fed the
 firmware's ACK for each send). The driver keeps its own poll loops — each asks
 :func:`_takeover` on every poll — and records every lever it pulled and every command
-that went out on ONE durable evidence log (:class:`_RecoveryEvidence`, persisted step by
-step through ``printer_incidents.note_step``), so the give-up reason, the operator page
+that went out on ONE durable evidence log (:class:`_RecoveryEvidence`, the store's
+``printer_incidents.EvidenceLog`` bound to this driver's steps, persisted step by step),
+so the give-up reason, the operator page
 and a restarted driver's next lever are derived from what was sent and what the wire
 said, never from a premise.
 
@@ -212,10 +213,10 @@ from backend.app.services.incident_resolution import (
     driver_owns,
     ledger,
 )
+from backend.app.services.job_identity import same_job
 from backend.app.services.plate_occupancy import DepositEvidence
 from backend.app.services.printer_incidents import (
     FAULT_RESTART_STEP,
-    RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
     runout_slot_desc,
     waiting_reason_for,
@@ -592,8 +593,10 @@ def _restart_refusal(incident: RecoveryIncident) -> str | None:
 #   CHECK_ASSISTANT only, and CONTINUE is ``ams_control resume`` (``ams_control_resume``
 #   below; the fork's own dialog dispatcher, ``bambu_mqtt`` ``HMSAction.CONTINUE``, maps
 #   it so). Nor is it Studio's ``command_hms_resume`` / ``command_hms_ignore``, which carry
-#   ``err`` + ``param: "reserve"`` + ``job_id``: no fork publisher has ever sent that shape
-#   (the ``bambu_mqtt`` dialog helper NAMED ``hms_resume`` sends the plain resume). Freed
+#   ``err`` + ``param: "reserve"`` + ``job_id``: since 2026-09-29 ``bambu_mqtt.execute_hms_action``
+#   publishes those for the dialog's "Problem solved, resume" / "Ignore" buttons (the modal,
+#   and the plate-check episode's press in ``pause_recovery``), and no lever here sends
+#   either — a feed fault's dialog offers neither button. Freed
 #   009-H2S 2026-07-20 (an EMPTY path) — the one measured remote release, so it stays
 #   first; on a LOADED stalled feeder it re-runs the print's own change and re-holds
 #   (002-H2S 2026-09-11; 012-H2S 2026-09-23, re-PAUSEd in 47 s; 012-H2S 2026-09-25,
@@ -809,8 +812,21 @@ class LeverStep:
 
     @classmethod
     def draft(cls, lever: Lever) -> LeverStep:
-        """An unsent step: :meth:`_RecoveryEvidence.note` assigns its ``seq`` and ``at``."""
+        """An unsent step: the log's ``note`` assigns its ``seq`` and ``at``."""
         return cls(seq=0, lever=lever, outcome=None, moved=None, at=None)
+
+    def entry(self) -> printer_incidents.StepEntry:
+        """The ledger row this step is written as: a ``lever`` naming the lever."""
+        return printer_incidents.StepEntry(kind=STEP_KIND_LEVER, name=self.lever)
+
+    def sent(self, seq: int, at: datetime) -> LeverStep:
+        return replace(self, seq=seq, at=at)
+
+    def answered(self, outcome: str) -> LeverStep:
+        """The reader's verdict. A token that is no :data:`LeverReading` RAISES."""
+        if not _is_reading(outcome):
+            raise LookupError(f"spool_recovery: lever step {self.seq} answered with {outcome!r}")
+        return replace(self, outcome=outcome)
 
 
 @dataclass(frozen=True)
@@ -828,8 +844,23 @@ class CommandStep:
 
     @classmethod
     def draft(cls, command: ams_command.Command, target: int | None, feeder: str | None) -> CommandStep:
-        """An unsent step: :meth:`_RecoveryEvidence.note` assigns its ``seq`` and ``at``."""
+        """An unsent step: the log's ``note`` assigns its ``seq`` and ``at``."""
         return cls(seq=0, command=command, target=target, feeder=feeder, answer=None, at=None)
+
+    def entry(self) -> printer_incidents.StepEntry:
+        """The ledger row this step is written as: a ``command`` with its tray and feeder."""
+        return printer_incidents.StepEntry(
+            kind=STEP_KIND_COMMAND, name=self.command, target=self.target, feeder=self.feeder
+        )
+
+    def sent(self, seq: int, at: datetime) -> CommandStep:
+        return replace(self, seq=seq, at=at)
+
+    def answered(self, outcome: str) -> CommandStep:
+        """The classifier's answer. A token that is no ``ams_command.Answer`` RAISES."""
+        if not _is_answer(outcome):
+            raise LookupError(f"spool_recovery: command step {self.seq} answered with {outcome!r}")
+        return replace(self, answer=outcome)
 
 
 _COMMANDS: frozenset[str] = frozenset(get_args(ams_command.Command))
@@ -852,122 +883,60 @@ def _is_answer(token: str) -> TypeGuard[ams_command.Answer]:
     return token in _ANSWERS
 
 
-def _step_of(row: PrinterIncidentStep) -> LeverStep | CommandStep:
-    """Hydrate ONE ledger row. A token this module's vocabulary cannot name RAISES — a
-    ledger that says something the driver cannot read is drift, never a skipped row."""
-    outcome = row.outcome
-    if row.kind == STEP_KIND_LEVER:
-        if not _is_lever(row.name):
-            raise LookupError(f"spool_recovery: incident {row.incident_id} step {row.seq} names no lever: {row.name!r}")
-        if outcome is not None and not _is_reading(outcome):
-            raise LookupError(f"spool_recovery: incident {row.incident_id} step {row.seq} reads {outcome!r}")
-        return LeverStep(seq=row.seq, lever=row.name, outcome=outcome, moved=None, at=row.sent_at)
-    if row.kind == STEP_KIND_COMMAND:
-        if not _is_command(row.name):
-            raise LookupError(
-                f"spool_recovery: incident {row.incident_id} step {row.seq} names no command: {row.name!r}"
-            )
-        if outcome is not None and not _is_answer(outcome):
-            raise LookupError(f"spool_recovery: incident {row.incident_id} step {row.seq} answers {outcome!r}")
-        return CommandStep(
-            seq=row.seq, command=row.name, target=row.target, feeder=row.feeder, answer=outcome, at=row.sent_at
-        )
-    raise LookupError(f"spool_recovery: incident {row.incident_id} step {row.seq} has kind {row.kind!r}")
+class _RecoveryEvidence(printer_incidents.EvidenceLog[LeverStep | CommandStep]):
+    """THE evidence log of one AMS incident: every lever pulled and every AMS command
+    sent, in send order, with what the wire answered — the RECORDS the escalation reason,
+    the operator page and a restarted driver's next lever are derived from.
 
-
-@dataclass
-class _RecoveryEvidence:
-    """THE evidence log of one incident: every lever pulled and every AMS command sent,
-    in send order, with what the wire answered — the RECORDS the escalation reason, the
-    operator page and a restarted driver's next lever are derived from.
-
-    Durable, because the wire cannot restate it: on a feeder-stall wedge every release
-    verb's consequence is identical (012-H2S 2026-09-23 — both CONTINUE spellings re-ran
-    the stalled feed and re-held in ``1/5``), so a driver restarted from the wire alone
-    re-grinds the stall from the first lever. Every step is persisted at the SEND
-    (:meth:`note`) and answered at the READ (:meth:`answer`) through
-    ``printer_incidents.note_step`` / ``answer_step`` — this class is their ONE caller —
-    and the log is built ONLY by :meth:`from_row` (both spawn paths, AST-pinned). Every
-    counter is DERIVED from ``steps``; nothing is counted twice.
+    The store's :class:`~backend.app.services.printer_incidents.EvidenceLog` (its write
+    discipline: noted at the send, answered at the read, built only by ``from_row``, the
+    ledger's one writer) bound to THIS driver's vocabulary — :class:`LeverStep` and
+    :class:`CommandStep` — plus every reading this driver derives from its log. Durable,
+    because on a feeder-stall wedge every release verb's consequence is identical
+    (012-H2S 2026-09-23), so a driver restarted from the wire alone re-grinds the stall
+    from the first lever. Every counter is DERIVED from ``steps``; nothing is counted
+    twice.
 
     The 009-H2S incident reported ``no_eligible_spool`` after four failed loads — a lie
     that sent the operator looking for spools instead of at the feed path. The reason is
     read off this log, never off a position in the code.
     """
 
-    incident_id: int
-    steps: list[LeverStep | CommandStep] = field(default_factory=list)
-
     @classmethod
-    async def from_row(cls, db: AsyncSession, incident_id: int) -> _RecoveryEvidence:
-        """The log of ``incident_id`` as the ledger holds it — empty for a fresh incident,
-        the previous driver's steps for a re-entered one."""
-        return cls(
-            incident_id=incident_id, steps=[_step_of(row) for row in await printer_incidents.steps_of(db, incident_id)]
-        )
+    def _step_of(cls, row: PrinterIncidentStep) -> LeverStep | CommandStep:
+        """Hydrate ONE ledger row. A token this module's vocabulary cannot name RAISES — a
+        ledger that says something the driver cannot read is drift, never a skipped row."""
+        outcome = row.outcome
+        if row.kind == STEP_KIND_LEVER:
+            if not _is_lever(row.name):
+                raise LookupError(
+                    f"spool_recovery: incident {row.incident_id} step {row.seq} names no lever: {row.name!r}"
+                )
+            if outcome is not None and not _is_reading(outcome):
+                raise LookupError(f"spool_recovery: incident {row.incident_id} step {row.seq} reads {outcome!r}")
+            return LeverStep(seq=row.seq, lever=row.name, outcome=outcome, moved=None, at=row.sent_at)
+        if row.kind == STEP_KIND_COMMAND:
+            if not _is_command(row.name):
+                raise LookupError(
+                    f"spool_recovery: incident {row.incident_id} step {row.seq} names no command: {row.name!r}"
+                )
+            if outcome is not None and not _is_answer(outcome):
+                raise LookupError(f"spool_recovery: incident {row.incident_id} step {row.seq} answers {outcome!r}")
+            return CommandStep(
+                seq=row.seq, command=row.name, target=row.target, feeder=row.feeder, answer=outcome, at=row.sent_at
+            )
+        raise LookupError(f"spool_recovery: incident {row.incident_id} step {row.seq} has kind {row.kind!r}")
 
-    async def note(self, step: LeverStep | CommandStep) -> int:
-        """Append ``step`` (a :meth:`LeverStep.draft` / :meth:`CommandStep.draft`) with the
-        next ``seq`` and PERSIST it, in its own session, at the send. Returns the seq.
-
-        Best-effort on the write, like every bookkeeping step of this driver: a failed
-        commit is logged and the in-memory step stands, so the live driver's own budget
-        still holds — what is lost is only the durability a re-entry would read.
-        """
-        from backend.app.core.database import async_session
-
-        seq = max((s.seq for s in self.steps), default=0) + 1
-        at = datetime.utcnow()
-        try:
-            async with async_session() as db:
-                match step:
-                    case LeverStep():
-                        row = await printer_incidents.note_step(
-                            db, self.incident_id, seq=seq, kind=STEP_KIND_LEVER, name=step.lever
-                        )
-                    case CommandStep():
-                        row = await printer_incidents.note_step(
-                            db,
-                            self.incident_id,
-                            seq=seq,
-                            kind=STEP_KIND_COMMAND,
-                            name=step.command,
-                            target=step.target,
-                            feeder=step.feeder,
-                        )
-                    case _:
-                        assert_never(step)
-                at = row.sent_at
-        except Exception:  # noqa: BLE001 — a ledger write must never crash the driver
-            logger.exception("spool_recovery: incident %s step %s could not be persisted", self.incident_id, seq)
-        self.steps.append(replace(step, seq=seq, at=at))
-        return seq
-
-    async def answer(self, seq: int, outcome: LeverReading | ams_command.Answer, *, moved: bool | None = None) -> None:
-        """Fill step ``seq``'s outcome — the reader's verdict (with ``moved``) for a lever,
-        the classifier's answer for a command — in memory AND on the ledger."""
-        from backend.app.core.database import async_session
-
-        index = next((i for i, s in enumerate(self.steps) if s.seq == seq), None)
-        if index is None:
-            raise LookupError(f"spool_recovery: incident {self.incident_id} has no step {seq} to answer")
-        step = self.steps[index]
-        match step:
-            case LeverStep():
-                if not _is_reading(outcome):
-                    raise LookupError(f"spool_recovery: lever step {seq} answered with {outcome!r}")
-                self.steps[index] = replace(step, outcome=outcome, moved=moved)
-            case CommandStep():
-                if not _is_answer(outcome):
-                    raise LookupError(f"spool_recovery: command step {seq} answered with {outcome!r}")
-                self.steps[index] = replace(step, answer=outcome)
-            case _:
-                assert_never(step)
-        try:
-            async with async_session() as db:
-                await printer_incidents.answer_step(db, self.incident_id, seq, outcome=outcome)
-        except Exception:  # noqa: BLE001 — a ledger write must never crash the driver
-            logger.exception("spool_recovery: incident %s step %s answer could not be persisted", self.incident_id, seq)
+    async def answer(self, seq: int, outcome: str, *, moved: bool | None = None) -> None:
+        """Fill step ``seq``'s outcome — the reader's verdict for a lever, the classifier's
+        answer for a command — through the store's log, then keep a lever's ``moved``: the
+        read's own, in memory only (the ledger keeps the verdict, not the motion)."""
+        await super().answer(seq, outcome)
+        if moved is None:
+            return
+        for index, step in enumerate(self.steps):
+            if step.seq == seq and isinstance(step, LeverStep):
+                self.steps[index] = replace(step, moved=moved)
 
     # --- derived: every reading below is a projection of ``steps`` ---------------------
 
@@ -2404,7 +2373,7 @@ async def _close_for_new_fault(db: AsyncSession, row: PrinterIncident, verdict: 
     """End the open AMS row the new fault answered — the closers' own two steps.
 
     ``printer_incidents.close`` (the store's one closer, which logs the ``CLOSED …
-    source=`` line) and the unit's hold projection (:func:`_clear_hold_projection`), in
+    source=`` line) and the unit's hold projection (``printer_incidents.clear_hold_projection``), in
     that order, as every lifecycle closer does; the new incident stamps its own token
     when it opens. A close somebody else won leaves nothing to clear: that closer
     cleared it.
@@ -2412,7 +2381,7 @@ async def _close_for_new_fault(db: AsyncSession, row: PrinterIncident, verdict: 
     incident_id, printer_id, item_id, kind, status = row.id, row.printer_id, row.item_id, row.kind, row.status
     if await printer_incidents.close(db, incident_id, status=STATUS_RESOLVED, source=verdict.source) is None:
         return
-    cleared = await _clear_hold_projection(db, item_id)
+    cleared = await printer_incidents.clear_hold_projection(db, item_id)
     logger.info(
         "spool_recovery: printer %s new fault — %s incident %s closed (was %s) — %s%s",
         printer_id,
@@ -2526,20 +2495,21 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                 return None
 
             if existing is None and printer_incidents.job_pause_held(printer_id):
-                # The printer PAUSED this job to ask a human about the plate (its own
-                # pre-print check), and every act this machine owns ends in a resume — a
-                # release lever, the swap round's resume, the refill auto-resume. Any of
-                # them would restart the print onto the plate the printer refused. So no
-                # new AMS incident is opened while that question stands: the human's
-                # resume ends the job pause, and a fault still standing then is owned on
-                # the very next push (and its raw alert reaches them meanwhile —
+                # The printer PAUSED this job at its own pre-print plate check, and every
+                # act this machine owns ends in a resume — a release lever, the swap round's
+                # resume, the refill auto-resume. Any of them would restart the print onto
+                # the plate the printer refused with no re-check. So no new AMS incident is
+                # opened while that question stands: the plate-check episode answers it
+                # (``pause_recovery`` — its re-check press, then a stop; a human in its
+                # fallback), and a fault still standing after the job pause ends is owned on
+                # the very next push (its raw alert reaches the operator meanwhile —
                 # ``owned_full_codes`` mirrors this gate). An AMS row ALREADY open keeps its
                 # owner; the upgrade below only re-classifies it and resumes nothing.
                 _note_outcome(
                     printer_id,
                     job_id,
                     fingerprint,
-                    "not owned — the printer paused this job for a human (plate check); the answer comes first",
+                    "not owned — the printer paused this job at its plate check; that answer comes first",
                 )
                 return None
 
@@ -2688,8 +2658,8 @@ async def owned_full_codes(db: AsyncSession, printer_id: int, state) -> frozense
     (3) Three arms, one authority each:
         * the ACTIONABLE candidates — when an incident owns them, which MIRRORS
           :func:`on_ams_fault`'s durable entry gates: a standing AMS row (the raw alert
-          is the duplicate), or the gates a new row opens past (no job paused for a
-          human, no aborted close of this exact fault). Foreign prints
+          is the duplicate), or the gates a new row opens past (no job paused at its
+          plate check, no aborted close of this exact fault). Foreign prints
           included — an incident owns every class of their AMS faults (runouts and
           physical faults since 2026-08-09, mechanical since the 2026-08-10
           origin-agnostic ruling);
@@ -2741,10 +2711,10 @@ async def owned_full_codes(db: AsyncSession, printer_id: int, state) -> frozense
 async def _entry_would_open(db: AsyncSession, printer_id: int, state, candidates: frozenset[FaultCandidate]) -> bool:
     """With no standing AMS row, would :func:`on_ams_fault` open one for ``candidates``?
 
-    Its remaining durable gates, mirrored: while the printer's job is paused for a human
-    (its own plate check) no NEW AMS incident opens, so nothing speaks for the fault and
-    its raw alert is the only word the operator gets; and a fault an ABORTED close barred
-    will never be owned again — its raw alert goes through rather than into silence.
+    Its remaining durable gates, mirrored: while the printer's job is paused at its own
+    plate check no NEW AMS incident opens, so nothing speaks for the fault and its raw
+    alert is the only word the operator gets; and a fault an ABORTED close barred will
+    never be owned again — its raw alert goes through rather than into silence.
     """
     if printer_incidents.job_pause_held(printer_id):
         return False
@@ -3317,11 +3287,12 @@ def _takeover(
         upgraded it under us (a jam the taxonomy re-read as a physical fault). The one
         token that is NOT an abort; see :func:`_hand_over`.
     ``job_changed``
-        The printer is echoing a different ``subtask_id``. Whatever this driver was
-        recovering, it is not what is on the wire now. In the restart continuation
-        (``awaiting == "job_over"``) also ANY job on the printer (:data:`_JOB_OVER_STATES`
-        read otherwise): the job the driver stopped cannot run again, and the unit's
-        requeue cannot dispatch while this row holds the printer.
+        The printer is echoing a different ``subtask_id`` (``job_identity.same_job`` answers
+        ``other``: both sides name a job). Whatever this driver was recovering, it is not
+        what is on the wire now. In the restart continuation (``awaiting == "job_over"``)
+        also ANY job on the printer (:data:`_JOB_OVER_STATES` read otherwise): the job the
+        driver stopped cannot run again, and the unit's requeue cannot dispatch while this
+        row holds the printer.
     ``job_ended``
         The live state is neither PAUSE nor RUNNING — IDLE / FINISH / FAILED / PREPARE.
         Somebody else's act in every loop that asks this predicate; the windows where a
@@ -3357,8 +3328,7 @@ def _takeover(
     kind = printer_incidents.cached_kind(incident.printer_id, incident.incident_id)
     if kind is not None and kind != incident.kind:
         return "reclassified"
-    job = (getattr(st, "subtask_id", None) or "").strip()
-    if incident.job_id and job and job != incident.job_id:
+    if same_job(getattr(st, "subtask_id", None), incident.job_id) == "other":
         return "job_changed"
     if awaiting == "job_over":
         if live not in _JOB_OVER_STATES:
@@ -4119,7 +4089,7 @@ async def _restart(incident: RecoveryIncident, *, evidence: _RecoveryEvidence) -
     spool = "unknown spool"
     try:
         async with async_session() as db:
-            await _clear_hold_projection(db, incident.item_id)
+            await printer_incidents.clear_hold_projection(db, incident.item_id)
             spool = await _describe_slot(db, pid, jammed)
     except Exception:  # noqa: BLE001 — the close stands; only its log line's detail is lost
         logger.exception("spool_recovery: restart bookkeeping failed for printer %s", pid)
@@ -5673,28 +5643,6 @@ async def _clear_oor_if_resumed_on_jammed_feeder(db: AsyncSession, incident: Rec
 # happened: a human took the printer, not "recovery succeeded".
 
 
-def _clearable(reason: str | None) -> bool:
-    """May this hold token be cleared by an incident close?
-
-    Only the tokens this module owns (:data:`RECOVERY_WAITING_REASONS`). A unit
-    holding for a plate-vision trip or a filament deficit keeps its own reason — a
-    resume observed on the wire says nothing about those.
-    """
-    return reason in RECOVERY_WAITING_REASONS
-
-
-async def _clear_hold_projection(db: AsyncSession, item_id: int | None) -> bool:
-    """Drop the incident's ``waiting_reason`` projection from a farm unit."""
-    if item_id is None:
-        return False
-    item = await db.get(PrintQueueItem, item_id)
-    if item is None or not _clearable(item.waiting_reason):
-        return False
-    item.waiting_reason = None
-    await db.commit()
-    return True
-
-
 async def on_observed_running(printer_id: int) -> bool:
     """The printer is RUNNING again — close whatever incident it was holding.
 
@@ -5736,7 +5684,9 @@ async def on_observed_running(printer_id: int) -> bool:
                     continue
                 item_id, kind, status = incident.item_id, incident.kind, incident.status
                 if await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source):
-                    closed.append((incident.id, kind, status, await _clear_hold_projection(db, item_id)))
+                    closed.append(
+                        (incident.id, kind, status, await printer_incidents.clear_hold_projection(db, item_id))
+                    )
         for incident_id, kind, status, cleared in closed:
             logger.info(
                 "spool_recovery: printer %s observed RUNNING — %s incident %s closed (was %s)%s",
@@ -5897,7 +5847,7 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
                         first = now
 
                     await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source)
-                    cleared = await _clear_hold_projection(db, incident.item_id)
+                    cleared = await printer_incidents.clear_hold_projection(db, incident.item_id)
                     _hold_over_since.pop(incident.id, None)
                     _repair_resume_sent.discard(incident.id)
                     closed += 1
@@ -5939,8 +5889,7 @@ async def _maybe_self_heal_after_repair(incident, state, *, evidence: str, live:
     """
     if evidence != _REPAIR_EVIDENCE_LOAD or live != "PAUSE":
         return
-    job = (getattr(state, "subtask_id", None) or "").strip()
-    if not job or job != (incident.job_id or ""):
+    if same_job(getattr(state, "subtask_id", None), incident.job_id) != "same":
         return
     if incident.id in _repair_resume_sent:
         return
@@ -6002,13 +5951,20 @@ async def rearm_incidents_on_startup() -> int:
                 # printer IDLE — "not PAUSE" to the wire cell — and must re-enter the
                 # continuation, which finishes what the log says is left (the unload, or
                 # only the park and the close), never close the row ``startup_rearm``.
-                try:
-                    restart_owed = (await _RecoveryEvidence.from_row(db, incident.id)).restart_stop is not None
-                except LookupError:
-                    # A ledger the driver cannot read is drift (``_step_of``); it must not
-                    # cost every other row its startup verdict.
-                    logger.exception("spool_recovery: startup — incident %s has an unreadable step ledger", incident.id)
-                    restart_owed = False
+                # Asked of THIS driver's rows only: the restart stop is an AMS row's lever,
+                # and another kind's ledger is another driver's vocabulary (a plate-check
+                # episode's ``dialog`` / ``stop`` steps, ``pause_recovery``), which this
+                # driver's log cannot read and must not report as drift.
+                restart_owed = False
+                if incident.kind in AMS_FAULT_KINDS:
+                    try:
+                        restart_owed = (await _RecoveryEvidence.from_row(db, incident.id)).restart_stop is not None
+                    except LookupError:
+                        # A ledger the driver cannot read is drift (``_step_of``); it must not
+                        # cost every other row its startup verdict.
+                        logger.exception(
+                            "spool_recovery: startup — incident %s has an unreadable step ledger", incident.id
+                        )
                 verdict = incident_resolution.resolve(
                     incident,
                     "startup",
@@ -6019,7 +5975,7 @@ async def rearm_incidents_on_startup() -> int:
                         driverless.append((incident.id, pid))
                     continue
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source)
-                await _clear_hold_projection(db, incident.item_id)
+                await printer_incidents.clear_hold_projection(db, incident.item_id)
                 closed += 1
                 logger.info(
                     "spool_recovery: startup — printer %s incident %s (%s) closed — %s",
@@ -6499,13 +6455,14 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
             return False
 
         if printer_incidents.job_pause_held(printer_id):
-            # The printer ALSO paused this job to ask a human about the plate. A refill
-            # resume would answer that question too, onto the plate it refused — the one
-            # predicate every job-resuming lane reads. The runout hold stays open and the
-            # human's resume closes both.
+            # The printer ALSO paused this job at its plate check. A refill resume would
+            # answer that question too, onto the plate it refused with no re-check — the one
+            # predicate every job-resuming lane reads. The runout hold stays open: the
+            # plate-check episode's own press (``pause_recovery``) or, in its fallback, a
+            # human's resume answers both.
             logger.info(
                 "spool_recovery: printer %s is held at a job pause (the printer's plate check) — refill seen, "
-                "not resuming; the operator resumes on the printer",
+                "not resuming; the plate-check episode answers that pause",
                 printer_id,
             )
             return False
@@ -6577,16 +6534,14 @@ async def _resume_after_repair(printer_id: int, incident_id: int) -> bool:
             return False
 
         if printer_incidents.job_pause_held(printer_id):
-            # Same rule as the refill lane: the printer paused this job for a human's
-            # answer about the plate, and a repair resume would answer it for them.
+            # Same rule as the refill lane: the printer paused this job at its plate check,
+            # and a repair resume would answer that pause with no re-check.
             logger.info(
                 "spool_recovery: printer %s is held at a job pause (the printer's plate check) — repair seen, "
-                "not resuming; the operator resumes on the printer",
+                "not resuming; the plate-check episode answers that pause",
                 printer_id,
             )
             return False
-
-        job = (getattr(st, "subtask_id", None) or "").strip()
 
         from backend.app.core.database import async_session
 
@@ -6594,7 +6549,7 @@ async def _resume_after_repair(printer_id: int, incident_id: int) -> bool:
             row = await db.get(PrinterIncident, incident_id)
             if row is None or row.resolved_at is not None:
                 return False
-            if not job or job != (row.job_id or ""):
+            if same_job(getattr(st, "subtask_id", None), row.job_id) != "same":
                 return False
             # The same question the sweep asks, asked of the same table: does this
             # row's own evidence still hold? A row of any OTHER class answers False
@@ -6761,7 +6716,7 @@ async def _close_runout_hold_and_notify(printer_id: int, slot: tuple[int, int] |
             slot_desc = runout_slot_desc(tray) or "the filament slot"
             if incident is not None:
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=RESOLVE_AUTO_RESUME)
-            await _clear_hold_projection(db, item_id)
+            await printer_incidents.clear_hold_projection(db, item_id)
             printer = await db.get(Printer, printer_id)
             printer_name = (printer.name if printer else None) or f"printer {printer_id}"
             st = _get_state(printer_id)

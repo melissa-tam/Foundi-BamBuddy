@@ -1647,6 +1647,105 @@ class TestPowerLossVocabulary:
         assert classify_short_code("0300_400D") is None
 
 
+class TestPlateCheckVocabulary:
+    """The printer's own pre-print plate check: ONE code set and the predicate the pause
+    lane reads — ``PAUSE`` plus the CURRENT ``print_error`` dialog.
+
+    Print-module (0x03) and mainboard/camera (0x05) codes, so the set is a named literal
+    OUTSIDE the AMS fault taxonomy — the same ruling as the power-loss vocabulary above."""
+
+    def test_the_set_holds_exactly_the_four_native_vision_codes(self):
+        """Copied verbatim from the literal it replaced (``bambu_mqtt``'s private set): the
+        move must neither widen nor narrow what the pause lane trips on."""
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
+
+        expected = frozenset({"0300_8017", "0300_8006", "0500_806E", "0500_808C"})
+        assert expected == PLATE_CHECK_HMS_CODES
+
+    def test_the_retired_literal_is_gone_and_every_reader_holds_the_one_set(self):
+        """The readers are the pause lane (``plate_check_paused``, beside the set) and the failure
+        category. ``main``'s HMS-edge spawn — the set's third reader — is deleted (2026-09-29):
+        the plate-check episode's only trigger is the pause sampler."""
+        from backend.app import main
+        from backend.app.services import bambu_mqtt, terminal_outcome
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
+
+        assert not hasattr(bambu_mqtt, "_HMS_PLATE_OCCUPANCY_CODES")
+        assert not hasattr(main, "PLATE_CHECK_HMS_CODES")
+        assert terminal_outcome.PLATE_CHECK_HMS_CODES is PLATE_CHECK_HMS_CODES
+        # The failure category still names every member.
+        for code in PLATE_CHECK_HMS_CODES:
+            assert terminal_outcome._HMS_FAILURE_REASONS[code] == "Plate not empty (printer vision)"
+
+    def test_the_codes_are_not_ams_taxonomy_rows(self):
+        """The AMS classifier must not claim them — the jam machine, the dispatch gate and
+        the incident sweep all read the taxonomy (``live_candidates``), and a plate check
+        routed there would open an AMS incident on a printer with nothing wrong in its AMS."""
+        from backend.app.services.bambu_mqtt import HMSError
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, classify_short_code, live_candidates
+
+        for code in PLATE_CHECK_HMS_CODES:
+            assert classify_short_code(code) is None, code
+        # The print_error-lane shape the parser stores: attr = the whole 32-bit word.
+        entry = HMSError(code="0x808c", attr=0x0500808C, module=5, severity=3, full_code="0500808C")
+        assert live_candidates(SimpleNamespace(hms_errors=[entry])) == frozenset()
+
+    @pytest.mark.parametrize(
+        ("print_error", "dialog"),
+        [(0x0500808C, 0x0500808C), (0x03008007, 0x03008007), (0x0300400D, 0x0300400D), (0x00000002, 0), (0, 0)],
+        ids=["plate-check", "power-loss-prompt", "fatal", "status-phase-word", "none"],
+    )
+    def test_print_error_dialog_reads_status_words_as_no_dialog(self, print_error, dialog):
+        """A low half below 0x4000 is a status / phase word, not a dialog — the one reading of that
+        threshold, shared by the MQTT merge and the pause lane's "another dialog" hand-over."""
+        from backend.app.services.hms_errors import print_error_dialog
+
+        assert print_error_dialog(print_error) == dialog
+
+    @pytest.mark.parametrize(
+        ("print_error", "short"),
+        [(0x0500808C, "0500_808C"), (0x0500806E, "0500_806E"), (0x03008017, "0300_8017"), (0, "0000_0000")],
+    )
+    def test_print_error_short_code_splits_the_word(self, print_error, short):
+        from backend.app.services.hms_errors import print_error_short_code
+
+        assert print_error_short_code(print_error) == short
+
+    @pytest.mark.parametrize(
+        ("gcode_state", "print_error", "expected"),
+        [
+            pytest.param("PAUSE", 0x0500808C, True, id="pause+808C"),
+            pytest.param("PAUSE", 83918958, True, id="pause+806E_decimal"),
+            pytest.param("PAUSE", 0x03008017, True, id="pause+0300_8017"),
+            pytest.param("RUNNING", 0x0500808C, False, id="running+808C"),
+            pytest.param("PAUSE", 0x03008007, False, id="pause+power_loss_prompt"),
+            pytest.param("PAUSE", 0, False, id="pause+no_dialog"),
+            pytest.param("FAILED", 0x0500808C, False, id="failed+808C"),
+        ],
+    )
+    def test_plate_check_paused_truth_table(self, gcode_state, print_error, expected):
+        from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.hms_errors import plate_check_paused
+
+        assert plate_check_paused(PrinterState(state=gcode_state, print_error=print_error)) is expected
+
+    def test_a_lingering_hms_entry_does_not_trip_it(self):
+        """The dialog leg is the CURRENT ``print_error``, never the merged HMS list — a
+        plate code left in ``hms_errors`` after the dialog closed is not a trip."""
+        from backend.app.services.bambu_mqtt import HMSError, PrinterState
+        from backend.app.services.hms_errors import plate_check_paused
+
+        leftover = HMSError(code="0x808c", attr=0x0500808C, module=5, severity=3, full_code="0500808C")
+        assert plate_check_paused(PrinterState(state="PAUSE", print_error=0, hms_errors=[leftover])) is False
+
+    def test_a_malformed_state_never_raises(self):
+        from backend.app.services.hms_errors import plate_check_paused
+
+        assert plate_check_paused(None) is False
+        assert plate_check_paused(SimpleNamespace(state="PAUSE")) is False
+        assert plate_check_paused(SimpleNamespace(state="PAUSE", print_error="not-a-number")) is False
+
+
 class TestFingerprintTokens:
     """``fingerprint_tokens`` is ``candidate_fingerprint``'s inverse: a STORED fingerprint
     (an incident's ``codes``, an aborted-close block) reads back as the very tokens the

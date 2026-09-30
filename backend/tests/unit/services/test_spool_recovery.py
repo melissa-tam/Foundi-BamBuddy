@@ -4534,6 +4534,49 @@ class TestZombieRecoveringRearm:
             await db_session.get(PrintQueueItem, item.id)
         ).waiting_reason == printer_incidents.WAITING_REASON_PHYSICAL
 
+    async def test_a_plate_check_episodes_ledger_is_not_read_as_this_drivers(
+        self, db_session, printer_factory, monkeypatch, caplog
+    ):
+        """The rearm asks an open row's ledger whether THIS driver stopped its job to restart
+        it (``restart_owed``). A plate-check episode's ledger holds the plate-check driver's
+        ``dialog`` / ``stop`` steps (``pause_recovery``), which this driver's vocabulary
+        cannot name: the row is not this driver's, so its ledger is not read — no
+        "unreadable step ledger" drift ERROR — and its own startup verdict still runs (an
+        IDLE printer is no RUNNING evidence, and nobody re-enters it here)."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION, STATUS_RECOVERING
+        from backend.app.services import pause_recovery
+        from backend.app.services.hms_actions import HMSAction
+
+        printer = await printer_factory()
+        row = await _seed_incident(
+            db_session,
+            printer.id,
+            kind=KIND_PLATE_VISION,
+            status=STATUS_RECOVERING,
+            code="0500_808C",
+            codes="0500_808C",
+        )
+        await printer_incidents.note_step(
+            db_session, row.id, seq=1, kind="dialog", name=str(HMSAction.PROBLEM_SOLVED_RESUME)
+        )
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="success")
+        await printer_incidents.note_step(
+            db_session, row.id, seq=2, kind="stop", name=pause_recovery.PLATE_CHECK_STOP_VERB
+        )
+        state = _make_state(gcode_state="IDLE", hms=[])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            assert await spool_recovery.rearm_incidents_on_startup() == 0
+
+        assert not any("unreadable step ledger" in r.getMessage() for r in caplog.records)
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        (open_row,) = await _incident_rows(db_session, printer.id)
+        assert (open_row.id, open_row.status, open_row.resolved_at) == (row.id, STATUS_RECOVERING, None)
+        assert client.calls == []
+        assert printer_incidents.driver_live(printer.id) is False
+
 
 # ===========================================================================
 # C4 — the EXTERNAL-spool runout takes its own operator copy

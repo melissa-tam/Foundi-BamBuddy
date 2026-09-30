@@ -3,6 +3,7 @@
 Tests the full request/response cycle for /api/v1/printers/ endpoints.
 """
 
+import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -2822,13 +2823,41 @@ class TestClearHMSErrorsAPI:
             assert "failed" in response.json()["detail"].lower()
 
 
+def _dialog_client(*, result: str | None = "success", reason: str | None = None, echo: bool = True):
+    """A REAL ``BambuMQTTClient`` whose broker answers every print-topic frame the way the
+    firmware does: an echo of the frame's own ``command`` + ``sequence_id`` with a
+    ``result`` (``echo=False`` is the silent drop). The echo goes through the client's own
+    parse point, so the route reads it exactly as it reads a printer's."""
+    from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+    client = BambuMQTTClient(ip_address="192.168.1.100", serial_number="TEST-HMS", access_code="12345678")
+    client._client = MagicMock()
+    client.state.connected = True
+
+    def _publish(_topic, payload, qos=1):
+        frame = json.loads(payload).get("print")
+        if not echo or frame is None:
+            return
+        answer = {"command": frame["command"], "sequence_id": frame["sequence_id"], "result": result}
+        if reason is not None:
+            answer["reason"] = reason
+        client._process_message({"print": answer})
+
+    client._client.publish.side_effect = _publish
+    return client
+
+
+def _published_print_frames(client):
+    return [json.loads(c.args[1])["print"] for c in client._client.publish.call_args_list if '"print"' in c.args[1]]
+
+
 class TestExecuteHMSActionAPI:
     """Integration tests for the /hms/execute-action endpoint (#1743).
 
-    Mirrors TestClearHMSErrorsAPI's shape — the two routes share the same
-    permission gate, the same DB-lookup + client-existence flow, and the
-    same dispatch-then-return-success pattern. The body-validation cases
-    add coverage that the bare clear endpoint doesn't need.
+    The route answers from the firmware's own ACK of the frame it sent
+    (``SentCommand`` → ``BambuMQTTClient.await_ack``): success → 200, a refusing ACK →
+    502 naming the answer, no ACK within the budget → 502 (the silent drop #1830 names),
+    and a frame whose echo is never recorded (the ``uiop`` close) → 200 "sent".
     """
 
     _VALID_BODY = {
@@ -2862,44 +2891,163 @@ class TestExecuteHMSActionAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_execute_hms_action_success(self, async_client: AsyncClient, printer_factory):
-        """200 happy path — dispatcher returns True AND printer state moves
-        within the ack-wait window. The state delta is the firmware's only
-        proof that the command landed (publish success is necessary but not
-        sufficient; see #1830 §(3))."""
+    async def test_a_success_ack_is_200(self, async_client: AsyncClient, printer_factory):
+        """The farm's plate-check press, through the route: the vendor "Problem solved"
+        frame goes out, the firmware answers THAT send with success, 200."""
         printer = await printer_factory(name="Test Printer")
-
-        mock_client = MagicMock()
-        # Pre-action state — paused with a fault.
-        mock_client.state.state = "PAUSE"
-        mock_client.state.print_error = 0x05008051
-        mock_client.state.hms_errors = [object()]
-
-        def _act(*_a, **_kw):
-            # Simulate the printer accepting the command and clearing the fault
-            # by the time the ack-wait expires.
-            mock_client.state.state = "FAILED"
-            mock_client.state.print_error = 0
-            mock_client.state.hms_errors = []
-            return True
-
-        mock_client.execute_hms_action.side_effect = _act
+        client = _dialog_client(result="success")
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
         ):
-            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_client.return_value = client
+
+            body = {"print_error": "0500808C", "action": "PROBLEM_SOLVED_RESUME", "job_id": "771234"}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["success"] is True
+        assert "executed" in result["message"].lower()
+        assert _published_print_frames(client) == [
+            {
+                "command": "resume",
+                "err": "83918988",
+                "param": "reserve",
+                "job_id": "771234",
+                "sequence_id": "1",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_body_args_reach_the_dispatcher_in_order(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
+            patch.object(client, "execute_hms_action", wraps=client.execute_hms_action) as dispatch,
+        ):
+            mock_pm.get_client.return_value = client
 
             body = {"print_error": "07008029", "action": "FILAMENT_EXTRUDED", "job_id": "task-7"}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
-            assert response.status_code == 200
-            result = response.json()
-            assert result["success"] is True
-            assert "executed" in result["message"].lower()
-            # Body args reach the client method in (print_error, action, job_id) order.
-            mock_client.execute_hms_action.assert_called_once_with("07008029", "FILAMENT_EXTRUDED", "task-7")
+        assert response.status_code == 200
+        dispatch.assert_called_once_with("07008029", "FILAMENT_EXTRUDED", "task-7")
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_missing_job_id_is_sent_empty(self, async_client: AsyncClient, printer_factory):
+        """The body's ``job_id`` is optional (a fault with no job); the dialog frame always
+        carries the key, as Studio's does — ``""``, never ``null``, never omitted."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
+        ):
+            mock_pm.get_client.return_value = client
+
+            body = {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        assert _published_print_frames(client)[0]["job_id"] == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_refusing_ack_is_502_naming_the_answer(self, async_client: AsyncClient, printer_factory):
+        """The firmware answered THIS send, and the answer was no: a 502 that says what it
+        said, never the old "state did not move" guess."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="fail", reason="err mismatch")
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
+        ):
+            mock_pm.get_client.return_value = client
+
+            body = {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 502
+        detail = response.json()["detail"]
+        assert "ignore" in detail
+        assert "result=fail" in detail
+        assert "reason=err mismatch" in detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_no_ack_within_the_budget_is_502(self, async_client: AsyncClient, printer_factory):
+        """502 when publish succeeded but no ACK names the send inside the budget — the
+        silent-rejection failure mode #1830 identifies: the broker ACKs the publish at QoS
+        1 but the firmware drops the command."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(echo=False)
+        # Another send's ACK is not this send's answer.
+        client._process_message({"print": {"command": "clean_print_error", "sequence_id": "7", "result": "success"}})
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.02),
+        ):
+            mock_pm.get_client.return_value = client
+
+            response = await async_client.post(
+                f"/api/v1/printers/{printer.id}/hms/execute-action", json=self._VALID_BODY
+            )
+
+        assert response.status_code == 502
+        assert "acknowledge" in response.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_re_pause_inside_the_window_is_still_a_success(self, async_client: AsyncClient, printer_factory):
+        """The race the state diff lost (upstream #1869): the printer accepts, resumes and
+        re-pauses on the same dialog inside the window, so ``gcode_state`` and the HMS list
+        round-trip to their pre-press values. The ACK is the answer, not the state."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+        client.state.state = "PAUSE"
+        client.state.print_error = 0x0500808C
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
+        ):
+            mock_pm.get_client.return_value = client
+
+            body = {"print_error": "0500808C", "action": "PROBLEM_SOLVED_RESUME", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        assert (client.state.state, client.state.print_error) == ("PAUSE", 0x0500808C)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_unrecorded_echo_answers_sent(self, async_client: AsyncClient, printer_factory):
+        """The double-check OK ends on the system-topic ``uiop`` close, whose echo is never
+        recorded as an ACK: 200 "sent", without waiting on an answer that cannot come."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(echo=False)
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 5.0),
+        ):
+            mock_pm.get_client.return_value = client
+
+            body = {"print_error": "03008070", "action": "DBL_CHECK_OK", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "message": "HMS action sent"}
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2907,23 +3055,16 @@ class TestExecuteHMSActionAPI:
         """The dialog's "Stop printing" is an operator pressing Stop: it goes through the
         ONE owner (``print_control.stop_as_operator`` — the durable stop request AND the
         stop), never the dialog dispatcher, which used to send it without the request so the
-        terminal read as a genuine failure (2026-09-24)."""
+        terminal read as a genuine failure (2026-09-24). The stop frame carries no sequence
+        id, so its answer is "sent"."""
         printer = await printer_factory(name="Test Printer")
 
         mock_client = MagicMock()
-        mock_client.state.state = "PAUSE"
-        mock_client.state.hms_errors = [object()]
-
-        def _stopped(_pid):
-            mock_client.state.state = "FAILED"
-            mock_client.state.hms_errors = []
-            return True
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
             patch(
-                "backend.app.api.routes.printers.stop_as_operator", new_callable=AsyncMock, side_effect=_stopped
+                "backend.app.api.routes.printers.stop_as_operator", new_callable=AsyncMock, return_value=True
             ) as operator_stop,
         ):
             mock_pm.get_client.return_value = mock_client
@@ -2932,17 +3073,35 @@ class TestExecuteHMSActionAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
         assert response.status_code == 200
+        assert response.json() == {"success": True, "message": "HMS action sent"}
         operator_stop.assert_awaited_once_with(printer.id)
         mock_client.execute_hms_action.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_execute_hms_action_dispatcher_failure(self, async_client: AsyncClient, printer_factory):
-        """400 when the dispatcher returns False (unknown action, mid-flight disconnect)."""
+    async def test_an_undelivered_stop_is_400(self, async_client: AsyncClient, printer_factory):
+        printer = await printer_factory(name="Test Printer")
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.stop_as_operator", new_callable=AsyncMock, return_value=False),
+        ):
+            mock_pm.get_client.return_value = MagicMock()
+
+            body = {"print_error": "0500808C", "action": "STOP_PRINTING", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_nothing_sent_is_400(self, async_client: AsyncClient, printer_factory):
+        """400 when the dispatcher sent nothing (``None``): unknown action, a mid-flight
+        disconnect, a refused ``err``, a screen-only button."""
         printer = await printer_factory(name="Test Printer")
 
         mock_client = MagicMock()
-        mock_client.execute_hms_action.return_value = False
+        mock_client.execute_hms_action.return_value = None
 
         with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
             mock_pm.get_client.return_value = mock_client
@@ -2956,65 +3115,41 @@ class TestExecuteHMSActionAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_execute_hms_action_no_printer_ack_returns_502(self, async_client: AsyncClient, printer_factory):
-        """502 when publish succeeded but printer state didn't move within the
-        ack-wait window. This is the silent-rejection failure mode #1830
-        identifies: the broker ACKs the publish at QoS 1 but the firmware
-        drops the command (err mismatch, wrong shape, state mismatch).
-        Surfacing this as 502 instead of 200 stops the UI from claiming
-        success while the modal sticks."""
+    async def test_a_16_char_code_on_an_err_frame_is_refused(self, async_client: AsyncClient, printer_factory):
+        """The schema admits a 16-char ``hms[]`` code (other buttons carry no ``err``), but
+        the dialog frames' ``err`` is the 32-bit ``print_error`` only: nothing is sent."""
         printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
 
-        mock_client = MagicMock()
-        mock_client.state.state = "PAUSE"
-        mock_client.state.print_error = 0x05008051
-        mock_client.state.hms_errors = [object()]
-        mock_client.execute_hms_action.return_value = True  # publish "succeeded"
-        # Crucially: state does NOT change → ack-wait detects no movement.
-
-        with (
-            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
-        ):
-            mock_pm.get_client.return_value = mock_client
-
-            response = await async_client.post(
-                f"/api/v1/printers/{printer.id}/hms/execute-action", json=self._VALID_BODY
-            )
-
-            assert response.status_code == 502
-            assert "acknowledge" in response.json()["detail"].lower()
-
-    @pytest.mark.asyncio
-    @pytest.mark.integration
-    async def test_execute_hms_action_accepts_16_char_full_code(self, async_client: AsyncClient, printer_factory):
-        """200 for a 16-char full_code (hms[]-array-sourced fault). The
-        schema's relaxed pattern allows both 8-char (print_error) and
-        16-char (hms[]) shapes."""
-        printer = await printer_factory(name="Test Printer")
-
-        mock_client = MagicMock()
-        mock_client.state.state = "RUNNING"
-        mock_client.state.print_error = 0
-        mock_client.state.hms_errors = [object()]
-
-        def _act(*_a, **_kw):
-            mock_client.state.hms_errors = []
-            return True
-
-        mock_client.execute_hms_action.side_effect = _act
-
-        with (
-            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.01),
-        ):
-            mock_pm.get_client.return_value = mock_client
+        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = client
 
             body = {"print_error": "0C00030000020010", "action": "IGNORE_RESUME"}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
-            assert response.status_code == 200
-            mock_client.execute_hms_action.assert_called_once_with("0C00030000020010", "IGNORE_RESUME", None)
+        assert response.status_code == 400
+        client._client.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_execute_hms_action_accepts_16_char_full_code(self, async_client: AsyncClient, printer_factory):
+        """200 for a 16-char full_code (hms[]-array-sourced fault) on a button whose frame
+        carries no ``err``. The schema's relaxed pattern allows both 8-char (print_error)
+        and 16-char (hms[]) shapes."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="SUCCESS")
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
+        ):
+            mock_pm.get_client.return_value = client
+
+            body = {"print_error": "0700200000020010", "action": "CONTINUE"}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        assert _published_print_frames(client) == [{"command": "ams_control", "param": "resume", "sequence_id": "1"}]
 
     @pytest.mark.asyncio
     @pytest.mark.integration

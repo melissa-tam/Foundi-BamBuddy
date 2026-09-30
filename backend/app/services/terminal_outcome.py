@@ -31,7 +31,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from backend.app.models.printer_incident import FAULT_KINDS, KIND_PLATE_VISION
-from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
 from backend.app.services.farm_correlation import (
     OPERATOR_STOP_VERDICTS,
     REQUEUE_VERDICTS,
@@ -39,7 +38,14 @@ from backend.app.services.farm_correlation import (
     STOP_VERDICT_PLATE_REFUSED,
     StopVerdict,
 )
-from backend.app.services.hms_errors import PrinterMessage, messages_from_payload, summary_of, unique_messages
+from backend.app.services.hms_errors import (
+    PLATE_CHECK_HMS_CODES,
+    PrinterMessage,
+    messages_from_payload,
+    summary_of,
+    unique_messages,
+)
+from backend.app.services.job_identity import is_held_job
 from backend.app.services.plate_occupancy import PlateRefusal
 
 if TYPE_CHECKING:
@@ -83,9 +89,9 @@ _HMS_FAILURE_REASONS: dict[str, str] = {
     "0701_8013": "Clogged nozzle",
     "0702_8003": "Clogged nozzle",
 }
-# The printer's own pre-print plate check, from the one code set the wire
-# layer defines, so the category and the trip lane can never name different codes.
-for _occupancy_code in _HMS_PLATE_OCCUPANCY_CODES:
+# The printer's own pre-print plate check, from the one code set the HMS taxonomy
+# defines, so the category and the trip lane can never name different codes.
+for _occupancy_code in PLATE_CHECK_HMS_CODES:
     _HMS_FAILURE_REASONS.setdefault(_occupancy_code, "Plate not empty (printer vision)")
 
 # The category for a stop a HUMAN attributed and the printer explained nothing about.
@@ -101,6 +107,38 @@ _STOP_RAW_STATUSES: frozenset[str] = frozenset({"failed", "aborted"})
 # PAYLOAD's own peaks (``last_progress`` / ``last_layer_num``, never the live printer's, which by
 # then may describe another job); ``none`` = nothing is charged.
 ChargeBasis = Literal["full", "partial", "none"]
+
+# How far back the retry-or-escalate verdict looks for the farm's OTHER failed-re-check stops on
+# the same printer (operator ruling 2026-09-29: "if the retry's re-check fails too, escalate").
+# Derived on 2026-09-04 (the first self-heal lane's ``farm_policy._VISION_RECHECK_WINDOW_S``,
+# recovered from b85a5f25^) from what the two ends of the window have to separate: a retry
+# re-dispatches within minutes (the requeued unit takes the next scheduler tick, and its own
+# start G-code IS the re-check), so an hour comfortably contains two genuine consecutive
+# failures; and an unrelated trip a shift later must NOT count as the second, because "twice in
+# a row" is the whole evidence for calling a plate occupied.
+PLATE_RECHECK_WINDOW_S = 3600.0
+
+
+@dataclass(frozen=True, slots=True)
+class PlateCheckFacts:
+    """What the plate-check episode of the job that ended says about its terminal.
+
+    Read by ``pause_recovery.plate_check_facts`` BEFORE any closer runs (the episode's row is
+    one of the holds that terminal closes), and ``None`` there when the job had no plate-check
+    episode at all.
+
+    ``farm_stopped`` — the FARM's stop ended this job because its re-check failed (the ladder's
+    second rung): the episode's evidence log holds a ``stop`` step answered ``taken`` or not yet
+    answered. A stop answered as NOT taken (the driver then handed the paused print to a human),
+    an operator's own Stop, or a job the printer ended by itself reads False.
+
+    ``stops_in_window`` — how many OTHER plate-check episodes on this printer, opened within
+    :data:`PLATE_RECHECK_WINDOW_S`, the farm already stopped. Non-zero means this terminal ends
+    the retry's own failed re-check.
+    """
+
+    farm_stopped: bool
+    stops_in_window: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,8 +169,11 @@ class TerminalOutcome:
     queue row's ``error_message``, the notification's ``{reason}``), rendered by the one
     HMS renderer; None when the printer said nothing.
 
-    ``plate_refusal`` — set iff the verdict is ``plate_refused``: the plate authority's
-    gate cause, carrying the printer's words for the check that refused the plate.
+    ``plate_refusal`` — set when the verdict is ``plate_refused`` and the refusal is
+    ESCALATED: the plate authority's gate cause, carrying the printer's words for the check
+    that refused the plate. ``None`` on a ``plate_refused`` verdict the farm RETRIES
+    (:func:`_farm_retries`) — the verdict still records the unit ``cancelled`` and requeues
+    it, but no gate rises and nobody is paged.
 
     ``charge`` — the filament charge basis (:data:`ChargeBasis`), decided once by
     :func:`_charge_basis` from the terminal's own evidence.
@@ -253,6 +294,40 @@ def _charge_basis(raw_status: str, verdict: StopVerdict | None, evidence: Deposi
     return "partial" if read_a_peak else "none"
 
 
+def _farm_retries(plate_check: PlateCheckFacts | None, *, farm_unit: bool, evidence: DepositEvidence) -> bool:
+    """Does a ``plate_refused`` terminal RETRY the print rather than hand the plate to a human?
+
+    The plate-check ladder (operator ruling 2026-09-29): the farm presses the printer's own
+    "Problem solved, resume"; when that re-check fails the farm stops the print and retries the
+    same print; when the RETRY's re-check fails too, it escalates. So a refused plate is retried
+    only when every one of these holds:
+
+    * the job had a plate-check episode (``plate_check`` is not None);
+    * the FARM stopped it (``farm_stopped``: the farm's own ``stop`` step ended the job). An
+      operator who stops the print mid-episode writes no farm ``stop`` step, and a human who
+      stops it after the farm's stop did NOT take is ending a print the farm already handed
+      over — both ESCALATE: a human who stepped in owns the plate they stepped in on;
+    * it is a FARM unit (``farm_unit``: an id- or name-confirmed attribution with a unit). A
+      foreign print has nothing the farm could requeue, and a fallback-only attribution is the
+      same doubt that denies it an automatic sweep;
+    * the farm stopped no OTHER plate-check episode on this printer inside
+      :data:`PLATE_RECHECK_WINDOW_S` (``stops_in_window == 0``): a second failed re-check is
+      the retry's own, and escalates;
+    * nothing was deposited (``not evidence.deposited``): a stop that left material on the plate
+      is a plate a human must clear, whatever the check said.
+
+    Anything else — including a terminal whose facts could not be read (``plate_check_facts``
+    fails closed to ``farm_stopped=False``) — escalates.
+    """
+    return (
+        plate_check is not None
+        and plate_check.farm_stopped
+        and farm_unit
+        and plate_check.stops_in_window == 0
+        and not evidence.deposited
+    )
+
+
 def build_terminal_outcome(
     *,
     raw_status: str,
@@ -263,21 +338,31 @@ def build_terminal_outcome(
     first_article: bool,
     is_eject: bool,
     hms_errors: list[dict] | None,
+    plate_check: PlateCheckFacts | None = None,
+    farm_unit: bool = False,
 ) -> TerminalOutcome:
     """Build THE outcome of one terminal from facts the caller captured before any sink acted.
 
     ``open_incidents`` must be the SAME projection ``verdict`` was classified over (read
     once, ahead of every closer). ``job_id`` is the terminal's echoed ``subtask_id``:
     the printer's recorded words for a hold count as this terminal's evidence only when
-    the hold paused THIS job — a hold from another job explains nothing about this one.
+    the hold paused THIS job (``job_identity.is_held_job``) — a hold from another job
+    explains nothing about this one.
 
     The evidence the category and the message are built from is the holds' recorded
     words first (they are WHY the job was held, and a stop wipes the printer's live list,
     so a refused plate's codes survive only there) and then the terminal payload's own
     HMS list, de-duplicated by short code.
+
+    ``plate_check`` (the job's plate-check episode, read before any closer) and ``farm_unit``
+    decide ONE thing: whether a ``plate_refused`` verdict retries or escalates
+    (:func:`_farm_retries`). Retry leaves ``plate_refusal`` None — no gate, no page — while the
+    verdict and ``recorded_status`` stay as they are, so the unit still records ``cancelled``
+    and is requeued next in line. An operator's own Stop mid-episode leaves no farm ``stop``
+    step, so it always escalates. Both default to the escalating reading, so a caller with no
+    plate-check facts (the downtime reconcile's unobserved job phase) can never retry.
     """
-    job = (job_id or "").strip()
-    this_job = [incident for incident in open_incidents if str(incident.get("job_id") or "").strip() == job]
+    this_job = [incident for incident in open_incidents if is_held_job(job_id, str(incident.get("job_id") or ""))]
     recorded = [message for incident in this_job for message in _recorded_messages(incident)]
     printer_evidence = unique_messages([*recorded, *messages_from_payload(hms_errors)])
 
@@ -294,7 +379,7 @@ def build_terminal_outcome(
             category = USER_CANCELLED_CATEGORY
 
     refusal: PlateRefusal | None = None
-    if verdict == STOP_VERDICT_PLATE_REFUSED:
+    if verdict == STOP_VERDICT_PLATE_REFUSED and not _farm_retries(plate_check, farm_unit=farm_unit, evidence=evidence):
         refusal = PlateRefusal(
             messages=unique_messages(
                 [

@@ -135,8 +135,10 @@ class PrintQueueItem(Base):
     #   'operator_screen'   stopped on the printer's own touchscreen (detected from the
     #                       firmware's cancel-echo HMS codes);
     #   'plate_refused'     the printer's own plate check PAUSED the job and it ended
-    #                       without printing (usually an operator stopping the paused
-    #                       print) — the plate is held for a human and the unit requeued;
+    #                       without printing (usually the farm's own stop after its
+    #                       in-place re-check failed, 2026-09-29; or an operator's) — the
+    #                       unit requeued next in line, the plate retried with no gate or
+    #                       held for a human (``terminal_outcome``);
     #   'fault_restart'     the recovery driver stopped a job that had deposited nothing,
     #                       over a feed stall on its first filament load, with its last
     #                       release rung — the unit requeued next in line onto the

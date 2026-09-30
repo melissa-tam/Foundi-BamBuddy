@@ -90,7 +90,7 @@ from backend.app.services import job_terminal, notify_dedup, print_reconcile
 from backend.app.services.archive import ArchiveService
 from backend.app.services.archive_purge import archive_purge_service
 from backend.app.services.bambu_ftp import clear_3mf_cache
-from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES, PrinterState
+from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.fleet_activity import fleet_activity_recorder
 from backend.app.services.foreign_archive import locate_3mf_for_print, maybe_schedule_foreign_3mf_retry
 from backend.app.services.github_backup import github_backup_service
@@ -1116,30 +1116,6 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
             )
 
-        # Native plate-occupancy capture. The H2-series pre-print plate
-        # check surfaces as an HMS code and PAUSEs the job on the printer. The reaction
-        # is the pause-recovery lane's: it records a ``job_pause`` hold (the chip, the
-        # unit's waiting reason, one page in the printer's own words) and sends NOTHING —
-        # the print stays paused with the printer's message on its screen for the human
-        # who fixes the plate and resumes (user ruling 2026-09-24).
-        #
-        # Fire-and-forget, not awaited: the lane opens a row and pages, and the ~1 Hz
-        # status flow must not wait on either. Strong-referenced (spawn_background_task)
-        # for the same reason the runout hook above is — a weakly-held task can vanish
-        # mid-await with no traceback.
-        _new_occupancy = edges.appeared_short & _HMS_PLATE_OCCUPANCY_CODES
-        if _new_occupancy:
-            try:
-                from backend.app.services.pause_recovery import on_plate_vision_trip
-
-                spawn_background_task(
-                    on_plate_vision_trip(printer_id, set(_new_occupancy)), name=f"plate-vision-p{printer_id}"
-                )
-            except Exception as _pe:  # noqa: BLE001 — capture must never crash the status flow
-                logging.getLogger(__name__).warning(
-                    "[PLATE-VISION] native plate-occupancy capture failed for printer %s: %s", printer_id, _pe
-                )
-
         # USB storage-low capture. When an HMS "USB full" code APPEARS, the farm
         # auto-cleans the drive (recordings first, then oldest unused print files) and
         # fires the dedicated on_storage_low notification with the outcome.
@@ -1210,20 +1186,22 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             "[SPOOL-RECOVERY] incident wire sampler failed for printer %s: %s", printer_id, _dwe
         )
 
-    # Power-loss prompt sampler (2026-09-04 fleet outage). Same shape and the same
-    # placement rationale as the sampler above: sync, in-memory, session-free, and
-    # OUTSIDE the "HMS present" branch because one of the two edges it derives — a
-    # RECONNECT — arrives on pushes that carry no HMS at all. It spawns at most one
-    # recovery driver per printer while the firmware's own recovery prompt stands, and
-    # arms the lost-Z-reference hold for a printer that came back from a FLEET outage
-    # with a part still on its plate.
+    # Pause-recovery sampler (the 2026-09-04 fleet outage; the plate-check ladder,
+    # 2026-09-29). Same shape and the same placement rationale as the sampler above:
+    # sync, in-memory, session-free, and OUTSIDE the "HMS present" branch because what it
+    # reads — a RECONNECT, the printer's current ``print_error`` dialog — arrives on
+    # pushes that carry no HMS at all. It is the ONLY trigger of both pause causes: at
+    # most one power-loss driver per printer while the firmware's own recovery prompt
+    # stands, the plate-check episode driver on a plate-check pause (or its re-entry after
+    # a restart), and the lost-Z-reference hold for a printer that came back from a FLEET
+    # outage with a part still on its plate.
     try:
         from backend.app.services.pause_recovery import note_status_push
 
         note_status_push(printer_id, state)
     except Exception as _ple:  # noqa: BLE001 — sampling must never crash the status flow
         logging.getLogger(__name__).warning(
-            "[PAUSE-RECOVERY] power-loss sampler failed for printer %s: %s", printer_id, _ple
+            "[PAUSE-RECOVERY] pause-recovery sampler failed for printer %s: %s", printer_id, _ple
         )
 
     # Restart-replay HMS suppression (Phase D). Same one-shot shape as the runout
@@ -3648,11 +3626,19 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # the job was held: the 2026-09-11 "operator stop over an open fault requeues" ruling
     # never fired in production for exactly that reason. An operator's UI Stop is a DURABLE
     # fact on this job's unit (``print_control.stop_as_operator`` commits it before the stop
-    # goes out), read first — the one await — so the snapshot and the verdict below are
-    # taken together, and a stop pressed before a restart still reads as the operator's.
+    # goes out), read first, so the snapshot and the verdict below are taken together, and
+    # a stop pressed before a restart still reads as the operator's. The job's plate-check
+    # episode (what the farm's own driver SENT: its stop, and its other stops in the
+    # window) is read next, off the same snapshot, before the closer ends that episode.
+    #
+    # The order that follows is load-bearing: classify inputs → eject detection →
+    # correlation → deposit evidence → THE outcome → the incident closer (it records the
+    # outcome's refused-or-retried answer) → the AMS terminal re-read sweep → the plate
+    # authority → the rest.
     from backend.app.core.database import run_with_retry as _run_with_retry
     from backend.app.services import printer_incidents as _printer_incidents
     from backend.app.services.farm_correlation import classify_stop, operator_stop_requested
+    from backend.app.services.pause_recovery import plate_check_facts
 
     try:
         _operator_stop = await _run_with_retry(
@@ -3663,6 +3649,8 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
         _operator_stop = False
     _open_at_terminal = _printer_incidents.snapshots(printer_id)
     _stop_source = classify_stop(data, operator_stop_requested=_operator_stop, open_incidents=_open_at_terminal)
+    # Never raises: an unreadable episode comes back as facts that escalate.
+    _plate_check = await plate_check_facts(printer_id, _open_at_terminal, data.get("subtask_id"))
 
     # Server-dispatched eject jobs (part-present sweep / FA remote eject) are
     # motion-only prints with NO queue item and NO archive. Detect this terminal as
@@ -3689,30 +3677,6 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             printer_id,
             _raw_status,
         )
-
-    # Close the incidents this terminal answers (extended 2026-09-17). A JOB hold
-    # cannot outlive the job; an EQUIPMENT fault can — and since 011-H2S a ``repair``
-    # hold IS answered by the job the fault interrupted reaching ``completed``, because
-    # that means filament fed through the repaired path to the end of that print.
-    #
-    # Deliberately placed HERE rather than up with the per-print resets: the verdict
-    # needs ``_is_eject_job`` (an eject sweep is filament-less, so its completion proves
-    # nothing) and the firmware's own ``subtask_id``. ``_raw_status`` is the printer's own
-    # word, captured before any reading of it. And it runs AFTER the classification
-    # inputs above were captured — this is the closer that empties them.
-    #
-    # The farm unit's own waiting_reason hygiene stays farm_policy.on_terminal's job,
-    # so the two never fight over one row.
-    try:
-        from backend.app.services.incident_resolution import TerminalEvent
-        from backend.app.services.spool_recovery import on_job_terminal
-
-        await on_job_terminal(
-            printer_id,
-            TerminalEvent(status=_raw_status, eject=_is_eject_job, job_id=data.get("subtask_id")),
-        )
-    except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
-        logger.warning("[SPOOL-RECOVERY] incident close failed on print complete for printer %s: %s", printer_id, _ite)
 
     # Terminal-status correlation. Resolve WHICH queue item this
     # finish belongs to ONCE, up front, and thread the verdict to BOTH the plate-
@@ -3809,29 +3773,6 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # ungated plates, six units recorded cancelled though they completed).
     from backend.app.services.plate_occupancy import DepositEvidence, plate_occupancy
 
-    # Auto RFID re-read sweep at the PRINT terminal so a mid-print AMS
-    # refill (the firmware does not auto-read spools inserted during a print) is
-    # recognized within seconds with zero operator clicks. Skipped for eject-job
-    # terminals — each unit cycle sweeps once at the print terminal, not again at
-    # the eject terminal. Fire-and-forget: the sweep is sequential with per-slot
-    # spacing (~5s each) and must not block the completion callback; it dedupes
-    # duplicate terminal callbacks internally.
-    if not _is_eject_job:
-        try:
-            from backend.app.services import ams_presence
-
-            asyncio.create_task(ams_presence.on_printer_terminal(printer_id))
-        except Exception as _swe:  # noqa: BLE001 — sweep must never crash the callback
-            logger.warning("AMS terminal re-read sweep failed to schedule for printer %s: %s", printer_id, _swe)
-
-        # The terminal-time slot-IDENTITY reconcile that used to run here
-        # (``spool_tagless.reconcile_bound_slot_identities``) is gone at the slot-pipeline cutover.
-        # Its intent — a bound slot whose live identity has drifted gets re-decided while
-        # the printer is idle — is now the pipeline's: the sweep above produces the FULL
-        # RFID reads its DEFERs are waiting for, and the next raw push re-runs the whole
-        # decision table against them (a drifted-config KEEP refreshes the fingerprint,
-        # an unresolved slot draws an owed identify). One decider, no idle-only twin.
-
     _evidence = DepositEvidence.from_terminal_payload(data, is_dry_run=_resolved_is_dry_run)
     no_deposit = not _evidence.deposited
     # THE outcome of this terminal, built ONCE from the inputs captured above and handed
@@ -3850,6 +3791,10 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
         first_article=_resolved_first_article,
         is_eject=_is_eject_job,
         hms_errors=data.get("hms_errors"),
+        plate_check=_plate_check,
+        # A FARM unit for the plate-check retry: the same id- or name-confirmed attribution
+        # that may arm an automatic sweep — a fallback-only attribution may do neither.
+        farm_unit=_verdict in farm_correlation.AUTO_CLEAR_VERDICTS and _resolved_item_id is not None,
     )
     if _outcome.recorded_status != _raw_status:
         logger.info(
@@ -3862,6 +3807,64 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # The upstream sinks (relay, archive, notification, smart plug, timelapse) read the
     # payload's status; they read the OUTCOME's word through it.
     data = {**data, "status": _outcome.recorded_status}
+
+    # Close the incidents this terminal answers (extended 2026-09-17). A JOB hold
+    # cannot outlive the job; an EQUIPMENT fault can — and since 011-H2S a ``repair``
+    # hold IS answered by the job the fault interrupted reaching ``completed``, because
+    # that means filament fed through the repaired path to the end of that print.
+    #
+    # Deliberately placed HERE, after THE outcome: the rule table records a plate-check
+    # episode's close by the outcome's own answer — ``plate_refused`` when the plate is
+    # handed to a human, ``terminal`` when the farm retries it — so the outcome is built
+    # first. It also needs ``_is_eject_job`` (an eject sweep is filament-less, so its
+    # completion proves nothing) and the firmware's own ``subtask_id``; ``_raw_status``
+    # is the printer's own word, captured before any reading of it. Nothing between the
+    # snapshot above and this call reads the incident store (correlation reads the queue
+    # and settings, the deposit evidence and the outcome read the payload and the
+    # captured snapshot), so this closer — the one that empties the snapshot's rows —
+    # still runs after every classification input was taken.
+    #
+    # The farm unit's own waiting_reason hygiene stays farm_policy.on_terminal's job,
+    # so the two never fight over one row.
+    try:
+        from backend.app.services.incident_resolution import TerminalEvent
+        from backend.app.services.spool_recovery import on_job_terminal
+
+        await on_job_terminal(
+            printer_id,
+            TerminalEvent(
+                status=_raw_status,
+                eject=_is_eject_job,
+                job_id=data.get("subtask_id"),
+                plate_refused=_outcome.plate_refusal is not None,
+            ),
+        )
+    except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
+        logger.warning("[SPOOL-RECOVERY] incident close failed on print complete for printer %s: %s", printer_id, _ite)
+
+    # Auto RFID re-read sweep at the PRINT terminal so a mid-print AMS
+    # refill (the firmware does not auto-read spools inserted during a print) is
+    # recognized within seconds with zero operator clicks. Skipped for eject-job
+    # terminals — each unit cycle sweeps once at the print terminal, not again at
+    # the eject terminal. Fire-and-forget: the sweep is sequential with per-slot
+    # spacing (~5s each) and must not block the completion callback; it dedupes
+    # duplicate terminal callbacks internally. Spawned AFTER the incident closer, as it
+    # always was, so it runs against the holds this terminal leaves standing.
+    if not _is_eject_job:
+        try:
+            from backend.app.services import ams_presence
+
+            asyncio.create_task(ams_presence.on_printer_terminal(printer_id))
+        except Exception as _swe:  # noqa: BLE001 — sweep must never crash the callback
+            logger.warning("AMS terminal re-read sweep failed to schedule for printer %s: %s", printer_id, _swe)
+
+        # The terminal-time slot-IDENTITY reconcile that used to run here
+        # (``spool_tagless.reconcile_bound_slot_identities``) is gone at the slot-pipeline cutover.
+        # Its intent — a bound slot whose live identity has drifted gets re-decided while
+        # the printer is idle — is now the pipeline's: the sweep above produces the FULL
+        # RFID reads its DEFERs are waiting for, and the next raw push re-runs the whole
+        # decision table against them (a drifted-config KEEP refreshes the fingerprint,
+        # an unresolved slot draws an owed identify). One decider, no idle-only twin.
 
     # Raise the plate-clear gate for queued dispatch (#961). Any terminal status may
     # have left material on the bed: a user can cancel ten hours into a print, a
