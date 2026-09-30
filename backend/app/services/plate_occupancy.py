@@ -83,7 +83,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     # Annotation-only: the core stays stdlib-only at RUNTIME. The messages it stores are
-    # built by the one HMS renderer before they reach the authority.
+    # built by the one HMS renderer before they reach the authority, and the live peaks
+    # by the MQTT client's one reader.
+    from backend.app.services.bambu_mqtt import JobPeaks
     from backend.app.services.hms_errors import PrinterMessage
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,10 @@ logger = logging.getLogger(__name__)
 # to disagree about PAUSE — which is the difference between leaving a native-vision
 # hold alone and double-dispatching onto an occupied plate.
 ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
+
+# :attr:`DepositEvidence.final_status` of a job that has NOT ended (:meth:`DepositEvidence.live`):
+# never ``completed``, so only the peaks can say the plate is empty.
+_LIVE_JOB = "live"
 
 
 TransitionRefusal = Literal[
@@ -281,6 +287,29 @@ class DepositEvidence:
             peaks_reliable=False,
             last_layer_num=None,
             last_progress=None,
+        )
+
+    @classmethod
+    def live(cls, peaks: JobPeaks) -> DepositEvidence:
+        """Has the job running NOW left anything on the plate? The same three rules, over
+        the client's one peaks reader (``BambuMQTTClient.job_peaks``) instead of a terminal
+        payload.
+
+        The job has not ended, so there is no final status to trust (``_LIVE_JOB``, never
+        ``completed``), and it is never a dry run — both the fail-closed side: a reading
+        that cannot be vouched for (``peaks.reliable`` False, a client that attached
+        mid-job) deposits. The peaks are the highest this job has SHOWN, the current
+        reading included (:attr:`JobPeaks.peak_layer_num`): a job paused mid-way through
+        its first layer has saved nothing yet and must still read as deposited. Read by the
+        recovery driver's restart rung (operator ruling 2026-09-29), which ends a job only
+        when this says nothing is on the plate.
+        """
+        return cls(
+            final_status=_LIVE_JOB,
+            is_dry_run=False,
+            peaks_reliable=peaks.reliable,
+            last_layer_num=peaks.peak_layer_num,
+            last_progress=peaks.peak_progress,
         )
 
 

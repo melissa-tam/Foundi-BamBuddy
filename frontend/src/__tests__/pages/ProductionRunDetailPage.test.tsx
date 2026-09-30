@@ -387,6 +387,45 @@ describe('ProductionRunDetailPage', () => {
     expect(within(operator).queryByText(stoppedAtPlateCheck)).not.toBeInTheDocument();
   });
 
+  it('attributes a farm restart to the farm, not to an operator', async () => {
+    server.use(
+      http.get('*/api/v1/production-runs/1', () =>
+        HttpResponse.json(
+          detailRun({
+            units: [
+              // The farm stopped a job that deposited nothing over a feed stall at
+              // print start and requeued it; the H2S echo of that remote stop must
+              // not read as the operator's.
+              unit({ id: 109, status: 'cancelled', stop_source: 'fault_restart' }),
+              // Liveness pair: a genuine operator stop still reads as one.
+              unit({ id: 110, status: 'cancelled', stop_source: 'operator_screen' }),
+            ],
+          }),
+        ),
+      ),
+      printerStatusHandler,
+    );
+
+    renderDetail();
+    const table = await screen.findByRole('table');
+    const rowOf = (unitId: number): HTMLElement => {
+      const row = within(table)
+        .getAllByRole('row')
+        .find((r) => within(r).queryByRole('cell', { name: `#${unitId}` }));
+      if (!row) throw new Error(`no row for unit #${unitId}`);
+      return row;
+    };
+    const { stoppedByFarmFeedStall, stoppedByOperator } = en.productionRuns.detail;
+
+    const restarted = rowOf(109);
+    expect(within(restarted).getByText(stoppedByFarmFeedStall)).toBeInTheDocument();
+    expect(within(restarted).queryByText(stoppedByOperator)).not.toBeInTheDocument();
+
+    const operator = rowOf(110);
+    expect(within(operator).getByText(stoppedByOperator)).toBeInTheDocument();
+    expect(within(operator).queryByText(stoppedByFarmFeedStall)).not.toBeInTheDocument();
+  });
+
   it('renders the first-article banner in the header when awaiting approval (Phase 4, F1)', async () => {
     server.use(
       http.get('*/api/v1/production-runs/1', () =>

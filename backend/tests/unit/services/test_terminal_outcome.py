@@ -88,6 +88,79 @@ class TestRecordedStatus:
         assert _build("aborted").verdict is None  # no verdict is invented for it
 
 
+class TestTheFarmsRestartStop:
+    """``fault_restart``: the recovery driver stopped a job that had deposited nothing, over a
+    feed stall on its first filament load, to restart it on the backup spool (operator ruling
+    2026-09-29). A stop, never a failure — recorded exactly as a refused plate is."""
+
+    _JAM = {
+        "kind": "jam",
+        "job_id": _JOB,
+        "printer_messages": [{"short_code": "0700_8006", "description": "Feeding failed."}],
+    }
+
+    @pytest.mark.parametrize("first_article", [False, True], ids=["unit", "first_article"])
+    @pytest.mark.parametrize("raw", ["failed", "aborted", "cancelled"])
+    def test_it_is_recorded_cancelled_a_first_article_included(self, raw, first_article):
+        """Recorded ``failed``, a first article would spend its one retry and feed quarantine
+        for a job the farm itself chose to restart."""
+        outcome = _build(raw, "fault_restart", holds=[self._JAM], deposited=False, first_article=first_article)
+        assert outcome.recorded_status == "cancelled"
+        assert outcome.verdict == "fault_restart"
+
+    def test_it_is_not_an_operators_stop(self):
+        outcome = _build("failed", "fault_restart", holds=[self._JAM], deposited=False, hms=[])
+        assert outcome.operator_stopped is False
+        assert outcome.failure_category is None  # never "User cancelled": nobody pressed Stop
+
+    def test_the_stall_the_farm_restarted_over_is_the_units_message(self):
+        """The printer's recorded words for the hold of THIS job are the terminal's evidence."""
+        outcome = _build("failed", "fault_restart", holds=[self._JAM], deposited=False, hms=[])
+        assert outcome.printer_message == "[0700_8006] Feeding failed."
+        assert outcome.faults_open == frozenset({"jam"})
+
+    def test_it_creates_no_gate(self):
+        """A no-deposit terminal gates nothing, and the verdict adds no refusal that would
+        gate a plate regardless of the deposit (only ``plate_refused`` does)."""
+        from backend.app.services.farm_correlation import terminal_disposition
+        from backend.app.services.plate_occupancy import plate_occupancy
+
+        evidence = _evidence(status="failed", deposited=False)
+        outcome = build_terminal_outcome(
+            raw_status="failed",
+            verdict="fault_restart",
+            open_incidents=[self._JAM],
+            job_id=_JOB,
+            evidence=evidence,
+            first_article=False,
+            is_eject=False,
+            hms_errors=[],
+        )
+        assert outcome.plate_refusal is None
+
+        plate_occupancy.note_terminal(
+            91,
+            terminal_disposition(
+                verdict="matched",
+                item_id=7,
+                eject_profile_id=3,
+                first_article=False,
+                batch_id=1,
+                source_subtask_id=_JOB,
+                evidence=evidence,
+                raise_gate=True,
+                refusal=outcome.plate_refusal,
+            ),
+        )
+        assert plate_occupancy.is_plate_occupied(91) is False
+
+    def test_the_charge_basis_is_unchanged_a_measured_zero_charges_nothing(self):
+        """The basis reads the evidence, not the verdict: measured peaks at zero → ``partial``
+        of nothing; unmeasured peaks with nothing read → ``none``."""
+        assert _charge("failed", "fault_restart", layer=0, progress=0) == "partial"
+        assert _charge("failed", "fault_restart", reliable=False, layer=0, progress=0) == "none"
+
+
 class TestFaultsOpenAtTheTerminal:
     def test_only_equipment_faults_are_captured(self):
         """A HOLD IS NOT A FAULT: a declared maintenance hold is not something an operator
@@ -105,6 +178,7 @@ class TestFaultsOpenAtTheTerminal:
         assert _build("failed", "operator_ui").operator_stopped is True
         assert _build("failed", "operator_screen").operator_stopped is True
         assert _build("failed", "plate_refused").operator_stopped is False
+        assert _build("failed", "fault_restart").operator_stopped is False
         assert _build("failed").operator_stopped is False
 
 

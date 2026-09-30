@@ -3133,6 +3133,78 @@ class TestSpoolRecoveryNotifications:
 
             mock_send.assert_not_called()
 
+    @staticmethod
+    def _ended_job_details() -> list[str]:
+        """Every reason copy the recovery driver pages with once the job has ENDED."""
+        from backend.app.services import spool_recovery
+
+        return [spool_recovery._ESCALATE_DETAIL[reason] for reason in sorted(spool_recovery._JOB_ENDED_REASONS)] + list(
+            spool_recovery._ENDED_JOB_DETAIL.values()
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind,foreign", [("jam", False), ("jam", True), ("physical", False), ("runout", False)])
+    async def test_a_page_after_the_job_ended_never_says_paused_or_resume(
+        self, service, mock_provider, mock_db, kind, foreign
+    ):
+        """A page composed AFTER the job ended — a release verb ended the print, or the driver
+        stopped it to restart it (operator ruling 2026-09-29) — has no print waiting: no
+        "left PAUSED", no "resume on the printer", whatever the kind, and not the jam's seeded
+        template (its body says PAUSED)."""
+        for detail in self._ended_job_details():
+            with (
+                patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+                patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+                patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+            ):
+                mock_get.return_value = [mock_provider]
+
+                await service.on_spool_recovery_failed(
+                    7, "013-H2S", "SKU007 plate", detail, mock_db, kind=kind, foreign=foreign, job_ended=True
+                )
+
+                mock_build.assert_not_awaited()
+                title, message = mock_send.call_args.args[1], mock_send.call_args.args[2]
+                assert "paused" not in f"{title} {message}".lower(), message
+                assert "resume on the printer" not in message.lower(), message
+                assert message.startswith("013-H2S: 'SKU007 plate'") and "has ended." in message
+                assert message.endswith(detail)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind,foreign", [("jam", True), ("physical", False), ("runout", False)])
+    async def test_a_give_up_over_a_live_pause_keeps_the_paused_clause(
+        self, service, mock_provider, mock_db, kind, foreign
+    ):
+        """The other side: a give-up while the print is PAUSED keeps saying so."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_get.return_value = [mock_provider]
+
+            await service.on_spool_recovery_failed(
+                7, "012-H2S", "SKU007 plate", "The AMS is holding the change.", mock_db, kind=kind, foreign=foreign
+            )
+
+            assert "is left PAUSED" in mock_send.call_args.args[2]
+
+    @pytest.mark.asyncio
+    async def test_a_jam_give_up_over_a_live_pause_uses_the_paused_template(self, service, mock_provider, mock_db):
+        from backend.app.models.notification_template import DEFAULT_TEMPLATES
+
+        body = next(t for t in DEFAULT_TEMPLATES if t["event_type"] == "spool_recovery_failed")["body_template"]
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.side_effect = lambda _db, _event, variables: ("t", service._render_template(body, variables))
+
+            await service.on_spool_recovery_failed(7, "012-H2S", "SKU007 plate", "Held.", mock_db)
+
+            assert mock_send.call_args.args[2] == "012-H2S: 'SKU007 plate' is left PAUSED. Held."
+
     @pytest.mark.asyncio
     async def test_on_spool_out_of_rotation_sends_when_enabled(self, service, mock_provider, mock_db):
         with (

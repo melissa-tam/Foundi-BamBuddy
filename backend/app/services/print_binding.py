@@ -177,6 +177,25 @@ async def live_print_archive(db: AsyncSession, printer_id: int) -> PrintArchive 
     )
 
 
+async def completed_since(db: AsyncSession, printer_id: int, since: datetime) -> bool:
+    """Has a print COMPLETED on this printer after ``since`` (naive UTC, the stamps' own)?
+
+    "A print ran through this printer's path to its end": a ``completed`` archive closed
+    after ``since``. An eject sweep creates no archive, so a filament-less sweep is never
+    one; a screen-started (foreign) print is archived like any other, and it counts — the
+    path is the printer's. Read by the recovery driver's printer bound
+    (``spool_recovery._restart_refault``).
+    """
+    found = await db.scalar(
+        select(PrintArchive.id)
+        .where(PrintArchive.printer_id == printer_id)
+        .where(PrintArchive.status == "completed")
+        .where(PrintArchive.completed_at > since)
+        .limit(1)
+    )
+    return found is not None
+
+
 async def printers_with_live_print(db: AsyncSession) -> set[int]:
     """Every printer that has a ``printing`` archive."""
     rows = await db.execute(

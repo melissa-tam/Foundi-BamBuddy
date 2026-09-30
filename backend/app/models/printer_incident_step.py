@@ -53,8 +53,13 @@ from backend.app.core.database import Base
 # ``dialog`` → the stop rung), and the retry-or-escalate verdict counts ``stop`` steps.
 # Neither is a ``lever`` (a release verb over a wedged AMS change, budgeted per lever) nor
 # a ``command`` (an AMS motion with a tray and a feeder): folding them in would make every
-# reader of those two kinds filter the plate lane's rows back out. All four fit ``kind``'s
-# VARCHAR(8), and nothing constrains the column in either dialect, so no migration.
+# reader of those two kinds filter the plate lane's rows back out. The AMS driver's OWN
+# stop is the other way round, and stays a ``lever``: its restart rung
+# (``printer_incidents.FAULT_RESTART_STEP``, the same 2026-09-29 day) is the last row of
+# its release ladder, budgeted, pulled and read like every other rung, and the open-row
+# projection derives the restart-stop flag from that lever. The kinds are per driver
+# vocabulary, never per verb. All four fit ``kind``'s VARCHAR(8), and nothing constrains
+# the column in either dialect, so no migration.
 StepKind = Literal["lever", "command", "dialog", "stop"]
 STEP_KIND_LEVER: StepKind = "lever"
 STEP_KIND_COMMAND: StepKind = "command"

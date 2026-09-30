@@ -254,6 +254,38 @@ class TestDepositEvidence:
         assert (evidence.peaks_reliable, evidence.is_dry_run) == (False, False)
         assert evidence.deposited is True
 
+    @pytest.mark.parametrize(
+        "saved,current,reliable,deposited",
+        [
+            # A job paused before its first layer, measured from its start: nothing.
+            ((0.0, 0), (0.0, 0), True, False),
+            # Mid-way through its first layer: nothing SAVED yet, the current reading counts.
+            ((0.0, 0), (0.0, 1), True, True),
+            ((0.0, 0), (1.0, 0), True, True),
+            ((12.0, 6), (0.0, 0), True, True),
+            # A client that attached mid-job measured nothing: fail closed.
+            ((0.0, 0), (0.0, 0), False, True),
+        ],
+    )
+    def test_live_reads_the_job_running_now_fail_closed(self, saved, current, reliable, deposited):
+        """The recovery driver's restart rung (operator ruling 2026-09-29) asks this of the
+        LIVE job before it stops one: never a dry run, never ``completed``, and the peaks the
+        job has SHOWN — the current reading included. ``saved`` / ``current`` are
+        ``(percent, layer)``."""
+        from backend.app.services.bambu_mqtt import JobPeaks
+
+        peaks = JobPeaks(
+            last_progress=saved[0],
+            last_layer_num=saved[1],
+            progress=current[0],
+            layer_num=current[1],
+            reliable=reliable,
+        )
+        evidence = po.DepositEvidence.live(peaks)
+
+        assert (evidence.is_dry_run, evidence.final_status == "completed") == (False, False)
+        assert evidence.deposited is deposited
+
 
 # ---------------------------------------------------------------------------
 # 2. note_terminal

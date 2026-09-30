@@ -170,6 +170,7 @@ export default {
       timeCol: 'Terminée / démarrée',
       stoppedByOperator: 'Arrêtée par l\'opérateur',
       stoppedAtPlateCheck: 'Arrêtée au contrôle du plateau',
+      stoppedByFarmFeedStall: "Arrêtée par la ferme : blocage d'alimentation au démarrage de l'impression",
       stoppedByFarmVision: 'Arrêtée par la ferme : contrôle du plateau',
       stoppedByReconcileUnknown: 'Résultat inconnu après reconnexion',
       firstArticleBadge: 'Première pièce',

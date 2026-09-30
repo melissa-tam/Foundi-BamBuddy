@@ -1145,6 +1145,9 @@ async def _remind_open_incidents(
             elif incident.kind == KIND_Z_REFERENCE_LOST:
                 await notif.on_z_reference_lost(printer_id=pid, printer_name=printer_name, db=db)
             else:
+                # A hold on a printer that is NOT paused outlived the job it was raised on
+                # (a physical fault after its job ended, a restart give-up after the farm's
+                # own stop): the wrapper must not call that job "left PAUSED".
                 await notif.on_spool_recovery_failed(
                     printer_id=pid,
                     printer_name=printer_name,
@@ -1154,6 +1157,7 @@ async def _remind_open_incidents(
                     kind=incident.kind,
                     runout_slot=slot,
                     foreign=incident.item_id is None,
+                    job_ended=live != "PAUSE",
                 )
             logger.warning(
                 "farm_stall: printer %s STILL held by %s incident %s (%d min, state=%s%s) — "

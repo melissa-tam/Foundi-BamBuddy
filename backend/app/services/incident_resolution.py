@@ -134,6 +134,12 @@ class Context:
     process's motion memory. ``driver_live`` is ``printer_incidents.driver_live`` for
     this printer — the ONE liveness store — asked by the caller and passed in, so a
     verdict is a pure function of what it is handed.
+
+    ``restart_owed`` is what the row's STEP LEDGER says (``spool_recovery``'s evidence log,
+    read by the startup rearm): the recovery driver sent its restart stop on this still-open
+    row — the job is over by the farm's own act and the restart continuation owes the row
+    what is left of it: the unload (the stalled filament may still be in the tube), the park
+    and the close (operator ruling 2026-09-29). Only the ``startup`` occasion reads it.
     """
 
     state: PrinterState | None
@@ -141,6 +147,7 @@ class Context:
     driver_live: bool
     terminal: TerminalEvent | None = None
     cleared: ClearedEvent | None = None
+    restart_owed: bool = False
 
 
 @dataclass(frozen=True)
@@ -436,7 +443,19 @@ def _wire_sweep_tick(_row: PrinterIncident, ctx: Context) -> Verdict:
 
 def _wire_startup(_row: PrinterIncident, ctx: Context) -> Verdict:
     """The same ladder with no dwell and no fault-liveness guard: a restart re-derives
-    every wire fact from scratch, and a printer already running has answered."""
+    every wire fact from scratch, and a printer already running has answered.
+
+    One reading of "not PAUSE" is not the hold ending: a row whose driver STOPPED the job
+    to restart it (``ctx.restart_owed``) reads IDLE / FAILED because of that stop, while its
+    continuation has not finished — closing it here hands the printer to the dispatcher with
+    the stalled filament possibly still in the tube, or the stalled spool unparked. It
+    stands, and the rearm re-enters the continuation (the row still reads ``recovering``)."""
+    if ctx.restart_owed:
+        return Verdict(
+            close=False,
+            evidence="the driver stopped this job to restart it and has not finished — "
+            "the restart continuation re-enters",
+        )
     over, reported = _hold_over(ctx.state)
     if not over:
         return Verdict(close=False, evidence=f"state is {reported or 'unreported'}, not a positive non-PAUSE")

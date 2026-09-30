@@ -370,6 +370,25 @@ class TestLineage:
         assert await requeue.failed_ancestor_count(db_session, row) == requeue._LINEAGE_WALK_MAX
         assert (await requeue.lineage_root(db_session, row)).id == row.id
 
+    async def test_a_plate_gets_one_fault_restart_read_off_its_ancestors(self, db_session):
+        """R1 (operator ruling 2026-09-29): the recovery driver restarts a plate ONCE. Spent
+        is derived from the lineage — an ANCESTOR ended with the restart verdict — never
+        stored, and never the plate's own stop (its terminal carries the verdict too once
+        it lands, and it is the restart being decided)."""
+        from backend.app.services.farm_correlation import STOP_VERDICT_FAULT_RESTART
+
+        chain = await self._chain(db_session, ["cancelled", "cancelled", "printing"])
+        assert await requeue.fault_restart_spent(db_session, chain[-1]) is False  # plain cancels
+
+        chain[0].stop_source = STOP_VERDICT_FAULT_RESTART
+        await db_session.commit()
+        assert await requeue.fault_restart_spent(db_session, chain[-1]) is True  # a grand-parent's counts
+        assert await requeue.fault_restart_spent(db_session, chain[1]) is True
+
+        chain[-1].stop_source = STOP_VERDICT_FAULT_RESTART
+        await db_session.commit()
+        assert await requeue.fault_restart_spent(db_session, chain[0]) is False  # its own stop is not an ancestor's
+
 
 # --------------------------------------------------------------------------- #
 # The dispatcher's order — "next" means the same thing in both orderings

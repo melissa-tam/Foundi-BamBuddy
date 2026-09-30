@@ -170,11 +170,17 @@ def _push(client, **fields) -> None:
     client._process_message({"print": fields})
 
 
-class TestJobLayer:
-    """``job_layer`` — the per-job layer the plate-check episode reads for its pass (RUNNING at
-    layer >= 1 of THIS job). The same source and reliability flag as the terminal payload's
-    ``last_layer_num`` / ``peaks_reliable``: a predecessor's republish or a restart baseline is
-    never a reading of this job."""
+class TestThePlateCheckLayerReading:
+    """The per-job layer the plate-check episode reads for its pass (RUNNING at layer >= 1 of
+    THIS job) — ``pause_recovery._job_layer``, read off the client's ONE peaks reader
+    (``job_peaks``), so it has the terminal payload's source and reliability flag: a
+    predecessor's republish or a restart baseline is never a reading of this job."""
+
+    @staticmethod
+    def _layer(client) -> int | None:
+        from backend.app.services.pause_recovery import _job_layer
+
+        return _job_layer(client)
 
     def test_a_restart_attach_reads_no_measurement(self, mqtt_client):
         """Born mid-job: whatever layer the printer reports is a baseline, not a measurement."""
@@ -184,7 +190,8 @@ class TestJobLayer:
         _push(mqtt_client, gcode_state="RUNNING", layer_num=5)
 
         assert mqtt_client.state.layer_num == 5
-        assert mqtt_client.job_layer() is None
+        assert mqtt_client.job_peaks().reliable is False
+        assert self._layer(mqtt_client) is None
 
     def test_a_predecessors_republished_layer_is_not_this_jobs(self, mqtt_client):
         """The firmware keeps republishing the previous job's final layer while this one heats,
@@ -202,10 +209,80 @@ class TestJobLayer:
         _push(mqtt_client, layer_num=167)  # the stale republish
         _push(mqtt_client, gcode_state="PAUSE", layer_num=167)  # its plate check
 
-        assert mqtt_client.job_layer() == 0
+        assert self._layer(mqtt_client) == 0
 
         _push(mqtt_client, gcode_state="RUNNING", layer_num=0)  # this job's own first reading
-        assert mqtt_client.job_layer() == 0
+        assert self._layer(mqtt_client) == 0
         _push(mqtt_client, layer_num=1)
 
-        assert mqtt_client.job_layer() == 1
+        assert self._layer(mqtt_client) == 1
+
+
+class TestTheOnePeaksReader:
+    """``job_peaks`` — THE read of how far the tracked job got, shared by the terminal
+    payload and the recovery driver's LIVE deposit read (operator ruling 2026-09-29). It
+    honours the stale-predecessor gate: for the seconds a new job heats and levels the
+    firmware republishes the PREVIOUS job's percent (the live percent is never reset at a
+    print start), and a paused layer-0 job must never read as having printed it — nor may a
+    job that did print read as empty."""
+
+    @staticmethod
+    def _start(client, predecessor_percents=(60, 100), predecessor_layers=(100, 167)) -> None:
+        client.on_print_start = lambda data: None
+        client.on_print_running_observed = lambda data: None
+        client.on_print_complete = lambda data: None
+        client._process_message({"print": {"gcode_state": "RUNNING", "gcode_file": "prev.gcode.3mf"}})
+        for layer in predecessor_layers:
+            client._process_message({"print": {"layer_num": layer}})
+        for percent in predecessor_percents:
+            client._process_message({"print": {"mc_percent": percent}})
+        client._process_message({"print": {"gcode_state": "FINISH"}})
+        client._process_message({"print": {"gcode_state": "RUNNING", "gcode_file": RUNNING_FILE}})
+
+    def _live_deposited(self, client) -> bool:
+        from backend.app.services.plate_occupancy import DepositEvidence
+
+        return DepositEvidence.live(client.job_peaks()).deposited
+
+    def test_a_predecessors_republished_percent_never_makes_a_layer_0_job_deposited(self, mqtt_client):
+        self._start(mqtt_client)
+        mqtt_client._process_message({"print": {"mc_percent": 100, "layer_num": 167}})  # the stale republish
+        mqtt_client._process_message({"print": {"gcode_state": "PAUSE"}})
+
+        assert mqtt_client.state.progress == 100.0  # the live field still holds the predecessor's
+        peaks = mqtt_client.job_peaks()
+        assert (peaks.progress, peaks.layer_num, peaks.reliable) == (0.0, 0, True)
+        assert self._live_deposited(mqtt_client) is False
+
+    def test_a_job_mid_way_through_its_first_layer_reads_deposited(self, mqtt_client):
+        self._start(mqtt_client)
+        mqtt_client._process_message({"print": {"mc_percent": 0, "layer_num": 0}})  # this job's own
+        mqtt_client._process_message({"print": {"layer_num": 1}})
+        mqtt_client._process_message({"print": {"gcode_state": "PAUSE"}})
+
+        peaks = mqtt_client.job_peaks()
+        assert (peaks.last_layer_num, peaks.layer_num, peaks.peak_layer_num) == (0, 1, 1)
+        assert self._live_deposited(mqtt_client) is True
+
+    def test_its_own_percent_reads_deposited(self, mqtt_client):
+        self._start(mqtt_client)
+        mqtt_client._process_message({"print": {"mc_percent": 0}})
+        mqtt_client._process_message({"print": {"mc_percent": 2}})
+
+        assert mqtt_client.job_peaks().progress == 2.0
+        assert self._live_deposited(mqtt_client) is True
+
+    def test_the_terminal_payload_carries_the_readers_three_keys(self, mqtt_client):
+        """One reader: the payload's ``last_progress`` / ``last_layer_num`` / ``peaks_reliable``
+        are exactly ``job_peaks().terminal_fields()`` at the terminal."""
+        payload: dict = {}
+        self._start(mqtt_client)
+        mqtt_client.on_print_complete = lambda data: payload.update(data)
+        for layer in (1, 2, 3):
+            mqtt_client._process_message({"print": {"layer_num": layer}})
+        expected = {"last_progress": 0.0, "last_layer_num": 2, "peaks_reliable": True}
+        assert mqtt_client.job_peaks().terminal_fields() == expected
+
+        mqtt_client._process_message({"print": {"gcode_state": "FAILED"}})
+
+        assert {key: payload[key] for key in expected} == expected

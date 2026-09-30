@@ -927,7 +927,8 @@ def _plate_state(*, subtask="task-1", print_error=_PLATE_ERR, gcode_state="PAUSE
 
 
 def _set(**fields):
-    """One scripted wire answer: set these fields (``layer`` is the client's job layer)."""
+    """One scripted wire answer: set these fields (``layer`` is the client's job layer, read
+    through its ``job_peaks``)."""
 
     def apply(wire):
         for name, value in fields.items():
@@ -1001,8 +1002,18 @@ class PlateWire:
             return None
         return CommandAck(command=sent.command, sequence_id=sent.sequence_id, result=self.ack, reason=None, at=0.0)
 
-    def job_layer(self):
-        return self.layer
+    def job_peaks(self):
+        """The client's one peaks reader: ``layer`` None is a reading this client did not
+        measure (``reliable`` False — it attached the job mid-flight)."""
+        from backend.app.services.bambu_mqtt import JobPeaks
+
+        return JobPeaks(
+            last_progress=0.0,
+            last_layer_num=0,
+            progress=0.0,
+            layer_num=self.layer or 0,
+            reliable=self.layer is not None,
+        )
 
     def resume_print(self):
         """The power-loss lane's plain resume (the hand-over re-arm test)."""
@@ -1255,8 +1266,8 @@ class TestPlateCheckRungOne:
         assert wire.stops == []
 
     async def test_a_layer_this_client_cannot_measure_never_passes(self, monkeypatch, db_session):
-        """A client that attached the job mid-flight (``job_layer`` None: a restart baseline or a
-        predecessor's republish) proves nothing: the driver exits WITHOUT closing — the sweep
+        """A client that attached the job mid-flight (``job_peaks`` not ``reliable``: a restart
+        baseline or a predecessor's republish) proves nothing: the driver exits WITHOUT closing — the sweep
         closes a job RUNNING for its dwell, and a plate dialog that comes back re-enters."""
         await _printer(db_session, 89)
         wire = PlateWire(_plate_state(), layer=None).install(monkeypatch)

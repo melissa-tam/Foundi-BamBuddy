@@ -896,9 +896,12 @@ class TestAmsFaultTaxonomyCodeWordLane:
     def test_the_table_holds_no_unpinned_code_word(self):
         from backend.app.services.hms_errors import _CODE_WORD_TAXONOMY
 
-        # The tray rows plus the two attr-scoped code words classified only under a
-        # submodule attr (0x00020002's motor/RFID meanings, 0x00030003).
+        # The tray rows plus the three attr-scoped code words classified only under a
+        # submodule attr (0x00020002's motor/RFID meanings, 0x00030003, and 0x00020001's
+        # per-slot OVERLOAD meaning — under the tray attrs that word is the runout demand
+        # and stays None).
         assert set(_CODE_WORD_TAXONOMY) == set(_EXPECTED_TRAY_CODE_WORDS) | {
+            0x00020001,
             0x00020002,
             0x00030003,
         }
@@ -1111,6 +1114,247 @@ class TestAmsFaultTaxonomyCollisionPins:
         assert classify_ams_fault(_tray_attr(), 0x00020025).fault_class.value == "informational"
         assert classify_short_code("0700_0025").fault_class.value == "informational"
         assert "0700_0025" not in mechanical_feed_short_codes()
+
+
+def _overload_attr(ams_id: int = 0, tray: int = 0, module: int = 0x07) -> int:
+    """The per-slot OVERLOAD attr — the ``0700_6X00`` shape, submodule ``0x60 + tray``."""
+    return (module << 24) | (ams_id << 16) | ((0x60 + tray) << 8)
+
+
+def _word_entry(attr: int, code_word: int, *, severity: int = 2) -> SimpleNamespace:
+    """An ``hms[]``-lane entry as the parser builds it: full code = attr + code word, 16 hex."""
+    return _fake_hms_error(
+        code=hex(code_word), attr=attr, module=attr >> 24, severity=severity, full_code=f"{attr:08X}{code_word:08X}"
+    )
+
+
+class TestTheSlotOverloadWord:
+    """011-H2S 2026-09-29, incident 419: ``0700_6200_0002_0001`` — "The AMS A Slot 3 is
+    overloaded. The filament may be tangled or the filament buffer may be stuck." — stood
+    beside the jam the recovery driver owned, was read by no taxonomy row, and paged the
+    operator raw. It is the runout DEMAND's own code word under another submodule family,
+    so the pins run both ways: it classifies as the jam it is, and it never reads as a
+    demand."""
+
+    @pytest.mark.parametrize("tray", [0, 1, 2, 3])
+    @pytest.mark.parametrize("ams_id", [0, 1, 7])
+    def test_it_classifies_mechanical_and_names_its_own_slot(self, ams_id, tray):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        verdict = classify_ams_fault(_overload_attr(ams_id, tray), 0x00020001)
+        assert verdict is not None
+        assert verdict.fault_class.value == "mechanical_feed"
+        # slot = byte − 0x60: the row's own family decodes it, not the tray layout.
+        assert verdict.slot == (ams_id, tray)
+        assert (verdict.extruder_side, verdict.external, verdict.retract_failure) == (False, False, False)
+
+    def test_the_row_reads_the_vendor_text(self):
+        """The row's evidence, from the vendored catalog rather than restated."""
+        from backend.app.services.hms_catalog import lookup_full_code
+
+        for tray in range(4):
+            assert lookup_full_code(f"{_overload_attr(0, tray):08X}00020001") == (
+                f"The AMS A Slot {tray + 1} is overloaded. The filament may be tangled or the filament buffer may be stuck."
+            )
+
+    def test_the_family_is_exactly_four_bytes(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        assert classify_ams_fault(_submodule_attr(0x5F), 0x00020001) is None
+        assert classify_ams_fault(_submodule_attr(0x64), 0x00020001) is None
+
+    def test_the_ams_ht_overload_is_a_jam_with_no_decoded_slot(self):
+        """Module 0x18 carries the same sentence; the slot layout reader is AMS-module
+        (0x07) only, the same as every other per-slot family on AMS-HT."""
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        verdict = classify_ams_fault(_overload_attr(0, 2, module=0x18), 0x00020001)
+        assert verdict.fault_class.value == "mechanical_feed"
+        assert verdict.slot is None
+
+    def test_the_external_holders_overload_stays_unclassified(self):
+        """``07FF_6000_0002_0001`` is "External spool may be tangled or jammed" — the
+        holder's own table does not read the 0x60 family, and the AMS row must not
+        leak into it."""
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        assert classify_ams_fault(_external_attr(submodule=0x60), 0x00020001) is None
+
+    def test_the_tray_attr_demand_is_still_unclassified(self):
+        from backend.app.services.hms_errors import classify_ams_fault
+
+        assert classify_ams_fault(_tray_attr(tray=2), 0x00020001) is None
+
+    def test_it_is_never_a_runout_demand(self):
+        from backend.app.services.hms_errors import (
+            ams_slot_from_attr,
+            current_runout_demand,
+            hms_error_payload,
+            runout_hold_active,
+            runout_slot_from_hms,
+            runout_standing_for_slot,
+            slot_runout_full_codes,
+        )
+
+        overload = _word_entry(_overload_attr(tray=2), 0x00020001)
+        # ams_slot_from_attr stays the TRAY family (0x20–0x23) — every demand reader
+        # decodes through it.
+        assert ams_slot_from_attr(overload.attr) is None
+        assert runout_slot_from_hms(overload.attr, 0x00020001) is None
+        assert current_runout_demand([overload]) is None
+        assert runout_standing_for_slot([overload], 0, 2) is False
+        assert "runout_slot" not in hms_error_payload(overload)
+        assert slot_runout_full_codes([overload]) == frozenset()
+        assert runout_hold_active(SimpleNamespace(state="PAUSE", hms_errors=[overload])) is False
+
+    def test_the_tray_attr_word_beside_it_is_still_the_demand(self):
+        from backend.app.services.hms_errors import current_runout_demand, slot_runout_full_codes
+
+        overload = _word_entry(_overload_attr(tray=2), 0x00020001)
+        demand = _word_entry(_tray_attr(tray=1), 0x00020001)
+        # Last match wins, and the overload is never a match — whichever order they stand in.
+        assert current_runout_demand([demand, overload]) == (0, 1)
+        assert current_runout_demand([overload, demand]) == (0, 1)
+        assert slot_runout_full_codes([overload, demand]) == {demand.full_code}
+
+    def test_the_short_form_collides_so_the_candidate_carries_the_full_code(self):
+        from backend.app.services.hms_errors import hms_short_code, live_candidates
+
+        overload = _word_entry(_overload_attr(tray=2), 0x00020001)
+        demand = _word_entry(_tray_attr(tray=2), 0x00020001)
+        assert hms_short_code(overload.attr, overload.code) == hms_short_code(demand.attr, demand.code) == "0700_0001"
+
+        candidates = live_candidates(SimpleNamespace(hms_errors=[overload, demand]))
+        assert {(c.full_code, c.fault_class.value, c.slot) for c in candidates} == {
+            (overload.full_code, "mechanical_feed", (0, 2))
+        }
+
+
+class TestShortCodeAmbiguity:
+    """Which shorts name more than one fault — derived from the code-word tables and the
+    slot-runout family, never listed. The incident's representative code prefers an
+    unambiguous one (011-H2S: ``0700_8010`` over the overload's ``0700_0001``)."""
+
+    def test_the_derived_suffixes(self):
+        from backend.app.services.hms_errors import _AMBIGUOUS_EXTERNAL_SUFFIXES, _AMBIGUOUS_SUFFIXES
+
+        # 0001: a slot's overload (0x60 family) vs its demand and pull-back notice (tray).
+        # 0002: the motor overload vs the RFID tag (two rows) vs the auto-switch report.
+        # 0003: "filament may be broken in AMS" (tray) vs "RFID cannot be read" (RFID).
+        assert {0x0001, 0x0002, 0x0003} == _AMBIGUOUS_SUFFIXES
+        # Every holder code word has one row, and no unclassified meaning shares one.
+        assert not _AMBIGUOUS_EXTERNAL_SUFFIXES
+
+    @pytest.mark.parametrize(
+        ("short", "ambiguous"),
+        [
+            ("0700_0001", True),
+            ("0701_0001", True),
+            ("1800_0001", True),  # AMS-HT speaks the same code words
+            ("0700_0002", True),
+            ("0700_0003", True),
+            ("0700_8010", False),
+            ("0700_0019", False),
+            ("0700_0005", False),  # purge-abnormal: its row and its runout meaning are one fault
+            ("07FF_0001", False),  # the holder's own table
+            ("0300_0001", False),  # not an AMS module
+            ("0700_001", False),
+            ("bogus", False),
+            ("", False),
+        ],
+    )
+    def test_the_reader(self, short, ambiguous):
+        from backend.app.services.hms_errors import short_code_ambiguous
+
+        assert short_code_ambiguous(short) is ambiguous
+        assert short_code_ambiguous(short.lower()) is ambiguous
+
+
+class TestCandidatesCarryTheirOwnIdentity:
+    """Every classified entry carries its LOSSLESS full code and the AMS unit its attr
+    names, on both wire lanes — what "does an incident speak for THIS code" compares."""
+
+    def test_both_wire_lanes_carry_their_full_code_and_unit(self):
+        from backend.app.services.hms_errors import live_candidates
+
+        word = _word_entry(_tray_attr(ams_id=1, tray=2), 0x00020019)
+        # print_error lane: attr IS the 32-bit word, full code its 8 hex.
+        short = _fake_hms_error(code="0x8010", attr=0x07008010, module=7, severity=3, full_code="07008010")
+
+        by_code = {c.full_code: c for c in live_candidates(SimpleNamespace(hms_errors=[word, short]))}
+        assert set(by_code) == {"0701220000020019", "07008010"}
+        assert (by_code["0701220000020019"].ams_unit, by_code["0701220000020019"].slot) == (1, (1, 2))
+        assert (by_code["07008010"].ams_unit, by_code["07008010"].slot) == (0, None)
+
+    def test_notices_are_the_informational_entries_with_their_unit(self):
+        from backend.app.services.hms_errors import live_candidates, live_notices
+
+        resistance = _word_entry(_tray_attr(ams_id=0, tray=2), 0x00020025)  # the 011 17:59:18 push
+        locating = _word_entry(_tray_attr(ams_id=1, tray=0), 0x00030007)
+        # 0x00020025 under a submodule no code-word row reads: the lossy ``07xx_0025``
+        # short row classifies it, and the unit still comes off the attr.
+        short_lane = _word_entry(_submodule_attr(0x01, ams_id=2), 0x00020025)
+        jam = _fake_hms_error(code="0x8010", attr=0x07008010, module=7, severity=3, full_code="07008010")
+        state = SimpleNamespace(hms_errors=[resistance, locating, short_lane, jam])
+
+        notices = live_notices(state)
+        assert {(n.full_code, n.ams_unit) for n in notices} == {
+            (resistance.full_code, 0),
+            (locating.full_code, 1),
+            (short_lane.full_code, 2),
+        }
+        assert {n.fault_class.value for n in notices} == {"informational"}
+        assert {c.full_code for c in live_candidates(state)} == {"07008010"}
+
+    def test_a_malformed_entry_is_skipped(self):
+        from backend.app.services.hms_errors import live_notices
+
+        assert live_notices(SimpleNamespace(hms_errors=[SimpleNamespace(attr="bogus", code=None)])) == frozenset()
+
+
+class TestTheRecordedFullCodeReader:
+    """``classify_full_code`` — THE reader of a code an incident RECORDED
+    (``printer_incident.hms_full_codes``): the same taxonomy and candidate shape the live
+    wire gets, from the firmware's own identifier. The recovery driver re-entered after its
+    own stop reads which side faulted from it (coordinator ruling 2026-09-29)."""
+
+    def test_a_recorded_code_reads_as_the_live_entry_it_was_recorded_from(self):
+        from backend.app.services.hms_errors import classify_full_code, live_candidates
+
+        word = _word_entry(_tray_attr(ams_id=1, tray=2), 0x00020019)
+        short = _fake_hms_error(code="0x8010", attr=0x07008010, module=7, severity=3, full_code="07008010")
+
+        for entry in (word, short):
+            (live,) = live_candidates(SimpleNamespace(hms_errors=[entry]))
+            assert classify_full_code(entry.full_code) == live
+            assert classify_full_code(entry.full_code.lower()) == live  # case of the stored text is not identity
+
+    def test_the_side_and_the_class_survive_the_record(self):
+        from backend.app.services.hms_errors import AmsFaultClass, classify_full_code
+
+        extruder = classify_full_code("0300801E")  # print_error lane: main extruder overloaded
+        assert extruder is not None
+        assert (extruder.short_code, extruder.fault_class, extruder.extruder_side) == (
+            "0300_801E",
+            AmsFaultClass.MECHANICAL_FEED,
+            True,
+        )
+        notice = classify_full_code(_word_entry(_tray_attr(ams_id=0, tray=2), 0x00020025).full_code)
+        assert notice is not None and notice.fault_class is AmsFaultClass.INFORMATIONAL  # any class; caller filters
+
+    @pytest.mark.parametrize("value", ["", None, "ZZZ", "0700800", "07008010X", "0700000000008010FF"])
+    def test_a_value_that_is_no_full_code_reads_none(self, value):
+        from backend.app.services.hms_errors import classify_full_code
+
+        assert classify_full_code(value) is None
+
+    def test_the_renderer_splits_through_the_same_reader(self):
+        """One split: the printer-message renderer and the classifier read a stored code the
+        same way — the renderer's short code is the classifier's."""
+        from backend.app.services.hms_errors import classify_full_code, printer_message_from_full_code
+
+        for code in ("0701220000020019", "07008010", "0300801E"):
+            assert printer_message_from_full_code(code).short_code == classify_full_code(code).short_code
 
 
 def _external_attr(unit_byte: int = 0xFF, submodule: int = 0x20, module: int = 0x07) -> int:

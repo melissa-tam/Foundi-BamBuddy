@@ -110,7 +110,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Literal, TypeGuard, get_args
+from typing import TYPE_CHECKING, Literal, TypeGuard, get_args
 
 from backend.app.models.printer_incident import (
     AMS_FAULT_KINDS,
@@ -143,6 +143,9 @@ from backend.app.services.job_identity import is_held_job
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.terminal_outcome import PLATE_RECHECK_WINDOW_S, PlateCheckFacts
+
+if TYPE_CHECKING:
+    from backend.app.services.bambu_mqtt import BambuMQTTClient
 
 logger = logging.getLogger(__name__)
 
@@ -1290,8 +1293,8 @@ async def _watch_recheck(episode: _Episode, pressed_at: float) -> str | None:
     (c) a PAUSE on another dialog (a real dialog code that is not a plate code) → HAND OVER.
         A PAUSE with NO dialog is not one: the press clears the dialog a push or two before
         the job leaves PAUSE, so that reading waits for (b), (d) or (e);
-    (d) RUNNING at layer >= 1 of THIS job (the client's per-job layer, ``job_layer``) →
-        PASSED. A RUNNING whose layer this client cannot measure (it attached the job
+    (d) RUNNING at layer >= 1 of THIS job (:func:`_job_layer`, off the client's one peaks
+        reader) → PASSED. A RUNNING whose layer this client cannot measure (it attached the job
         mid-flight), or that has not reached layer 1 :data:`_RECHECK_FIRST_LAYER_S` after it
         began, exits instead: the sweep closes a job RUNNING for its dwell, and a plate
         dialog that comes back re-enters at rung 2;
@@ -1360,8 +1363,7 @@ async def _watch_recheck(episode: _Episode, pressed_at: float) -> str | None:
                 )
                 return None
             if live == "RUNNING":
-                client = printer_manager.get_client(pid)
-                layer = client.job_layer() if client is not None else None
+                layer = _job_layer(printer_manager.get_client(pid))
                 if layer is None:
                     logger.info(
                         "[pause-recovery] printer %s plate-check episode %s: the job is RUNNING but this client "
@@ -1386,6 +1388,23 @@ async def _watch_recheck(episode: _Episode, pressed_at: float) -> str | None:
                     )
                     return None
         await asyncio.sleep(_EPISODE_POLL_S)
+
+
+def _job_layer(client: BambuMQTTClient | None) -> int | None:
+    """The highest layer THIS job has printed — or ``None`` when this client's reading is no
+    measurement of this job.
+
+    Read off the client's ONE peaks reader (``BambuMQTTClient.job_peaks``, the same
+    reading the terminal payload carries): :attr:`~backend.app.services.bambu_mqtt.JobPeaks.peak_layer_num`
+    counts the live layer only behind the stale-predecessor gate (the firmware's republish
+    of the PREVIOUS job's layer is never this job's), and ``reliable`` False — a client that
+    attached the job mid-flight (a restart) and holds a baseline it cannot tell from a
+    predecessor's republish — reads ``None``: absence of measurement is not a measurement.
+    """
+    if client is None:
+        return None
+    peaks = client.job_peaks()
+    return peaks.peak_layer_num if peaks.reliable else None
 
 
 async def _close_passed(episode: _Episode, layer: int) -> None:

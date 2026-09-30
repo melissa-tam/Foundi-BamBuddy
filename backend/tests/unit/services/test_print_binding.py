@@ -785,6 +785,25 @@ class TestLivePrintQuestions:
     async def test_is_live_status(self, status, live):
         assert is_live_status(status) is live
 
+    async def test_completed_since(self, own_session_factory):
+        """The recovery driver's printer bound: "has a print run through this printer's path to
+        its end since T" — a ``completed`` archive on THIS printer closed after T. A failed one,
+        one on another printer, or one closed before T is not."""
+        from backend.app.services.print_binding import completed_since
+
+        maker = own_session_factory
+        pid, other = await seed_printer(maker, serial="H2S-A"), await seed_printer(maker, serial="H2S-B")
+        since = NOW - timedelta(hours=2)
+        await seed_archive(maker, printer_id=pid, status="completed", completed_at=since - timedelta(minutes=1))
+        await seed_archive(maker, printer_id=pid, status="failed", completed_at=NOW)
+        await seed_archive(maker, printer_id=other, status="completed", completed_at=NOW)
+
+        async with maker() as s:
+            assert await completed_since(s, pid, _naive(since)) is False
+        await seed_archive(maker, printer_id=pid, status="completed", completed_at=NOW)
+        async with maker() as s:
+            assert await completed_since(s, pid, _naive(since)) is True
+
 
 # ---------------------------------------------------------------------------
 # RC1 — the restart regression, through main.on_print_complete

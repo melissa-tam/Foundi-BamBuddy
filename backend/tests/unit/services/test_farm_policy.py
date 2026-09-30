@@ -17,6 +17,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.printer_incident import (
+    KIND_JAM,
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
     KIND_RUNOUT,
@@ -3110,6 +3111,102 @@ class TestGracefulRequeue:
         await db_session.refresh(batch)
         assert batch.pause_reason is None  # the requeue, not the operator-stop hold
 
+    async def test_a_farm_restart_requeues_next_in_line_without_a_hold_or_a_page(self, db_session):
+        """``fault_restart`` (operator ruling 2026-09-29): the recovery driver stopped a job
+        that had deposited nothing, to restart it on the backup spool. Requeued next in line
+        with its settings under the ``fault_stop`` cause — no retry spent, no quarantine
+        feed, the run stays active, and nothing is paged from here (the driver pages on
+        its own escalations)."""
+        printer = await _mk_printer_row(db_session, "GRQFR")
+        batch, prof = await _mk_run(db_session, quantity=3, printer_ids=[printer.id], require_fa=False)
+        await _mk_live_unit(db_session, batch, prof, printer_id=printer.id, status="pending", pos=1)
+        item = await _mk_live_unit(
+            db_session,
+            batch,
+            prof,
+            printer_id=printer.id,
+            status="cancelled",
+            pos=2,
+            skip_filament_check=True,
+            stop_source=farm_correlation.STOP_VERDICT_FAULT_RESTART,
+        )
+
+        with (
+            patch.object(requeue, "requeue_attempt", wraps=requeue.requeue_attempt) as requeue_spy,
+            patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock) as page,
+            patch.object(farm_policy, "maybe_quarantine_printer", new_callable=AsyncMock) as quarantine,
+            patch.object(farm_policy, "_maybe_lift_held_bed", new_callable=AsyncMock) as bed_lift,
+        ):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                item.id,
+                "cancelled",
+                outcome=_outcome(farm_correlation.STOP_VERDICT_FAULT_RESTART, faults={KIND_JAM}),
+            )
+
+        assert requeue_spy.await_args.kwargs["cause"] == "fault_stop"
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
+        assert len(retries) == 1
+        assert retries[0].status == "pending"
+        assert retries[0].skip_filament_check is True  # the same settings
+        assert (retries[0].position, retries[0].been_jumped) == (1, True)  # next in line
+        assert await requeue.failed_ancestor_count(db_session, retries[0]) == 0  # no retry spent
+        quarantine.assert_not_awaited()
+        page.assert_not_awaited()  # NOT the operator-stop page
+        bed_lift.assert_not_awaited()  # the bed lift is the refused plate's alone
+        await db_session.refresh(batch)
+        assert (batch.status, batch.pause_reason) == ("active", None)  # NOT the operator-stop hold
+
+    async def test_a_farm_restarted_first_article_is_requeued_as_a_first_article(self, db_session):
+        """Recorded ``cancelled`` by the builder, and the policy keys on the verdict ahead of
+        the status fork — so the first article never reaches ``_on_item_failed``."""
+        printer = await _mk_printer_row(db_session, "GRQFRFA")
+        batch, prof = await _mk_run(db_session, quantity=3, printer_ids=[printer.id], require_fa=True)
+        fa = (await _items(db_session, batch.id))[0]
+        fa.status = "cancelled"
+        fa.stop_source = farm_correlation.STOP_VERDICT_FAULT_RESTART
+        fa.completed_at = datetime.now(timezone.utc)
+        await db_session.commit()
+
+        with (
+            patch.object(farm_policy, "_on_item_failed", new_callable=AsyncMock) as failed_path,
+            patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock) as page,
+        ):
+            await farm_policy.on_terminal(
+                db_session,
+                printer.id,
+                fa.id,
+                "cancelled",
+                outcome=_outcome(farm_correlation.STOP_VERDICT_FAULT_RESTART, faults={KIND_JAM}),
+            )
+
+        failed_path.assert_not_awaited()
+        page.assert_not_awaited()
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == fa.id]
+        assert len(retries) == 1
+        assert retries[0].first_article is True  # re-attempted AS a first article
+        await db_session.refresh(batch)
+        assert (batch.status, batch.pause_reason, batch.first_article_state) == ("active", None, "pending_print")
+
+    async def test_the_same_terminal_without_the_verdict_holds_the_run(self, db_session):
+        """Liveness pair — what the ``fault_restart`` route exists to prevent: the farm's own
+        stop, classified the way an H2C (no cancel echo) terminal read before the verdict
+        existed, lands in ``on_operator_stop`` and holds the run for a human."""
+        printer = await _mk_printer_row(db_session, "GRQFR0")
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[printer.id], require_fa=False)
+        item = await _mk_live_unit(db_session, batch, prof, printer_id=printer.id, status="cancelled")
+
+        with patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock) as page:
+            await farm_policy.on_terminal(
+                db_session, printer.id, item.id, "cancelled", outcome=_outcome(None, faults={KIND_JAM})
+            )
+
+        assert [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id] == []
+        page.assert_awaited_once()
+        await db_session.refresh(batch)
+        assert batch.pause_reason == "operator_stop"
+
     async def test_a_completed_terminal_is_never_requeued(self, db_session):
         """A stop that lost the race to a finishing print produced a part."""
         printer = await _mk_printer_row(db_session, "GRQ4")
@@ -3519,13 +3616,19 @@ class TestRecoverClosesOperatorResolvedHolds:
 
 class TestEscalationNeverStops:
     """Operator decision 2026-09-04: an unrecoverable filament fault stays PAUSED and
-    RESUMABLE. ``spool_recovery`` escalates and holds; it never stops the print — the
-    graceful half of that decision is :func:`farm_policy.on_farm_requeue`, which turns
-    the operator's OWN stop of a held print into a requeue.
+    RESUMABLE. ``spool_recovery`` escalates and holds — the graceful half of that decision
+    is :func:`farm_policy.on_farm_requeue`, which turns the operator's OWN stop of a held
+    print into a requeue.
 
-    Pinned at MODULE scope by parsing the recovery lane: the invariant is "no stop is
-    ever sent from this lane", not "not from this one branch", and an AST walk is the
-    only assertion that covers every path including the ones a future change adds.
+    Amended by operator ruling R1 (2026-09-29, 013-H2S incidents 410/411): the recovery
+    lane ends a job in exactly ONE place — its last release rung,
+    ``_LEVERS[printer_incidents.FAULT_RESTART_STEP]``, pulled only for a farm unit that has
+    deposited nothing — and never as the operator: a mid-print stall still escalates and
+    holds. Where that one stop lives is pinned by
+    ``test_code_quality.TestRecoveryDriverOwnership.test_the_restart_stop_is_published_by_its_rung_alone``;
+    this case pins the rest at MODULE scope by parsing the recovery lane — the operator's
+    stop verbs never, and the raw stop once — because an AST walk is the only assertion that
+    covers every path, including the ones a future change adds.
     """
 
     async def test_the_recovery_lane_sends_no_stop_anywhere(self):
@@ -3535,10 +3638,13 @@ class TestEscalationNeverStops:
         from backend.app.services import spool_recovery
 
         tree = ast.parse(inspect.getsource(spool_recovery))
-        called = {
+        called = [
             node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
-        }
-        forbidden = {"stop_print", "stop_as_operator", "stamp_operator_stop"}
-        assert called & forbidden == set(), f"spool_recovery must never stop a print: {called & forbidden}"
+        ]
+        operator_verbs = {"stop_as_operator", "stamp_operator_stop"}
+        assert set(called) & operator_verbs == set(), (
+            f"spool_recovery must never stop a print as the operator: {set(called) & operator_verbs}"
+        )
+        assert called.count("stop_print") == 1, "the recovery lane's one raw stop is its restart rung (R1)"

@@ -10,6 +10,7 @@ reference arbitrary printer/sku ids without seeding those parents.
 """
 
 from datetime import datetime, timezone
+from typing import get_args
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,7 +20,11 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.dispatch_target import encode_printer_ids
 from backend.app.services.farm_correlation import (
+    OPERATOR_STOP_VERDICTS,
+    REQUEUE_VERDICTS,
+    STOP_VERDICT_FAULT_RESTART,
     STOP_VERDICT_PLATE_REFUSED,
+    StopVerdict,
     classify_stop,
     farm_work_slated_for,
     farm_work_targets_printer,
@@ -40,6 +45,7 @@ from backend.app.services.plate_occupancy import (
     PlateRefusal,
     plate_occupancy,
 )
+from backend.app.services.printer_incidents import PAYLOAD_FAULT_RESTART_STOP
 from backend.app.services.printer_manager import printer_manager
 
 # The per-file occupancy reset that used to live here is GONE: the plate-vision
@@ -671,6 +677,95 @@ class TestClassifyStopPlateRefused:
             {"status": "failed", "subtask_id": echo}, operator_stop_requested=False, open_incidents=[hold]
         )
         assert (verdict == STOP_VERDICT_PLATE_REFUSED) is refused
+
+
+class TestClassifyStopFaultRestart:
+    """``fault_restart``: a non-completed terminal of the job an open row's recovery driver
+    stopped with its last release rung (operator ruling 2026-09-29, 013-H2S 410/411).
+
+    The projection dicts are built here with the contract key; the ledger → key writer is
+    ``printer_incidents``'. The LEDGER decides, never the echo: H2S echoes the farm's own
+    remote stop as a cancel echo, H2C echoes nothing."""
+
+    _RESTART = {
+        "kind": "jam",
+        "job_id": "JOB-9",
+        "printer_messages": [],
+        PAYLOAD_FAULT_RESTART_STOP: True,
+    }
+
+    @pytest.mark.parametrize("echo", [True, False], ids=["h2s_cancel_echo", "h2c_no_echo"])
+    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
+    def test_the_drivers_stop_is_a_fault_restart_echo_or_not(self, status, echo):
+        payload = {"status": status, "subtask_id": "JOB-9"}
+        if echo:
+            payload["user_cancel_observed"] = True
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._RESTART])
+            == STOP_VERDICT_FAULT_RESTART
+        )
+
+    def test_it_outranks_the_operators_ui_stop(self):
+        """An operator Stop pressed while the driver's stop was out ends the same job the
+        same way; the ledger says the farm is restarting it."""
+        payload = {"status": "failed", "subtask_id": "JOB-9", "user_cancel_observed": True}
+        assert (
+            classify_stop(payload, operator_stop_requested=True, open_incidents=[self._RESTART])
+            == STOP_VERDICT_FAULT_RESTART
+        )
+
+    def test_it_outranks_the_reconciles_unknown(self):
+        """A restart between the driver's stop and its terminal: the ledger survives it."""
+        payload = {"status": "aborted", "subtask_id": "JOB-9", "outcome_unknown": True}
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._RESTART])
+            == STOP_VERDICT_FAULT_RESTART
+        )
+
+    def test_a_refused_plate_of_the_same_job_still_ranks_first(self):
+        vision = {"kind": "plate_vision", "job_id": "JOB-9", "printer_messages": []}
+        payload = {"status": "failed", "subtask_id": "JOB-9"}
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._RESTART, vision])
+            == STOP_VERDICT_PLATE_REFUSED
+        )
+
+    def test_another_jobs_row_is_not_this_terminals_restart(self):
+        """The row's driver stopped JOB-9; any other job ending keeps its own verdict."""
+        payload = {"status": "failed", "subtask_id": "EJECT-1", "user_cancel_observed": True}
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._RESTART]) == "operator_screen"
+        )
+
+    @pytest.mark.parametrize("subtask", ["", "0", None])
+    def test_an_id_less_terminal_is_not_the_ledgered_job(self, subtask):
+        """``same_job`` answers ``unknown`` for an id-less side, and unknown is not this row's
+        stop: the ledger names the job it stopped. The terminal keeps what else it carries."""
+        payload = {"status": "failed", "subtask_id": subtask}
+        assert classify_stop(payload, operator_stop_requested=False, open_incidents=[self._RESTART]) is None
+
+    def test_an_id_less_row_is_not_a_restart_of_anything(self):
+        row = {**self._RESTART, "job_id": ""}
+        payload = {"status": "failed", "subtask_id": "JOB-9"}
+        assert classify_stop(payload, operator_stop_requested=False, open_incidents=[row]) is None
+
+    def test_a_completed_terminal_is_never_a_restart(self):
+        """The stop lost the race to a finishing job: the part exists."""
+        payload = {"status": "completed", "subtask_id": "JOB-9"}
+        assert classify_stop(payload, operator_stop_requested=False, open_incidents=[self._RESTART]) is None
+
+    @pytest.mark.parametrize("flag", [False, None])
+    def test_a_row_without_the_ledgered_stop_is_an_ordinary_fault(self, flag):
+        """The same job's jam row, no restart rung sent: the operator's stop keeps its verdict."""
+        row = {**self._RESTART, PAYLOAD_FAULT_RESTART_STOP: flag}
+        payload = {"status": "failed", "subtask_id": "JOB-9"}
+        assert classify_stop(payload, operator_stop_requested=True, open_incidents=[row]) == "operator_ui"
+        assert classify_stop(payload, operator_stop_requested=False, open_incidents=[row]) is None
+
+    def test_the_token_is_a_member_of_the_closed_set(self):
+        assert STOP_VERDICT_FAULT_RESTART in get_args(StopVerdict)
+        assert STOP_VERDICT_FAULT_RESTART in REQUEUE_VERDICTS
+        assert STOP_VERDICT_FAULT_RESTART not in OPERATOR_STOP_VERDICTS
 
 
 class TestResolvePrintingFarmItem:

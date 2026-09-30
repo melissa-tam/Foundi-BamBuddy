@@ -798,6 +798,55 @@ class PrinterState:
     reported_model: str | None = None
 
 
+@dataclass(frozen=True)
+class JobPeaks:
+    """How far the tracked job got — :meth:`BambuMQTTClient.job_peaks`, THE one read of the
+    client's private peak fields, for the terminal payload and a live reader alike.
+
+    * ``last_progress`` / ``last_layer_num`` — the last non-zero reading saved BEFORE the
+      current one. At a terminal the firmware's cancel has zeroed the live fields, so these
+      are the job's peaks, and they are what the terminal payload carries
+      (:meth:`terminal_fields`).
+    * ``progress`` / ``layer_num`` — the CURRENT reading, counted only once THIS job has
+      posted one of its own (the stale-predecessor gate, ``_job_*_baseline_seen``, released):
+      until then the live percent is still the PREVIOUS job's republished value (the
+      percent is not reset at print start), and a job paused before its first layer would
+      read as having printed its predecessor's 100 %.
+    * ``reliable`` — this client watched the job START, so the numbers are a measurement
+      (``_peaks_reliable``; an attach mid-job is not).
+
+    A LIVE job's current reading is part of how far it got — a job paused mid-way through
+    its first layer reads ``layer_num == 1`` while nothing has been saved yet — so a live
+    reader takes the larger of the two (:attr:`peak_progress` / :attr:`peak_layer_num`);
+    ``plate_occupancy.DepositEvidence.live`` is that reader.
+    """
+
+    last_progress: float
+    last_layer_num: int
+    progress: float
+    layer_num: int
+    reliable: bool
+
+    @property
+    def peak_progress(self) -> float:
+        """The highest percent this job has shown so far."""
+        return max(self.last_progress, self.progress)
+
+    @property
+    def peak_layer_num(self) -> int:
+        """The highest layer this job has shown so far."""
+        return max(self.last_layer_num, self.layer_num)
+
+    def terminal_fields(self) -> dict[str, float | int | bool]:
+        """The three keys a terminal payload carries (``DepositEvidence.from_terminal_payload``
+        and the usage charge read them)."""
+        return {
+            "last_progress": self.last_progress,
+            "last_layer_num": self.last_layer_num,
+            "peaks_reliable": self.reliable,
+        }
+
+
 def job_consumption_evidence(state: PrinterState) -> dict[str, object]:
     """The per-job consumption evidence a terminal payload carries — read off ``state`` NOW.
 
@@ -1950,26 +1999,6 @@ class BambuMQTTClient:
         the same synchronous stretch as its own publish reads its own send's id.
         """
         return self._last_sent_sequence.get(command)
-
-    def job_layer(self) -> int | None:
-        """The highest layer THIS job has printed, as this client's per-job tracking read it —
-        or ``None`` when that tracking is not a measurement of this job. Read-only.
-
-        The same source and the same reliability flag the terminal payload's
-        ``last_layer_num`` / ``peaks_reliable`` come from: ``state.layer_num`` behind the
-        stale-predecessor gate (a print start zeroes it, and the firmware's republish of the
-        PREVIOUS job's layer is discarded until this job posts one of its own) and
-        ``_last_valid_layer_num`` (this job's last non-zero reading, kept across the
-        firmware's cancel reset). ``None`` while ``_peaks_reliable`` is False: a client that
-        attached the job mid-flight (a restart) holds a baseline it cannot tell from a
-        predecessor's republish, and absence of measurement is not a measurement.
-
-        Read by the plate-check episode (``pause_recovery``): after the farm pressed
-        "Problem solved, resume", RUNNING at layer >= 1 of this job is the re-check passing.
-        """
-        if not self._peaks_reliable:
-            return None
-        return max(self.state.layer_num, self._last_valid_layer_num)
 
     def _deliver_command_result(self, print_data: dict) -> None:
         """Hand an AMS write's firmware ACK to ``on_ams_command_result``.
@@ -3400,6 +3429,29 @@ class BambuMQTTClient:
         means there is nothing to confuse this job with: the gate is open immediately.
         """
         return not baseline_seen and prev_job_final > 0 and reading >= prev_job_final
+
+    def job_peaks(self) -> JobPeaks:
+        """How far the tracked job got (:class:`JobPeaks`) — THE one reader of the peak fields.
+
+        Read by the terminal payload (:meth:`JobPeaks.terminal_fields`) and by LIVE readers:
+        ``plate_occupancy.DepositEvidence.live`` (the recovery driver's "has this job
+        deposited anything" before its restart rung) and the plate-check episode
+        (``pause_recovery``: after the farm pressed "Problem solved, resume", RUNNING at
+        :attr:`JobPeaks.peak_layer_num` >= 1 of a ``reliable`` reading is the re-check
+        passing). The current reading counts only once
+        the stale-predecessor gate has released for this job: before that the live percent
+        is the predecessor's republished value, and ``state.layer_num`` is still the 0 the
+        print start set (the layer gate discards the republish), so neither can make a
+        paused layer-0 job read as deposited — nor can a job that did print read as empty,
+        because its own readings release the gate.
+        """
+        return JobPeaks(
+            last_progress=self._last_valid_progress,
+            last_layer_num=self._last_valid_layer_num,
+            progress=self.state.progress if self._job_progress_baseline_seen else 0.0,
+            layer_num=self.state.layer_num if self._job_layer_baseline_seen else 0,
+            reliable=self._peaks_reliable,
+        )
 
     def _update_state(self, data: dict):
         """Update printer state from message data."""
@@ -4868,14 +4920,13 @@ class BambuMQTTClient:
                     # live printer for these (``job_consumption_evidence`` says why, and
                     # owns the per-job key set it shares with the reconcile's synthesis).
                     #
-                    # Last valid progress/layer before firmware reset (for partial usage tracking)
-                    "last_progress": self._last_valid_progress,
-                    "last_layer_num": self._last_valid_layer_num,
-                    # Whether the two peaks above may be read as a MEASUREMENT of this
-                    # job: False when this client never saw the job start (restart
-                    # recovery), so a consumer deciding "did this leave a part on the
-                    # plate?" must fail closed instead of trusting a zero.
-                    "peaks_reliable": self._peaks_reliable,
+                    # Last valid progress/layer before firmware reset (for partial usage
+                    # tracking), and whether they may be read as a MEASUREMENT of this job:
+                    # ``peaks_reliable`` is False when this client never saw the job start
+                    # (restart recovery), so a consumer deciding "did this leave a part on
+                    # the plate?" must fail closed instead of trusting a zero. Read through
+                    # the one peaks reader, which a live reader shares.
+                    **self.job_peaks().terminal_fields(),
                     **job_consumption_evidence(self.state),
                     # Operator-cancel echo seen during this print: lets the
                     # terminal-status handler classify a screen-stop and skip retry /

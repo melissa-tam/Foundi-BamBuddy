@@ -519,6 +519,20 @@ class TestAttentionReminders:
             mock_n.assert_awaited_once()
             assert mock_n.await_args.kwargs["kind"] == "jam"
 
+    @pytest.mark.parametrize(("live", "ended"), [("PAUSE", False), ("IDLE", True), ("FAILED", True)])
+    async def test_a_hold_that_outlived_its_job_is_not_reminded_as_paused(self, db_session, live, ended):
+        """A physical hold on a printer that is NOT paused — a restart give-up after the farm's
+        own stop (operator ruling 2026-09-29), or any physical fault after its job ended — is
+        reminded as a job that has ENDED (``job_ended``), so the wrapper never says "left
+        PAUSED"; on a paused printer it still does."""
+        await _add_incident_held(db_session, 7, "physical", code="0700_8004")
+        mgr = _FakeManager({7: True}, {7: _FakeState(live)})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["job_ended"] is ended
+
     async def test_runout_incident_refires_with_the_runout_kind(self, db_session):
         await _add_incident_held(db_session, 8, "runout")
         mgr = _FakeManager({8: True}, {8: _FakeState("PAUSE")})

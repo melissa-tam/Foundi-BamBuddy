@@ -1322,25 +1322,18 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # ledger self-bounds (prunes absent-too-long codes) and is per-printer.
         new_error_codes = notify_dedup.new_codes(printer_id, current_error_codes, time.time())
 
-        # Recoverable feed-fault / runout short codes among the NEW codes, computed
-        # ONCE here so the notify session's recovery-owned suppression and the
-        # spool-recovery spawn below read the SAME set. ``_code_word`` +
-        # ``runout_slot_from_hms`` serve that suppression's attr-aware companion test.
-        from backend.app.services.hms_errors import (
-            _code_word,
-            is_notify_suppressed,
-            runout_slot_from_hms,
-        )
-        from backend.app.services.spool_recovery import on_ams_fault, owned_short_codes
+        from backend.app.services.hms_errors import is_notify_suppressed, live_candidates
+        from backend.app.services.spool_recovery import on_ams_fault
 
-        # Codes an AMS INCIDENT speaks for, derived from ALL live HMS entries through
-        # the fault taxonomy — not from ``new_error_codes``. That decoupling is the
-        # fix for the silent class: a code standing at restart (seed_standing marks it
-        # already-seen) or flapping inside the 600 s re-notify window never entered
+        # The ACTIONABLE AMS faults standing now, derived from ALL live HMS entries
+        # through the fault taxonomy — not from ``new_error_codes``. That decoupling is
+        # the fix for the silent class: a code standing at restart (seed_standing marks
+        # it already-seen) or flapping inside the 600 s re-notify window never entered
         # ``new_error_codes``, so the old spawn never fired and never logged — 9 runout
-        # episodes passed with no incident, no alert and no trace. Computed once here
-        # so the notify suppression and the spawn below read the SAME set.
-        _incident_codes = owned_short_codes(state)
+        # episodes passed with no incident, no alert and no trace. It gates the
+        # incident spawn below; which codes an incident SPEAKS FOR is the owner's answer
+        # (``spool_recovery.owned_full_codes``), asked in the notify session.
+        _actionable = live_candidates(state)
 
         if new_error_codes:
             # Get the actual new errors for the notification.
@@ -1383,16 +1376,16 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                     # Recovery-owned suppression (2026-07-20): a single physical feed
                     # fault emits several HMS codes and the recovery state machine sends
                     # its OWN lifecycle notifications, so raw per-code alerts here would
-                    # double-notify (one fault produced 4 Discord messages). When
-                    # recovery will own the incident, drop the raw alerts. will_own
-                    # already fails closed; the guard is belt-and-braces so a predicate
-                    # error can never silence the raw alerts.
-                    owned = False
-                    if _incident_codes:
-                        try:
-                            owned = await spool_recovery.will_own(db, printer_id, state)
-                        except Exception:  # noqa: BLE001 — never suppress on a crashed predicate
-                            owned = False
+                    # double-notify (one fault produced 4 Discord messages). The owner
+                    # answers WHICH full codes an incident speaks for; this loop drops
+                    # exactly those. It already fails toward notifying (empty set); the
+                    # guard is belt-and-braces so a predicate error can never silence
+                    # the raw alerts.
+                    owned: frozenset[str] = frozenset()
+                    try:
+                        owned = await spool_recovery.owned_full_codes(db, printer_id, state)
+                    except Exception:  # noqa: BLE001 — never suppress on a crashed predicate
+                        owned = frozenset()
 
                     entries: list[dict] = []
                     suppressed_owned: list[str] = []
@@ -1453,13 +1446,10 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         # raw per-code alert would double-notify. Still stamp the durable
                         # ledger (recovery's messages satisfy "operator informed", and
                         # without the row a standing owned code would re-blast at the next
-                        # deploy via seed_standing). The companion predicate is attr-aware:
-                        # never match the bare short string "0700_0001" — it collides with
-                        # the slot-attributed runout family.
-                        if owned and (
-                            short_code in _incident_codes
-                            or runout_slot_from_hms(error.attr, _code_word(error.code)) is not None
-                        ):
+                        # deploy via seed_standing). Matched by FULL code, never the short:
+                        # "0700_0001" is a slot's overload AND a slot's runout demand, and
+                        # an incident owning the one must never silence the other.
+                        if error.full_code in owned:
                             await notify_dedup.record_sent(
                                 db,
                                 notify_dedup.HMS_SCOPE,
@@ -1559,7 +1549,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # 600 s window, is never "new"). The service's own entry throttle keeps a
         # standing fault from re-querying every second; all other gating lives there
         # too. Guarded fire-and-forget hook only.
-        if _incident_codes:
+        if _actionable:
             try:
                 asyncio.create_task(on_ams_fault(printer_id, state))
             except Exception as _fe:  # noqa: BLE001 — hook must never crash the status flow
