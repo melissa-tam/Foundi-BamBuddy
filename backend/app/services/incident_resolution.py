@@ -128,10 +128,10 @@ class Context:
     verdict is a pure function of what it is handed.
 
     ``restart_owed`` is what the row's STEP LEDGER says (``spool_recovery``'s evidence log,
-    read by the startup rearm): the recovery driver sent its restart stop on this row and
-    no unload since answered ``complete`` — the job is over by the farm's own act and the
-    stalled filament may still be in the tube, so the restart continuation owes the path
-    its unload (operator ruling 2026-09-29). Only the ``startup`` occasion reads it.
+    read by the startup rearm): the recovery driver sent its restart stop on this still-open
+    row — the job is over by the farm's own act and the restart continuation owes the row
+    what is left of it: the unload (the stalled filament may still be in the tube), the park
+    and the close (operator ruling 2026-09-29). Only the ``startup`` occasion reads it.
     """
 
     state: PrinterState | None
@@ -421,14 +421,14 @@ def _wire_startup(_row: PrinterIncident, ctx: Context) -> Verdict:
     every wire fact from scratch, and a printer already running has answered.
 
     One reading of "not PAUSE" is not the hold ending: a row whose driver STOPPED the job
-    to restart it (``ctx.restart_owed``) reads IDLE / FAILED because of that stop, while
-    the unload its continuation owes the path has not completed — closing it here hands
-    the printer to the dispatcher with the stalled filament still in the tube. It stands,
-    and the rearm re-enters the continuation (the row still reads ``recovering``)."""
+    to restart it (``ctx.restart_owed``) reads IDLE / FAILED because of that stop, while its
+    continuation has not finished — closing it here hands the printer to the dispatcher with
+    the stalled filament possibly still in the tube, or the stalled spool unparked. It
+    stands, and the rearm re-enters the continuation (the row still reads ``recovering``)."""
     if ctx.restart_owed:
         return Verdict(
             close=False,
-            evidence="the driver stopped this job to restart it and its unload has not completed — "
+            evidence="the driver stopped this job to restart it and has not finished — "
             "the restart continuation re-enters",
         )
     over, reported = _hold_over(ctx.state)

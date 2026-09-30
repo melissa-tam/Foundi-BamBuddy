@@ -557,10 +557,11 @@ class TestTheWireLane:
     @pytest.mark.parametrize("live", ["IDLE", "FAILED"])
     def test_a_restart_the_driver_owes_an_unload_stands_at_startup(self, live):
         """A deploy mid-restart (operator ruling 2026-09-29): the driver STOPPED this row's
-        job to restart it and its unload has not completed (``restart_owed``, read off the
-        step ledger by the rearm). The printer reads IDLE / FAILED because of that stop — not
-        because the hold is over — so the cell stands and the continuation re-enters,
-        instead of handing the dispatcher a tube with the stalled filament in it. Only the
+        job to restart it and the row is still open (``restart_owed`` — the stop on the step
+        ledger, read by the rearm, whatever the unload answered). The printer reads IDLE /
+        FAILED because of that stop — not because the hold is over — so the cell stands and
+        the continuation re-enters to finish (the unload, or the park and the close), instead
+        of handing the dispatcher a tube that may still hold the stalled filament. Only the
         startup occasion reads it; without it the same reading closes as before."""
         owed = Context(state=_state(live), ledger=MotionLedger(), driver_live=False, restart_owed=True)
         verdict = resolve(_row(RESOLUTION_WIRE, status=STATUS_RECOVERING), "startup", owed)

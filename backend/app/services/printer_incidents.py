@@ -775,6 +775,26 @@ async def find_closed(db: AsyncSession, printer_id: int, job_id: str, codes: str
     return result.scalar_one_or_none()
 
 
+async def last_closed_by(db: AsyncSession, printer_id: int, source: str) -> PrinterIncident | None:
+    """This printer's most recently CLOSED row whose close was ``source``, or None.
+
+    The recovery driver's printer bound asks it with ``RESOLVE_DRIVER_RESTART``: the last
+    time this printer's path stalled on a first load and the driver restarted the job
+    (``spool_recovery._restart_refault``) — a second such stall with no print completed
+    since is the path's, not the spool's. An open row has no close, so the incident asking
+    is never its own answer.
+    """
+    result = await db.execute(
+        select(PrinterIncident)
+        .where(PrinterIncident.printer_id == printer_id)
+        .where(PrinterIncident.resolve_source == source)
+        .where(PrinterIncident.resolved_at.is_not(None))
+        .order_by(PrinterIncident.resolved_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def count_resolved(db: AsyncSession, printer_id: int, job_id: str, kind: str) -> int:
     """How many incidents of ``kind`` this job has already RECOVERED from.
 

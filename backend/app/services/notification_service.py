@@ -3026,6 +3026,7 @@ class NotificationService:
         kind: str = "jam",
         runout_slot: str | None = None,
         foreign: bool = False,
+        job_ended: bool = False,
     ):
         """Fire when a mid-print AMS fault could NOT be auto-recovered.
 
@@ -3047,6 +3048,14 @@ class NotificationService:
 
         ``foreign`` marks a print the farm did not dispatch: the job is named but no
         unit/run is, and the operator is told the farm cannot act on it.
+
+        ``job_ended`` — the page is composed AFTER the job ended: a release verb ended the
+        print, or the recovery driver stopped it itself to restart it on the backup spool
+        (``spool_recovery._job_ended`` derives it from the reason and the step ledger). No
+        print is waiting, so no copy of this page may say "left PAUSED" or "resume on the
+        printer": every kind takes the one ended-job sentence, and the jam's seeded template
+        — whose body says PAUSED — is not used for it. ``detail`` states the job, the path,
+        the plate, the unit and the exit.
         """
         providers = await self._get_providers_for_event(db, "on_spool_recovery_failed", printer_id)
         if not providers:
@@ -3059,7 +3068,13 @@ class NotificationService:
         }
         foreign_txt = " (a print Bambuddy did not dispatch)" if foreign else ""
 
-        if kind == "runout":
+        if job_ended:
+            label = {"runout": "Filament runout NOT recovered", "physical": "Filament hardware fault"}.get(
+                kind, "Spool jam NOT recovered"
+            )
+            title = f"{label} — {printer_name}"
+            message = f"{printer_name}: '{job_name}'{foreign_txt} has ended. {detail}"
+        elif kind == "runout":
             slot_txt = f" into {runout_slot}" if runout_slot else ""
             title = f"Filament runout NOT recovered — {printer_name}"
             message = (

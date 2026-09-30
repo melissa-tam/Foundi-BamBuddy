@@ -267,6 +267,34 @@ class TestAlreadyHandledAndFlapCap:
         assert await printer_incidents.count_resolved(db_session, printer.id, "task-1", KIND_JAM) == 1
         assert await printer_incidents.count_resolved(db_session, printer.id, "task-2", KIND_JAM) == 0
 
+    async def test_last_closed_by_is_the_printers_latest_close_of_that_source(self, db_session, printer_factory):
+        """The recovery driver's printer bound: this printer's LAST ``driver_restart`` close.
+        Another source, another printer, or a row still open is not it."""
+        from datetime import timedelta
+
+        from backend.app.models.printer_incident import RESOLVE_DRIVER_RESTART
+
+        printer, other = await printer_factory(), await printer_factory()
+        assert await printer_incidents.last_closed_by(db_session, printer.id, RESOLVE_DRIVER_RESTART) is None
+        closed: list[PrinterIncident] = []
+        for hours_ago in (3, 1):
+            row = await _open(db_session, printer.id, kind=KIND_JAM, codes=f"jam:{hours_ago}")
+            row = await printer_incidents.close(
+                db_session, row.id, status=STATUS_RESOLVED, source=RESOLVE_DRIVER_RESTART
+            )
+            row.resolved_at = row.resolved_at - timedelta(hours=hours_ago)
+            await db_session.commit()
+            closed.append(row)
+        swap = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:swap")
+        await printer_incidents.close(db_session, swap.id, status=STATUS_RESOLVED, source="driver_swap")
+        elsewhere = await _open(db_session, other.id, kind=KIND_JAM, codes="jam:other")
+        await printer_incidents.close(db_session, elsewhere.id, status=STATUS_RESOLVED, source=RESOLVE_DRIVER_RESTART)
+        await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:open")
+
+        latest = await printer_incidents.last_closed_by(db_session, printer.id, RESOLVE_DRIVER_RESTART)
+
+        assert latest is not None and latest.id == closed[1].id
+
 
 class TestSnapshotProjection:
     async def test_open_populates_and_close_clears_the_cache(self, db_session, printer_factory):

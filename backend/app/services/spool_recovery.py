@@ -188,7 +188,7 @@ from backend.app.services import (
     spool_respool,
     tray_fields,
 )
-from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, ams_mid_filament_change
+from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, HMSError, ams_mid_filament_change
 from backend.app.services.hms_errors import (
     AmsFaultClass,
     FaultCandidate,
@@ -415,7 +415,7 @@ _ESCALATE_DETAIL: dict[str, str] = {
     # says so: the job's state, the path's, the plate's, the unit's, and the one physical
     # exit — the row is held as a PHYSICAL fault from here (:func:`_give_up`), which a
     # completed load, a print running through the path, or Recover ends. No feeder clause
-    # (:data:`_NO_FEEDER_CLAUSE`): its "then resume on the printer" names a print that is over.
+    # (:data:`_JOB_ENDED_REASONS`): its "then resume on the printer" names a print that is over.
     "restart_unload_failed": (
         "Feed stall at layer 0: the farm stopped the job, and the unload of the stalled feeder did not "
         "complete, so filament may still be in the path. The plate is clear and the unit is back in the queue. "
@@ -503,6 +503,7 @@ Lever = Literal[
     "resume_then_pause",
     "ams_control_resume",
     "clean_print_error",
+    "retry_after_clear",
     "ams_control_abort",
     "ams_control_reset",
     "ams_control_pause",
@@ -523,18 +524,12 @@ class LeverSpec:
     ``pulls`` — the rung's budget per INCIDENT, pulled back to back before the ladder moves
     on, and spent from the durable step log (:meth:`_RecoveryEvidence.lever_spent`): a
     restarted driver resumes mid-budget, never re-grinding the stalled feeder from the
-    first pull. One pull is the rule; the dialog's Retry (``ams_control_resume``) takes
-    three. A repeated Retry is what a human does at the screen: on 011-H2S 2026-09-29
-    (incident 419) the farm's one Retry re-held, and a second Retry — the operator's, at the
-    touchscreen — fed slot 3, the stall's fourth feed attempt; the swap then recovered it.
-    The vendor catalog offers exactly that button for the codes this ladder meets:
-    ``backend/app/data/hms_actions.json`` maps ``07008006`` and ``07008010`` to CONTINUE
-    (with CHECK_ASSISTANT), and CONTINUE is ``ams_control("resume")``. The budget bounds the
-    grinding at three step windows. Spent is a STEP on the incident's log, never a
-    process-lifetime counter — the counters that preceded it were keyed by (printer, job),
-    so 003-H2S 2026-09-19 04:31 met a second fault 69 s after a self-heal on the same job
-    and gave up with ZERO CONTINUEs sent — and never an in-memory list either, which a
-    restart emptied. A new incident is a new log.
+    first pull. One pull is the rule; the Retry after the dialog is cleared
+    (``retry_after_clear``) takes two — why is that rung's own entry in the table's notes.
+    Spent is a STEP on the incident's log, never a process-lifetime counter — the counters
+    that preceded it were keyed by (printer, job), so 003-H2S 2026-09-19 04:31 met a second
+    fault 69 s after a self-heal on the same job and gave up with ZERO CONTINUEs sent — and
+    never an in-memory list either, which a restart emptied. A new incident is a new log.
 
     ``pull_rule`` — asked when the ladder REACHES the rung: ``None`` pulls it, a sentence
     says why not, and a rung it refuses is skipped, NOT spent (:func:`_release_ladder`).
@@ -613,12 +608,23 @@ def _restart_refusal(incident: RecoveryIncident) -> str | None:
 #   arm at the deadline.
 # * ``ams_control_resume`` — ``ams_control("resume")``: the error dialog's CONTINUE for
 #   ``07008006`` / ``07008005``, its RETRY, and the extruder-switch panel's "Retry".
-#   012-H2S 2026-09-23: echo SUCCESS, re-held in 87 s. Pulled THREE times back to back
-#   (:attr:`LeverSpec.pulls`): a human repeats the Retry, and 011-H2S 2026-09-29 fed on the
-#   second one.
+#   012-H2S 2026-09-23: echo SUCCESS, re-held in 87 s.
 # * ``clean_print_error`` — the dialog's OK / close ("clears whatever error dialog is
 #   currently active"). The FRAME only (``BambuMQTTClient.clean_print_error``): a local
 #   HMS wipe would fake the quiet reading this ladder is judged by. Unmeasured.
+# * ``retry_after_clear`` — ``ams_control("resume")`` again, now with the error dialog
+#   cleared, pulled TWICE back to back (:attr:`LeverSpec.pulls`): the order 011-H2S
+#   2026-09-29 (incident 419) released in — the dialog's Retry (``ams_control_resume``)
+#   re-held, the dialog was cleared (``clean_print_error``), and the next Retry fed slot 3.
+#   That Retry was the operator's, at the touchscreen; whether they pressed Resume or Retry
+#   is indistinguishable in the logs, and both re-run the same feed of slot 3 — the farm's
+#   bare ``print.resume`` had already re-held twice (the first two rungs), so the repeated
+#   verb is the dialog's Retry. The vendor catalog offers exactly that button for the codes
+#   this ladder meets: ``backend/app/data/hms_actions.json`` maps ``07008006`` and
+#   ``07008010`` to CONTINUE (with CHECK_ASSISTANT), and CONTINUE is ``ams_control("resume")``.
+#   Two pulls, because 011 needed one after the clear and the second bounds the grinding at
+#   one more step window. It sits right after ``clean_print_error``, before the verbs with no
+#   vendor call site.
 # * ``ams_control_abort`` — the extruder-switch panel's "Quit"
 #   (``ExtruderSwithingStatus::on_quit``); the catalog maps it for ``07008036`` only, and
 #   its effect on a paused print is undocumented. Unmeasured.
@@ -663,7 +669,7 @@ _LEVERS: dict[Lever, LeverSpec] = {
         publish=lambda client: client.ams_control("resume"),
         pause_on_empty_path=False,
         text="ams_control resume",
-        pulls=3,
+        pulls=1,
         pull_rule=_pull_always,
     ),
     "clean_print_error": LeverSpec(
@@ -671,6 +677,13 @@ _LEVERS: dict[Lever, LeverSpec] = {
         pause_on_empty_path=False,
         text="clean_print_error",
         pulls=1,
+        pull_rule=_pull_always,
+    ),
+    "retry_after_clear": LeverSpec(
+        publish=lambda client: client.ams_control("resume"),
+        pause_on_empty_path=False,
+        text="retry after clear",
+        pulls=2,
         pull_rule=_pull_always,
     ),
     "ams_control_abort": LeverSpec(
@@ -1073,14 +1086,6 @@ class _RecoveryEvidence:
         stop = self.restart_stop
         return stop is not None and any(s.seq < stop.seq for s in self.command_steps)
 
-    @property
-    def restart_owed(self) -> bool:
-        """The restart stop went out and no unload since answered ``complete``: the stalled
-        filament may still be in the tube, and the continuation owes the path its unload.
-        What the startup rearm hands the rule table (``incident_resolution.Context``), so a
-        deploy mid-restart re-enters the continuation instead of closing the row."""
-        return self.restart_stop is not None and not self.restart_unloaded
-
     def exhaustion_reason(self) -> str:
         """The honest escalation reason for running out of candidates/rounds."""
         if self.answer_lost:
@@ -1128,8 +1133,11 @@ class RecoveryIncident:
     # overloaded). A re-jam then keeps the replacement in rotation — the extruder,
     # not the spool, is the common factor, and since 006-H2S 2026-09-21 (incident 289)
     # neither does the JAMMED spool get parked: :func:`_commit_out_of_rotation` is the
-    # one place that rule lives.
-    extruder_side_only: bool
+    # one place that rule lives. None when no mechanical-feed code is in the candidate set
+    # it was built from — a startup re-entry whose wire and recorded codes name none — and
+    # then nothing is parked either: which side faulted is unknown, and a missed stamp heals
+    # forward while a false one is permanent (invariant 11).
+    extruder_side_only: bool | None
     # True when ANY physical-fault candidate is a pull-back the firmware could not
     # finish (``hms_errors`` ``retract_failure``). FROZEN at entry from the candidate
     # set that opened the incident, like every other fact here: the escalation copy is
@@ -1202,7 +1210,7 @@ def _build_incident(
         jammed_global_tray=tray,
         kind=kind,
         external=external,
-        extruder_side_only=bool(mechanical) and all(c.extruder_side for c in mechanical),
+        extruder_side_only=all(c.extruder_side for c in mechanical) if mechanical else None,
         # Read off the PHYSICAL candidates only: the flag answers "is the printer
         # holding a failed pull-back", and only that class can be one. A mechanical
         # sibling standing beside it (006's ``0700_0017``) says nothing about it.
@@ -2057,13 +2065,37 @@ def _feeder_position(state, jammed_global_tray: int | None, printer_id: int | No
 # copy's own last sentence (Retry) is the one action and a "then resume" beside it would
 # contradict it — the ``_retract_clause`` lesson.
 _CLAUSE_WITHOUT_INSTRUCTION: frozenset[str] = frozenset({"wedge_unreleased", "swap_held_after_release"})
-# The reasons that carry no feeder clause at all: the print is over, so where the
-# filament sits is the next job's question, never an instruction about this one. The
-# restart give-ups state the path themselves — the farm stopped the job and knows what
-# its own unload answered — and their exit is not a resume.
-_NO_FEEDER_CLAUSE: frozenset[str] = frozenset(
+# The reasons that are only ever reached after the job ENDED: a release verb ended the print
+# (``wedge_ended_print``), or the restart rung's stop did (the three restart give-ups). The
+# other half of "the job is over" is the step ledger's — any give-up once the restart stop
+# is on it (:func:`_job_ended`).
+_JOB_ENDED_REASONS: frozenset[str] = frozenset(
     {"wedge_ended_print", "restart_unload_failed", "restart_no_candidate", "restart_refaulted"}
 )
+
+# A reason reachable on EITHER side of the job's end has a second copy for the ended side,
+# because its paused copy's instruction ("resume on the printer") names a print that is
+# over. ``printer_offline`` is the one today: the offline bound can be met inside the
+# restart continuation, after the driver's own stop.
+_ENDED_JOB_DETAIL: dict[str, str] = {
+    "printer_offline": (
+        "The printer stopped reporting after the farm stopped the job at layer 0, so the farm could not read "
+        "what the AMS did. The plate is clear and the unit is back in the queue. Check the printer's connection "
+        "and the filament path, then load a slot on the printer or press Recover."
+    ),
+}
+
+
+def _job_ended(reason: str, evidence: _RecoveryEvidence | None) -> bool:
+    """Is this page composed after the job ENDED? DERIVED, from the reason and the step
+    ledger: a reason that is only reached after the end (:data:`_JOB_ENDED_REASONS`), or any
+    give-up once the restart stop is on the ledger (the printer_offline bound met inside the
+    continuation). Such a page says neither "left PAUSED" nor "resume on the printer": it
+    carries no feeder clause (the filament's place is the copy's own, and the next job's
+    question), its reason copy is the ended-side one where there are two
+    (:data:`_ENDED_JOB_DETAIL`), and the notification wrapper is told so
+    (``on_spool_recovery_failed(job_ended=True)``)."""
+    return reason in _JOB_ENDED_REASONS or (evidence is not None and evidence.restart_stop is not None)
 
 
 def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None, *, reason: str) -> str | None:
@@ -2078,11 +2110,10 @@ def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None, *, 
     give-up that unloaded nothing renders nothing about unloading. Runout / physical /
     external kinds get no clause at all (their copy already carries the slot
     instruction, and the swap machine never moved their filament). ``reason`` gates the
-    instruction half (:data:`_CLAUSE_WITHOUT_INSTRUCTION`, :data:`_NO_FEEDER_CLAUSE`),
-    the ``_retract_clause`` pattern — one instruction per page, never two.
+    instruction half (:data:`_CLAUSE_WITHOUT_INSTRUCTION`), the ``_retract_clause`` pattern
+    — one instruction per page, never two. A page composed after the job ended asks for no
+    clause at all (:func:`_job_ended`, :func:`_compose_detail`).
     """
-    if reason in _NO_FEEDER_CLAUSE:
-        return None
     instruct = reason not in _CLAUSE_WITHOUT_INSTRUCTION
     slot = runout_slot_desc(position.global_tray) or f"tray {position.global_tray}"
     if position.kind == "jammed":
@@ -2236,8 +2267,13 @@ def _compose_detail(
     minted by the startup re-entry when the wire has NO actionable fault left — the
     flag is False by construction there, and appending the otherwise-arm printed "and
     resume on the printer. Then resume on the printer." One instruction, once.
+
+    A page composed after the job ENDED (:func:`_job_ended`) takes the ended-side copy of
+    its reason and no feeder clause: every clause instruction ends "resume on the printer",
+    and the print is over.
     """
-    detail = _ESCALATE_DETAIL.get(reason, reason)
+    ended = _job_ended(reason, evidence)
+    detail = (_ENDED_JOB_DETAIL.get(reason) if ended else None) or _ESCALATE_DETAIL.get(reason, reason)
     clauses: list[str] = []
     if incident.is_feed_fault:
         sent = _evidence_sentence(evidence) if evidence is not None else None
@@ -2245,10 +2281,14 @@ def _compose_detail(
         # printer off its session still carries its last session's cached ``tray_now``,
         # and a clause read from it would describe a printer the farm cannot see.
         st = _get_state(incident.printer_id)
-        feeder = _feeder_clause(
-            _feeder_position(st if _reads_live(st) else None, incident.jammed_global_tray, incident.printer_id),
-            restore,
-            reason=reason,
+        feeder = (
+            None
+            if ended
+            else _feeder_clause(
+                _feeder_position(st if _reads_live(st) else None, incident.jammed_global_tray, incident.printer_id),
+                restore,
+                reason=reason,
+            )
         )
         clauses = [clause for clause in (sent, feeder) if clause is not None]
     elif incident.kind == KIND_PHYSICAL and reason == "physical_fault":
@@ -3932,6 +3972,7 @@ async def _close_ended_by_driver(incident: RecoveryIncident, *, evidence: _Recov
                     kind=incident.kind,
                     runout_slot=runout_slot_desc(incident.jammed_global_tray),
                     foreign=incident.item_id is None,
+                    job_ended=_job_ended("wedge_ended_print", evidence),
                 )
             except Exception:  # noqa: BLE001 — notification failure is non-fatal
                 logger.exception("spool_recovery: ended-print notification failed for printer %s", incident.printer_id)
@@ -4045,14 +4086,17 @@ async def _restart(incident: RecoveryIncident, *, evidence: _RecoveryEvidence) -
             spool = await _describe_slot(db, pid, jammed)
     except Exception:  # noqa: BLE001 — the close stands; only its log line's detail is lost
         logger.exception("spool_recovery: restart bookkeeping failed for printer %s", pid)
-    parked = (
-        f"kept spool {spool} in rotation (extruder-side fault)"
-        if incident.extruder_side_only
-        else f"parked spool {spool}"
-    )
+    if incident.extruder_side_only is False:
+        parked = f"parked spool {spool}"
+    elif incident.extruder_side_only:
+        parked = f"kept spool {spool} in rotation (extruder-side fault)"
+    else:
+        parked = f"kept spool {spool} in rotation (the fault's side is unknown)"
+    # The unit's requeue is its terminal's (``farm_policy`` on the restart stop verdict); the
+    # driver states the hand-back it relies on, not a requeue it did not see.
     logger.info(
-        "spool_recovery: printer %s RESTARTED at layer %s — stopped job %s, unloaded tray %s, %s; unit %s requeued "
-        "(replacement tray %s in hand)",
+        "spool_recovery: printer %s RESTARTED at layer %s — stopped job %s, unloaded tray %s, %s; unit %s handed "
+        "back through its terminal (replacement tray %s in hand)",
         pid,
         incident.layer_at_fault,
         incident.job_id or "-",
@@ -4085,40 +4129,28 @@ async def _restart_refault(incident: RecoveryIncident) -> str | None:
     * The UNIT (operator ruling 2026-09-29: once per unit): an ancestor of this plate ended
       with the restart verdict (``requeue.fault_restart_spent``, the lineage walk's owner).
     * The PRINTER — the path, not the spool (013-H2S 2026-09-28: after slot 3 stalled, slot 4
-      stalled in the same tube segment): its last ``driver_restart`` close, with no print
-      COMPLETED on it since. "A print ran through the path" is read from ``print_archives`` —
-      a completed archive on this printer after that close (an eject sweep makes none) —
-      rather than from ``incident_resolution.ledger.path_ran_at``: that sighting is process
-      memory a deploy empties, and a stalled job's own pre-stall RUNNING samples (heating,
-      levelling on a quiet path) qualify as one, so it could never bound a second stall.
+      stalled in the same tube segment): its last ``driver_restart`` close
+      (``printer_incidents.last_closed_by``), with no print COMPLETED on it since
+      (``print_binding.completed_since`` — a completed archive; an eject sweep makes none).
+      Not ``incident_resolution.ledger.path_ran_at``: that sighting is process memory a
+      deploy empties, and a stalled job's own pre-stall RUNNING samples (heating, levelling on
+      a quiet path) qualify as one, so it could never bound a second stall.
     """
     from backend.app.core.database import async_session
-    from backend.app.models.archive import PrintArchive
-    from backend.app.services import requeue
+    from backend.app.services import print_binding, requeue
 
     async with async_session() as db:
         item = await db.get(PrintQueueItem, incident.item_id) if incident.item_id is not None else None
         if item is not None and await requeue.fault_restart_spent(db, item):
             return f"unit {item.id}'s plate was already restarted once"
-        last_restart = await db.scalar(
-            select(PrinterIncident.resolved_at)
-            .where(PrinterIncident.printer_id == incident.printer_id)
-            .where(PrinterIncident.resolve_source == RESOLVE_DRIVER_RESTART)
-            .where(PrinterIncident.id != incident.incident_id)
-            .order_by(PrinterIncident.resolved_at.desc())
-            .limit(1)
-        )
-        if last_restart is None:
+        last_restart = await printer_incidents.last_closed_by(db, incident.printer_id, RESOLVE_DRIVER_RESTART)
+        if last_restart is None or last_restart.resolved_at is None:
             return None
-        completed = await db.scalar(
-            select(PrintArchive.id)
-            .where(PrintArchive.printer_id == incident.printer_id)
-            .where(PrintArchive.status == "completed")
-            .where(PrintArchive.completed_at > last_restart)
-            .limit(1)
-        )
-        if completed is None:
-            return f"no print completed on this printer since its last restart at {last_restart.isoformat()}"
+        if not await print_binding.completed_since(db, incident.printer_id, last_restart.resolved_at):
+            return (
+                f"no print completed on this printer since its last restart (incident {last_restart.id}, "
+                f"{last_restart.resolved_at.isoformat()})"
+            )
     return None
 
 
@@ -4869,6 +4901,18 @@ async def _commit_out_of_rotation(
             incident.code,
         )
         return
+    if incident.extruder_side_only is None:
+        # A re-entered incident whose live wire and recorded codes name no mechanical-feed
+        # fault: which side faulted is unknown, and a false stamp is permanent (invariant 11).
+        logger.info(
+            "spool_recovery: printer %s %s tray %s kept IN rotation — the fault's side is unknown (no "
+            "mechanical-feed code on the wire or on record for %s)",
+            incident.printer_id,
+            role,
+            global_tray,
+            incident.code,
+        )
+        return
     await _mark_out_of_rotation(incident, global_tray)
 
 
@@ -5249,8 +5293,8 @@ async def _hold_the_path(incident: RecoveryIncident) -> None:
 
     try:
         async with async_session() as db:
-            row = await db.get(PrinterIncident, incident.incident_id)
-            if row is None or row.resolved_at is not None or row.kind == KIND_PHYSICAL:
+            row = await printer_incidents.get_open(db, incident.printer_id, kinds=AMS_FAULT_KINDS)
+            if row is None or row.id != incident.incident_id or row.kind == KIND_PHYSICAL:
                 return
             await printer_incidents.upgrade(
                 db,
@@ -5351,6 +5395,7 @@ async def _escalate(
                     kind=incident.kind,
                     runout_slot=slot_hint,
                     foreign=incident.item_id is None,
+                    job_ended=_job_ended(reason, evidence),
                 )
             except Exception:  # noqa: BLE001 — notification failure is non-fatal
                 logger.exception("spool_recovery: failed notification error for printer %s", incident.printer_id)
@@ -5360,12 +5405,11 @@ async def _escalate(
             # ledger row per incident: an upgrade re-escalates a row that may already
             # have paged and been recorded, and the ledger — not a flag — says so.
             await _record_escalation_and_maybe_quarantine(db, incident, reason, opened_at=row.created_at)
-        stopped = evidence is not None and evidence.restart_stop is not None
         logger.warning(
             "spool_recovery: printer %s ESCALATED (%s) — %s",
             incident.printer_id,
             reason,
-            "the job the driver stopped is over; the printer is held" if stopped else "left PAUSED",
+            "the job has ended; the printer is held" if _job_ended(reason, evidence) else "left PAUSED",
         )
         # A HELD runout's escalation IS the durable exhaustion record. The three
         # edge-driven spent lanes hang off `hms_edges` appearance edges, which every
@@ -5917,11 +5961,12 @@ async def rearm_incidents_on_startup() -> int:
                 pid = incident.printer_id
                 live = printer_incidents.driver_live(pid)
                 # The row's step ledger answers the one question the wire cannot: did the
-                # driver STOP this job to restart it, with the unload still owed? A deploy
-                # mid-restart then finds the printer IDLE — "not PAUSE" to the wire cell —
-                # and must re-enter the continuation, not close the row over a loaded tube.
+                # driver STOP this job to restart it? A deploy mid-restart then finds the
+                # printer IDLE — "not PAUSE" to the wire cell — and must re-enter the
+                # continuation, which finishes what the log says is left (the unload, or
+                # only the park and the close), never close the row ``startup_rearm``.
                 try:
-                    restart_owed = (await _RecoveryEvidence.from_row(db, incident.id)).restart_owed
+                    restart_owed = (await _RecoveryEvidence.from_row(db, incident.id)).restart_stop is not None
                 except LookupError:
                     # A ledger the driver cannot read is drift (``_step_of``); it must not
                     # cost every other row its startup verdict.
@@ -5961,6 +6006,41 @@ async def rearm_incidents_on_startup() -> int:
     except Exception:  # noqa: BLE001 — startup hygiene must never block the lifespan
         logger.exception("spool_recovery: startup incident sweep failed")
     return closed
+
+
+@dataclass(frozen=True)
+class _RecordedWire:
+    """The ``hms_errors`` list a row RECORDED at open, in the shape ``live_candidates`` reads."""
+
+    hms_errors: list[HMSError]
+
+
+def _recorded_candidates(full_codes: str | None) -> frozenset[FaultCandidate]:
+    """The fault candidates a row's RECORDED full codes (``printer_incident.hms_full_codes``)
+    classify to, through the one taxonomy (``hms_errors.live_candidates``).
+
+    A startup re-entry meets a wire with no actionable code left — a CONTINUE, or the
+    driver's own stop, emptied it — while the incident's shape (which side faulted, a
+    latched pull-back) is a fact about the fault the row opened on. The firmware's own
+    identifiers were recorded then, so the fault is re-read from them, never re-guessed:
+    a 16-hex ``hms[]`` code is ``attr`` + the 32-bit code word, an 8-hex ``print_error`` code
+    is the word itself (its low 16 bits the error) — the shapes the client records
+    (``BambuMQTTClient`` ``full_code``). An empty set when nothing was recorded or nothing
+    classifies: the caller's fields then speak alone, and no side is claimed
+    (:attr:`RecoveryIncident.extruder_side_only` None — nothing is parked).
+    """
+    entries: list[HMSError] = []
+    for raw in (full_codes or "").split(","):
+        code = raw.strip().upper()
+        if len(code) not in (8, 16):
+            continue
+        try:
+            value = int(code, 16)
+        except ValueError:
+            continue
+        attr, word = (value >> 32, value & 0xFFFFFFFF) if len(code) == 16 else (value, value & 0xFFFF)
+        entries.append(HMSError(code=f"0x{word:x}", attr=attr, module=(attr >> 24) & 0xFF, severity=2, full_code=code))
+    return live_candidates(_RecordedWire(entries))
 
 
 async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asyncio.Task | None:
@@ -6011,16 +6091,20 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                 # process interrupted the continuation. The job is over: its terminal wiped
                 # the HMS list, so the wire has nothing left to re-classify, and its unit is
                 # no longer printing, so none resolves. The ROW's facts are the incident —
-                # its fault, its slot, its unit — and the driver picks the continuation up
-                # from the log (:func:`_drive_recovery`), the unload first if it is owed.
-                candidates = frozenset()
+                # its fault (the codes it recorded, through the taxonomy), its slot, its
+                # unit — and the driver picks the continuation up from the log
+                # (:func:`_drive_recovery`), whatever of it is left.
+                candidates = _recorded_candidates(row.hms_full_codes)
                 kind, external = row.kind, False
                 code, fingerprint = row.code, row.codes
                 tray = row.slot_global_tray
                 job_id, item_id = row.job_id, row.item_id
                 escalate_reason = None
             elif fault_class is None:
-                # No actionable candidate: the row's facts are the evidence left.
+                # No actionable candidate: the row's facts are the evidence left — its
+                # recorded codes through the taxonomy for the fault's shape (which side, a
+                # latched pull-back), its fields for the rest.
+                candidates = _recorded_candidates(row.hms_full_codes)
                 kind, external = row.kind, False
                 code, fingerprint = row.code, row.codes
                 tray = row.slot_global_tray

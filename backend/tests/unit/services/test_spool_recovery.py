@@ -196,8 +196,8 @@ def _make_state(
 def _release_pulls() -> list[str]:
     """Every RELEASE verb, as many times as its budget, in ladder order — what a ladder
     wedged on every pull sends when the restart rung is not pulled (a deposit, or a foreign
-    print). ``ams_control_resume`` (the dialog's Retry) is pulled three times back to back
-    (operator ruling R2, 2026-09-29)."""
+    print). ``retry_after_clear`` — the Retry once the dialog is cleared — is pulled twice
+    back to back (operator ruling R2, 2026-09-29)."""
     return [lever for lever, spec in spool_recovery._LEVERS.items() if not spec.ends_job for _ in range(spec.pulls)]
 
 
@@ -2683,8 +2683,8 @@ async def test_every_verb_wedged_on_an_empty_path_gives_up_unreleased_with_nothi
     assert _escalated_reasons(caplog) == ["wedge_unreleased"]
     assert failed.call_args.kwargs["detail"] == (
         spool_recovery._ESCALATE_DETAIL["wedge_unreleased"]
-        + " Sent: resume: wedged; resume then pause: wedged; ams_control resume ×3: wedged; clean_print_error: "
-        "wedged; ams_control abort: wedged; ams_control reset: wedged; ams_control pause: wedged."
+        + " Sent: resume: wedged; resume then pause: wedged; ams_control resume: wedged; clean_print_error: wedged; retry after clear ×2: wedged; "
+        "ams_control abort: wedged; ams_control reset: wedged; ams_control pause: wedged."
     )
     oor.assert_not_awaited()
     assert state.state == "PAUSE"  # never resumed blind
@@ -2700,7 +2700,7 @@ async def test_each_lever_is_pulled_its_budget_per_incident_and_a_new_incident_h
     nothing and reads ``unreleased``. A new incident on the same job is a new log with
     every lever back — 003-H2S 2026-09-19 04:31 met a second fault 69 s after a self-heal
     and gave up with ZERO CONTINUEs sent on a budget keyed by the job. Each lever is pulled
-    its own budget (the dialog's Retry three times, R2 2026-09-29); the restart rung is not
+    its own budget (the Retry after the clear twice, R2 2026-09-29); the restart rung is not
     pulled for a foreign print, and skipped is not spent."""
     printer = await printer_factory()
     state = _make_state(tray_now=255, ams_status_main=1)
@@ -6066,6 +6066,7 @@ _FRAME: dict[str, tuple] = {
     "ams_control_abort": ("ams_control", "abort"),
     "ams_control_reset": ("ams_control", "reset"),
     "ams_control_pause": ("ams_control", "pause"),
+    "retry_after_clear": ("ams_control", "resume"),
     "print_stop": ("stop",),
 }
 # The verbs whose read is the release table (wedged / released / self_healed …): every rung
@@ -6132,6 +6133,7 @@ class TestTheLeverTable:
             "resume_then_pause",
             "ams_control_resume",
             "clean_print_error",
+            "retry_after_clear",
             "ams_control_abort",
             "ams_control_reset",
             "ams_control_pause",
@@ -6699,10 +6701,10 @@ def _loads(client) -> list[int]:
 
 
 _SEVEN_WEDGED = (
-    "Sent: resume: wedged; resume then pause: wedged; ams_control resume ×3: wedged; clean_print_error: wedged; "
+    "Sent: resume: wedged; resume then pause: wedged; ams_control resume: wedged; clean_print_error: wedged; retry after clear ×2: wedged; "
     "ams_control abort: wedged; ams_control reset: wedged; ams_control pause: wedged."
 )
-_FOUR_WEDGED = "resume: wedged; resume then pause: wedged; ams_control resume ×3: wedged; clean_print_error: wedged"
+_FOUR_WEDGED = "resume: wedged; resume then pause: wedged; ams_control resume: wedged; clean_print_error: wedged"
 
 
 class TestTheLoadedWedge:
@@ -6741,11 +6743,12 @@ class TestTheLoadedWedge:
             "The jammed spool is still loaded (AMS A slot 4)."
         )
         assert "then resume on the printer" not in detail
+        assert failed.call_args.kwargs["job_ended"] is False  # a live pause: the wrapper keeps "left PAUSED"
         assert "wedge_unreleased" in spool_recovery._JAM_QUARANTINE_REASONS  # swap_dropped_wedged's slot
         assert "swap_held_after_release" not in _escalated_reasons(caplog)
         assert any(
-            "levers=resume:wedged,resume_then_pause:wedged,ams_control_resume:wedged,ams_control_resume:wedged,"
-            "ams_control_resume:wedged,clean_print_error:wedged" in r.getMessage()
+            "levers=resume:wedged,resume_then_pause:wedged,ams_control_resume:wedged,clean_print_error:wedged,"
+            "retry_after_clear:wedged,retry_after_clear:wedged" in r.getMessage()
             for r in caplog.records
         )
         oor.assert_not_awaited()
@@ -6782,9 +6785,9 @@ class TestTheLoadedWedge:
             ("lever", "resume", "wedged"),
             ("lever", "resume_then_pause", "wedged"),
             ("lever", "ams_control_resume", "wedged"),
-            ("lever", "ams_control_resume", "wedged"),
-            ("lever", "ams_control_resume", "wedged"),
             ("lever", "clean_print_error", "wedged"),
+            ("lever", "retry_after_clear", "wedged"),
+            ("lever", "retry_after_clear", "wedged"),
             ("lever", "ams_control_abort", "released"),
             ("command", "unload", "complete"),
             ("command", "load", "complete"),
@@ -6836,8 +6839,9 @@ class TestTheLoadedWedge:
         assert not any("verdict=restore_" in m for m in lines)  # it moved nothing: nothing to restore
         detail = failed.call_args.kwargs["detail"]
         assert detail == (
-            f"{spool_recovery._ESCALATE_DETAIL['swap_held_after_release']} Sent: {_FOUR_WEDGED}; ams_control "
-            "abort: released; unload: held. An unload is held in the AMS and runs at the next release; load a slot "
+            f"{spool_recovery._ESCALATE_DETAIL['swap_held_after_release']} Sent: {_FOUR_WEDGED}; retry after "
+            "clear ×2: wedged; ams_control abort: released; unload: held. An unload is held in the AMS and runs at "
+            "the next release; load a slot "
             "when the printer asks for filament. The jammed spool is still loaded (AMS A slot 4)."
         )
         assert detail.count("An unload is held") == 1  # the held command is named in ONE place
@@ -6941,6 +6945,7 @@ class TestTheLoadedWedge:
         assert failed.call_args.kwargs["detail"] == (
             f"A release verb ended the print. Sent: {_FOUR_WEDGED.replace('clean_print_error: wedged', 'clean_print_error: ended')}."
         )
+        assert failed.call_args.kwargs["job_ended"] is True  # the print is over: no "left PAUSED"
         assert [r.reason for r in await _escalation_rows(db_session, printer.id)] == ["wedge_ended_print"]
         quarantine.assert_not_called()
         assert not any(c[0] in ("unload", "load") for c in client.calls)
@@ -8390,9 +8395,11 @@ def test_feeder_clause_table():
         for position in (jammed, empty, _position("other", 1)):
             for restore in (None, "ok", "fail", "skipped_drying"):
                 assert "resume on the printer" not in (clause(position, restore, reason) or "")
-    # wedge_ended_print: the print is over — where the filament sits is no instruction.
-    for position in (jammed, empty, _position("other", 1)):
-        assert clause(position, None, "wedge_ended_print") is None
+    # wedge_ended_print: the print is over — where the filament sits is no instruction. The
+    # gate is the composer's (``_job_ended`` — the reason, or the restart stop on the ledger),
+    # asked once for the clause and the page: TestTheRestartRung pins every ended reason.
+    assert spool_recovery._job_ended("wedge_ended_print", None) is True
+    assert spool_recovery._job_ended("wedge_unreleased", None) is False
 
 
 async def test_a_runout_escalation_carries_no_feeder_clause(db_session, printer_factory, monkeypatch):
@@ -10101,7 +10108,7 @@ class TestTheRestartRung:
         assert any("command=unload" in m and "answer=complete" in m for m in lines)
         assert any(
             f"printer {printer.id} RESTARTED at layer 0 — stopped job task-1, unloaded tray 2, parked spool" in m
-            and f"unit {item.id} requeued" in m
+            and f"unit {item.id} handed back through its terminal" in m
             for m in lines
         )
         db_session.expunge_all()
@@ -10153,13 +10160,15 @@ class TestTheRestartRung:
 
     # ---- C10 (c): 011 #419 — the second Retry feeds, the swap recovers ----------------
 
-    async def test_011_the_second_retry_feeds_and_the_swap_recovers_with_no_stop(
+    async def test_011_the_retry_after_the_clear_feeds_and_the_swap_recovers_with_no_stop(
         self, db_session, printer_factory, monkeypatch
     ):
-        """THE 011 REPLAY (layer 108, `0700_8010` on slot 3, the path EMPTY, `1/6`): both
-        ``print.resume`` spellings and the first Retry re-hold; the SECOND Retry feeds slot 3
-        and the AMS leaves the change (`3/0`, ``tray_now=2``) — ``released``. The swap round
-        then unloads, loads a backup and resumes: RECOVERED by a swap, no stop, no human."""
+        """THE 011 REPLAY (layer 108, `0700_8010` on slot 3, the path EMPTY, `1/6`), in the
+        order 011 released in: both ``print.resume`` spellings and the dialog's Retry re-hold,
+        the dialog is cleared, and the Retry after the clear — ``retry_after_clear``'s FIRST
+        pull, where 011 needed the operator — feeds slot 3: the AMS leaves the change (`3/0`,
+        ``tray_now=2``), ``released``. The swap round unloads, loads the backup (slot 3 → 4)
+        and resumes: RECOVERED by a swap, no stop, no human."""
 
         class _SecondRetryFeeds(FakeClient):
             def ams_control(self, action, *, request_pushall=False):
@@ -10182,6 +10191,9 @@ class TestTheRestartRung:
         await task
 
         assert client.calls.count(("ams_control", "resume")) == 2
+        assert client.calls.index(("clean_print_error",)) < len(client.calls) - client.calls[::-1].index(
+            ("ams_control", "resume")
+        )  # the second Retry went out after the clear
         assert ("stop",) not in client.calls
         (row,) = await _incident_rows(db_session, printer.id)
         assert (row.status, row.resolve_source) == ("resolved", "driver_swap")
@@ -10190,7 +10202,8 @@ class TestTheRestartRung:
             ("lever", "resume", "wedged"),
             ("lever", "resume_then_pause", "wedged"),
             ("lever", "ams_control_resume", "wedged"),
-            ("lever", "ams_control_resume", "released"),
+            ("lever", "clean_print_error", "wedged"),
+            ("lever", "retry_after_clear", "released"),
             ("command", "unload", "complete"),
             ("command", "load", "complete"),
         ]
@@ -10256,10 +10269,12 @@ class TestTheRestartRung:
         detail = failed.call_args.kwargs["detail"]
         assert detail == (
             f"{spool_recovery._ESCALATE_DETAIL['restart_refaulted']} Sent: resume: wedged; resume then pause: "
-            "wedged; ams_control resume ×3: wedged; clean_print_error: wedged; ams_control abort: wedged; "
-            "ams_control reset: wedged; ams_control pause: wedged; print stop: stopped; unload: complete."
+            "wedged; ams_control resume: wedged; clean_print_error: wedged; retry after clear ×2: wedged; "
+            "ams_control abort: wedged; ams_control reset: wedged; ams_control pause: wedged; print stop: stopped; "
+            "unload: complete."
         )
         assert "Left PAUSED" not in detail and "left PAUSED" not in detail
+        assert failed.call_args.kwargs["job_ended"] is True  # the wrapper says "has ended", never PAUSED
         assert [r.reason for r in await _escalation_rows(db_session, printer.id)] == ["restart_refaulted"]
         assert "restart_refaulted" in spool_recovery._JAM_QUARANTINE_REASONS
         oor.assert_not_awaited()
@@ -10482,19 +10497,24 @@ class TestTheRestartRung:
 
     # ---- C1: the Retry's budget, spent from the ledger -----------------------------------
 
-    async def test_the_retry_budget_is_three_and_spent_from_the_ledger(self, db_session, printer_factory):
+    async def test_the_retry_after_clear_budget_is_two_and_spent_from_the_ledger(self, db_session, printer_factory):
         printer = await printer_factory()
         incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05)
         evidence = await _log(db_session, incident.incident_id)
-        assert [spool_recovery._lever(lever).pulls for lever in spool_recovery._LEVERS] == [1, 1, 3, 1, 1, 1, 1, 1]
-        for pulled in range(1, 4):
-            await evidence.note(spool_recovery.LeverStep.draft("ams_control_resume"))
+        assert [spool_recovery._lever(lever).pulls for lever in spool_recovery._LEVERS] == [1, 1, 1, 1, 2, 1, 1, 1, 1]
+        await evidence.note(spool_recovery.LeverStep.draft("ams_control_resume"))
+        assert (await _log(db_session, incident.incident_id)).lever_spent("ams_control_resume") is True
+        for pulled in range(1, 3):
+            await evidence.note(spool_recovery.LeverStep.draft("retry_after_clear"))
             hydrated = await _log(db_session, incident.incident_id)
-            assert hydrated.lever_spent("ams_control_resume") is (pulled == 3)
+            assert hydrated.lever_spent("retry_after_clear") is (pulled == 2)
 
-    async def test_a_restarted_driver_resumes_the_retry_mid_budget(self, db_session, printer_factory, monkeypatch):
-        """A deploy after the FIRST Retry: the re-entered driver pulls neither resume again,
-        pulls the Retry — the second of its three — and that one releases; the swap runs."""
+    async def test_a_restarted_driver_resumes_the_retry_after_clear_mid_budget(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """A deploy after the FIRST Retry after the clear: the re-entered driver pulls none of
+        the rungs before it again, pulls ``retry_after_clear`` — the second of its two — and
+        that one releases; the swap runs."""
         printer = await printer_factory()
         await _bind_spool(db_session, printer.id, 0, 0)
         _spy(monkeypatch, "on_spool_out_of_rotation")
@@ -10507,7 +10527,8 @@ class TestTheRestartRung:
             code="0700_8010",
             codes="mechanical_feed:0700_8010",
         )
-        for seq, lever in enumerate(("resume", "resume_then_pause", "ams_control_resume"), start=1):
+        pulled = ("resume", "resume_then_pause", "ams_control_resume", "clean_print_error", "retry_after_clear")
+        for seq, lever in enumerate(pulled, start=1):
             await printer_incidents.note_step(db_session, row.id, seq=seq, kind="lever", name=lever)
             await printer_incidents.answer_step(db_session, row.id, seq, outcome="wedged")
         state = _make_state(tray_now=0, ams_status_main=1, trays=[_ams_tray(0), _ams_tray(1)])
@@ -10518,27 +10539,39 @@ class TestTheRestartRung:
         await printer_incidents._drivers[printer.id]  # noqa: SLF001 — the re-entered driver
 
         assert client.calls[0] == ("ams_control", "resume")
+        assert ("clean_print_error",) not in client.calls
         steps = await printer_incidents.steps_of(db_session, row.id)
-        assert [(s.seq, s.name, s.outcome) for s in steps][:5] == [
+        assert [(s.seq, s.name, s.outcome) for s in steps][:7] == [
             (1, "resume", "wedged"),
             (2, "resume_then_pause", "wedged"),
             (3, "ams_control_resume", "wedged"),
-            (4, "ams_control_resume", "released"),
-            (5, "unload", "complete"),
+            (4, "clean_print_error", "wedged"),
+            (5, "retry_after_clear", "wedged"),
+            (6, "retry_after_clear", "released"),
+            (7, "unload", "complete"),
         ]
 
     # ---- C8: a deploy mid-restart re-enters the continuation --------------------------
 
-    async def _stopped_row(self, db, printer_id, item_id, *, unloaded: bool):
-        row = await _seed_incident(
+    async def _stopped_row(self, db, printer_id, item_id, *, unloaded: bool, full_codes=None):
+        """A row a restart left mid-continuation: every release pull wedged, the stop sent,
+        and — ``unloaded`` — the unload after it answered ``complete``. ``full_codes`` are the
+        firmware codes it recorded at open (default: 013's, both mechanical, not extruder-side)."""
+        row = await printer_incidents.open_new(
             db,
-            printer_id,
-            kind="jam",
-            status="recovering",
+            printer_id=printer_id,
+            job_id="task-1",
             item_id=item_id,
+            kind="jam",
             code="0700_8006",
             codes="mechanical_feed:0700_0019@0-2,mechanical_feed:0700_8006",
             slot_global_tray=2,
+            hms_full_codes=(
+                full_codes
+                if full_codes is not None
+                else [_tube_0019_hms(0, 2).full_code, _feed_into_extruder_hms().full_code]
+            ),
+            status="recovering",
         )
         seq = 0
         for _kind, lever, outcome in _wedged_then_stopped():
@@ -10579,24 +10612,79 @@ class TestTheRestartRung:
         db_session.expunge_all()
         assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None
 
-    async def test_a_restart_whose_unload_completed_is_not_owed_to_the_continuation(
-        self, db_session, printer_factory, monkeypatch
+    async def test_a_deploy_after_the_unload_completed_re_enters_to_park_and_close(
+        self, db_session, printer_factory, monkeypatch, caplog
     ):
-        """The contract's scope: only a row whose unload is still OWED stands at startup. One
-        whose unload after the stop answered ``complete`` has an empty path, and the wire
-        cell closes it ``startup_rearm`` as before."""
+        """A deploy after the unload answered ``complete`` but before the park and the close:
+        the continuation is still owed (the row is open and the stop is on its ledger), so the
+        rearm re-enters it — the unload is not sent again (``restart_unloaded``), the jammed
+        spool is parked and the row closes ``driver_restart``, never ``startup_rearm``."""
         printer = await printer_factory()
-        item, _jammed, _backup = await _restart_setup(db_session, printer.id)
+        item, jammed, _backup = await _restart_setup(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
         row = await self._stopped_row(db_session, printer.id, item.id, unloaded=True)
         state, client = _wedge_013()
         state.state, state.ams_status_main, state.hms_errors, state.tray_now = "IDLE", 0, [], 255
         _wire(monkeypatch, state, client)
 
-        await spool_recovery.rearm_incidents_on_startup()
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            await spool_recovery.rearm_incidents_on_startup()
+            await printer_incidents._drivers[printer.id]  # noqa: SLF001 — the re-entered driver
 
         (closed,) = await _incident_rows(db_session, printer.id)
-        assert (closed.id, closed.status, closed.resolve_source) == (row.id, "resolved", "startup_rearm")
-        assert client.calls == []
+        assert (closed.id, closed.status, closed.resolve_source) == (row.id, "resolved", "driver_restart")
+        assert not any(c[0] in ("stop", "unload", "load") for c in client.calls)
+        assert not any("startup_rearm" in r.getMessage() for r in caplog.records)
+        db_session.expunge_all()
+        assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None
+
+    @pytest.mark.parametrize(
+        "full_codes,line",
+        [
+            ([], "the fault's side is unknown"),
+            (["0300801E"], "extruder-side fault"),
+        ],
+        ids=["nothing_recorded", "extruder_side_recorded"],
+    )
+    async def test_re_entry_derives_the_fault_side_from_the_recorded_codes_and_never_parks_blind(
+        self, db_session, printer_factory, monkeypatch, caplog, full_codes, line
+    ):
+        """After the stop the wire names no fault, so a re-entered driver reads the fault's side
+        from the codes the row RECORDED, through the taxonomy. A recorded extruder-side fault
+        (``0300_801E``) parks nothing, as at entry; with nothing to derive it from, nothing is
+        parked either — a missed stamp heals forward, a false one is permanent (invariant 11).
+        The restart still closes."""
+        printer = await printer_factory()
+        item, jammed, _backup = await _restart_setup(db_session, printer.id)
+        oor = _spy(monkeypatch, "on_spool_out_of_rotation")
+        row = await self._stopped_row(db_session, printer.id, item.id, unloaded=True, full_codes=full_codes)
+        state, client = _wedge_013()
+        state.state, state.ams_status_main, state.hms_errors, state.tray_now = "IDLE", 0, [], 255
+        _wire(monkeypatch, state, client)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            await spool_recovery.rearm_incidents_on_startup()
+            await printer_incidents._drivers[printer.id]  # noqa: SLF001 — the re-entered driver
+
+        (closed,) = await _incident_rows(db_session, printer.id)
+        assert (closed.id, closed.resolve_source) == (row.id, "driver_restart")
+        oor.assert_not_awaited()
+        assert any("kept IN rotation" in r.getMessage() and line in r.getMessage() for r in caplog.records)
+        db_session.expunge_all()
+        assert (await db_session.get(Spool, jammed.id)).feed_fault_at is None
+
+    def test_the_recorded_codes_classify_through_the_taxonomy(self):
+        from backend.app.services.hms_errors import AmsFaultClass
+
+        recorded = spool_recovery._recorded_candidates(
+            ",".join([_tube_0019_hms(0, 2).full_code, _feed_into_extruder_hms().full_code, "0300801E", "zz", ""])
+        )
+        by_code = {c.short_code: c for c in recorded}
+        assert set(by_code) == {"0700_0019", "0700_8006", "0300_801E"}
+        assert by_code["0700_0019"].slot == (0, 2)  # the hms[] lane keeps its attr
+        assert {c.fault_class for c in recorded} == {AmsFaultClass.MECHANICAL_FEED}
+        assert [c.short_code for c in recorded if c.extruder_side] == ["0300_801E"]
+        assert spool_recovery._recorded_candidates(None) == frozenset()
 
     # ---- the evidence log's restart projections ---------------------------------------
 
@@ -10605,7 +10693,7 @@ class TestTheRestartRung:
         incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05)
         evidence = await _log(db_session, incident.incident_id)
         await _logged_command(evidence, "unload", "complete")  # a swap round before the stop
-        assert (evidence.restart_stop, evidence.restart_owed, evidence.committed_before_restart) == (
+        assert (evidence.restart_stop, evidence.restart_unloaded, evidence.committed_before_restart) == (
             None,
             False,
             False,
@@ -10614,9 +10702,48 @@ class TestTheRestartRung:
         seq = await evidence.note(spool_recovery.LeverStep.draft(printer_incidents.FAULT_RESTART_STEP))
         await evidence.answer(seq, "stopped", moved=True)
         assert evidence.restart_stop is not None and evidence.restart_stop.seq == seq
-        assert evidence.restart_owed is True  # the earlier unload preceded the stop
+        assert evidence.restart_unloaded is False  # the earlier unload preceded the stop
         assert evidence.committed_before_restart is True
 
         await _logged_command(evidence, "unload", "complete")
         hydrated = await _log(db_session, incident.incident_id)
-        assert (hydrated.restart_unloaded, hydrated.restart_owed) == (True, False)
+        assert (hydrated.restart_stop is not None, hydrated.restart_unloaded) == (True, True)
+
+    @pytest.mark.parametrize("reason", sorted(spool_recovery._JOB_ENDED_REASONS))
+    async def test_a_page_composed_after_the_job_ended_names_no_pause_and_no_resume(
+        self, db_session, printer_factory, monkeypatch, reason
+    ):
+        """D3: every reason only reached after the job ENDED composes a page with no "PAUSED"
+        and no "resume on the printer" — no feeder clause, whatever the wire shows."""
+        printer = await printer_factory()
+        state = _make_state(tray_now=2, ams_status_main=0, hms=[])
+        _wire(monkeypatch, state, FakeClient(state))
+        incident = replace(await _owned_incident(db_session, printer.id, step_timeout_s=0.05), jammed_global_tray=2)
+        evidence = await _log(db_session, incident.incident_id)
+
+        assert spool_recovery._job_ended(reason, evidence) is True
+        detail = spool_recovery._compose_detail(incident, reason, restore=None, evidence=evidence)
+        assert "paused" not in detail.lower() and "resume on the printer" not in detail.lower(), detail
+
+    async def test_the_offline_bound_after_the_stop_pages_the_ended_copy(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """``printer_offline`` is reachable on both sides of the job's end; the step ledger
+        decides which copy it takes. Before the stop: the paused copy, feeder clause and all.
+        After it: the ended copy, no clause."""
+        printer = await printer_factory()
+        state = _make_state(tray_now=2, ams_status_main=0, hms=[])
+        _wire(monkeypatch, state, FakeClient(state))
+        incident = replace(await _owned_incident(db_session, printer.id, step_timeout_s=0.05), jammed_global_tray=2)
+        evidence = await _log(db_session, incident.incident_id)
+
+        paused = spool_recovery._compose_detail(incident, "printer_offline", restore=None, evidence=evidence)
+        assert spool_recovery._job_ended("printer_offline", evidence) is False
+        assert paused.startswith(spool_recovery._ESCALATE_DETAIL["printer_offline"])
+        assert "resume on the printer" in paused
+
+        seq = await evidence.note(spool_recovery.LeverStep.draft(printer_incidents.FAULT_RESTART_STEP))
+        await evidence.answer(seq, "stopped", moved=True)
+        ended = spool_recovery._compose_detail(incident, "printer_offline", restore=None, evidence=evidence)
+        assert spool_recovery._job_ended("printer_offline", evidence) is True
+        assert ended == f"{spool_recovery._ENDED_JOB_DETAIL['printer_offline']} Sent: print stop: stopped."

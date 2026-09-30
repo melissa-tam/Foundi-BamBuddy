@@ -1460,6 +1460,26 @@ class TestRecoveryDriverOwnership:
         ]
         assert len(reads) == 1, "the restart rung reads DepositEvidence.live(...).deposited once"
 
+    def test_the_restart_bounds_read_their_owners(self):
+        """The printer bound's two facts are their owners' reads — the last ``driver_restart``
+        close (``printer_incidents.last_closed_by``) and a completed print since
+        (``print_binding.completed_since``) — so the driver names no archive table and
+        selects no incident row of its own."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
+        strays = [
+            f"  - spool_recovery:{node.lineno}"
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Name) and node.id == "PrintArchive")
+            or (
+                isinstance(node, ast.Call)
+                and _called(node.func) == (None, "select")
+                and any(isinstance(arg, ast.Name) and arg.id == "PrinterIncident" for arg in ast.walk(node))
+            )
+        ]
+        assert not strays, "The driver reads another owner's table:\n" + "\n".join(strays)
+        calls = {_called(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        assert {("printer_incidents", "last_closed_by"), ("print_binding", "completed_since")} <= calls
+
 
 # --- The deposit predicate and the lineage walk keep their one owner each --------------
 
