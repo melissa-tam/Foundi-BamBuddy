@@ -201,6 +201,7 @@ from backend.app.services.hms_errors import (
     power_loss_prompt_standing,
 )
 from backend.app.services.incident_resolution import (
+    _JOB_OVER_STATES,
     _REPAIR_EVIDENCE_LOAD,
     Context,
     TerminalEvent,
@@ -3181,10 +3182,10 @@ async def _await_live_state(incident: RecoveryIncident, states: frozenset[str], 
 # itself (``ended``) — unless the operator's Stop mark says the terminal was theirs.
 _DRIVER_STATES: tuple[str, ...] = ("PAUSE", "RUNNING")
 
-# The live states in which the printer holds NO job — what the restart continuation
-# (:func:`_restart`) works in once the driver's own stop has ended the job. Anything else
-# (a job preparing, running or paused) on that printer is somebody else's.
-_JOB_OVER_STATES: tuple[str, ...] = ("FAILED", "IDLE", "FINISH")
+# The live states in which the printer positively holds NO job — the rule table's own set
+# (``incident_resolution._JOB_OVER_STATES``, imported above) is what the restart
+# continuation (:func:`_restart`) works in once the driver's own stop has ended the job;
+# anything else (a job preparing, running or paused) on that printer is somebody else's.
 
 
 TakeoverToken = Literal[
