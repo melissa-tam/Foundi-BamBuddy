@@ -831,6 +831,19 @@ class _PlateCheckLadder(_PlateCheckJourney):
             stack.enter_context(patch.object(pause_recovery, name, value))
 
     @staticmethod
+    def _hold_clock(stack, clock):
+        """The plate authority's hold clock (``plate_occupancy._now_mono``), steered by the test.
+
+        The held-bed lift is a CLAIMED bed motion: from the send until its motion time has
+        passed, ``dispatchable`` refuses the printer (``bed_motion_in_flight``). The journeys
+        record ``farm_policy``'s post-lift wait instead of sleeping it, so the window's lapse is
+        modelled on this clock — never by releasing the claim by hand."""
+        from backend.app.services import plate_occupancy as po
+
+        stack.enter_context(patch.object(po, "_now_mono", clock))
+        return clock
+
+    @staticmethod
     async def _episode_done(printer_id):
         """Await the episode driver the sampler spawned, to its end."""
         import backend.app.core.tasks as core_tasks
@@ -924,6 +937,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
 
             assert wire.presses == [("0500808C", "PROBLEM_SOLVED_RESUME", "SUB-1")]
             assert wire.stops == []
+            wire.client.send_gcode.assert_not_called()  # the lift belongs to a terminal; none came
             page.assert_not_awaited()
             row = await self._episode_row(mocks.maker, printer_id, "SUB-1")
             assert (row.resolve_source, printer_incidents.outcome_of(row)) == ("recheck_passed", "auto_recovered")
@@ -935,13 +949,14 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             assert _occupancy().is_plate_occupied(printer_id) is False
 
     @pytest.mark.asyncio
-    async def test_ii_the_recheck_fails_the_farm_stops_and_retries_the_same_print(self, test_engine):
+    async def test_ii_the_recheck_fails_the_farm_stops_and_retries_the_same_print(self, test_engine, clock):
         from contextlib import ExitStack
 
         from backend.app.models.print_batch import PrintBatch
         from backend.app.models.print_queue import PrintQueueItem
         from backend.app.services import farm_policy, printer_incidents
         from backend.app.services.notification_service import notification_service
+        from backend.app.services.plate_occupancy import Evidence
 
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
@@ -958,6 +973,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             ).install(stack)
             page = stack.enter_context(patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock))
             waits = self._record_lift_waits(stack)
+            self._hold_clock(stack, clock)
             self._fast_ladder(stack)
 
             await self._failed_episode(printer_id, wire, "SUB-2", tasks_before)
@@ -981,9 +997,15 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             wire.client.send_gcode.assert_called_once()
             assert "G380 S2 Z-12.0" in wire.client.send_gcode.call_args.args[0]
             assert waits == [pytest.approx((farm_policy.VISION_HOLD_PROBE_MM + 12.0) / (1200 / 60))]
+            # ...and it is a CLAIMED motion: the retry cannot be released onto the printer until
+            # the lift's own motion time has passed.
+            idle = Evidence(live_state="IDLE")
+            assert _occupancy().dispatchable(printer_id, idle) == "bed_motion_in_flight"
+            clock.advance(waits[0] + 0.01)
+            assert _occupancy().dispatchable(printer_id, idle) is None
 
     @pytest.mark.asyncio
-    async def test_iii_the_retrys_own_failed_recheck_refuses_the_plate(self, test_engine):
+    async def test_iii_the_retrys_own_failed_recheck_refuses_the_plate(self, test_engine, clock):
         """A second failed episode on this printer inside the window: the plate is a human's —
         a refusal gate in the printer's words, the bed lifted, the unit requeued."""
         from contextlib import ExitStack
@@ -992,7 +1014,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
         from backend.app.models.print_queue import PrintQueueItem
         from backend.app.services import printer_incidents
         from backend.app.services.notification_service import notification_service
-        from backend.app.services.plate_occupancy import EscalationOnly
+        from backend.app.services.plate_occupancy import EscalationOnly, Evidence
 
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
@@ -1001,11 +1023,19 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             wire = _LadderWire(self._paused("SUB-3"), ack="fail").install(stack)  # refused: straight to the stop
             stack.enter_context(patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock))
             waits = self._record_lift_waits(stack)
+            self._hold_clock(stack, clock)
             self._fast_ladder(stack)
 
             await self._failed_episode(printer_id, wire, "SUB-3", tasks_before)
             (retry,) = await self._requeues(mocks.maker, item_id)
             assert _occupancy().is_plate_occupied(printer_id) is False  # the first stop retried
+
+            # The scheduler can dispatch the retry only once the first lift's claimed motion
+            # window has lapsed (``dispatchable`` refuses ``bed_motion_in_flight`` inside it).
+            idle = Evidence(live_state="IDLE")
+            assert _occupancy().dispatchable(printer_id, idle) == "bed_motion_in_flight"
+            clock.advance(waits[0] + 0.01)
+            assert _occupancy().dispatchable(printer_id, idle) is None
 
             # The retry is dispatched back onto the same printer, and trips again.
             async with mocks.maker() as s:
@@ -1099,6 +1129,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             row = await self._episode_row(mocks.maker, printer_id, "SUB-5")
             assert (row.status, row.resolved_at) == ("escalated", None)
             assert await self._ledger(mocks.maker, row.id) == [("dialog", "fail"), ("stop", "not_taken")]
+            wire.client.send_gcode.assert_not_called()  # the job never ended: no terminal, no lift
             page.assert_awaited_once()
             detail = page.await_args.kwargs["source_detail"]
             assert detail.startswith("The printer reported: ")
