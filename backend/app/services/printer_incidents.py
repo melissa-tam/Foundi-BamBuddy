@@ -355,6 +355,31 @@ def waiting_reason_for(kind: str, *, external: bool = False) -> str:
     return _WAITING_REASON_BY_KIND[kind]
 
 
+async def clear_hold_projection(db: AsyncSession, item_id: int | None) -> bool:
+    """Drop an incident's ``waiting_reason`` projection from a farm unit. True when it cleared one.
+
+    Only the tokens an incident owns (:data:`RECOVERY_WAITING_REASONS`): a unit waiting for
+    something else — a filament deficit, a stagger — keeps its own reason, because an
+    incident closing says nothing about those. ``None`` (a foreign print's hold) clears
+    nothing. Commits.
+
+    The ONE clear, beside the table it reads: every lane that closes an incident whose hold
+    projected onto a unit — ``spool_recovery``'s closers and the plate-check episode driver
+    (``pause_recovery``) — clears through here. It moved from ``spool_recovery`` on
+    2026-09-29 when the episode driver became its second caller.
+    """
+    if item_id is None:
+        return False
+    from backend.app.models.print_queue import PrintQueueItem
+
+    item = await db.get(PrintQueueItem, item_id)
+    if item is None or item.waiting_reason not in RECOVERY_WAITING_REASONS:
+        return False
+    item.waiting_reason = None
+    await db.commit()
+    return True
+
+
 def _reset_state() -> None:
     """Test hook: drop the projection cache AND the driver liveness slots between cases.
 
@@ -626,7 +651,7 @@ def cached_kind(printer_id: int, incident_id: int) -> str | None:
 # --- driver liveness (2026-09-23) ---------------------------------------------------
 
 
-def register_driver(printer_id: int, task: asyncio.Task[object], *, incident_id: int) -> None:
+def register_driver(printer_id: int, task: asyncio.Task[object], *, incident_id: int | None) -> None:
     """Take this printer's liveness slot for a freshly spawned recovery driver.
 
     For the AMS recovery driver it is OBSERVABILITY, not a gate: entry exclusivity stays
@@ -640,6 +665,14 @@ def register_driver(printer_id: int, task: asyncio.Task[object], *, incident_id:
     ``recovering`` ``job_pause`` row is owned only while a driver is live
     (``incident_resolution.driver_owns``). It stays one slot per printer for both lanes.
 
+    ``incident_id`` is ``None`` when the driver registers at its SPAWN, before its row
+    exists — the plate-check trip: the ~1 Hz sampler spawns the task and registers it in the
+    same synchronous stretch, so the next status push already reads it live and cannot spawn
+    a second driver while the first one is still opening its row (a task runs nothing until
+    the loop next turns). The registry stores no id — it is liveness, not ownership — so
+    there is nothing to bind once the row opens: the id serves only the violation line
+    below, and the driver's own log lines name its row from the moment it opens.
+
     Either way a driver spawning over a LIVE one means a closer freed the open row from
     under that one, so if it ever happens it must be one grep away: 006-H2S 17:23:55
     (2026-09-04) produced no line at all, and the single line naming the moment is the
@@ -650,7 +683,7 @@ def register_driver(printer_id: int, task: asyncio.Task[object], *, incident_id:
         logger.warning(
             "printer_incidents: printer %s: spawning a recovery driver while one is live — invariant violated (%s)",
             printer_id,
-            f"incident {incident_id} spawned over a live driver",
+            f"incident {incident_id if incident_id is not None else '(not yet opened)'} spawned over a live driver",
         )
     _drivers[printer_id] = task
 

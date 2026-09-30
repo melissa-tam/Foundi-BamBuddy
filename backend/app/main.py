@@ -94,7 +94,6 @@ from backend.app.services.bambu_mqtt import PrinterState
 from backend.app.services.fleet_activity import fleet_activity_recorder
 from backend.app.services.foreign_archive import locate_3mf_for_print, maybe_schedule_foreign_3mf_retry
 from backend.app.services.github_backup import github_backup_service
-from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
 from backend.app.services.homeassistant import homeassistant_service
 from backend.app.services.library_integrity import library_integrity_service
 from backend.app.services.library_trash import library_trash_service
@@ -1117,30 +1116,6 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
             )
 
-        # Native plate-occupancy capture. The H2-series pre-print plate
-        # check surfaces as an HMS code and PAUSEs the job on the printer. The reaction
-        # is the pause-recovery lane's: it records a ``job_pause`` hold (the chip, the
-        # unit's waiting reason, one page in the printer's own words) and sends NOTHING —
-        # the print stays paused with the printer's message on its screen for the human
-        # who fixes the plate and resumes (user ruling 2026-09-24).
-        #
-        # Fire-and-forget, not awaited: the lane opens a row and pages, and the ~1 Hz
-        # status flow must not wait on either. Strong-referenced (spawn_background_task)
-        # for the same reason the runout hook above is — a weakly-held task can vanish
-        # mid-await with no traceback.
-        _new_occupancy = edges.appeared_short & PLATE_CHECK_HMS_CODES
-        if _new_occupancy:
-            try:
-                from backend.app.services.pause_recovery import on_plate_vision_trip
-
-                spawn_background_task(
-                    on_plate_vision_trip(printer_id, set(_new_occupancy)), name=f"plate-vision-p{printer_id}"
-                )
-            except Exception as _pe:  # noqa: BLE001 — capture must never crash the status flow
-                logging.getLogger(__name__).warning(
-                    "[PLATE-VISION] native plate-occupancy capture failed for printer %s: %s", printer_id, _pe
-                )
-
         # USB storage-low capture. When an HMS "USB full" code APPEARS, the farm
         # auto-cleans the drive (recordings first, then oldest unused print files) and
         # fires the dedicated on_storage_low notification with the outcome.
@@ -1211,20 +1186,22 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             "[SPOOL-RECOVERY] incident wire sampler failed for printer %s: %s", printer_id, _dwe
         )
 
-    # Power-loss prompt sampler (2026-09-04 fleet outage). Same shape and the same
-    # placement rationale as the sampler above: sync, in-memory, session-free, and
-    # OUTSIDE the "HMS present" branch because one of the two edges it derives — a
-    # RECONNECT — arrives on pushes that carry no HMS at all. It spawns at most one
-    # recovery driver per printer while the firmware's own recovery prompt stands, and
-    # arms the lost-Z-reference hold for a printer that came back from a FLEET outage
-    # with a part still on its plate.
+    # Pause-recovery sampler (the 2026-09-04 fleet outage; the plate-check ladder,
+    # 2026-09-29). Same shape and the same placement rationale as the sampler above:
+    # sync, in-memory, session-free, and OUTSIDE the "HMS present" branch because what it
+    # reads — a RECONNECT, the printer's current ``print_error`` dialog — arrives on
+    # pushes that carry no HMS at all. It is the ONLY trigger of both pause causes: at
+    # most one power-loss driver per printer while the firmware's own recovery prompt
+    # stands, the plate-check episode driver on a plate-check pause (or its re-entry after
+    # a restart), and the lost-Z-reference hold for a printer that came back from a FLEET
+    # outage with a part still on its plate.
     try:
         from backend.app.services.pause_recovery import note_status_push
 
         note_status_push(printer_id, state)
     except Exception as _ple:  # noqa: BLE001 — sampling must never crash the status flow
         logging.getLogger(__name__).warning(
-            "[PAUSE-RECOVERY] power-loss sampler failed for printer %s: %s", printer_id, _ple
+            "[PAUSE-RECOVERY] pause-recovery sampler failed for printer %s: %s", printer_id, _ple
         )
 
     # Restart-replay HMS suppression (Phase D). Same one-shot shape as the runout

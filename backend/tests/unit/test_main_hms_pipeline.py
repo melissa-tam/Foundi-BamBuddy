@@ -830,10 +830,11 @@ class TestAutoSwitchNotificationSuppression:
 # standing at restart as already-seen. Right for paging a human, wrong for a state
 # decision. They now ride the wire-HMS APPEARANCE edge instead; these pin that the
 # switch actually happens — an edge fires them even when notify_dedup calls the code
-# stale, which is exactly the shape that was silently dropping them.
+# stale, which is exactly the shape that was silently dropping them. (The plate check
+# rode this edge too until 2026-09-29; its only trigger is now the pause sampler.)
 
-# A native plate-occupancy code (H2-series pre-print vision check), and the USB
-# storage-low code — the two membership-tested consumers.
+# A native plate-occupancy code (H2-series pre-print vision check) as it merges onto the
+# HMS list, and the USB storage-low code — the membership-tested consumers.
 _PLATE_OCCUPANCY = _err(code="0x808C", attr=0x05000000, module=0x05, full_code="050000000000808C")
 _STORAGE_LOW = _err(code="0x30004", attr=0x05000100, module=0x05, full_code="0500010000030004")
 
@@ -854,23 +855,23 @@ async def _stale_then_reappear(printer_id: int, err: SimpleNamespace) -> None:
 
 @pytest.mark.asyncio
 class TestMovedConsumersRideTheAppearanceEdge:
-    async def test_plate_occupancy_fires_on_an_edge_notify_dedup_calls_stale(self):
-        # The vision edge drives ``pause_recovery.on_plate_vision_trip`` (the lane that
-        # records the job-pause hold and pages in the printer's words — it sends the
-        # printer nothing); ``on_native_plate_detection`` is deleted. It is SPAWNED
-        # rather than awaited — the lane opens a row and pages, and the ~1 Hz status flow
-        # must not wait on either.
+    async def test_a_plate_check_code_appearing_spawns_nothing_its_trigger_is_the_sampler(self):
+        """The plate-check episode's ONLY trigger is ``pause_recovery.note_status_push`` (the
+        pause sampler, reading ``print_error``): the HMS-edge spawn is deleted (2026-09-29). A
+        plate code APPEARING on the HMS list spawns no task of its own, and every push — that
+        one included — still reaches the sampler with the live state."""
         with (
             _Harness() as h,
-            patch("backend.app.services.pause_recovery.on_plate_vision_trip", new=AsyncMock()) as plate_hook,
+            patch("backend.app.services.pause_recovery.note_status_push") as sampler,
         ):
             await _stale_then_reappear(5, _PLATE_OCCUPANCY)
-            await asyncio.sleep(0)  # let the fire-and-forget task run
+            await _drain_tasks()
 
-        plate_hook.assert_awaited_once()
-        assert plate_hook.await_args.args == (5, {"0500_808C"})
-        # ...and the alert lane genuinely considered the code stale on that push.
-        h.notify.on_printer_error.assert_not_awaited()
+        assert not [name for name in h.spawned if "plate" in name]
+        assert sampler.call_count == 2  # the seeding frame and the appearance frame
+        (printer_id, state), _ = sampler.call_args
+        assert printer_id == 5
+        assert [err.full_code for err in state.hms_errors] == [_PLATE_OCCUPANCY.full_code]
 
     async def test_storage_low_fires_on_an_edge_notify_dedup_calls_stale(self):
         with (

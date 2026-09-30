@@ -1419,12 +1419,15 @@ class TestPlateCheckVocabulary:
         assert expected == PLATE_CHECK_HMS_CODES
 
     def test_the_retired_literal_is_gone_and_every_reader_holds_the_one_set(self):
+        """The readers are the pause lane (``plate_check_paused``, beside the set) and the failure
+        category. ``main``'s HMS-edge spawn — the set's third reader — is deleted (2026-09-29):
+        the plate-check episode's only trigger is the pause sampler."""
         from backend.app import main
         from backend.app.services import bambu_mqtt, terminal_outcome
         from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
 
         assert not hasattr(bambu_mqtt, "_HMS_PLATE_OCCUPANCY_CODES")
-        assert main.PLATE_CHECK_HMS_CODES is PLATE_CHECK_HMS_CODES
+        assert not hasattr(main, "PLATE_CHECK_HMS_CODES")
         assert terminal_outcome.PLATE_CHECK_HMS_CODES is PLATE_CHECK_HMS_CODES
         # The failure category still names every member.
         for code in PLATE_CHECK_HMS_CODES:
@@ -1442,6 +1445,18 @@ class TestPlateCheckVocabulary:
         # The print_error-lane shape the parser stores: attr = the whole 32-bit word.
         entry = HMSError(code="0x808c", attr=0x0500808C, module=5, severity=3, full_code="0500808C")
         assert live_candidates(SimpleNamespace(hms_errors=[entry])) == frozenset()
+
+    @pytest.mark.parametrize(
+        ("print_error", "dialog"),
+        [(0x0500808C, 0x0500808C), (0x03008007, 0x03008007), (0x0300400D, 0x0300400D), (0x00000002, 0), (0, 0)],
+        ids=["plate-check", "power-loss-prompt", "fatal", "status-phase-word", "none"],
+    )
+    def test_print_error_dialog_reads_status_words_as_no_dialog(self, print_error, dialog):
+        """A low half below 0x4000 is a status / phase word, not a dialog — the one reading of that
+        threshold, shared by the MQTT merge and the pause lane's "another dialog" hand-over."""
+        from backend.app.services.hms_errors import print_error_dialog
+
+        assert print_error_dialog(print_error) == dialog
 
     @pytest.mark.parametrize(
         ("print_error", "short"),

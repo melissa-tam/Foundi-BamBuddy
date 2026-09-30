@@ -2,14 +2,20 @@
 
 Two causes live here, and the split of duties is the same for both.
 
-**What this module owns.** DETECTION (a per-push wire sampler), the HOLD RECORD
-(a ``printer_incident`` row — never a process dict) and the DECISION: *answer the
-prompt*, *hold for a human*, or *stand aside*. Nothing else. Everything that happens
-AFTER a terminal — the terminal's classification, the plate gate, the requeue, the
-held-bed lift — belongs to ``terminal_outcome`` / the plate authority /
-``farm_policy.on_terminal``, which already own run/retry/quarantine and the one
-post-terminal motion. This lane never awaits a terminal it does not own, never stops a
-print and never imports ``main``.
+**What this module owns.** DETECTION (a per-push wire sampler, :func:`note_status_push`
+— the ONLY trigger of both causes), the RECORD (a ``printer_incident`` row — never a
+process dict — plus, for a plate-check episode, its step ledger) and the DECISION:
+*answer the prompt*, *hold for a human*, or *stand aside*. Nothing else. Everything that
+happens AFTER a terminal — the terminal's classification and whether a refused plate
+retries or escalates, the plate gate, the first page and the hourly nag, the requeue, the
+held-bed lift — belongs to ``terminal_outcome`` / the plate authority / ``eject.monitor``
+/ ``farm_stall`` / ``farm_policy.on_terminal``, which already own run/retry/quarantine and
+the one post-terminal motion. This lane never awaits a terminal it does not own and never
+imports ``main``. It sends ONE stop of its own: the job whose plate check the farm's own
+re-check could not clear (the ladder's second rung, below) — the farm ending its own job,
+so a raw ``stop_print`` (``test_code_quality._RAW_STOP_CALLERS``), never the operator's
+stop. (A sweep a power cut interrupted is killed by the eject lane's own re-drive,
+``eject.remote.redrive_eject_stop``, never composed here.)
 
 ``power_loss`` (2026-09-04 fleet outage)
     A power cut rebooted every printer while the server stayed up on its UPS. Each
@@ -21,32 +27,72 @@ print and never imports ``main``.
     the farm answers it: resume, confirm on the wire, and HOLD for a human only when
     the answer did not take.
 
-``plate_vision`` (user ruling 2026-09-24, restoring the pre-2026-09-04 behaviour)
-    The printer's own pre-print plate check trips (``_HMS_PLATE_OCCUPANCY_CODES``) and
-    the firmware PAUSEs the job. The printer is asking a human — "align the build
-    plate", "remove the debris" — and the farm leaves the question with them: the print
-    stays PAUSED with the printer's message on its screen, a ``job_pause`` hold records
-    it (the "Plate check" chip, the unit's waiting reason), and ONE page carries the
-    printer's own words. The human fixes the plate and resumes — the RUNNING edge of that
-    job ends the hold and the same job continues — or stops it, and the terminal's
-    verdict (``plate_refused``) gates the plate and requeues the unit. The 2026-09-04 lane
-    STOPPED the print instead; the stop wiped the printer's message within a second and
-    the requeue restarted into the same trip (003-H2S, 2026-09-24).
+``plate_vision`` — the plate-check LADDER (operator rulings 2026-09-04 and 2026-09-29)
+    The printer's own pre-print plate check trips: the firmware PAUSEs the job at layer 0
+    and shows its plate dialog, carried on ``print_error`` (``hms_errors.plate_check_paused``
+    — ``0500_808C`` build-plate offset, ``0500_806E`` foreign objects). The operator's two
+    rulings, verbatim:
+
+    * 2026-09-04: "move the bed up away from the bottom, stop the print entirely, and
+      escalate to operator rather than leaving the print paused (which has heatbed/nozzle
+      at print temp)".
+    * 2026-09-29: first press the printer's own "Problem solved, resume" — NOT "Ignore and
+      resume" — and "figure out how to send that command correctly". If that re-check
+      fails, stop and retry the same print. If the retry's re-check fails too, escalate,
+      "and make sure the bed is not at the bottom where the eject assist things are
+      bending the plate".
+
+    One trip of one job is one EPISODE: one ``plate_vision`` row (class ``job_pause``),
+    opened ``recovering`` and driven by :func:`_plate_check_episode`, one per printer.
+    Rung 1 re-checks IN PLACE: it presses "Problem solved, resume"
+    (``execute_hms_action(PROBLEM_SOLVED_RESUME)`` — the vendor frame, ``err`` = the decimal
+    ``print_error``, ``job_id`` = the paused job), reads the firmware's ACK, and watches the
+    wire: RUNNING at layer >= 1 of THIS job passes (the row closes ``recheck_passed`` and the
+    print continues); the plate dialog back on the same job, a ``fail`` ACK, a press that did
+    not go out, or the job still PAUSEd :data:`_RECHECK_CONFIRM_S` after the press fails it.
+    Rung 2 STOPS the print (heaters off), the level re-read before every send; the terminal
+    then decides (``terminal_outcome``): the printer's first farm stop inside the window on a
+    farm unit with nothing deposited is a RETRY (the unit requeued next in line, no gate, no
+    page), anything else ESCALATES (a human-clear gate in the printer's words and a page);
+    either way ``farm_policy`` lifts the bed off the release aid. A PAUSE that is not the
+    plate check (the power-loss prompt after a reboot, a runout) is HANDED OVER: the row
+    closes ``handed_over`` and the power-loss edge is re-armed so its prompt is not stranded.
+
+    The paused hold is only the FALLBACK — the farm cannot end the job (its stop never went
+    out, or was not taken in :data:`_STOP_CONFIRM_S`): the row turns ESCALATED, a human's for
+    good, and one page asks them to fix the plate and resume. It is not self-heal and is
+    never the first answer: on 2026-09-24 the 09-04 lane was replaced by exactly that hold,
+    calling the operator's own request "a previous change", and every trip then waited for a
+    human, 1 min to 8 h, with the bed down and the heaters at print temperature.
 
 Restart durability (F7)
-    The only durable state is the incident row. Three things live in process memory
-    and each names how the wire re-answers it:
+    Durable: every incident row, and a plate-check episode's step ledger
+    (``printer_incident_step`` through :class:`_PlateCheckEvidence`, the store's
+    ``EvidenceLog``) — which buttons and stops the driver sent, because the wire cannot
+    restate it (the PAUSE reads the same before and after the press). A restart re-enters
+    an open ``recovering`` episode while its job is still PAUSEd and derives the owed rung
+    from the ledger alone: no press on it → press; a press on it → stop, NEVER a second
+    resume. An ``escalated`` episode is the human's and is never re-driven.
 
-    * ``_in_flight`` — one driver handle per printer, so a standing prompt spawns one
-      recovery rather than one per push. A restart drops it; the very next push
-      re-derives "the prompt is standing" for free and spawns again. "Already decided"
-      is the incident row, which survives, so the cost of a restart is at most ONE
+    The episode driver's LIVENESS is the store's (``printer_incidents.register_driver`` /
+    ``driver_live``), and for this lane it is a GATE: the sampler registers the driver at
+    its spawn, before its row exists, and spawns nothing while one is live — the row itself
+    cannot refuse a second driver once it exists (re-entry adopts it). A restart empties the
+    registry by killing the task, which is the truth. Three more things live in process
+    memory, and each names how the wire re-answers it:
+
+    * ``_in_flight`` — the POWER-LOSS driver's handle per printer, and only its: a standing
+      prompt spawns one recovery rather than one per push. A restart drops it; the very
+      next push re-derives "the prompt is standing" for free and spawns again. "Already
+      decided" is the incident row, which survives, so the cost of a restart is at most ONE
       idempotent resume.
     * ``_seen`` — the per-printer wire sample (``connection_epoch`` + the measured
       outage) behind the reconnect EDGE. A restart re-seeds without edging, exactly
       like ``spool_recovery._wire_sample`` and ``hms_edges``: an outage that ended
       before we looked is not an edge we witnessed, and the measured duration is then
       simply unknown (the notification drops the sentence rather than inventing one).
+      A plate-check hand-over clears its ``at_prompt``, so a power-loss prompt that stood
+      behind the episode (its driver stood aside on the job pause) edges again.
     * ``_summary`` — the fleet accumulator for ONE summary page per outage. A restart
       mid-window loses the counts, which are the whole point of the page; that is
       accepted (F9) and paid for by the log line every window close emits whether or
@@ -71,20 +117,25 @@ from backend.app.models.printer_incident import (
     KIND_PLATE_VISION,
     KIND_POWER_LOSS,
     KIND_Z_REFERENCE_LOST,
+    RESOLVE_HANDED_OVER,
+    RESOLVE_RECHECK_PASSED,
     STATUS_ESCALATED,
+    STATUS_RECOVERING,
     STATUS_RESOLVED,
 )
 from backend.app.models.printer_incident_step import STEP_KIND_DIALOG, STEP_KIND_STOP, PrinterIncidentStep, StepKind
-from backend.app.services import incident_resolution, printer_incidents
+from backend.app.services import incident_resolution, print_reconcile, printer_incidents
 from backend.app.services.hms_actions import HMSAction
 from backend.app.services.hms_errors import (
     POWER_LOSS_PROMPT_CODES,
     POWER_LOSS_RESUME_FAILED_CODES,
     full_codes_of,
-    messages_from_full_codes,
+    plate_check_paused,
     power_loss_hold_active,
     power_loss_prompt_standing,
     power_loss_resume_failed,
+    print_error_dialog,
+    print_error_short_code,
     summary_of,
 )
 from backend.app.services.incident_resolution import ClearedEvent, Context, ledger
@@ -130,11 +181,47 @@ _OUTAGE_BURST_MIN_PRINTERS = 3
 # (09:25:37-09:26:03); 120 s is ~4.6x that, which covers a slower rolling brown-out
 # without reaching across two unrelated single-printer events.
 _OUTAGE_BURST_WINDOW_S = 120.0
-# The operator instruction that closes the plate-check page. The printer's own words
-# (rendered by the one HMS renderer) come first; this says what the farm is doing about
-# them — nothing — and what the human does. Sys-admin register: no exclamation, no
+# The operator instruction that closes the plate-check FALLBACK page — the one the ladder
+# sends only when the farm could not end the job itself (its stop never went out, or was
+# not taken). The printer's own words (rendered by the one HMS renderer) come first; this
+# says where the print is and what the human does. Sys-admin register: no exclamation, no
 # apology, the action named.
 _VISION_PAUSED_INSTRUCTION = "Print paused — fix the plate, then resume."
+
+# --- the plate-check ladder's budget (operator ruling 2026-09-29) ---------------------
+
+# How long the "Problem solved, resume" press waits for its firmware ACK. The figure the HMS
+# modal's route waits for the same frame (``api/routes/printers.HMS_ACTION_ACK_WAIT_SECONDS``);
+# an ACK proves acceptance, never execution, so the watch confirms on the wire whatever it
+# answers, and a short wait keeps that watch close behind the press.
+_RECHECK_ACK_S = 2.5
+# Poll step of that ACK wait. The route's own: the ACK log is appended on the MQTT thread, so
+# polling is the whole mechanism.
+_RECHECK_ACK_POLL_S = 0.1
+# How long the job may run after the press without reaching layer 1 before the driver stops
+# watching. UNMEASURED: the start block a resumed job still runs (re-home, levelling, purge)
+# takes minutes, so a quarter hour means the layer reading is not coming; the driver then
+# exits and the sweep closes the row on the job RUNNING (``observed_running``). It bounds the
+# watch in every state — a driver that watched a whole print would hold its row open until
+# the terminal, which would read a failure of that print as a refused plate.
+_RECHECK_FIRST_LAYER_S = 900.0
+# How long a pause may stand after the press before the in-place re-check counts as FAILED.
+# The operator's remote plain Resume freed four plate-check pauses within ~1 s (2026-09-25/26),
+# so 30 s is ~30x the observed answer; the power-loss confirm's figure (``_POWER_LOSS_CONFIRM_S``).
+_RECHECK_CONFIRM_S = 30.0
+# How long the farm's stop gets to take the job out of PAUSE, and after it did, how long the
+# driver stays live for the terminal closer to end the row. The power-loss confirm's figure: a
+# taken stop lands its terminal within seconds.
+_STOP_CONFIRM_S = 30.0
+# One retry of a stop whose send did not go out (the session mid-churn). Short, unlike the
+# power-loss retry: the job waits with the bed and nozzle at print temperature (ruling 2026-09-04).
+_VISION_STOP_RETRY_S = 5.0
+# Poll step of the episode's watch and waits: the status push cadence (~1 Hz). A faster poll
+# reads the same push again.
+_EPISODE_POLL_S = 1.0
+# The printer's words for a job that is over — a stop taken from PAUSE reads IDLE (or FAILED).
+# The job-over vocabulary ``incident_resolution`` and ``print_reconcile`` read the same way.
+_JOB_OVER_STATES: frozenset[str] = frozenset({"IDLE", "FAILED", "FINISH"})
 
 
 # --- process memory (see the module docstring's restart-durability story) -----------
@@ -197,13 +284,15 @@ def _reset_state() -> None:
 def note_status_push(printer_id: int, state) -> None:
     """Per-push wire sampler. Sync, DB-free, in-memory — and it NEVER raises.
 
-    Rides the ~1 Hz status push beside ``spool_recovery.note_demand_watch``. It does
-    exactly two things:
+    Rides the ~1 Hz status push beside ``spool_recovery.note_demand_watch``, and is the
+    ONLY trigger of this lane. It does exactly three things:
 
     * spawns ONE power-loss recovery driver while the prompt stands
       (:func:`hms_errors.power_loss_hold_active` = live ``PAUSE`` and ``0300_8007``
       standing), deduped by :data:`_in_flight` so a prompt that stands for minutes
       still gets a single driver;
+    * spawns the plate-check episode driver on a TRIP or a RE-ENTRY
+      (:func:`_sample_plate_check`), one per printer through the store's liveness gate;
     * derives the RECONNECT edge (``connection_epoch`` advanced) and, when the fleet's
       disconnect anchors say this was an OUTAGE rather than one printer, arms the
       lost-Z-reference hold for a printer that came back with a part on its plate.
@@ -241,8 +330,9 @@ def note_status_push(printer_id: int, state) -> None:
             _maybe_arm_z_reference_hold(printer_id, anchor)
 
         if printer_incidents.automation_held(printer_id):
-            # MAINTENANCE MODE: the power-loss prompt is the operator's to answer — they
-            # are standing at the screen. Nothing is resumed.
+            # MAINTENANCE MODE: the power-loss prompt and the plate dialog are the
+            # operator's to answer — they are standing at the screen. Nothing is resumed,
+            # pressed or stopped.
             #
             # The wire sample above is still recorded, deliberately: the sampler's memory
             # stays current, so an edge that happened DURING the hold is consumed by the
@@ -254,6 +344,8 @@ def note_status_push(printer_id: int, state) -> None:
                     "reconnected" if reconnected else "at the power-loss prompt",
                 )
             return
+
+        _sample_plate_check(printer_id, state)
 
         if not at_prompt or was_at_prompt:
             # Level, not edge: the prompt either is not standing, or it was already
@@ -304,7 +396,10 @@ async def _recover_power_loss(printer_id: int, observed_subtask: str | None) -> 
         PRESENCE evidence, and that resume answers the power-loss prompt too (printer 8
         proved it on 2026-09-04). A JOB-PAUSE hold (the printer's plate check paused this
         job) stands this lane aside too: resuming would restart the print onto the plate
-        the printer refused, and the answer is the human's.
+        the printer refused with no re-check, and the answer is the plate-check episode's
+        (its "Problem solved, resume", then a stop; a human's in its fallback). If the
+        episode HANDS OVER — the pause is not the plate check's — it re-arms this lane's
+        rising edge, so the prompt is answered on the next push.
     (d) RESUME — farm unit or FOREIGN print alike (operator ruling: parity). Success is
         a LOG LINE and a summary entry, with no durable record; failure is a HOLD.
     """
@@ -325,14 +420,16 @@ async def _recover_power_loss(printer_id: int, observed_subtask: str | None) -> 
             return
 
         if printer_incidents.job_pause_held(printer_id):
-            # The printer paused this job to ask a HUMAN about the plate (its own
-            # pre-print check), and the power cut came during that pause. Answering the
-            # firmware's prompt with a resume would answer the plate question too — with
-            # the plate the printer just refused still on the bed. The one predicate every
-            # job-resuming lane reads; the human's resume answers both prompts at once.
+            # The printer paused this job at its own pre-print plate check, and the power
+            # cut came during that pause. Answering the firmware's prompt with a resume
+            # would answer the plate question too — with the plate the printer just refused
+            # still on the bed and no re-check. The one predicate every job-resuming lane
+            # reads. The plate-check episode owns that pause: its re-entry sees a PAUSE
+            # that is no longer the plate check's and HANDS OVER, re-arming this lane's
+            # edge; an escalated episode is the human's, whose resume answers both.
             logger.info(
                 "[pause-recovery] printer %s is held at a job pause (the printer's plate check) — standing "
-                "aside, the prompt is the operator's to answer",
+                "aside, the plate-check episode answers first",
                 printer_id,
             )
             _record(printer_id, "held_by_fault")
@@ -892,101 +989,583 @@ async def plate_check_facts(
     return facts
 
 
-# --- entry point 2: the plate-vision trip -------------------------------------------
+# --- entry point 2: the plate-check episode (its trigger and its driver) -------------
 
 
-async def on_plate_vision_trip(printer_id: int, codes: set[str]) -> bool:
-    """The printer's pre-print plate check tripped: HOLD for a human. Send nothing.
+def _live_job(state) -> str:
+    """The printer's live ``subtask_id`` ("" when it names none)."""
+    return (getattr(state, "subtask_id", None) or "").strip()
 
-    True when this call opened the hold; False when the lane stood aside (a hold is
-    already standing for this printer) or failed.
 
-    The printer PAUSED the job and is showing the operator what is wrong with the plate.
-    The farm's whole act is to record that — and to leave the printer exactly as the
-    firmware put it, with its message on its screen:
+def _sample_plate_check(printer_id: int, state) -> None:
+    """The plate-check episode's ONE trigger — spawn its driver on a TRIP or a RE-ENTRY.
 
-    * a ``plate_vision`` row, opened ESCALATED (a human's from the instant it opens),
-      bound to the paused job (``job_id``) and carrying the printer's full codes
-      (``hms_full_codes``) so the card still shows its words after the dialog is gone.
-      Its class is ``job_pause``: the paused job's RUNNING edge ends it (the human fixed
-      the plate and resumed — the same job continues) and so does its terminal (the
-      human stopped it — the terminal's ``plate_refused`` verdict gates the plate and
-      requeues the unit). While it stands, no automatic lane resumes the job
-      (``printer_incidents.job_pause_held``) and the scheduler dispatches nothing onto
-      the printer (``hold_blocks_dispatch``);
-    * the unit's ``waiting_reason`` — the projection the power-loss hold writes the same
-      way (``waiting_reason_for``) — when a FARM unit is printing; a foreign print holds
-      the printer with ``item_id`` NULL exactly as every other hold does;
-    * ONE page, ``on_plate_not_empty``, in the printer's own words plus the instruction.
+    Level-triggered on purpose: the question "is a plate check standing that nobody is
+    answering?" is re-asked on every push, so nothing depends on witnessing an edge, and a
+    restart re-derives it from the wire and the row for free. Every guard reads a fact the
+    wire or the store restates at once:
 
-    NOTHING is sent to the printer. The 2026-09-04 lane stopped the print here; the stop
-    wiped the printer's message within a second, and the requeue restarted into the same
-    trip (003-H2S, 2026-09-24). ``test_pause_recovery`` pins by AST that this module
-    never calls ``stop_print``.
+    * a FRESH report only (``print_reconcile.is_fresh``) — a reconnect re-broadcasts the
+      previous session's cached PAUSE before the pushall answers;
+    * no live driver on the printer (``printer_incidents.driver_live``, the gate), and no
+      eject owning it (``plate_occupancy.eject_identity``, the power-loss driver's own
+      check — a sweep is never pressed or stopped from here);
+    * the open ``plate_vision`` row decides which occasion this is:
+
+      - none, and the printer is PAUSEd at its plate check (``plate_check_paused``) → TRIP;
+      - ``recovering``, bound to the live job (``job_identity.is_held_job``), and the job
+        still ``PAUSE`` — ANY pause: after a printer reboot ``print_error`` may be the
+        power-loss prompt, and the driver must then hand over rather than leave the row
+        standing — → RE-ENTRY (a restart killed its driver);
+      - ``escalated`` is the human's, and a ``recovering`` row of another job, or of a job
+        that is not paused, is its closers' — nothing.
+
+    The driver is registered in the SAME synchronous stretch as its spawn
+    (``register_driver``, before its row exists), so a second push cannot spawn a second
+    driver while the first is still opening its row. Maintenance mode never reaches here
+    (:func:`note_status_push` returns first). Guarded on its own: a failure here must not
+    cost the power-loss decision that follows it on the same push.
+    """
+    try:
+        if not print_reconcile.is_fresh(state):
+            return
+        if printer_incidents.driver_live(printer_id):
+            return
+        if plate_occupancy.eject_identity(printer_id) is not None:
+            return
+        job = _live_job(state)
+        snap = printer_incidents.snapshot(printer_id, kind=KIND_PLATE_VISION)
+        if snap is None:
+            if not plate_check_paused(state):
+                return
+            incident_id = None
+        elif (
+            snap.get("status") == STATUS_RECOVERING
+            and is_held_job(job, str(snap.get("job_id") or ""))
+            and (getattr(state, "state", None) or "").upper() == "PAUSE"
+        ):
+            incident_id = snap.get("id")
+        else:
+            return
+
+        from backend.app.core.tasks import spawn_background_task
+
+        task = spawn_background_task(_plate_check_episode(printer_id, job), name=f"plate-check-p{printer_id}")
+        printer_incidents.register_driver(printer_id, task, incident_id=incident_id)
+    except Exception:  # noqa: BLE001 — invariant 10: never crash the status flow
+        logger.exception("[pause-recovery] plate-check sampler failed for printer %s", printer_id)
+
+
+@dataclass(frozen=True)
+class _Episode:
+    """The row one plate-check driver acts for, as it opened or adopted it."""
+
+    printer_id: int
+    job: str
+    incident_id: int
+    item_id: int | None
+
+
+async def _plate_check_episode(printer_id: int, job: str) -> None:
+    """Drive ONE plate-check episode of ``job`` down the ladder (operator ruling 2026-09-29).
+
+    Opens the episode's row, or adopts the one a restart left ``recovering``; reads the
+    OWED rung from its ledger alone — no ``dialog`` step: re-check in place
+    (:func:`_recheck_in_place`); a ``dialog`` step: stop (:func:`_stop_the_print`), never a
+    second resume. Never raises; always gives its liveness slot back.
     """
     try:
         from backend.app.core.database import async_session
-        from backend.app.models.printer import Printer
-        from backend.app.services.farm_correlation import resolve_printing_farm_item
-        from backend.app.services.notification_service import notification_service
 
-        state = printer_manager.get_status(printer_id)
-        subtask = (getattr(state, "subtask_id", None) or "").strip()
-        ordered = sorted(codes)
-        full_codes = full_codes_of(getattr(state, "hms_errors", None) or [], ordered)
-
+        episode = await _open_episode(printer_id, job)
+        if episode is None:
+            return
         async with async_session() as db:
-            item = await resolve_printing_farm_item(db, printer_id)
+            log = await _PlateCheckEvidence.from_row(db, episode.incident_id)
+        if log.has_step(STEP_KIND_DIALOG):
+            failed: str | None = "the press is already on the episode's ledger (re-entered after a restart)"
+        else:
+            failed = await _recheck_in_place(episode, log)
+        if failed is not None:
+            await _stop_the_print(episode, log, why=failed)
+    except Exception:  # noqa: BLE001 — a driver must never crash the event loop
+        logger.exception("[pause-recovery] plate-check episode failed for printer %s", printer_id)
+    finally:
+        task = asyncio.current_task()
+        if task is not None:
+            printer_incidents.release_driver(printer_id, task)
+
+
+async def _open_episode(printer_id: int, job: str) -> _Episode | None:
+    """Open the episode's ``recovering`` row — or adopt the open one, or stand down.
+
+    A TRIP opens the row: bound to the paused job, to the FARM unit printing it
+    (``farm_correlation.resolve_printing_farm_item`` — by job identity, farm units only; a
+    foreign print holds the printer with ``item_id`` NULL), carrying the dialog's short code
+    and the printer's full code (``hms_full_codes``, its words after the dialog is gone), and
+    projecting the hold onto the unit's ``waiting_reason``.
+
+    When the row cannot open (one ``plate_vision`` row per printer), the open one is ADOPTED
+    only while it is ``recovering`` and bound to this same job — a restart's re-entry.
+    Anything else — an escalated row (the human's), another job's row — stands the driver
+    down.
+    """
+    from backend.app.core.database import async_session
+    from backend.app.services.farm_correlation import resolve_printing_farm_item
+
+    state = printer_manager.get_status(printer_id)
+    async with async_session() as db:
+        incident = None
+        item = None
+        if plate_check_paused(state) and is_held_job(_live_job(state), job):
+            short = print_error_short_code(int(state.print_error))
+            item = await resolve_printing_farm_item(db, printer_id, job)
             incident = await printer_incidents.open_new(
                 db,
                 printer_id=printer_id,
-                job_id=subtask,
+                job_id=job,
                 item_id=item.id if item is not None else None,
                 kind=KIND_PLATE_VISION,
-                code=ordered[0] if ordered else "",
-                codes=",".join(ordered),
+                code=short,
+                codes=short,
                 slot_global_tray=None,
-                hms_full_codes=full_codes,
-                status=STATUS_ESCALATED,
+                hms_full_codes=full_codes_of(getattr(state, "hms_errors", None) or [], [short]),
+                status=STATUS_RECOVERING,
             )
-            if incident is None:
-                # One open row per printer per kind: the trip re-fires on repeated
-                # pushes, and a hold already standing IS this trip's record.
-                logger.info(
-                    "[pause-recovery] printer %s plate check tripped %s but a plate-check hold already stands — "
-                    "standing aside",
-                    printer_id,
-                    ordered,
-                )
-                return False
+        if incident is not None:
             if item is not None:
                 item.waiting_reason = printer_incidents.waiting_reason_for(KIND_PLATE_VISION)
                 await db.commit()
-
-            printer = await db.get(Printer, printer_id)
-            printer_name = printer.name if printer is not None else f"printer {printer_id}"
-            words = summary_of(messages_from_full_codes(full_codes, fallback_short_codes=ordered)) or ", ".join(ordered)
-            await notification_service.on_plate_not_empty(
+            logger.warning(
+                "[pause-recovery] printer %s plate check tripped %s (%s, job %s) — episode %s opened, "
+                "the farm re-checks in place",
                 printer_id,
-                printer_name,
-                db,
-                # The catalog's own sentences end in a period; the page adds exactly one.
-                source_detail=f"The printer reported: {words.rstrip('.')}. {_VISION_PAUSED_INSTRUCTION}",
+                incident.code,
+                f"unit {item.id}" if item is not None else "foreign print",
+                job or "-",
+                incident.id,
             )
+            return _Episode(printer_id=printer_id, job=job, incident_id=incident.id, item_id=incident.item_id)
 
+        row = await printer_incidents.get_open(db, printer_id, kinds={KIND_PLATE_VISION})
+        if row is None or row.status != STATUS_RECOVERING or not is_held_job(job, row.job_id):
+            logger.info(
+                "[pause-recovery] printer %s plate-check episode not driven — %s",
+                printer_id,
+                "no plate-check pause and no episode to re-enter"
+                if row is None
+                else f"its open episode {row.id} is {row.status} on job {row.job_id or '-'}",
+            )
+            return None
         logger.warning(
-            "[pause-recovery] printer %s plate check tripped %s (%s, job %s) — print left PAUSED for a human, "
-            "incident %s",
+            "[pause-recovery] printer %s plate-check episode %s re-entered (%s, job %s, code %s) — the owed "
+            "rung is read from its ledger",
             printer_id,
-            ordered,
-            f"unit {item.id}" if item is not None else "foreign print",
-            subtask or "-",
-            incident.id,
+            row.id,
+            f"unit {row.item_id}" if row.item_id is not None else "foreign print",
+            job or "-",
+            row.code,
         )
-        return True
-    except Exception:  # noqa: BLE001 — invariant 10: never crash the status flow
-        logger.exception("[pause-recovery] plate-vision trip handling failed for printer %s", printer_id)
-        return False
+        return _Episode(printer_id=printer_id, job=job, incident_id=row.id, item_id=row.item_id)
+
+
+# What the level re-read before every send says. ``plate_pause`` is the only one a send may
+# follow; ``other_pause`` is handed over; the rest stand the driver down (the row's closers,
+# the sweep or the re-entry own what comes next).
+_Level = Literal["plate_pause", "other_pause", "stale", "held", "other_job", "not_paused"]
+
+
+@dataclass(frozen=True)
+class _LevelReading:
+    level: _Level
+    state: object | None
+    why: str
+
+
+def _read_level(episode: _Episode) -> _LevelReading:
+    """Re-read the level a send rests on: the printer is still PAUSEd at its plate check, on
+    this episode's job, on a fresh report, and not under a service hold."""
+    state = printer_manager.get_status(episode.printer_id)
+    if not print_reconcile.is_fresh(state):
+        return _LevelReading("stale", state, "the printer is not on a fresh session")
+    if printer_incidents.automation_held(episode.printer_id):
+        return _LevelReading("held", state, "the printer is in maintenance mode")
+    live_job = _live_job(state)
+    if not is_held_job(live_job, episode.job):
+        return _LevelReading("other_job", state, f"the printer is on another job ({live_job or '-'})")
+    live = (getattr(state, "state", None) or "").upper()
+    if live != "PAUSE":
+        return _LevelReading("not_paused", state, f"the job is {live or 'unknown'}, not PAUSE")
+    if plate_check_paused(state):
+        return _LevelReading("plate_pause", state, "paused at the plate check")
+    return _LevelReading("other_pause", state, _other_pause_why(state))
+
+
+def _dialog_of(state) -> int:
+    """The printer's CURRENT dialog (``print_error``), or 0 for none or a status/phase word."""
+    return print_error_dialog(int(getattr(state, "print_error", 0) or 0))
+
+
+def _other_pause_why(state) -> str:
+    """Why a PAUSE is not the plate check's, in words for the hand-over line."""
+    dialog = _dialog_of(state)
+    if dialog:
+        return f"the job is paused for {print_error_short_code(dialog)}, not the plate check"
+    return "the job is paused with no plate-check dialog"
+
+
+def _row_open(episode: _Episode) -> bool:
+    """Is THIS episode's row still open? The store's projection, DB-free."""
+    snap = printer_incidents.snapshot(episode.printer_id, kind=KIND_PLATE_VISION)
+    return snap is not None and snap.get("id") == episode.incident_id
+
+
+async def _recheck_in_place(episode: _Episode, log: _PlateCheckEvidence) -> str | None:
+    """Rung 1: press the printer's own "Problem solved, resume", read the ACK, watch the wire.
+
+    Returns WHY the re-check failed when rung 2 is owed; ``None`` when the episode ended some
+    other way (passed, handed over, stood down).
+    """
+    pid = episode.printer_id
+    reading = _read_level(episode)
+    if reading.level == "other_pause":
+        await _hand_over(episode, reading.why)
+        return None
+    if reading.level != "plate_pause":
+        logger.info(
+            "[pause-recovery] printer %s plate-check episode %s stood down — %s", pid, episode.incident_id, reading.why
+        )
+        return None
+
+    print_error = int(getattr(reading.state, "print_error", 0) or 0)
+    client = printer_manager.get_client(pid)
+    seq = await log.note(PlateCheckStep.dialog())
+    pressed_at = asyncio.get_running_loop().time()
+    sent = (
+        client.execute_hms_action(f"{print_error:08X}", HMSAction.PROBLEM_SOLVED_RESUME, episode.job)
+        if client is not None
+        else None
+    )
+    if sent is None:
+        await log.answer(seq, "not_sent")
+        logger.warning(
+            "[pause-recovery] printer %s plate check: problem-solved resume answer=not_sent (episode %s)",
+            pid,
+            episode.incident_id,
+        )
+        return "the press did not go out"
+    logger.info(
+        "[pause-recovery] printer %s plate check: problem-solved resume sent (seq %s, err %s) — episode %s, job %s",
+        pid,
+        sent.sequence_id,
+        print_error,
+        episode.incident_id,
+        episode.job or "-",
+    )
+    ack = await client.await_ack(sent, _RECHECK_ACK_S, _RECHECK_ACK_POLL_S)
+    answer: PlateCheckDialogAnswer = "no_ack" if ack is None else ("success" if ack.succeeded else "fail")
+    await log.answer(seq, answer)
+    logger.info(
+        "[pause-recovery] printer %s plate check: problem-solved resume answer=%s (episode %s%s)",
+        pid,
+        answer,
+        episode.incident_id,
+        f", reason {ack.reason}" if ack is not None and ack.reason else "",
+    )
+    if answer == "fail":
+        return "the firmware answered fail"
+    return await _watch_recheck(episode, pressed_at)
+
+
+async def _watch_recheck(episode: _Episode, pressed_at: float) -> str | None:
+    """Watch the wire after the press, the driver live throughout. Returns why the re-check
+    FAILED (rung 2 is owed), or ``None`` when the episode ended otherwise.
+
+    Each poll, in order:
+
+    (a) the row closed, the printer left its session, or it is on another job → exit: the
+        closers or the re-entry rule own the row;
+    (b) the plate dialog back on the same job after it left it (the job RUNNING, or the
+        dialog cleared) → FAILED;
+    (c) a PAUSE on another dialog (a real dialog code that is not a plate code) → HAND OVER.
+        A PAUSE with NO dialog is not one: the press clears the dialog a push or two before
+        the job leaves PAUSE, so that reading waits for (b), (d) or (e);
+    (d) RUNNING at layer >= 1 of THIS job (the client's per-job layer, ``job_layer``) →
+        PASSED. A RUNNING whose layer this client cannot measure (it attached the job
+        mid-flight), or that has not reached layer 1 :data:`_RECHECK_FIRST_LAYER_S` after it
+        began, exits instead: the sweep closes a job RUNNING for its dwell, and a plate
+        dialog that comes back re-enters at rung 2;
+    (e) PAUSEd (never having left it, or again with no dialog) :data:`_RECHECK_CONFIRM_S`
+        since the press or the pause began → FAILED; rung 2's level read hands a pause that
+        is not the plate check's over.
+
+    A job the printer reports over exits too: its terminal closes the row.
+    """
+    pid = episode.printer_id
+    loop = asyncio.get_running_loop()
+    left_the_dialog = False
+    paused_since: float | None = pressed_at
+    running_since: float | None = None
+    while True:
+        if not _row_open(episode):
+            logger.info(
+                "[pause-recovery] printer %s plate-check episode %s closed by its closers", pid, episode.incident_id
+            )
+            return None
+        state = printer_manager.get_status(pid)
+        if not print_reconcile.is_fresh(state):
+            logger.info(
+                "[pause-recovery] printer %s plate-check episode %s: the printer left its session — the "
+                "re-entry answers on its return",
+                pid,
+                episode.incident_id,
+            )
+            return None
+        live_job = _live_job(state)
+        if not is_held_job(live_job, episode.job):
+            logger.info(
+                "[pause-recovery] printer %s plate-check episode %s: the printer is on another job (%s)",
+                pid,
+                episode.incident_id,
+                live_job or "-",
+            )
+            return None
+        live = (getattr(state, "state", None) or "").upper()
+        now = loop.time()
+        if live != "RUNNING":
+            running_since = None
+        if live == "PAUSE":
+            dialog = _dialog_of(state)
+            if dialog and not plate_check_paused(state):
+                await _hand_over(episode, _other_pause_why(state))
+                return None
+            if not dialog:
+                left_the_dialog = True
+            elif left_the_dialog:
+                return "the plate dialog came back on the same job"
+            if paused_since is None:
+                paused_since = now
+            if now - paused_since >= _RECHECK_CONFIRM_S:
+                return f"still paused {_RECHECK_CONFIRM_S:.0f}s after the press"
+        else:
+            left_the_dialog = True
+            paused_since = None
+            if live in _JOB_OVER_STATES:
+                logger.info(
+                    "[pause-recovery] printer %s plate-check episode %s: the job reads %s — its terminal closes "
+                    "the episode",
+                    pid,
+                    episode.incident_id,
+                    live,
+                )
+                return None
+            if live == "RUNNING":
+                client = printer_manager.get_client(pid)
+                layer = client.job_layer() if client is not None else None
+                if layer is None:
+                    logger.info(
+                        "[pause-recovery] printer %s plate-check episode %s: the job is RUNNING but this client "
+                        "did not see it start, so its layer is no measurement — the sweep closes it on RUNNING, a "
+                        "returning plate dialog re-enters",
+                        pid,
+                        episode.incident_id,
+                    )
+                    return None
+                if layer >= 1:
+                    await _close_passed(episode, layer)
+                    return None
+                if running_since is None:
+                    running_since = now
+                if now - running_since >= _RECHECK_FIRST_LAYER_S:
+                    logger.info(
+                        "[pause-recovery] printer %s plate-check episode %s: the job has run %.0fs without reaching "
+                        "layer 1 — the sweep closes it on RUNNING, a returning plate dialog re-enters",
+                        pid,
+                        episode.incident_id,
+                        now - running_since,
+                    )
+                    return None
+        await asyncio.sleep(_EPISODE_POLL_S)
+
+
+async def _close_passed(episode: _Episode, layer: int) -> None:
+    """The re-check passed: close the row ``recheck_passed`` (a farm close) and clear the
+    unit's hold projection. The same job prints on."""
+    from backend.app.core.database import async_session
+
+    async with async_session() as db:
+        row = await printer_incidents.close(
+            db, episode.incident_id, status=STATUS_RESOLVED, source=RESOLVE_RECHECK_PASSED
+        )
+        if row is not None:
+            await printer_incidents.clear_hold_projection(db, episode.item_id)
+    logger.info(
+        "[pause-recovery] printer %s plate check: re-check passed at layer %s — episode %s closed, job %s prints on",
+        episode.printer_id,
+        layer,
+        episode.incident_id,
+        episode.job or "-",
+    )
+
+
+async def _hand_over(episode: _Episode, why: str) -> None:
+    """The job is paused, but not by its plate check (the power-loss prompt after a reboot, a
+    runout): close the row ``handed_over``, clear the unit's hold projection, and re-arm the
+    power-loss rising edge — that driver stood aside on the job pause while this row stood,
+    so without the re-arm its prompt would be stranded."""
+    from backend.app.core.database import async_session
+
+    async with async_session() as db:
+        row = await printer_incidents.close(db, episode.incident_id, status=STATUS_RESOLVED, source=RESOLVE_HANDED_OVER)
+        if row is not None:
+            await printer_incidents.clear_hold_projection(db, episode.item_id)
+    sample = _seen.get(episode.printer_id)
+    if sample is not None:
+        _seen[episode.printer_id] = replace(sample, at_prompt=False)
+    logger.info(
+        "[pause-recovery] printer %s plate check: handed over (%s) — episode %s closed",
+        episode.printer_id,
+        why,
+        episode.incident_id,
+    )
+
+
+async def _stop_the_print(episode: _Episode, log: _PlateCheckEvidence, *, why: str) -> None:
+    """Rung 2: the farm STOPS the print whose re-check failed (the heaters go off with it).
+
+    The level is re-read BEFORE every send: a pause that is no longer the plate check's is
+    handed over, anything else stands the driver down. One retry of a send that did not go
+    out, :data:`_VISION_STOP_RETRY_S` later. The stop is confirmed on the wire
+    (``printer_manager.await_state``, the job over within :data:`_STOP_CONFIRM_S`) and
+    answered on the ledger: ``taken`` → stay live until the terminal closer ends the row,
+    bounded by the same budget; ``not_taken`` / ``not_sent`` → the FALLBACK (:func:`_escalate`).
+    What the terminal makes of the stop — a retry or an escalation — is ``terminal_outcome``'s.
+    """
+    pid = episode.printer_id
+    logger.warning(
+        "[pause-recovery] printer %s plate check: re-check failed (%s) — stopping the print (episode %s, job %s)",
+        pid,
+        why,
+        episode.incident_id,
+        episode.job or "-",
+    )
+    reading = _read_level(episode)
+    if reading.level == "other_pause":
+        await _hand_over(episode, reading.why)
+        return
+    if reading.level != "plate_pause":
+        logger.info(
+            "[pause-recovery] printer %s plate-check episode %s stood down before the stop — %s",
+            pid,
+            episode.incident_id,
+            reading.why,
+        )
+        return
+
+    seq = await log.note(PlateCheckStep.stop())
+    sent = printer_manager.stop_print(pid)
+    if not sent:
+        logger.info(
+            "[pause-recovery] printer %s plate check: the stop did not go out — one retry in %.0fs",
+            pid,
+            _VISION_STOP_RETRY_S,
+        )
+        await asyncio.sleep(_VISION_STOP_RETRY_S)
+        reading = _read_level(episode)
+        if reading.level == "plate_pause":
+            sent = printer_manager.stop_print(pid)
+        elif reading.level != "stale":
+            # The level moved while the send was out: the stop never went out and never will.
+            await log.answer(seq, "not_sent")
+            if reading.level == "other_pause":
+                await _hand_over(episode, reading.why)
+            else:
+                logger.info(
+                    "[pause-recovery] printer %s plate-check episode %s stood down before the stop's retry — %s",
+                    pid,
+                    episode.incident_id,
+                    reading.why,
+                )
+            return
+
+    answer: PlateCheckStopAnswer
+    if not sent:
+        answer = "not_sent"
+    elif await printer_manager.await_state(
+        pid, set(_JOB_OVER_STATES), _STOP_CONFIRM_S, poll_interval_s=_EPISODE_POLL_S
+    ):
+        answer = "taken"
+    else:
+        answer = "not_taken"
+    await log.answer(seq, answer)
+    logger.log(
+        logging.INFO if answer == "taken" else logging.WARNING,
+        "[pause-recovery] printer %s plate check: stop answer=%s (episode %s, job %s)",
+        pid,
+        answer,
+        episode.incident_id,
+        episode.job or "-",
+    )
+    if answer != "taken":
+        await _escalate(episode, answer)
+        return
+
+    # Taken: the job's terminal closes the row (its closer runs whether or not a driver is
+    # live). Stay live meanwhile, so no other closer reads the row as nobody's.
+    deadline = asyncio.get_running_loop().time() + _STOP_CONFIRM_S
+    while _row_open(episode) and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(_EPISODE_POLL_S)
+    if _row_open(episode):
+        logger.info(
+            "[pause-recovery] printer %s plate-check episode %s: the stop was taken but no terminal closed it "
+            "within %.0fs — the sweep closes it once the printer reports the job over",
+            pid,
+            episode.incident_id,
+            _STOP_CONFIRM_S,
+        )
+
+
+async def _escalate(episode: _Episode, answer: PlateCheckStopNotTaken) -> None:
+    """The FALLBACK: the farm could not end the job, so the paused print is a human's.
+
+    ``mark_escalated`` — the row stays open and the farm never acts on it again (the sampler
+    reads ``escalated`` as the human's) — and ONE page in the printer's own words (the row's
+    recorded ``hms_full_codes``) with :data:`_VISION_PAUSED_INSTRUCTION`. The human's resume
+    or stop ends it through the ordinary closers.
+    """
+    from backend.app.core.database import async_session
+    from backend.app.models.printer import Printer
+    from backend.app.services.notification_service import notification_service
+
+    pid = episode.printer_id
+    async with async_session() as db:
+        row = await printer_incidents.mark_escalated(db, episode.incident_id)
+        if row is None:
+            logger.info(
+                "[pause-recovery] printer %s plate-check episode %s closed before the fallback — nothing to hold",
+                pid,
+                episode.incident_id,
+            )
+            return
+        printer = await db.get(Printer, pid)
+        printer_name = printer.name if printer is not None else f"printer {pid}"
+        words = summary_of(printer_incidents.printer_messages_of(row)) or row.code
+        await notification_service.on_plate_not_empty(
+            pid,
+            printer_name,
+            db,
+            # The catalog's own sentences end in a period; the page adds exactly one.
+            source_detail=f"The printer reported: {words.rstrip('.')}. {_VISION_PAUSED_INSTRUCTION}",
+        )
+    logger.warning(
+        "[pause-recovery] printer %s plate check: the stop was %s — print left PAUSED for a human, episode %s "
+        "escalated (%s, job %s)",
+        pid,
+        answer.replace("_", " "),
+        episode.incident_id,
+        f"unit {episode.item_id}" if episode.item_id is not None else "foreign print",
+        episode.job or "-",
+    )
 
 
 # --- entry point 3: the operator's clear --------------------------------------------

@@ -244,8 +244,9 @@ _RESOLUTION_LITERALS = {
 # cannot see:
 #   * ``service_hold`` — ``exit``, the declared hold's own and only counterpart verb.
 # ``farm_policy`` was the second declared lane (the 2026-09-04 plate-vision first-trip
-# re-check) until 2026-09-24: the plate-check hold is now a ``job_pause`` row the table
-# closes on its own job's resume or terminal, and the farm policy ends no row at all.
+# re-check) until 2026-09-24: the plate-check episode is now a ``job_pause`` row the table
+# closes on its own job's resume or terminal, beside the episode driver's own closes in
+# ``pause_recovery`` (``recheck_passed`` / ``handed_over``), and the farm policy ends no row.
 # A close appearing anywhere else fails this test BY CONSTRUCTION. That is the point:
 # the allowlist is a declaration, so a new closer has to be argued for in a diff rather
 # than added in silence.
@@ -284,18 +285,25 @@ _OPERATOR_STOP_CALLERS = {
 }
 
 # WHO may send a RAW ``stop_print`` — the MQTT ``print.stop`` WITHOUT the operator's request.
-# A bare stop is the FARM ending a job it owns, and there are exactly two such acts:
+# A bare stop is the FARM ending a job it owns (or the operator verb sending its own), and
+# there are exactly three such acts:
 #   * ``print_control``   — the operator verb itself (the request, then the stop);
 #   * ``eject/remote``    — the eject lane's kill of its OWN sweep (the runtime watchdog,
-#                           the start deadline, the re-drive).
-# ``printer_manager`` is the per-printer facade that forwards to the client.
-# ``pause_recovery``'s plate-check stop is gone (2026-09-24: the printer's plate check
-# PAUSES the job for a human, and the farm sends nothing), and so is every route's bare
-# stop — an operator's stop goes through ``print_control`` so it carries its request.
+#                           the start deadline, the re-drive);
+#   * ``pause_recovery``  — the plate-check ladder's second rung: the farm ends a job its
+#                           plate check refused after the in-place re-check failed
+#                           (operator rulings 2026-09-04 / 2026-09-29). It is the farm's
+#                           stop, not an operator's, so it carries no stop request — the
+#                           episode's step ledger records it, and the terminal reads it
+#                           there (``pause_recovery.plate_check_facts``).
+# ``printer_manager`` is the per-printer facade that forwards to the client. Every route's
+# bare stop is gone — an operator's stop goes through ``print_control`` so it carries its
+# request.
 _RAW_STOP_CALLERS = {
     ("services", "print_control.py"),
     ("services", "eject", "remote.py"),
     ("services", "printer_manager.py"),
+    ("services", "pause_recovery.py"),
 }
 
 
@@ -337,7 +345,7 @@ def _scan_raw_stops(py_file: Path) -> list[tuple[str, int]]:
 
 
 class TestRawStopOwnership:
-    """A bare ``print.stop`` is the FARM ending its own job — only two lanes may send one."""
+    """A bare ``print.stop`` is the FARM ending its own job — only the allowlisted lanes send one."""
 
     def test_only_the_allowlisted_lanes_send_a_raw_stop(self):
         strays: list[str] = []

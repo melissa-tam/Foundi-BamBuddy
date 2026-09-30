@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
-from backend.app.services.hms_errors import hms_severity
+from backend.app.services.hms_errors import hms_severity, print_error_dialog
 from backend.app.services.tray_fields import (
     TRAY_PRESENT_STATES,
     TRAYS_PER_AMS_UNIT,
@@ -1950,6 +1950,26 @@ class BambuMQTTClient:
         the same synchronous stretch as its own publish reads its own send's id.
         """
         return self._last_sent_sequence.get(command)
+
+    def job_layer(self) -> int | None:
+        """The highest layer THIS job has printed, as this client's per-job tracking read it —
+        or ``None`` when that tracking is not a measurement of this job. Read-only.
+
+        The same source and the same reliability flag the terminal payload's
+        ``last_layer_num`` / ``peaks_reliable`` come from: ``state.layer_num`` behind the
+        stale-predecessor gate (a print start zeroes it, and the firmware's republish of the
+        PREVIOUS job's layer is discarded until this job posts one of its own) and
+        ``_last_valid_layer_num`` (this job's last non-zero reading, kept across the
+        firmware's cancel reset). ``None`` while ``_peaks_reliable`` is False: a client that
+        attached the job mid-flight (a restart) holds a baseline it cannot tell from a
+        predecessor's republish, and absence of measurement is not a measurement.
+
+        Read by the plate-check episode (``pause_recovery``): after the farm pressed
+        "Problem solved, resume", RUNNING at layer >= 1 of this job is the re-check passing.
+        """
+        if not self._peaks_reliable:
+            return None
+        return max(self.state.layer_num, self._last_valid_layer_num)
 
     def _deliver_command_result(self, print_data: dict) -> None:
         """Hand an AMS write's firmware ACK to ``on_ams_command_result``.
@@ -4110,10 +4130,9 @@ class BambuMQTTClient:
                 module = (print_error >> 16) & 0xFFFF  # High 16 bits (e.g., 0x0500)
                 error = print_error & 0xFFFF  # Low 16 bits (e.g., 0x8061)
 
-                # Values below 0x4000 are status/phase indicators, not real errors.
-                # All known HMS errors use 0x4xxx (fatal), 0x8xxx (warning), 0xCxxx (prompt).
-                # Some firmware sends low values like 0x0002 during normal printing.
-                if error < 0x4000:
+                # Values below 0x4000 are status/phase indicators, not real errors
+                # (``hms_errors.print_error_dialog``, the one reading of that threshold).
+                if not print_error_dialog(print_error):
                     pass  # Skip — not a real error
                 else:
                     # Store in a format that matches the community error database
@@ -4562,10 +4581,10 @@ class BambuMQTTClient:
         # is_new_print and fired a FALSE PRINT START — wiping the pause's own hms_errors and
         # tray_change_log, re-snapshotting usage, sending a start notification — and a stop
         # from the pause (PAUSE→IDLE) fired NO terminal, because that arm needs
-        # `_was_running`. The 2026-09-24 plate-check restore made long PAUSEs routine (a
-        # vision trip holds the job for a human), so a deploy landing during one is now the
-        # likely shape, not a corner; the firmware's power-loss prompt (0300_8007) waits in
-        # PAUSE too.
+        # `_was_running`. PAUSEs are routine on this farm — a plate-check trip pauses the
+        # job until the farm's re-check press (or, in its fallback, a human) answers it, and
+        # the firmware's power-loss prompt (0300_8007) waits in PAUSE too — so a deploy
+        # landing during one is a likely shape, not a corner.
         #
         # PAUSE attaches only when entered from OUTSIDE an active job (`_ACTIVE_JOB_STATES`;
         # a first push has no previous state at all): that job began unseen. A PAUSE

@@ -109,13 +109,15 @@ logger = logging.getLogger(__name__)
 Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 
 # "The printer's own plate check refused this plate." A non-completed terminal of the
-# very job an OPEN ``plate_vision`` hold paused: the printer said the plate is wrong,
+# very job an OPEN ``plate_vision`` episode paused: the printer said the plate is wrong,
 # paused the job at its pre-print check, and the job then ended without printing — the
-# operator stopped it (UI or screen), or the printer gave up on it. ONE origin for the
-# literal: :func:`classify_stop` produces it, ``terminal_outcome`` records the unit as
-# ``cancelled`` on it (a first article included — a refused plate is not a failure and
-# must not spend the plate's retry), :func:`terminal_disposition` hands the plate
-# authority a refused-plate gate, and ``farm_policy`` requeues the unit and lifts the bed.
+# FARM stopped it after its in-place re-check failed (the 2026-09-29 ladder,
+# ``pause_recovery``), an operator stopped it (UI or screen), or the printer gave up on it.
+# ONE origin for the literal: :func:`classify_stop` produces it, ``terminal_outcome``
+# records the unit as ``cancelled`` on it (a first article included — a refused plate is
+# not a failure and must not spend the plate's retry) and decides retry vs escalate,
+# :func:`terminal_disposition` hands the plate authority a refused-plate gate when it
+# escalates, and ``farm_policy`` requeues the unit and lifts the bed.
 # 13 characters — inside ``print_queue.stop_source``'s VARCHAR(20).
 #
 # It REPLACED ``farm_vision_abort`` (2026-09-04 → 2026-09-24), the mark the farm stamped
@@ -732,12 +734,13 @@ def classify_stop(
     In precedence order:
 
     - ``plate_refused``     — the terminal is NOT ``completed`` and names the job an open
-      ``plate_vision`` hold paused (``job_identity.is_held_job``: an id-less echo is the
-      id-less job the hold recorded, ``""`` and ``"0"`` alike). The printer's own plate check
-      refused the plate and the job ended without printing. Highest precedence, above
-      both operator signals: the operator pressing Stop on a paused plate check is how
-      this verdict is USUALLY produced, and what it means for the plate and the unit is
-      the refusal, not the button.
+      ``plate_vision`` episode paused (``job_identity.is_held_job``: an id-less echo is the
+      id-less job the episode recorded, ``""`` and ``"0"`` alike). The printer's own plate
+      check refused the plate and the job ended without printing. Highest precedence,
+      above both operator signals: the farm's own stop after a failed re-check is how this
+      verdict is usually produced (2026-09-29), an operator pressing Stop on the paused
+      print the other way, and what it means for the plate and the unit is the refusal,
+      not the button — whether it retries or escalates is ``terminal_outcome``'s.
     - ``operator_ui``       — ``operator_stop_requested``: Stop was pressed in the Bambuddy
       UI (the printer card, the queue page, the printer's HMS dialog, the API) for THIS
       job's unit. A FOREIGN job has no unit and no request; a UI stop of one falls through
@@ -778,33 +781,32 @@ def classify_stop(
     return None
 
 
-async def resolve_printing_farm_item(db: AsyncSession, printer_id: int) -> PrintQueueItem | None:
-    """The FARM unit currently ``printing`` on ``printer_id``, or None.
+async def resolve_printing_farm_item(
+    db: AsyncSession, printer_id: int, subtask_id: str | None
+) -> PrintQueueItem | None:
+    """The FARM unit printing ``subtask_id`` on ``printer_id``, or None.
 
-    "Farm" here is the loop's own test: the item carries an
-    ``eject_profile_id``, or its batch carries a ``sku_file_id``. Distinct from
-    :func:`resolve_printing_item`, which asks the IDENTITY question (which unit is this
-    echoed job?) — this one asks the OWNERSHIP question (is the farm loop responsible
-    for what is on this printer?), which is what decides whether a plate-check hold has
-    a unit to project its waiting reason onto.
+    Two questions, asked in order. IDENTITY first — which ``printing`` unit is this job?
+    :func:`resolve_printing_item`'s answer (the id-matched unit, else the sole printing
+    one), so a hold binds the unit of the job it paused, never merely the newest row on the
+    printer. Then OWNERSHIP — is the farm loop responsible for it? The loop's own test: the
+    unit carries an ``eject_profile_id``, or its batch carries a ``sku_file_id``. A plain
+    queue print answers None, like a FOREIGN one.
 
-    Extracted from the deleted ``on_native_plate_detection`` when the plate-vision
-    reaction moved to ``pause_recovery``: the resolution was the reusable half of that
-    function, and correlation is where it belongs.
+    What decides whether a plate-check episode (``pause_recovery``) has a unit to bind and
+    to project its waiting reason onto. Extracted from the deleted
+    ``on_native_plate_detection``; bound by job identity since 2026-09-29, when the episode
+    began to act on the job it binds (the ladder's press and stop).
     """
-    result = await db.execute(
-        select(PrintQueueItem)
-        .where(PrintQueueItem.printer_id == printer_id)
-        .where(PrintQueueItem.status == "printing")
-        .order_by(PrintQueueItem.started_at.desc())
-    )
-    for candidate in result.scalars().all():
-        if candidate.eject_profile_id is not None:
-            return candidate
-        if candidate.batch_id is not None:
-            batch = await db.get(PrintBatch, candidate.batch_id)
-            if batch is not None and batch.sku_file_id is not None:
-                return candidate
+    item = await resolve_printing_item(db, printer_id, subtask_id)
+    if item is None:
+        return None
+    if item.eject_profile_id is not None:
+        return item
+    if item.batch_id is not None:
+        batch = await db.get(PrintBatch, item.batch_id)
+        if batch is not None and batch.sku_file_id is not None:
+            return item
     return None
 
 
