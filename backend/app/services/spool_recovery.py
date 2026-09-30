@@ -307,6 +307,16 @@ def _outranks(fault_class: AmsFaultClass, kind: str) -> bool:
     return _CLASS_PRECEDENCE.index(fault_class) < _CLASS_PRECEDENCE.index(existing)
 
 
+def _recorded_words(candidates: frozenset[FaultCandidate]) -> list[str]:
+    """The printer's own words for the faults an incident speaks for, as its row records them.
+
+    Recorded when the row opens or is re-classified: a release lever, a stop or the next
+    job clears them off the printer while the hold they explain still stands. The
+    candidates' OWN full codes, never a short-code round trip: ``0700_0001`` would sweep a
+    runout demand standing beside an owned overload into the incident's words."""
+    return sorted({c.full_code for c in candidates} - {""})
+
+
 # --- waiting_reason tokens -------------------------------------------------
 # The kind -> token table and its tokens live in ``printer_incidents`` (the store that
 # owns the kinds) since the pause-cause kinds joined them; imported here because this
@@ -2451,12 +2461,7 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
         # to recover.
         external = primary.external if primary is not None else False
         code = primary.short_code if primary is not None else ""
-        # The printer's own words for the faults this incident will speak for, recorded
-        # now: a release lever, a stop or the next job clears them off the printer while
-        # the hold they explain still stands. The candidates' OWN full codes, never a
-        # short-code round trip: ``0700_0001`` would sweep a runout demand standing
-        # beside an owned overload into the incident's words.
-        full_codes = sorted({c.full_code for c in candidates} - {""})
+        full_codes = _recorded_words(candidates)
 
         from backend.app.core.database import async_session
         from backend.app.models.printer import Printer
@@ -5344,6 +5349,14 @@ async def _escalate(
     they let the composed detail say what the farm did and where the filament is
     (:func:`_compose_detail`). Both are passed explicitly and never inferred: the
     defaults (``None``) are the truthful answer for every caller that sent nothing.
+
+    The KIND of the hold is the ROW's fact, read off the row ``mark_escalated`` returns —
+    never the in-memory ``incident.kind``, which is the kind the driver was BUILT with.
+    :func:`_give_up` re-classifies a jam row a physical hold after the restart stop
+    (:func:`_hold_the_path`), and the page and the unit's token must name the hold the
+    row — and the hourly reminder reading it — carries. What stays on the incident is
+    what the DRIVER saw and did: the composed detail (its evidence log) and the runout
+    spent stamp (paired with the driver's own reason).
     """
     from backend.app.core.database import async_session
     from backend.app.models.printer import Printer
@@ -5352,10 +5365,10 @@ async def _escalate(
     # Per-tray diagnostic snapshot on every escalation (the 18:45 forensics gap).
     await _log_tray_snapshot(incident)
 
+    # The DRIVER's account — what it sent and what the wire answered — keyed on the kind
+    # it ran as: a jam machine that ended in a physical hold still sent a jam machine's
+    # steps, and the page must say so.
     detail = _compose_detail(incident, reason, restore=restore, evidence=evidence)
-    # The hold's projection onto the farm unit, one token per kind. A foreign print
-    # has no unit — the incident row carries the whole state there.
-    token = waiting_reason_for(incident.kind, external=incident.external)
     slot_hint = "the external spool holder" if incident.external else runout_slot_desc(incident.jammed_global_tray)
     try:
         async with async_session() as db:
@@ -5381,6 +5394,11 @@ async def _escalate(
                     reason,
                 )
                 return
+            # The hold's kind, from the row in hand, and its projection onto the farm unit
+            # (one token per kind). A foreign print has no unit — the row carries the whole
+            # state there.
+            kind = row.kind
+            token = waiting_reason_for(kind, external=incident.external)
             item = await db.get(PrintQueueItem, incident.item_id) if incident.item_id is not None else None
             # The hold token belongs on the unit the printer is HOLDING. A unit that is no
             # longer printing has no hold to show — the restart give-ups come after the
@@ -5399,7 +5417,7 @@ async def _escalate(
                     job_name=incident.job_name,
                     detail=detail,
                     db=db,
-                    kind=incident.kind,
+                    kind=kind,
                     runout_slot=slot_hint,
                     foreign=incident.item_id is None,
                     job_ended=_job_ended(reason, evidence),
@@ -5430,7 +5448,9 @@ async def _escalate(
         # convention is unconfirmed (a wrong-side stamp on a dual-holder model is
         # permanent), and `recovery_interrupted` because it is a restart artifact with
         # no live runout evidence behind it. The kind check pins the pairing so a future
-        # reason rename cannot quietly point this at a different fault class.
+        # reason rename cannot quietly point this at a different fault class — the pairing
+        # of the DRIVER's reason with the kind the driver ran as, so it reads the incident,
+        # not the row: the stamp is about the roll the driver's runout exhausted.
         if incident.kind == KIND_RUNOUT and reason == "runout_needs_refill":
             try:
                 await spool_respool.mark_spent_on_runout_hold(
@@ -6109,6 +6129,23 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                 tray, verdict = _resolve_fault_tray(
                     item, state, kind=kind, external=external, candidates=candidates, printer_id=printer_id
                 )
+                if _outranks(fault_class, row.kind):
+                    # The live fault OUTRANKS the row's reading: re-classify the row, the
+                    # entry gate's own upgrade rule. The kind of the hold is the ROW's fact —
+                    # ``_escalate`` pages it, the hourly reminder nags it and the resolution
+                    # table closes it by it — so a re-entry that acted on the live kind while
+                    # the row kept the milder one would page one fault and hold another.
+                    upgraded = await printer_incidents.upgrade(
+                        db,
+                        row.id,
+                        kind=kind,
+                        code=code,
+                        codes=fingerprint,
+                        slot_global_tray=tray,
+                        hms_full_codes=_recorded_words(candidates),
+                    )
+                    if upgraded is None:
+                        return None  # closed between the read and the re-classification
                 escalate_reason = await _route_fault(
                     db, printer_id=printer_id, job_id=job_id, kind=kind, external=external, verdict=verdict, tray=tray
                 )

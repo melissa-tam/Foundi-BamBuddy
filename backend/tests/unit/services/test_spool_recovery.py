@@ -4534,6 +4534,31 @@ class TestZombieRecoveringRearm:
             await db_session.get(PrintQueueItem, item.id)
         ).waiting_reason == printer_incidents.WAITING_REASON_PHYSICAL
 
+    async def test_re_entry_on_a_worse_live_fault_re_classifies_the_row_and_pages_once(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """A jam zombie whose wire now names a PHYSICAL fault: the re-entry re-classifies the
+        row (the entry gate's upgrade rule) before it escalates, so the row, the page and the
+        unit's token name one fault — the hourly reminder reads that row — and the next push
+        of the same wire finds nothing left to upgrade: one page, not a jam page followed by
+        the entry gate's physical one."""
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        zombie = await self._zombie(db_session, printer.id, item_id=item.id)
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _make_state(gcode_state="PAUSE", tray_now=255, hms=[_physical_wire_hms()])
+        _wire(monkeypatch, state, FakeClient(state))
+
+        await spool_recovery.rearm_incidents_on_startup()
+
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.id, row.status, row.kind) == (zombie.id, "escalated", "physical")
+        assert row.hms_full_codes == _physical_wire_hms().full_code
+        assert [c.kwargs["kind"] for c in failed.call_args_list] == ["physical"]
+
+        assert await on_ams_fault(printer.id, state) is None
+        assert failed.await_count == 1
+
     async def test_a_plate_check_episodes_ledger_is_not_read_as_this_drivers(
         self, db_session, printer_factory, monkeypatch, caplog
     ):
@@ -10451,6 +10476,99 @@ class TestTheRestartRung:
         (row,) = await _incident_rows(db_session, printer.id)
         assert (row.status, row.kind) == ("escalated", "physical")
         oor.assert_not_awaited()
+
+    # ---- the page names the hold the ROW carries ----------------------------------------
+
+    @staticmethod
+    def _page_through_the_wrapper(monkeypatch) -> tuple[list[dict], list[tuple[str, str]]]:
+        """Record the kwargs ``_escalate`` pages with, then run the REAL wrapper, captured at
+        its send boundary (:func:`_capture_notifications`) — so the title the operator reads
+        is the wrapper's own, not an assumption about which branch a kind selects."""
+        from backend.app.services.notification_service import notification_service
+
+        sent = _capture_notifications(monkeypatch)
+        real = notification_service.on_spool_recovery_failed
+        pages: list[dict] = []
+
+        async def _page(*args, **kwargs):
+            pages.append(kwargs)
+            await real(*args, **kwargs)
+
+        monkeypatch.setattr(notification_service, "on_spool_recovery_failed", _page)
+        return pages, sent
+
+    @pytest.mark.parametrize("reason", ["restart_refaulted", "restart_unload_failed"])
+    async def test_a_restart_give_up_pages_the_physical_hold_its_row_carries(
+        self, db_session, printer_factory, monkeypatch, caplog, reason
+    ):
+        """A give-up after the restart stop re-classifies the jam row a PHYSICAL hold
+        (``_hold_the_path``) before it pages, and the page names the hold the ROW carries —
+        the hourly reminder reads that same row — never the jam the driver was built with:
+        kind ``physical`` and the ended-job physical wrapper ("Filament hardware fault"). The
+        detail stays the driver's own account of what it sent."""
+        from backend.app.services.farm_correlation import STOP_VERDICT_FAULT_RESTART
+
+        printer = await printer_factory()
+        retry_of_id = None
+        if reason == "restart_refaulted":
+            parent = PrintQueueItem(
+                printer_id=printer.id,
+                status="cancelled",
+                stop_source=STOP_VERDICT_FAULT_RESTART,
+                dispatch_subtask_id="t0",
+            )
+            db_session.add(parent)
+            await db_session.commit()
+            retry_of_id = parent.id
+        item, _jammed, _backup = await _restart_setup(db_session, printer.id, retry_of_id=retry_of_id)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        pages, sent = self._page_through_the_wrapper(monkeypatch)
+        state, client = _wedge_013(unload_deaf=reason == "restart_unload_failed")
+        _wire(monkeypatch, state, client)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert _escalated_reasons(caplog) == [reason]
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.kind) == ("escalated", "physical")
+        assert [page["kind"] for page in pages] == [row.kind]
+        assert pages[0]["job_ended"] is True
+        assert pages[0]["detail"].startswith(spool_recovery._ESCALATE_DETAIL[reason])
+        assert "Sent: " in pages[0]["detail"]  # the jam machine's evidence log, kept
+        ((title, message),) = sent
+        assert title == f"Filament hardware fault — {printer.name}"
+        assert "has ended." in message and "Spool jam" not in title
+        # No terminal runs in this harness, so the unit still reads ``printing`` and takes
+        # the hold token: the row's physical one, never the jam's "recovery failed".
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == (
+            printer_incidents.WAITING_REASON_PHYSICAL
+        )
+
+    async def test_a_plain_wedge_give_up_still_pages_the_jam(self, db_session, printer_factory, monkeypatch, caplog):
+        """The other side: a jam give-up with no restart stop on the ledger
+        (``wedge_unreleased`` — the job deposited a layer, so the rung is never pulled)
+        re-classifies nothing, and pages the jam it is, with the jam's token on the unit."""
+        printer = await printer_factory()
+        item, _jammed, _backup = await _restart_setup(db_session, printer.id)
+        pages, sent = self._page_through_the_wrapper(monkeypatch)
+        state, client = _wedge_013(layer=6)
+        _wire(monkeypatch, state, client)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert _escalated_reasons(caplog) == ["wedge_unreleased"]
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.kind) == ("escalated", "jam")
+        assert [(page["kind"], page["job_ended"]) for page in pages] == [("jam", False)]
+        ((title, _message),) = sent
+        assert "Filament hardware fault" not in title
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason == WAITING_REASON_FAILED
 
     # ---- C4: whose terminal the stop's is ----------------------------------------------
 
