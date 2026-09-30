@@ -37,6 +37,7 @@ from backend.app.models.printer_incident import (
     RESOLVE_JOB_ENDED_UNSEEN,
     RESOLVE_OBSERVED_RUNNING,
     RESOLVE_OPERATOR,
+    RESOLVE_PLATE_REFUSED,
     RESOLVE_REARM,
     RESOLVE_REPAIR_COMPLETED,
     RESOLVE_REPAIR_OBSERVED,
@@ -319,6 +320,29 @@ class TestTheJobPauseLane:
         verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(live="FAILED", terminal=terminal))
         assert verdict.close is True
         assert verdict.source == RESOLVE_TERMINAL
+
+    def test_a_terminal_that_refused_the_plate_closes_it_under_its_own_source(self):
+        """The terminal outcome's answer rides the event: a refusal is the human's (a gate
+        and a page follow), so the ledger must tell it from the farm's own stop-and-retry."""
+        refused = TerminalEvent(status="failed", eject=False, job_id=_JOB, plate_refused=True)
+        retried = TerminalEvent(status="failed", eject=False, job_id=_JOB)
+
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(live="FAILED", terminal=refused))
+        assert (verdict.close, verdict.source) == (True, RESOLVE_PLATE_REFUSED)
+        verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(live="FAILED", terminal=retried))
+        assert (verdict.close, verdict.source) == (True, RESOLVE_TERMINAL)
+
+    def test_a_refusal_of_another_job_or_an_eject_still_stands(self):
+        other = TerminalEvent(status="failed", eject=False, job_id="other-job", plate_refused=True)
+        sweep = TerminalEvent(status="completed", eject=True, job_id=_JOB, plate_refused=True)
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(terminal=other)).close is False
+        assert resolve(_row(RESOLUTION_JOB_PAUSE), "job_terminal", self._ctx(terminal=sweep)).close is False
+
+    def test_the_refusal_flag_changes_no_other_class(self):
+        """Only the ``job_pause`` cell reads it: a wire hold's terminal close is unchanged."""
+        refused = TerminalEvent(status="failed", eject=False, job_id=_JOB, plate_refused=True)
+        verdict = resolve(_row(RESOLUTION_WIRE), "job_terminal", self._ctx(live="FAILED", terminal=refused))
+        assert (verdict.close, verdict.source) == (True, RESOLVE_TERMINAL)
 
     def test_another_jobs_terminal_stands(self):
         terminal = TerminalEvent(status="failed", eject=False, job_id="other-job")
@@ -689,6 +713,16 @@ class TestTheCompletedArm:
         row.job_id = ""
 
         assert resolve(row, "job_terminal", self._ctx(job_id=None)).close is False
+
+    @pytest.mark.parametrize(("row_job", "echo"), [("0", "0"), ("", "0"), ("0", ""), (_JOB, "0")])
+    def test_a_lan_print_id_names_no_job_either(self, row_job, echo):
+        """``"0"`` is the printer's "no job" as much as ``""`` is (``job_identity``): repair
+        evidence needs the terminal to NAME the interrupted job, so two ``"0"``s — a hand
+        ``==`` once called them the same job — launder nothing."""
+        row = _row(RESOLUTION_REPAIR)
+        row.job_id = row_job
+
+        assert resolve(row, "job_terminal", self._ctx(job_id=echo)).close is False
 
     @pytest.mark.parametrize("status", ["aborted", "failed", "cancelled", "FINISH", ""])
     def test_only_completed_counts(self, status):
@@ -1136,6 +1170,27 @@ class TestDriverOwns:
     )
     def test_driver_owns(self, status, live, expected):
         assert driver_owns(_row(RESOLUTION_WIRE, status=status), live=live) is expected
+
+    @pytest.mark.parametrize(
+        ("status", "live", "expected"),
+        [
+            # A job-pause episode's ``recovering`` is a promise only a LIVE driver keeps: with
+            # none, the row is adjudicable (else a job that ended unseen strands it forever).
+            (STATUS_RECOVERING, False, False),
+            (STATUS_RECOVERING, True, True),
+            (STATUS_ESCALATED, True, True),
+            (STATUS_ESCALATED, False, False),
+        ],
+    )
+    def test_a_job_pause_row_is_owned_only_by_a_live_driver(self, status, live, expected):
+        assert driver_owns(_row(RESOLUTION_JOB_PAUSE, status=status), live=live) is expected
+
+    @pytest.mark.parametrize(
+        "resolution", [RESOLUTION_WIRE, RESOLUTION_REPAIR, RESOLUTION_OPERATOR, RESOLUTION_DECLARED]
+    )
+    def test_every_other_class_keeps_the_promise_reading(self, resolution):
+        """An AMS ``recovering`` row with no live task is the startup re-entry's to drive."""
+        assert driver_owns(_row(resolution, status=STATUS_RECOVERING), live=False) is True
 
 
 class TestPathQuiet:

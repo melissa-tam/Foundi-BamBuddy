@@ -871,8 +871,10 @@ _NOT_QUEUE_UNITS: dict[tuple[str, str], str] = {
 }
 
 # Attributes that carry a printer job id. Comparing two of them is the job-identity question, which
-# has three answers — ``job_identity.same_job``.
-_JOB_ID_ATTRS = frozenset({"subtask_id", "dispatch_subtask_id", "dispatch_subtask", "live_subtask"})
+# has three answers — ``job_identity.same_job``. ``job_id`` is an incident row's recorded job (and
+# the ``"job_id"`` key of the store's projection, matched as a ``.get("job_id")`` operand): comparing
+# it by hand is the held-job question, whose one answer is ``job_identity.is_held_job``.
+_JOB_ID_ATTRS = frozenset({"subtask_id", "dispatch_subtask_id", "dispatch_subtask", "live_subtask", "job_id"})
 _JOB_IDENTITY_OWNERS = frozenset(
     {
         ("services", "job_identity.py"),
@@ -893,6 +895,8 @@ _JOB_ID_COMPARISONS: dict[tuple[str, str], str] = {
     ("services/print_scheduler.py", "PrintScheduler._watchdog_print_start"): (
         "change detection of the printer's OWN echo across the dispatch (did it flip?), not two jobs compared"
     ),
+    ("services/printer_incidents.py", "find_closed"): "SQL filter: the closed rows of one (printer, job, fingerprint)",
+    ("services/printer_incidents.py", "count_resolved"): "SQL filter: the recovered rows of one job",
 }
 
 
@@ -932,11 +936,18 @@ def _scan_queue_unit_archive_reads(py_file: Path) -> list[tuple[str, int]]:
 
 
 def _names_job_id(node: ast.expr) -> bool:
-    """Does this comparison operand spell a job id — the attribute itself, through a method chain
-    (``x.subtask_id.strip()``) or an ``or`` default (``(x.subtask_id or "")``)? A call to a FUNCTION
-    (``same_job(...)``) is the adopted form and does not count."""
+    """Does this comparison operand spell a job id — the attribute itself, a projection's
+    ``.get("job_id")``, through a method chain (``x.subtask_id.strip()``), a ``str(...)`` coercion or
+    an ``or`` default (``(x.subtask_id or "")``)? A call to any other FUNCTION (``same_job(...)``) is
+    the adopted form and does not count."""
     if isinstance(node, ast.Attribute) and node.attr in _JOB_ID_ATTRS:
         return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
+        key = node.args[0] if node.args else None
+        if isinstance(key, ast.Constant) and key.value in _JOB_ID_ATTRS:
+            return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str" and node.args:
+        return _names_job_id(node.args[0])
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         return _names_job_id(node.func.value)
     if isinstance(node, ast.BoolOp):
@@ -1018,12 +1029,39 @@ class TestPrintRecordResolution:
 
     def test_the_adopted_sites_ask_the_owner(self):
         """The liveness half of the migration: the adopted sites really call the owner."""
-        from backend.app.services import dispatch_claim, incident_resolution, plate_occupancy_store, production_run
+        from backend.app.services import (
+            dispatch_claim,
+            farm_correlation,
+            incident_resolution,
+            plate_occupancy_store,
+            production_run,
+            spool_recovery,
+            terminal_outcome,
+        )
 
         assert "print_archive_of" in _source_of(production_run.build_run_response)
-        assert "same_job" in _source_of(incident_resolution._same_job)  # noqa: SLF001
         assert "same_job" in _source_of(dispatch_claim.judge)
         assert "same_job" in _source_of(plate_occupancy_store._startup_policy)  # noqa: SLF001
+        # The held-job rule (2026-09-29): the rule table's job-pause cells and BOTH terminal
+        # classifiers — the stop verdict and the outcome builder — ask ``is_held_job``.
+        for cell in (
+            incident_resolution._job_pause_running_edge,  # noqa: SLF001
+            incident_resolution._job_pause_job_terminal,  # noqa: SLF001
+            incident_resolution._job_pause_running,  # noqa: SLF001
+            incident_resolution._job_pause_ended_unseen,  # noqa: SLF001
+            farm_correlation.classify_stop,
+            terminal_outcome.build_terminal_outcome,
+        ):
+            assert "is_held_job" in _source_of(cell), cell.__name__
+        assert not hasattr(incident_resolution, "_same_job")
+        # A NAMED job, never an id-less match: the repair arm and the AMS driver's job tests.
+        for site in (
+            incident_resolution._repair_job_terminal,  # noqa: SLF001
+            spool_recovery._takeover,  # noqa: SLF001
+            spool_recovery._maybe_self_heal_after_repair,  # noqa: SLF001
+            spool_recovery._resume_after_repair,  # noqa: SLF001
+        ):
+            assert "same_job" in _source_of(site), site.__name__
 
 
 def _source_of(obj: object) -> str:
@@ -1309,6 +1347,16 @@ def _app_trees() -> list[tuple[tuple[str, ...], ast.Module]]:
     return [(_relative_parts(f), ast.parse(f.read_text(encoding="utf-8"))) for f in get_python_files(BACKEND_DIR)]
 
 
+def _names_evidence_log(base: ast.expr) -> bool:
+    """Does a class base name the store's evidence log — ``EvidenceLog``,
+    ``printer_incidents.EvidenceLog``, or either subscripted with a step type?"""
+    if isinstance(base, ast.Subscript):
+        base = base.value
+    return (isinstance(base, ast.Name) and base.id == "EvidenceLog") or (
+        isinstance(base, ast.Attribute) and base.attr == "EvidenceLog"
+    )
+
+
 class TestRecoveryDriverOwnership:
     """ONE owner per fact of the recovery driver. SOURCE pins, like their neighbours: every
     failure they catch is a well-formed second copy that every behaviour test passes."""
@@ -1373,9 +1421,10 @@ class TestRecoveryDriverOwnership:
 
     def test_the_step_ledger_has_one_writer(self):
         """``printer_incidents.note_step`` / ``answer_step`` are called ONLY by the evidence
-        log's own mutators, so a step is recorded at the send and answered at the read in
+        log's own mutators — the store's ``EvidenceLog.note`` / ``answer``, whichever driver
+        subclasses it — so a step is recorded at the send and answered at the read in
         exactly one place."""
-        allowed = {("_RecoveryEvidence", "note"): "note_step", ("_RecoveryEvidence", "answer"): "answer_step"}
+        allowed = {("EvidenceLog", "note"): "note_step", ("EvidenceLog", "answer"): "answer_step"}
         found: set[str] = set()
         strays: list[str] = []
         for parts, tree in _app_trees():
@@ -1385,7 +1434,7 @@ class TestRecoveryDriverOwnership:
                 _owner, name = _called(node.func)
                 if name not in ("note_step", "answer_step"):
                     continue
-                if parts == _SPOOL_RECOVERY and allowed.get(tuple(scope[-2:])) == name:
+                if parts == _PRINTER_INCIDENTS and allowed.get(tuple(scope[-2:])) == name:
                     found.add(name)
                 else:
                     strays.append(
@@ -1417,26 +1466,42 @@ class TestRecoveryDriverOwnership:
         assert seen == _RELEASE_FRAME_SCOPES
 
     def test_the_evidence_log_is_built_only_from_the_ledger(self):
-        """``_RecoveryEvidence`` is constructed ONLY by ``from_row`` — the one constructor
-        both spawn paths use, so a driver can never start from an in-memory log that
-        forgot what the incident already sent."""
+        """``printer_incidents.EvidenceLog`` — and every driver's subclass of it — is
+        constructed ONLY by the store's ``from_row``, the one constructor every spawn path
+        uses, so a driver can never start from an in-memory log that forgot what the
+        incident already sent. A subclass may not re-define ``from_row`` either: that would
+        be a second constructor under the same name."""
+        trees = _app_trees()
+        logs = {"EvidenceLog"} | {
+            node.name
+            for _parts, tree in trees
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and any(_names_evidence_log(base) for base in node.bases)
+        }
         strays: list[str] = []
         builds_from_row = False
-        for parts, tree in _app_trees():
+        for parts, tree in trees:
             for node, scope in _scoped_nodes(tree):
+                # A def's own scope ends in its own name, so its class is the one before it.
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "from_row"
+                    and len(scope) >= 2
+                    and scope[-2] in logs - {"EvidenceLog"}
+                ):
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} {scope[-2]} re-defines from_row")
                 if not isinstance(node, ast.Call):
                     continue
                 _owner, name = _called(node.func)
-                if name == "_RecoveryEvidence":
-                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} constructs _RecoveryEvidence")
-                if (
-                    parts == _SPOOL_RECOVERY
-                    and name == "cls"
-                    and tuple(scope[-2:]) == ("_RecoveryEvidence", "from_row")
-                ):
+                if name in logs:
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} constructs {name}")
+                if parts == _PRINTER_INCIDENTS and name == "cls" and tuple(scope[-2:]) == ("EvidenceLog", "from_row"):
                     builds_from_row = True
         assert not strays, "The evidence log is built outside from_row:\n" + "\n".join(strays)
         assert builds_from_row
+        # Liveness: the subclass scan still sees the AMS driver's log, so it cannot pass on an
+        # empty set.
+        assert "_RecoveryEvidence" in logs
 
 
 def _scan_resolution_vocabulary(py_file: Path) -> list[tuple[str, int]]:

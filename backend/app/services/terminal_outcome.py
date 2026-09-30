@@ -39,6 +39,7 @@ from backend.app.services.farm_correlation import (
     StopVerdict,
 )
 from backend.app.services.hms_errors import PrinterMessage, messages_from_payload, summary_of, unique_messages
+from backend.app.services.job_identity import is_held_job
 from backend.app.services.plate_occupancy import PlateRefusal
 
 if TYPE_CHECKING:
@@ -265,15 +266,15 @@ def build_terminal_outcome(
     ``open_incidents`` must be the SAME projection ``verdict`` was classified over (read
     once, ahead of every closer). ``job_id`` is the terminal's echoed ``subtask_id``:
     the printer's recorded words for a hold count as this terminal's evidence only when
-    the hold paused THIS job — a hold from another job explains nothing about this one.
+    the hold paused THIS job (``job_identity.is_held_job``) — a hold from another job
+    explains nothing about this one.
 
     The evidence the category and the message are built from is the holds' recorded
     words first (they are WHY the job was held, and a stop wipes the printer's live list,
     so a refused plate's codes survive only there) and then the terminal payload's own
     HMS list, de-duplicated by short code.
     """
-    job = (job_id or "").strip()
-    this_job = [incident for incident in open_incidents if str(incident.get("job_id") or "").strip() == job]
+    this_job = [incident for incident in open_incidents if is_held_job(job_id, str(incident.get("job_id") or ""))]
     recorded = [message for incident in this_job for message in _recorded_messages(incident)]
     printer_evidence = unique_messages([*recorded, *messages_from_payload(hms_errors)])
 
