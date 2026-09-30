@@ -550,6 +550,18 @@ class TestFoldAck:
 
         assert observation.acked is False
 
+    def test_the_reading_is_the_ack_records_own(self) -> None:
+        """ONE reading of ``result``: ``CommandAck.succeeded``. ``ams_command`` keeps no
+        spelling set of its own, so the motion lane and the dialog-button lane can never
+        disagree about what the firmware said."""
+        from backend.app.services import ams_command
+
+        assert not hasattr(ams_command, "_ACK_SUCCESS_RESULTS")
+        for result in ("success", "SUCCESS", "ok", "fail", None):
+            observation = Observation()
+            observation.fold_ack(_ack(result))
+            assert observation.acked is _ack(result).succeeded
+
     def test_an_ack_once_seen_stays_seen(self) -> None:
         """A later ``None`` (the ACK rolled out of the client's bounded log) changes nothing."""
         observation = Observation()

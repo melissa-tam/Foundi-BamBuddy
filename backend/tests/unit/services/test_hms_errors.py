@@ -660,10 +660,6 @@ _EXPECTED_PHYSICAL = (
 _EXPECTED_RFID = _family(_AMS_UNIT_MODULES, "4025")
 _EXPECTED_INFORMATIONAL = _family(_AMS_UNIT_MODULES, "0025")
 _EXPECTED_EXTRUDER_SIDE = {"0300_801E"}
-# The printer's own pre-print plate check — the four members of the retired
-# ``bambu_mqtt._HMS_PLATE_OCCUPANCY_CODES`` literal, copied verbatim: the move into the
-# taxonomy must neither widen nor narrow what the pause lane trips on.
-_EXPECTED_PLATE_CHECK = {"0300_8017", "0300_8006", "0500_806E", "0500_808C"}
 
 # Every short code whose verdict must carry ``retract_failure=True`` — "the printer is
 # LATCHED in a pull-back it could not finish", which is what makes the touchscreen's
@@ -709,7 +705,6 @@ _EXPECTED_SHORT_CLASSES = {
     "physical_fault": _EXPECTED_PHYSICAL,
     "rfid_read": _EXPECTED_RFID,
     "informational": _EXPECTED_INFORMATIONAL,
-    "plate_check": _EXPECTED_PLATE_CHECK,
 }
 
 # The pre-relocation literal from spool_respool.py, copied verbatim. RUNOUT_HMS_CODES
@@ -863,12 +858,9 @@ class TestAmsFaultTaxonomyShortLane:
         assert not hasattr(hms_errors, "legacy_swap_short_codes")
 
     def test_an_unclassified_short_code_is_none(self):
-        """CHANGED 2026-09-29: the example was ``0500_808C``, which now has its own
-        PLATE_CHECK row (the plan that retired ``bambu_mqtt``'s literal plate set).
-        ``0300_8003`` (AI spaghetti detection) is the documented unclassified sibling."""
         from backend.app.services.hms_errors import classify_short_code
 
-        assert classify_short_code("0300_8003") is None
+        assert classify_short_code("0500_808C") is None
         assert classify_short_code("0300_400C") is None
 
     def test_lookup_is_case_insensitive(self):
@@ -1412,15 +1404,19 @@ class TestPowerLossVocabulary:
 
 
 class TestPlateCheckVocabulary:
-    """The printer's own pre-print plate check: ONE code set (a taxonomy view) and the
-    predicate the pause lane reads — ``PAUSE`` plus the CURRENT ``print_error`` dialog."""
+    """The printer's own pre-print plate check: ONE code set and the predicate the pause
+    lane reads — ``PAUSE`` plus the CURRENT ``print_error`` dialog.
 
-    def test_the_set_is_the_taxonomy_view_with_the_retired_literals_members(self):
-        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, AmsFaultClass, _shorts_where
+    Print-module (0x03) and mainboard/camera (0x05) codes, so the set is a named literal
+    OUTSIDE the AMS fault taxonomy — the same ruling as the power-loss vocabulary above."""
 
-        assert PLATE_CHECK_HMS_CODES == _EXPECTED_PLATE_CHECK
-        derived = _shorts_where(lambda r: r.fault_class is AmsFaultClass.PLATE_CHECK)
-        assert derived == PLATE_CHECK_HMS_CODES
+    def test_the_set_holds_exactly_the_four_native_vision_codes(self):
+        """Copied verbatim from the literal it replaced (``bambu_mqtt``'s private set): the
+        move must neither widen nor narrow what the pause lane trips on."""
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES
+
+        expected = frozenset({"0300_8017", "0300_8006", "0500_806E", "0500_808C"})
+        assert expected == PLATE_CHECK_HMS_CODES
 
     def test_the_retired_literal_is_gone_and_every_reader_holds_the_one_set(self):
         from backend.app import main
@@ -1434,14 +1430,15 @@ class TestPlateCheckVocabulary:
         for code in PLATE_CHECK_HMS_CODES:
             assert terminal_outcome._HMS_FAILURE_REASONS[code] == "Plate not empty (printer vision)"
 
-    def test_a_plate_check_is_never_an_actionable_ams_fault(self):
-        """The class is outside ACTIONABLE_CLASSES, so classifying the codes hands them to
-        no AMS lane: the jam machine, the dispatch gate and the incident sweep read only
-        ``live_candidates``."""
+    def test_the_codes_are_not_ams_taxonomy_rows(self):
+        """The AMS classifier must not claim them — the jam machine, the dispatch gate and
+        the incident sweep all read the taxonomy (``live_candidates``), and a plate check
+        routed there would open an AMS incident on a printer with nothing wrong in its AMS."""
         from backend.app.services.bambu_mqtt import HMSError
-        from backend.app.services.hms_errors import ACTIONABLE_CLASSES, AmsFaultClass, live_candidates
+        from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, classify_short_code, live_candidates
 
-        assert AmsFaultClass.PLATE_CHECK not in ACTIONABLE_CLASSES
+        for code in PLATE_CHECK_HMS_CODES:
+            assert classify_short_code(code) is None, code
         # The print_error-lane shape the parser stores: attr = the whole 32-bit word.
         entry = HMSError(code="0x808c", attr=0x0500808C, module=5, severity=3, full_code="0500808C")
         assert live_candidates(SimpleNamespace(hms_errors=[entry])) == frozenset()

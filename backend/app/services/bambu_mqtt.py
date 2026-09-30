@@ -660,10 +660,6 @@ class PrinterState:
     raw_data: dict = field(default_factory=dict)
     gcode_file: str | None = None
     subtask_id: str | None = None
-    # The push's own `job_id` field (BambuStudio's `job_id_`), as a string; "" until a push
-    # carries one. A wire fact re-read per push: the dialog-button frames echo it back
-    # (`BambuMQTTClient.execute_hms_action`), the way Studio's `command_hms_resume` does.
-    job_id: str = ""
     # The printer's CURRENT dialog code: the 32-bit `print_error` word as the last push
     # carrying the field reported it, 0 = no dialog. Set from EVERY such push, 0 included,
     # so it never outlives its dialog — unlike `hms_errors`, where the same code is also
@@ -3402,8 +3398,6 @@ class BambuMQTTClient:
                 self.state.current_print = data["subtask_name"]
         if "subtask_id" in data:
             self.state.subtask_id = data["subtask_id"]
-        if "job_id" in data:
-            self.state.job_id = "" if data["job_id"] is None else str(data["job_id"])
         if "mc_percent" in data:
             new_progress = float(data["mc_percent"])
             # Discard the predecessor's percent (2026-08-22 — same wire behaviour as the
@@ -7314,7 +7308,7 @@ class BambuMQTTClient:
         logger.info("[%s] Set liveview %s", self.serial_number, "enabled" if enable else "disabled")
         return True
 
-    def execute_hms_action(self, print_error: str, action: str, job_id: str | None = None) -> SentCommand | None:
+    def execute_hms_action(self, print_error: str, action: str, job_id: str) -> SentCommand | None:
         """Press one of the printer's dialog buttons — the ONE owner of the dialog-button
         frames (AST-pinned: ``test_code_quality.TestHmsDialogFrameOwnership``).
 
@@ -7344,9 +7338,13 @@ class BambuMQTTClient:
         measured with hex. Only the 8-hex-char ``print_error`` form is accepted for it: a
         16-char ``hms[]`` code names no dialog the firmware can match, so it — or anything
         unparseable — REFUSES the press (a WARNING naming why, nothing published).
-        ``job_id`` is the caller's when non-empty, else the push's own
-        :attr:`PrinterState.job_id` (Studio's ``job_id_``), ``""`` when the printer
-        reports none.
+        ``job_id`` has ONE rule: the ``subtask_id`` of the job whose dialog is being
+        pressed, passed by the caller (``""`` when that job has none) — the modal sends the
+        snapshot on ``HMSError.job_id``, the farm the paused job's live ``subtask_id``.
+        That is the value upstream #1869 field-tested the err-bearing frames with, and on
+        a farm dispatch ``task_id`` == ``subtask_id`` == ``project_id``. The push's own
+        ``job_id`` field is deliberately NOT read: what it carries on a LAN print has
+        never been observed on this fleet.
 
         Every print-topic frame carries a real ``sequence_id`` (:meth:`_next_sequence_id`,
         recorded under its command for :meth:`last_sent_sequence_id`) and is followed by a
@@ -7403,8 +7401,6 @@ class BambuMQTTClient:
                 )
             return err
 
-        dialog_job_id = job_id or self.state.job_id or ""
-
         match action:
             case (
                 HMSAction.RESUME_PRINTING
@@ -7422,13 +7418,13 @@ class BambuMQTTClient:
                 err = dialog_err()
                 if err is None:
                     return None
-                return send({"command": "resume", "err": err, "param": "reserve", "job_id": dialog_job_id})
+                return send({"command": "resume", "err": err, "param": "reserve", "job_id": job_id})
 
             case HMSAction.IGNORE_RESUME | HMSAction.IGNORE_NO_REMINDER_NEXT_TIME | HMSAction.DONT_REMIND_NEXT_TIME:
                 err = dialog_err()
                 if err is None:
                     return None
-                return send({"command": "ignore", "err": err, "param": "reserve", "job_id": dialog_job_id})
+                return send({"command": "ignore", "err": err, "param": "reserve", "job_id": job_id})
 
             case HMSAction.NO_REMINDER_NEXT_TIME:
                 err = dialog_err()

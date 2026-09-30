@@ -1342,10 +1342,6 @@ class AmsFaultClass(str, Enum):
     PHYSICAL_FAULT = "physical_fault"  # breakage/clog/hardware — needs physical work, never a swap
     RFID_READ = "rfid_read"  # the tag could not be read (expected on a tagless slot)
     INFORMATIONAL = "informational"  # a progress notice or a precursor — no farm action
-    # The printer's own pre-print vision check PAUSEd the job over the build plate. Not an
-    # AMS fault: outside ACTIONABLE_CLASSES, so no AMS incident lane ever sees it. The
-    # pause lane reads it through :data:`PLATE_CHECK_HMS_CODES` / :func:`plate_check_paused`.
-    PLATE_CHECK = "plate_check"
 
 
 @dataclass(frozen=True)
@@ -1741,27 +1737,6 @@ _SHORT_TAXONOMY_ROWS: tuple[tuple[tuple[str, ...], str, _ShortRow], ...] = (
     # 07xx_2X00_0002_0025). Classified so the precursor can never be mistaken for
     # a swap trigger; see the code-word row for the evidence.
     ((*_AMS_UNITS,), "0025", _ShortRow(_INFO)),
-    # -- PLATE_CHECK: the H2-series NATIVE pre-print vision check -------------
-    # The printer PAUSEs the job at layer 0 and shows the dialog on its screen. Production
-    # (hms-events, all 6 tripped printers) sees these ONLY on the 32-bit ``print_error``
-    # lane — ``0500806E`` (83918958) and ``0500808C`` (83918988) — which is why the pause
-    # predicate reads ``PrinterState.print_error``, not the merged HMS list. The two 0300
-    # rows are set members never yet observed on this fleet.
-    # "Foreign objects detected on heatbed. Please check and clean the heatbed. Then,
-    # select "Resume" to resume the print job."
-    (("0300",), "8017", _ShortRow(AmsFaultClass.PLATE_CHECK)),
-    # "The build plate marker was not detected. Please confirm the build plate is
-    # correctly positioned on the heatbed with all four corners aligned, and the marker
-    # is visible."
-    (("0300",), "8006", _ShortRow(AmsFaultClass.PLATE_CHECK)),
-    # "Foreign objects detected on heatbed; please check and clean up the heatbed."
-    # (H2S live-observed 2026-07-20, printer 8 / fw 01.01.02.00.)
-    (("0500",), "806E", _ShortRow(AmsFaultClass.PLATE_CHECK)),
-    # "Detected build plate offset or debris. Please align the build plate with the
-    # heatbed and remove all debris from the plate surface before continuing." The
-    # dominant production trip; it also fires on an EMPTY, unseated plate (003-H2S
-    # 2026-09-24). Catalog actions: IGNORE_RESUME, PROBLEM_SOLVED_RESUME.
-    (("0500",), "808C", _ShortRow(AmsFaultClass.PLATE_CHECK)),
 )
 
 
@@ -1795,11 +1770,6 @@ _RUNOUT_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFau
 _RUNOUT_EXTERNAL_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.RUNOUT_EXTERNAL)
 _MECHANICAL_FEED_SHORTS: frozenset[str] = _shorts_where(lambda r: r.fault_class is _MECHANICAL)
 _EXTRUDER_SIDE_SHORTS: frozenset[str] = _shorts_where(lambda r: r.extruder_side)
-
-# The printer's own pre-print plate check — the single origin for the pause lane, the
-# failure-reason category and the HMS-edge capture. A VIEW of the taxonomy rows, never a
-# second literal.
-PLATE_CHECK_HMS_CODES: frozenset[str] = _shorts_where(lambda r: r.fault_class is AmsFaultClass.PLATE_CHECK)
 
 # ``retract_failure`` deliberately gets NO set of its own here. A short-lane view is
 # blind to the two code-word members (0x00020011 / 0x00020024), so a consumer reading
@@ -2224,6 +2194,42 @@ def runout_hold_active(state) -> bool:
         return False
 
 
+# The H2-series NATIVE pre-print plate check: the printer PAUSEs the job at layer 0 and
+# shows the dialog on its screen. The single origin for the pause lane
+# (:func:`plate_check_paused`), the failure-reason category and the HMS-edge capture.
+#
+# Production (hms-events, all 6 tripped printers) sees these ONLY on the 32-bit
+# ``print_error`` lane — ``0500806E`` (83918958) and ``0500808C`` (83918988) — which is
+# why the pause predicate reads ``PrinterState.print_error``, not the merged HMS list. The
+# two 0300 members have never been observed on this fleet.
+#
+# DELIBERATELY OUTSIDE the AMS fault taxonomy. These are print-module (0x03) and
+# mainboard/camera (0x05) codes, and the taxonomy's module gate ``_AMS_MODULES`` excludes
+# both by construction — a shared code suffix is not kinship (``0300_8006`` here is the
+# plate marker check; ``0700_8006`` in the taxonomy is an AMS feed fault). So the "never
+# write a new HMS frozenset literal, add a taxonomy row" rule does not reach here; the
+# prior art for a non-AMS literal set is ``usb_storage.HMS_STORAGE_LOW_FULL_CODES``.
+PLATE_CHECK_HMS_CODES: frozenset[str] = frozenset(
+    {
+        # "Foreign objects detected on heatbed. Please check and clean the heatbed. Then,
+        # select "Resume" to resume the print job."
+        "0300_8017",
+        # "The build plate marker was not detected. Please confirm the build plate is
+        # correctly positioned on the heatbed with all four corners aligned, and the
+        # marker is visible."
+        "0300_8006",
+        # "Foreign objects detected on heatbed; please check and clean up the heatbed."
+        # H2S live-observed 2026-07-20, printer 8 / fw 01.01.02.00.
+        "0500_806E",
+        # "Detected build plate offset or debris. Please align the build plate with the
+        # heatbed and remove all debris from the plate surface before continuing." The
+        # dominant production trip; it also fires on an EMPTY, unseated plate (003-H2S
+        # 2026-09-24). Catalog actions: IGNORE_RESUME, PROBLEM_SOLVED_RESUME.
+        "0500_808C",
+    }
+)
+
+
 # The firmware's power-loss recovery PROMPT: "There was an unfinished print job when
 # the printer lost power. If the model is still adhered to the build plate, you can try
 # resuming the print job." Every one of the 11 active printers raised exactly this code
@@ -2242,7 +2248,7 @@ def runout_hold_active(state) -> bool:
 # code suffix is not kinship (the same ruling that keeps ``0300_8003``, AI spaghetti
 # detection, out of it). So the "never write a new HMS frozenset literal, add a taxonomy
 # row" rule does not reach here; the prior art for a non-AMS literal set is
-# ``usb_storage.HMS_STORAGE_LOW_FULL_CODES``.
+# :data:`PLATE_CHECK_HMS_CODES` and ``usb_storage.HMS_STORAGE_LOW_FULL_CODES``.
 #
 # Matched on the SHORT code (``hms_short_code``), the same shape
 # :data:`PLATE_CHECK_HMS_CODES` is matched on.

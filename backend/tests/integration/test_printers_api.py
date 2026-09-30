@@ -2896,7 +2896,6 @@ class TestExecuteHMSActionAPI:
         frame goes out, the firmware answers THAT send with success, 200."""
         printer = await printer_factory(name="Test Printer")
         client = _dialog_client(result="success")
-        client.state.job_id = "771234"
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
@@ -2904,7 +2903,7 @@ class TestExecuteHMSActionAPI:
         ):
             mock_pm.get_client.return_value = client
 
-            body = {"print_error": "0500808C", "action": "PROBLEM_SOLVED_RESUME", "job_id": None}
+            body = {"print_error": "0500808C", "action": "PROBLEM_SOLVED_RESUME", "job_id": "771234"}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
         assert response.status_code == 200
@@ -2939,6 +2938,26 @@ class TestExecuteHMSActionAPI:
 
         assert response.status_code == 200
         dispatch.assert_called_once_with("07008029", "FILAMENT_EXTRUDED", "task-7")
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_missing_job_id_is_sent_empty(self, async_client: AsyncClient, printer_factory):
+        """The body's ``job_id`` is optional (a fault with no job); the dialog frame always
+        carries the key, as Studio's does — ``""``, never ``null``, never omitted."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+
+        with (
+            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
+            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
+        ):
+            mock_pm.get_client.return_value = client
+
+            body = {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        assert _published_print_frames(client)[0]["job_id"] == ""
 
     @pytest.mark.asyncio
     @pytest.mark.integration

@@ -4248,7 +4248,8 @@ async def execute_hms_action(
             raise HTTPException(400, "Failed to execute HMS action")
         return {"success": True, "message": "HMS action sent"}
 
-    sent = client.execute_hms_action(body.print_error, body.action, body.job_id)
+    # The dialog frames echo the pressed job's subtask id; a fault with no job sends "".
+    sent = client.execute_hms_action(body.print_error, body.action, body.job_id or "")
     if sent is None:
         raise HTTPException(400, "Failed to execute HMS action")
     if sent.sequence_id is None:

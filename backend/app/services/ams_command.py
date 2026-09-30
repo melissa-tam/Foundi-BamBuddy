@@ -123,11 +123,6 @@ RefusalReason = Literal["not_connected", "runout_hold"]
 #: name the firmware's ACK for either carries.
 _WIRE_COMMAND = "ams_change_filament"
 
-#: The ACK ``result`` spellings that mean success, compared lower-cased — the wire has
-#: shown both ``result=success`` (the motion echoes) and ``result=SUCCESS`` (the
-#: ``ams_control resume`` echo), 012-H2S 2026-09-23. Anything else is a failure.
-_ACK_SUCCESS_RESULTS = frozenset({"success", "ok"})
-
 #: How long the AMS must hold its "nothing fed" reading before an unload with NO
 #: observed change cycle counts as complete (and how long a mid-change unload's empty
 #: reading must hold). The operator's proven manual recovery left 16 s between the
@@ -255,14 +250,14 @@ class Observation:
     def fold_ack(self, ack: CommandAck | None) -> None:
         """Fold the firmware's ACK for this send (:func:`ack_of`) into the running facts.
 
-        A ``result`` that lower-cases to ``success`` or ``ok`` is success; anything else
-        (``fail``, a null result) is a failure. ``None`` — no ACK yet, or one already
-        rolled out of the client's bounded ACK log — changes nothing: an ACK once seen
-        stays seen.
+        Success is :attr:`CommandAck.succeeded`, the one reading of an ACK's ``result``
+        (``success`` / ``ok`` in any case; anything else, a null result included, is a
+        failure). ``None`` — no ACK yet, or one already rolled out of the client's bounded
+        ACK log — changes nothing: an ACK once seen stays seen.
         """
         if ack is None:
             return
-        self.acked = ack.result is not None and ack.result.lower() in _ACK_SUCCESS_RESULTS
+        self.acked = ack.succeeded
 
     def fold(self, entry: AmsWireSnapshot, now: AmsWireSnapshot, elapsed_s: float) -> None:
         """Fold one poll into the running facts. Idempotent for a repeated ``now``."""

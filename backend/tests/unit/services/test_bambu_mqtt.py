@@ -6821,7 +6821,7 @@ class TestAwaitAck:
         mqtt_client._client = MagicMock()
         mqtt_client.state.connected = True
 
-        sent = mqtt_client.execute_hms_action("0500808C", HMSAction.PROBLEM_SOLVED_RESUME)
+        sent = mqtt_client.execute_hms_action("0500808C", HMSAction.PROBLEM_SOLVED_RESUME, "771234")
         frame = _published_payloads(mqtt_client)[0]["print"]
         mqtt_client._process_message(
             {"print": {"command": frame["command"], "sequence_id": frame["sequence_id"], "result": "success"}}
@@ -6832,15 +6832,15 @@ class TestAwaitAck:
         assert ack is not None and ack.succeeded
 
 
-class TestDialogWireFacts:
-    """``PrinterState.print_error`` and ``job_id`` — wire facts re-read on every push that
-    carries them. ``print_error`` is the printer's CURRENT dialog (0 = none), which is why
-    a 0 push must clear it even though the ``hms_errors`` merge skips 0."""
+class TestPrintErrorWireFact:
+    """``PrinterState.print_error`` — the printer's CURRENT dialog (0 = none), a wire fact
+    re-read on every push that carries it, which is why a 0 push must clear it even though
+    the ``hms_errors`` merge skips 0."""
 
     client_kwargs = {"serial": "TEST_WIRE_FACTS"}
 
-    def test_defaults(self, mqtt_client):
-        assert (mqtt_client.state.print_error, mqtt_client.state.job_id) == (0, "")
+    def test_default_is_no_dialog(self, mqtt_client):
+        assert mqtt_client.state.print_error == 0
 
     def test_print_error_is_the_wire_word(self, mqtt_client):
         mqtt_client._process_message({"print": {"print_error": 83918988}})
@@ -6871,23 +6871,6 @@ class TestDialogWireFacts:
 
         assert mqtt_client.state.print_error == 2
         assert mqtt_client.state.hms_errors == []
-
-    @pytest.mark.parametrize(
-        ("wire", "expected"),
-        [("771234", "771234"), (771234, "771234"), ("", ""), (None, "")],
-    )
-    def test_job_id_is_the_push_field_as_a_string(self, mqtt_client, wire, expected):
-        mqtt_client.state.job_id = "stale"
-
-        mqtt_client._process_message({"print": {"job_id": wire}})
-
-        assert mqtt_client.state.job_id == expected
-
-    def test_a_push_without_job_id_keeps_it(self, mqtt_client):
-        mqtt_client._process_message({"print": {"job_id": "771234"}})
-        mqtt_client._process_message({"print": {"gcode_state": "PAUSE"}})
-
-        assert mqtt_client.state.job_id == "771234"
 
 
 # Each sequenced publisher, called once, and the wire command name it records under.
@@ -6982,7 +6965,9 @@ class TestCleanPrintErrorPublisher:
     def test_the_hms_modal_ok_publishes_the_frame_then_a_pushall(self, mqtt_client):
         from backend.app.services.hms_actions import HMSAction
 
-        assert mqtt_client.execute_hms_action("03008070", HMSAction.OK_BUTTON) == SentCommand("clean_print_error", "1")
+        assert mqtt_client.execute_hms_action("03008070", HMSAction.OK_BUTTON, "") == SentCommand(
+            "clean_print_error", "1"
+        )
 
         assert _published_payloads(mqtt_client) == [
             {"print": {"command": "clean_print_error", "sequence_id": "1"}},
@@ -6992,7 +6977,7 @@ class TestCleanPrintErrorPublisher:
     def test_the_hms_modal_double_check_ok_keeps_its_uiop_close(self, mqtt_client):
         from backend.app.services.hms_actions import HMSAction
 
-        assert mqtt_client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK) == SentCommand("uiop", None)
+        assert mqtt_client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK, "") == SentCommand("uiop", None)
 
         payloads = _published_payloads(mqtt_client)
         assert payloads[:2] == [
