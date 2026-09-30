@@ -981,6 +981,113 @@ class TestOperatorStopOverAFaultRequeues(_PlateCheckJourney):
                 assert batch.pause_reason is None  # the requeue, not the operator-stop hold
 
 
+class TestFarmRestartStop(_PlateCheckJourney):
+    """The terminal of a job the recovery driver stopped with its LAST release rung
+    (operator ruling 2026-09-29, 013-H2S incidents 410/411): a feed stall on the first
+    filament load of a job that had deposited nothing.
+
+    Driven through the real ``on_print_complete``, job phase and ``farm_policy``. The open
+    row is the store's own; the one thing laid over its projection is the contract key the
+    step-ledger writer derives (``printer_incidents.PAYLOAD_FAULT_RESTART_STOP``), at the one
+    read the handler makes before any closer runs. Before the verdict existed, an H2S echo
+    of the farm's stop read ``operator_screen`` and an H2C terminal (no echo) read nothing:
+    the unit was held for a human, and a first article was recorded ``failed``.
+    """
+
+    _SUB = "SUB-FR"
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        self._reset_process_state()
+        yield
+        self._reset_process_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("first_article", [False, True], ids=["unit", "first_article"])
+    @pytest.mark.parametrize("screen_echo", [True, False], ids=["h2s_cancel_echo", "h2c_no_echo"])
+    async def test_the_unit_is_restarted_next_in_line_not_failed_held_or_paged(
+        self, test_engine, screen_echo, first_article
+    ):
+        import contextlib
+        from contextlib import ExitStack
+
+        from sqlalchemy import select
+
+        from backend.app.models.print_batch import PrintBatch
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.models.printer_incident import KIND_JAM, STATUS_RECOVERING
+        from backend.app.services import farm_policy, printer_incidents
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            stopped_page = stack.enter_context(
+                patch.object(farm_policy.notification_service, "on_run_unit_stopped", new_callable=AsyncMock)
+            )
+            quarantine = stack.enter_context(
+                patch.object(farm_policy, "maybe_quarantine_printer", new_callable=AsyncMock)
+            )
+            printer_id, item_id, batch_id = await self._seed_farm_unit(
+                mocks.maker,
+                serial=f"FR-{int(screen_echo)}{int(first_article)}",
+                subtask=self._SUB,
+                first_article=first_article,
+            )
+            async with mocks.maker() as s:
+                await printer_incidents.open_new(
+                    s,
+                    printer_id=printer_id,
+                    job_id=self._SUB,
+                    item_id=item_id,
+                    kind=KIND_JAM,
+                    code="0700_8006",
+                    codes="mechanical_feed:0700_8006",
+                    slot_global_tray=2,
+                    status=STATUS_RECOVERING,
+                )
+            store_snapshots = printer_incidents.snapshots
+
+            def ledgered(pid):
+                return [
+                    {**row, printer_incidents.PAYLOAD_FAULT_RESTART_STOP: True} if row["job_id"] == self._SUB else row
+                    for row in store_snapshots(pid)
+                ]
+
+            stack.enter_context(patch.object(printer_incidents, "snapshots", side_effect=ledgered))
+
+            await self._terminal(printer_id, subtask=self._SUB, status="failed", screen_echo=screen_echo)
+            # The policy and the no-archive notification are AWAITED, never drained: a
+            # cancel would race the very calls this test reads.
+            for task in asyncio.all_tasks() - tasks_before:
+                if (task.get_name() or "").startswith(("farm-policy-terminal", "notify-no-archive")):
+                    with contextlib.suppress(Exception):
+                        await task
+            await TestPlateClearGate._drain(tasks_before)
+
+            async with mocks.maker() as s:
+                item = await s.get(PrintQueueItem, item_id)
+                # A stop the farm made, never a failure — a first article included.
+                assert (item.status, item.stop_source) == ("cancelled", "fault_restart")
+                requeues = (
+                    (await s.execute(select(PrintQueueItem).where(PrintQueueItem.retry_of_id == item_id)))
+                    .scalars()
+                    .all()
+                )
+                assert len(requeues) == 1
+                assert (requeues[0].status, requeues[0].position) == ("pending", 1)  # next in line
+                assert requeues[0].first_article is first_article
+                batch = await s.get(PrintBatch, batch_id)
+                assert (batch.status, batch.pause_reason) == ("active", None)  # the run is not held
+
+            stopped_page.assert_not_awaited()  # no operator-stop page for the farm's own restart
+            quarantine.assert_not_awaited()  # not a failure: nothing feeds quarantine
+            # The generic upstream "stopped" event fires as it does for every requeue lane.
+            mocks.notif.on_print_complete.assert_awaited_once()
+            assert mocks.notif.on_print_complete.await_args.args[2] == "cancelled"
+            # A no-deposit terminal gates nothing, and the verdict adds no gate of its own.
+            assert _occupancy().is_plate_occupied(printer_id) is False
+
+
 class TestAnUnattributedAbortHoldsTheRun(_PlateCheckJourney):
     """An ``aborted`` terminal nobody attributed (no UI mark, no screen echo, no hold, no
     reconcile flag) on a farm unit that DEPOSITED — the printer ended the job in neither

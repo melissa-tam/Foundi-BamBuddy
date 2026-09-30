@@ -34,6 +34,7 @@ from backend.app.models.printer_incident import FAULT_KINDS, KIND_PLATE_VISION
 from backend.app.services.bambu_mqtt import _HMS_PLATE_OCCUPANCY_CODES
 from backend.app.services.farm_correlation import (
     OPERATOR_STOP_VERDICTS,
+    REQUEUE_VERDICTS,
     STOP_SOURCE_RECONCILE_UNKNOWN,
     STOP_VERDICT_PLATE_REFUSED,
     StopVerdict,
@@ -179,10 +180,13 @@ def _recorded_status(
 ) -> str:
     """The farm's word for this terminal. Every rewrite, with its reason, in one place.
 
-    * ``plate_refused`` → ``cancelled``, a FIRST ARTICLE included. The printer refused
-      the plate; nothing was printed and nothing failed. Recorded ``failed``, a first
-      article would spend its one retry (``requeue.failed_ancestor_count``) and feed
-      quarantine for a plate the printer itself turned away.
+    * a requeue verdict (``farm_correlation.REQUEUE_VERDICTS``) → ``cancelled``, a FIRST
+      ARTICLE included. ``plate_refused``: the printer refused the plate; nothing was
+      printed and nothing failed. ``fault_restart``: the farm stopped a job that had
+      deposited nothing, over a feed stall on its first filament load, to restart it on
+      the backup spool (operator ruling 2026-09-29). Recorded ``failed``, a first article
+      would spend its one retry (``requeue.failed_ancestor_count``) and feed quarantine
+      for a plate the printer turned away or the farm itself chose to restart.
     * an operator's UI Stop → ``cancelled`` (an explicit queue action, whatever the
       firmware called it).
     * a job that deposited NOTHING and is neither a first article nor an eject →
@@ -200,7 +204,7 @@ def _recorded_status(
       holds, a human is paged, RESUME tops the deficit back up), and ONE word describes
       the terminal in the queue row, the archive and the page alike.
     """
-    if verdict == STOP_VERDICT_PLATE_REFUSED and raw_status != "completed":
+    if verdict in REQUEUE_VERDICTS and raw_status != "completed":
         return "cancelled"
     if verdict == "operator_ui" and raw_status in _STOP_RAW_STATUSES:
         return "cancelled"

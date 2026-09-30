@@ -514,6 +514,8 @@ class TestOperatorStopRequestOwnership:
 # three callers each released a claim with their own ideas of position and run state,
 # and the retry insert lived in farm_policy beside its decisions.
 _REQUEUE_OWNER = ("services", "requeue.py")
+# The one module that DECIDES a new attempt of a plate (``requeue.requeue_attempt``'s only caller).
+_REQUEUE_DECIDER = ("services", "farm_policy.py")
 _QUEUE_BUILDER = ("services", "queue_builder.py")
 _LINEAGE_FIELD = "retry_of_id"
 
@@ -624,9 +626,35 @@ class TestRequeueOwnership:
                 "lock and the head/tail rule live there and nowhere else."
             )
 
+    def test_only_the_farm_policy_requeues_an_attempt(self):
+        """WHETHER a plate goes back is the terminal disposition's (``farm_policy``: the stop
+        verdict, the genuine-failure cap, the run's state); HOW it goes back is ``requeue``'s.
+        A second caller is a second decision — the recovery driver requeueing the unit it
+        stopped would mint a row the terminal's own disposition mints again, or one no
+        terminal ever classified."""
+        strays = [
+            f"  - {'/'.join(parts)}:{node.lineno}"
+            for parts, tree in _app_trees()
+            if parts != _REQUEUE_DECIDER
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _called_attr(node) == "requeue_attempt"
+        ]
+        if strays:
+            pytest.fail(
+                "requeue.requeue_attempt is called outside services/farm_policy.py:\n"
+                + "\n".join(strays)
+                + "\n\nA terminal's disposition is farm_policy's (on_unit_terminal, read off the "
+                "terminal's ONE classification). A new reason to put a plate back is a verdict "
+                "(farm_correlation.StopVerdict) the policy routes, not a second requeue call."
+            )
+
     def test_the_owners_still_do_it(self):
         """The liveness half: pins that scan for strays pass on an empty tree too."""
         trees = dict(_app_trees())
+        assert any(
+            isinstance(node, ast.Call) and _called_attr(node) == "requeue_attempt"
+            for node in ast.walk(trees[_REQUEUE_DECIDER])
+        )
         requeue_tree = trees[_REQUEUE_OWNER]
         assert any(
             isinstance(node, ast.Call) and _called_attr(node) == "release_unstarted_claim"
