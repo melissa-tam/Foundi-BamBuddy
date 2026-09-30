@@ -122,6 +122,16 @@ Verdict = Literal["matched", "matched_by_name", "fallback", "foreign", "none"]
 # run-detail lineage still renders it; nothing writes it any more.
 STOP_VERDICT_PLATE_REFUSED = "plate_refused"
 
+# "The farm stopped this job to restart it on the backup spool." A terminal of the job an
+# OPEN AMS row's recovery driver stopped with its last release rung — a feed stall on the
+# first filament load of a job that had deposited nothing (operator ruling 2026-09-29).
+# Read off the open-row projection's ``printer_incidents.PAYLOAD_FAULT_RESTART_STOP``, never
+# off the printer's cancel echo (H2S echoes a remote stop; H2C echoes nothing). The unit is
+# recorded ``cancelled`` (a first article included) and requeued next in line with no retry
+# spent; ``requeue`` reads the token back to allow ONE such restart per unit lineage.
+# 13 characters — inside ``print_queue.stop_source``'s VARCHAR(20).
+STOP_VERDICT_FAULT_RESTART = "fault_restart"
+
 # "The farm never learned how this print ended." Stamped when the DOWNTIME reconcile
 # synthesises a terminal for a print whose outcome the wire cannot supply — the printer
 # came back IDLE, or echoing a different job, so there is no FINISH/FAILED to believe.

@@ -130,6 +130,20 @@ logger = logging.getLogger(__name__)
 # recovery, whatever else the close says.
 RESOLVE_DRIVER_ENDED = "driver_ended"
 
+# The step-ledger NAME of the recovery driver's last release rung: ``print.stop`` on a job
+# that has deposited nothing (operator ruling 2026-09-29). ONE origin for the spelling —
+# ``spool_recovery._LEVERS`` keys the rung by it and the open-row projection derives
+# :data:`PAYLOAD_FAULT_RESTART_STOP` from a step carrying it — because the terminal
+# classifier reads the farm's own stop off that projection, and a second spelling is how the
+# verdict would quietly stop being reached. 10 characters — inside the step name's VARCHAR(32).
+FAULT_RESTART_STEP = "print_stop"
+
+# The open-row projection key that says "the driver has SENT its restart stop on this row"
+# (a step named :data:`FAULT_RESTART_STEP` is on the row's ledger). Derived from the ledger
+# by the ledger's one writer and at rehydrate, never stored on the row: the ledger IS the
+# record of what a driver sent.
+PAYLOAD_FAULT_RESTART_STOP = "fault_restart_stop"
+
 # The statuses that mean "closed" — both stamp ``resolved_at`` (see the model
 # docstring's lifecycle table), so the open/closed question is asked of that column
 # and never of this tuple.

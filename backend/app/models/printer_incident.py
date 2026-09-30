@@ -290,6 +290,12 @@ RESOLVE_REPAIR_COMPLETED = "repair_completed"
 # is ``printer_incidents.outcome_of``.
 RESOLVE_DRIVER_SWAP = "driver_swap"
 RESOLVE_DRIVER_SELF_HEAL = "driver_self_heal"
+# The driver ended a job that had deposited NOTHING (a feed stall on the first filament
+# load, every release verb spent), unloaded the stalled feeder, parked its spool and
+# handed the unit back to the queue, which restarts it on the backup slot (operator
+# ruling 2026-09-29, 013-H2S incidents 410/411). A farm recovery, so it counts toward
+# the zero-human tally beside the swap and the self-heal.
+RESOLVE_DRIVER_RESTART = "driver_restart"
 # The startup rearm found the printer positive and closed the row: a RESTART's
 # reconciliation, not a witnessed resume — the edge itself was never observed.
 RESOLVE_REARM = "startup_rearm"
