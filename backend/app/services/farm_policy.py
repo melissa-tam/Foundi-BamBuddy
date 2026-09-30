@@ -750,9 +750,12 @@ async def _on_item_failed(db: AsyncSession, batch: PrintBatch, item: PrintQueueI
 async def on_operator_stop(db: AsyncSession, batch: PrintBatch, item: PrintQueueItem) -> None:
     """A farm unit ended without its plate and without failing.
 
-    Called from :func:`on_terminal` for EVERY farm item that lands terminal
-    ``cancelled`` — the operator's stop (``stop_source`` set) and, since 2026-09-19,
-    an outcome the farm could not learn at all (``reconcile_unknown``, or no stamp).
+    Called from :func:`on_unit_terminal` for a farm item that lands terminal
+    ``cancelled`` and does NOT requeue — :func:`_requeues_gracefully` is asked first,
+    and a refused plate, the farm's own restart stop and an operator stop over an open
+    fault go back in the queue instead. What is left: the operator's stop
+    (``stop_source`` set) and, since 2026-09-19, an outcome the farm could not learn at
+    all (``reconcile_unknown``, or no stamp).
     The name is the common case, not the whole set: what unites them is that the unit
     produced no part and nothing failed, so the run must HOLD for a human rather than
     count it either way. Deliberately does the OPPOSITE of a failure:
