@@ -19,7 +19,8 @@ Three shapes of "back in the queue", one module:
   Lineage-free is load-bearing: ``production_run.planned_plate_count`` and the top-up
   shortfall both count ``retry_count == 0`` rows as the run's primaries.
 
-…and the ONE walk of a lineage chain, :func:`lineage_root` / :func:`failed_ancestor_count`.
+…and the ONE walk of a lineage chain, :func:`lineage_root` / :func:`failed_ancestor_count` /
+:func:`fault_restart_spent`.
 
 **Next in line.** Every plate this module puts back lands at the HEAD of its target's
 position scope — ``create_queue_items(insert_at_top=True)`` for a new row,
@@ -50,6 +51,7 @@ from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services import queue_transitions
 from backend.app.services.dispatch_target import target_of
+from backend.app.services.farm_correlation import STOP_VERDICT_FAULT_RESTART
 from backend.app.services.queue_builder import create_queue_items, requeue_fields, seat_at_head
 
 if TYPE_CHECKING:
@@ -345,3 +347,20 @@ async def failed_ancestor_count(db: AsyncSession, item: PrintQueueItem) -> int:
     attempt has 0 failed ancestors and gets its retry; that retry has 1).
     """
     return len([ancestor async for ancestor in _ancestors(db, item) if ancestor.status == "failed"])
+
+
+async def fault_restart_spent(db: AsyncSession, item: PrintQueueItem) -> bool:
+    """Has ``item``'s plate already used its ONE fault restart?
+
+    The recovery driver may end a job that deposited nothing — a feed stall on its first
+    filament load that no release verb freed — and hand the plate back to the queue for
+    the backup spool (``farm_correlation.STOP_VERDICT_FAULT_RESTART``). Once per unit
+    (operator ruling 2026-09-29): a plate whose lineage was already restarted and stalls
+    again is escalated, not restarted a second time. Derived, never stored: some ANCESTOR
+    ended with that stop verdict. Strictly the ancestors — ``item``'s own terminal is the
+    stop the driver has just sent, and it carries the verdict too once it lands.
+    """
+    async for ancestor in _ancestors(db, item):
+        if ancestor.stop_source == STOP_VERDICT_FAULT_RESTART:
+            return True
+    return False

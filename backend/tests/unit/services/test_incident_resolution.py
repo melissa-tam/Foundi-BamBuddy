@@ -554,6 +554,22 @@ class TestTheWireLane:
 
         assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_REARM, False)
 
+    @pytest.mark.parametrize("live", ["IDLE", "FAILED"])
+    def test_a_restart_the_driver_owes_an_unload_stands_at_startup(self, live):
+        """A deploy mid-restart (operator ruling 2026-09-29): the driver STOPPED this row's
+        job to restart it and its unload has not completed (``restart_owed``, read off the
+        step ledger by the rearm). The printer reads IDLE / FAILED because of that stop — not
+        because the hold is over — so the cell stands and the continuation re-enters,
+        instead of handing the dispatcher a tube with the stalled filament in it. Only the
+        startup occasion reads it; without it the same reading closes as before."""
+        owed = Context(state=_state(live), ledger=MotionLedger(), driver_live=False, restart_owed=True)
+        verdict = resolve(_row(RESOLUTION_WIRE, status=STATUS_RECOVERING), "startup", owed)
+        assert verdict.close is False
+        assert "restart continuation re-enters" in verdict.evidence
+
+        not_owed = replace(owed, restart_owed=False)
+        assert resolve(_row(RESOLUTION_WIRE, status=STATUS_RECOVERING), "startup", not_owed).close is True
+
 
 class TestTheRepairLaneMotionEvidence:
     def _ctx(self, *, live="IDLE", hms=None, load_at=None, ams_status_main=0):

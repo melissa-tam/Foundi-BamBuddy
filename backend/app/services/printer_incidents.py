@@ -97,6 +97,7 @@ from backend.app.models.printer_incident import (
     RECOVER_ENDS,
     RESOLUTION_WIRE,
     RESOLVE_AUTO_RESUME,
+    RESOLVE_DRIVER_RESTART,
     RESOLVE_DRIVER_SELF_HEAL,
     RESOLVE_DRIVER_SWAP,
     RESOLVE_TERMINAL,
@@ -107,7 +108,7 @@ from backend.app.models.printer_incident import (
     STATUS_RESOLVED,
     PrinterIncident,
 )
-from backend.app.models.printer_incident_step import PrinterIncidentStep, StepKind
+from backend.app.models.printer_incident_step import STEP_KIND_LEVER, PrinterIncidentStep, StepKind
 
 # ``hms_errors`` is a LEAF (it imports only the vendored catalogs), so the one message
 # renderer is imported at module level — no cycle can form through it.
@@ -140,8 +141,9 @@ FAULT_RESTART_STEP = "print_stop"
 
 # The open-row projection key that says "the driver has SENT its restart stop on this row"
 # (a step named :data:`FAULT_RESTART_STEP` is on the row's ledger). Derived from the ledger
-# by the ledger's one writer and at rehydrate, never stored on the row: the ledger IS the
-# record of what a driver sent.
+# by the ledger's one writer, at rehydrate and at every re-projection of the row
+# (:func:`_restart_stops`), never stored on the row: the ledger IS the record of what a
+# driver sent.
 PAYLOAD_FAULT_RESTART_STOP = "fault_restart_stop"
 
 # The statuses that mean "closed" — both stamp ``resolved_at`` (see the model
@@ -400,7 +402,7 @@ def slot_desc(incident: PrinterIncident) -> str | None:
     return "external" if row_external(incident) else None
 
 
-def _payload(incident: PrinterIncident) -> dict:
+def _payload(incident: PrinterIncident, *, fault_restart_stop: bool = False) -> dict:
     """The projection the printer card renders.
 
     ``id`` rides along so a reader can ask about ONE row rather than about whatever
@@ -424,6 +426,13 @@ def _payload(incident: PrinterIncident) -> dict:
     (``farm_correlation.classify_stop``), which asks "is this terminal the job this hold
     paused?" of this DB-free projection; the card ignores it.
 
+    :data:`PAYLOAD_FAULT_RESTART_STOP` rides along for the same classifier: True once the
+    recovery driver has SENT its restart stop on this row, so the terminal of that stop
+    classifies as the farm's restart rather than the cancel echo H2S sends for any remote
+    stop (H2C sends none). It is a projection of the step ledger, never a column — the
+    caller passes what the ledger says (:func:`_restart_stops`; :func:`note_step` flips it
+    at the send), and a row nothing has derived it for reads False.
+
     Only JSON PRIMITIVES: the WS lane serializes this dict with a bare ``json.dumps``.
     """
     return {
@@ -435,7 +444,33 @@ def _payload(incident: PrinterIncident) -> dict:
         "created_at": incident.created_at.isoformat() if incident.created_at else None,
         "operator_exits": closed_by_recover(incident.kind, external=row_external(incident)),
         "printer_messages": [message.as_payload() for message in printer_messages_of(incident)],
+        PAYLOAD_FAULT_RESTART_STOP: fault_restart_stop,
     }
+
+
+async def _restart_stops(db: AsyncSession, incident_ids: Iterable[int]) -> frozenset[int]:
+    """The rows among ``incident_ids`` whose ledger holds the driver's restart stop — a
+    lever step named :data:`FAULT_RESTART_STEP`. THE derivation of
+    :data:`PAYLOAD_FAULT_RESTART_STOP` from the table, for every projection that is rebuilt
+    from a row (:func:`rehydrate`, and the re-projections after an escalation or an
+    upgrade): the ledger only ever grows, so a flag the send set is never lost by one."""
+    ids = list(incident_ids)
+    if not ids:
+        return frozenset()
+    result = await db.execute(
+        select(PrinterIncidentStep.incident_id)
+        .where(PrinterIncidentStep.incident_id.in_(ids))
+        .where(PrinterIncidentStep.kind == STEP_KIND_LEVER)
+        .where(PrinterIncidentStep.name == FAULT_RESTART_STEP)
+    )
+    return frozenset(result.scalars().all())
+
+
+async def _reproject(db: AsyncSession, incident: PrinterIncident) -> None:
+    """Rebuild ONE open row's cached projection after a write to the row, the restart flag
+    derived from its ledger (:func:`_restart_stops`)."""
+    stopped = incident.id in await _restart_stops(db, [incident.id])
+    _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident, fault_restart_stop=stopped)
 
 
 def printer_messages_of(incident: PrinterIncident) -> tuple[PrinterMessage, ...]:
@@ -935,7 +970,7 @@ async def mark_escalated(db: AsyncSession, incident_id: int) -> PrinterIncident 
     incident.status = STATUS_ESCALATED
     incident.escalated_at = datetime.utcnow()
     await db.commit()
-    _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident)
+    await _reproject(db, incident)
     return incident
 
 
@@ -982,7 +1017,7 @@ async def upgrade(
     incident.slot_global_tray = slot_global_tray
     incident.hms_full_codes = join_full_codes(hms_full_codes)
     await db.commit()
-    _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident)
+    await _reproject(db, incident)
     logger.info(
         "printer_incidents: printer %s incident %s UPGRADED kind=%s->%s code=%s codes=%s slot=%s",
         incident.printer_id,
@@ -1094,6 +1129,11 @@ async def note_step(
     ``(incident_id, seq)`` is a driver that lost count of its own log, and the unique
     index raises ``IntegrityError`` for it — after this rolls the failed commit back, so
     the caller's session stays usable.
+
+    A lever step named :data:`FAULT_RESTART_STEP` also sets the open row's cached
+    :data:`PAYLOAD_FAULT_RESTART_STOP` — here, at the one writer, once the step is durable
+    and BEFORE the driver publishes the stop, so the terminal that stop produces is always
+    classified against a projection that already says the farm sent it.
     """
     step = PrinterIncidentStep(
         incident_id=incident_id,
@@ -1111,6 +1151,10 @@ async def note_step(
         await db.rollback()
         raise
     logger.info("printer_incidents: incident %s step %s %s=%s sent", incident_id, seq, kind, name)
+    if kind == STEP_KIND_LEVER and name == FAULT_RESTART_STEP:
+        for rows in _open_cache.values():
+            if incident_id in rows:
+                rows[incident_id] = {**rows[incident_id], PAYLOAD_FAULT_RESTART_STOP: True}
     return step
 
 
@@ -1173,8 +1217,12 @@ OUTCOMES: tuple[str, ...] = (
 
 # The closes the FARM performed. A refill auto-resume on a row that was never paged
 # cannot happen today (a runout escalates before its refill lane can fire), so its
-# membership here is the rule, not an observed count.
-_FARM_CLOSES: frozenset[str] = frozenset({RESOLVE_DRIVER_SWAP, RESOLVE_DRIVER_SELF_HEAL, RESOLVE_AUTO_RESUME})
+# membership here is the rule, not an observed count. The restart
+# (``RESOLVE_DRIVER_RESTART``) is the driver's third recovery beside the swap and the
+# self-heal: the job it stopped had deposited nothing, and the unit goes back to the queue.
+_FARM_CLOSES: frozenset[str] = frozenset(
+    {RESOLVE_DRIVER_SWAP, RESOLVE_DRIVER_SELF_HEAL, RESOLVE_DRIVER_RESTART, RESOLVE_AUTO_RESUME}
+)
 
 
 def outcome_of(incident: PrinterIncident) -> str:
@@ -1397,10 +1445,15 @@ async def rehydrate(db: AsyncSession) -> int:
     """Rebuild the projection cache from the DB. Returns the number of open rows.
 
     Called at startup, after the stale-incident sweep, so a restart mid-hold still
-    renders the chip and still answers "is this printer owned".
+    renders the chip and still answers "is this printer owned". The restart flag is
+    derived from each row's ledger (:func:`_restart_stops`), so a terminal classified after
+    a restart still reads the farm's own stop.
     """
     _open_cache.clear()
     rows = await all_open(db)
+    stopped = await _restart_stops(db, [incident.id for incident in rows])
     for incident in rows:
-        _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident)
+        _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(
+            incident, fault_restart_stop=incident.id in stopped
+        )
     return len(rows)
