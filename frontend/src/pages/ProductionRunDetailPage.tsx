@@ -198,6 +198,10 @@ const OPERATOR_STOP_LABEL: StopSourceLabel = {
  * - `plate_refused` — the printer's own plate check paused the print and it
  *   ended without printing. The label names the plate check, not who pressed
  *   Stop: the lineage question is why this plate went back in the queue.
+ * - `fault_restart` — the farm stopped a job that had deposited nothing, over
+ *   a feed stall on its first filament load, to restart it on the backup
+ *   spool. The label names the farm and the stall, never an operator: the
+ *   printer may have echoed the farm's remote stop as a screen cancel.
  * - `farm_vision_abort` — the farm's own stop of a plate-check trip.
  *   The farm no longer stops on a trip (the print stays paused
  *   for a human), so nothing writes this token now; the row renders STORED
@@ -210,6 +214,7 @@ const STOP_SOURCE_LABELS: Readonly<Record<UnitStopSource, StopSourceLabel>> = {
   operator_ui: OPERATOR_STOP_LABEL,
   operator_screen: OPERATOR_STOP_LABEL,
   plate_refused: { icon: ScanEye, key: 'productionRuns.detail.stoppedAtPlateCheck' },
+  fault_restart: { icon: RotateCcw, key: 'productionRuns.detail.stoppedByFarmFeedStall' },
   farm_vision_abort: { icon: ScanEye, key: 'productionRuns.detail.stoppedByFarmVision' },
   reconcile_unknown: { icon: HelpCircle, key: 'productionRuns.detail.stoppedByReconcileUnknown' },
 };
