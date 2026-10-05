@@ -353,6 +353,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "farm_escalate_consecutive_failures",
             "farm_offline_stall_minutes",
             "farm_pause_stall_minutes",
+            "farm_plate_check_decision_minutes",
             "farm_cooldown_stall_window_minutes",
             "farm_cooldown_max_hold_minutes",
             "farm_cooldown_aux_fan_percent",

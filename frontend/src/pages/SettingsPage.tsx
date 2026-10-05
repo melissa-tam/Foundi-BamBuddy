@@ -1080,6 +1080,7 @@ export function SettingsPage() {
       (settings.farm_escalate_consecutive_failures ?? 2) !== (localSettings.farm_escalate_consecutive_failures ?? 2) ||
       (settings.farm_offline_stall_minutes ?? 30) !== (localSettings.farm_offline_stall_minutes ?? 30) ||
       (settings.farm_pause_stall_minutes ?? 15) !== (localSettings.farm_pause_stall_minutes ?? 15) ||
+      (settings.farm_plate_check_decision_minutes ?? 10) !== (localSettings.farm_plate_check_decision_minutes ?? 10) ||
       (settings.respool_prompt_threshold_g ?? 30) !== (localSettings.respool_prompt_threshold_g ?? 30) ||
       (settings.farm_cooldown_stall_window_minutes ?? 15) !== (localSettings.farm_cooldown_stall_window_minutes ?? 15) ||
       (settings.farm_cooldown_stall_epsilon_c ?? 1) !== (localSettings.farm_cooldown_stall_epsilon_c ?? 1) ||
@@ -1212,6 +1213,7 @@ export function SettingsPage() {
         farm_escalate_consecutive_failures: localSettings.farm_escalate_consecutive_failures,
         farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
         farm_pause_stall_minutes: localSettings.farm_pause_stall_minutes,
+        farm_plate_check_decision_minutes: localSettings.farm_plate_check_decision_minutes,
         respool_prompt_threshold_g: localSettings.respool_prompt_threshold_g,
         farm_cooldown_stall_window_minutes: localSettings.farm_cooldown_stall_window_minutes,
         farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
@@ -5229,6 +5231,15 @@ export function SettingsPage() {
                   </p>
                 </div>
               </div>
+              <SettingNumber
+                id="farm-plate-check-decision-minutes"
+                label={t('settings.farmPlateCheckDecisionMinutes', 'Plate check decision window (min)')}
+                hint={t('settings.farmPlateCheckDecisionMinutesHelp', 'After a failed re-check the print waits paused this long for Ignore and resume or Stop; then the farm stops it and holds the plate.')}
+                value={localSettings.farm_plate_check_decision_minutes ?? 10}
+                onChange={(value) => updateSetting('farm_plate_check_decision_minutes', value)}
+                min={1}
+                max={120}
+              />
               <div className="flex items-center justify-between pt-1">
                 <div className="flex-1 mr-4">
                   <p className="text-sm text-white">

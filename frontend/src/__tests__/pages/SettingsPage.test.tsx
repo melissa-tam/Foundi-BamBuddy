@@ -12,6 +12,7 @@ import { server } from '../mocks/server';
 import { SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, SIDEBAR_ORDER_KEY } from '../../utils/sidebarLayout';
 import { setAuthToken } from '../../api/client';
 import i18n from '../../i18n';
+import en from '../../i18n/locales/en';
 
 const mockSettings = {
   auto_archive: true,
@@ -934,6 +935,64 @@ describe('SettingsPage', () => {
         // the default General tab (the card itself is not rendered yet).
         expect(screen.getByText('Dispatch responsiveness')).toBeInTheDocument();
       });
+    });
+  });
+
+  // How long a print stays PAUSED at the printer's plate-check dialog for a
+  // human's Ignore and resume or Stop before the farm stops it (1–120 min).
+  describe('Farm tab — plate check decision window', () => {
+    const LABEL = en.settings.farmPlateCheckDecisionMinutes;
+
+    const openFarmTab = async (user: ReturnType<typeof userEvent.setup>) => {
+      await waitFor(() => {
+        expect(screen.getByText('Farm')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Farm'));
+    };
+
+    it('renders the window at its default with the mechanism in a tooltip', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      // mockSettings omits the key, so the component's `?? 10` fallback shows.
+      const field = await waitFor(() => screen.getByLabelText(LABEL) as HTMLInputElement);
+      expect(field.value).toBe('10');
+      expect(field).toHaveAttribute('min', '1');
+      expect(field).toHaveAttribute('max', '120');
+
+      const help = en.settings.farmPlateCheckDecisionMinutesHelp;
+      await user.click(screen.getByRole('button', { name: help }));
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(help);
+    });
+
+    it('round-trips the window through the save endpoint, clamped to 120', async () => {
+      const bodies: Array<Record<string, unknown>> = [];
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          bodies.push(body);
+          return HttpResponse.json({ ...mockSettings, ...body });
+        }),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await openFarmTab(user);
+
+      const field = await waitFor(() => screen.getByLabelText(LABEL) as HTMLInputElement);
+      fireEvent.change(field, { target: { value: '25' } });
+      await waitFor(
+        () => expect(bodies.at(-1)?.farm_plate_check_decision_minutes).toBe(25),
+        { timeout: 5000 },
+      );
+
+      fireEvent.change(field, { target: { value: '500' } });
+      expect(field.value).toBe('120');
+      await waitFor(
+        () => expect(bodies.at(-1)?.farm_plate_check_decision_minutes).toBe(120),
+        { timeout: 5000 },
+      );
     });
   });
 

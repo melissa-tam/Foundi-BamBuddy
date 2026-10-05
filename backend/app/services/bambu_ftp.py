@@ -8,15 +8,49 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from enum import Enum
 from ftplib import FTP, FTP_TLS  # nosec B402
 from io import BytesIO
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    from backend.app.models.printer import Printer
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _parse_list_mtime(month: str, day: str, time_or_year: str, *, now: datetime) -> datetime | None:
+    """The UTC-aware modification time of one ``LIST`` line's date columns, or None.
+
+    The printer's FTP server stamps ``LIST`` in UTC (measured 2026-10-05: the listing, the
+    printer's own clock and the farm's agreed once read as UTC). Read as LOCAL time on a farm
+    west of Greenwich, a file written in the last few hours parsed "in the future", was rolled
+    back a year, and the USB sweep deleted the camera recording still being written (a 110 MB
+    partial, 2026-10-04 23:46).
+
+    ``Mon DD HH:MM`` carries no year: the server prints that form only for recent stamps, so the
+    year is the one that puts the stamp NEAREST to ``now`` — a stamp a printer clock writes a
+    little ahead of the farm's lands just ahead of now (never a year back), and one written just
+    before New Year read in January lands in the old year. ``Mon DD YYYY`` is midnight UTC.
+    """
+    try:
+        if ":" not in time_or_year:
+            return datetime.strptime(f"{month} {day} {time_or_year}", "%b %d %Y").replace(tzinfo=timezone.utc)
+        # 2000 is a leap year, so a Feb 29 stamp parses before its real year is chosen.
+        stamp = datetime.strptime(f"{month} {day} 2000 {time_or_year}", "%b %d %Y %H:%M")
+    except ValueError:
+        return None
+    candidates: list[datetime] = []
+    for year in (now.year - 1, now.year, now.year + 1):
+        try:
+            candidates.append(stamp.replace(year=year, tzinfo=timezone.utc))
+        except ValueError:
+            continue  # Feb 29 outside a leap year
+    return min(candidates, key=lambda candidate: abs(candidate - now)) if candidates else None
 
 
 class DeleteResult(Enum):
@@ -289,7 +323,12 @@ class BambuFTPClient:
             self._ftp = None
 
     def list_files(self, path: str = "/") -> list[dict]:
-        """List files in a directory."""
+        """List files in a directory.
+
+        Each entry's ``mtime`` (when the line carries one) is a tz-AWARE UTC datetime — the
+        server stamps ``LIST`` in UTC (:func:`_parse_list_mtime`). Every reader compares it with
+        an aware value or takes ``.timestamp()``.
+        """
         if not self._ftp:
             return []
 
@@ -298,6 +337,7 @@ class BambuFTPClient:
             self._ftp.cwd(path)
             items = []
             self._ftp.retrlines("LIST", items.append)
+            now = datetime.now(timezone.utc)
 
             for item in items:
                 parts = item.split()
@@ -306,31 +346,9 @@ class BambuFTPClient:
                     is_dir = item.startswith("d")
                     size = int(parts[4]) if not is_dir else 0
 
-                    # Parse modification time from FTP listing
-                    # Format: "Nov 30 10:15" or "Nov 30  2024"
-                    mtime = None
-                    try:
-                        from datetime import datetime
-
-                        month = parts[5]
-                        day = parts[6]
-                        time_or_year = parts[7]
-
-                        # Determine if it's time (HH:MM) or year
-                        if ":" in time_or_year:
-                            # Recent file: "Nov 30 10:15" - assume current year
-                            year = datetime.now().year
-                            time_str = f"{month} {day} {year} {time_or_year}"
-                            mtime = datetime.strptime(time_str, "%b %d %Y %H:%M")
-                            # If parsed date is in the future, use last year
-                            if mtime > datetime.now():
-                                mtime = mtime.replace(year=year - 1)
-                        else:
-                            # Older file: "Nov 30 2024" - no time, just date
-                            time_str = f"{month} {day} {time_or_year}"
-                            mtime = datetime.strptime(time_str, "%b %d %Y")
-                    except (ValueError, IndexError):
-                        pass  # Non-critical: mtime parsing is best-effort; file entry works without it
+                    # "Nov 30 10:15" (recent, no year) or "Nov 30  2024"; best-effort — an entry
+                    # works without its mtime.
+                    mtime = _parse_list_mtime(parts[5], parts[6], parts[7], now=now)
 
                     file_entry = {
                         "name": name,
@@ -757,10 +775,22 @@ class BambuFTPClient:
             except (OSError, ftplib.Error):
                 pass  # Both AVBL and STAT unsupported; storage info will rely on directory scan
 
-        # Calculate used space by listing root directories
+        # Calculate used space by listing root directories. ``/ipcam`` holds the camera's video
+        # recording, the largest occupant of an H2S drive (~250 MB per segment); H2S answers
+        # AVBL with an error, so this scan is the only size reading the UI has there.
         try:
             total_used = 0
-            dirs_to_scan = ["/cache", "/timelapse", "/model", "/data", "/data/Metadata", "/"]
+            dirs_to_scan = [
+                "/cache",
+                "/timelapse",
+                "/timelapse/thumbnail",
+                "/ipcam",
+                "/ipcam/thumbnail",
+                "/model",
+                "/data",
+                "/data/Metadata",
+                "/",
+            ]
 
             for dir_path in dirs_to_scan:
                 try:
@@ -1155,6 +1185,71 @@ async def delete_file_async(
         return DeleteResult.FAILED
 
     return await loop.run_in_executor(None, _delete)
+
+
+async def run_in_session(
+    ip_address: str,
+    access_code: str,
+    fn: Callable[[BambuFTPClient], T],
+    *,
+    socket_timeout: float | None = None,
+    printer_model: str | None = None,
+) -> T:
+    """Run ``fn`` against ONE connected FTPS session, in a worker thread, and return its result.
+
+    For work that touches many paths: every ``*_async`` wrapper above opens its own session
+    (TLS handshake + login per call), and a printer caps concurrent FTPS sessions, so a sweep
+    that listed five directories and deleted fifty files through them held the printer's FTP
+    for 55 sessions in a row. ``fn`` receives the connected :class:`BambuFTPClient` and uses its
+    sync methods (``list_files`` / ``delete_file`` …); the session is closed when it returns or
+    raises. Raises :class:`ConnectionError` when the connect or the login fails — the caller
+    tells "printer unreachable" from "nothing there" by it.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _run() -> T:
+        client = BambuFTPClient(ip_address, access_code, timeout=socket_timeout, printer_model=printer_model)
+        if not client.connect():
+            raise ConnectionError(f"FTPS connect/login to {ip_address} failed")
+        try:
+            return fn(client)
+        finally:
+            client.disconnect()
+
+    return await loop.run_in_executor(None, _run)
+
+
+async def remove_abandoned_upload(printer: "Printer", remote_path: str, *, lane: str, why: str) -> bool:
+    """Remove a lane's OWN upload for a job that will not run. True iff the file is off the drive.
+
+    THE one body every abandonment exit shares — a dispatch whose claim or commit was refused
+    or whose print command failed, an eject whose upload, start or claim failed or that the
+    printer never started. A file left on the USB for a job that never happened is one
+    screen-tap away from a FOREIGN print, and it fills the drive. A 550 is success (the file is
+    not there), only a real failure is False. Best-effort by design: every outcome is one log
+    line naming the lane and why, and nothing raises — the caller is already unwinding.
+    """
+    try:
+        result = await delete_file_async(
+            printer.ip_address, printer.access_code, remote_path, printer_model=printer.model
+        )
+    except Exception as exc:  # noqa: BLE001 — an unwinding lane must never raise from its cleanup
+        logger.debug("[USB] %s: delete of %s raised: %s", lane, remote_path, exc)
+        result = DeleteResult.FAILED
+    removed = result is not DeleteResult.FAILED
+    logger.log(
+        logging.INFO if removed else logging.WARNING,
+        "[USB] %s: abandoned upload %s on printer %s %s (%s)",
+        lane,
+        remote_path,
+        getattr(printer, "name", None) or getattr(printer, "id", "?"),
+        {
+            DeleteResult.DELETED: "removed",
+            DeleteResult.NOT_FOUND: "already gone",
+        }.get(result, "could not be removed"),
+        why,
+    )
+    return removed
 
 
 async def download_file_bytes_async(

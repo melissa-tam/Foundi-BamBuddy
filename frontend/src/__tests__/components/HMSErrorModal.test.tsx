@@ -15,6 +15,7 @@ import { HMSErrorModal } from '../../components/HMSErrorModal';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
 import type { HMSError } from '../../api/client';
+import en from '../../i18n/locales/en';
 
 const WIKI = 'https://wiki.bambulab.com/en/hms/home';
 
@@ -175,6 +176,54 @@ describe('HMSErrorModal', () => {
 
       fireEvent.keyDown(window, { key: 'Escape' });
       expect(onClose).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // The plate-check dialog's buttons are the human's only while the farm is
+  // not acting: the backend filters a plate-check code's `actions` to the
+  // human's turn (`plate_check_exit.actions`) or to `[]`, and the modal renders
+  // exactly that list, so it never offers a button that races the farm.
+  describe('plate-check dialog buttons', () => {
+    const plateCheck = (actions: string[]): HMSError => ({
+      attr: 0x05008000,
+      code: '0x808C',
+      module: 5,
+      severity: 2,
+      full_code: '0500808C',
+      short_code: '0500_808C',
+      description: 'Detected build plate offset or debris',
+      actions,
+      job_id: '4711',
+      wiki_url: WIKI,
+    });
+
+    it('offers no dialog button while the farm is acting (actions empty)', () => {
+      render(<HMSErrorModal {...defaultProps} errors={[plateCheck([])]} />);
+
+      expect(screen.getByText('Detected build plate offset or debris')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: en.hmsErrors.actions.IGNORE_RESUME })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: en.hmsErrors.actions.PROBLEM_SOLVED_RESUME })).not.toBeInTheDocument();
+    });
+
+    it('offers both dialog buttons on the human turn and presses the held dialog', async () => {
+      let body: unknown = null;
+      server.use(
+        http.post('/api/v1/printers/:id/hms/execute-action', async ({ request }) => {
+          body = await request.json();
+          return HttpResponse.json({ success: true, message: 'HMS action executed' });
+        }),
+      );
+      const user = userEvent.setup();
+      render(
+        <HMSErrorModal {...defaultProps} errors={[plateCheck(['PROBLEM_SOLVED_RESUME', 'IGNORE_RESUME'])]} />,
+      );
+
+      expect(screen.getByRole('button', { name: en.hmsErrors.actions.PROBLEM_SOLVED_RESUME })).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: en.hmsErrors.actions.IGNORE_RESUME }));
+
+      await waitFor(() =>
+        expect(body).toEqual({ action: 'IGNORE_RESUME', print_error: '0500808C', job_id: '4711' }),
+      );
     });
   });
 });

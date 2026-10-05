@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.app.services import usb_storage
+from backend.app.services import usb_storage, usb_uploads
 from backend.app.services.eject.remote import upload_in_flight as eject_lane_upload_in_flight
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.usb_storage import usb_present
@@ -24,8 +24,10 @@ OTHER = 8
 @pytest.fixture(autouse=True)
 def _reset_usb_state():
     usb_storage._reset_state()
+    usb_uploads._reset_state()
     yield
     usb_storage._reset_state()
+    usb_uploads._reset_state()
 
 
 @pytest.fixture
@@ -74,24 +76,25 @@ class TestLiveReading:
 class TestUploadBlipSuppression:
     async def test_in_flight_upload_masks_a_false_reading(self, statuses):
         statuses[PID] = SimpleNamespace(sdcard=False)
-        async with usb_storage.upload_in_flight(PID):
+        async with usb_uploads.upload_in_flight(PID):
             assert usb_present(PID) is None
         # The blip window closes with the upload.
         assert usb_present(PID) is False
 
     async def test_in_flight_upload_does_not_mask_a_present_drive(self, statuses):
         statuses[PID] = SimpleNamespace(sdcard=True)
-        async with usb_storage.upload_in_flight(PID):
+        async with usb_uploads.upload_in_flight(PID):
             assert usb_present(PID) is True
 
     async def test_in_flight_on_another_printer_does_not_mask(self, statuses):
         statuses[PID] = SimpleNamespace(sdcard=False)
-        async with usb_storage.upload_in_flight(OTHER):
+        async with usb_uploads.upload_in_flight(OTHER):
             assert usb_present(PID) is False
 
     async def test_remote_eject_lane_registration_masks(self, statuses):
-        # The eject lane wraps its FTPS upload in the SAME context manager, so its
-        # blips are suppressed without that module knowing anything about USB state.
+        # The eject lane wraps its FTPS upload in the SAME context manager (the leaf
+        # ``usb_uploads`` registry), so its blips are suppressed without that module
+        # knowing anything about USB state.
         statuses[PID] = SimpleNamespace(sdcard=False)
         async with eject_lane_upload_in_flight(PID):
             assert usb_present(PID) is None

@@ -10,6 +10,7 @@ import { PrintersPage } from '../../pages/PrintersPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
 import en from '../../i18n/locales/en';
+import { formatTimeOnly, parseUTCDate } from '../../utils/date';
 
 const mockPrinters = [
   {
@@ -985,6 +986,190 @@ describe('PrintersPage', () => {
       await screen.findByRole('button', { name: en.printers.plateStatus.markCleared });
       const refusalLead = en.printers.plateStatus.refusal.split('{{message}}')[0];
       expect(screen.queryByText((text) => text.startsWith(refusalLead))).not.toBeInTheDocument();
+    });
+  });
+
+  /**
+   * The human's turn at a paused plate check (operator ruling 2026-10-05): the
+   * farm's self-heal ran out and left the print PAUSED at the printer's dialog
+   * for a bounded window. The card offers the printer's own "Ignore and resume"
+   * exactly while the backend's `plate_check_exit` says so; the UI never
+   * re-derives the turn from the hold chip or the HMS list.
+   * Copy is asserted through the `en` leaves, never restated here.
+   */
+  describe('plate check: Ignore and resume', () => {
+    const DEADLINE = '2026-10-05T08:10:00Z';
+    const REFUSAL = 'Plate check: the farm is still working on it';
+    const IGNORE = en.printers.plateCheck.ignoreResume;
+
+    const plateCheckExit = (deadlineAt: string | null) => ({
+      print_error: '0500808C',
+      job_id: '4711',
+      actions: ['PROBLEM_SOLVED_RESUME', 'IGNORE_RESUME'],
+      deadline_at: deadlineAt,
+    });
+
+    /** A print PAUSED at the plate dialog under an escalated plate-check hold. */
+    const pausedAtPlateCheck = (exit: ReturnType<typeof plateCheckExit> | null) => ({
+      state: 'PAUSE',
+      hms_errors: [],
+      open_incident: {
+        id: 472,
+        kind: 'plate_vision',
+        status: 'escalated',
+        slot_desc: null,
+        created_at: '2026-10-05T08:00:00Z',
+        operator_exits: false,
+        driver_live: false,
+        printer_messages: [],
+      },
+      plate_check_exit: exit,
+    });
+
+    const serveStatus = (status: Record<string, unknown>) => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...mockPrinterStatus, ...status }),
+        ),
+      );
+    };
+
+    /** Press the card's button and return the confirm dialog it opens. */
+    const openConfirm = async (user: ReturnType<typeof userEvent.setup>) => {
+      await user.click(await screen.findByRole('button', { name: IGNORE }));
+      return screen.findByRole('dialog');
+    };
+
+    it('offers no Ignore and resume while the backend reports no human turn', async () => {
+      // The same escalated hold on the same paused print, but no exit on the
+      // wire (e.g. the farm's own stop is in flight): the chip, not the button.
+      serveStatus(pausedAtPlateCheck(null));
+      render(<PrintersPage />);
+
+      await screen.findByText(en.printers.incident.plate_vision);
+      await screen.findByRole('button', { name: en.printers.stop });
+      expect(screen.queryByRole('button', { name: IGNORE })).not.toBeInTheDocument();
+    });
+
+    it('offers Ignore and resume on the human turn', async () => {
+      serveStatus(pausedAtPlateCheck(plateCheckExit(DEADLINE)));
+      render(<PrintersPage />);
+
+      expect(await screen.findByRole('button', { name: IGNORE })).toBeEnabled();
+    });
+
+    it('disables Ignore and resume without printers:control', async () => {
+      // Auth enabled with no logged-in user: hasPermission is false for everything.
+      server.use(
+        http.get('*/api/v1/auth/status', () =>
+          HttpResponse.json({ auth_enabled: true, requires_setup: false }),
+        ),
+      );
+      serveStatus(pausedAtPlateCheck(plateCheckExit(DEADLINE)));
+      render(<PrintersPage />);
+
+      const button = await screen.findByRole('button', { name: IGNORE });
+      await waitFor(() => expect(button).toBeDisabled());
+      expect(button).toHaveAttribute('title', en.printers.permission.noControl);
+    });
+
+    it('states the consequence and the deadline in the confirm', async () => {
+      serveStatus(pausedAtPlateCheck(plateCheckExit(DEADLINE)));
+      render(<PrintersPage />);
+
+      const dialog = await openConfirm(userEvent.setup());
+      expect(within(dialog).getByRole('heading', { name: en.printers.plateCheck.confirmTitle })).toBeInTheDocument();
+      expect(within(dialog).getByText(en.printers.plateCheck.confirmBody, { exact: false })).toBeInTheDocument();
+      // The page's own local-time formatter over the UTC deadline (settings
+      // carry no time_format here, so the card uses 'system').
+      const time = formatTimeOnly(parseUTCDate(DEADLINE)!, 'system');
+      const deadlineLine = en.printers.plateCheck.confirmDeadline.replace('{{time}}', time);
+      expect(within(dialog).getByText(deadlineLine, { exact: false })).toBeInTheDocument();
+      expect(within(dialog).getByRole('button', { name: en.common.cancel })).toBeInTheDocument();
+    });
+
+    it('omits the deadline line when no deadline is armed', async () => {
+      serveStatus(pausedAtPlateCheck(plateCheckExit(null)));
+      render(<PrintersPage />);
+
+      const dialog = await openConfirm(userEvent.setup());
+      expect(within(dialog).getByText(en.printers.plateCheck.confirmBody, { exact: false })).toBeInTheDocument();
+      const deadlineLead = en.printers.plateCheck.confirmDeadline.split('{{time}}')[0];
+      expect(within(dialog).queryByText(deadlineLead, { exact: false })).not.toBeInTheDocument();
+    });
+
+    it('sends nothing when the confirm is cancelled', async () => {
+      let pressed = false;
+      serveStatus(pausedAtPlateCheck(plateCheckExit(DEADLINE)));
+      server.use(
+        http.post('/api/v1/printers/:id/hms/execute-action', () => {
+          pressed = true;
+          return HttpResponse.json({ success: true, message: 'HMS action executed' });
+        }),
+      );
+      render(<PrintersPage />);
+
+      const user = userEvent.setup();
+      const dialog = await openConfirm(user);
+      await user.click(within(dialog).getByRole('button', { name: en.common.cancel }));
+
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      expect(pressed).toBe(false);
+    });
+
+    it('presses IGNORE_RESUME for the held dialog, then re-reads the printer status', async () => {
+      let sent: { printerId: string; body: unknown } | null = null;
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        // Before the press: the human's turn. After it: the print runs again.
+        // Only the mutation's invalidation can re-read inside the test (the
+        // card's fallback poll is 30 s), so the button vanishing proves it.
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json(
+            sent
+              ? { ...mockPrinterStatus, state: 'RUNNING', plate_check_exit: null }
+              : { ...mockPrinterStatus, ...pausedAtPlateCheck(plateCheckExit(DEADLINE)) },
+          ),
+        ),
+        http.post('/api/v1/printers/:id/hms/execute-action', async ({ request, params }) => {
+          sent = { printerId: String(params.id), body: await request.json() };
+          return HttpResponse.json({ success: true, message: 'HMS action executed' });
+        }),
+      );
+      render(<PrintersPage />);
+
+      const user = userEvent.setup();
+      const dialog = await openConfirm(user);
+      await user.click(within(dialog).getByRole('button', { name: IGNORE }));
+
+      await waitFor(() =>
+        expect(sent).toEqual({
+          printerId: '1',
+          body: { action: 'IGNORE_RESUME', print_error: '0500808C', job_id: '4711' },
+        }),
+      );
+      expect(await screen.findByText(en.printers.plateCheck.sent)).toBeInTheDocument();
+      await waitFor(() => expect(screen.queryByRole('button', { name: IGNORE })).not.toBeInTheDocument());
+    });
+
+    it('names the backend refusal when the press is refused (409)', async () => {
+      serveStatus(pausedAtPlateCheck(plateCheckExit(DEADLINE)));
+      server.use(
+        http.post('/api/v1/printers/:id/hms/execute-action', () =>
+          HttpResponse.json({ detail: REFUSAL }, { status: 409 }),
+        ),
+      );
+      render(<PrintersPage />);
+
+      const user = userEvent.setup();
+      const dialog = await openConfirm(user);
+      await user.click(within(dialog).getByRole('button', { name: IGNORE }));
+
+      expect(
+        await screen.findByText(en.printers.plateCheck.refused.replace('{{message}}', REFUSAL)),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(en.printers.plateCheck.sent)).not.toBeInTheDocument();
     });
   });
 

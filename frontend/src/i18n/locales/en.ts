@@ -192,7 +192,7 @@ export default {
         printerOfflineStalled: 'Printer offline mid-print — outcome unknown until it reconnects',
         printerServiceHold: 'Printer in maintenance mode',
         printPausedStalled: 'Paused on the printer — needs attention (no auto-recovery)',
-        visionHold: 'Paused at plate check — fix the plate, then resume',
+        visionHold: 'Paused at the plate check. Ignore and resume, or stop the print.',
         powerLossHold: 'Held at the printer\'s power-loss prompt — resume at the printer',
         zReferenceLost: 'Restarted with a part on the plate — remove it by hand',
         previousPrintFailed: 'Held: previous print failed',
@@ -1284,7 +1284,7 @@ export default {
       runout: 'Refill the demanded slot; the print resumes on its own',
       physical: 'Filament path blocked. Clears when a slot loads or the interrupted print completes through the path, or on Recover.',
       power_loss: 'Resume at the printer',
-      plate_vision: 'Fix the plate, then resume the print',
+      plate_vision: 'Ignore and resume, or stop the print',
       z_reference_lost: 'Restarted with a part on the plate — remove it by hand, then Mark plate cleared',
     },
     // A hold's RECORDED printer words, one line under the chip while the
@@ -1292,6 +1292,16 @@ export default {
     holdMessage: {
       reported: 'Printer reported: {{message}}',
       notShown: 'No longer shown on the printer',
+    },
+    // The human's turn at a paused plate check: the printer's own
+    // "Ignore and resume" button on the card, behind a confirm.
+    plateCheck: {
+      ignoreResume: 'Ignore and resume',
+      confirmTitle: 'Ignore and resume',
+      confirmBody: 'Skips the printer\'s plate check for this job. The print continues on the plate as it is.',
+      confirmDeadline: 'The farm stops the print at {{time}} if nothing is pressed.',
+      sent: 'Ignore and resume sent',
+      refused: 'Ignore and resume refused: {{message}}',
     },
     // Fans
     fans: {
@@ -2750,6 +2760,8 @@ export default {
     farmOfflineStallMinutesHelp: 'Flag a unit still printing whose printer has been offline this long — it never terminates, just shows the stall (5–720)',
     farmPauseStallMinutes: 'Paused stall (min)',
     farmPauseStallMinutesHelp: 'Flag and notify when a printing unit sits paused this long with no auto-recovery running — it never cancels anything (5–720)',
+    farmPlateCheckDecisionMinutes: 'Plate check decision window (min)',
+    farmPlateCheckDecisionMinutesHelp: 'After a failed re-check the print waits paused this long for Ignore and resume or Stop; then the farm stops it and holds the plate.',
     farmCooldownStallWindow: 'Cooling check interval (min)',
     farmCooldownStallWindowHelp: 'How often to confirm the bed is still cooling before an eject. Two failed checks in a row quarantine the printer. 0 turns the check off.',
     farmCooldownStallEpsilon: 'Minimum cooling per check (°C)',

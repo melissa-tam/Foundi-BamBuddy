@@ -130,6 +130,14 @@ def _claim(printer_id: int, pending: PendingEject) -> PendingEject:
     return claimed
 
 
+def _assert_removed(remove: AsyncMock, printer_id: int, remote_path: str, why: str) -> None:
+    """The abandonment exit called THE shared helper once, for this lane's own file."""
+    remove.assert_awaited_once()
+    printer, path = remove.await_args.args
+    assert (printer.id, path) == (printer_id, remote_path)
+    assert remove.await_args.kwargs == {"lane": "eject", "why": why}
+
+
 def _ftp_patches(*, connected=True, upload=True, started=True):
     return (
         patch.object(printer_manager, "is_connected", return_value=connected),
@@ -233,10 +241,12 @@ class TestDispatchPartPresentEject:
             printer, item = await _seed(db_session, source)
             _gate(printer.id)
             c1, c2, c3 = _ftp_patches(upload=False)
+            remove = AsyncMock(return_value=True)
             with (
                 c1,
                 c2,
                 c3,
+                patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
                 patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
@@ -246,6 +256,8 @@ class TestDispatchPartPresentEject:
             assert exc.value.status_code == 502
             assert plate_occupancy.pending_eject_view(printer.id) is None
             assert printer.id not in remote._start_deadlines
+            # A failed or partial upload may still have left bytes: the lane removes its own file.
+            _assert_removed(remove, printer.id, f"/eject_fa_item{item.id}.3mf", "the upload failed")
         finally:
             source.unlink(missing_ok=True)
 
@@ -255,10 +267,12 @@ class TestDispatchPartPresentEject:
             printer, item = await _seed(db_session, source)
             _gate(printer.id)
             c1, c2, c3 = _ftp_patches()
+            remove = AsyncMock(return_value=True)
             with (
                 c1,
                 c2,
                 c3,
+                patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
                 patch.object(printer_manager, "start_print", MagicMock(return_value=False)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
@@ -269,6 +283,42 @@ class TestDispatchPartPresentEject:
             # Nothing is claimed unless start_print was accepted.
             assert plate_occupancy.pending_eject_view(printer.id) is None
             assert printer.id not in remote._start_deadlines
+            _assert_removed(remove, printer.id, f"/eject_production_item{item.id}.3mf", "the start command was refused")
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_a_claim_refused_after_the_start_stops_the_sweep_and_removes_its_file(self, db_session):
+        """The file IS on the printer and the firmware may act on it: the sweep is stopped and
+        the upload removed, through the same shared helper as every other abandonment."""
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            _gate(printer.id)
+            c1, c2, c3 = _ftp_patches()
+            remove = AsyncMock(return_value=True)
+            stop = MagicMock(return_value=True)
+            with (
+                c1,
+                c2,
+                c3,
+                patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
+                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                patch.object(printer_manager, "stop_print", stop),
+                patch.object(plate_occupancy, "claim_for_eject", MagicMock(return_value="dispatch_in_flight")),
+                pytest.raises(remote.EjectDispatchError) as exc,
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
+                )
+            assert exc.value.code == "dispatch_in_flight"
+            stop.assert_called_once_with(printer.id)
+            assert printer.id not in remote._start_deadlines
+            _assert_removed(
+                remove,
+                printer.id,
+                f"/eject_production_item{item.id}.3mf",
+                "the claim was refused (dispatch_in_flight)",
+            )
         finally:
             source.unlink(missing_ok=True)
 
@@ -613,14 +663,35 @@ class TestEjectNameHelpers:
 
     def test_expected_stem(self):
         pe = remote.PendingEject("production", 5, 32)
-        assert remote.expected_eject_stem(pe) == "eject_production_item32"
-        assert remote.expected_eject_stem(remote.PendingEject("fa", 1, 7)) == "eject_fa_item7"
+        assert remote.expected_eject_stem(pe, 4) == "eject_production_item32"
+        assert remote.expected_eject_stem(remote.PendingEject("fa", 1, 7), 4) == "eject_fa_item7"
+
+    def test_expected_stem_covers_the_manual_sweep_by_printer_id(self):
+        """The foreign-plate sweep has no unit: its stem is keyed by the PRINTER, and it is the
+        same builder's answer (2026-10-05: three inline copies of this rule are gone)."""
+        assert remote.expected_eject_stem(remote.PendingEject("manual", None, None), 4) == "eject_manual_p4"
+        assert remote.parse_eject_job_name(remote.expected_eject_stem(PendingEject("manual", None, None), 42)) == (
+            "manual",
+            42,
+        )
+
+    def test_a_unit_bound_record_without_its_unit_names_nothing(self):
+        assert remote.expected_eject_stem(remote.PendingEject("production", 1, None), 4) is None
+
+    def test_a_dispatch_refuses_a_stem_it_cannot_name(self):
+        with pytest.raises(remote.EjectDispatchError) as exc:
+            remote._dispatch_stem(remote.PendingEject("production", 1, None), 4)
+        assert exc.value.status_code == 409
+        assert remote._dispatch_stem(remote.PendingEject("fa", 1, 7), 4) == "eject_fa_item7"
+
+    def test_the_remote_path_is_the_dispatchers_naming_rule(self):
+        assert remote._eject_remote_path("eject_production_item32") == "/eject_production_item32.3mf"
 
     def test_expected_stem_accepts_the_identity_projection(self):
         # The matcher only ever holds the projection, never the record.
         _claim(9010, PendingEject("production", 5, 32))
         identity = plate_occupancy.eject_identity(9010)
-        assert remote.expected_eject_stem(identity) == "eject_production_item32"
+        assert remote.expected_eject_stem(identity, 9010) == "eject_production_item32"
 
 
 class TestMatchesPendingEjectNameTightening:
@@ -746,10 +817,12 @@ class TestDispatchForeignEject:
             await db_session.refresh(prof)
             _gate(printer.id)
             c1, c2, c3 = _ftp_patches(upload=False)
+            remove = AsyncMock(return_value=True)
             with (
                 c1,
                 c2,
                 c3,
+                patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
                 patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
@@ -758,6 +831,7 @@ class TestDispatchForeignEject:
                 )
             assert exc.value.status_code == 502
             assert plate_occupancy.pending_eject_view(printer.id) is None
+            _assert_removed(remove, printer.id, f"/eject_manual_p{printer.id}.3mf", "the upload failed")
         finally:
             source.unlink(missing_ok=True)
 
@@ -998,6 +1072,37 @@ class TestEjectStartDeadline:
         # The printer is ejectable again — the operator can simply eject now.
         assert plate_occupancy.ejectable(pid, Evidence()) is None
 
+    @pytest.mark.parametrize(
+        "pending,stem",
+        [(PendingEject("production", 1, 5, expected_runtime_s=83.0), "eject_production_item5"), (None, None)],
+    )
+    async def test_an_expired_sweep_removes_its_file_named_by_the_one_builder(
+        self, db_session, own_session_factory, pending, stem
+    ):
+        """The expired record names the file through ``expected_eject_stem`` — the unit-bound
+        stem, or the printer-keyed manual one (``pending=None`` here stands for the manual
+        record, whose stem needs the printer row's id)."""
+        from backend.app.services.eject import monitor as monitor_mod
+
+        printer = Printer(name="SD", serial_number="SD1", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db_session.add(printer)
+        await db_session.commit()
+        await db_session.refresh(printer)
+        if pending is None:
+            pending, stem = PendingEject("manual", None, None, expected_runtime_s=60.0), f"eject_manual_p{printer.id}"
+        _claim(printer.id, pending)
+        remove = AsyncMock(return_value=True)
+
+        with (
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
+            patch("backend.app.core.database.async_session", own_session_factory),
+            patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
+        ):
+            await remote._start_deadline(printer.id, sleep=_FakeSleep(), timeout_s=1.0)
+
+        assert plate_occupancy.eject_identity(printer.id) is None
+        _assert_removed(remove, printer.id, f"/{stem}.3mf", "the printer never started the sweep")
+
     async def test_a_started_eject_is_never_expired_by_a_late_deadline(self):
         # The task can wake late or spuriously: the authority, not the timer, decides.
         from backend.app.services.eject import monitor as monitor_mod
@@ -1006,11 +1111,16 @@ class TestEjectStartDeadline:
         _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0))
         plate_occupancy.note_eject_started(pid)
 
-        with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
+        remove = AsyncMock(return_value=True)
+        with (
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+            patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
+        ):
             await remote._start_deadline(pid, sleep=_FakeSleep(), timeout_s=1.0)
 
         assert plate_occupancy.eject_identity(pid) is not None
         notify.assert_not_awaited()
+        remove.assert_not_awaited()  # a sweep that started keeps its file
 
     async def test_a_hydrated_eject_never_expires_on_the_start_deadline(self):
         """Its ``started_at`` is None BY CONSTRUCTION, so an expiry keyed on that would

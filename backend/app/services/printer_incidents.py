@@ -70,7 +70,14 @@ ONE writer of ``printer_incident_step``, called only by :class:`EvidenceLog`): w
 driver SENT against an incident, one row per step. The wire cannot restate it — a stalled
 feeder answers every release lever with the same re-PAUSE in the same change, and a plate
 check reads PAUSE before and after the farm pressed its re-check — so a restart must read it
-here to resume at the next unsent step instead of re-sending what already went out.
+here to resume at the next unsent step instead of re-sending what already went out. The ledger
+facts a DB-free reader needs ride the open-row projection (:func:`_ledger_projections`): the
+AMS driver's restart stop and a plate-check episode's last stop, flipped at the send and the read
+and re-derived at every rebuild of the projection — never a column.
+
+**The plate-check human's turn is decided here too** (:func:`plate_check_human_turn`, operator
+ruling 2026-10-05): a status serializer must offer "Ignore and resume" only while the print waits
+paused at the plate check for a person, and it may not import the ladder to ask.
 """
 
 from __future__ import annotations
@@ -80,7 +87,7 @@ import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 from sqlalchemy import exists, func as sa_func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -113,11 +120,15 @@ from backend.app.models.printer_incident import (
     STATUS_RESOLVED,
     PrinterIncident,
 )
-from backend.app.models.printer_incident_step import STEP_KIND_LEVER, PrinterIncidentStep, StepKind
+from backend.app.models.printer_incident_step import STEP_KIND_LEVER, STEP_KIND_STOP, PrinterIncidentStep, StepKind
+
+# ``hms_actions`` is a LEAF (the vendored action catalog), the one spelling of a dialog button.
+from backend.app.services.hms_actions import HMSAction
 
 # ``hms_errors`` is a LEAF (it imports only the vendored catalogs), so the one message
-# renderer is imported at module level — no cycle can form through it.
-from backend.app.services.hms_errors import PrinterMessage, messages_from_full_codes
+# renderer and the plate-check pause predicate are imported at module level — no cycle can
+# form through it.
+from backend.app.services.hms_errors import PrinterMessage, messages_from_full_codes, plate_check_paused
 
 # ``job_identity`` is stdlib-only by construction, so the held-job rule is imported the same way.
 from backend.app.services.job_identity import is_held_job
@@ -151,9 +162,19 @@ FAULT_RESTART_STEP = "print_stop"
 # The open-row projection key that says "the driver has SENT its restart stop on this row"
 # (a step named :data:`FAULT_RESTART_STEP` is on the row's ledger). Derived from the ledger
 # by the ledger's one writer, at rehydrate and at every re-projection of the row
-# (:func:`_restart_stops`), never stored on the row: the ledger IS the record of what a
+# (:func:`_ledger_projections`), never stored on the row: the ledger IS the record of what a
 # driver sent.
 PAYLOAD_FAULT_RESTART_STOP = "fault_restart_stop"
+
+# The dialog buttons a HUMAN may press on the printer's plate-check dialog through the farm, on
+# their turn (:func:`plate_check_human_turn`, operator ruling 2026-10-05): the printer's own
+# "Problem solved, resume" (it re-checks) and "Ignore and resume" (it skips the check). Ordered
+# as the card offers them; plain ``str`` so the projection stays JSON primitives. The ladder
+# itself never presses "Ignore" (``pause_recovery``).
+PLATE_CHECK_HUMAN_ACTIONS: tuple[str, ...] = (
+    str(HMSAction.PROBLEM_SOLVED_RESUME),
+    str(HMSAction.IGNORE_RESUME),
+)
 
 # The statuses that mean "closed" — both stamp ``resolved_at`` (see the model
 # docstring's lifecycle table), so the open/closed question is asked of that column
@@ -436,7 +457,31 @@ def slot_desc(incident: PrinterIncident) -> str | None:
     return "external" if row_external(incident) else None
 
 
-def _payload(incident: PrinterIncident, *, fault_restart_stop: bool = False) -> dict:
+@dataclass(frozen=True, slots=True)
+class _LedgerProjection:
+    """The step-ledger facts the open-row projection carries for DB-free readers.
+
+    ``fault_restart_stop`` — the AMS recovery driver has SENT its restart stop on the row (a
+    lever step named :data:`FAULT_RESTART_STEP`), read by the terminal classifier.
+
+    ``last_stop`` — a plate-check episode's LAST farm stop step as ``{"name", "outcome"}`` (the
+    outcome ``None`` while unanswered), or ``None`` when the farm sent none. Read by the episode's
+    sampler (an unanswered decision-hold stop re-enters; a standing hold is not the sampler's) and
+    by the deadline timer (a hold with a stop on it is no longer waiting for a decision). The name
+    is the ledger's as written: the ladder's own hydration reads a pre-2026-10-05 ``stop`` as the
+    retry rung's (``pause_recovery``), and no DB-free reader branches on it.
+    """
+
+    fault_restart_stop: bool = False
+    last_stop: dict | None = None
+
+
+def _payload(
+    incident: PrinterIncident,
+    *,
+    ledger: _LedgerProjection | None = None,
+    deadline_at: str | None = None,
+) -> dict:
     """The projection the printer card renders.
 
     ``id`` rides along so a reader can ask about ONE row rather than about whatever
@@ -460,15 +505,23 @@ def _payload(incident: PrinterIncident, *, fault_restart_stop: bool = False) -> 
     (``farm_correlation.classify_stop``), which asks "is this terminal the job this hold
     paused?" of this DB-free projection; the card ignores it.
 
-    :data:`PAYLOAD_FAULT_RESTART_STOP` rides along for the same classifier: True once the
-    recovery driver has SENT its restart stop on this row, so the terminal of that stop
-    classifies as the farm's restart rather than the cancel echo H2S sends for any remote
-    stop (H2C sends none). It is a projection of the step ledger, never a column — the
-    caller passes what the ledger says (:func:`_restart_stops`; :func:`note_step` flips it
-    at the send), and a row nothing has derived it for reads False.
+    The STEP-LEDGER facts (:class:`_LedgerProjection`) ride along for the DB-free readers:
+    :data:`PAYLOAD_FAULT_RESTART_STOP` (True once the recovery driver has SENT its restart
+    stop on this row, so the terminal of that stop classifies as the farm's restart rather
+    than the cancel echo H2S sends for any remote stop — H2C sends none) and ``last_stop`` (a
+    plate-check episode's last farm stop). Projections of the ledger, never columns: the
+    caller passes what the ledger says (:func:`_ledger_projections`; :func:`note_step` /
+    :func:`answer_step` re-derive at the send and the read), and a row nothing has derived
+    them for reads the defaults.
+
+    ``escalated_at`` — when the row became a human's (ISO, naive UTC like ``created_at``), the
+    start of a plate-check decision hold's window. ``deadline_at`` — when that window ends and
+    the farm stops the print (ISO, naive UTC), written only by the hold's deadline timer
+    (:func:`note_deadline`); ``None`` while no timer has computed it.
 
     Only JSON PRIMITIVES: the WS lane serializes this dict with a bare ``json.dumps``.
     """
+    ledger = ledger if ledger is not None else _LedgerProjection()
     return {
         "id": incident.id,
         "kind": incident.kind,
@@ -476,35 +529,87 @@ def _payload(incident: PrinterIncident, *, fault_restart_stop: bool = False) -> 
         "job_id": incident.job_id or "",
         "slot_desc": slot_desc(incident),
         "created_at": incident.created_at.isoformat() if incident.created_at else None,
+        "escalated_at": incident.escalated_at.isoformat() if incident.escalated_at else None,
         "operator_exits": closed_by_recover(incident.kind, external=row_external(incident)),
         "printer_messages": [message.as_payload() for message in printer_messages_of(incident)],
-        PAYLOAD_FAULT_RESTART_STOP: fault_restart_stop,
+        PAYLOAD_FAULT_RESTART_STOP: ledger.fault_restart_stop,
+        "last_stop": dict(ledger.last_stop) if ledger.last_stop is not None else None,
+        "deadline_at": deadline_at,
     }
 
 
-async def _restart_stops(db: AsyncSession, incident_ids: Iterable[int]) -> frozenset[int]:
-    """The rows among ``incident_ids`` whose ledger holds the driver's restart stop — a
-    lever step named :data:`FAULT_RESTART_STEP`. THE derivation of
-    :data:`PAYLOAD_FAULT_RESTART_STOP` from the table, for every projection that is rebuilt
-    from a row (:func:`rehydrate`, and the re-projections after an escalation or an
-    upgrade): the ledger only ever grows, so a flag the send set is never lost by one."""
+async def _ledger_projections(db: AsyncSession, incident_ids: Iterable[int]) -> dict[int, _LedgerProjection]:
+    """THE derivation of the projection's ledger facts from the table, for every projection that
+    is rebuilt from a row (:func:`rehydrate`, the re-projections after an escalation or an
+    upgrade) and for the one writer's own re-derivation at the send and the read. ONE query over
+    the rows' restart-stop levers and stop steps, in send order; a row with neither reads the
+    defaults. The ledger only ever grows, so a fact the send set is never lost by a rebuild."""
     ids = list(incident_ids)
     if not ids:
-        return frozenset()
+        return {}
     result = await db.execute(
-        select(PrinterIncidentStep.incident_id)
+        select(
+            PrinterIncidentStep.incident_id,
+            PrinterIncidentStep.kind,
+            PrinterIncidentStep.name,
+            PrinterIncidentStep.outcome,
+        )
         .where(PrinterIncidentStep.incident_id.in_(ids))
-        .where(PrinterIncidentStep.kind == STEP_KIND_LEVER)
-        .where(PrinterIncidentStep.name == FAULT_RESTART_STEP)
+        .where(
+            or_(
+                (PrinterIncidentStep.kind == STEP_KIND_LEVER) & (PrinterIncidentStep.name == FAULT_RESTART_STEP),
+                PrinterIncidentStep.kind == STEP_KIND_STOP,
+            )
+        )
+        .order_by(PrinterIncidentStep.incident_id, PrinterIncidentStep.seq)
     )
-    return frozenset(result.scalars().all())
+    restart: set[int] = set()
+    last_stop: dict[int, dict] = {}
+    for incident_id, kind, name, outcome in result.all():
+        if kind == STEP_KIND_LEVER:
+            restart.add(incident_id)
+        else:
+            last_stop[incident_id] = {"name": name, "outcome": outcome}
+    return {
+        incident_id: _LedgerProjection(fault_restart_stop=incident_id in restart, last_stop=last_stop.get(incident_id))
+        for incident_id in restart | set(last_stop)
+    }
 
 
 async def _reproject(db: AsyncSession, incident: PrinterIncident) -> None:
-    """Rebuild ONE open row's cached projection after a write to the row, the restart flag
-    derived from its ledger (:func:`_restart_stops`)."""
-    stopped = incident.id in await _restart_stops(db, [incident.id])
-    _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(incident, fault_restart_stop=stopped)
+    """Rebuild ONE open row's cached projection after a write to the row, its ledger facts
+    derived from the ledger (:func:`_ledger_projections`). The deadline is the hold timer's
+    note, not a fact of the row, so the cached one is carried over."""
+    ledger = (await _ledger_projections(db, [incident.id])).get(incident.id)
+    rows = _open_cache.setdefault(incident.printer_id, {})
+    deadline_at = rows.get(incident.id, {}).get("deadline_at")
+    rows[incident.id] = _payload(incident, ledger=ledger, deadline_at=deadline_at)
+
+
+async def _rederive_ledger(db: AsyncSession, incident_id: int) -> None:
+    """Re-derive ONE cached row's ledger facts after a step write — the projection follows the
+    ledger at the send and at the read. A row not in the cache (closed) is left alone."""
+    for rows in _open_cache.values():
+        if incident_id in rows:
+            ledger = (await _ledger_projections(db, [incident_id])).get(incident_id, _LedgerProjection())
+            rows[incident_id] = {
+                **rows[incident_id],
+                PAYLOAD_FAULT_RESTART_STOP: ledger.fault_restart_stop,
+                "last_stop": dict(ledger.last_stop) if ledger.last_stop is not None else None,
+            }
+            return
+
+
+def note_deadline(printer_id: int, incident_id: int, at: datetime | None) -> None:
+    """Project a plate-check decision hold's DEADLINE onto its open row (``deadline_at``), or
+    clear it (``None``). Projection ONLY — no column: the deadline is ``escalated_at`` plus the
+    setting, re-derived by the timer at every arm, so storing it would be a second copy that a
+    changed setting could contradict. ONE writer: the hold's deadline timer
+    (``pause_recovery._decision_deadline``). A row not open in the cache is left alone."""
+    rows = _open_cache.get(printer_id)
+    if not rows or incident_id not in rows:
+        return
+    rows[incident_id] = {**rows[incident_id], "deadline_at": at.isoformat() if at is not None else None}
 
 
 def printer_messages_of(incident: PrinterIncident) -> tuple[PrinterMessage, ...]:
@@ -600,6 +705,78 @@ def _with_liveness(printer_id: int, payload: dict) -> dict:
     AMS, not about one row.
     """
     return {**payload, "driver_live": driver_live(printer_id)}
+
+
+# Why the plate-check human's turn does NOT hold — :func:`plate_check_turn_refusal`.
+PlateCheckTurnRefusal = Literal["no_hold", "farm_acting", "not_paused", "other_job"]
+
+
+def _plate_check_turn(printer_id: int, state) -> tuple[PlateCheckTurnRefusal | None, dict | None]:
+    """THE rule of the human's turn, read once: ``(refusal, row)`` — the refusal ``None`` and the
+    plate-check row's projection when the turn holds. Every check reads a fact the store or the
+    wire restates for free, in order:
+
+    * the printer carries an open ``plate_vision`` row (:func:`snapshot` by kind, so an AMS or
+      power-loss row ranked above it never hides it) — else ``no_hold``;
+    * the row is ESCALATED and no driver is live on the printer — else ``farm_acting``: a
+      ``recovering`` episode is the ladder's to answer, and a live driver (the decision
+      deadline's stop is out) owns the outcome; a human press would race it;
+    * the printer is PAUSEd at its plate check right now (``hms_errors.plate_check_paused``) —
+      else ``not_paused``;
+    * on the job the row paused (``job_identity.is_held_job`` over the live ``subtask_id``) —
+      else ``other_job``.
+    """
+    row = snapshot(printer_id, kind=KIND_PLATE_VISION)
+    if row is None:
+        return "no_hold", None
+    if row.get("status") != STATUS_ESCALATED or row.get("driver_live"):
+        return "farm_acting", row
+    if not plate_check_paused(state):
+        return "not_paused", row
+    live_job = (getattr(state, "subtask_id", None) or "").strip()
+    if not is_held_job(live_job, str(row.get("job_id") or "")):
+        return "other_job", row
+    return None, row
+
+
+def plate_check_turn_refusal(printer_id: int, state) -> PlateCheckTurnRefusal | None:
+    """Why the human's turn at the plate-check dialog does NOT hold (:func:`_plate_check_turn`),
+    or ``None`` when it does. Pure, DB-free, sync. The refusal reading of the ONE rule
+    :func:`plate_check_human_turn` projects, for the press that is refused
+    (``pause_recovery.human_dialog_action``)."""
+    refusal, _row = _plate_check_turn(printer_id, state)
+    return refusal
+
+
+def plate_check_human_turn(printer_id: int, state) -> dict | None:
+    """Is it a HUMAN's turn at the printer's plate-check dialog? The dict the card and the HMS
+    modal offer the buttons from, or ``None``. Pure, DB-free, sync.
+
+    Operator ruling 2026-10-05: when the ladder's stop would be an escalation, the farm leaves the
+    print PAUSED at the dialog and a person decides — Ignore and resume, Problem solved, or Stop —
+    until the decision window runs out and the farm stops it. The turn holds while the printer's
+    plate-check row is ESCALATED, no driver is live, and the printer is PAUSEd at its plate check
+    on the row's own job (:func:`_plate_check_turn`): the decision hold, and the FALLBACK hold
+    whose stop the farm could not land. ``recovering`` (the ladder still acting) and a live driver
+    (the deadline's stop in flight) are the farm's — a press then would race it.
+
+    ``{"print_error": "%08X" of the live dialog, "job_id": the row's job, "actions":
+    PLATE_CHECK_HUMAN_ACTIONS, "deadline_at": the hold timer's ISO deadline or None}`` — JSON
+    primitives (the WS frame dumps it bare). EXACTLY two callers, both pinned
+    (``test_code_quality.TestPlateCheckDialogOwnership``): the status projection
+    (``printer_manager.plate_check_exit_payload``) and the press
+    (``pause_recovery.human_dialog_action``). Beside :func:`_with_liveness` because a status
+    serializer may not import the ladder to ask.
+    """
+    refusal, row = _plate_check_turn(printer_id, state)
+    if refusal is not None or row is None:
+        return None
+    return {
+        "print_error": f"{int(state.print_error):08X}",
+        "job_id": str(row.get("job_id") or ""),
+        "actions": list(PLATE_CHECK_HUMAN_ACTIONS),
+        "deadline_at": row.get("deadline_at"),
+    }
 
 
 def open_kinds(printer_id: int | None) -> frozenset[str]:
@@ -1204,10 +1381,12 @@ async def note_step(
     index raises ``IntegrityError`` for it — after this rolls the failed commit back, so
     the caller's session stays usable.
 
-    A lever step named :data:`FAULT_RESTART_STEP` also sets the open row's cached
-    :data:`PAYLOAD_FAULT_RESTART_STOP` — here, at the one writer, once the step is durable
-    and BEFORE the driver publishes the stop, so the terminal that stop produces is always
-    classified against a projection that already says the farm sent it.
+    The open row's cached ledger facts are re-derived here (:func:`_rederive_ledger`), at
+    the one writer, once the step is durable and BEFORE the driver publishes: a lever step
+    named :data:`FAULT_RESTART_STEP` sets :data:`PAYLOAD_FAULT_RESTART_STOP`, so the terminal
+    that stop produces is always classified against a projection that already says the farm
+    sent it; a plate-check ``stop`` step becomes the row's unanswered ``last_stop``, so the
+    sampler re-enters a stop a crash left unanswered.
     """
     step = PrinterIncidentStep(
         incident_id=incident_id,
@@ -1225,10 +1404,7 @@ async def note_step(
         await db.rollback()
         raise
     logger.info("printer_incidents: incident %s step %s %s=%s sent", incident_id, seq, kind, name)
-    if kind == STEP_KIND_LEVER and name == FAULT_RESTART_STEP:
-        for rows in _open_cache.values():
-            if incident_id in rows:
-                rows[incident_id] = {**rows[incident_id], PAYLOAD_FAULT_RESTART_STOP: True}
+    await _rederive_ledger(db, incident_id)
     return step
 
 
@@ -1236,7 +1412,9 @@ async def answer_step(db: AsyncSession, incident_id: int, seq: int, *, outcome: 
     """Record what the READ of step ``seq`` found, stamp ``read_at`` and commit.
 
     ``None`` when the incident has no such step — nothing was sent, so there is nothing
-    to answer.
+    to answer. The open row's cached ledger facts follow the answer (:func:`_rederive_ledger`):
+    a plate-check stop answered here is the ``last_stop`` outcome the deadline timer and the
+    sampler read.
     """
     step = await db.scalar(
         select(PrinterIncidentStep)
@@ -1251,6 +1429,7 @@ async def answer_step(db: AsyncSession, incident_id: int, seq: int, *, outcome: 
     logger.info(
         "printer_incidents: incident %s step %s %s=%s outcome=%s", incident_id, seq, step.kind, step.name, outcome
     )
+    await _rederive_ledger(db, incident_id)
     return step
 
 
@@ -1278,10 +1457,10 @@ async def count_rows_with_step(
     ``exclude_job_id``.
 
     The store read behind "how many OTHER plate-check episodes on this printer did the farm
-    already stop in the window" (``pause_recovery.plate_check_facts``): the retry-or-escalate
-    verdict counts the farm's own ``stop`` steps, so an operator's stop or a foreign
-    terminal — neither of which writes one — never counts. Open and closed rows alike: an
-    episode is counted by what the farm SENT in it, not by how it ended.
+    already stop in the window" (``pause_recovery``'s second rung, where the retry-or-escalate
+    decision is made once): it counts the farm's own ``stop`` steps, so an operator's stop or
+    a foreign terminal — neither of which writes one — never counts. Open and closed rows
+    alike: an episode is counted by what the farm SENT in it, not by how it ended.
 
     The excluded job is decided by :func:`~backend.app.services.job_identity.is_held_job`,
     in Python — the held-job rule has one spelling, and SQL cannot spell its ``unknown``
@@ -1717,15 +1896,17 @@ async def rehydrate(db: AsyncSession) -> int:
     """Rebuild the projection cache from the DB. Returns the number of open rows.
 
     Called at startup, after the stale-incident sweep, so a restart mid-hold still
-    renders the chip and still answers "is this printer owned". The restart flag is
-    derived from each row's ledger (:func:`_restart_stops`), so a terminal classified after
-    a restart still reads the farm's own stop.
+    renders the chip and still answers "is this printer owned". The ledger facts are
+    derived from each row's ledger (:func:`_ledger_projections`), so a terminal classified
+    after a restart still reads the farm's own stop. ``deadline_at`` starts ``None``: a
+    decision hold's deadline is re-armed from ``escalated_at`` and the setting by its timer
+    (``pause_recovery.rearm_decision_deadlines``), which writes it back.
     """
     _open_cache.clear()
     rows = await all_open(db)
-    stopped = await _restart_stops(db, [incident.id for incident in rows])
+    ledgers = await _ledger_projections(db, [incident.id for incident in rows])
     for incident in rows:
         _open_cache.setdefault(incident.printer_id, {})[incident.id] = _payload(
-            incident, fault_restart_stop=incident.id in stopped
+            incident, ledger=ledgers.get(incident.id)
         )
     return len(rows)

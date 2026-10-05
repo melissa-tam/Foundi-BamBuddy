@@ -1484,8 +1484,8 @@ class TestPauseCauseIncidentReminders:
         assert kwargs["outage_minutes"] is None
 
     async def test_plate_vision_fires_plate_not_empty_with_the_paused_wording(self, db_session):
-        """FLIPPED 2026-09-24: the print stays PAUSED at the plate check, so the
-        instruction IS to resume it once the plate is fixed."""
+        """The print stays PAUSED at the plate check for a person (the decision hold or the
+        fallback, operator ruling 2026-10-05), so the reminder names both exits the farm offers."""
         await _add_incident_held(db_session, 42, "plate_vision", code="0500_808C")
         mgr = _FakeManager({42: True}, {42: _FakeState("PAUSE")})
         with patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock) as mock_n:
@@ -1494,8 +1494,26 @@ class TestPauseCauseIncidentReminders:
 
         mock_n.assert_awaited_once()
         detail = mock_n.await_args.kwargs["source_detail"]
-        assert "paused" in detail.lower()
-        assert "resume" in detail.lower()
+        assert detail == "Print paused at the plate check. Ignore and resume, or stop the print."
+
+    async def test_the_pass_re_arms_an_overdue_plate_check_decision_hold(self, db_session):
+        """Operator ruling 2026-10-05: a decision hold's deadline is a timer (process memory). The
+        reminder pass hands the open rows it read to ``pause_recovery``, which re-arms a hold past
+        its deadline with no timer — the pass reads nothing more for it."""
+        from backend.app.services import pause_recovery
+
+        await _add_incident_held(db_session, 46, "plate_vision", code="0500_808C")
+        mgr = _FakeManager({46: True}, {46: _FakeState("PAUSE")})
+        with (
+            patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock),
+            patch.object(pause_recovery, "rearm_overdue_decision_deadlines", new_callable=AsyncMock) as rearm,
+        ):
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=0.0)
+
+        rearm.assert_awaited_once()
+        db, open_rows = rearm.await_args.args
+        assert db is db_session
+        assert [(row.printer_id, row.kind) for row in open_rows] == [(46, "plate_vision")]
 
     async def test_an_idle_printer_under_a_plate_check_hold_is_not_told_to_resume(self, db_session):
         """Not paused: "resume the print" would send the operator looking for a job

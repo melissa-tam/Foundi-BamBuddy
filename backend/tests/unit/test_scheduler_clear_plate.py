@@ -492,6 +492,9 @@ def _dispatch_env(scheduler, *, upload=None):
             patch.object(ps_module, "get_ftp_retry_settings", AsyncMock(return_value=(False, 3, 1.0, 30.0)))
         )
         stack.enter_context(patch.object(ps_module, "delete_file_async", delete_mock))
+        # The refusal paths remove their upload through ``bambu_ftp.remove_abandoned_upload``,
+        # which deletes through its own module: the same mock answers there.
+        stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", delete_mock))
         stack.enter_context(patch.object(ps_module, "upload_file_async", upload_mock))
         stack.enter_context(patch.object(ps_module, "with_ftp_retry", AsyncMock(return_value=True)))
         stack.enter_context(patch.object(ps_module, "cache_3mf_download", MagicMock()))

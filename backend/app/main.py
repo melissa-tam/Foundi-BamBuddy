@@ -120,11 +120,11 @@ from backend.app.services.spoolman_tracking import (
 from backend.app.services.tasmota import tasmota_service
 from backend.app.services.usb_storage import (
     HMS_STORAGE_LOW_FULL_CODES,
-    _deferred_printers,
-    drain_recordings_if_idle,
     on_storage_low,
     record_sdcard_and_detect_drop,
     should_retry_deferred,
+    sweep_after_terminal,
+    take_deferred,
     verify_and_alert_usb_drop,
 )
 
@@ -1571,23 +1571,24 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # probe-confirmed drop alerts. Thin spawn here; fully guarded on both sides.
     if record_sdcard_and_detect_drop(printer_id, bool(getattr(state, "sdcard", False))):
         try:
-            asyncio.create_task(verify_and_alert_usb_drop(printer_id))
+            spawn_background_task(verify_and_alert_usb_drop(printer_id), name=f"usb-drop-verify-p{printer_id}")
         except Exception as _de:  # noqa: BLE001 — alert must never crash the status flow
             logging.getLogger(__name__).warning(
                 "[USB-STORAGE] USB-drop alert failed for printer %s: %s", printer_id, _de
             )
 
     # Deferred-retry path (runs every tick, NOT gated on current HMS errors): a
-    # cleanup deferred by the actively-printing guard must retry once the print
-    # ends — and the storage code may have vanished from hms[] (the firmware drops
-    # it when it unmounts a full drive), so this cannot live inside the HMS block.
-    # The predicate is DB-free and short-circuits on set membership. Clear the
-    # deferral BEFORE create_task so consecutive ticks can't multi-spawn; the task
-    # re-arms it only if the printer is still printing.
-    if should_retry_deferred(printer_id, getattr(state, "state", None)):
-        _deferred_printers.discard(printer_id)
+    # storage-low sweep a gate swallowed (printing, the sweep cooldown, a dispatch or
+    # eject in flight) must retry once it can run — and the storage code may have
+    # vanished from hms[] (the firmware drops it when it unmounts a full drive), so
+    # this cannot live inside the HMS block. The predicate is DB-free and O(1);
+    # ``take_deferred`` consumes the deferral BEFORE the spawn so consecutive ticks
+    # can't multi-spawn, and the sweep re-arms it if a gate swallows the retry too.
+    if should_retry_deferred(printer_id, getattr(state, "state", None)) and take_deferred(printer_id):
         try:
-            asyncio.create_task(on_storage_low(printer_id, set(HMS_STORAGE_LOW_FULL_CODES)))
+            spawn_background_task(
+                on_storage_low(printer_id, set(HMS_STORAGE_LOW_FULL_CODES)), name=f"storage-low-retry-p{printer_id}"
+            )
         except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
             logging.getLogger(__name__).warning(
                 "[USB-STORAGE] deferred storage-low retry failed for printer %s: %s", printer_id, _se
@@ -3585,18 +3586,6 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # handing a stale file to the next print if it reuses the same name.
     clear_3mf_cache(printer_id)
 
-    # Proactive post-print recordings drain: trim the /ipcam camera chunks this
-    # print left behind (a long lights-out run generates ~3 GB/h) BEFORE the USB
-    # ever hits the HMS-full wall. Fire-and-forget, fully self-gated (setting /
-    # not-printing / 6h cooldown / single-flight) and never notifies — opportunistic
-    # only, so a failure stays silent and never blocks the completion flow.
-    try:
-        asyncio.create_task(drain_recordings_if_idle(printer_id))
-    except Exception as _drain_e:  # noqa: BLE001 — drain must never crash the callback
-        logger.warning(
-            "[USB-STORAGE] post-print recordings drain failed to schedule for printer %s: %s", printer_id, _drain_e
-        )
-
     try:
         ws_data = {
             "status": data.get("status"),
@@ -3628,8 +3617,8 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
     # fact on this job's unit (``print_control.stop_as_operator`` commits it before the stop
     # goes out), read first, so the snapshot and the verdict below are taken together, and
     # a stop pressed before a restart still reads as the operator's. The job's plate-check
-    # episode (what the farm's own driver SENT: its stop, and its other stops in the
-    # window) is read next, off the same snapshot, before the closer ends that episode.
+    # episode (the decision its driver RECORDED as its last stop's name, and the unit its
+    # row bound) is read next, off the same snapshot, before the closer ends that episode.
     #
     # The order that follows is load-bearing: classify inputs → eject detection →
     # correlation → deposit evidence → THE outcome → the incident closer (it records the
@@ -3677,6 +3666,24 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             printer_id,
             _raw_status,
         )
+
+    # The USB sweep's terminal trigger — a PRINT's terminal only: the camera recordings and
+    # the finished jobs' uploads leave the drive BEFORE it ever reaches the storage-low wall,
+    # in the minutes of cooldown that follow a print. An eject's terminal is the dispatcher's
+    # moment: it clears the plate gate and the next unit uploads within seconds, and the
+    # printer caps concurrent FTPS sessions (the sweep's per-delete gate protects the files,
+    # not the session). Nothing is lost by skipping it — the eject's own file leaves at its
+    # terminal through ``job_terminal.delete_uploaded_file``. Fire-and-forget, fully
+    # self-gated (setting / not-printing / cooldown / no dispatch, eject or upload in flight /
+    # single-flight) and never notifies, so a failure stays silent and never blocks the
+    # completion flow.
+    if not _is_eject_job:
+        try:
+            spawn_background_task(sweep_after_terminal(printer_id), name=f"usb-sweep-p{printer_id}")
+        except Exception as _sweep_e:  # noqa: BLE001 — the sweep must never crash the callback
+            logger.warning(
+                "[USB-STORAGE] post-print USB sweep failed to schedule for printer %s: %s", printer_id, _sweep_e
+            )
 
     # Terminal-status correlation. Resolve WHICH queue item this
     # finish belongs to ONCE, up front, and thread the verdict to BOTH the plate-
@@ -3792,9 +3799,9 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
         is_eject=_is_eject_job,
         hms_errors=data.get("hms_errors"),
         plate_check=_plate_check,
-        # A FARM unit for the plate-check retry: the same id- or name-confirmed attribution
-        # that may arm an automatic sweep — a fallback-only attribution may do neither.
-        farm_unit=_verdict in farm_correlation.AUTO_CLEAR_VERDICTS and _resolved_item_id is not None,
+        # The unit THIS terminal resolved — the one a plate-check retry requeues. Whether the
+        # episode decided a retry is the episode's own recorded stop (``farm_retries``).
+        resolved_item_id=_resolved_item_id,
     )
     if _outcome.recorded_status != _raw_status:
         logger.info(
@@ -5849,6 +5856,13 @@ async def lifespan(app: FastAPI):
     from backend.app.services.spool_recovery import rearm_incidents_on_startup
 
     await rearm_incidents_on_startup()
+
+    # Plate-check decision holds (operator ruling 2026-10-05): a hold's deadline is a timer —
+    # process memory — so re-arm it from the row's ``escalated_at`` + the setting, after the
+    # projection rehydrate above; a window that ran out during the downtime stops at once.
+    from backend.app.services.pause_recovery import rearm_decision_deadlines
+
+    await rearm_decision_deadlines()
 
     # Reconcile ejects that reached terminal (or failed) during the downtime window:
     # one background task per hydrated printer, each polling until its printer

@@ -27,6 +27,7 @@ from backend.app.services.bambu_ftp import (
     cleanup_downloaded_3mf,
     delete_file_async,
     get_ftp_retry_settings,
+    remove_abandoned_upload,
     upload_file_async,
     with_ftp_retry,
 )
@@ -84,7 +85,8 @@ from backend.app.services.spool_selection import (
 )
 from backend.app.services.stagger import stagger_policy
 from backend.app.services.tray_fields import parse_tray_state, tray_presence, tray_unread
-from backend.app.services.usb_storage import upload_in_flight, usb_present
+from backend.app.services.usb_storage import usb_present
+from backend.app.services.usb_uploads import upload_in_flight
 from backend.app.utils.filament_types import canonical_filament_type as _canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
 
@@ -3354,27 +3356,17 @@ class PrintScheduler:
 
     @staticmethod
     async def _cleanup_refused_upload(printer, remote_path: str, item_id: int, why: str) -> bool:
-        """Delete an uploaded file for a dispatch that will not run. True iff removed.
+        """Remove the upload of a dispatch that will not run. True iff the file is off the drive.
 
-        The ONE body both refusal paths share (the queue row moved during the upload;
-        the plate gate rose before the print command). A file left sitting on the USB
-        for a dispatch that never happened is one screen-tap away from being started as
-        a FOREIGN print — which is exactly the class these refusals exist to close.
-        Best-effort by design: a delete that fails is reported by the caller's warning,
-        never raised, because the dispatch is already being unwound.
+        Both refusal paths (the queue row moved during the upload; the plate gate rose
+        before the print command) share it. A file left sitting on the USB for a dispatch
+        that never happened is one screen-tap away from being started as a FOREIGN print —
+        which is exactly the class these refusals exist to close. The body is the farm's
+        ONE abandoned-upload helper (``bambu_ftp.remove_abandoned_upload``): a 550 counts
+        as removed, a real failure as not, and nothing raises — the dispatch is already
+        being unwound, and the caller's warning reports a file that stayed.
         """
-        try:
-            return bool(
-                await delete_file_async(
-                    printer.ip_address,
-                    printer.access_code,
-                    remote_path,
-                    printer_model=printer.model,
-                )
-            )
-        except Exception as cleanup_err:  # noqa: BLE001 — best-effort, must not raise
-            logger.debug("Queue item %s: USB cleanup after %s failed: %s", item_id, why, cleanup_err)
-            return False
+        return await remove_abandoned_upload(printer, remote_path, lane="dispatch", why=f"queue item {item_id}: {why}")
 
     async def _unwind_refused_commit(
         self,
@@ -4292,16 +4284,11 @@ class PrintScheduler:
             except Exception:
                 pass  # Don't fail if MQTT fails
         else:
-            # Clean up uploaded file from SD card to prevent phantom prints
-            try:
-                await delete_file_async(
-                    printer.ip_address,
-                    printer.access_code,
-                    remote_path,
-                    printer_model=printer.model,
-                )
-            except Exception:
-                pass  # Best-effort — don't fail the error handler
+            # The print command failed: remove this dispatch's own upload, so it cannot be
+            # screen-started as a phantom print. Best-effort, never raises.
+            await remove_abandoned_upload(
+                printer, remote_path, lane="dispatch", why=f"queue item {item.id}: the print command failed"
+            )
 
             # Print command failed - revert status
             await self._fail_queue_item(db, item, "Failed to send print command to printer", printer_id=printer_id)

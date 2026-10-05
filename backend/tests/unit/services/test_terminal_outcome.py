@@ -13,9 +13,12 @@ import pytest
 from backend.app.services.hms_errors import PrinterMessage
 from backend.app.services.plate_occupancy import DepositEvidence, PlateRefusal
 from backend.app.services.terminal_outcome import (
+    PLATE_CHECK_DEADLINE_STOP,
+    PLATE_CHECK_RETRY_STOP,
     PLATE_RECHECK_WINDOW_S,
     PlateCheckFacts,
     build_terminal_outcome,
+    farm_retries,
     open_holds_at_terminal,
 )
 
@@ -332,8 +335,9 @@ class TestChargeBasis:
         assert outcome.charge == "none"
 
 
-def _refused(plate_check, *, farm_unit, deposited):
-    """A ``plate_refused`` terminal of THIS job, whose plate-check hold recorded the printer's words."""
+def _refused(plate_check, *, deposited, resolved_item_id=7):
+    """A ``plate_refused`` terminal of THIS job, whose plate-check hold recorded the printer's words.
+    ``resolved_item_id`` is the unit the terminal itself resolved (the one a retry requeues)."""
     hold = {"kind": "plate_vision", "job_id": _JOB, "printer_messages": [_VISION_WORDS]}
     return build_terminal_outcome(
         raw_status="failed",
@@ -345,27 +349,54 @@ def _refused(plate_check, *, farm_unit, deposited):
         is_eject=False,
         hms_errors=[],
         plate_check=plate_check,
-        farm_unit=farm_unit,
+        resolved_item_id=resolved_item_id,
     )
 
 
 class TestPlateCheckRetryOrEscalate:
-    """The ladder's terminal verdict (operator ruling 2026-09-29): a re-check that failed is
-    STOPPED by the farm and the same print RETRIED; the retry's own failed re-check — a second
-    farm stop on the printer within the hour — ESCALATES, and so does everything the farm did
-    not stop itself. Retry = ``plate_refusal`` None (no gate, no page); escalate = the refusal
-    carrying the printer's words. The verdict and the recorded word never change."""
+    """The ladder's terminal verdict (operator rulings 2026-09-29 / 2026-10-05): the decision is made
+    ONCE, at the ladder's second rung, and RECORDED as the stop's name — this only reads it back.
+    A ``retry_stop`` that ended the job, on a unit the episode's row bound, with nothing deposited,
+    RETRIES (``plate_refusal`` None: no gate, no page); the decision deadline's ``deadline_stop``, an
+    operator's Stop (no farm stop) and everything else ESCALATE (the refusal carrying the printer's
+    words). The verdict and the recorded word never change."""
 
     @pytest.mark.parametrize("deposited", [False, True], ids=["empty", "deposited"])
-    @pytest.mark.parametrize("stops_in_window", [0, 1], ids=["first", "second"])
-    @pytest.mark.parametrize("farm_unit", [True, False], ids=["farm_unit", "not_farm"])
-    @pytest.mark.parametrize("farm_stopped", [True, False], ids=["farm_stop", "no_farm_stop"])
-    def test_the_truth_table(self, farm_stopped, farm_unit, stops_in_window, deposited):
-        facts = PlateCheckFacts(farm_stopped=farm_stopped, stops_in_window=stops_in_window)
+    @pytest.mark.parametrize("item_id", [7, None], ids=["row_unit", "foreign"])
+    @pytest.mark.parametrize(
+        "last_stop",
+        [
+            (PLATE_CHECK_RETRY_STOP, None),
+            (PLATE_CHECK_RETRY_STOP, "taken"),
+            (PLATE_CHECK_RETRY_STOP, "not_taken"),
+            (PLATE_CHECK_RETRY_STOP, "not_sent"),
+            (PLATE_CHECK_DEADLINE_STOP, None),
+            (PLATE_CHECK_DEADLINE_STOP, "taken"),
+            None,
+        ],
+        ids=[
+            "retry_unanswered",
+            "retry_taken",
+            "retry_not_taken",
+            "retry_not_sent",
+            "deadline_unanswered",
+            "deadline_taken",
+            "no_farm_stop",
+        ],
+    )
+    def test_the_truth_table(self, last_stop, item_id, deposited):
+        facts = PlateCheckFacts(last_stop=last_stop, item_id=item_id)
 
-        outcome = _refused(facts, farm_unit=farm_unit, deposited=deposited)
+        retries = (
+            last_stop is not None
+            and last_stop[0] == PLATE_CHECK_RETRY_STOP
+            and last_stop[1] in (None, "taken")
+            and item_id is not None
+            and not deposited
+        )
+        assert farm_retries(facts, evidence=_evidence(deposited=deposited)) is retries
 
-        retries = farm_stopped and farm_unit and stops_in_window == 0 and not deposited
+        outcome = _refused(facts, deposited=deposited)
         assert (outcome.plate_refusal is None) is retries
         if not retries:
             assert outcome.plate_refusal.messages[0].short_code == "0500_808C"
@@ -374,9 +405,15 @@ class TestPlateCheckRetryOrEscalate:
         assert outcome.recorded_status == "cancelled"
         assert outcome.failure_category == "Plate not empty (printer vision)"
 
-    @pytest.mark.parametrize("farm_unit", [True, False])
-    def test_a_job_with_no_plate_check_episode_escalates(self, farm_unit):
-        assert _refused(None, farm_unit=farm_unit, deposited=False).plate_refusal is not None
+    def test_farm_stopped_reads_the_last_stops_answer(self):
+        assert PlateCheckFacts(last_stop=(PLATE_CHECK_RETRY_STOP, None), item_id=1).farm_stopped is True
+        assert PlateCheckFacts(last_stop=(PLATE_CHECK_RETRY_STOP, "taken"), item_id=1).farm_stopped is True
+        assert PlateCheckFacts(last_stop=(PLATE_CHECK_RETRY_STOP, "not_taken"), item_id=1).farm_stopped is False
+        assert PlateCheckFacts(last_stop=None, item_id=1).farm_stopped is False
+
+    def test_a_job_with_no_plate_check_episode_escalates(self):
+        assert farm_retries(None, evidence=_evidence(deposited=False)) is False
+        assert _refused(None, deposited=False).plate_refusal is not None
 
     def test_the_defaults_escalate(self):
         """A caller with no plate-check facts (the reconcile's unobserved job phase) can never retry."""
@@ -385,12 +422,25 @@ class TestPlateCheckRetryOrEscalate:
 
     def test_an_operators_stop_mid_episode_escalates(self):
         """The operator pressed Stop while the farm was still re-checking: the episode's log
-        holds the farm's press but no farm ``stop`` step, so the human owns the plate."""
-        facts = PlateCheckFacts(farm_stopped=False, stops_in_window=0)
-        assert _refused(facts, farm_unit=True, deposited=False).plate_refusal is not None
+        holds the farm's press but no farm stop, so the human owns the plate."""
+        facts = PlateCheckFacts(last_stop=None, item_id=7)
+        assert _refused(facts, deposited=False).plate_refusal is not None
+
+    @pytest.mark.parametrize("resolved_item_id", [None, 8], ids=["terminal_resolved_none", "terminal_resolved_another"])
+    def test_a_retry_the_terminal_cannot_requeue_escalates_naming_both_units(self, resolved_item_id, caplog):
+        """The episode's ROW decided a retry of unit 7, but this terminal resolved no unit (or
+        another): there is no requeue target to invent — WARN naming both, and escalate."""
+        facts = PlateCheckFacts(last_stop=(PLATE_CHECK_RETRY_STOP, "taken"), item_id=7)
+
+        with caplog.at_level("WARNING", logger="backend.app.services.terminal_outcome"):
+            outcome = _refused(facts, deposited=False, resolved_item_id=resolved_item_id)
+
+        assert outcome.plate_refusal is not None
+        assert "decided a retry of unit 7" in caplog.text
+        assert ("no unit" if resolved_item_id is None else "unit 8") in caplog.text
 
     def test_the_facts_decide_nothing_without_the_verdict(self):
-        facts = PlateCheckFacts(farm_stopped=True, stops_in_window=0)
+        facts = PlateCheckFacts(last_stop=(PLATE_CHECK_RETRY_STOP, "taken"), item_id=7)
         outcome = build_terminal_outcome(
             raw_status="failed",
             verdict="operator_ui",
@@ -401,7 +451,7 @@ class TestPlateCheckRetryOrEscalate:
             is_eject=False,
             hms_errors=[],
             plate_check=facts,
-            farm_unit=True,
+            resolved_item_id=7,
         )
         assert outcome.plate_refusal is None
         assert outcome.verdict == "operator_ui"

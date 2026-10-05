@@ -2321,10 +2321,14 @@ async def scan_timelapse(
     # Strategy 3: Use file modification time from FTP listing
     # This handles cases where printer's filename timestamp is wrong but file mtime is correct
     if not matching_file and (archive.started_at or archive.completed_at or archive.created_at):
-        from datetime import datetime, timedelta
+        # ``timezone`` aliased: strategy 4 below binds the bare name locally for this whole function.
+        from datetime import datetime, timedelta, timezone as utc_zone
 
         _archive_start = archive.started_at
         archive_end = archive.completed_at or archive.created_at
+        # The listing's mtime is UTC-aware (``bambu_ftp.list_files``); the DB stores naive UTC.
+        if archive_end is not None and archive_end.tzinfo is None:
+            archive_end = archive_end.replace(tzinfo=utc_zone.utc)
         best_match = None
         best_diff = timedelta(hours=24)
 

@@ -2599,17 +2599,18 @@ class NotificationService:
         success: bool,
         freed_bytes: int,
         files_deleted: int,
-        free_bytes: int | None,
         reason: str | None,
         attempted: bool = True,
         db: AsyncSession,
     ):
         """Fire when a printer's USB fills up and the farm auto-cleanup runs.
 
-        Carries the outcome either way: on success, how much was freed (and the
-        free space now, if the printer reports it); on failure, a human reason
-        (e.g. FTPS unreachable, nothing cleanable). The ``detail`` phrasing is
-        built here so the template stays a simple ``{printer_name}: {detail}``.
+        Carries the outcome either way: on success, how much was freed; on failure, a
+        human reason (e.g. FTPS unreachable, nothing cleanable, or — after a sweep that
+        freed space — the printer still reporting low space). Free space is never
+        quoted: H2S answers FTP ``AVBL`` with an error, so the farm cannot know it. The
+        ``detail`` phrasing is built here so the template stays a simple
+        ``{printer_name}: {detail}``.
 
         ``attempted=False`` means NO cleanup ran (e.g. a bare USB-drop detection):
         the detail is then the raw ``reason`` alone — never the misleading
@@ -2626,11 +2627,7 @@ class NotificationService:
             base = reason or "USB problem detected"
             detail = base if base.endswith(".") else f"{base}."
         elif success:
-            if free_bytes is not None:
-                free_txt = f"{free_bytes / 1024**3:.1f} GB free now"
-            else:
-                free_txt = "free space unreported"
-            detail = f"Auto-cleanup freed {freed_mb} MB across {files_deleted} file(s); {free_txt}."
+            detail = f"Auto-cleanup freed {freed_mb} MB across {files_deleted} file(s)."
         elif files_deleted:
             detail = (
                 f"Auto-cleanup freed {freed_mb} MB across {files_deleted} file(s) "

@@ -558,6 +558,24 @@ export interface HMSActionBody {
   job_id: string | null;  // Optional job ID for context (if applicable)
 }
 
+/** The plate-check dialog buttons a human may press on the human's turn. */
+export type PlateCheckAction = 'PROBLEM_SOLVED_RESUME' | 'IGNORE_RESUME';
+
+/**
+ * `PrinterStatus.plate_check_exit`: the paused plate-check dialog a human may
+ * answer. `print_error` and `job_id` go back verbatim in `HMSActionBody`.
+ */
+export interface PlateCheckExit {
+  /** The dialog's `print_error`, 8 hex chars. */
+  print_error: string;
+  /** The held job's subtask id. */
+  job_id: string;
+  /** The dialog buttons the backend accepts on this turn. */
+  actions: PlateCheckAction[];
+  /** ISO UTC: when the farm stops the print if nothing is pressed; null when no deadline is armed. */
+  deadline_at: string | null;
+}
+
 export interface AMSTray {
   id: number;
   tray_color: string | null;
@@ -862,6 +880,12 @@ export interface PrinterStatus {
   // by that exact string, so a kind added here needs its locale key in the same
   // change (pinned by `__tests__/i18n/incidentKinds.test.ts`).
   open_incident?: OpenIncidentState | null;
+  // The human's turn at a paused plate check. Present iff the backend's one
+  // predicate (`printer_incidents.plate_check_human_turn`) holds: an escalated
+  // plate-check hold, no farm driver acting, the print PAUSED at the plate
+  // dialog on the held job. Its own field because `open_incident` shows only the
+  // top-ranked hold. Never re-derive it from `open_incident` or `hms_errors`.
+  plate_check_exit?: PlateCheckExit | null;
   // Operator maintenance hold, mirrored onto the status frame (including the
   // disconnected branch) so a card rendered from a stale fleet list still shows
   // it. `Printer.service_hold` is the primary origin; this is the fallback.
@@ -1592,6 +1616,11 @@ export interface AppSettings {
   // whose printer has been PAUSED at least this many minutes with no auto-recovery
   // active (never cancels — just surfaces the stall so an operator checks it).
   farm_pause_stall_minutes: number;
+  // Plate-check decision window (1–120 min): after a failed re-check the print
+  // stays PAUSED at the printer's plate-check dialog this long for a human's
+  // Ignore and resume or Stop; then the farm stops it and gates the plate.
+  // A different concern from `farm_pause_stall_minutes` (an alert threshold).
+  farm_plate_check_decision_minutes: number;
   // Eject-cooldown stall detection (server-dispatched eject): during the
   // post-print cooldown the bed must keep cooling. Over each stall window
   // (minutes) it must drop at least the epsilon (°C); two consecutive windows

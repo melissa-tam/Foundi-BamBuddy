@@ -91,6 +91,7 @@ import {
   Square,
   Pause,
   Play,
+  SkipForward,
   X,
   Fan,
   Wind,
@@ -129,7 +130,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, formatTimeOnly, parseUTCDate } from '../utils/date';
 import { OWN_SURFACE_INCIDENT_KINDS } from '../api/client';
-import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, SlotRecheckResult } from '../api/client';
+import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, SlotRecheckResult, PlateCheckAction, PlateCheckExit } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
@@ -1873,6 +1874,10 @@ function PrinterCard({
   const [bedJogStep, setBedJogStep] = useState<number>(10);
   const [showNotHomedModal, setShowNotHomedModal] = useState<null | { distance: number }>(null);
   const [showResumeConfirm, setShowResumeConfirm] = useState(false);
+  // The plate-check dialog the operator is confirming "Ignore and resume" for,
+  // captured at the click: the confirm sends THAT dialog's print_error/job_id,
+  // and the backend judges whether it is still the human's turn.
+  const [pendingIgnoreResume, setPendingIgnoreResume] = useState<PlateCheckExit | null>(null);
   const [showSkipObjectsModal, setShowSkipObjectsModal] = useState(false);
   const [showUploadForPrint, setShowUploadForPrint] = useState(false);
   const [showPrinterInfo, setShowPrinterInfo] = useState(false);
@@ -2460,6 +2465,23 @@ function PrinterCard({
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
     },
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToResumePrint'), 'error'),
+  });
+
+  // The printer's own plate-check "Ignore and resume" button. A refusal (409:
+  // the farm is still acting, or no paused plate check) arrives as the
+  // backend's `detail` in `error.message` via the client's `request` helper.
+  const ignoreResumeMutation = useMutation({
+    mutationFn: (exit: PlateCheckExit) =>
+      api.executeHMSAction(printer.id, {
+        action: 'IGNORE_RESUME' satisfies PlateCheckAction,
+        print_error: exit.print_error,
+        job_id: exit.job_id,
+      }),
+    onSuccess: () => {
+      showToast(t('printers.plateCheck.sent'));
+      queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
+    },
+    onError: (error: Error) => showToast(t('printers.plateCheck.refused', { message: error.message }), 'error'),
   });
 
   const clearPlateMutation = useMutation({
@@ -5048,10 +5070,15 @@ function PrinterCard({
               const isRunning = status.state === 'RUNNING';
               const isPaused = status.state === 'PAUSE';
               const isPrinting = isRunning || isPaused;
-              const isControlBusy = stopPrintMutation.isPending || pausePrintMutation.isPending || resumePrintMutation.isPending;
+              const isControlBusy = stopPrintMutation.isPending || pausePrintMutation.isPending || resumePrintMutation.isPending || ignoreResumeMutation.isPending;
               const unavailablePrintActionClass = 'bg-bambu-dark text-bambu-gray/50 cursor-not-allowed opacity-50';
               const iconControlClass = 'flex h-8 w-8 items-center justify-center rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
-              const printControlClass = 'flex h-8 w-20 items-center justify-center gap-1 px-2 rounded-lg text-xs font-medium transition-colors';
+              // One shape for the print-control buttons: Pause/Resume and Stop share a
+              // fixed width; the plate-check exit sizes to its longer label.
+              const printControlShape = 'flex h-8 items-center justify-center gap-1 px-2 rounded-lg text-xs font-medium transition-colors';
+              const printControlClass = `${printControlShape} w-20`;
+              // The backend's "human's turn" at a paused plate check; never re-derived here.
+              const plateCheckExit = status.plate_check_exit ?? null;
 
               return (
                 <div className="mt-3">
@@ -5381,53 +5408,77 @@ function PrinterCard({
 
                     </div>
 
-                    {/* Right: Print Control Buttons */}
-                    <div className="ml-auto flex items-center justify-end gap-2 flex-shrink-0">
-                      {/* Pause/Resume button */}
-                      {(() => {
-                        const pauseUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
+                    {/* Right: Print Control Buttons. The plate-check exit leads the group
+                        and wraps above Pause/Resume and Stop on a narrow card. */}
+                    <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
+                      {/* Plate check: the printer's own "Ignore and resume", offered only
+                          on the human's turn (the backend's `plate_check_exit`). */}
+                      {plateCheckExit && (() => {
+                        const ignoreUnavailable = isControlBusy || !hasPermission('printers:control');
                         return (
-                      <button
-                        onClick={() => isPaused ? setShowResumeConfirm(true) : setShowPauseConfirm(true)}
-                        disabled={pauseUnavailable}
-                        className={`
-                          ${printControlClass}
-                          ${pauseUnavailable
-                            ? unavailablePrintActionClass
-                            : isPaused
-                              ? 'bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30'
-                              : 'bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30'
-                          }
-                        `}
-                        title={!hasPermission('printers:control') ? t('printers.permission.noControl') : (isPaused ? t('printers.resume') : t('printers.pause'))}
-                      >
-                        {isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
-                        {isPaused ? t('printers.resume') : t('printers.pause')}
-                      </button>
+                          <button
+                            type="button"
+                            onClick={() => setPendingIgnoreResume(plateCheckExit)}
+                            disabled={ignoreUnavailable}
+                            className={`${printControlShape} whitespace-nowrap ${
+                              ignoreUnavailable
+                                ? unavailablePrintActionClass
+                                : 'bg-amber-500/20 text-amber-300 hover:bg-amber-500/30'
+                            }`}
+                            title={!hasPermission('printers:control') ? t('printers.permission.noControl') : t('printers.plateCheck.ignoreResume')}
+                          >
+                            <SkipForward className="w-3 h-3" />
+                            {t('printers.plateCheck.ignoreResume')}
+                          </button>
                         );
                       })()}
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        {/* Pause/Resume button */}
+                        {(() => {
+                          const pauseUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
+                          return (
+                        <button
+                          onClick={() => isPaused ? setShowResumeConfirm(true) : setShowPauseConfirm(true)}
+                          disabled={pauseUnavailable}
+                          className={`
+                            ${printControlClass}
+                            ${pauseUnavailable
+                              ? unavailablePrintActionClass
+                              : isPaused
+                                ? 'bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30'
+                                : 'bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30'
+                            }
+                          `}
+                          title={!hasPermission('printers:control') ? t('printers.permission.noControl') : (isPaused ? t('printers.resume') : t('printers.pause'))}
+                        >
+                          {isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
+                          {isPaused ? t('printers.resume') : t('printers.pause')}
+                        </button>
+                          );
+                        })()}
 
-                      {/* Stop button */}
-                      {(() => {
-                        const stopUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
-                        return (
-                      <button
-                        onClick={() => setShowStopConfirm(true)}
-                        disabled={stopUnavailable}
-                        className={`
-                          ${printControlClass}
-                          ${stopUnavailable
-                            ? unavailablePrintActionClass
-                            : 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
-                          }
-                        `}
-                        title={!hasPermission('printers:control') ? t('printers.permission.noControl') : t('printers.stop')}
-                      >
-                        <Square className="w-3 h-3" />
-                        {t('printers.stop')}
-                      </button>
-                        );
-                      })()}
+                        {/* Stop button */}
+                        {(() => {
+                          const stopUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
+                          return (
+                        <button
+                          onClick={() => setShowStopConfirm(true)}
+                          disabled={stopUnavailable}
+                          className={`
+                            ${printControlClass}
+                            ${stopUnavailable
+                              ? unavailablePrintActionClass
+                              : 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
+                            }
+                          `}
+                          title={!hasPermission('printers:control') ? t('printers.permission.noControl') : t('printers.stop')}
+                        >
+                          <Square className="w-3 h-3" />
+                          {t('printers.stop')}
+                        </button>
+                          );
+                        })()}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -7306,6 +7357,31 @@ function PrinterCard({
           onCancel={() => setShowResumeConfirm(false)}
         />
       )}
+
+      {/* Plate check "Ignore and resume" confirmation. The consequence lives
+          here, never on the card; the deadline line names when the farm stops
+          the print if the window runs out. */}
+      {pendingIgnoreResume && (() => {
+        const deadline = parseUTCDate(pendingIgnoreResume.deadline_at);
+        const body = t('printers.plateCheck.confirmBody');
+        return (
+          <ConfirmModal
+            title={t('printers.plateCheck.confirmTitle')}
+            message={
+              deadline
+                ? `${body}\n\n${t('printers.plateCheck.confirmDeadline', { time: formatTimeOnly(deadline, timeFormat) })}`
+                : body
+            }
+            confirmText={t('printers.plateCheck.ignoreResume')}
+            variant="warning"
+            onConfirm={() => {
+              ignoreResumeMutation.mutate(pendingIgnoreResume);
+              setPendingIgnoreResume(null);
+            }}
+            onCancel={() => setPendingIgnoreResume(null)}
+          />
+        );
+      })()}
 
       {/* Bed Jog — not-homed warning (Studio-style) */}
       {showNotHomedModal && (

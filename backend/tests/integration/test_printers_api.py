@@ -2851,6 +2851,55 @@ def _published_print_frames(client):
     return [json.loads(c.args[1])["print"] for c in client._client.publish.call_args_list if '"print"' in c.args[1]]
 
 
+async def _plate_check_row(db_session, printer_id, *, status, job_id="771234"):
+    """The printer's plate-check episode row as the ladder leaves it: ``escalated`` is the decision
+    hold (a person's turn), ``recovering`` the ladder still acting."""
+    from backend.app.models.printer_incident import KIND_PLATE_VISION
+    from backend.app.services import printer_incidents
+
+    return await printer_incidents.open_new(
+        db_session,
+        printer_id=printer_id,
+        job_id=job_id,
+        item_id=None,
+        kind=KIND_PLATE_VISION,
+        code="0500_808C",
+        codes="0500_808C",
+        slot_global_tray=None,
+        hms_full_codes=["0500808C"],
+        status=status,
+    )
+
+
+@contextmanager
+def _plate_check_paused(client, *, job_id="771234", print_error=0x0500808C):
+    """The printer PAUSEd at its plate-check dialog, as both the route and the plate-check lane
+    (``pause_recovery``, which reads the manager singleton) see it — the dialog merged onto the HMS
+    list the way the client's parser puts it there, with the catalog's own buttons."""
+    from backend.app.services.bambu_mqtt import HMSError
+    from backend.app.services.printer_manager import printer_manager
+
+    client.state.state = "PAUSE"
+    client.state.print_error = print_error
+    client.state.subtask_id = job_id
+    client.state.hms_errors = [
+        HMSError(
+            code=f"0x{print_error & 0xFFFF:x}",
+            attr=print_error,
+            module=5,
+            severity=3,
+            actions=["IGNORE_RESUME", "PROBLEM_SOLVED_RESUME"],
+            job_id=job_id,
+            full_code=f"{print_error:08X}",
+        )
+    ]
+    with (
+        patch.object(printer_manager, "get_client", return_value=client),
+        patch.object(printer_manager, "get_status", return_value=client.state),
+    ):
+        yield
+
+
 class TestExecuteHMSActionAPI:
     """Integration tests for the /hms/execute-action endpoint (#1743).
 
@@ -2858,6 +2907,10 @@ class TestExecuteHMSActionAPI:
     (``SentCommand`` → ``BambuMQTTClient.await_ack``): success → 200, a refusing ACK →
     502 naming the answer, no ACK within the budget → 502 (the silent drop #1830 names),
     and a frame whose echo is never recorded (the ``uiop`` close) → 200 "sent".
+
+    A press on the PLATE-CHECK dialog (other than "Stop printing") is a person answering the
+    ladder's decision hold (operator ruling 2026-10-05): ``pause_recovery.human_dialog_action``
+    decides, 409 off the person's turn.
     """
 
     _VALID_BODY = {
@@ -2865,6 +2918,16 @@ class TestExecuteHMSActionAPI:
         "action": "OK_BUTTON",
         "job_id": None,
     }
+
+    @pytest.fixture(autouse=True)
+    def _clean_plate_check_state(self):
+        from backend.app.services import pause_recovery, printer_incidents
+
+        printer_incidents._reset_state()
+        pause_recovery._reset_state()
+        yield
+        printer_incidents._reset_state()
+        pause_recovery._reset_state()
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2891,18 +2954,15 @@ class TestExecuteHMSActionAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_a_success_ack_is_200(self, async_client: AsyncClient, printer_factory):
-        """The farm's plate-check press, through the route: the vendor "Problem solved"
-        frame goes out, the firmware answers THAT send with success, 200."""
+    async def test_a_success_ack_is_200(self, async_client: AsyncClient, printer_factory, db_session):
+        """A person's plate-check press in the decision hold, through the route: the vendor
+        "Problem solved" frame goes out for the live dialog and the hold's job, the firmware
+        answers THAT send with success, 200."""
         printer = await printer_factory(name="Test Printer")
         client = _dialog_client(result="success")
+        await _plate_check_row(db_session, printer.id, status="escalated")
 
-        with (
-            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
-        ):
-            mock_pm.get_client.return_value = client
-
+        with _plate_check_paused(client):
             body = {"print_error": "0500808C", "action": "PROBLEM_SOLVED_RESUME", "job_id": "771234"}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
@@ -2943,7 +3003,8 @@ class TestExecuteHMSActionAPI:
     @pytest.mark.integration
     async def test_a_missing_job_id_is_sent_empty(self, async_client: AsyncClient, printer_factory):
         """The body's ``job_id`` is optional (a fault with no job); the dialog frame always
-        carries the key, as Studio's does — ``""``, never ``null``, never omitted."""
+        carries the key, as Studio's does — ``""``, never ``null``, never omitted. (A dialog that
+        is not the plate check: that one's press carries the hold's job.)"""
         printer = await printer_factory(name="Test Printer")
         client = _dialog_client(result="success")
 
@@ -2953,7 +3014,7 @@ class TestExecuteHMSActionAPI:
         ):
             mock_pm.get_client.return_value = client
 
-            body = {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": None}
+            body = {"print_error": "03008070", "action": "IGNORE_RESUME", "job_id": None}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
         assert response.status_code == 200
@@ -2973,7 +3034,7 @@ class TestExecuteHMSActionAPI:
         ):
             mock_pm.get_client.return_value = client
 
-            body = {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": None}
+            body = {"print_error": "03008070", "action": "IGNORE_RESUME", "job_id": None}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
         assert response.status_code == 502
@@ -3008,21 +3069,17 @@ class TestExecuteHMSActionAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_a_re_pause_inside_the_window_is_still_a_success(self, async_client: AsyncClient, printer_factory):
+    async def test_a_re_pause_inside_the_window_is_still_a_success(
+        self, async_client: AsyncClient, printer_factory, db_session
+    ):
         """The race the state diff lost (upstream #1869): the printer accepts, resumes and
         re-pauses on the same dialog inside the window, so ``gcode_state`` and the HMS list
         round-trip to their pre-press values. The ACK is the answer, not the state."""
         printer = await printer_factory(name="Test Printer")
         client = _dialog_client(result="success")
-        client.state.state = "PAUSE"
-        client.state.print_error = 0x0500808C
+        await _plate_check_row(db_session, printer.id, status="escalated")
 
-        with (
-            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
-        ):
-            mock_pm.get_client.return_value = client
-
+        with _plate_check_paused(client):
             body = {"print_error": "0500808C", "action": "PROBLEM_SOLVED_RESUME", "job_id": None}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
@@ -3150,6 +3207,96 @@ class TestExecuteHMSActionAPI:
 
         assert response.status_code == 200
         assert _published_print_frames(client) == [{"command": "ams_control", "param": "resume", "sequence_id": "1"}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_plate_check_press_mid_ladder_is_409(
+        self, async_client: AsyncClient, printer_factory, db_session, own_session_factory
+    ):
+        """The ladder is still acting (a ``recovering`` episode): a person's press would race the
+        farm's own re-check and stop. Refused, nothing sent, nothing on the ledger."""
+        from backend.app.services import pause_recovery
+
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+        row = await _plate_check_row(db_session, printer.id, status="recovering")
+
+        with _plate_check_paused(client):
+            body = {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": "771234"}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+            status = (await async_client.get(f"/api/v1/printers/{printer.id}/status")).json()
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Plate check: the farm is still working on it"
+        # The status projection offers no buttons mid-ladder: no turn, and the HMS modal's entry
+        # carries none (its catalog list is filtered at the projection).
+        assert status["plate_check_exit"] is None
+        assert [(e["short_code"], e["actions"]) for e in status["hms_errors"]] == [("0500_808C", [])]
+        client._client.publish.assert_not_called()
+        async with own_session_factory() as s:
+            assert (await pause_recovery._PlateCheckEvidence.from_row(s, row.id)).steps == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("setup", "body"),
+        [
+            ("no_hold", {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": "771234"}),
+            ("another_job", {"print_error": "0500808C", "action": "IGNORE_RESUME", "job_id": "771234"}),
+            ("hold", {"print_error": "0500808C", "action": "RESUME_PRINTING", "job_id": "771234"}),
+        ],
+        ids=["no-hold", "the-printer-is-on-another-job", "a-button-the-turn-does-not-offer"],
+    )
+    async def test_a_plate_check_press_off_the_persons_turn_is_409(
+        self, async_client: AsyncClient, printer_factory, db_session, setup, body
+    ):
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+        if setup != "no_hold":
+            await _plate_check_row(db_session, printer.id, status="escalated")
+
+        with _plate_check_paused(client, job_id="999999" if setup == "another_job" else "771234"):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "No paused plate check on this printer"
+        client._client.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("print_error", ["0500808C", "0500806E"], ids=["build-plate-offset", "foreign-objects"])
+    async def test_a_persons_ignore_in_the_hold_is_200_and_on_the_ledger(
+        self, async_client: AsyncClient, printer_factory, db_session, own_session_factory, print_error
+    ):
+        """Every plate-check code is delegated — ``0500_806E`` has no catalog button, and the turn
+        offers Ignore all the same. The press is noted on the episode's ledger, the frame is the
+        printer's own "ignore" for the live dialog and the hold's job."""
+        from backend.app.services import pause_recovery
+
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+        row = await _plate_check_row(db_session, printer.id, status="escalated")
+
+        with _plate_check_paused(client, print_error=int(print_error, 16)):
+            status = (await async_client.get(f"/api/v1/printers/{printer.id}/status")).json()
+            body = {"print_error": print_error, "action": "IGNORE_RESUME", "job_id": "771234"}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        # The person's turn on /status: its own field, and the HMS entry offers the turn's buttons.
+        assert status["plate_check_exit"] == {
+            "print_error": print_error,
+            "job_id": "771234",
+            "actions": ["PROBLEM_SOLVED_RESUME", "IGNORE_RESUME"],
+            "deadline_at": None,
+        }
+        assert [e["actions"] for e in status["hms_errors"]] == [["PROBLEM_SOLVED_RESUME", "IGNORE_RESUME"]]
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "message": "HMS action executed"}
+        (frame,) = _published_print_frames(client)
+        assert (frame["command"], frame["err"], frame["job_id"]) == ("ignore", str(int(print_error, 16)), "771234")
+        async with own_session_factory() as s:
+            log = await pause_recovery._PlateCheckEvidence.from_row(s, row.id)
+        assert [(step.kind, step.name, step.outcome) for step in log.steps] == [("dialog", "IGNORE_RESUME", "success")]
 
     @pytest.mark.asyncio
     @pytest.mark.integration

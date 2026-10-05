@@ -3389,7 +3389,6 @@ class TestOnStorageLowWording:
                 success=False,
                 freed_bytes=0,
                 files_deleted=0,
-                free_bytes=None,
                 reason="USB drive dropped/unmounted — power-cycle the printer to remount it",
                 attempted=False,
                 db=mock_db,
@@ -3415,7 +3414,6 @@ class TestOnStorageLowWording:
                 success=False,
                 freed_bytes=0,
                 files_deleted=0,
-                free_bytes=None,
                 reason=None,
                 attempted=False,
                 db=mock_db,
@@ -3439,7 +3437,6 @@ class TestOnStorageLowWording:
                 success=False,
                 freed_bytes=0,
                 files_deleted=0,
-                free_bytes=None,
                 reason="printer FTPS unreachable",
                 db=mock_db,
             )
@@ -3461,13 +3458,10 @@ class TestOnStorageLowWording:
                 success=True,
                 freed_bytes=3 * 1024 * 1024,
                 files_deleted=2,
-                free_bytes=5 * 1024**3,
                 reason=None,
                 db=mock_db,
             )
-        detail = self._detail_for(mock_build)
-        assert detail.startswith("Auto-cleanup freed 3 MB across 2 file(s)")
-        assert "5.0 GB free now" in detail
+        assert self._detail_for(mock_build) == "Auto-cleanup freed 3 MB across 2 file(s)."
 
 
 class TestQueueJobWaitingDedup:

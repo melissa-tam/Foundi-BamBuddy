@@ -4569,8 +4569,8 @@ class TestZombieRecoveringRearm:
         "unreadable step ledger" drift ERROR — and its own startup verdict still runs (an
         IDLE printer is no RUNNING evidence, and nobody re-enters it here)."""
         from backend.app.models.printer_incident import KIND_PLATE_VISION, STATUS_RECOVERING
-        from backend.app.services import pause_recovery
         from backend.app.services.hms_actions import HMSAction
+        from backend.app.services.terminal_outcome import PLATE_CHECK_RETRY_STOP
 
         printer = await printer_factory()
         row = await _seed_incident(
@@ -4585,9 +4585,7 @@ class TestZombieRecoveringRearm:
             db_session, row.id, seq=1, kind="dialog", name=str(HMSAction.PROBLEM_SOLVED_RESUME)
         )
         await printer_incidents.answer_step(db_session, row.id, 1, outcome="success")
-        await printer_incidents.note_step(
-            db_session, row.id, seq=2, kind="stop", name=pause_recovery.PLATE_CHECK_STOP_VERB
-        )
+        await printer_incidents.note_step(db_session, row.id, seq=2, kind="stop", name=PLATE_CHECK_RETRY_STOP)
         state = _make_state(gcode_state="IDLE", hms=[])
         client = FakeClient(state)
         _wire(monkeypatch, state, client)

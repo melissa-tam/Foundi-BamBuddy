@@ -844,6 +844,36 @@ class _PlateCheckLadder(_PlateCheckJourney):
             stack.enter_context(patch.object(pause_recovery, name, value))
 
     @staticmethod
+    def _decision_window(stack, seconds):
+        """Fix the decision hold's window (``farm_plate_check_decision_minutes``'s reading) for the
+        journey, so the hold's deadline timer runs out when the journey wants it to."""
+        from backend.app.services import pause_recovery
+
+        async def _fixed(_db):
+            return seconds
+
+        stack.enter_context(patch.object(pause_recovery, "_decision_window_s", _fixed))
+        stack.enter_context(patch.object(pause_recovery, "_DEADLINE_POLL_S", 0.01))
+
+    @staticmethod
+    async def _deadline_done(printer_id):
+        """Await the decision hold's deadline timer, then the driver it spawned, to their end."""
+        import backend.app.core.tasks as core_tasks
+
+        name = f"plate-check-deadline-p{printer_id}"
+        pending = [t for t in list(core_tasks._background_tasks) if t.get_name() == name and not t.done()]
+        if pending:
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=10)
+        await _PlateCheckLadder._episode_done(printer_id)
+
+    async def _held_episode(self, printer_id, wire):
+        """Trip → press → the re-check fails → rung 2 decides the HOLD: the print stays PAUSED."""
+        from backend.app.services import pause_recovery
+
+        pause_recovery.note_status_push(printer_id, wire.state)
+        await self._episode_done(printer_id)
+
+    @staticmethod
     def _hold_clock(stack, clock):
         """The plate authority's hold clock (``plate_occupancy._now_mono``), steered by the test.
 
@@ -910,6 +940,14 @@ class _PlateCheckLadder(_PlateCheckJourney):
         return [(step.kind, step.outcome) for step in log.steps]
 
     @staticmethod
+    async def _stop_names(maker, incident_id):
+        from backend.app.services.pause_recovery import _PlateCheckEvidence
+
+        async with maker() as s:
+            log = await _PlateCheckEvidence.from_row(s, incident_id)
+        return [step.name for step in log.steps if step.kind == "stop"]
+
+    @staticmethod
     async def _requeues(maker, item_id):
         from sqlalchemy import select
 
@@ -922,10 +960,12 @@ class _PlateCheckLadder(_PlateCheckJourney):
 
 
 class TestPlateCheckLadderJourney(_PlateCheckLadder):
-    """Every rung, end to end: the same print continues on a passing re-check; a failed one is
-    stopped and RETRIED; the retry's own failure is REFUSED to a human; a foreign print is
-    re-checked, then stopped and escalated; a stop the farm cannot land falls back to the
-    paused hold."""
+    """Every rung, end to end (operator rulings 2026-09-29 / 2026-10-05): the same print continues
+    on a passing re-check; a failed one is stopped and RETRIED; the retry's own failure is HELD
+    paused for a person — whose Ignore and resume through the route lets the same job print on,
+    and whose silence ends at the decision deadline in a stop and a REFUSED plate; a foreign
+    print is re-checked, held, and stopped at the deadline; a stop the farm cannot land falls back
+    to the paused hold."""
 
     @pytest.mark.asyncio
     async def test_i_the_recheck_passes_and_the_same_job_continues(self, test_engine):
@@ -994,6 +1034,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             assert len(wire.presses) == 1 and wire.stops == [printer_id]
             row = await self._episode_row(mocks.maker, printer_id, "SUB-2")
             assert await self._ledger(mocks.maker, row.id) == [("dialog", "success"), ("stop", "taken")]
+            assert await self._stop_names(mocks.maker, row.id) == ["retry_stop"]
             # The episode closed at its terminal as the farm's own recovery.
             assert (row.resolve_source, printer_incidents.outcome_of(row)) == ("terminal", "auto_recovered")
             async with mocks.maker() as s:
@@ -1017,68 +1058,137 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             clock.advance(waits[0] + 0.01)
             assert _occupancy().dispatchable(printer_id, idle) is None
 
-    @pytest.mark.asyncio
-    async def test_iii_the_retrys_own_failed_recheck_refuses_the_plate(self, test_engine, clock):
-        """A second failed episode on this printer inside the window: the plate is a human's —
-        a refusal gate in the printer's words, the bed lifted, the unit requeued."""
-        from contextlib import ExitStack
+    async def _retry_trips_again(self, mocks, wire, printer_id, item_id, clock, waits, tasks_before):
+        """The first episode retried (its stop ``retry_stop``), its lift's claimed motion window
+        lapsed, and the retry is dispatched back onto the same printer as ``SUB-3R``."""
         from datetime import datetime, timezone
 
         from backend.app.models.print_queue import PrintQueueItem
-        from backend.app.services import printer_incidents
+        from backend.app.services.plate_occupancy import Evidence
+
+        await self._failed_episode(printer_id, wire, "SUB-3", tasks_before)
+        (retry,) = await self._requeues(mocks.maker, item_id)
+        assert _occupancy().is_plate_occupied(printer_id) is False  # the first stop retried
+        idle = Evidence(live_state="IDLE")
+        assert _occupancy().dispatchable(printer_id, idle) == "bed_motion_in_flight"
+        clock.advance(waits[0] + 0.01)
+        assert _occupancy().dispatchable(printer_id, idle) is None
+        async with mocks.maker() as s:
+            unit = await s.get(PrintQueueItem, retry.id)
+            unit.status, unit.printer_id, unit.dispatch_subtask_id = "printing", printer_id, "SUB-3R"
+            unit.started_at = datetime.now(timezone.utc)
+            await s.commit()
+        wire.state = self._paused("SUB-3R")
+        return retry
+
+    @pytest.mark.asyncio
+    async def test_iii_the_retrys_own_failure_holds_for_a_person_whose_ignore_resumes_it(
+        self, test_engine, clock, async_client
+    ):
+        """A second failed episode on this printer inside the hour would be an escalation, so the
+        print is HELD paused at the dialog (operator ruling 2026-10-05): the hold shows on /status,
+        a person's Ignore and resume through the route is sent and answered, the same job prints
+        on, and the hold closes ``observed_running`` through the rule table — no stop, no gate."""
+        from contextlib import ExitStack
+
+        from backend.app.services import printer_incidents, spool_recovery
         from backend.app.services.notification_service import notification_service
-        from backend.app.services.plate_occupancy import EscalationOnly, Evidence
 
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
             mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
             printer_id, item_id, _batch = await self._seed_farm_unit(mocks.maker, serial="LAD-3", subtask="SUB-3")
-            wire = _LadderWire(self._paused("SUB-3"), ack="fail").install(stack)  # refused: straight to the stop
+            wire = _LadderWire(self._paused("SUB-3"), ack="fail", layer=0).install(stack)  # refused: rung 2
+            page = stack.enter_context(patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock))
+            waits = self._record_lift_waits(stack)
+            self._hold_clock(stack, clock)
+            self._fast_ladder(stack)
+            retry = await self._retry_trips_again(mocks, wire, printer_id, item_id, clock, waits, tasks_before)
+
+            await self._held_episode(printer_id, wire)
+
+            assert wire.stops == [printer_id]  # only the first episode's retry stop
+            row = await self._episode_row(mocks.maker, printer_id, "SUB-3R")
+            assert (row.status, row.resolved_at) == ("escalated", None)
+            assert await self._ledger(mocks.maker, row.id) == [("dialog", "fail")]
+            page.assert_awaited_once()
+            assert "Plate check failed twice. Print paused for 10 min" in page.await_args.kwargs["source_detail"]
+            assert printer_incidents.driver_live(printer_id) is False
+
+            # The person's turn, on the poll.
+            status = (await async_client.get(f"/api/v1/printers/{printer_id}/status")).json()
+            exit_ = status["plate_check_exit"]
+            assert (exit_["print_error"], exit_["job_id"]) == ("0500808C", "SUB-3R")
+            assert exit_["actions"] == ["PROBLEM_SOLVED_RESUME", "IGNORE_RESUME"]
+
+            # Ignore and resume, through the route — and the printer accepts it.
+            wire.client.await_ack = AsyncMock(side_effect=lambda sent, budget_s, poll_s: wire._ack(sent, "success"))
+            response = await async_client.post(
+                f"/api/v1/printers/{printer_id}/hms/execute-action",
+                json={"print_error": exit_["print_error"], "action": "IGNORE_RESUME", "job_id": exit_["job_id"]},
+            )
+            assert response.status_code == 200
+            assert wire.presses[-1] == ("0500808C", "IGNORE_RESUME", "SUB-3R")
+            assert await self._ledger(mocks.maker, row.id) == [("dialog", "fail"), ("dialog", "success")]
+
+            # The same job prints on: the hold closes through the rule table.
+            wire.state.state, wire.state.print_error, wire.state.hms_errors = "RUNNING", 0, []
+            assert await spool_recovery.on_observed_running(printer_id) is True
+            row = await self._episode_row(mocks.maker, printer_id, "SUB-3R")
+            assert (row.resolve_source, printer_incidents.outcome_of(row)) == ("observed_running", "human_resolved")
+            assert wire.stops == [printer_id]
+            assert _occupancy().is_plate_occupied(printer_id) is False
+            assert len(await self._requeues(mocks.maker, retry.id)) == 0  # the same job continues
+
+    @pytest.mark.asyncio
+    async def test_iv_a_hold_nobody_answers_is_stopped_at_the_deadline_and_the_plate_refused(self, test_engine, clock):
+        """The same second failure, and nobody presses anything: the decision window runs out, the
+        timer stops the print as ``deadline_stop``, and its terminal REFUSES the plate — a gate in
+        the printer's words, the bed lifted, the retry's unit requeued."""
+        from contextlib import ExitStack
+
+        from backend.app.models.print_queue import PrintQueueItem
+        from backend.app.services import printer_incidents
+        from backend.app.services.notification_service import notification_service
+        from backend.app.services.plate_occupancy import EscalationOnly
+
+        tasks_before = set(asyncio.all_tasks())
+        with ExitStack() as stack:
+            mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
+            printer_id, item_id, _batch = await self._seed_farm_unit(mocks.maker, serial="LAD-4", subtask="SUB-3")
+            wire = _LadderWire(self._paused("SUB-3"), ack="fail", layer=0).install(stack)
             stack.enter_context(patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock))
             waits = self._record_lift_waits(stack)
             self._hold_clock(stack, clock)
             self._fast_ladder(stack)
+            retry = await self._retry_trips_again(mocks, wire, printer_id, item_id, clock, waits, tasks_before)
+            self._decision_window(stack, 0.0)
 
-            await self._failed_episode(printer_id, wire, "SUB-3", tasks_before)
-            (retry,) = await self._requeues(mocks.maker, item_id)
-            assert _occupancy().is_plate_occupied(printer_id) is False  # the first stop retried
-
-            # The scheduler can dispatch the retry only once the first lift's claimed motion
-            # window has lapsed (``dispatchable`` refuses ``bed_motion_in_flight`` inside it).
-            idle = Evidence(live_state="IDLE")
-            assert _occupancy().dispatchable(printer_id, idle) == "bed_motion_in_flight"
-            clock.advance(waits[0] + 0.01)
-            assert _occupancy().dispatchable(printer_id, idle) is None
-
-            # The retry is dispatched back onto the same printer, and trips again.
-            async with mocks.maker() as s:
-                unit = await s.get(PrintQueueItem, retry.id)
-                unit.status, unit.printer_id, unit.dispatch_subtask_id = "printing", printer_id, "SUB-3R"
-                unit.started_at = datetime.now(timezone.utc)
-                await s.commit()
-            wire.state = self._paused("SUB-3R")
             tasks_before = set(asyncio.all_tasks())
-            await self._failed_episode(printer_id, wire, "SUB-3R", tasks_before)
+            await self._held_episode(printer_id, wire)
+            await self._until(lambda: len(wire.stops) == 2, "the decision deadline's stop")
+            await self._terminal(printer_id, subtask="SUB-3R", status="aborted")
+            await self._deadline_done(printer_id)
+            await self._settle(tasks_before)
 
-            assert len(wire.presses) == 2 and wire.stops == [printer_id, printer_id]
             row = await self._episode_row(mocks.maker, printer_id, "SUB-3R")
+            assert await self._stop_names(mocks.maker, row.id) == ["deadline_stop"]
             assert (row.resolve_source, printer_incidents.outcome_of(row)) == ("plate_refused", "human_resolved")
-            # Gated for a human, sourceless, in the printer's own words.
             view = _occupancy().snapshot(printer_id)
             assert view.plate_occupied is True
             assert view.plate_source_subtask_id is None
             assert isinstance(view.plate_policy, EscalationOnly)
             assert view.plate_policy.refusal.messages[0].short_code == "0500_808C"
-            # The bed lifted both times, and the retry's unit requeued again (to wait, or go elsewhere).
-            assert wire.client.send_gcode.call_count == 2
-            assert len(waits) == 2
+            assert wire.client.send_gcode.call_count == 2  # lifted both times
             async with mocks.maker() as s:
                 unit = await s.get(PrintQueueItem, retry.id)
                 assert (unit.status, unit.stop_source) == ("cancelled", "plate_refused")
             assert len(await self._requeues(mocks.maker, retry.id)) == 1
 
     @pytest.mark.asyncio
-    async def test_iv_a_foreign_print_is_rechecked_then_stopped_and_escalated(self, test_engine):
+    async def test_iv_b_a_foreign_print_is_rechecked_held_and_stopped_at_the_deadline(self, test_engine):
+        """A screen-started print has no unit to retry, so its failed re-check is an escalation:
+        held paused for a person, then — nobody answering — stopped at the deadline and refused."""
         from contextlib import ExitStack
 
         from backend.app.models.printer import Printer
@@ -1090,10 +1200,10 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
         with ExitStack() as stack:
             mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
             # A printer with NO farm unit on it (its geometry row is what the bed lift reads).
-            _pid, _item, _batch = await self._seed_farm_unit(mocks.maker, serial="LAD-4-GEO", subtask="SUB-OTHER")
+            _pid, _item, _batch = await self._seed_farm_unit(mocks.maker, serial="LAD-4F-GEO", subtask="SUB-OTHER")
             async with mocks.maker() as s:
                 printer = Printer(
-                    name="P-LAD-4", serial_number="LAD-4", ip_address="10.0.0.9", access_code="0000", model="H2S"
+                    name="P-LAD-4F", serial_number="LAD-4F", ip_address="10.0.0.9", access_code="0000", model="H2S"
                 )
                 s.add(printer)
                 await s.commit()
@@ -1101,18 +1211,25 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             # A screen-started print: no unit, a firmware-minted id. Its re-check fails too.
             wire = _LadderWire(
                 self._paused("FOREIGN-4"),
+                layer=0,
                 after_press=[_LadderWire.set(print_error=0), _LadderWire.set(print_error=self._PLATE_ERR)],
             ).install(stack)
             stack.enter_context(patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock))
             waits = self._record_lift_waits(stack)
             self._fast_ladder(stack)
+            self._decision_window(stack, 0.0)
 
-            await self._failed_episode(printer_id, wire, "FOREIGN-4", tasks_before)
+            await self._held_episode(printer_id, wire)
+            await self._until(lambda: len(wire.stops) == 1, "the decision deadline's stop")
+            await self._terminal(printer_id, subtask="FOREIGN-4", status="aborted")
+            await self._deadline_done(printer_id)
+            await self._settle(tasks_before)
 
             assert wire.presses == [("0500808C", "PROBLEM_SOLVED_RESUME", "FOREIGN-4")]  # re-checked first
             assert wire.stops == [printer_id]
             row = await self._episode_row(mocks.maker, printer_id, "FOREIGN-4")
             assert row.item_id is None
+            assert await self._stop_names(mocks.maker, row.id) == ["deadline_stop"]
             assert (row.resolve_source, printer_incidents.outcome_of(row)) == ("plate_refused", "human_resolved")
             view = _occupancy().snapshot(printer_id)
             assert view.plate_occupied is True
@@ -1132,7 +1249,7 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
         with ExitStack() as stack:
             mocks = TestPlateClearGate._setup_mocks(stack, test_engine)
             printer_id, item_id, _batch = await self._seed_farm_unit(mocks.maker, serial="LAD-5", subtask="SUB-5")
-            wire = _LadderWire(self._paused("SUB-5"), ack="fail", stop_taken=False).install(stack)
+            wire = _LadderWire(self._paused("SUB-5"), ack="fail", stop_taken=False, layer=0).install(stack)
             page = stack.enter_context(patch.object(notification_service, "on_plate_not_empty", new_callable=AsyncMock))
             self._fast_ladder(stack, stop_confirm_s=0.2)
 
@@ -1142,11 +1259,12 @@ class TestPlateCheckLadderJourney(_PlateCheckLadder):
             row = await self._episode_row(mocks.maker, printer_id, "SUB-5")
             assert (row.status, row.resolved_at) == ("escalated", None)
             assert await self._ledger(mocks.maker, row.id) == [("dialog", "fail"), ("stop", "not_taken")]
+            assert await self._stop_names(mocks.maker, row.id) == ["retry_stop"]
             wire.client.send_gcode.assert_not_called()  # the job never ended: no terminal, no lift
             page.assert_awaited_once()
             detail = page.await_args.kwargs["source_detail"]
             assert detail.startswith("The printer reported: ")
-            assert detail.endswith("Print paused — fix the plate, then resume.")
+            assert detail.endswith("Print paused at the plate check. Ignore and resume, or stop the print.")
             async with mocks.maker() as s:
                 item = await s.get(PrintQueueItem, item_id)
                 assert (item.status, item.waiting_reason) == ("printing", "plate_not_empty_printer_detected")
@@ -1167,14 +1285,15 @@ class TestPlateCheckFallbackHold(_PlateCheckLadder):
     first article included)."""
 
     async def _fallback_hold(self, maker, printer_id, item_id):
-        """The episode as the fallback leaves it: ESCALATED, the printer's code recorded, the
-        unit's hold projected."""
+        """The episode as the fallback leaves it: ESCALATED over a retry stop the printer did not
+        take, the printer's code recorded, the unit's hold projected."""
         from backend.app.models.print_queue import PrintQueueItem
         from backend.app.models.printer_incident import KIND_PLATE_VISION, STATUS_ESCALATED
-        from backend.app.services import printer_incidents
+        from backend.app.services import pause_recovery, printer_incidents
+        from backend.app.services.terminal_outcome import PLATE_CHECK_RETRY_STOP
 
         async with maker() as s:
-            await printer_incidents.open_new(
+            row = await printer_incidents.open_new(
                 s,
                 printer_id=printer_id,
                 job_id=self._SUBTASK,
@@ -1186,6 +1305,11 @@ class TestPlateCheckFallbackHold(_PlateCheckLadder):
                 hms_full_codes=["0500808C"],
                 status=STATUS_ESCALATED,
             )
+            log = await pause_recovery._PlateCheckEvidence.from_row(s, row.id)
+            pressed = await log.note(pause_recovery.PlateCheckStep.dialog())
+            await log.answer(pressed, "fail")
+            stopped = await log.note(pause_recovery.PlateCheckStep.stop(PLATE_CHECK_RETRY_STOP))
+            await log.answer(stopped, "not_taken")
             item = await s.get(PrintQueueItem, item_id)
             item.waiting_reason = printer_incidents.waiting_reason_for(KIND_PLATE_VISION)
             await s.commit()
@@ -1292,14 +1416,13 @@ class TestPlateCheckFallbackHold(_PlateCheckLadder):
 
 
 class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
-    """The ladder's terminal side (operator ruling 2026-09-29), through the REAL terminal.
+    """The ladder's terminal side (operator rulings 2026-09-29 / 2026-10-05), through the REAL
+    terminal: it reads the decision the ladder RECORDED as its stop's name and never re-decides.
 
-    The farm's re-check failed and the FARM stopped the print (the episode's log holds its
-    ``stop``): the same print is RETRIED — requeued next in line, no gate, no page, the bed
-    lifted and waited out, the episode closed ``terminal`` and counted ``auto_recovered``. If
-    the farm already stopped another episode on this printer inside the hour, this is the
-    retry's own failure: the plate is REFUSED to a human instead. The episode's steps are
-    seeded through its own evidence log, the ledger's one writer.
+    ``retry_stop``: the same print is RETRIED — requeued next in line, no gate, no page, the bed
+    lifted and waited out, the episode closed ``terminal`` and counted ``auto_recovered``.
+    ``deadline_stop`` (the decision hold's window ran out): the plate is REFUSED to a human. The
+    episode's steps are seeded through its own evidence log, the ledger's one writer.
     """
 
     @pytest.fixture(autouse=True)
@@ -1308,7 +1431,7 @@ class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
         yield
         self._reset_process_state()
 
-    async def _farm_stopped_terminal(self, test_engine, *, serial, prior_stop):
+    async def _farm_stopped_terminal(self, test_engine, *, serial, stop_name):
         from contextlib import ExitStack
 
         from sqlalchemy import select
@@ -1321,7 +1444,7 @@ class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
         from backend.app.services.pause_recovery import PlateCheckStep
         from backend.app.services.printer_manager import printer_manager
 
-        async def _episode(s, *, job_id, item_id, close):
+        async def _episode(s, *, job_id, item_id):
             row = await printer_incidents.open_new(
                 s,
                 printer_id=printer_id,
@@ -1332,14 +1455,12 @@ class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
                 codes="0500_808C",
                 slot_global_tray=None,
                 hms_full_codes=[self._FULL],
-                status="recovering",
+                status="escalated" if stop_name == "deadline_stop" else "recovering",
             )
             log = await pause_recovery._PlateCheckEvidence.from_row(s, row.id)
             pressed = await log.note(PlateCheckStep.dialog())
             await log.answer(pressed, "fail")  # the re-check failed...
-            await log.note(PlateCheckStep.stop())  # ...so the farm stopped; its answer is still owed
-            if close:
-                await printer_incidents.close(s, row.id, status="resolved", source="terminal")
+            await log.note(PlateCheckStep.stop(stop_name))  # ...so the farm stopped; its answer is still owed
 
         tasks_before = set(asyncio.all_tasks())
         with ExitStack() as stack:
@@ -1356,10 +1477,7 @@ class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
             stack.enter_context(patch.object(farm_policy.printer_manager, "get_client", return_value=lift))
             waits = self._record_lift_waits(stack)
             async with mocks.maker() as s:
-                if prior_stop:
-                    # The retry's parent: an episode of another job the farm already stopped here.
-                    await _episode(s, job_id="SUB-PARENT", item_id=None, close=True)
-                await _episode(s, job_id=self._SUBTASK, item_id=item_id, close=False)
+                await _episode(s, job_id=self._SUBTASK, item_id=item_id)
 
             await self._terminal(printer_id, subtask=self._SUBTASK)
             await self._settle(tasks_before)
@@ -1386,7 +1504,7 @@ class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
         from backend.app.services import farm_policy, printer_incidents
 
         printer_id, item, row, requeues, batch, lift, waits, page = await self._farm_stopped_terminal(
-            test_engine, serial="PCR-1", prior_stop=False
+            test_engine, serial="PCR-1", stop_name="retry_stop"
         )
 
         # The unit: a stop at the plate check, never a failure.
@@ -1406,13 +1524,15 @@ class TestPlateCheckFarmStopRetries(_PlateCheckJourney):
         assert (row.resolve_source, printer_incidents.outcome_of(row)) == ("terminal", "auto_recovered")
 
     @pytest.mark.asyncio
-    async def test_the_retrys_own_failed_recheck_escalates(self, test_engine):
-        """A second farm stop on this printer inside the hour: the plate is a human's."""
+    async def test_the_decision_deadlines_stop_escalates(self, test_engine):
+        """CONTRACT CHANGE (2026-10-05): the terminal no longer counts the window's other stops
+        (that decision moved to rung 2). The decision hold's window ran out and the farm stopped
+        the print as ``deadline_stop``: the plate is a human's, however little was deposited."""
         from backend.app.services import printer_incidents
         from backend.app.services.plate_occupancy import EscalationOnly
 
         printer_id, item, row, requeues, batch, lift, waits, _page = await self._farm_stopped_terminal(
-            test_engine, serial="PCR-2", prior_stop=True
+            test_engine, serial="PCR-2", stop_name="deadline_stop"
         )
 
         assert (item.status, item.stop_source) == ("cancelled", "plate_refused")

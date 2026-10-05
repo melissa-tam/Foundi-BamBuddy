@@ -2228,3 +2228,196 @@ class TestTheRestartStopProjection:
         assert self._flag(printer_id) is True
         await printer_incidents.mark_escalated(db_session, row_id)
         assert self._flag(printer_id) is True
+
+
+class TestThePlateCheckLedgerProjection:
+    """The plate-check ladder's facts on the open-row projection (operator ruling 2026-10-05), for
+    the DB-free readers — the episode's sampler, its deadline timer and the person's turn:
+    ``escalated_at`` (the decision window's start), ``last_stop`` (the farm's last stop as the
+    ledger recorded it) and ``deadline_at`` (the hold timer's note). The ledger facts follow the
+    one writer at the send and the read, and are re-derived at every rebuild of the projection —
+    never a column."""
+
+    @staticmethod
+    async def _episode(db_session, printer_factory, *, status=STATUS_RECOVERING):
+        printer = await printer_factory()
+        row = await _open(
+            db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="0500_808C", status=status
+        )
+        return printer.id, row
+
+    @staticmethod
+    def _snap(printer_id):
+        return printer_incidents.snapshot(printer_id, kind=KIND_PLATE_VISION)
+
+    async def test_a_fresh_row_projects_no_stop_and_no_deadline(self, db_session, printer_factory):
+        printer_id, row = await self._episode(db_session, printer_factory)
+
+        snap = self._snap(printer_id)
+        assert (snap["escalated_at"], snap["last_stop"], snap["deadline_at"]) == (None, None, None)
+        assert printer_incidents._payload(row)["last_stop"] is None
+
+    async def test_escalated_at_follows_the_escalation(self, db_session, printer_factory):
+        printer_id, row = await self._episode(db_session, printer_factory)
+
+        await printer_incidents.mark_escalated(db_session, row.id)
+
+        await db_session.refresh(row)
+        assert self._snap(printer_id)["escalated_at"] == row.escalated_at.isoformat()
+
+    async def test_the_last_stop_flips_at_the_send_and_at_the_read(self, db_session, printer_factory):
+        printer_id, row = await self._episode(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind="dialog", name="PROBLEM_SOLVED_RESUME")
+        assert self._snap(printer_id)["last_stop"] is None  # a press is not a stop
+
+        await printer_incidents.note_step(db_session, row.id, seq=2, kind="stop", name="retry_stop")
+        assert self._snap(printer_id)["last_stop"] == {"name": "retry_stop", "outcome": None}
+
+        await printer_incidents.answer_step(db_session, row.id, 2, outcome="taken")
+        assert self._snap(printer_id)["last_stop"] == {"name": "retry_stop", "outcome": "taken"}
+
+        await printer_incidents.note_step(db_session, row.id, seq=3, kind="stop", name="deadline_stop")
+        assert self._snap(printer_id)["last_stop"] == {"name": "deadline_stop", "outcome": None}
+
+    async def test_rehydrate_derives_it_from_the_ledger(self, db_session, printer_factory):
+        printer_id, row = await self._episode(db_session, printer_factory, status=STATUS_ESCALATED)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind="stop", name="deadline_stop")
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="not_taken")
+        printer_incidents.note_deadline(printer_id, row.id, datetime(2026, 10, 5, 4, 0, 0))
+        printer_incidents._reset_state()  # a restart: the projection is gone, the ledger is not
+
+        assert await printer_incidents.rehydrate(db_session) == 1
+
+        snap = self._snap(printer_id)
+        assert snap["last_stop"] == {"name": "deadline_stop", "outcome": "not_taken"}
+        assert snap["escalated_at"] is not None
+        # The deadline is the hold timer's note, re-armed from escalated_at — not restored here.
+        assert snap["deadline_at"] is None
+
+    async def test_a_re_projection_keeps_the_ledger_and_the_deadline(self, db_session, printer_factory):
+        printer_id, row = await self._episode(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind="stop", name="retry_stop")
+        printer_incidents.note_deadline(printer_id, row.id, datetime(2026, 10, 5, 4, 0, 0))
+
+        await printer_incidents.mark_escalated(db_session, row.id)  # re-projects the row
+
+        snap = self._snap(printer_id)
+        assert snap["last_stop"] == {"name": "retry_stop", "outcome": None}
+        assert snap["deadline_at"] == "2026-10-05T04:00:00"
+
+    async def test_note_deadline_is_projection_only(self, db_session, printer_factory):
+        printer_id, row = await self._episode(db_session, printer_factory, status=STATUS_ESCALATED)
+
+        printer_incidents.note_deadline(printer_id, row.id, datetime(2026, 10, 5, 4, 10, 0))
+        assert self._snap(printer_id)["deadline_at"] == "2026-10-05T04:10:00"
+        printer_incidents.note_deadline(printer_id, row.id, None)
+        assert self._snap(printer_id)["deadline_at"] is None
+        # A row that is not open: nothing to note, nothing raised.
+        printer_incidents.note_deadline(printer_id, row.id + 99, datetime(2026, 10, 5))
+        printer_incidents.note_deadline(printer_id + 99, row.id, datetime(2026, 10, 5))
+
+    async def test_the_restart_stop_and_the_last_stop_derive_side_by_side(self, db_session, printer_factory):
+        """One derivation for both ledger facts: the AMS driver's restart stop keeps working."""
+        printer = await printer_factory()
+        jam = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010", status=STATUS_RECOVERING)
+        await printer_incidents.note_step(
+            db_session, jam.id, seq=1, kind=STEP_KIND_LEVER, name=printer_incidents.FAULT_RESTART_STEP
+        )
+        plate = await _open(db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="0500_808C")
+        await printer_incidents.note_step(db_session, plate.id, seq=1, kind="stop", name="retry_stop")
+        printer_incidents._reset_state()
+
+        await printer_incidents.rehydrate(db_session)
+
+        jam_snap = printer_incidents.snapshot(printer.id, kind=KIND_JAM)
+        plate_snap = printer_incidents.snapshot(printer.id, kind=KIND_PLATE_VISION)
+        assert (jam_snap[printer_incidents.PAYLOAD_FAULT_RESTART_STOP], jam_snap["last_stop"]) == (True, None)
+        assert (plate_snap[printer_incidents.PAYLOAD_FAULT_RESTART_STOP], plate_snap["last_stop"]) == (
+            False,
+            {"name": "retry_stop", "outcome": None},
+        )
+
+
+def _paused_at_plate(*, subtask="task-1", print_error=0x0500808C, state="PAUSE"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(state=state, print_error=print_error, subtask_id=subtask)
+
+
+class TestPlateCheckHumanTurn:
+    """``plate_check_human_turn`` — THE predicate of a person's turn at the plate-check dialog
+    (operator ruling 2026-10-05): an escalated ``plate_vision`` row, no driver live, the printer
+    PAUSEd at its plate check on the row's job. Its dict is what the card's buttons and the HMS
+    modal's render from; ``plate_check_turn_refusal`` is the same rule read for the refused press."""
+
+    @staticmethod
+    async def _hold(db_session, printer_factory, *, status=STATUS_ESCALATED):
+        printer = await printer_factory()
+        row = await _open(
+            db_session, printer.id, kind=KIND_PLATE_VISION, code="0500_808C", codes="0500_808C", status=status
+        )
+        return printer.id, row
+
+    async def test_the_turn_holds_in_the_hold(self, db_session, printer_factory):
+        printer_id, row = await self._hold(db_session, printer_factory)
+        printer_incidents.note_deadline(printer_id, row.id, datetime(2026, 10, 5, 4, 10, 0))
+
+        turn = printer_incidents.plate_check_human_turn(printer_id, _paused_at_plate())
+
+        assert turn == {
+            "print_error": "0500808C",
+            "job_id": "task-1",
+            "actions": ["PROBLEM_SOLVED_RESUME", "IGNORE_RESUME"],
+            "deadline_at": "2026-10-05T04:10:00",
+        }
+        assert printer_incidents.plate_check_turn_refusal(printer_id, _paused_at_plate()) is None
+        import json
+
+        json.dumps(turn)  # the WS frame dumps it with no encoder
+
+    async def test_no_plate_check_row_is_no_turn(self, db_session, printer_factory):
+        printer = await printer_factory()
+        assert printer_incidents.plate_check_human_turn(printer.id, _paused_at_plate()) is None
+        assert printer_incidents.plate_check_turn_refusal(printer.id, _paused_at_plate()) == "no_hold"
+
+    async def test_a_recovering_episode_is_the_farms(self, db_session, printer_factory):
+        printer_id, _row = await self._hold(db_session, printer_factory, status=STATUS_RECOVERING)
+
+        assert printer_incidents.plate_check_human_turn(printer_id, _paused_at_plate()) is None
+        assert printer_incidents.plate_check_turn_refusal(printer_id, _paused_at_plate()) == "farm_acting"
+
+    async def test_a_live_driver_is_the_farms(self, db_session, printer_factory, driver_tasks):
+        """The decision deadline's stop is in flight: a press now would race it."""
+        printer_id, row = await self._hold(db_session, printer_factory)
+        printer_incidents.register_driver(printer_id, driver_tasks(), incident_id=row.id)
+
+        assert printer_incidents.plate_check_human_turn(printer_id, _paused_at_plate()) is None
+        assert printer_incidents.plate_check_turn_refusal(printer_id, _paused_at_plate()) == "farm_acting"
+
+    @pytest.mark.parametrize(
+        ("state", "refusal"),
+        [
+            ({"state": "RUNNING", "print_error": 0}, "not_paused"),
+            ({"print_error": 0x03008007}, "not_paused"),  # paused, but for the power-loss prompt
+            ({"subtask": "task-OTHER"}, "other_job"),
+        ],
+        ids=["running", "another-dialog", "another-job"],
+    )
+    async def test_only_while_paused_at_the_plate_check_of_the_rows_job(
+        self, db_session, printer_factory, state, refusal
+    ):
+        printer_id, _row = await self._hold(db_session, printer_factory)
+
+        assert printer_incidents.plate_check_human_turn(printer_id, _paused_at_plate(**state)) is None
+        assert printer_incidents.plate_check_turn_refusal(printer_id, _paused_at_plate(**state)) == refusal
+
+    async def test_another_kind_ranked_above_it_does_not_hide_it(self, db_session, printer_factory):
+        """A power-loss row outranks ``plate_vision`` on the chip (``KIND_PRECEDENCE``); the turn is
+        read off the plate-check row by kind, so it still holds."""
+        from backend.app.models.printer_incident import KIND_POWER_LOSS
+
+        printer_id, _row = await self._hold(db_session, printer_factory)
+        await _open(db_session, printer_id, kind=KIND_POWER_LOSS, code="0300_8007", codes="0300_8007")
+        assert printer_incidents.snapshot(printer_id)["kind"] == KIND_POWER_LOSS
+
+        assert printer_incidents.plate_check_human_turn(printer_id, _paused_at_plate()) is not None

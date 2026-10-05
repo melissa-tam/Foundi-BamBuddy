@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.printer import Printer
 from backend.app.services.bambu_mqtt import BambuMQTTClient, MQTTLogEntry, PrinterState, get_stage_name
-from backend.app.services.hms_errors import hms_error_payload
+from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, hms_error_payload
 from backend.app.services.tray_observation import TrayObservation, observe_ams_push
 from backend.app.utils.printer_models import A1_FAMILY_MODELS, canon_model
 
@@ -1316,6 +1316,48 @@ def open_incident_payload(printer_id: int | None) -> dict | None:
     return printer_incidents.snapshot(printer_id)
 
 
+def plate_check_exit_payload(printer_id: int | None, state: PrinterState | None) -> dict | None:
+    """The plate-check human's turn as the card reads it, or None (operator ruling 2026-10-05).
+
+    ``{print_error, job_id, actions, deadline_at}`` while the printer waits PAUSED at its plate
+    check for a person — ``printer_incidents.plate_check_human_turn``, the ONE predicate, which
+    this builder is the status projection's only caller of (pinned). Its OWN field rather than a
+    key of ``open_incident``: that chip shows the highest-precedence row, and an AMS or power-loss
+    row outranks ``plate_vision``, so a turn read off the chip would vanish under them.
+
+    ONE builder for all three construction sites (the WS serializer below and BOTH REST
+    ``/status`` branches), like :func:`open_incident_payload`: the button must not appear on the
+    socket push and vanish on the next poll. With no live state there is no paused dialog, so no
+    turn. JSON primitives only.
+    """
+    if not printer_id or state is None:
+        return None
+    from backend.app.services import printer_incidents
+
+    return printer_incidents.plate_check_human_turn(printer_id, state)
+
+
+def hms_errors_payload(state: PrinterState, plate_check_exit: dict | None) -> list[dict]:
+    """The printer's live HMS list as the wire carries it: :func:`hms_error_payload` per entry —
+    the single enrichment site — with a plate-check entry's ``actions`` set to the human's turn.
+
+    The HMS modal renders an entry's ``actions`` as its buttons. For a plate-check code
+    (``hms_errors.PLATE_CHECK_HMS_CODES``) the catalog's own list is replaced by the turn's
+    (:func:`plate_check_exit_payload`): the buttons while it is a person's turn, ``[]`` otherwise
+    — mid-ladder a press would race the farm's own re-check and stop (operator ruling
+    2026-10-05). The parser keeps the catalog's list; the filter is the projection's. ONE builder
+    for the WS frame and the REST ``/status`` route.
+    """
+    actions = list(plate_check_exit["actions"]) if plate_check_exit is not None else []
+    payloads = []
+    for entry in state.hms_errors or []:
+        payload = hms_error_payload(entry)
+        if payload["short_code"] in PLATE_CHECK_HMS_CODES:
+            payload["actions"] = list(actions)
+        payloads.append(payload)
+    return payloads
+
+
 def service_hold_payload(printer_id: int | None) -> dict | None:
     """Maintenance mode as ``{"since": iso}``, or None when the printer is not held.
 
@@ -1554,6 +1596,8 @@ def printer_state_to_dict(
         temperatures = {
             k: v for k, v in temperatures.items() if k not in ("chamber", "chamber_target", "chamber_heating")
         }
+    # Read once: both the field and the plate-check HMS entries' buttons project it.
+    plate_check_exit = plate_check_exit_payload(printer_id, state)
 
     result = {
         "connected": state.connected,
@@ -1573,9 +1617,9 @@ def printer_state_to_dict(
         "layer_num": state.layer_num,
         "total_layers": state.total_layers,
         "temperatures": temperatures,
-        # hms_error_payload is the single enrichment site (short_code/description/
-        # wiki_url) shared with the REST route — keeps WS and REST in lockstep.
-        "hms_errors": [hms_error_payload(e) for e in (state.hms_errors or [])],
+        # hms_errors_payload is the single builder (hms_error_payload's enrichment, a
+        # plate-check entry's buttons on the human's turn only) shared with the REST route.
+        "hms_errors": hms_errors_payload(state, plate_check_exit),
         # AMS data for filament colors
         "ams": ams_units if ams_units else None,
         "vt_tray": vt_tray,
@@ -1680,6 +1724,9 @@ def printer_state_to_dict(
         # snapshot — the chip names the fault that stopped the work, while this names a
         # hold a human declared, and the two stand side by side on one printer.
         "service_hold": service_hold_payload(printer_id),
+        # The plate-check human's turn (2026-10-05): {print_error, job_id, actions,
+        # deadline_at} or null — its own field, same builder as BOTH /status branches.
+        "plate_check_exit": plate_check_exit,
     }
     # Add cover URL if there's an active print and printer_id is provided
     # Include PAUSE state so skip objects modal can show cover
