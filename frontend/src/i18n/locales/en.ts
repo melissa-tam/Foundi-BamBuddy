@@ -192,7 +192,7 @@ export default {
         printerOfflineStalled: 'Printer offline mid-print — outcome unknown until it reconnects',
         printerServiceHold: 'Printer in maintenance mode',
         printPausedStalled: 'Paused on the printer — needs attention (no auto-recovery)',
-        visionHold: 'Paused at the plate check. Ignore and resume, or stop the print.',
+        visionHold: 'Paused at the plate check',
         powerLossHold: 'Held at the printer\'s power-loss prompt — resume at the printer',
         zReferenceLost: 'Restarted with a part on the plate — remove it by hand',
         previousPrintFailed: 'Held: previous print failed',
@@ -1287,6 +1287,12 @@ export default {
       plate_vision: 'Ignore and resume, or stop the print',
       z_reference_lost: 'Restarted with a part on the plate — remove it by hand, then Mark plate cleared',
     },
+    // The chip's tooltip while the farm still acts (`recovering`), for the
+    // kinds whose `incidentAction` names a person's exits that do not exist
+    // yet; every other kind keeps its `incidentAction` in both states.
+    incidentRecoveringAction: {
+      plate_vision: 'The farm is re-checking the plate',
+    },
     // A hold's RECORDED printer words, one line under the chip while the
     // printer no longer shows them live; `notShown` is that line's tooltip.
     holdMessage: {
@@ -1300,7 +1306,9 @@ export default {
       confirmTitle: 'Ignore and resume',
       confirmBody: 'Skips the printer\'s plate check for this job. The print continues on the plate as it is.',
       confirmDeadline: 'The farm stops the print at {{time}} if nothing is pressed.',
-      sent: 'Ignore and resume sent',
+      // 45 s: measured live 2026-10-05 on 014-H2S. The printer ACKs the ignore at
+      // once and clears the dialog, stays PAUSED ~45 s, then goes RUNNING by itself.
+      sent: 'Ignore and resume sent. The printer resumes in about 45 s.',
       refused: 'Ignore and resume refused: {{message}}',
     },
     // Fans

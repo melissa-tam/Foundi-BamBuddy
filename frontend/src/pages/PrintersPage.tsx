@@ -148,6 +148,7 @@ import { unshownPrinterMessages } from '../utils/printerMessages';
 import { FarmUnitChip } from '../components/FarmUnitChip';
 import { hmsTone } from '../utils/hmsTone';
 import { showNoUsbChip } from '../utils/noUsbChip';
+import { incidentActionKey } from '../utils/incidentChip';
 import { PrinterQueueWidget } from '../components/PrinterQueueWidget';
 import { AMSHistoryModal } from '../components/AMSHistoryModal';
 import { AmsBackupModal } from '../components/AmsBackupModal';
@@ -4334,9 +4335,11 @@ function PrinterCard({
                     // The pill names the hold; the tooltip says what it asks for
                     // (one label per control, the consequence in the title —
                     // react-best-practices §9), slot-qualified when the hold names one.
+                    // The key follows the hold's state: a person's exits are named
+                    // only once they exist (`utils/incidentChip`).
                     status.open_incident.slot_desc
-                      ? `${t(`printers.incidentAction.${status.open_incident.kind}`)} — ${status.open_incident.slot_desc}`
-                      : t(`printers.incidentAction.${status.open_incident.kind}`)
+                      ? `${t(incidentActionKey(status.open_incident))} — ${status.open_incident.slot_desc}`
+                      : t(incidentActionKey(status.open_incident))
                   }
                 >
                   <AlertTriangle className="w-3 h-3" />

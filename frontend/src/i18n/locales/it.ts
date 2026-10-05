@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: 'Stampante offline durante la stampa — esito sconosciuto finché non si riconnette',
         printerServiceHold: 'Stampante in modalità manutenzione',
         printPausedStalled: 'In pausa sulla stampante — richiede attenzione (nessun ripristino automatico)',
-        visionHold: 'In pausa al controllo del piatto. Ignora e riprendi, oppure ferma la stampa.',
+        visionHold: 'In pausa al controllo del piatto',
         powerLossHold: 'In attesa alla richiesta di ripristino dopo l\'interruzione di corrente — riprendi sulla stampante',
         zReferenceLost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano',
         previousPrintFailed: 'Trattenuta: la stampa precedente non è riuscita',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: 'Ignora e riprendi, oppure ferma la stampa',
       z_reference_lost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano, poi «Segna il piatto come liberato»',
     },
+    incidentRecoveringAction: {
+      plate_vision: 'La farm sta ricontrollando il piatto',
+    },
     holdMessage: {
       reported: 'La stampante ha segnalato: {{message}}',
       notShown: 'Non più mostrato sulla stampante',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: 'Ignora e riprendi',
       confirmBody: 'Salta il controllo del piatto della stampante per questo lavoro. La stampa continua sul piatto così com\'è.',
       confirmDeadline: 'La farm ferma la stampa alle {{time}} se non viene premuto nulla.',
-      sent: 'Ignora e riprendi inviato',
+      sent: 'Ignora e riprendi inviato. La stampante riprende tra circa 45 s.',
       refused: 'Ignora e riprendi rifiutato: {{message}}',
     },
     // Fans

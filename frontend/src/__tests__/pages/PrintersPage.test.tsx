@@ -889,7 +889,11 @@ describe('PrintersPage', () => {
     const PLATE_CHECK_TEXT = 'Detected build plate offset or debris';
     const plateCheck = { short_code: '0500_808C', description: PLATE_CHECK_TEXT };
 
-    const heldBy = (kind: string, messages: Array<{ short_code: string; description: string }>) => ({
+    const heldBy = (
+      kind: string,
+      messages: Array<{ short_code: string; description: string }>,
+      overrides: { status?: 'recovering' | 'escalated'; slot_desc?: string | null } = {},
+    ) => ({
       id: 327,
       kind,
       status: 'escalated',
@@ -898,6 +902,7 @@ describe('PrintersPage', () => {
       operator_exits: false,
       driver_live: false,
       printer_messages: messages,
+      ...overrides,
     });
 
     /** A live HMS entry as the status payload enriches it. */
@@ -961,7 +966,49 @@ describe('PrintersPage', () => {
       expect(await screen.findByText(reportedLine(feed.description))).toBeInTheDocument();
     });
 
-    const refusedPlate = (refusal: { messages: Array<{ short_code: string; description: string }> } | null) => ({
+    /*
+     * The chip's tooltip names a person's exits only once they exist. While the
+     * farm still answers a plate check (re-check, stop-and-retry) there is no
+     * "Ignore and resume" on the card and the backend answers a press with 409,
+     * so the amber chip says what the farm is doing instead.
+     */
+    it('names no exit on the plate-check chip while the farm is still acting', async () => {
+      serveStatus({ state: 'PAUSE', hms_errors: [], open_incident: heldBy('plate_vision', [], { status: 'recovering' }) });
+      render(<PrintersPage />);
+
+      const chip = await screen.findByTitle(en.printers.incidentRecoveringAction.plate_vision);
+      expect(chip).toHaveTextContent(en.printers.incident.recovering);
+      expect(screen.queryByTitle(en.printers.incidentAction.plate_vision)).not.toBeInTheDocument();
+    });
+
+    it("names the exits on the plate-check chip on the person's turn", async () => {
+      serveStatus({ state: 'PAUSE', hms_errors: [], open_incident: heldBy('plate_vision', [], { status: 'escalated' }) });
+      render(<PrintersPage />);
+
+      const chip = await screen.findByTitle(en.printers.incidentAction.plate_vision);
+      expect(chip).toHaveTextContent(en.printers.incident.plate_vision);
+      expect(screen.queryByTitle(en.printers.incidentRecoveringAction.plate_vision)).not.toBeInTheDocument();
+    });
+
+    // A runout row is `recovering` while it waits for the operator's refill, so
+    // its instruction is the point in both states, slot-qualified as before.
+    it.each(['recovering', 'escalated'] as const)(
+      "keeps a runout's slot-qualified instruction on the chip while %s",
+      async (status) => {
+        serveStatus({
+          state: 'PAUSE',
+          hms_errors: [],
+          open_incident: heldBy('runout', [], { status, slot_desc: 'AMS A slot 2' }),
+        });
+        render(<PrintersPage />);
+
+        expect(
+          await screen.findByTitle(`${en.printers.incidentAction.runout} — AMS A slot 2`),
+        ).toBeInTheDocument();
+      },
+    );
+
+    const refusedPlate =(refusal: { messages: Array<{ short_code: string; description: string }> } | null) => ({
       state: 'IDLE',
       awaiting_plate_clear: true,
       occupancy: {
@@ -1149,7 +1196,10 @@ describe('PrintersPage', () => {
           body: { action: 'IGNORE_RESUME', print_error: '0500808C', job_id: '4711' },
         }),
       );
-      expect(await screen.findByText(en.printers.plateCheck.sent)).toBeInTheDocument();
+      // The success toast carries the printer's measured resume latency, and is
+      // announced through the toast live region (role="status"), not just painted.
+      const toast = await screen.findByText(en.printers.plateCheck.sent);
+      expect(screen.getAllByRole('status').some((region) => region.contains(toast))).toBe(true);
       await waitFor(() => expect(screen.queryByRole('button', { name: IGNORE })).not.toBeInTheDocument());
     });
 

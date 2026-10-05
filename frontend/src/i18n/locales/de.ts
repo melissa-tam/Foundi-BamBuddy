@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: 'Drucker mitten im Druck offline — Ergebnis unbekannt, bis er sich wieder verbindet',
         printerServiceHold: 'Drucker im Wartungsmodus',
         printPausedStalled: 'Am Drucker pausiert — Eingriff nötig (keine automatische Behebung)',
-        visionHold: 'Bei der Plattenprüfung pausiert. Ignorieren und fortsetzen oder den Druck stoppen.',
+        visionHold: 'Bei der Plattenprüfung pausiert',
         powerLossHold: 'Wartet an der Stromausfall-Abfrage des Druckers — am Drucker fortsetzen',
         zReferenceLost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen',
         previousPrintFailed: 'Angehalten: vorheriger Druck fehlgeschlagen',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: 'Ignorieren und fortsetzen oder den Druck stoppen',
       z_reference_lost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen, dann „Platte als freigegeben markieren“',
     },
+    incidentRecoveringAction: {
+      plate_vision: 'Die Farm prüft die Platte erneut',
+    },
     holdMessage: {
       reported: 'Drucker meldete: {{message}}',
       notShown: 'Wird am Drucker nicht mehr angezeigt',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: 'Ignorieren und fortsetzen',
       confirmBody: 'Überspringt die Plattenprüfung des Druckers für diesen Auftrag. Der Druck läuft auf der Platte im aktuellen Zustand weiter.',
       confirmDeadline: 'Die Farm stoppt den Druck um {{time}}, wenn nichts gedrückt wird.',
-      sent: 'Ignorieren und fortsetzen gesendet',
+      sent: 'Ignorieren und fortsetzen gesendet. Der Drucker setzt in etwa 45 s fort.',
       refused: 'Ignorieren und fortsetzen abgelehnt: {{message}}',
     },
     // Fans

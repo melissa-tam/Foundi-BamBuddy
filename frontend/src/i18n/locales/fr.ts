@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: 'Imprimante hors ligne en cours d\'impression — résultat inconnu jusqu\'à sa reconnexion',
         printerServiceHold: 'Imprimante en mode maintenance',
         printPausedStalled: 'En pause sur l\'imprimante — intervention requise (pas de récupération automatique)',
-        visionHold: 'En pause au contrôle du plateau. Ignorer et reprendre, ou arrêter l\'impression.',
+        visionHold: 'En pause au contrôle du plateau',
         powerLossHold: 'En attente sur l\'invite de coupure de courant de l\'imprimante — reprenez sur l\'imprimante',
         zReferenceLost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main',
         previousPrintFailed: 'Retenue : l\'impression précédente a échoué',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: 'Ignorer et reprendre, ou arrêter l\'impression',
       z_reference_lost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main, puis « Marquer le plateau comme dégagé »',
     },
+    incidentRecoveringAction: {
+      plate_vision: 'La ferme revérifie le plateau',
+    },
     holdMessage: {
       reported: 'L\'imprimante a signalé : {{message}}',
       notShown: 'N\'est plus affiché sur l\'imprimante',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: 'Ignorer et reprendre',
       confirmBody: 'Ignore le contrôle du plateau de l\'imprimante pour ce travail. L\'impression continue sur le plateau en l\'état.',
       confirmDeadline: 'La ferme arrête l\'impression à {{time}} si rien n\'est pressé.',
-      sent: 'Ignorer et reprendre envoyé',
+      sent: 'Ignorer et reprendre envoyé. L\'imprimante reprend dans environ 45 s.',
       refused: 'Ignorer et reprendre refusé : {{message}}',
     },
     // Fans
