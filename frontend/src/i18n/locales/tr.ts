@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: 'Yazıcı baskı sırasında çevrimdışı oldu — yeniden bağlanana kadar sonuç bilinmiyor',
         printerServiceHold: 'Yazıcı bakım modunda',
         printPausedStalled: 'Yazıcıda duraklatıldı — müdahale gerekiyor (otomatik kurtarma yok)',
-        visionHold: 'Plaka kontrolünde duraklatıldı. Yok say ve sürdür ya da baskıyı durdur.',
+        visionHold: 'Plaka kontrolünde duraklatıldı',
         powerLossHold: 'Yazıcının elektrik kesintisi sorusunda bekliyor — yazıcıdan sürdürün',
         zReferenceLost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın',
         previousPrintFailed: 'Bekletildi: önceki baskı başarısız oldu',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: 'Yok say ve sürdür ya da baskıyı durdur',
       z_reference_lost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın, sonra “Plakayı temizlendi olarak işaretle”',
     },
+    incidentRecoveringAction: {
+      plate_vision: 'Çiftlik plakayı yeniden kontrol ediyor',
+    },
     holdMessage: {
       reported: 'Yazıcı bildirdi: {{message}}',
       notShown: 'Artık yazıcıda gösterilmiyor',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: 'Yok say ve sürdür',
       confirmBody: 'Bu iş için yazıcının plaka kontrolünü atlar. Baskı, plakanın mevcut hâliyle devam eder.',
       confirmDeadline: 'Hiçbir şeye basılmazsa çiftlik baskıyı saat {{time}} itibarıyla durdurur.',
-      sent: 'Yok say ve sürdür gönderildi',
+      sent: 'Yok say ve sürdür gönderildi. Yazıcı yaklaşık 45 sn içinde sürdürür.',
       refused: 'Yok say ve sürdür reddedildi: {{message}}',
     },
     // Fanlar

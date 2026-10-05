@@ -1116,13 +1116,17 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
             )
 
-        # USB storage-low capture. When an HMS "USB full" code APPEARS, the farm
-        # auto-cleans the drive (recordings first, then oldest unused print files) and
-        # fires the dedicated on_storage_low notification with the outcome.
+        # USB storage-low capture. The ARRIVAL of the HMS storage-low code triggers the
+        # USB sweep (``usb_storage``): files older than its age floor leave the drive,
+        # recordings and the root files the farm wrote outside the keep-set, over ONE
+        # FTPS session. It pages failures only (space still low after the sweep,
+        # undeletable files, nothing cleanable, an unreachable drive), at most once per
+        # printer per 6 h; a trigger a sweep gate swallows is retried by the
+        # deferred-retry path below.
         # Fire-and-forget so the slow FTP work never blocks the status flow; the service
-        # is fully self-guarded (unreachable FTPS → failure notification, never an
-        # exception). Strong-referenced for the same reason as the runout hook above: a
-        # long FTPS cleanup is exactly the shape a weakly-held task loses.
+        # never raises (an unreachable drive is a page, never an exception).
+        # Strong-referenced for the same reason as the runout hook above: a long FTPS
+        # sweep is exactly the shape a weakly-held task loses.
         _new_storage = edges.appeared_full & HMS_STORAGE_LOW_FULL_CODES
         if _new_storage:
             try:

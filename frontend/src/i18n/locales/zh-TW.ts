@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: '列印過程中印表機離線 — 重新連線前結果未知',
         printerServiceHold: '印表機處於維護模式',
         printPausedStalled: '印表機上已暫停 — 需要人工處理（無法自動復原）',
-        visionHold: '在列印板偵測處暫停。忽略並恢復，或停止列印。',
+        visionHold: '在列印板偵測處暫停',
         powerLossHold: '停在印表機的斷電復原提示 — 請在印表機上繼續',
         zReferenceLost: '重新啟動時列印板上仍有零件 — 請手動取下',
         previousPrintFailed: '已擱置：上一次列印失敗',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: '忽略並恢復，或停止列印',
       z_reference_lost: '重新啟動時列印板上仍有零件 — 手動取下後點選「將列印板標記為已清理」',
     },
+    incidentRecoveringAction: {
+      plate_vision: '農場正在重新偵測列印板',
+    },
     holdMessage: {
       reported: '印表機回報：{{message}}',
       notShown: '印表機上已不再顯示',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: '忽略並恢復',
       confirmBody: '略過印表機對此工作的列印板偵測。列印將在列印板目前狀態下繼續。',
       confirmDeadline: '如未進行任何操作，農場將在 {{time}} 停止列印。',
-      sent: '已傳送忽略並恢復',
+      sent: '已傳送忽略並恢復。印表機約 45 秒後恢復。',
       refused: '忽略並恢復遭拒：{{message}}',
     },
     // Fans

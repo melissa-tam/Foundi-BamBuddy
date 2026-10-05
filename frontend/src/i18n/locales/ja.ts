@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: '印刷中にプリンターがオフラインになりました — 再接続まで結果は不明です',
         printerServiceHold: 'プリンターはメンテナンスモードです',
         printPausedStalled: 'プリンターで一時停止中 — 対応が必要です（自動復旧は適用外）',
-        visionHold: 'プレート検査で一時停止中。無視して再開するか、印刷を停止してください。',
+        visionHold: 'プレート検査で一時停止中',
         powerLossHold: 'プリンターの停電復帰確認で待機中 — プリンター側で再開してください',
         zReferenceLost: '部品がプレートに載ったまま再起動 — 手で取り除いてください',
         previousPrintFailed: '保留中: 前の印刷が失敗しました',
@@ -1269,6 +1269,9 @@ export default {
       plate_vision: '無視して再開、または印刷を停止',
       z_reference_lost: '部品がプレートに載ったまま再起動 — 手で取り除いてから「プレートをクリア済みにする」',
     },
+    incidentRecoveringAction: {
+      plate_vision: 'ファームがプレートを再検査中',
+    },
     holdMessage: {
       reported: 'プリンターの報告: {{message}}',
       notShown: 'プリンターには表示されなくなりました',
@@ -1278,7 +1281,7 @@ export default {
       confirmTitle: '無視して再開',
       confirmBody: 'このジョブのプリンターのプレート検査をスキップします。印刷は現在のプレートのまま続行されます。',
       confirmDeadline: '何も押されない場合、ファームは {{time}} に印刷を停止します。',
-      sent: '無視して再開を送信しました',
+      sent: '無視して再開を送信しました。プリンターは約45秒後に再開します。',
       refused: '無視して再開が拒否されました: {{message}}',
     },
     // Fans

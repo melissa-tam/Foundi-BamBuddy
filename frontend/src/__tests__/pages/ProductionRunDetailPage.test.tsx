@@ -338,8 +338,8 @@ describe('ProductionRunDetailPage', () => {
     expect(within(table).getAllByText('Stopped by operator')).toHaveLength(1);
     expect(within(table).getByText('Retry #1 of unit 101')).toBeInTheDocument();
     expect(within(table).getByText('HMS 0300_8017')).toBeInTheDocument();
-    // The plate-check waiting reason renders its mapped copy (the print is
-    // PAUSED for a human since 2026-09-24), never the humanized token.
+    // The plate-check waiting reason renders its mapped copy (the print stays
+    // PAUSED at the plate check for the whole episode), never the humanized token.
     expect(
       within(table).getByText(en.productionRuns.detail.waiting.visionHold),
     ).toBeInTheDocument();

@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: '打印过程中打印机离线 — 重新连接前结果未知',
         printerServiceHold: '打印机处于维护模式',
         printPausedStalled: '打印机上已暂停 — 需要人工处理（无法自动恢复）',
-        visionHold: '在打印板检测处暂停。忽略并恢复，或停止打印。',
+        visionHold: '在打印板检测处暂停',
         powerLossHold: '停在打印机的断电恢复提示 — 请在打印机上继续',
         zReferenceLost: '重启时打印板上仍有零件 — 请手动取下',
         previousPrintFailed: '已搁置：上一次打印失败',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: '忽略并恢复，或停止打印',
       z_reference_lost: '重启时打印板上仍有零件 — 手动取下后点击“将打印板标记为已清理”',
     },
+    incidentRecoveringAction: {
+      plate_vision: '农场正在重新检测打印板',
+    },
     holdMessage: {
       reported: '打印机报告：{{message}}',
       notShown: '打印机上已不再显示',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: '忽略并恢复',
       confirmBody: '跳过打印机对此任务的打印板检测。打印将在打印板当前状态下继续。',
       confirmDeadline: '如未进行任何操作，农场将在 {{time}} 停止打印。',
-      sent: '已发送忽略并恢复',
+      sent: '已发送忽略并恢复。打印机约 45 秒后恢复。',
       refused: '忽略并恢复被拒绝：{{message}}',
     },
     // Fans

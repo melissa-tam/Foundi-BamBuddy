@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: 'Impressora offline no meio da impressão — resultado desconhecido até reconectar',
         printerServiceHold: 'Impressora em modo manutenção',
         printPausedStalled: 'Pausada na impressora — precisa de atenção (sem recuperação automática)',
-        visionHold: 'Pausada na verificação da placa. Ignorar e retomar, ou parar a impressão.',
+        visionHold: 'Pausada na verificação da placa',
         powerLossHold: 'Retida no aviso de queda de energia da impressora — retome na impressora',
         zReferenceLost: 'Reiniciada com uma peça na placa — remova-a à mão',
         previousPrintFailed: 'Retida: a impressão anterior falhou',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: 'Ignorar e retomar, ou parar a impressão',
       z_reference_lost: 'Reiniciada com uma peça na placa — remova-a à mão e depois «Marcar placa como liberada»',
     },
+    incidentRecoveringAction: {
+      plate_vision: 'A fazenda está verificando a placa novamente',
+    },
     holdMessage: {
       reported: 'A impressora informou: {{message}}',
       notShown: 'Não é mais exibido na impressora',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: 'Ignorar e retomar',
       confirmBody: 'Pula a verificação da placa da impressora para este trabalho. A impressão continua sobre a placa como está.',
       confirmDeadline: 'A fazenda para a impressão às {{time}} se nada for pressionado.',
-      sent: 'Ignorar e retomar enviado',
+      sent: 'Ignorar e retomar enviado. A impressora retoma em cerca de 45 s.',
       refused: 'Ignorar e retomar recusado: {{message}}',
     },
     // Fans

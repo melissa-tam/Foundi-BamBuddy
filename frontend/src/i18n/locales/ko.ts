@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: '인쇄 중 프린터가 오프라인이 되었습니다 — 다시 연결될 때까지 결과를 알 수 없습니다',
         printerServiceHold: '프린터가 유지보수 모드입니다',
         printPausedStalled: '프린터에서 일시정지됨 — 조치 필요 (자동 복구 미적용)',
-        visionHold: '플레이트 검사에서 일시 정지됨. 무시하고 재개하거나 출력을 중지하세요.',
+        visionHold: '플레이트 검사에서 일시 정지됨',
         powerLossHold: '프린터의 정전 복구 확인에서 대기 중 — 프린터에서 재개하세요',
         zReferenceLost: '플레이트에 출력물이 있는 상태로 재시작됨 — 손으로 제거하세요',
         previousPrintFailed: '보류됨: 이전 인쇄가 실패했습니다',
@@ -1228,6 +1228,9 @@ export default {
       plate_vision: '무시하고 재개하거나 출력을 중지하세요',
       z_reference_lost: '플레이트에 출력물이 있는 상태로 재시작됨 — 손으로 제거한 뒤 ‘플레이트 비움으로 표시’',
     },
+    incidentRecoveringAction: {
+      plate_vision: '팜이 플레이트를 다시 검사하는 중',
+    },
     holdMessage: {
       reported: '프린터 보고: {{message}}',
       notShown: '프린터에 더 이상 표시되지 않음',
@@ -1237,7 +1240,7 @@ export default {
       confirmTitle: '무시하고 재개',
       confirmBody: '이 작업에 대한 프린터의 플레이트 검사를 건너뜁니다. 출력은 현재 플레이트 상태 그대로 계속됩니다.',
       confirmDeadline: '아무것도 누르지 않으면 팜이 {{time}}에 출력을 중지합니다.',
-      sent: '무시하고 재개 전송됨',
+      sent: '무시하고 재개 전송됨. 프린터가 약 45초 후 재개됩니다.',
       refused: '무시하고 재개 거부됨: {{message}}',
     },
     fans: {

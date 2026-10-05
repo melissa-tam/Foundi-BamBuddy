@@ -191,7 +191,7 @@ export default {
         printerOfflineStalled: 'Impresora sin conexión a mitad de impresión — resultado desconocido hasta que se reconecte',
         printerServiceHold: 'Impresora en modo mantenimiento',
         printPausedStalled: 'En pausa en la impresora — requiere atención (sin recuperación automática)',
-        visionHold: 'En pausa en la comprobación de la cama. Ignorar y reanudar, o detener la impresión.',
+        visionHold: 'En pausa en la comprobación de la cama',
         powerLossHold: 'Retenida en el aviso de corte de energía de la impresora — reanude en la impresora',
         zReferenceLost: 'Reiniciada con una pieza en la cama — retírela a mano',
         previousPrintFailed: 'Retenida: la impresión anterior falló',
@@ -1270,6 +1270,9 @@ export default {
       plate_vision: 'Ignorar y reanudar, o detener la impresión',
       z_reference_lost: 'Reiniciada con una pieza en la cama — retírela a mano y luego «Marcar cama como despejada»',
     },
+    incidentRecoveringAction: {
+      plate_vision: 'La granja está volviendo a comprobar la cama',
+    },
     holdMessage: {
       reported: 'La impresora informó: {{message}}',
       notShown: 'Ya no se muestra en la impresora',
@@ -1279,7 +1282,7 @@ export default {
       confirmTitle: 'Ignorar y reanudar',
       confirmBody: 'Omite la comprobación de la cama de la impresora para este trabajo. La impresión continúa sobre la cama tal como está.',
       confirmDeadline: 'La granja detiene la impresión a las {{time}} si no se pulsa nada.',
-      sent: 'Ignorar y reanudar enviado',
+      sent: 'Ignorar y reanudar enviado. La impresora se reanuda en unos 45 s.',
       refused: 'Ignorar y reanudar rechazado: {{message}}',
     },
     // Fans

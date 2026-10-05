@@ -15,6 +15,7 @@ import { describe, it, expect } from 'vitest';
 import { OWN_SURFACE_INCIDENT_KINDS } from '../../api/client';
 import type { PrinterIncidentKind } from '../../api/client';
 import en from '../../i18n/locales/en';
+import { RECOVERING_ACTION_KINDS } from '../../utils/incidentChip';
 
 /** Every kind the status payload can carry — value is unused; the KEYS are the
  *  assertion, and `Record` makes omitting one a compile error. */
@@ -63,6 +64,17 @@ describe('printer incident chip labels', () => {
       } else {
         expect(actions[kind], `missing printers.incidentAction.${kind}`).toBeTruthy();
       }
+    }
+  });
+
+  /** The recovering-state tooltip (`printers.incidentRecoveringAction.<kind>`,
+   *  `utils/incidentChip`) is looked up the same dynamic way: a missing leaf
+   *  renders its raw key on hover, and an extra leaf is copy nothing renders. */
+  it('has the recovering tooltip for exactly the kinds that override it', () => {
+    const recovering: Record<string, string> = en.printers.incidentRecoveringAction;
+    expect(Object.keys(recovering).sort()).toEqual([...RECOVERING_ACTION_KINDS].sort());
+    for (const kind of RECOVERING_ACTION_KINDS) {
+      expect(recovering[kind], `missing printers.incidentRecoveringAction.${kind}`).toBeTruthy();
     }
   });
 });
