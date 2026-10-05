@@ -64,7 +64,8 @@ from backend.app.services.plate_occupancy import (
     plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.usb_storage import upload_in_flight
+from backend.app.services.usb_uploads import upload_in_flight
+from backend.app.utils.filename import derive_remote_filename
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -326,13 +327,35 @@ def is_eject_job_name(name: str | None) -> bool:
     return parse_eject_job_name(name) is not None
 
 
-def expected_eject_stem(pending: PendingEject | EjectIdentity) -> str:
-    """The eject job stem THIS pending eject was dispatched under.
+def expected_eject_stem(pending: PendingEject | EjectIdentity, printer_id: int) -> str | None:
+    """THE eject job stem: the one builder of the name a sweep is uploaded, started, matched and
+    removed under (the convention above :data:`_EJECT_NAME_RE`).
 
-    Accepts the record or its identity projection — both carry the two fields the
-    stem is minted from, and the matcher only ever holds the projection.
+    ``eject_{purpose}_item{queue_item_id}`` for a unit-bound sweep, ``eject_manual_p{printer_id}``
+    for the foreign-plate manual sweep, which has no unit. Accepts the record or its identity
+    projection — both carry the two fields the stem is minted from, and the matcher and the start
+    deadline only ever hold the projection. None when a unit-bound record carries no unit id: such
+    a record cannot name a file, so nothing is matched or removed by name.
     """
+    if pending.purpose == "manual":
+        return f"eject_manual_p{printer_id}"
+    if pending.queue_item_id is None:
+        return None
     return f"eject_{pending.purpose}_item{pending.queue_item_id}"
+
+
+def _dispatch_stem(pending: PendingEject, printer_id: int) -> str:
+    """The stem a sweep is dispatched under — :func:`expected_eject_stem`, refused when it cannot
+    name the file (a unit-bound sweep with no unit), before anything reaches the printer."""
+    stem = expected_eject_stem(pending, printer_id)
+    if stem is None:
+        raise EjectDispatchError(f"A {pending.purpose} eject needs its queue unit to name its file", status_code=409)
+    return stem
+
+
+def _eject_remote_path(job_stem: str) -> str:
+    """The storage path a sweep of this stem is uploaded to — the dispatcher's own naming rule."""
+    return f"/{derive_remote_filename(f'{job_stem}.gcode.3mf')}"
 
 
 # --------------------------------------------------------------------------- #
@@ -417,15 +440,18 @@ async def _start_deadline(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     timeout_s: float = EJECT_START_TIMEOUT_S,
 ) -> None:
-    """Retire an eject the printer never started, and page a human.
+    """Retire an eject the printer never started, page a human, and remove its sweep file.
 
     See :data:`EJECT_START_TIMEOUT_S` for why the shape exists at all. The authority
     decides whether the expiry actually fires (it refuses on a started or hydrated
     record), so this task can wake late or spuriously without consequence — a False
     return means somebody else already resolved the eject and there is nothing to
-    say."""
+    say. The uploaded sweep file is named from the expired record through
+    :func:`expected_eject_stem` (the one builder), never re-spelled here."""
     try:
         await sleep(timeout_s)
+        # Read BEFORE the expiry drops the record: the stem names the file to remove afterwards.
+        identity = plate_occupancy.eject_identity(printer_id)
         if not plate_occupancy.expire_eject_start(printer_id):
             return
         logger.warning(
@@ -444,6 +470,18 @@ async def _start_deadline(
                 "the plate has NOT been swept. Clear it by hand, or eject again now that the printer is free."
             ),
         )
+        # The sweep file is this lane's own footprint, and it will never run.
+        stem = expected_eject_stem(identity, printer_id) if identity is not None else None
+        if stem is not None:
+            from backend.app.core.database import async_session
+            from backend.app.services.bambu_ftp import remove_abandoned_upload
+
+            async with async_session() as db:
+                printer = await db.get(Printer, printer_id)
+            if printer is not None:
+                await remove_abandoned_upload(
+                    printer, _eject_remote_path(stem), lane="eject", why="the printer never started the sweep"
+                )
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 — a deadline failure must never escape the task
@@ -1245,11 +1283,7 @@ def matches_pending_eject(
         # A manual (foreign-plate) eject carries no queue item, so its stem is keyed
         # by PRINTER id — close the queue_item_id-None leniency for that purpose by
         # name-checking the printer-keyed stem instead.
-        expected_stem: str | None = None
-        if pending.purpose == "manual":
-            expected_stem = f"eject_manual_p{printer_id}"
-        elif pending.queue_item_id is not None:
-            expected_stem = expected_eject_stem(pending)
+        expected_stem = expected_eject_stem(pending, printer_id)
         if expected_stem is not None:
             name_mismatch = _eject_name_stem(subtask_name).lower() != expected_stem.lower()
     return not (id_mismatch or name_mismatch)
@@ -1512,7 +1546,7 @@ async def dispatch_part_present_eject(
         await _upload_start_claim_eject(
             printer=printer,
             eject_path=built.path,
-            job_stem=f"eject_{purpose}_item{queue_item_id}",
+            job_stem=_dispatch_stem(pending, printer.id),
             plate_id=built.plate_id,
             pending=pending,
             ev=ev,
@@ -1602,7 +1636,7 @@ async def dispatch_foreign_eject(
         await _upload_start_claim_eject(
             printer=printer,
             eject_path=built.path,
-            job_stem=f"eject_manual_p{printer_id}",
+            job_stem=_dispatch_stem(pending, printer_id),
             plate_id=built.plate_id,
             pending=pending,
             ev=ev,
@@ -1656,10 +1690,9 @@ async def _upload_start_claim_eject(
         upload_file_async,
         with_ftp_retry,
     )
-    from backend.app.utils.filename import derive_remote_filename
 
-    remote_filename = derive_remote_filename(f"{job_stem}.gcode.3mf")
-    remote_path = f"/{remote_filename}"
+    remote_path = _eject_remote_path(job_stem)
+    remote_filename = remote_path.removeprefix("/")
     ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
 
     # Upload progress rides the FTP callback, which fires on the executor thread —
@@ -1706,7 +1739,13 @@ async def _upload_start_claim_eject(
     finally:
         cleanup_downloaded_3mf(eject_path)
 
+    # Every abandonment exit below removes this lane's own upload: a sweep file left on the USB
+    # is one screen-tap away from a foreign start, and it fills the drive.
+    from backend.app.services.bambu_ftp import remove_abandoned_upload
+
     if not uploaded:
+        # A failed or partial upload may still have left bytes on the drive.
+        await remove_abandoned_upload(printer, remote_path, lane="eject", why="the upload failed")
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")
         raise EjectDispatchError("Failed to upload the eject file to the printer", status_code=502)
 
@@ -1725,6 +1764,7 @@ async def _upload_start_claim_eject(
         use_ams=False,
     )
     if not started:
+        await remove_abandoned_upload(printer, remote_path, lane="eject", why="the start command was refused")
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")
         raise EjectDispatchError("Failed to send the eject command to the printer", status_code=502)
 
@@ -1743,6 +1783,7 @@ async def _upload_start_claim_eject(
             refusal,
         )
         printer_manager.stop_print(printer.id)
+        await remove_abandoned_upload(printer, remote_path, lane="eject", why=f"the claim was refused ({refusal})")
         eject_progress.emit_eject_progress(printer_id=printer.id, queue_item_id=pending.queue_item_id, phase="failed")
         raise _refusal_error(refusal)
 

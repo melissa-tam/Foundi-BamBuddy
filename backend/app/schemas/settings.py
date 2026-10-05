@@ -617,6 +617,16 @@ class AppSettings(BaseModel):
         le=720,
         description="Flag a farm unit still 'printing' whose CONNECTED printer has sat unattended-PAUSEd this many minutes (5–720)",
     )
+    # Operator ruling 2026-10-05: when the plate-check ladder's stop would be an escalation, the
+    # print waits PAUSED at the dialog this long for Ignore and resume or Stop; then the farm stops
+    # it and holds the plate. Not the pause-stall threshold above (when an unattended pause pages).
+    farm_plate_check_decision_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="After a failed plate re-check, how long the print waits paused for Ignore and resume or Stop "
+        "before the farm stops it and holds the plate (1–120 minutes)",
+    )
     farm_cooldown_stall_window_minutes: int = Field(
         default=15,
         ge=0,
@@ -922,6 +932,7 @@ class AppSettingsUpdate(BaseModel):
     farm_escalate_consecutive_failures: int | None = Field(default=None, ge=1, le=20)
     farm_offline_stall_minutes: int | None = Field(default=None, ge=5, le=720)
     farm_pause_stall_minutes: int | None = Field(default=None, ge=5, le=720)
+    farm_plate_check_decision_minutes: int | None = Field(default=None, ge=1, le=120)
     farm_cooldown_stall_window_minutes: int | None = Field(default=None, ge=0, le=180)
     farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
     farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)

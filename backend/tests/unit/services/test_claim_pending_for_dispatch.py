@@ -33,6 +33,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services import print_scheduler as ps_module
+from backend.app.services.bambu_ftp import DeleteResult
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import scheduler
 from backend.app.services.printer_manager import printer_manager
@@ -84,11 +85,13 @@ def _dispatch_env(*, upload=None, delete=None):
     to move the row while the dispatcher is "uploading". ``delete`` overrides the
     FTPS delete, so a test can make the post-refusal cleanup fail. Yields the mocks
     worth asserting on; ``start`` is ``printer_manager.start_print``, i.e. the print
-    command itself, and ``delete`` is the USB cleanup.
+    command itself, and ``delete`` is the USB delete — ONE mock behind both the
+    scheduler's pre-upload clear and the abandoned-upload helper
+    (``bambu_ftp.remove_abandoned_upload``) the refusal paths remove their upload with.
     """
     start = MagicMock(return_value=True)
     upload_mock = AsyncMock(return_value=True) if upload is None else AsyncMock(side_effect=upload)
-    delete_mock = AsyncMock(return_value=True) if delete is None else AsyncMock(side_effect=delete)
+    delete_mock = AsyncMock(return_value=DeleteResult.DELETED) if delete is None else AsyncMock(side_effect=delete)
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch.object(printer_manager, "is_connected", return_value=True))
         # No ``state`` attribute → pre_state is None → no start watchdog task.
@@ -106,6 +109,7 @@ def _dispatch_env(*, upload=None, delete=None):
             patch.object(ps_module, "get_ftp_retry_settings", AsyncMock(return_value=(False, 3, 1.0, 30.0)))
         )
         stack.enter_context(patch.object(ps_module, "delete_file_async", delete_mock))
+        stack.enter_context(patch("backend.app.services.bambu_ftp.delete_file_async", delete_mock))
         stack.enter_context(patch.object(ps_module, "upload_file_async", upload_mock))
         stack.enter_context(patch.object(ps_module, "with_ftp_retry", AsyncMock(return_value=True)))
         stack.enter_context(patch.object(ps_module, "cache_3mf_download", MagicMock()))
@@ -232,3 +236,71 @@ class TestCancelDuringUpload:
         m.start.assert_not_called()
         assert (await db_session.scalar(select(PrintQueueItem.status).where(PrintQueueItem.id == item_id))) == "pending"
         assert any("COULD NOT BE REMOVED from printer" in r.message for r in caplog.records), caplog.text
+
+    async def test_a_failed_delete_result_reports_the_file_could_not_be_removed(self, db_session, tmp_path, caplog):
+        """A FAILED delete is a file still on the drive: the helper answers False on it, so the
+        warning must say so. (The old body returned ``bool(DeleteResult.FAILED)`` — always
+        truthy — and logged "removed from" over a file that stayed.)"""
+        printer, item, remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCFR")
+        item_id = item.id
+
+        async def _delete_fails(*_args, **_kwargs):
+            return DeleteResult.FAILED
+
+        with (
+            caplog.at_level(logging.INFO),
+            _dispatch_env(delete=_delete_fails) as m,
+            patch.object(ps_module, "claim_pending_for_dispatch", AsyncMock(return_value=False)),
+        ):
+            await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
+
+        m.start.assert_not_called()
+        assert m.delete.await_args.args[2] == remote_path
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("COULD NOT BE REMOVED from printer" in msg for msg in messages), caplog.text
+        assert not any("removed from printer" in msg and "COULD NOT" not in msg for msg in messages), caplog.text
+        assert any(
+            msg.startswith("[USB] dispatch: abandoned upload")
+            and "could not be removed" in msg
+            and f"queue item {item_id}: a refused claim" in msg
+            for msg in messages
+        ), caplog.text
+
+    async def test_a_not_found_result_counts_as_removed(self, db_session, tmp_path, caplog):
+        """A 550 means the file is not on the drive — the goal of the cleanup."""
+        printer, item, remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCNO")
+
+        async def _not_there(*_args, **_kwargs):
+            return DeleteResult.NOT_FOUND
+
+        with (
+            caplog.at_level(logging.WARNING, logger="backend.app.services.print_scheduler"),
+            _dispatch_env(delete=_not_there),
+            patch.object(ps_module, "claim_pending_for_dispatch", AsyncMock(return_value=False)),
+        ):
+            await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
+
+        assert any(
+            f"uploaded file {remote_path.lstrip('/')} removed from printer" in r.getMessage() for r in caplog.records
+        ), caplog.text
+
+
+class TestFailedPrintCommand:
+    async def test_a_failed_print_command_removes_the_upload_through_the_shared_helper(self, db_session, tmp_path):
+        printer, item, remote_path = await _seed_dispatchable(db_session, tmp_path, name="DCPF")
+        item_id = item.id
+        helper = AsyncMock(return_value=True)
+
+        with (
+            _dispatch_env() as m,
+            patch.object(ps_module, "remove_abandoned_upload", helper),
+            patch.object(printer_manager, "start_print", MagicMock(return_value=False)),
+        ):
+            await scheduler._start_print(db_session, item, ams_mapping=[1, -1])
+
+        helper.assert_awaited_once()
+        assert helper.await_args.args[1] == remote_path
+        assert helper.await_args.kwargs["lane"] == "dispatch"
+        assert helper.await_args.kwargs["why"] == f"queue item {item_id}: the print command failed"
+        # Only the routine pre-upload clear went through the raw delete.
+        assert m.delete.await_count == 1

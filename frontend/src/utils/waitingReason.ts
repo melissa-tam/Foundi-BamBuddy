@@ -45,10 +45,11 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
     case 'print_paused_stalled':
       return t('productionRuns.detail.waiting.printPausedStalled');
     case 'plate_not_empty_printer_detected':
-      // The printer's own plate check tripped and PAUSED the print; the farm
-      // sends nothing and holds it for a human (a `plate_vision` hold). The
-      // operator fixes the plate and resumes — the same job continues. A Stop
-      // instead raises a human-clear plate gate on the card.
+      // A `plate_vision` hold: the printer's own plate check PAUSED the print.
+      // The copy names the hold's two exits, the printer's "Ignore and resume"
+      // (on the printer card or its screen; the same job continues) or Stop.
+      // Once the decision window lapses the farm stops the print and gates the
+      // plate itself.
       return t('productionRuns.detail.waiting.visionHold');
     case 'power_loss_hold':
       // The printer is sitting at the firmware's OWN power-loss prompt and the

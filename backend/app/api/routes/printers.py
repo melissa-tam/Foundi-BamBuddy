@@ -60,8 +60,8 @@ from backend.app.services.bambu_ftp import (
 )
 from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.hms_actions import HMSAction
-from backend.app.services.hms_errors import hms_error_payload
-from backend.app.services.pause_recovery import on_plate_cleared
+from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, printer_message_from_full_code
+from backend.app.services.pause_recovery import human_dialog_action, on_plate_cleared
 from backend.app.services.plate_occupancy import Evidence, plate_occupancy
 from backend.app.services.print_control import stop_as_operator
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
@@ -69,8 +69,10 @@ from backend.app.services.printer_manager import (
     _eject_watch_payload,
     get_derived_status_name,
     has_chamber_fan,
+    hms_errors_payload,
     occupancy_payload,
     open_incident_payload,
+    plate_check_exit_payload,
     printer_manager,
     resolve_plate_id,
     service_hold_payload,
@@ -85,6 +87,8 @@ from backend.app.services.tray_fields import tray_presence_map
 from backend.app.utils.http import build_content_disposition
 
 if TYPE_CHECKING:
+    from backend.app.services.bambu_mqtt import CommandAck, SentCommand
+
     # Type-only: the AMS services stay out of this module's runtime import graph (see the
     # local imports below — ``slot_recheck`` pulls the slot pipeline's model graph in with it).
     from backend.app.services.slot_recheck import RecheckVerdict
@@ -546,6 +550,9 @@ async def get_printer_status(
             # ``open_incident.operator_exits``, and a hold that reported on the socket
             # but not on the poll would make that verb flicker.
             open_incident=open_incident_payload(printer_id),
+            # The plate-check human's turn — the one builder; with no session there is no
+            # paused dialog to answer, so it reads null here.
+            plate_check_exit=plate_check_exit_payload(printer_id, None),
             # Hardware capabilities are facts about the MODEL, not about the MQTT
             # session, so they are reportable with no session — same as the sticky
             # flags above. Load-bearing: the printer card's chamber-fan and airduct
@@ -563,9 +570,11 @@ async def get_printer_status(
     if state.state in ("RUNNING", "PAUSE") and state.gcode_file:
         cover_url = f"/api/v1/printers/{printer_id}/cover"
 
-    # Convert HMS errors to response format. hms_error_payload is the single
-    # enrichment site (short_code/description/wiki_url) shared with the WS path.
-    hms_errors = [HMSErrorResponse(**hms_error_payload(e)) for e in (state.hms_errors or [])]
+    # The plate-check human's turn, read once: the field AND the plate-check HMS entries'
+    # buttons project it. hms_errors_payload is the single builder (hms_error_payload's
+    # enrichment, the turn's buttons on a plate-check entry) shared with the WS path.
+    plate_check_exit = plate_check_exit_payload(printer_id, state)
+    hms_errors = [HMSErrorResponse(**payload) for payload in hms_errors_payload(state, plate_check_exit)]
 
     # Parse AMS data from raw_data
     ams_units = []
@@ -877,6 +886,8 @@ async def get_printer_status(
         service_hold=service_hold_payload(printer_id),
         # Same builder as the WS frame and the disconnected branch above.
         open_incident=open_incident_payload(printer_id),
+        # Same builder as the WS frame and the disconnected branch above.
+        plate_check_exit=plate_check_exit,
         quarantined=printer.quarantined,
         quarantine_reason=printer.quarantine_reason,
         model_mismatch=printer_manager.is_model_mismatch(printer_id),
@@ -4227,6 +4238,13 @@ async def execute_hms_action(
     recorded (the system-topic ``uiop`` close) answers 200 "sent". This replaces a
     before/after diff of ``gcode_state`` + the HMS-list length, which read a printer that
     accepted, resumed and re-paused inside the window as a refusal (upstream #1869).
+
+    A press on the printer's PLATE-CHECK dialog (``hms_errors.PLATE_CHECK_HMS_CODES``) other than
+    "Stop printing" is a person answering the plate-check ladder's decision hold (operator
+    ruling 2026-10-05): the decision, the ledger and the frame are
+    ``pause_recovery.human_dialog_action``'s, and it refuses unless it is the person's turn —
+    409 "Plate check: the farm is still working on it" while the ladder acts, 409 "No paused
+    plate check on this printer" otherwise. Its answer maps like any other press.
     """
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
@@ -4248,14 +4266,31 @@ async def execute_hms_action(
             raise HTTPException(400, "Failed to execute HMS action")
         return {"success": True, "message": "HMS action sent"}
 
+    dialog = printer_message_from_full_code(body.print_error)
+    if dialog is not None and dialog.short_code in PLATE_CHECK_HMS_CODES:
+        verdict = await human_dialog_action(printer_id, body.action, body.print_error, body.job_id)
+        if verdict.refusal == "farm_acting":
+            raise HTTPException(409, "Plate check: the farm is still working on it")
+        if verdict.refusal is not None:
+            raise HTTPException(409, "No paused plate check on this printer")
+        return _hms_action_answer(verdict.sent, verdict.ack)
+
     # The dialog frames echo the pressed job's subtask id; a fault with no job sends "".
     sent = client.execute_hms_action(body.print_error, body.action, body.job_id or "")
+    ack = None
+    if sent is not None and sent.sequence_id is not None:
+        ack = await client.await_ack(sent, HMS_ACTION_ACK_WAIT_SECONDS, HMS_ACTION_ACK_POLL_SECONDS)
+    return _hms_action_answer(sent, ack)
+
+
+def _hms_action_answer(sent: "SentCommand | None", ack: "CommandAck | None") -> dict:
+    """A dialog press and its ACK → the HTTP answer, for both lanes (a plate-check press the
+    ladder's service sent, any other the client sent here): nothing sent → 400; a frame whose
+    echo is never recorded → 200 "sent"; no ACK → 502; a refusing ACK → 502 naming it."""
     if sent is None:
         raise HTTPException(400, "Failed to execute HMS action")
     if sent.sequence_id is None:
         return {"success": True, "message": "HMS action sent"}
-
-    ack = await client.await_ack(sent, HMS_ACTION_ACK_WAIT_SECONDS, HMS_ACTION_ACK_POLL_SECONDS)
     if ack is None:
         raise HTTPException(502, f"Printer did not acknowledge HMS action within {HMS_ACTION_ACK_WAIT_SECONDS}s")
     if not ack.succeeded:

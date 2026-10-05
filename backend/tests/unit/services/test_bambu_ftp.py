@@ -13,14 +13,21 @@ Tests against a real mock implicit FTPS server, covering:
 - Failure injection scenarios (regressions for 0.1.8 bugs)
 """
 
+import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from backend.app.services import bambu_ftp
 from backend.app.services.bambu_ftp import (
     BambuFTPClient,
+    DeleteResult,
     FileNotOnPrinterError,
+    _parse_list_mtime,
     cache_3mf_download,
     cleanup_downloaded_3mf,
     clear_3mf_cache,
@@ -30,6 +37,8 @@ from backend.app.services.bambu_ftp import (
     get_cached_3mf,
     list_files_async,
     normalize_3mf_name,
+    remove_abandoned_upload,
+    run_in_session,
     upload_file_async,
     with_ftp_retry,
 )
@@ -1547,3 +1556,211 @@ class TestThreeMFCache:
     def test_cleanup_ignores_none(self):
         """None is the "nothing to clean up" case, not a refusal to log."""
         assert cleanup_downloaded_3mf(None) is False
+
+
+# ---------------------------------------------------------------------------
+# LIST timestamps are UTC (2026-10-05)
+# ---------------------------------------------------------------------------
+class TestListMtimeIsUtc:
+    """The printer's FTP server stamps ``LIST`` in UTC. Read as local time on a farm west of
+    Greenwich, a file written in the last few hours parsed "in the future", was rolled back a
+    year, and the USB sweep deleted the camera recording still being written (2026-10-04
+    23:46, a 110 MB partial). ``_parse_list_mtime`` is the one parser; ``now`` is injected."""
+
+    def test_hh_mm_is_utc_aware(self):
+        now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+        mtime = _parse_list_mtime("Oct", "05", "08:17", now=now)
+        assert mtime == datetime(2026, 10, 5, 8, 17, tzinfo=timezone.utc)
+        assert mtime.tzinfo is timezone.utc
+
+    def test_a_time_later_today_in_utc_is_not_rolled_back_a_year(self):
+        """The incident shape: at 19:50 EDT the farm's LOCAL clock reads 19:50 while the printer
+        stamps the recording being written 23:46 UTC. Against UTC now it is minutes old."""
+        now = datetime(2026, 10, 4, 23, 50, tzinfo=timezone.utc)  # 19:50 EDT
+        mtime = _parse_list_mtime("Oct", "04", "23:46", now=now)
+        assert mtime == datetime(2026, 10, 4, 23, 46, tzinfo=timezone.utc)
+        assert (now - mtime).total_seconds() == 240
+
+    def test_a_printer_clock_a_little_ahead_stays_this_year(self):
+        """A file the printer stamps "now" on a clock running ahead of the farm's lands just
+        ahead of now — never a year back, which would read as a year old and be deleted."""
+        now = datetime(2026, 10, 4, 23, 50, tzinfo=timezone.utc)
+        assert _parse_list_mtime("Oct", "04", "23:53", now=now) == datetime(2026, 10, 4, 23, 53, tzinfo=timezone.utc)
+
+    def test_a_december_stamp_read_in_january_is_last_year(self):
+        now = datetime(2027, 1, 1, 0, 10, tzinfo=timezone.utc)
+        assert _parse_list_mtime("Dec", "31", "23:50", now=now) == datetime(2026, 12, 31, 23, 50, tzinfo=timezone.utc)
+
+    def test_mon_dd_yyyy_is_utc_aware_midnight(self):
+        now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+        mtime = _parse_list_mtime("Nov", "30", "2024", now=now)
+        assert mtime == datetime(2024, 11, 30, tzinfo=timezone.utc)
+        assert mtime.tzinfo is timezone.utc
+
+    def test_an_unparseable_stamp_is_none(self):
+        now = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        assert _parse_list_mtime("Foo", "05", "08:17", now=now) is None
+        assert _parse_list_mtime("Oct", "xx", "2024", now=now) is None
+
+    def test_list_files_emits_aware_utc_mtimes(self):
+        """Through the client: a line stamped with the current UTC minute reads seconds old."""
+        stamp = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        line = f"-rw-r--r-- 1 root root 1048576 {stamp:%b} {stamp.day:2d} {stamp:%H:%M} rec_0001.mp4"
+
+        client = BambuFTPClient("127.0.0.1", "12345678")
+        client._ftp = SimpleNamespace(cwd=lambda _path: None, retrlines=lambda _cmd, callback: callback(line))
+        (entry,) = client.list_files("/ipcam")
+
+        assert entry["path"] == "/ipcam/rec_0001.mp4"
+        assert entry["mtime"] == stamp
+        assert entry["mtime"].tzinfo is timezone.utc
+        assert 0 <= (datetime.now(timezone.utc) - entry["mtime"]).total_seconds() < 120
+
+
+# ---------------------------------------------------------------------------
+# One FTPS session for many operations
+# ---------------------------------------------------------------------------
+class _SessionClient:
+    """A ``BambuFTPClient`` stand-in that records its session and every call on it."""
+
+    instances: list["_SessionClient"] = []
+    connect_ok = True
+
+    def __init__(self, ip_address, access_code, timeout=None, printer_model=None):
+        self.connects = 0
+        self.disconnects = 0
+        self.calls: list[tuple[str, str]] = []
+        _SessionClient.instances.append(self)
+
+    def connect(self):
+        self.connects += 1
+        return _SessionClient.connect_ok
+
+    def disconnect(self):
+        self.disconnects += 1
+
+    def list_files(self, path):
+        self.calls.append(("list", path))
+        return [{"name": "a.mp4", "path": f"{path}/a.mp4"}]
+
+    def delete_file(self, path):
+        self.calls.append(("delete", path))
+        return DeleteResult.DELETED
+
+
+@pytest.fixture
+def session_client(monkeypatch):
+    _SessionClient.instances = []
+    _SessionClient.connect_ok = True
+    monkeypatch.setattr(bambu_ftp, "BambuFTPClient", _SessionClient)
+    return _SessionClient
+
+
+class TestRunInSession:
+    @pytest.mark.asyncio
+    async def test_list_and_delete_ride_one_connection(self, session_client):
+        def _body(client):
+            paths = [entry["path"] for directory in ("/ipcam", "/timelapse") for entry in client.list_files(directory)]
+            return [client.delete_file(path) for path in paths]
+
+        results = await run_in_session("1.2.3.4", "x", _body, printer_model="H2S")
+
+        assert results == [DeleteResult.DELETED, DeleteResult.DELETED]
+        (client,) = session_client.instances  # ONE session for the whole body
+        assert (client.connects, client.disconnects) == (1, 1)
+        assert client.calls == [
+            ("list", "/ipcam"),
+            ("list", "/timelapse"),
+            ("delete", "/ipcam/a.mp4"),
+            ("delete", "/timelapse/a.mp4"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_connect_raises_connection_error_and_never_runs_the_body(self, session_client):
+        session_client.connect_ok = False
+        ran: list[bool] = []
+        with pytest.raises(ConnectionError):
+            await run_in_session("1.2.3.4", "x", lambda client: ran.append(True))
+        assert ran == []
+
+    @pytest.mark.asyncio
+    async def test_the_session_closes_when_the_body_raises(self, session_client):
+        def _boom(_client):
+            raise RuntimeError("body failed")
+
+        with pytest.raises(RuntimeError, match="body failed"):
+            await run_in_session("1.2.3.4", "x", _boom)
+        (client,) = session_client.instances
+        assert client.disconnects == 1
+
+    @pytest.mark.asyncio
+    async def test_against_the_mock_server(self, patch_ftp_port):
+        """End to end on the implicit-FTPS double: list, then delete, on one session."""
+        server = patch_ftp_port
+        server.add_file("ipcam/old.mp4", b"v" * 10)
+
+        def _body(client):
+            names = [entry["name"] for entry in client.list_files("/ipcam")]
+            return names, client.delete_file("/ipcam/old.mp4")
+
+        names, result = await run_in_session("127.0.0.1", "12345678", _body, printer_model="X1C")
+        assert "old.mp4" in names
+        assert result == DeleteResult.DELETED
+        assert not server.file_exists("ipcam/old.mp4")
+
+
+class TestStorageScanCoversRecordings:
+    def test_used_bytes_scans_ipcam_and_the_thumbnail_dirs(self, ftp_client_factory, ftp_server):
+        """H2S answers AVBL with an error, so the scan is the UI's only size reading — and the
+        camera's video recording under /ipcam is the drive's largest occupant."""
+        ftp_server.add_file("ipcam/rec.mp4", b"v" * 5000)
+        ftp_server.add_file("ipcam/thumbnail/rec.jpg", b"t" * 700)
+        ftp_server.add_file("timelapse/thumbnail/tl.jpg", b"t" * 300)
+        client = ftp_client_factory()
+        client.connect()
+        info = client.get_storage_info()
+        client.disconnect()
+        assert info is not None
+        assert info["used_bytes"] >= 6000
+
+
+class TestRemoveAbandonedUpload:
+    """The ONE abandonment helper: True iff the file is off the drive (a 550 counts), one log
+    line naming lane and why, and it never raises."""
+
+    _PRINTER = SimpleNamespace(id=7, name="007-H2S", ip_address="1.2.3.4", access_code="x", model="H2S")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "result,expected,word",
+        [
+            (DeleteResult.DELETED, True, "removed"),
+            (DeleteResult.NOT_FOUND, True, "already gone"),
+            (DeleteResult.FAILED, False, "could not be removed"),
+        ],
+    )
+    async def test_truth_table(self, result, expected, word, caplog):
+        delete = AsyncMock(return_value=result)
+        with (
+            caplog.at_level(logging.INFO, logger="backend.app.services.bambu_ftp"),
+            patch.object(bambu_ftp, "delete_file_async", delete),
+        ):
+            removed = await remove_abandoned_upload(
+                self._PRINTER, "/eject_production_item5.3mf", lane="eject", why="the upload failed"
+            )
+
+        assert removed is expected
+        assert delete.await_args.args == ("1.2.3.4", "x", "/eject_production_item5.3mf")
+        assert delete.await_args.kwargs == {"printer_model": "H2S"}
+        (line,) = [r.getMessage() for r in caplog.records if "abandoned upload" in r.getMessage()]
+        assert line == (
+            f"[USB] eject: abandoned upload /eject_production_item5.3mf on printer 007-H2S {word} (the upload failed)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_delete_is_reported_not_raised(self):
+        with patch.object(bambu_ftp, "delete_file_async", AsyncMock(side_effect=OSError("session gone"))):
+            removed = await remove_abandoned_upload(
+                self._PRINTER, "/part.3mf", lane="dispatch", why="queue item 3: a refused claim"
+            )
+        assert removed is False

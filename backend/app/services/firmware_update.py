@@ -27,7 +27,7 @@ from backend.app.services.bambu_ftp import (
 )
 from backend.app.services.firmware_check import get_firmware_service
 from backend.app.services.printer_manager import printer_manager
-from backend.app.services.usb_storage import upload_in_flight
+from backend.app.services.usb_uploads import upload_in_flight
 
 logger = logging.getLogger(__name__)
 

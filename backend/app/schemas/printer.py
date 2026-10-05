@@ -187,6 +187,39 @@ class PrinterMessageInfo(BaseModel):
     description: str = ""
 
 
+class PlateCheckStopInfo(BaseModel):
+    """A plate-check episode's LAST farm stop, as its ledger recorded it: the stop's name is the
+    retry-or-escalate decision the ladder made once (``retry_stop`` / ``deadline_stop``;
+    ``terminal_outcome``), ``outcome`` what the read of it answered (``None`` while unanswered)."""
+
+    name: str
+    outcome: str | None = None
+
+
+class PlateCheckExit(BaseModel):
+    """The plate-check HUMAN'S TURN (operator ruling 2026-10-05): the printer waits PAUSED at its
+    plate-check dialog for a person — Ignore and resume, Problem solved, or Stop.
+
+    Present ⇔ ``printer_incidents.plate_check_human_turn`` holds (an escalated ``plate_vision``
+    row, no farm driver live, PAUSEd at the plate check on the row's job); ``None`` otherwise —
+    including while the farm's own ladder is acting. Built by
+    ``printer_manager.plate_check_exit_payload`` for BOTH ``/status`` branches and the WS frame.
+    Its OWN field rather than part of ``open_incident``, because that chip shows the
+    highest-precedence row and an AMS or power-loss row outranks ``plate_vision``.
+
+    ``print_error`` and ``job_id`` are what ``POST /printers/{id}/hms/execute-action`` takes for
+    the press; ``actions`` the buttons the turn offers (``PROBLEM_SOLVED_RESUME``,
+    ``IGNORE_RESUME``); ``deadline_at`` when the farm stops the print if nobody presses (ISO,
+    naive UTC like ``created_at``; ``None`` for the FALLBACK hold, which has no deadline, and
+    until the hold's timer has computed it). JSON primitives only (the WS frame dumps bare).
+    """
+
+    print_error: str
+    job_id: str = ""
+    actions: list[str] = []
+    deadline_at: str | None = None
+
+
 class OpenIncidentState(BaseModel):
     """The printer's highest-precedence OPEN equipment-fault row, as the card reads it.
 
@@ -226,6 +259,14 @@ class OpenIncidentState(BaseModel):
     #: hold) — always present on the wire; the card shows the ones the live
     #: ``hms_errors`` no longer carries
     printer_messages: list[PrinterMessageInfo] = []
+    #: when the row became a person's (ISO, naive UTC) — a plate-check decision hold's window
+    #: starts here
+    escalated_at: str | None = None
+    #: a plate-check episode's last farm stop as its ledger recorded it (``None`` when the farm
+    #: sent none, and for every other kind)
+    last_stop: PlateCheckStopInfo | None = None
+    #: a plate-check decision hold's deadline (ISO, naive UTC) — the hold's timer projects it
+    deadline_at: str | None = None
 
 
 class ServiceHoldEnterResponse(BaseModel):
@@ -700,6 +741,10 @@ class PrinterStatus(BaseModel):
     # not a wire fact — so BOTH ``/status`` branches carry it, and so does
     # ``printer_state_to_dict``'s WS frame, from the one builder.
     open_incident: OpenIncidentState | None = None
+    # The plate-check human's turn (operator ruling 2026-10-05): the buttons a person may press
+    # on the printer's plate-check dialog through the farm, and when the farm stops the print
+    # if nobody does. Same builder for both ``/status`` branches and the WS frame.
+    plate_check_exit: PlateCheckExit | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;

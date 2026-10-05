@@ -898,11 +898,13 @@ _DONOR_READERS: dict[tuple[str, str], str] = {
     ("services/job_terminal.py", "_dispatched_filename"): (
         "the file name a live unit's dispatch was uploaded under — the path a stale job's cleanup keeps"
     ),
+    ("services/job_terminal.py", "_pinned_filenames"): (
+        "the keep-set: the source names of the pending units pinned to a printer"
+    ),
     ("services/print_scheduler.py", "PrintScheduler._get_filament_requirements"): "dispatch read: the source file",
     ("services/print_scheduler.py", "PrintScheduler._get_job_name"): "dispatch read: the source name",
     ("services/print_scheduler.py", "PrintScheduler._start_print"): "dispatch read: the bytes to upload",
     ("services/print_scheduler.py", "PrintScheduler.check_queue"): "a log line naming each pending unit's source",
-    ("services/usb_storage.py", "_in_use_remote_names"): "file names on the printer's USB a live unit prints from",
     ("services/user_deletion.py", "_destroy_owned_items"): "delete scope: the units printing FROM the user's archives",
     ("services/user_deletion.py", "delete_impact"): "delete forecast over the same scope",
 }
@@ -2827,3 +2829,111 @@ class TestUsageChargeOwnership:
                 if imported or reached:
                     strays.append(("/".join(parts), node.lineno))
         assert not strays, strays
+
+
+# --- the plate-check dialog: who presses it, who decides whose turn it is (2026-10-05) -------
+
+_PAUSE_RECOVERY = ("services", "pause_recovery.py")
+
+
+def _call_name(node: ast.Call) -> str | None:
+    func = node.func
+    return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+
+def _calls_named(name: str) -> list[tuple[tuple[str, ...], tuple[str, ...], ast.Call]]:
+    """Every CALL of ``name`` in the app — a function or a method — with its file and its
+    enclosing scope (class/function names, outermost first). Calls only: the name in prose,
+    a ``def`` of the same name (the route is named ``execute_hms_action`` too) never counts."""
+    hits = []
+    for parts, tree in _app_trees():
+        for node, scope in _scoped_nodes(tree):
+            if isinstance(node, ast.Call) and _call_name(node) == name:
+                hits.append((parts, scope, node))
+    return hits
+
+
+class TestPlateCheckDialogOwnership:
+    """The plate-check dialog after the 2026-10-05 ruling (the ladder's last rung became a bounded
+    decision hold, and a person may press Ignore and resume through the farm). SOURCE pins, like
+    their neighbours: each catches a well-formed second owner every behaviour test would pass."""
+
+    # WHO presses a printer-dialog button (``BambuMQTTClient.execute_hms_action``, the one frame
+    # builder — ``TestHmsDialogFrameOwnership``): the HMS modal's route for every other dialog, and
+    # the plate-check lane — the ladder's own re-check and a person's press on their turn. A third
+    # presser would answer a dialog no ledger records and no turn gates.
+    _DIALOG_PRESSERS = {("api", "routes", "printers.py"), _PAUSE_RECOVERY}
+
+    def test_the_dialog_is_pressed_only_by_the_route_and_the_plate_check_lane(self):
+        pressers = {parts for parts, _scope, _node in _calls_named("execute_hms_action")}
+        strays = pressers - self._DIALOG_PRESSERS
+        assert not strays, f"execute_hms_action is called outside the allowlisted pressers: {sorted(strays)}"
+        # Liveness: both allowlisted pressers still press.
+        assert pressers == self._DIALOG_PRESSERS
+
+    def test_the_human_turn_predicate_has_exactly_two_callers(self):
+        """``printer_incidents.plate_check_human_turn`` is THE predicate of a person's turn: the
+        status projection renders the buttons from it, and the press is refused by it. A third
+        reader would be a second opinion on when a person may press Ignore."""
+        callers = sorted((parts, scope[-1]) for parts, scope, _node in _calls_named("plate_check_human_turn"))
+        assert callers == [
+            (("services", "pause_recovery.py"), "human_dialog_action"),
+            (("services", "printer_manager.py"), "plate_check_exit_payload"),
+        ]
+
+    def test_the_stop_name_has_one_writer(self):
+        """The retry-or-escalate decision is RECORDED as the stop step's name. Its one writer is
+        ``PlateCheckStep.stop(name)``, called once — in ``_stop_the_print``, passing the decision
+        through — and no other code builds a ``PlateCheckStep`` itself (the step's own builders,
+        and the ledger's hydration, read what was written)."""
+        stops = [
+            (parts, scope, node)
+            for parts, scope, node in _calls_named("stop")
+            if isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "PlateCheckStep"
+        ]
+        assert [(parts, scope) for parts, scope, _node in stops] == [(_PAUSE_RECOVERY, ("_stop_the_print",))]
+        (_parts, _scope, call) = stops[0]
+        assert [ast.unparse(arg) for arg in call.args] == ["name"]
+
+        # Hydration reads back what was written; nothing else constructs a step by hand.
+        built = {(parts, scope) for parts, scope, _node in _calls_named("PlateCheckStep")}
+        assert built <= {(_PAUSE_RECOVERY, ("_PlateCheckEvidence", "_step_of"))}, sorted(built)
+        # Liveness: the builder itself writes the decision it was handed as the step's name.
+        (writer,) = [
+            node
+            for parts, scope, node in _calls_named("cls")
+            if parts == _PAUSE_RECOVERY and scope == ("PlateCheckStep", "stop")
+        ]
+        assert {kw.arg: ast.unparse(kw.value) for kw in writer.keywords}["name"] == "name"
+
+    def test_farm_retries_has_one_caller_the_terminal(self):
+        """``terminal_outcome.farm_retries`` reads the recorded decision back; the terminal's
+        builder is its one caller, so no other lane re-reads a retry out of a plate-check episode."""
+        callers = [(parts, scope) for parts, scope, _node in _calls_named("farm_retries")]
+        assert callers == [(("services", "terminal_outcome.py"), ("build_terminal_outcome",))]
+
+    def test_the_plate_driver_closes_only_on_its_own_outcomes(self):
+        """The plate-check driver closes its row ONLY on its own outcomes — ``recheck_passed`` (the
+        press let the job print on) and ``handed_over`` (the pause is not the plate check's). Every
+        other end of a plate-check episode — a person's resume or stop, the job's terminal, the
+        decision hold's deadline stop's terminal — is the rule table's (``incident_resolution``),
+        because no driver lives during a hold. The one other close in this module is the
+        operator's clear (``on_plate_cleared``), whose source is the table's own verdict."""
+        tree = ast.parse((BACKEND_DIR / "services" / "pause_recovery.py").read_text(encoding="utf-8"))
+        constants: set[str] = set()
+        for node, scope in _scoped_nodes(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            owner = node.func.value
+            if not (isinstance(owner, ast.Name) and owner.id == "printer_incidents" and node.func.attr == "close"):
+                continue
+            source = next((kw.value for kw in node.keywords if kw.arg == "source"), None)
+            if isinstance(source, ast.Name):
+                constants.add(source.id)
+            else:
+                assert source is not None and ast.unparse(source) == "verdict.source", ast.unparse(node)
+                assert scope == ("on_plate_cleared",), f"a table-verdict close outside on_plate_cleared: {scope}"
+        # The driver's sources, all of them, and both still there.
+        assert constants == {"RESOLVE_RECHECK_PASSED", "RESOLVE_HANDED_OVER"}

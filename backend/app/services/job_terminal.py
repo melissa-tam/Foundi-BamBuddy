@@ -374,21 +374,50 @@ async def _dispatched_filename(db: AsyncSession, unit: PrintQueueItem) -> str | 
     return None
 
 
+async def _pinned_filenames(db: AsyncSession, printer_id: int) -> list[str]:
+    """The source file names of the PENDING units pinned to ``printer_id``, in ONE query.
+
+    A pending row's ``printer_id`` is an operator pin, so these are the files the printer is
+    told to print next. The name is the scheduler's own rule (``_dispatched_filename``): the donor
+    archive's filename, else the library file's.
+    """
+    rows = await db.execute(
+        select(PrintArchive.filename, LibraryFile.filename)
+        .select_from(PrintQueueItem)
+        .outerjoin(PrintArchive, PrintArchive.id == PrintQueueItem.archive_id)
+        .outerjoin(LibraryFile, LibraryFile.id == PrintQueueItem.library_file_id)
+        .where(PrintQueueItem.printer_id == printer_id, PrintQueueItem.status == "pending")
+    )
+    return [archive_name or library_name for archive_name, library_name in rows.all() if archive_name or library_name]
+
+
 async def live_upload_paths(
     db: AsyncSession, printer_id: int, live_job: str | None, live_subtask_name: str | None
 ) -> frozenset[str]:
-    """The paths the printer's LIVE job may be printing from — the ones a stale job's cleanup keeps.
+    """THE keep-set: the upload paths on printer ``printer_id`` that must STAY.
 
-    A farm runs one file N times, so a stale job and the job the printer runs now usually share
-    ONE upload path (``derive_remote_filename`` of the same donor): deleting "the stale job's
-    file" would delete the running job's. The job phase acts on the job that ended and never on
-    the running one — the whole of RC3. The live job's paths are its own name's fallbacks and,
-    for a farm dispatch, its unit's upload path.
+    Read by every lane that removes a file from a printer's storage root — a stale job's
+    cleanup (the downtime reconcile) and the USB sweep (``usb_storage``) — so "what may not be
+    deleted" has one answer:
+
+    * the LIVE job's paths — its own name's fallbacks and, for a farm dispatch, its unit's upload
+      path. A farm runs one file N times, so a stale job and the job the printer runs now usually
+      share ONE upload path (``derive_remote_filename`` of the same donor): deleting "the stale
+      job's file" would delete the running job's. The job phase acts on the job that ended and
+      never on the running one — the whole of RC3;
+    * the paths of the PENDING units pinned to this printer — the files it is told to print next.
+
+    A ``printing`` unit that is not the live job is deliberately absent. It is either a claim in
+    flight — a dispatch lease or an upload, which stands the whole USB sweep down — or a job that
+    ended where nobody saw it, whose own file the downtime reconcile is about to remove: keeping
+    it would defeat that very cleanup.
     """
     paths = set(upload_candidates(None, live_subtask_name))
     unit = await print_binding.dispatched_unit(db, printer_id, live_job)
     if unit is not None:
         paths.update(upload_candidates(await _dispatched_filename(db, unit), None))
+    for filename in await _pinned_filenames(db, printer_id):
+        paths.update(upload_candidates(filename, None))
     return frozenset(paths)
 
 

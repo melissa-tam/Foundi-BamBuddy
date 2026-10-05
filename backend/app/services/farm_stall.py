@@ -80,9 +80,11 @@ from backend.app.services.printer_incidents import (
 from backend.app.services.printer_manager import printer_manager
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from backend.app.models.printer_incident import PrinterIncident
 
 logger = logging.getLogger(__name__)
 
@@ -932,9 +934,11 @@ _JAM_REMINDER_DETAIL = "Spool jam STILL not recovered — the printer is still P
 _RUNOUT_REMINDER_DETAIL = (
     "Filament runout STILL not resolved — the printer is still PAUSED awaiting a same-slot refill."
 )
-# The printer's pre-print plate check PAUSED the job (2026-09-24: the farm no longer
-# stops it) — the operator fixes the plate and resumes, the same job continues.
-_PLATE_VISION_REMINDER_DETAIL = "Print paused at plate check. Fix the plate, then resume the print."
+# The printer's pre-print plate check PAUSED the job and the hold is a person's: the decision
+# hold (operator ruling 2026-10-05 — the farm stops the print when its window runs out, so a
+# reminder reaches only a window longer than the reminder's) or the FALLBACK (the farm's stop did
+# not land). Both are answered the same way, and the farm offers both exits.
+_PLATE_VISION_REMINDER_DETAIL = "Print paused at the plate check. Ignore and resume, or stop the print."
 _POWER_LOSS_REMINDER_REASON = "The farm could not answer the prompt; it is STILL waiting."
 _Z_REFERENCE_REMINDER_DETAIL = (
     "This printer STILL has a part on its plate after a restart — its Z reference is lost. "
@@ -997,12 +1001,12 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
     # fact ends these holds. A lost Z reference holds an IDLE printer as its NORMAL shape
     # (there may never have been a print running), and only the operator ends it. A
     # plate-check episode is a PAUSE hold that ends with its job: the farm re-checks in
-    # place, and on a failed re-check STOPS the print (retry, or escalate on the retry's own
-    # failure) — the terminal of that stop closes the row, and an escalated plate is then
-    # nagged from its refused-plate GATE (the third arm below), not from this row. So a
-    # plate-check row still open on a printer that is not paused is only ever the short gap
-    # before that terminal or the sweep's job-ended-unseen close; its copy says only what is
-    # true then.
+    # place, and on a failed re-check STOPS the print to retry it, or leaves it paused for a
+    # person's decision and stops it when the window runs out — the terminal of that stop
+    # closes the row, and a refused plate is then nagged from its GATE (the refused-plate arm
+    # below), not from this row. So a plate-check row still open on a printer that is not
+    # paused is only ever the short gap before that terminal or the sweep's job-ended-unseen
+    # close; its copy says only what is true then.
     KIND_POWER_LOSS: (
         "This printer is STILL held at its power-loss prompt and will take no work until the prompt is answered."
     ),
@@ -1048,6 +1052,7 @@ async def _remind_open_incidents(
     db: AsyncSession,
     notif,
     *,
+    open_rows: Sequence[PrinterIncident],
     manager,
     now: float,
     held_keys: set[tuple[int, str]],
@@ -1078,7 +1083,7 @@ async def _remind_open_incidents(
     from backend.app.models.printer import Printer
     from backend.app.services import printer_incidents
 
-    for incident in await printer_incidents.all_open(db):
+    for incident in open_rows:
         if incident.status != STATUS_ESCALATED:
             continue  # 'recovering' is the machine acting — not a hold to nag about
         pid = incident.printer_id
@@ -1261,6 +1266,12 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
 
     Each nags once per :data:`_ATTENTION_REMINDER_S` window until the hold lifts.
 
+    The same pass re-arms a plate-check decision hold's deadline timer when the hold is past
+    its deadline with no timer running (``pause_recovery.rearm_overdue_decision_deadlines``,
+    operator ruling 2026-10-05): the timer is process memory, and a hold that lost it would
+    otherwise sit paused and hot past the window the operator set. It reads the open rows this
+    pass already read, so it costs nothing while no such hold exists.
+
     Cadence: the first alert stays owned by the original escalation path, which
     never touches the ``"attention"`` :func:`notify_dedup.allow` scope. So the loop
     SEEDS the window the first tick it sees the condition and the first REMINDER
@@ -1284,7 +1295,13 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
     # these are retained below; every other tracked key is reset. The incident arm
     # shares the ledger, keyed ``incident:{id}`` — one reset pass, one contract.
     held_keys: set[tuple[int, str]] = set()
-    await _remind_open_incidents(db, notification_service, manager=manager, now=now, held_keys=held_keys)
+    from backend.app.services import pause_recovery, printer_incidents
+
+    open_rows = await printer_incidents.all_open(db)
+    await pause_recovery.rearm_overdue_decision_deadlines(db, open_rows)
+    await _remind_open_incidents(
+        db, notification_service, open_rows=open_rows, manager=manager, now=now, held_keys=held_keys
+    )
     await _remind_refused_plates(db, manager=manager, now=now, held_keys=held_keys)
 
     for item in list(result.scalars().all()):

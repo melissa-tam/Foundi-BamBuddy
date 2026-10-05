@@ -16,7 +16,7 @@ forcing the manual-selection fallback the reporter explicitly asked for.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -175,3 +175,44 @@ class TestMatchTimelapseByTimestamp:
         assert match is not None
         assert match["name"] == "video_2026-05-08_09-41-29.mp4"
         assert diff is not None
+
+
+class TestScanStrategyThreeMtime:
+    """``/archives/{id}/timelapse/scan`` strategy 3 (file mtime vs the archive's end).
+
+    The FTPS listing's ``mtime`` is UTC-AWARE (the printer stamps ``LIST`` in UTC,
+    ``bambu_ftp.list_files``) while the DB stores naive UTC. ``abs(mtime - archive_end)``
+    across the two raised ``TypeError`` — the route normalises ``archive_end`` first."""
+
+    async def test_an_aware_listing_mtime_against_a_naive_archive_end(
+        self, db_session, printer_factory, archive_factory
+    ):
+        from unittest.mock import AsyncMock, patch
+
+        from backend.app.api.routes.archives import scan_timelapse
+
+        printer = await printer_factory(model="H2S")
+        archive = await archive_factory(
+            printer.id,
+            filename="Bracket.gcode.3mf",
+            started_at=None,  # strategy 2 (filename timestamp vs start) cannot answer
+            completed_at=datetime(2026, 10, 5, 8, 0),  # naive UTC, as the DB stores it
+            with_run=False,
+        )
+        assert archive.completed_at.tzinfo is None
+        videos = [
+            _video("video_far.mp4", mtime=datetime(2026, 10, 4, 1, 0, tzinfo=timezone.utc)),
+            _video("video_near.mp4", mtime=datetime(2026, 10, 5, 8, 4, tzinfo=timezone.utc)),
+        ]
+        download = AsyncMock(return_value=b"mp4 bytes")
+        with (
+            patch("backend.app.services.bambu_ftp.list_files_async", AsyncMock(return_value=videos)),
+            patch("backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))),
+            patch("backend.app.services.bambu_ftp.download_file_bytes_async", download),
+            patch("backend.app.services.archive.ArchiveService.attach_timelapse", AsyncMock(return_value=True)),
+        ):
+            result = await scan_timelapse(archive.id, db=db_session, _=None)
+
+        assert result["status"] == "attached"
+        assert result["filename"] == "video_near.mp4"
+        assert download.await_args.args[2] == "/timelapse/video_near.mp4"
