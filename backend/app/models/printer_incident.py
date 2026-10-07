@@ -112,6 +112,10 @@ ALL_KINDS: frozenset[str] = AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS
 # be "do this plate again" — a requeue, because the printer was HELD — which is exactly
 # the wrong answer for the one hold that means nothing is broken.
 FAULT_KINDS: frozenset[str] = ALL_KINDS - DECLARED_KINDS
+# The fault kinds a RECURRING signature can be read from (``printer_incidents.recurring_signatures``):
+# a runout is consumption, and a power loss or a lost Z frame is a SITE event — none of the three
+# says a printer keeps breaking. Derived by subtraction so a new fault kind joins by default.
+RECURRENCE_KINDS: frozenset[str] = FAULT_KINDS - {KIND_RUNOUT, KIND_POWER_LOSS, KIND_Z_REFERENCE_LOST}
 
 # The RETURN-TO-NORMAL rule: what evidence ends a hold of each kind.
 #

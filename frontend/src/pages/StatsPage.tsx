@@ -61,17 +61,25 @@ import { TabList, TabPanel } from '../components/ui/Tabs';
 import { useTabs } from '../hooks/useTabs';
 import { InfoHint } from '../components/ui/InfoHint';
 import { FleetTab, FleetTimeframeHint } from '../components/fleet/FleetTab';
+import { FaultsTab } from '../components/incidents/FaultsTab';
 import { FLEET_DASHBOARD_STORAGE_KEY } from '../utils/fleetMetrics';
 
 // Constants
 const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 /**
- * The two lenses on this page. `prints` is the default, so it is the ABSENCE
+ * The three lenses on this page. `prints` is the default, so it is the ABSENCE
  * of the search param rather than a value — a URL nobody has touched opens
  * where it always did.
  */
-type StatsTab = 'prints' | 'fleet';
+type StatsTab = 'prints' | 'fleet' | 'faults';
+
+/** The tabs a `?tab=` value may name; anything else opens Prints. */
+const URL_TABS: readonly StatsTab[] = ['fleet', 'faults'];
+
+function tabFromUrl(value: string | null): StatsTab {
+  return URL_TABS.find((tab) => tab === value) ?? 'prints';
+}
 
 /**
  * The Prints grid's layout key. Its Fleet twin is `FLEET_DASHBOARD_STORAGE_KEY`
@@ -954,7 +962,7 @@ export function StatsPage() {
   // DERIVED from the URL, never mirrored into state: a deep link and a click
   // land in exactly the same place, and there is no second copy to get out of
   // step with the address bar.
-  const activeTab: StatsTab = searchParams.get('tab') === 'fleet' ? 'fleet' : 'prints';
+  const activeTab: StatsTab = tabFromUrl(searchParams.get('tab'));
   const [isExporting, setIsExporting] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [dashboardKey, setDashboardKey] = useState(0);
@@ -976,12 +984,12 @@ export function StatsPage() {
   const [showTimeframePicker, setShowTimeframePicker] = useState(false);
 
   const handleTabChange = (tab: StatsTab) => {
-    if (tab === 'fleet') {
-      searchParams.set('tab', 'fleet');
-    } else {
+    if (tab === 'prints') {
       searchParams.delete('tab');
+    } else {
+      searchParams.set('tab', tab);
     }
-    // `replace`: arrowing across a two-tab strip is not navigation, and a
+    // `replace`: arrowing across a tab strip is not navigation, and a
     // history entry per keystroke would make Back mean "the tab I was on a
     // moment ago" instead of "the page I came from".
     setSearchParams(searchParams, { replace: true });
@@ -993,12 +1001,20 @@ export function StatsPage() {
     items: [
       { id: 'prints', label: t('fleetMetrics.tabs.prints') },
       { id: 'fleet', label: t('fleetMetrics.tabs.fleet') },
+      { id: 'faults', label: t('fleetMetrics.tabs.faults') },
     ],
   });
 
-  /** The grid the header's layout controls act on: whichever tab is open. */
+  /**
+   * The grid the header's layout controls act on: whichever tab is open. The
+   * Faults tab has no widget grid, so its key is null and the controls hide.
+   */
   const layoutStorageKey =
-    activeTab === 'fleet' ? FLEET_DASHBOARD_STORAGE_KEY : PRINTS_DASHBOARD_STORAGE_KEY;
+    activeTab === 'fleet'
+      ? FLEET_DASHBOARD_STORAGE_KEY
+      : activeTab === 'prints'
+        ? PRINTS_DASHBOARD_STORAGE_KEY
+        : null;
 
   // Persist timeframe selection
   useEffect(() => {
@@ -1014,6 +1030,7 @@ export function StatsPage() {
 
   // Read hidden count from the ACTIVE tab's layout
   useEffect(() => {
+    if (layoutStorageKey === null) return;
     const updateHiddenCount = () => {
       try {
         const saved = localStorage.getItem(layoutStorageKey);
@@ -1182,11 +1199,14 @@ export function StatsPage() {
             </h1>
             {isRefetching && <Loader2 className="w-5 h-5 text-bambu-green animate-spin" />}
           </div>
-          <p className="text-bambu-gray mt-1">{t('stats.subtitle')}</p>
+          {/* The subtitle describes the widget grid, so it shows only where one is. */}
+          {layoutStorageKey !== null && <p className="text-bambu-gray mt-1">{t('stats.subtitle')}</p>}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Hidden widgets button - toggles panel in Dashboard */}
-          {hiddenCount > 0 && (
+          {/* Hidden widgets button - toggles panel in Dashboard. The layout
+              controls act on a widget grid, so they are absent on the Faults
+              tab, which has none. */}
+          {layoutStorageKey !== null && hiddenCount > 0 && (
             <Button
               variant="secondary"
               onClick={() => {
@@ -1199,22 +1219,24 @@ export function StatsPage() {
             </Button>
           )}
           {/* Reset Layout */}
-          <Button
-            variant="secondary"
-            onClick={() => {
-              localStorage.removeItem(layoutStorageKey);
-              setDashboardKey(prev => prev + 1);
-              showToast(t('stats.layoutReset'));
-            }}
-            disabled={!hasPermission('settings:update')}
-            title={!hasPermission('settings:update') ? t('stats.noPermissionResetLayout') : undefined}
-          >
-            <RotateCcw className="w-4 h-4" />
-            {t('stats.resetLayout')}
-          </Button>
+          {layoutStorageKey !== null && (
+            <Button
+              variant="secondary"
+              onClick={() => {
+                localStorage.removeItem(layoutStorageKey);
+                setDashboardKey(prev => prev + 1);
+                showToast(t('stats.layoutReset'));
+              }}
+              disabled={!hasPermission('settings:update')}
+              title={!hasPermission('settings:update') ? t('stats.noPermissionResetLayout') : undefined}
+            >
+              <RotateCcw className="w-4 h-4" />
+              {t('stats.resetLayout')}
+            </Button>
+          )}
           {/* Recalculate costs, Export and the user filter all act on print
-              ARCHIVES, so they are absent on the Fleet tab rather than present
-              and inert. */}
+              ARCHIVES, so they are absent on the Fleet and Faults tabs rather
+              than present and inert. */}
           {activeTab === 'prints' && (
             <>
           {/* Recalculate Costs */}
@@ -1407,10 +1429,11 @@ export function StatsPage() {
               </>
             )}
           </div>
-          {/* The picker serves both tabs, and the two read a different day.
-              Which one is in force is supplementary detail, so it rides a
-              tooltip on the control rather than a line of the header. */}
-          {activeTab === 'fleet' ? (
+          {/* The picker serves every tab, and Prints reads a UTC day while
+              Fleet and Faults read the site's. Which one is in force is
+              supplementary detail, so it rides a tooltip on the control
+              rather than a line of the header. */}
+          {activeTab !== 'prints' ? (
             <FleetTimeframeHint />
           ) : (
             <InfoHint text={t('fleetMetrics.hints.timeframePrints')} />
@@ -1428,6 +1451,8 @@ export function StatsPage() {
       <TabPanel tabs={tabs}>
         {activeTab === 'fleet' ? (
           <FleetTab timeframe={timeframe} gridKey={dashboardKey} />
+        ) : activeTab === 'faults' ? (
+          <FaultsTab timeframe={timeframe} />
         ) : isLoading ? (
           <div className="text-center py-12 text-bambu-gray">{t('stats.loadingStats')}</div>
         ) : (

@@ -86,12 +86,13 @@ import logging
 import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 from sqlalchemy import exists, func as sa_func, or_, select
 from sqlalchemy.exc import IntegrityError
 
+from backend.app.models.printer import Printer
 from backend.app.models.printer_incident import (
     AMS_FAULT_KINDS,
     DECLARED_KINDS,
@@ -105,6 +106,7 @@ from backend.app.models.printer_incident import (
     KIND_SERVICE_HOLD,
     KIND_Z_REFERENCE_LOST,
     RECOVER_ENDS,
+    RECURRENCE_KINDS,
     RESOLUTION_WIRE,
     RESOLVE_AUTO_RESUME,
     RESOLVE_DRIVER_RESTART,
@@ -128,14 +130,23 @@ from backend.app.services.hms_actions import HMSAction
 # ``hms_errors`` is a LEAF (it imports only the vendored catalogs), so the one message
 # renderer and the plate-check pause predicate are imported at module level — no cycle can
 # form through it.
-from backend.app.services.hms_errors import PrinterMessage, messages_from_full_codes, plate_check_paused
+from backend.app.services.hms_errors import (
+    PrinterMessage,
+    messages_from_full_codes,
+    plate_check_paused,
+    printer_message_from_short_code,
+)
 
 # ``job_identity`` is stdlib-only by construction, so the held-job rule is imported the same way.
 from backend.app.services.job_identity import is_held_job
 
+# ``site_time`` is a stdlib-only leaf: the ONE site calendar the ledger read model's window and
+# recurrence days are counted on.
+from backend.app.utils import site_time
+
 if TYPE_CHECKING:
     import asyncio
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping, Sequence
     from typing import Self
 
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -353,7 +364,41 @@ def runout_slot_desc(global_tray: int | None) -> str | None:
     return f"AMS {chr(ord('A') + global_tray // 4)} slot {global_tray % 4 + 1}"
 
 
-def row_external(incident: PrinterIncident) -> bool:
+class OutcomeFacts(Protocol):
+    """The stored facts :func:`outcome_of`, :func:`held_seconds` and :func:`summary` read.
+
+    A :class:`PrinterIncident` satisfies it, and so does a light column-select ``Row``
+    (:func:`ledger_page`'s window read), so the ledger's one derivation runs over either
+    without a second spelling of it. Read-only properties, because a ``Row`` is.
+    """
+
+    @property
+    def kind(self) -> str: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def created_at(self) -> datetime | None: ...
+    @property
+    def escalated_at(self) -> datetime | None: ...
+    @property
+    def resolved_at(self) -> datetime | None: ...
+    @property
+    def resolve_source(self) -> str | None: ...
+
+
+class LedgerFacts(OutcomeFacts, Protocol):
+    """:class:`OutcomeFacts` plus the identity columns the ledger read model groups on:
+    :func:`row_external` reads ``code``, :func:`recurring_signatures` the printer and id."""
+
+    @property
+    def id(self) -> int: ...
+    @property
+    def printer_id(self) -> int: ...
+    @property
+    def code(self) -> str: ...
+
+
+def row_external(incident: LedgerFacts) -> bool:
     """Is this row's fault on the EXTERNAL spool holder?
 
     ONE derivation, read from the taxonomy's own verdict over the row's durable
@@ -1661,7 +1706,7 @@ _FARM_CLOSES: frozenset[str] = frozenset(
 )
 
 
-def outcome_of(incident: PrinterIncident) -> str:
+def outcome_of(incident: OutcomeFacts) -> str:
     """Which :data:`OUTCOMES` bucket this row is in. Pure; total over every row shape.
 
     ``escalated_at`` is the human axis: once a page went out, the close — whatever
@@ -1715,7 +1760,7 @@ def outcome_of(incident: PrinterIncident) -> str:
     return OUTCOME_RESOLVED_UNPAGED
 
 
-def held_seconds(incident: PrinterIncident, now: datetime) -> float:
+def held_seconds(incident: OutcomeFacts, now: datetime) -> float:
     """How long this row has HELD its printer: ``created_at`` → close, or → ``now`` while open.
 
     THE one derivation of an incident's duration, so the row a reader sees on
@@ -1813,7 +1858,7 @@ def held_stats(rows: list[PrinterIncident], now: datetime) -> dict[str, HeldStat
     return stats
 
 
-def summary(rows: list[PrinterIncident]) -> dict:
+def summary(rows: Sequence[OutcomeFacts]) -> dict:
     """The tally over ``rows``: total, zero-human count, declared count, and the two breakdowns.
 
     **A DECLARED row is counted in ``by_kind`` and nowhere else** (2026-09-12). This
@@ -1845,39 +1890,340 @@ def summary(rows: list[PrinterIncident]) -> dict:
     }
 
 
-async def list_recent(
+# --- the ledger read model (2026-10-07) ---------------------------------------------
+#
+# ``GET /api/v1/incidents`` (the Stats page's Faults tab) reads the ledger through ONE
+# composition, :func:`ledger_page`: a site-date window, the kind / printer / outcome
+# filters, offset paging, the window-wide :func:`summary` and the recurring-issue lines.
+# The window is resolved HERE (``site_time.day_bounds``, as ``/fleet-metrics`` resolves
+# its own), so the Faults tab's tally and the Fleet tab's recovery summary count the same
+# rows for the same dates; the route validates and maps only.
+
+
+@dataclass(frozen=True, slots=True)
+class Recurrence:
+    """The thresholds of the recurring-issue rule (:func:`recurring_signatures`).
+
+    Deliberately strict, so the Faults tab's strip is empty on most days. Over the
+    farm's 2026-10-07 ledger a 30-day window flags one printer line (011-H2S extruder
+    overload ``0300_801E``: 9 holds on 4 days, last the day before) and one fleet line
+    (foreign objects on the plate ``0500_806E`` on 13 of 16 printers); a 14-day window
+    flags the fleet line only. The one-day bursts that night (014-H2S plate offset on
+    its arrival day, 012-H2S's shape-41 wedge day, 013-H2S ``0700_0019``) are correctly
+    not raised.
+
+    Recency is SEVEN site days, for printer and fleet lines alike (operator, 2026-10-07):
+    a signature silent for over a week is not recurring, and a 14-day horizon diluted the
+    strip with lines like 012-H2S ``0700_0012`` (last hold 14 days back) and 009-H2S
+    ``0700_8010`` (last hold 10 days back, 6 min held in all).
+    """
+
+    #: Holds of one signature on one printer before it can be a printer line.
+    min_holds: int
+    #: Distinct SITE days those holds fell on — a one-day burst is not recurrence.
+    min_days: int
+    #: The last hold's site date may be at most this many site days before the window end.
+    recency_days: int
+    #: Share of the active roster that must carry a ``(kind, code)`` for it to be ONE fleet line.
+    fleet_share: float
+    #: Distinct carriers a fleet line needs whatever the share — on a roster of one or two, ONE
+    #: printer is half the fleet, and a fleet line about a single printer is a printer line.
+    fleet_min_carriers: int
+
+
+_RECURRENCE = Recurrence(min_holds=3, min_days=3, recency_days=7, fleet_share=0.5, fleet_min_carriers=2)
+
+RecurrenceScope = Literal["printer", "fleet"]
+SCOPE_PRINTER: RecurrenceScope = "printer"
+SCOPE_FLEET: RecurrenceScope = "fleet"
+
+
+@dataclass(frozen=True, slots=True)
+class RecurringWorst:
+    """One of a fleet line's worst carriers."""
+
+    printer_id: int
+    printer_name: str
+    holds: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecurringSignature:
+    """One recurring-issue line: a ``(kind, code)`` that keeps holding a printer, or the fleet.
+
+    ``scope == "printer"`` names one printer (``worst`` is empty); ``scope == "fleet"``
+    names none and carries its two worst carriers in ``worst``. ``fleet_median`` is a
+    DISPLAYED figure — the median holds of this ``(kind, code)`` per ACTIVE printer, a
+    printer without one counting as 0 — and decides nothing.
+    """
+
+    scope: RecurrenceScope
+    printer_id: int | None
+    printer_name: str | None
+    kind: str
+    code: str
+    printer_message: PrinterMessage | None
+    holds: int
+    days: int
+    held_s: float
+    last_at: datetime
+    fleet_median: float
+    printers_affected: int
+    roster_size: int
+    #: The site's UTC offset AT ``last_at`` (``site_time.offset_minutes``), for a client
+    #: that renders the site-local wall clock without a tz database.
+    utc_offset_minutes: int
+    worst: tuple[RecurringWorst, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _Episodes:
+    """What one group of rows amounts to: count, distinct site days, held time, last hold."""
+
+    holds: int
+    days: int
+    held_s: float
+    last_at: datetime
+    last_day: date
+
+    @classmethod
+    def of(cls, rows: Sequence[LedgerFacts], now: datetime) -> _Episodes:
+        stamps = [row.created_at for row in rows if row.created_at is not None]
+        last_at = max(stamps)
+        return cls(
+            holds=len(rows),
+            days=len({site_time.to_site(stamp).date() for stamp in stamps}),
+            held_s=sum(held_seconds(row, now) for row in rows),
+            last_at=last_at,
+            last_day=site_time.to_site(last_at).date(),
+        )
+
+    def recent(self, date_to: date) -> bool:
+        """Site-DATE arithmetic against the window end — the site calendar is ``site_time``'s."""
+        return (date_to - self.last_day).days <= _RECURRENCE.recency_days
+
+
+def recurring_signatures(
+    rows: Iterable[LedgerFacts],
+    *,
+    date_to: date,
+    roster: Mapping[int, str],
+    now: datetime,
+) -> list[RecurringSignature]:
+    """The recurring-issue lines over a window's UNFILTERED rows. Pure; sorted by held time.
+
+    A signature is ``(printer_id, kind, code)`` over rows whose kind is in
+    :data:`~backend.app.models.printer_incident.RECURRENCE_KINDS` and whose code is not an
+    external-spool instruction (:func:`row_external`). ``roster`` is the ACTIVE printers
+    (id → name); a row from any other printer counts toward nothing, and an EMPTY roster
+    (every dev stack, whose real printers are all inactive) has no lines.
+
+    * **Fleet line** — a ``(kind, code)`` carried by at least :attr:`Recurrence.fleet_share`
+      of the roster AND by at least :attr:`Recurrence.fleet_min_carriers` printers (so one
+      printer on a one- or two-printer roster is never "the fleet"), on at least :attr:`Recurrence.min_days` distinct site days overall,
+      the last within :attr:`Recurrence.recency_days` site days of ``date_to``: ONE line
+      naming the two worst carriers, never one line per printer.
+    * **Printer line** — a signature that is NOT fleet-wide with at least
+      :attr:`Recurrence.min_holds` holds on at least :attr:`Recurrence.min_days` distinct
+      site days, the last within :attr:`Recurrence.recency_days` site days of ``date_to``.
+
+    A fleet-wide ``(kind, code)`` never yields a printer line, whether or not its fleet line
+    passes — the cause is the process, not the printer. ``now`` measures the open rows'
+    held time (:func:`held_seconds`).
+    """
+    if not roster:
+        return []
+    carriers_of: dict[tuple[str, str], dict[int, list[LedgerFacts]]] = {}
+    for row in rows:
+        if row.printer_id not in roster or row.kind not in RECURRENCE_KINDS or row.created_at is None:
+            continue
+        if row_external(row):
+            continue
+        carriers_of.setdefault((row.kind, row.code), {}).setdefault(row.printer_id, []).append(row)
+
+    lines: list[RecurringSignature] = []
+    for (kind, code), carriers in carriers_of.items():
+        fleet_median = float(statistics.median(len(carriers.get(printer_id, ())) for printer_id in roster))
+        message = printer_message_from_short_code(code)
+        fleet_wide = len(carriers) >= _RECURRENCE.fleet_min_carriers and len(carriers) >= _RECURRENCE.fleet_share * len(
+            roster
+        )
+        if fleet_wide:
+            episodes = _Episodes.of([row for printer_rows in carriers.values() for row in printer_rows], now)
+            if episodes.days < _RECURRENCE.min_days or not episodes.recent(date_to):
+                continue
+            ranked = sorted(carriers.items(), key=lambda item: (-len(item[1]), roster[item[0]], item[0]))
+            lines.append(
+                RecurringSignature(
+                    scope=SCOPE_FLEET,
+                    printer_id=None,
+                    printer_name=None,
+                    kind=kind,
+                    code=code,
+                    printer_message=message,
+                    holds=episodes.holds,
+                    days=episodes.days,
+                    held_s=episodes.held_s,
+                    last_at=episodes.last_at,
+                    fleet_median=fleet_median,
+                    printers_affected=len(carriers),
+                    roster_size=len(roster),
+                    utc_offset_minutes=site_time.offset_minutes(episodes.last_at),
+                    worst=tuple(
+                        RecurringWorst(printer_id=printer_id, printer_name=roster[printer_id], holds=len(held))
+                        for printer_id, held in ranked[:2]
+                    ),
+                )
+            )
+            continue
+        for printer_id, printer_rows in carriers.items():
+            episodes = _Episodes.of(printer_rows, now)
+            if (
+                episodes.holds < _RECURRENCE.min_holds
+                or episodes.days < _RECURRENCE.min_days
+                or not episodes.recent(date_to)
+            ):
+                continue
+            lines.append(
+                RecurringSignature(
+                    scope=SCOPE_PRINTER,
+                    printer_id=printer_id,
+                    printer_name=roster[printer_id],
+                    kind=kind,
+                    code=code,
+                    printer_message=message,
+                    holds=episodes.holds,
+                    days=episodes.days,
+                    held_s=episodes.held_s,
+                    last_at=episodes.last_at,
+                    fleet_median=fleet_median,
+                    printers_affected=len(carriers),
+                    roster_size=len(roster),
+                    utc_offset_minutes=site_time.offset_minutes(episodes.last_at),
+                )
+            )
+    lines.sort(key=lambda line: (-line.held_s, -line.holds, line.scope, line.printer_id or 0, line.kind, line.code))
+    return lines
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerPage:
+    """One page of the ledger read model, with the window-wide figures beside it.
+
+    ``total`` counts the rows matching every filter across the window (so
+    ``total == summary["total"] + summary["declared"]`` when no ``outcome`` filter is
+    set); ``summary`` is over the kind + printer filtered population only, so an outcome
+    filter cannot collapse the auto-recovered share to 0 % / 100 %; ``recurring`` is over
+    the UNFILTERED window. ``rows`` are full ORM rows in page order, newest first.
+    ``recurring_ids`` are the page rows whose ``(printer_id, kind, code)`` matches a
+    printer-scope line. ``now`` is the one instant every held time on the page is measured at.
+    """
+
+    total: int
+    summary: dict
+    recurring: tuple[RecurringSignature, ...]
+    rows: tuple[PrinterIncident, ...]
+    printer_names: dict[int, str]
+    recurring_ids: frozenset[int]
+    now: datetime
+
+
+async def ledger_page(
     db: AsyncSession,
     *,
-    since: datetime,
-    kind: str | None = None,
-    printer_id: int | None = None,
-    limit: int = 200,
-) -> list[PrinterIncident]:
-    """Rows opened at or after ``since``, newest first, optionally narrowed."""
-    stmt = select(PrinterIncident).where(PrinterIncident.created_at >= since)
-    if kind is not None:
-        stmt = stmt.where(PrinterIncident.kind == kind)
-    if printer_id is not None:
-        stmt = stmt.where(PrinterIncident.printer_id == printer_id)
-    # id DESC is the tiebreak, not decoration: rows opened in one push share a stamp.
-    stmt = stmt.order_by(PrinterIncident.created_at.desc(), PrinterIncident.id.desc()).limit(limit)
-    return list((await db.execute(stmt)).scalars().all())
+    date_from: date | None,
+    date_to: date | None,
+    kind: str | None,
+    printer_id: int | None,
+    outcome: str | None,
+    limit: int,
+    offset: int,
+) -> LedgerPage:
+    """Rows OPENED in the inclusive site-date window, filtered, paged newest first.
+
+    ``date_from`` / ``date_to`` are site dates resolved through ``site_time.day_bounds``
+    (an absent bound leaves that side open). Three queries per call, whatever the page:
+
+    * Q3 — ``printers`` (id, name, is_active): names for every row, and the ACTIVE roster
+      :func:`recurring_signatures` counts over;
+    * Q1 — the window's rows as nine narrow columns, ``(created_at DESC, id DESC)`` (rows
+      opened in one push share a stamp, so the id is the tiebreak). Recurrence, the
+      filters, :func:`summary` and :func:`outcome_of` run over these light rows in Python —
+      the one derivation of each, never a SQL twin;
+    * Q2 — the page's full rows by primary key, re-ordered to the page.
+    """
+    now = datetime.utcnow()
+    printers = (await db.execute(select(Printer.id, Printer.name, Printer.is_active))).all()
+    names = {printer.id: printer.name for printer in printers}
+    active = {printer.id: printer.name for printer in printers if printer.is_active}
+
+    stmt = select(
+        PrinterIncident.id,
+        PrinterIncident.printer_id,
+        PrinterIncident.kind,
+        PrinterIncident.code,
+        PrinterIncident.status,
+        PrinterIncident.escalated_at,
+        PrinterIncident.resolve_source,
+        PrinterIncident.resolved_at,
+        PrinterIncident.created_at,
+    )
+    if date_from is not None:
+        stmt = stmt.where(PrinterIncident.created_at >= site_time.day_bounds(date_from)[0])
+    if date_to is not None:
+        stmt = stmt.where(PrinterIncident.created_at < site_time.day_bounds(date_to)[1])
+    window = (await db.execute(stmt.order_by(PrinterIncident.created_at.desc(), PrinterIncident.id.desc()))).all()
+
+    recurring = recurring_signatures(
+        window, date_to=date_to if date_to is not None else site_time.site_today(now), roster=active, now=now
+    )
+    population = [
+        row
+        for row in window
+        if (kind is None or row.kind == kind) and (printer_id is None or row.printer_id == printer_id)
+    ]
+    kept = population if outcome is None else [row for row in population if outcome_of(row) == outcome]
+    page_ids = [row.id for row in kept[offset : offset + limit]]
+
+    rows: list[PrinterIncident] = []
+    if page_ids:
+        loaded = {
+            incident.id: incident
+            for incident in (await db.execute(select(PrinterIncident).where(PrinterIncident.id.in_(page_ids))))
+            .scalars()
+            .all()
+        }
+        rows = [loaded[incident_id] for incident_id in page_ids if incident_id in loaded]
+
+    printer_lines = {(line.printer_id, line.kind, line.code) for line in recurring if line.scope == SCOPE_PRINTER}
+    return LedgerPage(
+        total=len(kept),
+        summary=summary(population),
+        recurring=tuple(recurring),
+        rows=tuple(rows),
+        printer_names=names,
+        recurring_ids=frozenset(row.id for row in rows if (row.printer_id, row.kind, row.code) in printer_lines),
+        now=now,
+    )
 
 
 async def list_overlapping(db: AsyncSession, *, start: datetime, end: datetime) -> list[PrinterIncident]:
     """Every row whose hold INTERSECTS ``[start, end)``, oldest first, uncapped.
 
-    The question a timeline asks, which :func:`list_recent` cannot answer: that one
-    filters on ``created_at >= since``, so an incident that opened before the window
-    and was still holding right through it — the longest outages, exactly the ones a
-    downtime figure must not miss — is invisible to it. Here an incident is the
-    half-open interval ``[created_at, resolved_at or +inf)`` and the test is the
-    standard overlap: it began before the window ended, and it had not ended when the
-    window began.
+    The question a timeline asks, which a "rows opened in the window" read cannot answer:
+    an incident that opened before the window and was still holding right through it —
+    the longest outages, exactly the ones a downtime figure must not miss — was not opened
+    in it. Here an incident is the half-open interval ``[created_at, resolved_at or +inf)``
+    and the test is the standard overlap: it began before the window ended, and it had not
+    ended when the window began.
+
+    **Or it OPENED in the window** (``created_at >= start``), so "opened in the window" —
+    the Fleet tab's recovery tally, and :func:`ledger_page`'s window — is a SUBSET of
+    "overlapping" by construction: a zero-length row at a day edge (closed at the instant
+    it opened) would otherwise be counted by one read and not the other.
 
     No ``limit``: a cap on a row set a caller is about to SUM would silently
-    under-report, which is the failure mode :func:`list_recent`'s cap is acceptable
-    for (a page a human reads) and this one's would not be. The window is the bound.
+    under-report. The window is the bound.
 
     ``(created_at, id)`` ordering so a sweep over the rows is deterministic —
     incidents opened in one push share a stamp. Plain SQL comparisons on two
@@ -1886,7 +2232,13 @@ async def list_overlapping(db: AsyncSession, *, start: datetime, end: datetime) 
     stmt = (
         select(PrinterIncident)
         .where(PrinterIncident.created_at < end)
-        .where(or_(PrinterIncident.resolved_at.is_(None), PrinterIncident.resolved_at > start))
+        .where(
+            or_(
+                PrinterIncident.resolved_at.is_(None),
+                PrinterIncident.resolved_at > start,
+                PrinterIncident.created_at >= start,
+            )
+        )
         .order_by(PrinterIncident.created_at, PrinterIncident.id)
     )
     return list((await db.execute(stmt)).scalars().all())

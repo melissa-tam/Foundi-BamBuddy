@@ -18,9 +18,10 @@
  *   numbers dimmed instead of blanking the page.
  * - **`/intervals` is the drill-down.** Fetched only when a cell is opened.
  *
- * `resolveFleetRange` lives here rather than in `utils/fleetMetrics.ts` because
- * it is what turns the picker plus `/status` into this module's query key: it
- * is the argument, not the encoding.
+ * `resolveSiteRange` / `resolveFleetRange` live here rather than in
+ * `utils/fleetMetrics.ts` because they are what turn the picker plus `/status`
+ * into a query key (this module's, and `hooks/useIncidents`'): they are the
+ * argument, not the encoding.
  */
 
 import {
@@ -124,11 +125,15 @@ function clampToMaxDays(range: FleetRange): FleetRange {
 }
 
 /**
- * Resolve the picker's selection into the window the Fleet tab asks for.
+ * Resolve the picker's selection into SITE dates — THE one picker → site-range
+ * owner. Unclamped: what it answers is the window the operator picked, and a
+ * consumer with a cost guard (the Fleet tab, `resolveFleetRange`) applies it
+ * on top rather than leaking it into this function. The Faults tab reads this
+ * directly, because the fault ledger is a cheap read with no 366-day ceiling.
  *
- * Pure, and `undefined` until `/status` has answered — the Fleet tab's "today"
- * is the SITE's, and anchoring on the browser's would give a farm PC in another
- * zone a different last day from the one the server buckets on.
+ * Pure, and `undefined` until `/status` has answered — "today" is the SITE's,
+ * and anchoring on the browser's would give a farm PC in another zone a
+ * different last day from the one the server buckets on.
  *
  * **"All time" resolves to `history_since`,** which is the earlier of the first
  * observation and the first incident: fault and hold history reaches back to
@@ -140,9 +145,9 @@ function clampToMaxDays(range: FleetRange): FleetRange {
  * the instant's UTC calendar date and step back one day. The error is bounded
  * at a day and it always errs EARLY, so the window can never clip off real
  * history; the extra leading day comes back as a `not_recorded` bucket, which
- * the matrix already renders as a dash.
+ * the matrix already renders as a dash, and no ledger row precedes it.
  */
-export function resolveFleetRange(
+export function resolveSiteRange(
   timeframe: TimeframeState,
   status: FleetStatus | undefined,
 ): FleetRange | undefined {
@@ -151,20 +156,31 @@ export function resolveFleetRange(
 
   if (timeframe.preset === 'all-time') {
     if (status.history_since === null) return { dateFrom: today, dateTo: today };
-    const firstDay = addCalendarDays(status.history_since.slice(0, 10), -1);
-    const floor = addCalendarDays(today, -(FLEET_MAX_RANGE_DAYS - 1));
-    return { dateFrom: firstDay < floor ? floor : firstDay, dateTo: today };
+    return { dateFrom: addCalendarDays(status.history_since.slice(0, 10), -1), dateTo: today };
   }
 
   if (timeframe.preset === 'custom') {
     if (!timeframe.dateFrom || !timeframe.dateTo) return undefined;
     if (timeframe.dateTo < timeframe.dateFrom) return undefined;
-    return clampToMaxDays({ dateFrom: timeframe.dateFrom, dateTo: timeframe.dateTo });
+    return { dateFrom: timeframe.dateFrom, dateTo: timeframe.dateTo };
   }
 
   const { dateFrom, dateTo } = computeDateRange(timeframe.preset, today);
   if (dateFrom === undefined || dateTo === undefined) return undefined;
-  return clampToMaxDays({ dateFrom, dateTo });
+  return { dateFrom, dateTo };
+}
+
+/**
+ * The window the Fleet tab asks for: the site range clamped to the longest
+ * window `/fleet-metrics` answers, keeping its END — which, for "All time",
+ * floors the start at 366 days before the site's today.
+ */
+export function resolveFleetRange(
+  timeframe: TimeframeState,
+  status: FleetStatus | undefined,
+): FleetRange | undefined {
+  const range = resolveSiteRange(timeframe, status);
+  return range === undefined ? undefined : clampToMaxDays(range);
 }
 
 /** The label leaf for the resolved period, for the summary card's column head. */

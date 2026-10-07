@@ -32,6 +32,8 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
+# The ledger tally's one model lives with the ledger read (``schemas/incidents``).
+from backend.app.schemas.incidents import IncidentSummary
 from backend.app.utils.site_time import Bucket
 
 ValuesT = TypeVar("ValuesT")
@@ -268,16 +270,6 @@ class RecoveryValues(BaseModel):
     opened: int
     # incident kind -> count. Sparse.
     opened_by_kind: dict[str, int]
-
-
-class IncidentSummary(BaseModel):
-    """``printer_incidents.summary`` as a model — the equipment-fault ledger's tally."""
-
-    total: int
-    zero_human: int
-    declared: int
-    by_outcome: dict[str, int]
-    by_kind: dict[str, dict[str, int]]
 
 
 class TimeToRecover(BaseModel):

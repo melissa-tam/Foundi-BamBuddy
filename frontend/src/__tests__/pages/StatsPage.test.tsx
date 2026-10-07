@@ -22,6 +22,7 @@ import {
   makeFleetStatusProduction,
   makePrinterIntervals,
 } from '../fixtures/fleetMetrics';
+import { makeIncidentsResponse } from '../fixtures/incidents';
 
 /** The Prints grid's layout key, spelled here so the reset test can prove it is untouched. */
 const PRINTS_DASHBOARD_STORAGE_KEY = 'bambusy-dashboard-layout-v2';
@@ -176,7 +177,10 @@ describe('StatsPage', () => {
       }),
       http.get('/api/v1/archives/analysis/failures', () => {
         return HttpResponse.json(mockFailureAnalysis);
-      })
+      }),
+      // The Fleet and Faults tabs both resolve their window on the site's today.
+      http.get('/api/v1/fleet-metrics/status', () => HttpResponse.json(makeFleetStatus())),
+      http.get('/api/v1/incidents', () => HttpResponse.json(makeIncidentsResponse())),
     );
   });
 
@@ -632,6 +636,27 @@ describe('StatsPage', () => {
       pushState.mockRestore();
     });
 
+    it('opens the Faults tab from a ?tab=faults deep link, with the ledger in its panel', async () => {
+      window.history.replaceState({}, '', '/?tab=faults');
+
+      render(<StatsPage />);
+
+      const tab = await screen.findByRole('tab', { name: i18n.t('fleetMetrics.tabs.faults'), selected: true });
+      const panel = screen.getByRole('tabpanel');
+      expect(panel).toHaveAttribute('aria-labelledby', tab.id);
+      expect(
+        await within(panel).findByRole('table', { name: i18n.t('fleetMetrics.tabs.faults') }),
+      ).toBeInTheDocument();
+    });
+
+    it('writes ?tab=faults into the URL', async () => {
+      render(<StatsPage />);
+
+      await userEvent.click(await screen.findByRole('tab', { name: i18n.t('fleetMetrics.tabs.faults') }));
+
+      await waitFor(() => expect(window.location.search).toBe('?tab=faults'));
+    });
+
     it('drops the param again on the way back to Prints', async () => {
       window.history.replaceState({}, '', '/?tab=fleet');
       render(<StatsPage />);
@@ -654,6 +679,31 @@ describe('StatsPage', () => {
       expect(screen.queryByText('All Users')).not.toBeInTheDocument();
       // The layout and timeframe controls serve both tabs and stay.
       expect(screen.getByText('Reset Layout')).toBeInTheDocument();
+    });
+
+    it('hides the archive and layout controls on the Faults tab', async () => {
+      window.history.replaceState({}, '', '/?tab=faults');
+      render(<StatsPage />);
+      await screen.findByRole('tab', { name: i18n.t('fleetMetrics.tabs.faults'), selected: true });
+
+      expect(screen.queryByText('Recalculate Costs')).not.toBeInTheDocument();
+      expect(screen.queryByText('Export Stats')).not.toBeInTheDocument();
+      // No widget grid on this tab, so nothing for Reset layout to act on.
+      expect(screen.queryByText('Reset Layout')).not.toBeInTheDocument();
+    });
+
+    it('shows the widget-grid subtitle on Fleet and not on Faults', async () => {
+      const subtitle = i18n.t('stats.subtitle');
+      window.history.replaceState({}, '', '/?tab=faults');
+      const { unmount } = render(<StatsPage />);
+      await screen.findByRole('tab', { name: i18n.t('fleetMetrics.tabs.faults'), selected: true });
+      expect(screen.queryByText(subtitle)).not.toBeInTheDocument();
+      unmount();
+
+      window.history.replaceState({}, '', '/?tab=fleet');
+      render(<StatsPage />);
+      await screen.findByRole('tab', { name: i18n.t('fleetMetrics.tabs.fleet'), selected: true });
+      expect(screen.getByText(subtitle)).toBeInTheDocument();
     });
 
     it('keeps the archive controls on the Prints tab', async () => {

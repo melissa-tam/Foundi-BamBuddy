@@ -2,11 +2,12 @@
 
 ``printer_incident`` is a durable interval ledger (``created_at`` → ``resolved_at``,
 NULL = still holding), and a downtime figure is a sum over those intervals clipped
-to a window. ``list_recent`` cannot serve that: it filters ``created_at >= since``,
-so an incident that opened before the window and held right through it — the longest
-outages, the ones a downtime figure least may miss — is invisible to it. These pins
-hold the overlap test at both boundaries, the absence of a row cap, and the one
-derivation of a hold's duration that ``GET /incidents`` and any overlay share.
+to a window. A read of the rows OPENED in the window cannot serve that: an incident
+that opened before the window and held right through it — the longest outages, the
+ones a downtime figure least may miss — was not opened in it. These pins hold the
+overlap test at both boundaries, "opened in the window" as a subset of it, the absence
+of a row cap, and the one derivation of a hold's duration that ``GET /incidents`` and
+any overlay share.
 """
 
 from datetime import datetime, timedelta
@@ -74,7 +75,7 @@ class TestListOverlapping:
                 _incident(printer_id=a.id, created_at=at(19), resolved_at=at(20), job_id="after"),
                 # Wholly inside.
                 _incident(printer_id=a.id, created_at=at(13), resolved_at=at(14), job_id="inside"),
-                # Opened before, closed after — the row list_recent cannot see.
+                # Opened before, closed after — the row an opened-in-window read cannot see.
                 _incident(printer_id=a.id, created_at=at(6), resolved_at=at(23), job_id="spanning"),
                 # Still open, opened long before the window.
                 _incident(printer_id=a.id, kind=KIND_POWER_LOSS, created_at=at(6), job_id="open_ended"),
@@ -119,6 +120,34 @@ class TestListOverlapping:
         rows = await printer_incidents.list_overlapping(db_session, start=_START, end=_END)
 
         assert "open_after_end" not in [row.job_id for row in rows]
+
+    async def test_every_row_opened_in_the_window_is_overlapping(self, db_session, printer_factory):
+        """Every row OPENED in ``[start, end)`` is an overlapping row, by construction.
+
+        A zero-length row AT ``start`` (closed the instant it opened) never held the
+        printer inside the window, yet it was OPENED in it — the ledger read
+        (``ledger_page``) and the Fleet tab's tally count it, so the overlap read must
+        return it or the tally (drawn from these rows) loses it at a day edge. A row
+        whose close was stamped BEFORE its open (a clock step) is the same case.
+        """
+        printer = await printer_factory()
+        db_session.add_all(
+            [
+                _incident(printer_id=printer.id, created_at=_START, resolved_at=_START, job_id="zero_length_at_start"),
+                _incident(
+                    printer_id=printer.id,
+                    created_at=_START + timedelta(hours=1),
+                    resolved_at=_START - timedelta(seconds=5),
+                    job_id="backwards_close",
+                ),
+                _incident(printer_id=printer.id, created_at=_END, resolved_at=_END, job_id="zero_length_at_end"),
+            ]
+        )
+        await db_session.commit()
+
+        rows = await printer_incidents.list_overlapping(db_session, start=_START, end=_END)
+
+        assert [row.job_id for row in rows] == ["zero_length_at_start", "backwards_close"]
 
     async def test_there_is_no_row_cap(self, db_session, printer_factory):
         """A cap on a set the caller is about to SUM would silently under-report."""

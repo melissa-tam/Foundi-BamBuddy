@@ -1394,8 +1394,12 @@ export function formatSiteInstant(
   return new Intl.DateTimeFormat(locale, { ...options, timeZone: UTC }).format(shifted);
 }
 
-/** How a calendar DATE is spelled once the server has already resolved it. */
-const SITE_DATE_FORMAT: Intl.DateTimeFormatOptions = {
+/**
+ * How a calendar DATE is spelled once the server has already resolved it.
+ * Exported so an offset-bearing instant can be named as a DAY through
+ * `formatSiteInstant(naiveUtc, offset, locale, SITE_DATE_FORMAT)`.
+ */
+export const SITE_DATE_FORMAT: Intl.DateTimeFormatOptions = {
   year: 'numeric',
   month: 'short',
   day: 'numeric',

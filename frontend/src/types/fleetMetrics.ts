@@ -23,6 +23,9 @@
  */
 
 import type { PrinterIncidentKind } from '../api/client';
+// The ledger's tally is owned by `types/incidents.ts` (the recovery summary
+// below is the same `printer_incidents.summary`).
+import type { IncidentSummary } from './incidents';
 
 // ── the class vocabulary ────────────────────────────────────────────────────
 //
@@ -247,15 +250,6 @@ export interface RecoveryValues {
   opened: number;
   /** incident kind -> count. Sparse. */
   opened_by_kind: Partial<Record<PrinterIncidentKind, number>>;
-}
-
-/** `printer_incidents.summary` as a model — the equipment-fault ledger's tally. */
-export interface IncidentSummary {
-  total: number;
-  zero_human: number;
-  declared: number;
-  by_outcome: Record<string, number>;
-  by_kind: Record<string, Record<string, number>>;
 }
 
 /** How long one kind's holds stood, over the FAULT rows opened in the window. */
