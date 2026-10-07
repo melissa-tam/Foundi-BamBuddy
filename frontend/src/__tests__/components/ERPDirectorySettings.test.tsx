@@ -39,7 +39,8 @@ describe('ERPDirectorySettings', () => {
     render(<ERPDirectorySettings />);
 
     expect(await screen.findByRole('heading', { name: /ERP Directory Login/i })).toBeInTheDocument();
-    expect(screen.getByLabelText(/Database Host/i)).toHaveValue('erp.local');
+    // The heading is static; the saved values arrive with the settings query, so wait for the first one.
+    await waitFor(() => expect(screen.getByLabelText(/Database Host/i)).toHaveValue('erp.local'));
     expect(screen.getByLabelText(/^Port$/i)).toHaveValue(3306);
     expect(screen.getByLabelText(/Database Name/i)).toHaveValue('FoundiDB');
     expect(screen.getByLabelText(/Database User/i)).toHaveValue('ro_user');
@@ -51,7 +52,7 @@ describe('ERPDirectorySettings', () => {
     render(<ERPDirectorySettings />);
 
     await screen.findByRole('heading', { name: /ERP Directory Login/i });
-    expect(screen.getByLabelText('BamBuddy group for ADMIN')).toHaveValue('Administrators');
+    await waitFor(() => expect(screen.getByLabelText('BamBuddy group for ADMIN')).toHaveValue('Administrators'));
     expect(screen.getByLabelText('BamBuddy group for EDITOR')).toHaveValue('Operators');
     expect(screen.getByLabelText('BamBuddy group for VIEWER')).toHaveValue('Viewers');
   });
