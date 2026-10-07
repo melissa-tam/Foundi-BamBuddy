@@ -114,6 +114,17 @@ def day_bounds(d: date, tz: tzinfo | None = None) -> tuple[datetime, datetime]:
     return _day_bounds(d, _resolved(tz))
 
 
+def offset_minutes(dt: datetime, tz: tzinfo | None = None) -> int:
+    """The site's UTC offset, in minutes, AT the instant ``dt`` (naive UTC or aware).
+
+    Carried on a response beside a naive-UTC stamp so a client renders site-local wall
+    clocks without a tz database of its own — the OS zone's display name (a Windows host
+    with no ``TZ``) is no IANA key, and a browser cannot resolve it. Read at the instant
+    itself, so a stamp either side of a transition carries its own offset.
+    """
+    return _offset_minutes(dt, _resolved(tz))
+
+
 def bucket_edges(
     date_from: date,
     date_to: date,

@@ -26,6 +26,7 @@
  */
 
 import type { PrinterIncidentKind } from '../../../api/client';
+import { clearedNoPersonShare } from '../../../utils/incidents';
 import type {
   CycleGroup,
   CycleKind,
@@ -579,8 +580,7 @@ export function recoveryHeadline(projection: RecoveryProjection): RecoveryHeadli
     .sort((left, right) => right.count - left.count || byText(left.kind, right.kind));
   return {
     faultOpenHours: projection.fault_open_seconds / SECONDS_PER_HOUR,
-    clearedNoPersonShare:
-      projection.summary.total > 0 ? projection.summary.zero_human / projection.summary.total : null,
+    clearedNoPersonShare: clearedNoPersonShare(projection.summary),
     leadRecovery: ranked[0] ?? null,
   };
 }

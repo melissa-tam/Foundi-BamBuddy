@@ -69,7 +69,6 @@ from backend.app.schemas.fleet_metrics import (
     CycleStats,
     FleetSeriesValues,
     IncidentInterval,
-    IncidentSummary,
     MatrixCell,
     MatrixPrinter,
     MatrixProjection,
@@ -86,6 +85,7 @@ from backend.app.schemas.fleet_metrics import (
     TimeToRecover,
     UnitsValues,
 )
+from backend.app.schemas.incidents import IncidentSummary
 from backend.app.services.fleet_metrics.classifier import (
     GROUP_CYCLE_OVERHEAD,
     GROUP_DOWN,

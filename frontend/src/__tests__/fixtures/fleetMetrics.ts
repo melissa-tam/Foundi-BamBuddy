@@ -37,6 +37,7 @@ import type {
   ThroughputValues,
   UnitsValues,
 } from '../../types/fleetMetrics';
+import { NO_OUTCOMES } from './incidents';
 
 /** The fixtures' site zone: UTC+12, so nothing accidentally passes in UTC. */
 export const FIXTURE_UTC_OFFSET_MINUTES = 720;
@@ -554,8 +555,8 @@ function makeRecovery(shapes: BucketShape[]): RecoveryProjection {
       total: opened,
       zero_human: 1,
       declared: 1,
-      by_outcome: { auto_recovered: 1, human_resolved: Math.max(0, opened - 1) },
-      by_kind: { jam: { auto_recovered: 1, human_resolved: Math.max(0, opened - 1) } },
+      by_outcome: { ...NO_OUTCOMES, auto_recovered: 1, human_resolved: Math.max(0, opened - 1) },
+      by_kind: { jam: { ...NO_OUTCOMES, auto_recovered: 1, human_resolved: Math.max(0, opened - 1) } },
     },
     time_to_recover: [
       { kind: 'jam', count: opened, open_count: 1, total_held_s: 5 * HOUR_S, median_recover_s: 3600, p90_recover_s: 9000 },

@@ -11,9 +11,10 @@ The migration is exercised against a throwaway engine, twice, because
 """
 
 import asyncio
+import itertools
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -23,7 +24,11 @@ from backend.app.models.printer_incident import (
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
+    KIND_POWER_LOSS,
     KIND_RUNOUT,
+    KIND_SERVICE_HOLD,
+    KIND_Z_REFERENCE_LOST,
+    RESOLVE_DRIVER_SWAP,
     RESOLVE_OBSERVED_RUNNING,
     STATUS_ABORTED,
     STATUS_ESCALATED,
@@ -33,6 +38,8 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.models.printer_incident_step import STEP_KIND_COMMAND, STEP_KIND_LEVER
 from backend.app.services import printer_incidents
+from backend.app.services.hms_errors import printer_message_from_short_code
+from backend.app.utils import site_time
 
 pytestmark = pytest.mark.asyncio
 
@@ -2421,3 +2428,387 @@ class TestPlateCheckHumanTurn:
         assert printer_incidents.snapshot(printer_id)["kind"] == KIND_POWER_LOSS
 
         assert printer_incidents.plate_check_human_turn(printer_id, _paused_at_plate()) is not None
+
+
+# --- the ledger read model (2026-10-07) ---------------------------------------------
+
+_DATE_TO = date(2026, 10, 7)
+_NOW = site_time.day_bounds(_DATE_TO)[1]
+_FLEET16 = {printer_id: f"{printer_id:03d}-H2S" for printer_id in range(1, 17)}
+_light_ids = itertools.count(1)
+
+
+@dataclass(frozen=True)
+class _Light:
+    """A light ledger row — the nine columns ``ledger_page``'s window select carries."""
+
+    id: int
+    printer_id: int
+    kind: str
+    code: str
+    status: str
+    created_at: datetime
+    escalated_at: datetime | None
+    resolved_at: datetime | None
+    resolve_source: str | None
+
+
+def _site_day(days_before: int, *, hour: int = 12, date_to: date = _DATE_TO) -> datetime:
+    """A naive-UTC instant at ``hour`` site-local, ``days_before`` site days before ``date_to``."""
+    return site_time.day_bounds(date_to - timedelta(days=days_before))[0] + timedelta(hours=hour)
+
+
+def _hold(printer_id: int, days_before: int, *, kind=KIND_JAM, code="0300_801E", hour=12, held_s=300) -> _Light:
+    created = _site_day(days_before, hour=hour)
+    return _Light(
+        id=next(_light_ids),
+        printer_id=printer_id,
+        kind=kind,
+        code=code,
+        status=STATUS_RESOLVED,
+        created_at=created,
+        escalated_at=None,
+        resolved_at=created + timedelta(seconds=held_s),
+        resolve_source=RESOLVE_DRIVER_SWAP,
+    )
+
+
+def _signatures(rows, roster=_FLEET16):
+    return printer_incidents.recurring_signatures(rows, date_to=_DATE_TO, roster=roster, now=_NOW)
+
+
+def _plate_trips_on_13_of_16(*, last_days_before: int) -> list[_Light]:
+    """The 2026-10-07 fleet line's shape: foreign objects on 13 of 16 printers, 001 and 009 worst."""
+    rows = [
+        _hold(1, last_days_before + offset, kind=KIND_PLATE_VISION, code="0500_806E", hour=hour)
+        for offset, hour in (
+            (0, 9),
+            (0, 15),
+            (1, 9),
+            (1, 15),
+            (3, 9),
+            (5, 9),
+            (5, 15),
+            (8, 9),
+            (8, 15),
+            (12, 9),
+            (12, 15),
+        )
+    ]
+    rows += [
+        _hold(9, last_days_before + offset, kind=KIND_PLATE_VISION, code="0500_806E", hour=hour)
+        for offset, hour in ((0, 10), (2, 10), (2, 16), (4, 10), (4, 16), (6, 10), (6, 16), (9, 10), (9, 16), (11, 10))
+    ]
+    for printer_id in (2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13):
+        rows.append(_hold(printer_id, last_days_before + printer_id % 5, kind=KIND_PLATE_VISION, code="0500_806E"))
+    return rows
+
+
+class TestRecurringSignatures:
+    """The recurring-issue rule on fixtures shaped like the 2026-10-07 dry run."""
+
+    def test_a_printer_that_keeps_holding_on_several_days_is_one_printer_line(self):
+        """(a) 011-H2S: 9 extruder-overload holds on 4 site days, fleet median 0."""
+        rows = [_hold(11, days) for days in (1, 1, 1, 2, 2, 5, 5, 9, 9)]
+
+        (line,) = _signatures(rows)
+
+        assert line.scope == printer_incidents.SCOPE_PRINTER
+        assert (line.printer_id, line.printer_name) == (11, "011-H2S")
+        assert (line.kind, line.code) == (KIND_JAM, "0300_801E")
+        assert (line.holds, line.days) == (9, 4)
+        assert line.held_s == 9 * 300
+        assert line.last_at == _site_day(1)
+        assert line.fleet_median == 0.0
+        assert (line.printers_affected, line.roster_size) == (1, 16)
+        assert line.worst == ()
+
+    def test_a_one_day_burst_is_not_recurrence(self):
+        """(b) 014-H2S's arrival day: 8 holds, all on ONE site day."""
+        rows = [_hold(14, 2, kind=KIND_PLATE_VISION, code="0500_808C", hour=hour) for hour in range(1, 9)]
+
+        assert _signatures(rows) == []
+
+    def test_a_signature_that_went_quiet_is_not_current(self):
+        """(c) 3 holds on 3 days, the last 20 site days before the window end."""
+        rows = [_hold(10, days) for days in (20, 22, 25)]
+
+        assert _signatures(rows) == []
+
+    def test_a_code_most_of_the_fleet_carries_is_ONE_fleet_line(self):
+        """(d) foreign objects on 13 of 16 printers: one fleet line, no printer lines — even
+        for 001-H2S with 11 holds on 6 days, which alone would pass the printer rule."""
+        rows = _plate_trips_on_13_of_16(last_days_before=1)
+
+        (line,) = _signatures(rows)
+
+        assert line.scope == printer_incidents.SCOPE_FLEET
+        assert (line.printer_id, line.printer_name) == (None, None)
+        assert (line.kind, line.code) == (KIND_PLATE_VISION, "0500_806E")
+        assert (line.printers_affected, line.roster_size) == (13, 16)
+        assert line.holds == len(rows)
+        assert [(worst.printer_id, worst.printer_name, worst.holds) for worst in line.worst] == [
+            (1, "001-H2S", 11),
+            (9, "009-H2S", 10),
+        ]
+        assert line.fleet_median == 1.0
+
+    def test_external_runout_declared_and_site_event_rows_never_count(self):
+        """(e) each would be a printer line by count and days alone."""
+        days = (1, 1, 2, 3, 3, 4)
+        rows = [_hold(3, d, kind=KIND_PHYSICAL, code="07FF_C011") for d in days]  # external-spool instruction
+        rows += [_hold(4, d, kind=KIND_RUNOUT, code="0700_8011") for d in days]  # consumption
+        rows += [_hold(5, d, kind=KIND_SERVICE_HOLD, code="") for d in days]  # declared
+        rows += [_hold(6, d, kind=KIND_POWER_LOSS, code="0300_8007") for d in days]  # site event
+        rows += [_hold(7, d, kind=KIND_Z_REFERENCE_LOST, code="power_loss") for d in days]  # site event
+
+        assert _signatures(rows) == []
+
+    def test_the_fleet_median_counts_every_active_printer_and_nothing_else(self):
+        """(f) the displayed median divides by the ACTIVE roster (a printer with no hold is 0);
+        rows from a printer outside the roster (inactive, deleted) count nowhere."""
+        roster = {1: "001-H2S", 2: "002-H2S", 3: "003-H2S", 4: "004-H2S"}
+        rows = [_hold(1, d) for d in (1, 2, 3, 4, 5, 6)] + [_hold(2, d) for d in (1, 3, 5, 7)]
+        rows += [_hold(99, d) for d in range(1, 21)]  # inactive: twenty holds, counted nowhere
+
+        (line,) = _signatures(rows, roster)
+
+        assert line.scope == printer_incidents.SCOPE_FLEET  # 2 of 4 carriers: half the roster
+        assert line.fleet_median == 2.0  # median of [6, 4, 0, 0]
+        assert (line.holds, line.printers_affected, line.roster_size) == (10, 2, 4)
+        assert [worst.printer_id for worst in line.worst] == [1, 2]
+
+    def test_a_one_printer_roster_keeps_printer_lines(self):
+        """One printer is the whole roster, yet a fleet line needs two carriers: a printer line."""
+        (line,) = _signatures([_hold(1, days) for days in (1, 2, 3, 4)], {1: "001-H2S"})
+
+        assert line.scope == printer_incidents.SCOPE_PRINTER
+        assert (line.printer_id, line.holds, line.days, line.roster_size) == (1, 4, 4, 1)
+
+    def test_a_two_printer_roster_needs_both_carriers_for_a_fleet_line(self):
+        """Half of two is one printer — still a printer line; both carrying is the fleet."""
+        roster = {1: "001-H2S", 2: "002-H2S"}
+        one_carrier = [_hold(1, days) for days in (1, 2, 3)]
+
+        (line,) = _signatures(one_carrier, roster)
+        assert (line.scope, line.printer_id, line.printers_affected) == (printer_incidents.SCOPE_PRINTER, 1, 1)
+
+        (line,) = _signatures(one_carrier + [_hold(2, 2)], roster)
+        assert line.scope == printer_incidents.SCOPE_FLEET
+        assert (line.printers_affected, line.roster_size, line.holds) == (2, 2, 4)
+
+    def test_an_empty_roster_has_no_lines(self):
+        """(h) every dev stack keeps the real printers inactive; the median is never asked."""
+        assert (
+            printer_incidents.recurring_signatures(
+                [_hold(11, days) for days in (1, 2, 3, 4)], date_to=_DATE_TO, roster={}, now=_NOW
+            )
+            == []
+        )
+
+    def test_a_fleet_wide_code_that_went_quiet_has_no_line_of_either_scope(self):
+        """(i) the fleet shape, last occurrence 20 site days before the window end."""
+        assert _signatures(_plate_trips_on_13_of_16(last_days_before=20)) == []
+
+    def test_a_line_carries_the_taxonomy_words(self):
+        """(k) the description is ``hms_errors``'s, never a second text source."""
+        (line,) = _signatures([_hold(11, days) for days in (1, 2, 3)])
+
+        assert line.printer_message == printer_message_from_short_code("0300_801E")
+        assert line.printer_message is not None and line.printer_message.description
+
+    def test_a_line_carries_the_site_offset_at_its_last_hold(self):
+        """Every scope: the offset is ``site_time``'s, read AT ``last_at`` (host-zone independent)."""
+        lines = _signatures([_hold(11, days) for days in (1, 2, 3)] + _plate_trips_on_13_of_16(last_days_before=1))
+
+        assert {line.scope for line in lines} == {printer_incidents.SCOPE_PRINTER, printer_incidents.SCOPE_FLEET}
+        for line in lines:
+            assert line.utc_offset_minutes == site_time.offset_minutes(line.last_at)
+
+    def test_lines_are_sorted_by_held_time(self):
+        rows = [_hold(11, days, held_s=60) for days in (1, 2, 3)]
+        rows += [_hold(12, days, kind=KIND_PHYSICAL, code="0700_8004", held_s=3600) for days in (1, 2, 3)]
+
+        assert [line.printer_id for line in _signatures(rows)] == [12, 11]
+
+    def test_recency_is_counted_in_site_dates(self):
+        """The last hold 7 site days before the window end is in; 8 is out (a week's silence)."""
+        assert len(_signatures([_hold(11, days) for days in (7, 9, 11)])) == 1
+        assert _signatures([_hold(11, days) for days in (8, 9, 11)]) == []
+
+    def test_a_fleet_line_obeys_the_same_week(self):
+        """The fleet shape with its last trip 7 site days back is a line; 8 days back is none."""
+        assert len(_signatures(_plate_trips_on_13_of_16(last_days_before=7))) == 1
+        assert _signatures(_plate_trips_on_13_of_16(last_days_before=8)) == []
+
+
+class TestLedgerPage:
+    """The read model behind ``GET /incidents``: light window rows, full page rows."""
+
+    @staticmethod
+    async def _row(db, printer_id, created_at, **columns) -> PrinterIncident:
+        columns.setdefault("kind", KIND_JAM)
+        columns.setdefault("code", "0700_8010")
+        columns.setdefault("status", STATUS_RESOLVED)
+        if columns["status"] != STATUS_RECOVERING and columns["status"] != STATUS_ESCALATED:
+            columns.setdefault("resolved_at", created_at + timedelta(minutes=3))
+        row = PrinterIncident(
+            printer_id=printer_id,
+            job_id="task-1",
+            item_id=None,
+            codes=f"{columns['kind']}:{columns['code']}",
+            slot_global_tray=None,
+            created_at=created_at,
+            **columns,
+        )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        return row
+
+    async def _every_outcome(self, db_session, printer_factory) -> list[PrinterIncident]:
+        a = await printer_factory()
+        b = await printer_factory()
+        today = site_time.site_today()
+        at = [_site_day(days, date_to=today) for days in (1, 2, 3, 4, 5, 6, 7)]
+        return [
+            await self._row(db_session, a.id, at[0], status=STATUS_RECOVERING),
+            await self._row(
+                db_session,
+                b.id,
+                at[1],
+                kind=KIND_PHYSICAL,
+                code="0700_8004",
+                status=STATUS_ESCALATED,
+                escalated_at=at[1],
+            ),
+            await self._row(db_session, a.id, at[2], resolve_source=RESOLVE_DRIVER_SWAP),
+            await self._row(db_session, a.id, at[3], escalated_at=at[3], resolve_source=RESOLVE_OBSERVED_RUNNING),
+            await self._row(db_session, b.id, at[4], resolve_source=RESOLVE_OBSERVED_RUNNING),
+            await self._row(db_session, b.id, at[5], status=STATUS_ABORTED, resolve_source="operator"),
+            await self._row(db_session, a.id, at[6], status=STATUS_ABORTED, resolve_source=None),
+        ]
+
+    async def test_light_rows_answer_the_same_outcome_as_full_rows(self, db_session, printer_factory):
+        """Every outcome filter returns exactly the rows whose FULL-row ``outcome_of`` is that outcome."""
+        rows = await self._every_outcome(db_session, printer_factory)
+        expected = {
+            outcome: [row.id for row in rows if printer_incidents.outcome_of(row) == outcome]
+            for outcome in printer_incidents.OUTCOMES
+        }
+        assert all(expected.values()), "every outcome must be represented, or the equivalence proves less"
+
+        for outcome in printer_incidents.OUTCOMES:
+            page = await printer_incidents.ledger_page(
+                db_session,
+                date_from=None,
+                date_to=None,
+                kind=None,
+                printer_id=None,
+                outcome=outcome,
+                limit=1000,
+                offset=0,
+            )
+            assert [row.id for row in page.rows] == expected[outcome], outcome
+            assert page.total == len(expected[outcome])
+
+    async def test_pages_are_newest_first_with_the_id_as_tiebreak(self, db_session, printer_factory):
+        printer = await printer_factory()
+        today = site_time.site_today()
+        shared = _site_day(2, date_to=today)
+        older = await self._row(db_session, printer.id, _site_day(3, date_to=today))
+        first_of_pair = await self._row(db_session, printer.id, shared)
+        second_of_pair = await self._row(db_session, printer.id, shared)
+        newest = await self._row(db_session, printer.id, _site_day(1, date_to=today))
+
+        def page(limit, offset):
+            return printer_incidents.ledger_page(
+                db_session,
+                date_from=None,
+                date_to=None,
+                kind=None,
+                printer_id=None,
+                outcome=None,
+                limit=limit,
+                offset=offset,
+            )
+
+        whole = await page(10, 0)
+        assert [row.id for row in whole.rows] == [newest.id, second_of_pair.id, first_of_pair.id, older.id]
+        middle = await page(2, 1)
+        assert [row.id for row in middle.rows] == [second_of_pair.id, first_of_pair.id]
+        assert all(isinstance(row, PrinterIncident) for row in middle.rows)
+
+    async def test_the_summary_ignores_the_outcome_filter_while_total_applies_it(self, db_session, printer_factory):
+        """(j)"""
+        rows = await self._every_outcome(db_session, printer_factory)
+
+        page = await printer_incidents.ledger_page(
+            db_session,
+            date_from=None,
+            date_to=None,
+            kind=None,
+            printer_id=None,
+            outcome=printer_incidents.OUTCOME_AUTO_RECOVERED,
+            limit=50,
+            offset=0,
+        )
+
+        assert page.total == 1
+        assert page.summary == printer_incidents.summary(rows)
+
+    async def test_recurrence_reads_the_unfiltered_window_and_flags_matching_rows(self, db_session, printer_factory):
+        """(g) a filter never changes what counts as recurring; (l) only rows matching a
+        printer-scope line are flagged."""
+        printers = [await printer_factory() for _ in range(4)]
+        today = site_time.site_today()
+        overloads = [
+            await self._row(db_session, printers[0].id, _site_day(days, date_to=today), code="0300_801E")
+            for days in (1, 2, 3)
+        ]
+        bystander = await self._row(db_session, printers[1].id, _site_day(1, date_to=today))
+        runout = await self._row(
+            db_session, printers[2].id, _site_day(1, date_to=today), kind=KIND_RUNOUT, code="0700_8011"
+        )
+
+        unfiltered = await printer_incidents.ledger_page(
+            db_session,
+            date_from=today - timedelta(days=29),
+            date_to=today,
+            kind=None,
+            printer_id=None,
+            outcome=None,
+            limit=50,
+            offset=0,
+        )
+        runouts_only = await printer_incidents.ledger_page(
+            db_session,
+            date_from=today - timedelta(days=29),
+            date_to=today,
+            kind=KIND_RUNOUT,
+            printer_id=None,
+            outcome=None,
+            limit=50,
+            offset=0,
+        )
+
+        assert [(line.printer_id, line.code) for line in unfiltered.recurring] == [(printers[0].id, "0300_801E")]
+        assert runouts_only.recurring == unfiltered.recurring
+        assert [row.id for row in runouts_only.rows] == [runout.id]
+        assert unfiltered.recurring_ids == frozenset(row.id for row in overloads)
+        assert bystander.id not in unfiltered.recurring_ids
+
+    async def test_an_inactive_fleet_has_no_recurring_lines(self, db_session, printer_factory):
+        """(h) the dev-stack shape: every printer row inactive."""
+        printer = await printer_factory(is_active=False)
+        today = site_time.site_today()
+        for days in (1, 2, 3):
+            await self._row(db_session, printer.id, _site_day(days, date_to=today), code="0300_801E")
+
+        page = await printer_incidents.ledger_page(
+            db_session, date_from=None, date_to=None, kind=None, printer_id=None, outcome=None, limit=50, offset=0
+        )
+
+        assert page.recurring == ()
+        assert page.total == 3
+        assert page.printer_names == {printer.id: printer.name}

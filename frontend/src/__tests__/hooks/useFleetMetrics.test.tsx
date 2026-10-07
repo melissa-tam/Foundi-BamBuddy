@@ -17,6 +17,7 @@ import {
   FLEET_STATUS_POLL_MS,
   fleetMetricsKeys,
   resolveFleetRange,
+  resolveSiteRange,
   useFleetOverview,
   useFleetPrinterIntervals,
   useFleetStatus,
@@ -199,5 +200,41 @@ describe('resolveFleetRange', () => {
     expect(resolveFleetRange(timeframe('custom'), status)).toBeUndefined();
     expect(resolveFleetRange(timeframe('custom', '2026-09-10'), status)).toBeUndefined();
     expect(resolveFleetRange(timeframe('custom', '2026-09-10', '2026-09-01'), status)).toBeUndefined();
+  });
+});
+
+// ── resolveSiteRange ────────────────────────────────────────────────────────
+
+describe('resolveSiteRange', () => {
+  const status = makeFleetStatus();
+
+  it('answers undefined until /status has said what today is', () => {
+    expect(resolveSiteRange(timeframe('last-7'), undefined)).toBeUndefined();
+  });
+
+  it('resolves all time to the day before history_since, with no 366-day floor', () => {
+    expect(resolveSiteRange(timeframe('all-time'), { ...status, history_since: '2019-01-05T00:00:00' })).toEqual({
+      dateFrom: '2019-01-04',
+      dateTo: '2026-09-21',
+    });
+  });
+
+  it('leaves a custom range longer than 366 days unclamped', () => {
+    expect(resolveSiteRange(timeframe('custom', '2024-01-01', '2026-09-21'), status)).toEqual({
+      dateFrom: '2024-01-01',
+      dateTo: '2026-09-21',
+    });
+  });
+
+  it('asks for nothing when a custom range is incomplete or reversed', () => {
+    expect(resolveSiteRange(timeframe('custom', '2026-09-10'), status)).toBeUndefined();
+    expect(resolveSiteRange(timeframe('custom', '2026-09-10', '2026-09-01'), status)).toBeUndefined();
+  });
+
+  it('is what the fleet range clamps: equal wherever the window already fits', () => {
+    const presets: TimeframePreset[] = ['today', 'this-week', 'this-month', 'last-7', 'last-30', 'last-90', 'this-year', 'all-time'];
+    for (const preset of presets) {
+      expect(resolveFleetRange(timeframe(preset), status)).toEqual(resolveSiteRange(timeframe(preset), status));
+    }
   });
 });

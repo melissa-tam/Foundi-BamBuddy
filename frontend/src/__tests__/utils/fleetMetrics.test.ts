@@ -52,6 +52,7 @@ import {
   formatPrinters,
   formatSiteDate,
   formatSiteInstant,
+  SITE_DATE_FORMAT,
   formatTickCount,
   groupLabelKey,
   headerRangeKey,
@@ -926,6 +927,13 @@ describe('site time', () => {
     expect(formatInstantSiteDay('2026-09-01T03:00:00', 'Mars/Olympus', 'en-GB')).toMatch(
       /1 Sept 2026/,
     );
+  });
+
+  it('reads an instant on the site clock from its own offset, never a zone name', () => {
+    // A ledger row: 10:18 UTC at a site on EDT (UTC−4) opened at 06:18 site time.
+    expect(formatSiteInstant('2026-10-07T10:18:21', -240, 'en-GB')).toMatch(/7 Oct.*06:18/);
+    // The same instant as a site DAY: past midnight UTC, still the previous site day.
+    expect(formatSiteInstant('2026-10-07T02:00:00', -240, 'en-GB', SITE_DATE_FORMAT)).toMatch(/6 Oct 2026/);
   });
 
   it('hands back the raw value rather than "Invalid Date" on unparseable input', () => {

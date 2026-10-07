@@ -8,6 +8,7 @@ import {
   makeFleetStatus,
   makePrinterIntervals,
 } from '../fixtures/fleetMetrics';
+import { makeIncidentsResponse } from '../fixtures/incidents';
 
 // Sample data
 const mockSmartPlugs = [
@@ -561,6 +562,8 @@ export const handlers = [
   http.get('/api/v1/fleet-metrics/printers/:id/intervals', () =>
     HttpResponse.json(makePrinterIntervals())
   ),
+  // The fault ledger (Stats → Faults tab).
+  http.get('/api/v1/incidents', () => HttpResponse.json(makeIncidentsResponse())),
   http.get('/api/v1/settings/check-ffmpeg', () =>
     HttpResponse.json({ available: false, version: null })
   ),

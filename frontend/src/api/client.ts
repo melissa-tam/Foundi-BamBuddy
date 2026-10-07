@@ -34,9 +34,17 @@ import type {
   FleetStatus,
   PrinterIntervalsResponse,
 } from '../types/fleetMetrics';
+import type { IncidentsQuery, IncidentsResponse } from '../types/incidents';
 export type { FarmPrinterContext } from '../types/productionRuns';
 
 const API_BASE = '/api/v1';
+
+/**
+ * The most rows `GET /incidents` returns in one page (the route's `le=1000`).
+ * The Faults table's "All" asks for exactly this, and says so when the window
+ * holds more.
+ */
+export const INCIDENTS_MAX_LIMIT = 1000;
 
 export class ApiError extends Error {
   status: number;
@@ -7447,6 +7455,22 @@ export const api = {
     return request<PrinterIntervalsResponse>(
       `/fleet-metrics/printers/${printerId}/intervals?${params.toString()}`,
     );
+  },
+  /**
+   * One page of the equipment-fault ledger for an inclusive SITE-date window,
+   * with the window-wide summary, `total` and the recurring lines. Callers go
+   * through `hooks/useIncidents.ts`, which owns the query key.
+   */
+  getIncidents: (query: IncidentsQuery) => {
+    const params = new URLSearchParams();
+    params.set('date_from', query.dateFrom);
+    params.set('date_to', query.dateTo);
+    if (query.kind !== undefined) params.set('kind', query.kind);
+    if (query.outcome !== undefined) params.set('outcome', query.outcome);
+    if (query.printerId !== undefined) params.set('printer_id', String(query.printerId));
+    params.set('limit', String(query.limit));
+    params.set('offset', String(query.offset));
+    return request<IncidentsResponse>(`/incidents?${params.toString()}`);
   },
 };
 
