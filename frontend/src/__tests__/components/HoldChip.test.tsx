@@ -75,11 +75,15 @@ describe('HoldChip', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('asks for a slot when the toolhead is empty and nothing is loading', () => {
-    renderChip({ state: 'PAUSE', open_incident: null, toolhead: { feed: 'empty', tray: null, refill: null } });
+  it('says what a Resume does when the backend verdict is owed', () => {
+    renderChip({
+      state: 'PAUSE',
+      open_incident: null,
+      toolhead: { feed: 'empty', tray: null, refill: null, refill_reason: 'owed' },
+    });
 
     expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: en.printers.incidentAction.toolhead_refill })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: en.printers.toolhead.reason.owed })).toBeInTheDocument();
   });
 
   it("ends an incident row's tooltip with the slot it names", () => {

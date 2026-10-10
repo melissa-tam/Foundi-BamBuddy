@@ -469,32 +469,41 @@ class TestResumeOwnership:
         assert uses == ["execute_hms_action"]  # the route's gate: the family goes to the verb
 
     def test_the_refill_exclusions_have_one_owner(self):
-        """K7: the predicates a refill decision composes are ``spool_recovery.refill_owed``'s alone.
-        Its exclusion readers — the open-row pending command, maintenance mode, the runout demand,
-        the power-loss prompt, a filament change in flight — appear together nowhere else in the app
-        as a refill decision; the detectors and the verb read the VERDICT. Pinned on the one function
-        that calls ``refill_owed``'s private settle rule outside the driver's own waits."""
-        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
-        callers = {
-            scope[-1]
-            for node, scope in _scoped_nodes(tree)
-            if isinstance(node, ast.Call) and _called(node.func)[1] == "refill_owed"
+        """K7: the predicates a refill decision composes are ``refill_verdict.refill_owed``'s alone (a
+        LEAF — ``test_import_graph.TestTheRefillVerdictIsALeaf``). Its exclusion readers — the open-row
+        pending command, maintenance mode, the runout demand, the power-loss prompt, a filament change
+        in flight — appear together nowhere else in the app as a refill decision; every reader reads
+        the VERDICT. Its readers, each with its reason: the resume verb (T3), the refill driver at its
+        publish, the restart re-entry and the per-push detectors (T2 / T4), all in ``spool_recovery``;
+        and the status frame's ``toolhead.refill_reason`` (T3 — what a Resume would do, so the card
+        never re-derives K7). The settle rule (``pending_settles``) is read by the verdict and the
+        driver's own waits only."""
+        found: set[tuple[tuple[str, ...], str]] = set()
+        settle_readers: set[tuple[tuple[str, ...], str]] = set()
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = _called(node.func)[1]
+                if name == "refill_owed":
+                    found.add((parts, scope[-1] if scope else "<module>"))
+                elif name == "pending_settles":
+                    settle_readers.add((parts, scope[-1] if scope else "<module>"))
+        verdict = ("services", "refill_verdict.py")
+        manager = ("services", "printer_manager.py")
+        assert found == {
+            (_SPOOL_RECOVERY, "resume_paused_print"),
+            (_SPOOL_RECOVERY, "_refill_then_resume"),
+            (_SPOOL_RECOVERY, "_reentered_trigger"),
+            (_SPOOL_RECOVERY, "_sample_toolhead"),
+            (manager, "toolhead_payload"),
         }
-        assert callers == {"resume_paused_print", "_refill_then_resume", "_reentered_trigger", "_sample_toolhead"}
-        settle_readers = {
-            scope[-1]
-            for node, scope in _scoped_nodes(tree)
-            if isinstance(node, ast.Call) and _called(node.func)[1] == "_pending_settles"
+        assert settle_readers == {
+            (verdict, "refill_owed"),
+            (_SPOOL_RECOVERY, "_await_pending_command"),
+            (_SPOOL_RECOVERY, "_settle_pending"),
+            (_SPOOL_RECOVERY, "_sample_toolhead"),
         }
-        assert settle_readers == {"refill_owed", "_await_pending_command", "_settle_pending", "_sample_toolhead"}
-        # No other module asks the refill question at all.
-        others = sorted(
-            parts
-            for parts, tree in _app_trees()
-            if parts != _SPOOL_RECOVERY
-            and any(isinstance(n, ast.Call) and _called(n.func)[1] == "refill_owed" for n in ast.walk(tree))
-        )
-        assert not others, others
 
 
 class TestTerminalPolicyHook:

@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'L’AMS a bougé, mais le chargement n’a pas abouti.',
         unloadActed: 'L’AMS a bougé, mais le déchargement n’a pas abouti.',
       },
+      reason: {
+        owed: 'La reprise charge d’abord une bobine.',
+        maintenance: 'Mode maintenance : la ferme ne charge rien. Chargez un emplacement, puis reprenez.',
+        physical: 'Dégagez le chemin du filament et chargez un emplacement, puis reprenez.',
+        command_pending: 'L’AMS retient la commande en file de la ferme. La ferme charge la tête quand elle s’exécute.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorer et reprendre',

@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'AMS 已動作，但載入未完成。',
         unloadActed: 'AMS 已動作，但卸載未完成。',
       },
+      reason: {
+        owed: '繼續列印時會先載入料卷。',
+        maintenance: '維護模式：農場不載入任何耗材。請載入一個槽位後繼續列印。',
+        physical: '清理耗材通道並載入一個槽位後繼續列印。',
+        command_pending: 'AMS 保留著農場排隊的指令。該指令執行後農場會為工具頭載入耗材。',
+      },
     },
     plateCheck: {
       ignoreResume: '忽略並恢復',

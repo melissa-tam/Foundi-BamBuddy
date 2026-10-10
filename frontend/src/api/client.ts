@@ -767,14 +767,38 @@ export type ToolheadRefillState =
     };
 
 /**
+ * What a Bambuddy Resume would do about an EMPTY toolhead right now
+ * (`schemas/printer.ToolheadRefillReason`) — the resume route's own T3 verdict, served so
+ * the card never re-derives it: `owed` (the resume loads a spool first), `fed`, the
+ * exclusions (`maintenance`, `physical`, `runout_demand`, `power_loss_prompt`,
+ * `before_first_layer`, `last_layer`, `change_in_flight`, `command_pending`,
+ * `eject_sweep`) and `unknown` (nothing readable).
+ */
+export type ToolheadRefillReason =
+  | 'owed'
+  | 'fed'
+  | 'maintenance'
+  | 'physical'
+  | 'runout_demand'
+  | 'power_loss_prompt'
+  | 'before_first_layer'
+  | 'last_layer'
+  | 'change_in_flight'
+  | 'command_pending'
+  | 'eject_sweep'
+  | 'unknown';
+
+/**
  * `PrinterStatus.toolhead` (`schemas/printer.ToolheadState`): the ACTIVE extruder's feed —
- * `fed` (an AMS feeder, `tray` set) / `external` / `empty` / `unknown` (nothing read) — and
- * the farm's refill of it, set only while the feed reads empty or unknown.
+ * `fed` (an AMS feeder, `tray` set) / `external` / `empty` / `unknown` (nothing read) — the
+ * farm's refill of it (set only while the feed reads empty or unknown) and, while it reads
+ * empty, `refill_reason`. Absent on a backend predating the field: read as no verdict.
  */
 export interface ToolheadState {
   feed: 'fed' | 'external' | 'empty' | 'unknown';
   tray: number | null;
   refill: ToolheadRefillState | null;
+  refill_reason?: ToolheadRefillReason | null;
 }
 
 export interface NozzleInfo {

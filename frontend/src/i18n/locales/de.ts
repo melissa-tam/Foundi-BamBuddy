@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'AMS hat sich bewegt, aber das Laden wurde nicht abgeschlossen.',
         unloadActed: 'AMS hat sich bewegt, aber das Entladen wurde nicht abgeschlossen.',
       },
+      reason: {
+        owed: 'Fortsetzen lädt zuerst eine Spule.',
+        maintenance: 'Wartungsmodus: Die Farm lädt nichts. Einen Slot laden, dann fortsetzen.',
+        physical: 'Filamentweg freimachen und einen Slot laden, dann fortsetzen.',
+        command_pending: 'Das AMS hält den eingereihten Befehl der Farm. Die Farm lädt den Druckkopf, sobald er ausgeführt wird.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorieren und fortsetzen',

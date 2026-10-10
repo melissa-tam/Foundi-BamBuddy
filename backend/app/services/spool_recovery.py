@@ -151,7 +151,7 @@ dedup/grace bookkeeping. From the routes: :func:`resume_paused_print` — THE re
 paused print (K9, 2026-10-10), which refills an EMPTY toolhead first (Raymond 2026-10-10:
 "when i click resume there MUST be filament loaded"); every refill runs as a registered
 driver of an open row (:func:`_refill_episode`, K10), and whether one is owed is
-:func:`refill_owed`'s alone (K7).
+:func:`refill_verdict.refill_owed`'s alone (K7).
 """
 
 from __future__ import annotations
@@ -197,8 +197,9 @@ from backend.app.services import (
     ams_command,
     farm_correlation,
     incident_resolution,
-    print_reconcile,
+    live_reading,
     printer_incidents,
+    refill_verdict,
     spool_respool,
     tray_fields,
 )
@@ -227,7 +228,7 @@ from backend.app.services.incident_resolution import (
     ledger,
 )
 from backend.app.services.job_identity import same_job
-from backend.app.services.plate_occupancy import DepositEvidence, plate_occupancy
+from backend.app.services.plate_occupancy import DepositEvidence
 from backend.app.services.printer_incidents import (
     FAULT_RESTART_STEP,
     WAITING_REASON_RECOVERING,
@@ -235,12 +236,13 @@ from backend.app.services.printer_incidents import (
     waiting_reason_for,
 )
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.refill_verdict import RefillReason, RefillTrigger
 from backend.app.services.spool_respool import decode_global_tray, encode_global_tray
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from backend.app.services.bambu_mqtt import BambuMQTTClient, PrinterState
+    from backend.app.services.bambu_mqtt import BambuMQTTClient, JobPeaks, PrinterState
 
 logger = logging.getLogger(__name__)
 
@@ -2074,7 +2076,7 @@ class FeederPosition:
     reads it: THE reader's (:func:`_read_after` — self-heal, swap, the empty-path pause, the
     swapped tray), the feeder kind a command step records at its send (:func:`_feeder_kind` —
     what the command acts on, which ``ams_command.posture`` keys the answer by and
-    ``ams_command.ran`` reads back), and the operator's resume on the jammed feeder
+    ``refill_verdict.ran`` reads back), and the operator's resume on the jammed feeder
     (:func:`_clear_oor_if_resumed_on_jammed_feeder`). On a dual nozzle an empty active hotend
     beside a loaded deputy prints air, so no either-extruder reading of it exists.
 
@@ -2413,14 +2415,14 @@ def _compose_detail(
     and the print is over.
     """
     ended = _job_ended(reason, evidence)
-    # Where the filament sits is read off a LIVE wire only (:func:`_reads_live`): a printer off
+    # Where the filament sits is read off a LIVE wire only (:func:`live_reading.reads_live`): a printer off
     # its session still carries its last session's cached feeder fields, and a clause read from
     # them would describe a printer the farm cannot see. The ACTIVE extruder (K1), never "any".
     feed: tray_fields.ExtruderFeed | None = None
     refill_page = reason in _TOOLHEAD_REASONS
     if (incident.is_feed_fault or refill_page) and not ended:
         st = _get_state(incident.printer_id)
-        if _reads_live(st):
+        if live_reading.reads_live(st):
             feed = tray_fields.toolhead_feed(st).active
     empty = feed is not None and feed.kind == "empty"
     detail = (
@@ -2961,11 +2963,11 @@ async def _run_recovery(incident: RecoveryIncident) -> None:
         # Derive-don't-store: nothing records "an edge was deferred"; the LEVEL is
         # re-read once, here, where the slot is already free. A no-op when the row is
         # already closed, and never a second closer — this IS the closer. Only a LIVE
-        # RUNNING counts (:func:`_reads_live`): a printer the driver gave up on as offline
+        # RUNNING counts (:func:`live_reading.reads_live`): a printer the driver gave up on as offline
         # still carries its dead session's cached RUNNING, and closing on it would end the
         # very hold that ``printer_offline`` page just raised.
         st = _get_state(pid)
-        if st is not None and _reads_live(st) and _live_state(st) == "RUNNING":
+        if st is not None and live_reading.reads_live(st) and _live_state(st) == "RUNNING":
             await on_observed_running(pid)
 
 
@@ -3393,18 +3395,6 @@ async def _resume_and_read(incident: RecoveryIncident, target: int, *, evidence:
 # ``rearm_incidents_on_startup``'s.
 
 
-def _reads_live(st: PrinterState | None) -> bool:
-    """Is ``st`` evidence about the printer RIGHT NOW? THE driver's one freshness question.
-
-    ``print_reconcile.is_fresh`` — connected, and the current session's first report
-    APPLIED — plus the rearm's own evidence rule (:func:`_hold_over`): a ``gcode_state``
-    the printer has not positively reported (``""`` / ``UNKNOWN``) is not a reading either.
-    No state at all (no client registered — a startup before the printer connects, a
-    re-registration) is not fresh by the same test.
-    """
-    return print_reconcile.is_fresh(st) and _live_state(st) not in ("", "UNKNOWN")
-
-
 class _PrinterOffline(Exception):
     """The printer did not come back to a live session within
     :attr:`RecoverySettings.offline_bound_s`. Raised by :func:`_live_reading` from whatever
@@ -3420,7 +3410,7 @@ class _PrinterOffline(Exception):
 async def _live_reading(
     incident: RecoveryIncident, *, clock: Callable[[], float] | None = None
 ) -> tuple[PrinterState, float]:
-    """THE driver's read of the wire: a LIVE state (:func:`_reads_live`), and how long the
+    """THE driver's read of the wire: a LIVE state (:func:`live_reading.reads_live`), and how long the
     read waited for one — measured on ``clock``, the caller's own window clock (default
     :func:`_now`), so the caller moves its deadline by exactly that much and a session gap
     never burns a step's read window.
@@ -3433,7 +3423,7 @@ async def _live_reading(
     """
     pid = incident.printer_id
     st = _get_state(pid)
-    if st is not None and _reads_live(st):
+    if st is not None and live_reading.reads_live(st):
         return st, 0.0
     window_clock = clock or _now
     window_started = window_clock()
@@ -3452,7 +3442,7 @@ async def _live_reading(
     while True:
         await asyncio.sleep(_POLL_INTERVAL_S)
         st = _get_state(pid)
-        if st is not None and _reads_live(st):
+        if st is not None and live_reading.reads_live(st):
             waited = window_clock() - window_started
             logger.info(
                 "[spool_recovery] printer %s reporting again after %.1fs (epoch=%s) — recovery continues",
@@ -4519,7 +4509,7 @@ async def _wait_ams_write_window(printer_id: int, ams_id: int) -> str | None:
 def _feeder_kind(incident: RecoveryIncident) -> str:
     """The feeder the command ACTS ON, at its send: the ACTIVE extruder relative to the jammed
     tray (:func:`_feeding_position`) — the entry ``ams_command.posture`` keys the answer by and
-    ``ams_command.ran`` reads back, so the record and the answer describe one extruder. On an
+    ``refill_verdict.ran`` reads back, so the record and the answer describe one extruder. On an
     H2C the jammed tray on the deputy beside an empty active nozzle records ``empty``, never
     ``jammed`` (an unload then reads as run the moment it is sent); a fed extruder on a row
     that names no jammed tray records ``other``, so its unload's run stays readable."""
@@ -4703,7 +4693,7 @@ async def _observe_command(
 
 
 # How a wait on the farm's OWN pending command ended (:func:`_await_pending_command`). Closed.
-# ``ran`` — the wire shows the command ran (``ams_command.ran``), answered ``complete`` on the
+# ``ran`` — the wire shows the command ran (``refill_verdict.ran``), answered ``complete`` on the
 # log; ``undecidable`` — an unload sent with nothing loaded, and the toolhead still empty:
 # nothing physical can answer it and its running can pull nothing back, answered
 # ``undecidable`` (the classifier's own token for that); ``void`` — the printer rebooted (the
@@ -4737,7 +4727,7 @@ async def _await_pending_command(
     resume, the read). NO elapsed time decides anything here (operator ruling 2026-10-10: "time
     is not the right signal"); the wait ends only on an EVENT:
 
-    * the command RAN — ``ams_command.ran`` over the step's own ledger columns and the live
+    * the command RAN — ``refill_verdict.ran`` over the step's own ledger columns and the live
       toolhead (``tray_fields.toolhead_feed``, the ACTIVE extruder): the step is re-answered
       ``complete`` through the log's one writer — the classifier's own completion token, which
       is what "held, then ran" settles to (the C1 contract: "it then answers complete"); the
@@ -4774,7 +4764,7 @@ async def _await_pending_command(
         if power_loss_prompt_standing(getattr(st, "hms_errors", None) or []):
             await _void_on_reboot(incident.printer_id, step.seq, step.command, evidence=evidence)
             return "void"
-        settles = _pending_settles(step.entry(), tray_fields.toolhead_feed(st))
+        settles = refill_verdict.pending_settles(step.entry(), tray_fields.toolhead_feed(st))
         if settles == "undecidable":
             # Only a restart meets this: an unload sent with NOTHING loaded (its recorded
             # feeder names no loaded tray) and nobody read its answer. No reading of the wire
@@ -4907,7 +4897,7 @@ async def _void_pending_after_reboot(printer_id: int, pending: printer_incidents
 
 async def _settle_cut_short(incident: RecoveryIncident, seq: int, *, evidence: _RecoveryEvidence) -> None:
     """A takeover cut command ``seq``'s observation short, so the classifier never answered it.
-    Settle what the wire ALREADY shows: a command the toolhead shows RAN (``ams_command.ran``
+    Settle what the wire ALREADY shows: a command the toolhead shows RAN (``refill_verdict.ran``
     over the step's own ledger columns and the live ``tray_fields.toolhead_feed``) is answered
     ``complete`` through the log's one writer; anything else stays as it is — unanswered or
     ``held`` — and so stays the farm's pending command (K11), which keeps the row open for the
@@ -4915,10 +4905,10 @@ async def _settle_cut_short(incident: RecoveryIncident, seq: int, *, evidence: _
     push as an operator's Resume would read as queued, and hold a row open for nothing. A
     printer that is not reporting live settles nothing."""
     st = _get_state(incident.printer_id)
-    if st is None or not _reads_live(st):
+    if st is None or not live_reading.reads_live(st):
         return
     step = evidence.command_step(seq)
-    if printer_incidents.command_pends(step.answer) and ams_command.ran(step.entry(), tray_fields.toolhead_feed(st)):
+    if printer_incidents.command_pends(step.answer) and refill_verdict.ran(step.entry(), tray_fields.toolhead_feed(st)):
         await evidence.answer(seq, "complete")
         logger.info(
             "spool_recovery: printer %s the %s (step %s) cut short by a takeover had already run — answered complete",
@@ -5885,174 +5875,11 @@ async def _refill_toolhead(incident: RecoveryIncident, *, evidence: _RecoveryEvi
         return _refill_failed(incident, tray, command, "session_changed")
 
     live = _get_state(pid)
-    feed = tray_fields.toolhead_feed(live if _reads_live(live) else None).active
+    feed = tray_fields.toolhead_feed(live if live_reading.reads_live(live) else None).active
     if feed.kind == "fed" and feed.tray == tray:
         _log_candidate_outcome(incident, gtid=tray, verdict="refill_loaded")
         return RefillLoaded(tray=tray)
     return _refill_failed(incident, tray, "load", "not_at_toolhead")
-
-
-# --- K7: is a toolhead refill OWED here? (2026-10-10) ------------------------------
-#
-# The operator requirement this serves, verbatim (Raymond 2026-10-10 03:55 EDT): "when i click
-# resume there MUST be filament loaded. It's not the users job to know whether or not there's
-# filament in there, the fact that it's unloaded is the farms POOR auto recovery mechanics".
-# Three EVENTS can owe a refill (the plan's triggers; "time is not the right signal", Raymond the
-# same day, so none of them is a clock):
-#
-# * ``T2`` — a FARM command the step ledger still held as pending RAN after the hand-over (an
-#   accepted pull-back runs on its own ~4.5 min after the send: 011-H2S 04:31:27 → 04:36:01,
-#   014-H2S 02:45:58 → 02:50:38) — the consequence is the farm's to undo;
-# * ``T3`` — a person pressed Resume in Bambuddy (the route, the HMS dialog's resume buttons) or the
-#   farm resumes on a person's behalf (the refill lane, the repair self-heal);
-# * ``T4`` — the first RUNNING push with nothing fed (a screen resume onto an empty toolhead, or a
-#   pending pull-back that drained under a running print): Raymond 2026-09-17, "If nothing is
-#   feedingg after 20secs the print is ruined already" — so the first push, never a dwell.
-
-RefillTrigger = Literal["T2", "T3", "T4"]
-
-# Why a refill is (not) owed — CLOSED, first match wins in :func:`refill_owed`'s order:
-#
-# * ``owed``               — the ACTIVE extruder reads EMPTY and nothing below holds: refill it.
-# * ``fed``                — the active extruder is fed (an AMS feeder, or the external spool).
-# * ``unknown``            — no live reading to decide on: the printer is not reporting on its
-#                            session (``_reads_live``), there is no client to read the job's layer
-#                            from, or the toolhead reading names nothing.
-# * ``eject_sweep``        — the farm's own eject job owns the printer (``plate_occupancy.
-#                            eject_identity``): it runs with the filament retracted by design — a
-#                            sweep is filament-less, never air.
-# * ``change_in_flight``   — a filament change is in flight (``bambu_mqtt.ams_mid_filament_change``):
-#                            the AMS owns the toolhead's next motion — the print's own change is the
-#                            head of its work, and anything sent into it is held (012-H2S 2026-09-23).
-# * ``command_pending``    — a farm motion command on an open row is still QUEUED (the ledger holds it
-#                            pending and the wire does not show it ran): nothing goes behind it — a
-#                            second command behind a queued one runs too — and when it runs, its
-#                            consequence is T2's.
-# * ``power_loss_prompt``  — the firmware's post-reboot prompt stands (``0300_8007``): the reboot's own
-#                            answer is the power-loss lane's (``pause_recovery``), and a ``tray_now``
-#                            read across a reboot is the firmware's reset, not a measurement.
-# * ``runout_demand``      — the firmware asks for the SAME slot (``hms_errors.current_runout_demand``),
-#                            or the printer holds an open RUNOUT row (the demand the refill lane is
-#                            answering, after it cleared off the wire): invariant 9 — a runout is a
-#                            same-slot refill, never a swap, and a load during the hold LATCHES in
-#                            firmware (006-H2S 2026-07-26). The refill LANE owns it.
-# * ``maintenance``        — maintenance mode (``printer_incidents.automation_held``): the farm loads
-#                            nothing on a printer with hands in it.
-# * ``physical``           — an open PHYSICAL hold — T2 ONLY: its exit is the operator's own load, so
-#                            the farm's command running after the hand-over does not reach for the
-#                            path; a person's Resume (T3) and a screen resume onto air (T4) still try
-#                            the refill and report a failure.
-# * ``before_first_layer`` — the job has not printed layer 1 (``JobPeaks.layer_num`` through the
-#                            client's one peaks reader, behind its stale-predecessor gate): the start
-#                            block's own load is still to come, so a 255 there is not air.
-# * ``last_layer``         — T4 ONLY: a RUNNING job AT its last layer (``total_layers`` known) reads
-#                            empty because of the end-of-print retract, not air — ``JobPeaks.
-#                            first_unfed_layer``'s own rule (``L`` below ``total_layers``).
-RefillReason = Literal[
-    "owed",
-    "fed",
-    "maintenance",
-    "physical",
-    "runout_demand",
-    "power_loss_prompt",
-    "before_first_layer",
-    "last_layer",
-    "change_in_flight",
-    "command_pending",
-    "eject_sweep",
-    "unknown",
-]
-
-
-@dataclass(frozen=True)
-class RefillOwed:
-    """:func:`refill_owed`'s verdict: the trigger it was asked for and the closed reason."""
-
-    trigger: RefillTrigger
-    reason: RefillReason
-
-    @property
-    def owed(self) -> bool:
-        return self.reason == "owed"
-
-
-# What settles a farm command the step ledger still holds pending, read off the live toolhead —
-# ``complete`` (``ams_command.ran`` says it ran) or ``undecidable`` (an unload sent with NOTHING
-# loaded, or with no reading of what was, while the toolhead reads empty: no wire reading can say
-# it ran, and its running pulls nothing back). ``None``: still queued.
-PendingSettle = Literal["complete", "undecidable"]
-
-
-def _pending_settles(step: printer_incidents.StepEntry, live: tray_fields.ToolheadFeed) -> PendingSettle | None:
-    """Has the farm's pending motion command ``step`` (its ledger columns) stopped being a queue?
-    THE one rule, read by the driver's own wait (:func:`_await_pending_command`), the refill verdict
-    (:func:`refill_owed`) and the per-push detectors (:func:`_sample_toolhead`). Pure."""
-    ran = ams_command.ran(step, live)
-    if ran is True:
-        return "complete"
-    if ran is None and step.name == "unload" and live.active.kind == "empty":
-        return "undecidable"
-    return None
-
-
-def _pending_entry(pending: printer_incidents.PendingCommand) -> printer_incidents.StepEntry:
-    """The ledger columns of the open-row projection's pending command, as ``ams_command.ran``
-    reads a step."""
-    return printer_incidents.StepEntry(
-        kind=STEP_KIND_COMMAND, name=pending.name, target=pending.target, feeder=pending.feeder
-    )
-
-
-def refill_owed(printer_id: int, state, *, trigger: RefillTrigger) -> RefillOwed:
-    """Is a toolhead refill OWED on this printer now, for ``trigger``? THE one owner of the
-    exclusions (K7) — no other module, and no other function here, composes these predicates for a
-    refill decision (``test_code_quality.TestResumeOwnership``).
-
-    Pure, sync and DB-free — every fact it reads is the wire (``state``), the open-row projection
-    (``printer_incidents``' cache: maintenance, the open kinds, the pending command) or the client's
-    one peaks reader — because the per-push detectors ask it on every status push (invariant 10).
-    The reasons and their order are :data:`RefillReason`'s; the toolhead is the ACTIVE extruder's
-    (``tray_fields.toolhead_feed``, K1 — an empty active nozzle beside a loaded one prints air).
-    """
-    if state is None or not _reads_live(state):
-        return RefillOwed(trigger, "unknown")
-    client = printer_manager.get_client(printer_id)
-    if client is None:
-        return RefillOwed(trigger, "unknown")
-    if plate_occupancy.eject_identity(printer_id) is not None:
-        return RefillOwed(trigger, "eject_sweep")
-    feed = tray_fields.toolhead_feed(state)
-    match feed.active.kind:
-        case "fed" | "external":
-            return RefillOwed(trigger, "fed")
-        case "unknown":
-            return RefillOwed(trigger, "unknown")
-        case "empty":
-            pass
-        case _:
-            assert_never(feed.active.kind)
-    if ams_mid_filament_change(state):
-        return RefillOwed(trigger, "change_in_flight")
-    pending = printer_incidents.pending_command(printer_id)
-    if pending is not None and _pending_settles(_pending_entry(pending), feed) is None:
-        return RefillOwed(trigger, "command_pending")
-    hms_list = getattr(state, "hms_errors", None) or []
-    if power_loss_prompt_standing(hms_list):
-        return RefillOwed(trigger, "power_loss_prompt")
-    open_kinds = printer_incidents.open_kinds(printer_id)
-    if current_runout_demand(hms_list) is not None or KIND_RUNOUT in open_kinds:
-        return RefillOwed(trigger, "runout_demand")
-    if printer_incidents.automation_held(printer_id):
-        return RefillOwed(trigger, "maintenance")
-    if trigger == "T2" and KIND_PHYSICAL in open_kinds:
-        return RefillOwed(trigger, "physical")
-    layer = client.job_peaks().layer_num
-    if layer < 1:
-        return RefillOwed(trigger, "before_first_layer")
-    total = int(getattr(state, "total_layers", 0) or 0)
-    if trigger == "T4" and 0 < total <= layer:
-        return RefillOwed(trigger, "last_layer")
-    return RefillOwed(trigger, "owed")
 
 
 async def _give_up(incident: RecoveryIncident, reason: str, *, evidence: _RecoveryEvidence) -> None:
@@ -6107,7 +5934,7 @@ async def _give_up(incident: RecoveryIncident, reason: str, *, evidence: _Recove
         st = _get_state(incident.printer_id)
         if (
             st is not None
-            and _reads_live(st)
+            and live_reading.reads_live(st)
             and not ams_mid_filament_change(st)
             and tray_fields.toolhead_feed(st).active.kind == "empty"
         ):
@@ -7521,7 +7348,7 @@ async def resume_paused_print(
     Never raises (an assist lane must never crash its caller; a failure is logged and answers
     ``not_sent``).
 
-    At publish time it asks K7 (:func:`refill_owed`, trigger ``T3``) and acts on the one decision
+    At publish time it asks K7 (:func:`refill_verdict.refill_owed`, trigger ``T3``) and acts on the one decision
     table (:data:`_RESUME_DECISION`):
 
     * ``resume`` — a fed toolhead, or the firmware feeding it itself: ONE resume, the dialog button
@@ -7546,13 +7373,13 @@ async def resume_paused_print(
         if client is None:
             return ResumeNotSent("not_connected")
         st = _get_state(printer_id)
-        if st is None or not _reads_live(st):
+        if st is None or not live_reading.reads_live(st):
             return _refused("unknown")
         if _live_state(st) != "PAUSE":
             return _refused("not_paused")
         if printer_incidents.driver_live(printer_id):
             return _refused("farm_acting")
-        verdict = refill_owed(printer_id, st, trigger="T3")
+        verdict = refill_verdict.refill_owed(printer_id, st, trigger="T3", peaks=_job_peaks(printer_id))
         decision = _resume_decision(verdict.reason)
         match decision:
             case "resume":
@@ -7601,6 +7428,13 @@ async def resume_paused_print(
     except Exception:  # noqa: BLE001 — a resume lane must never crash its caller
         logger.exception("spool_recovery: %s resume failed for printer %s", name, printer_id)
         return ResumeNotSent("not_sent")
+
+
+def _job_peaks(printer_id: int) -> JobPeaks | None:
+    """The client's one peaks reader for the refill verdict (``refill_verdict.refill_owed``'s
+    ``peaks``): ``None`` with no client registered — the verdict then decides nothing."""
+    client = printer_manager.get_client(printer_id)
+    return client.job_peaks() if client is not None else None
 
 
 # --- K10: every refill runs as a REGISTERED driver of an OPEN row ----------------------
@@ -7723,7 +7557,7 @@ async def _stop_air_print(printer_id: int) -> bool:
 
 
 async def _settle_pending(printer_id: int, pending: printer_incidents.PendingCommand) -> None:
-    """Answer the farm's pending motion command the wire now shows settled (:func:`_pending_settles`)
+    """Answer the farm's pending motion command the wire now shows settled (:func:`refill_verdict.pending_settles`)
     — through the log's one writer (``EvidenceLog.answer``), so the projection re-derives no pending
     command. Re-reads the ledger (``from_row``) and settles the step only while it still pends: the
     detector saw it on a push, and the world moves."""
@@ -7735,9 +7569,9 @@ async def _settle_pending(printer_id: int, pending: printer_incidents.PendingCom
     if still is None or still.seq != pending.seq:
         return
     st = _get_state(printer_id)
-    if st is None or not _reads_live(st):
+    if st is None or not live_reading.reads_live(st):
         return
-    settles = _pending_settles(still.entry(), tray_fields.toolhead_feed(st))
+    settles = refill_verdict.pending_settles(still.entry(), tray_fields.toolhead_feed(st))
     if settles is None:
         return
     await evidence.answer(still.seq, settles)
@@ -7823,7 +7657,7 @@ async def _refill_episode(
         if task is not None:
             printer_incidents.release_driver(pid, task)
         st = _get_state(pid)
-        if st is not None and _reads_live(st) and _live_state(st) == "RUNNING":
+        if st is not None and live_reading.reads_live(st) and _live_state(st) == "RUNNING":
             await on_observed_running(pid)
 
 
@@ -7875,7 +7709,9 @@ async def _reentered_trigger(incident: RecoveryIncident) -> RefillTrigger | None
     match _live_state(st):
         case "PAUSE":
             return "T3"
-        case "RUNNING" if refill_owed(incident.printer_id, st, trigger="T4").owed:
+        case "RUNNING" if refill_verdict.refill_owed(
+            incident.printer_id, st, trigger="T4", peaks=_job_peaks(incident.printer_id)
+        ).owed:
             return "T4" if await _stop_air_print(incident.printer_id) else None
         case _:
             return None
@@ -7913,7 +7749,7 @@ async def _refill_then_resume(
             case _:
                 assert_never(waited)
     st, _waited = await _live_reading(incident)
-    owed = refill_owed(pid, st, trigger=trigger)
+    owed = refill_verdict.refill_owed(pid, st, trigger=trigger, peaks=_job_peaks(pid))
     result: RefillLoaded | None = None
     decision = _resume_decision(owed.reason)
     match decision:
@@ -8344,14 +8180,14 @@ def note_demand_watch(printer_id: int, state) -> None:
 def _sample_toolhead(printer_id: int, state, live: str) -> None:
     """The K11 detectors, on one status push (2026-10-10). Sync, DB-free and total — they ride the
     ~1 Hz callback (invariant 10; the caller's guard covers them) — and they read the refill verdict
-    (:func:`refill_owed`, K7), never its predicates. Each spawns :func:`_refill_episode` and
+    (:func:`refill_verdict.refill_owed`, K7), never its predicates. Each spawns :func:`_refill_episode` and
     registers it as the printer's driver in the SAME synchronous stretch (the
     ``pause_recovery._sample_plate_check`` pattern), so the next push finds the driver live and
     spawns no second one. Nothing here decides on elapsed time (Raymond 2026-10-10: "time is not the
     right signal"): every trigger is the wire's own event.
 
     * **D1 — PAUSE.** An open row's farm command the ledger holds PENDING has RUN
-      (:func:`_pending_settles` over the projection and the live ACTIVE extruder) with no driver
+      (:func:`refill_verdict.pending_settles` over the projection and the live ACTIVE extruder) with no driver
       live: the AMS ran it after the hand-over (an accepted pull-back runs on its own ~4.5 min after
       the send — 011-H2S 04:31:27 → 04:36:01, 014-H2S 02:45:58 → 02:50:38). The episode answers the
       step, then refills the now-empty toolhead on that row when K7(T2) owes it; the print STAYS
@@ -8363,18 +8199,20 @@ def _sample_toolhead(printer_id: int, state, live: str) -> None:
       Retry (T2-running: the step is answered first). A LEVEL, so the first fresh sample after a farm
       restart acts; never twice for one episode, because the registered driver guards it while it
       lives and after it the wire reads fed again (or the print is paused, which D2 never reads)."""
-    if printer_incidents.driver_live(printer_id) or not _reads_live(state):
+    if printer_incidents.driver_live(printer_id) or not live_reading.reads_live(state):
         return
     pending = printer_incidents.pending_command(printer_id)
     ran = (
-        pending is not None and _pending_settles(_pending_entry(pending), tray_fields.toolhead_feed(state)) is not None
+        pending is not None
+        and refill_verdict.pending_settles(refill_verdict.pending_entry(pending), tray_fields.toolhead_feed(state))
+        is not None
     )
     if live == "PAUSE":
         if pending is None or not ran:
             return
         trigger: RefillTrigger = "T2"
     elif live == "RUNNING":
-        if not refill_owed(printer_id, state, trigger="T4").owed:
+        if not refill_verdict.refill_owed(printer_id, state, trigger="T4", peaks=_job_peaks(printer_id)).owed:
             return
         trigger = "T4"
     else:

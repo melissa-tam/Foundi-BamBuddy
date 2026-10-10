@@ -86,7 +86,7 @@ from backend.app.core.database import async_session, engine, init_db
 from backend.app.core.tasks import spawn_background_task
 from backend.app.core.websocket import ws_manager
 from backend.app.models.smart_plug import SmartPlug
-from backend.app.services import job_terminal, notify_dedup, print_reconcile
+from backend.app.services import job_terminal, live_reading, notify_dedup, print_reconcile
 from backend.app.services.archive import ArchiveService
 from backend.app.services.archive_purge import archive_purge_service
 from backend.app.services.bambu_ftp import clear_3mf_cache
@@ -850,7 +850,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # session on the old session's job (2026-09-25). The transport stamps
     # `report_epoch` at the end of the first report it APPLIES, so this fires on that
     # very push, once per session.
-    if print_reconcile.is_fresh(state) and _printer_reconciled_epoch.get(printer_id) != state.connection_epoch:
+    if live_reading.is_fresh(state) and _printer_reconciled_epoch.get(printer_id) != state.connection_epoch:
         _printer_reconciled_epoch[printer_id] = state.connection_epoch
         spawn_background_task(
             reconcile_stale_active_prints(printer_id),

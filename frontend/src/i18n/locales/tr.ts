@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'AMS hareket etti ancak yükleme tamamlanmadı.',
         unloadActed: 'AMS hareket etti ancak çıkarma tamamlanmadı.',
       },
+      reason: {
+        owed: 'Devam ettirme önce bir makara yükler.',
+        maintenance: 'Bakım modu: çiftlik hiçbir şey yüklemez. Bir yuva yükleyin, sonra devam ettirin.',
+        physical: 'Filaman yolunu temizleyin ve bir yuva yükleyin, sonra devam ettirin.',
+        command_pending: 'AMS çiftliğin kuyruktaki komutunu tutuyor. Komut çalıştığında çiftlik kafayı yükler.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Yok say ve sürdür',

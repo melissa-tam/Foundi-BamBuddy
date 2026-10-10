@@ -146,7 +146,7 @@ from backend.app.models.printer_incident import (
     PrinterIncident,
 )
 from backend.app.models.printer_incident_step import STEP_KIND_DIALOG, STEP_KIND_STOP, PrinterIncidentStep, StepKind
-from backend.app.services import incident_resolution, print_reconcile, printer_incidents
+from backend.app.services import incident_resolution, live_reading, printer_incidents
 from backend.app.services.hms_actions import HMSAction
 from backend.app.services.hms_errors import (
     POWER_LOSS_PROMPT_CODES,
@@ -1178,7 +1178,7 @@ def _ledger_reading(snapshot: _LadderSnapshot) -> _LedgerReading:
 
 
 def _live_reading(snapshot: _LadderSnapshot, state) -> _LiveReading:
-    if not print_reconcile.is_fresh(state):
+    if not live_reading.is_fresh(state):
         return "stale"
     if printer_incidents.automation_held(snapshot.printer_id):
         return "held"
@@ -1212,7 +1212,7 @@ def _sample_plate_check(printer_id: int, state) -> None:
     it from the wire and the row for free. DB-free: every guard reads a fact the wire or the
     store's projection restates at once:
 
-    * a FRESH report only (``print_reconcile.is_fresh``) — a reconnect re-broadcasts the
+    * a FRESH report only (``live_reading.is_fresh``) — a reconnect re-broadcasts the
       previous session's cached PAUSE before the pushall answers;
     * no live driver on the printer (``printer_incidents.driver_live``, the gate), and no
       eject owning it (``plate_occupancy.eject_identity``, the power-loss driver's own
@@ -1231,7 +1231,7 @@ def _sample_plate_check(printer_id: int, state) -> None:
     cost the power-loss decision that follows it on the same push.
     """
     try:
-        if not print_reconcile.is_fresh(state):
+        if not live_reading.is_fresh(state):
             return
         if printer_incidents.driver_live(printer_id):
             return
@@ -1552,7 +1552,7 @@ async def _watch_recheck(episode: _Episode, pressed_at: float) -> str | None:
             )
             return None
         state = printer_manager.get_status(pid)
-        if not print_reconcile.is_fresh(state):
+        if not live_reading.is_fresh(state):
             logger.info(
                 "[pause-recovery] printer %s plate-check episode %s: the printer left its session — the "
                 "re-entry answers on its return",
@@ -1851,7 +1851,7 @@ async def _stop_the_print(episode: _Episode, log: _PlateCheckEvidence, name: str
         owed = _owed(episode, log, deadline_due=False)
         if owed.rung == name:
             sent = printer_manager.stop_print(pid)
-        elif print_reconcile.is_fresh(owed.state):
+        elif live_reading.is_fresh(owed.state):
             # The level moved while the send was out: the stop never went out and is no longer owed.
             await log.answer(seq, "not_sent")
             logger.info(
