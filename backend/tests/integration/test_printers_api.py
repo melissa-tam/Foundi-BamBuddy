@@ -732,7 +732,9 @@ class TestPrintersAPI:
         """BOTH ``/status`` branches carry ``toolhead`` (K10/C3c, 2026-10-10), the one builder: the
         connected branch reads the ACTIVE extruder; with no session the feed is ``unknown`` while the
         farm's failed refill — the incident store's own projection — still reports, naming its command
-        (a failed UNLOAD is an unload, on the row's slot)."""
+        (a failed UNLOAD is an unload, on the row's slot). ``refill_reason`` (the T3 verdict) rides an
+        EMPTY feed only: here a reading not yet of this session, so ``unknown``; nothing with no
+        session."""
         from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL, STATUS_ESCALATED
         from backend.app.services import printer_incidents
         from backend.app.services.bambu_mqtt import PrinterState
@@ -768,6 +770,7 @@ class TestPrintersAPI:
                 "feed": "empty" if connected else "unknown",
                 "tray": None,
                 "refill": {"phase": "failed", "command": "unload", "slot": "AMS A slot 1", "answer": "acted"},
+                "refill_reason": "unknown" if connected else None,
             }
         finally:
             printer_incidents._reset_state()

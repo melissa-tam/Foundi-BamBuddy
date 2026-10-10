@@ -83,7 +83,7 @@ A command whose session ended under it
 A reconnect does not answer a command, and it does not un-ask it either: the AMS kept
 doing (or not doing) what it was told while the farm could not see it. So a reading on a
 NEWER session (``connection_epoch`` moved) is waited out until that session's first
-fresh report (``AmsWireSnapshot.fresh`` — ``print_reconcile.is_fresh``, the one spelling),
+fresh report (``AmsWireSnapshot.fresh`` — ``live_reading.is_fresh``, the one spelling),
 and then the command is answered by its MOTION alone, through the second table
 :data:`_ACROSS_ROWS` (same key, same no-default rule): a load whose feeder reads the
 commanded tray, an unload whose AMS reads idle with nothing fed → ``complete``; an unload
@@ -103,11 +103,10 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import Literal
 
-from backend.app.models.printer_incident_step import STEP_KIND_COMMAND
 from backend.app.schemas.printer import AmsCommandOutcome
-from backend.app.services import print_reconcile, spool_respool
+from backend.app.services import live_reading, spool_respool
 from backend.app.services.bambu_mqtt import (
     AMS_STATUS_ASSIST,
     AMS_STATUS_IDLE,
@@ -117,17 +116,15 @@ from backend.app.services.bambu_mqtt import (
     ams_mid_filament_change,
 )
 from backend.app.services.hms_errors import current_runout_demand, runout_hold_active
-from backend.app.services.printer_incidents import StepEntry, runout_slot_desc
+from backend.app.services.printer_incidents import runout_slot_desc
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.tray_fields import (
     TRAY_NOW_EXTERNAL_SPOOL,
     TRAY_NOW_NOTHING_FED,
     ExtruderFeed,
-    ToolheadFeed,
     extruder_feed,
     parse_int_field,
     toolhead_feed,
-    valid_feeder,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,7 +202,7 @@ class AmsWireSnapshot:
     of "is the toolhead fed": per extruder on a dual-nozzle machine, where ``tray_now`` is a
     single value guessed onto an AMS unit); :func:`posture` reads the entry feeder from it.
     ``fresh`` is whether the state describes its CURRENT MQTT session
-    (``print_reconcile.is_fresh`` — the one spelling): what lets :func:`classify` tell a
+    (``live_reading.is_fresh`` — the one spelling): what lets :func:`classify` tell a
     new session's cached, previous-session fields from its first real report.
     ``taken_at`` is :func:`time.monotonic` (via :func:`_monotonic`).
     """
@@ -230,7 +227,7 @@ def snapshot(state: PrinterState | None) -> AmsWireSnapshot:
         ams_status_sub=parse_int_field(getattr(state, "ams_status_sub", None)),
         tray_tar=parse_int_field(getattr(state, "tray_tar", None)),
         connection_epoch=parse_int_field(getattr(state, "connection_epoch", None)),
-        fresh=print_reconcile.is_fresh(state),
+        fresh=live_reading.is_fresh(state),
         taken_at=_monotonic(),
         feed=toolhead_feed(state).active,
     )
@@ -644,55 +641,6 @@ def classify(
     if elapsed_s >= deadline_s:
         return "acted" if observation.moved else "no_movement"
     return None
-
-
-# --- did a recorded motion command run -------------------------------------------------
-
-#: The feeder-position kinds a recovery driver RECORDS at a send that name a real AMS feeder
-#: at the extruder — the jammed tray, or another one (``spool_recovery.FeederKind``, written
-#: on ``printer_incident_step.feeder``). Read here, never re-spelled there: the vocabulary is
-#: the driver's (its module imports this one, so the reverse import would be a cycle), and
-#: ``test_ams_command.TestRan`` pins this subset against it.
-_RECORDED_LOADED_FEEDERS: frozenset[str] = frozenset({"jammed", "other"})
-
-_COMMANDS: frozenset[str] = frozenset(get_args(Command))
-
-
-def ran(step: StepEntry, live: ToolheadFeed) -> bool | None:
-    """Did this RECORDED motion command run? Read off the step's own ledger columns
-    (``printer_incidents.StepEntry``: the command ``name``, the load's ``target``, the
-    feeder-position kind read at the send) and the LIVE toolhead feed
-    (``tray_fields.toolhead_feed`` — the ACTIVE extruder). Pure and DB-free.
-
-    Its readers ask it about a command that may still run after nobody watched it answer:
-    the recovery driver's round top after a restart (never send behind a pending command)
-    and the per-push detector of a farm command that ran after the hand-over. The measured
-    reason: an accepted pull-back ran ON ITS OWN ~4.5 min after the send (011-H2S
-    2026-10-09 04:31:27 → 04:36:01; 014-H2S 2026-10-10 02:45:58 → 02:50:38).
-
-    * unload — ran ⇔ the recorded entry feeder was LOADED (:data:`_RECORDED_LOADED_FEEDERS`)
-      and the active extruder now reads empty. Sent with nothing loaded, or with no
-      reading of what was: ``None`` (nothing physical can answer it).
-    * load — ran ⇔ the active feeder now IS the target. A target that is no AMS feeder
-      (the external spool, Ext-R, none): ``None`` — the feed reading cannot attribute it.
-    * a live reading of ``unknown``: ``None`` (nothing was read).
-
-    Motion-only: a step that is not a ``command``, or names a command this module does not
-    publish, RAISES ``LookupError`` — a ledger token nobody can read back is drift, never a
-    skipped row (``printer_incidents.EvidenceLog``'s rule).
-    """
-    if step.kind != STEP_KIND_COMMAND or step.name not in _COMMANDS:
-        raise LookupError(f"ams_command.ran: not a motion command step (kind={step.kind!r}, name={step.name!r})")
-    if live.active.kind == "unknown":
-        return None
-    if step.name == "unload":
-        if step.feeder not in _RECORDED_LOADED_FEEDERS:
-            return None
-        return live.active.kind == "empty"
-    target = valid_feeder(step.target)
-    if target is None:
-        return None
-    return live.active.kind == "fed" and live.active.tray == target
 
 
 # --- the verbs ------------------------------------------------------------------------

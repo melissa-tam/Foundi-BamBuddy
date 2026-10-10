@@ -52,11 +52,11 @@ from backend.app.services.ams_command import (
     observe,
     operator_commanded_since,
     posture,
-    ran,
     snapshot,
 )
 from backend.app.services.bambu_mqtt import CommandAck, PrinterState, ams_mid_filament_change
 from backend.app.services.printer_incidents import StepEntry
+from backend.app.services.refill_verdict import ran
 from backend.app.services.tray_fields import ExtruderFeed, ToolheadFeed, extruder_feed, toolhead_feed
 from backend.tests._fixtures.ast_tree import ParsedModule, ParsedTree
 from backend.tests._fixtures.clock import FakeClock
@@ -231,7 +231,7 @@ class TestSnapshot:
         ],
     )
     def test_fresh_is_the_one_freshness_question(self, connected: bool, report_epoch: int | None, fresh: bool) -> None:
-        """``print_reconcile.is_fresh`` — connected, and THIS session's report applied."""
+        """``live_reading.is_fresh`` — connected, and THIS session's report applied."""
         state = PrinterState(connected=connected, connection_epoch=4, report_epoch=report_epoch)
 
         assert snapshot(state).fresh is fresh
@@ -930,7 +930,7 @@ def _live(tray_now: object) -> ToolheadFeed:
 
 
 class TestRan:
-    """``ran(step, live)`` — did a RECORDED motion command run, read off the step's own
+    """``refill_verdict.ran(step, live)`` — did a RECORDED motion command run, read off the step's own
     recorded columns and the live K1 reading. Pure and DB-free: its readers are the driver's
     round top after a restart (never send behind a command that may still run) and the
     per-push detector of a farm command that ran after the hand-over (011/014-H2S: an
@@ -1000,10 +1000,11 @@ class TestRan:
         """``ran`` reads the feeder-position kind the recovery driver RECORDS at the send
         (``spool_recovery.FeederKind``): both kinds that name a real feeder at the extruder
         count as loaded, and every kind it reads is one the driver can write."""
+        from backend.app.services import refill_verdict
         from backend.app.services.spool_recovery import FeederKind
 
-        assert {"jammed", "other"} == ams_command._RECORDED_LOADED_FEEDERS
-        assert set(get_args(FeederKind)) >= ams_command._RECORDED_LOADED_FEEDERS
+        assert {"jammed", "other"} == refill_verdict._RECORDED_LOADED_FEEDERS
+        assert set(get_args(FeederKind)) >= refill_verdict._RECORDED_LOADED_FEEDERS
 
 
 # --- the verbs -----------------------------------------------------------------------------

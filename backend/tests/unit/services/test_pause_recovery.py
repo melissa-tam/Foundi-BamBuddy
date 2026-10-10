@@ -126,7 +126,7 @@ def _make_state(
     st.subtask_id = subtask
     st.subtask_name = "SKU007"
     st.connection_epoch = epoch
-    st.report_epoch = epoch  # this session's first report applied (``print_reconcile.is_fresh``)
+    st.report_epoch = epoch  # this session's first report applied (``live_reading.is_fresh``)
     st.disconnected_at = disconnected_at
     st.hms_errors = hms if hms is not None else [_prompt_hms()]
     return st

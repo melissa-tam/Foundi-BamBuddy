@@ -1318,7 +1318,7 @@ def open_incident_payload(printer_id: int | None) -> dict | None:
 
 def toolhead_payload(printer_id: int | None, state: PrinterState | None) -> dict:
     """The printer's ACTIVE extruder feed and the farm's refill of it, as the card's "Toolhead empty"
-    chip reads it (K10/C3c, 2026-10-10): ``{"feed", "tray", "refill"}``.
+    chip reads it (K10/C3c, 2026-10-10): ``{"feed", "tray", "refill", "refill_reason"}``.
 
     DERIVED on every broadcast, never stored: ``feed`` / ``tray`` are ``tray_fields.toolhead_feed``'s
     ACTIVE reading (K1 — the one reader of "is the toolhead fed"; on a dual nozzle an empty active
@@ -1326,17 +1326,28 @@ def toolhead_payload(printer_id: int | None, state: PrinterState | None) -> dict
     (``{"phase", "command", "slot", "answer"}`` — the open-row projection and the liveness slot,
     passed through as is) — carried only while the feed reads empty or unknown,
     because a toolhead that reads fed again was loaded, and a failed refill under it is history.
+    ``refill_reason`` is what a Resume would do about an EMPTY feed — the T3 verdict
+    (``refill_verdict.refill_owed``'s reason, the client's peaks read here), so the card never
+    re-derives K7 (012-H2S 2026-10-10: paused at layer 0, the start block loads itself —
+    ``before_first_layer``, never "Load a slot"); ``None`` for any other feed. The verdict is a
+    LEAF (``test_import_graph.TestTheRefillVerdictIsALeaf``): this registry never imports the
+    recovery driver.
 
     ONE builder for all three construction sites (the WS serializer below and BOTH REST ``/status``
     branches), like :func:`open_incident_payload`. JSON primitives only. Total: ``state`` may be
     ``None`` (no session) — the feed is then ``unknown``.
     """
-    from backend.app.services import printer_incidents
+    from backend.app.services import printer_incidents, refill_verdict
     from backend.app.services.tray_fields import toolhead_feed
 
     active = toolhead_feed(state).active
     refill = printer_incidents.refill_state(printer_id) if active.kind in ("empty", "unknown") else None
-    return {"feed": active.kind, "tray": active.tray, "refill": refill}
+    reason = None
+    if active.kind == "empty" and printer_id:
+        client = printer_manager.get_client(printer_id)
+        peaks = client.job_peaks() if client is not None else None
+        reason = refill_verdict.refill_owed(printer_id, state, trigger="T3", peaks=peaks).reason
+    return {"feed": active.kind, "tray": active.tray, "refill": refill, "refill_reason": reason}
 
 
 def plate_check_exit_payload(printer_id: int | None, state: PrinterState | None) -> dict | None:

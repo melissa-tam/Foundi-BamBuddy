@@ -1271,6 +1271,12 @@ export default {
         loadActed: 'AMS가 움직였지만 로드가 완료되지 않았습니다.',
         unloadActed: 'AMS가 움직였지만 언로드가 완료되지 않았습니다.',
       },
+      reason: {
+        owed: '재개하면 먼저 스풀을 로드합니다.',
+        maintenance: '유지보수 모드: 팜은 아무것도 로드하지 않습니다. 슬롯을 로드한 뒤 재개하세요.',
+        physical: '필라멘트 경로를 정리하고 슬롯을 로드한 뒤 재개하세요.',
+        command_pending: 'AMS가 팜의 대기 중인 명령을 보유하고 있습니다. 명령이 실행되면 팜이 툴헤드를 로드합니다.',
+      },
     },
     plateCheck: {
       ignoreResume: '무시하고 재개',

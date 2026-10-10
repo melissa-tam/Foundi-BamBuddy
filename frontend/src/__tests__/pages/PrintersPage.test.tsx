@@ -1056,14 +1056,42 @@ describe('PrintersPage', () => {
       expect(screen.queryByText(en.printers.incident.jam)).not.toBeInTheDocument();
     });
 
-    it('shows "Toolhead empty" on a paused print with nothing fed and no hold open', async () => {
-      serveStatus({ state: 'PAUSE', hms_errors: [], toolhead: { feed: 'empty', tray: null, refill: null } });
+    it('shows "Toolhead empty" on a paused print when the resume verdict is owed', async () => {
+      serveStatus({
+        state: 'PAUSE',
+        hms_errors: [],
+        toolhead: { feed: 'empty', tray: null, refill: null, refill_reason: 'owed' },
+      });
       render(<PrintersPage />);
 
-      expect(
-        await screen.findByRole('button', { name: en.printers.incidentAction.toolhead_refill }),
-      ).toBeInTheDocument();
+      expect(await screen.findByRole('button', { name: en.printers.toolhead.reason.owed })).toBeInTheDocument();
       expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
+    });
+
+    /*
+     * 012-H2S 2026-10-10: PAUSEd at layer 0 at the plate-marker dialog, `tray_now`
+     * 255, no row — before the first layer the printer loads filament itself, so
+     * the card must not tell anyone to load a slot. Same for an older backend
+     * that sends no verdict.
+     */
+    it.each([
+      ['before the first layer (the 012-H2S shape)', { refill_reason: 'before_first_layer' }],
+      ['with no verdict from an older backend', {}],
+    ])('shows no "Toolhead empty" chip on a paused print %s', async (_label, verdict) => {
+      serveStatus({
+        state: 'PAUSE',
+        layer_num: 0,
+        hms_errors: [],
+        toolhead: { feed: 'empty', tray: null, refill: null, ...verdict },
+      });
+      render(<PrintersPage />);
+
+      // The card has rendered its paused controls before the chip is judged absent.
+      await screen.findByRole('button', { name: en.printers.resume });
+      expect(screen.queryByText(en.printers.incident.toolhead_refill)).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: en.printers.incidentAction.toolhead_refill }),
+      ).not.toBeInTheDocument();
     });
 
     const refusedPlate =(refusal: { messages: Array<{ short_code: string; description: string }> } | null) => ({

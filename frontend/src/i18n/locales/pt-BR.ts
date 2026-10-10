@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'O AMS se moveu, mas o carregamento não terminou.',
         unloadActed: 'O AMS se moveu, mas o descarregamento não terminou.',
       },
+      reason: {
+        owed: 'Retomar carrega uma bobina primeiro.',
+        maintenance: 'Modo manutenção: a fazenda não carrega nada. Carregue um slot e depois retome.',
+        physical: 'Desobstrua o caminho do filamento e carregue um slot, depois retome.',
+        command_pending: 'O AMS retém o comando enfileirado da fazenda. A fazenda carrega o cabeçote quando ele for executado.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorar e retomar',

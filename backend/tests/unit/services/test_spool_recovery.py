@@ -33,7 +33,7 @@ from backend.app.models.printer_incident import KIND_PLATE_VISION, PrinterIncide
 from backend.app.models.recovery_escalation import RecoveryEscalation
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import ams_command, incident_resolution, printer_incidents, spool_recovery
+from backend.app.services import ams_command, incident_resolution, printer_incidents, refill_verdict, spool_recovery
 from backend.app.services.bambu_mqtt import CommandAck, HMSError, PrinterState
 from backend.app.services.printer_incidents import (
     WAITING_REASON_FAILED,
@@ -181,7 +181,7 @@ def _make_state(
     ams_status_main=0,
 ):
     st = PrinterState()
-    # A printer reporting on its CURRENT session (``print_reconcile.is_fresh``): the
+    # A printer reporting on its CURRENT session (``live_reading.is_fresh``): the
     # driver's every read goes through its session gate, and a gap is a case of its own.
     st.connected = True
     st.report_epoch = st.connection_epoch
@@ -7204,7 +7204,7 @@ class TestTheLoadedWedge:
 # for the whole 90 s step window — then, ~4.5 min after the send (011: 04:31:27 →
 # 04:36:01; 014: 02:45:58 → 02:50:38), the AMS ran it with no farm publish, emptying the
 # toolhead under a page that said "slot N is loaded … press Continue". The driver now
-# OWNS that held command: it waits until the command runs (``ams_command.ran``) and
+# OWNS that held command: it waits until the command runs (``refill_verdict.ran``) and
 # continues the contract — the load, the resume, the read.
 # ===========================================================================
 
@@ -7764,7 +7764,7 @@ class TestAFirmwareRebootVoidsThePendingCommand:
 class TestARestartedDriverNeverSendsBehindAPendingCommand:
     """Item 2 of the 2026-10-10 contract: a driver re-entered after a farm restart whose log ENDS
     in a command the AMS has not run (answered ``held``, or sent and never read — the process
-    died between the send and the read) runs the same wait (``ams_command.ran``), never a fresh
+    died between the send and the read) runs the same wait (``refill_verdict.ran``), never a fresh
     send — a second command behind a queued one runs too — and then continues the contract from
     that command."""
 
@@ -9300,7 +9300,7 @@ def test_feeding_position_never_lets_a_guessed_tray_now_stand_in_for_the_map():
 
 def test_a_command_step_records_the_active_extruder_it_acts_on(monkeypatch):
     """K1 + K5: a command step records the feeder the command ACTS ON — the active extruder at
-    the send — which is what ``ams_command.posture`` keys the answer by and ``ams_command.ran``
+    the send — which is what ``ams_command.posture`` keys the answer by and ``refill_verdict.ran``
     reads back. H2C: the jammed tray on the DEPUTY beside an empty active nozzle records
     ``empty``, so the unload is never read as having run the moment it is sent."""
     state = _make_state(tray_now=0)
@@ -9313,7 +9313,7 @@ def test_a_command_step_records_the_active_extruder_it_acts_on(monkeypatch):
     step = spool_recovery.CommandStep.draft("unload", None, kind).entry()
 
     assert kind == "empty"
-    assert ams_command.ran(step, spool_recovery.tray_fields.toolhead_feed(state)) is not True
+    assert refill_verdict.ran(step, spool_recovery.tray_fields.toolhead_feed(state)) is not True
 
 
 def test_a_refill_rows_unload_with_no_jammed_tray_can_be_read_as_ran(monkeypatch):
@@ -9329,7 +9329,7 @@ def test_a_refill_rows_unload_with_no_jammed_tray_can_be_read_as_ran(monkeypatch
     state.tray_now = 255  # the unload ran
 
     assert kind == "other"
-    assert ams_command.ran(step, spool_recovery.tray_fields.toolhead_feed(state)) is True
+    assert refill_verdict.ran(step, spool_recovery.tray_fields.toolhead_feed(state)) is True
 
 
 @pytest.mark.parametrize(
@@ -12042,7 +12042,7 @@ def _air_state(*, tray_now=255, layer=50, total=100, gcode_state="PAUSE", hms=No
 
 
 class TestTheRefillVerdict:
-    """``spool_recovery.refill_owed(printer_id, state, *, trigger)`` — the ONE answer to "may the farm
+    """``refill_verdict.refill_owed(printer_id, state, *, trigger, peaks)`` — the ONE answer to "may the farm
     refill this toolhead now", read by the resume verb (T3), the per-push detectors (T2 / T4) and
     nothing else. Closed reasons; every trigger is an EVENT (Raymond 2026-10-10: "time is not the
     right signal"); ``physical`` excludes T2 only (T3/T4 still try and report); ``last_layer`` is
@@ -12051,14 +12051,19 @@ class TestTheRefillVerdict:
     _TRIGGERS = ("T2", "T3", "T4")
 
     async def _verdicts(self, monkeypatch, printer_id, state, client=None):
-        _wire(monkeypatch, state, client if client is not None else FakeClient(state))
-        return {t: spool_recovery.refill_owed(printer_id, state, trigger=t).reason for t in self._TRIGGERS}
+        client = client if client is not None else FakeClient(state)
+        _wire(monkeypatch, state, client)
+        # The FakeClient scripts its peaks off the state, so a state-less case hands in none — the
+        # verdict answers ``unknown`` on the state alone before it reads them.
+        peaks = client.job_peaks() if state is not None else None
+        return {t: refill_verdict.refill_owed(printer_id, state, trigger=t, peaks=peaks).reason for t in self._TRIGGERS}
 
     async def test_an_empty_toolhead_mid_print_is_owed_on_every_trigger(self, db_session, printer_factory, monkeypatch):
         printer = await printer_factory()
         verdicts = await self._verdicts(monkeypatch, printer.id, _air_state())
         assert verdicts == {"T2": "owed", "T3": "owed", "T4": "owed"}
-        assert spool_recovery.refill_owed(printer.id, _air_state(), trigger="T3").owed is True
+        state = _air_state()
+        assert refill_verdict.refill_owed(printer.id, state, trigger="T3", peaks=FakeClient(state).job_peaks()).owed
 
     @pytest.mark.parametrize("tray_now", [0, 3, 254], ids=["fed_slot_1", "fed_slot_4", "external_spool"])
     async def test_a_fed_toolhead_owes_nothing(self, db_session, printer_factory, monkeypatch, tray_now):
@@ -12076,13 +12081,14 @@ class TestTheRefillVerdict:
         assert set((await self._verdicts(monkeypatch, printer.id, unparsed)).values()) == {"unknown"}
 
     async def test_no_client_is_unknown(self, db_session, printer_factory, monkeypatch):
-        """``before_first_layer`` is read off the client's one peaks reader; with no client the
-        job's layer is not a measurement, so nothing is decided."""
+        """``before_first_layer`` is read off the client's one peaks reader; with no client (no
+        peaks handed in) the job's layer is not a measurement, so nothing is decided — and the
+        driver's own gather hands in none when the registry holds no client."""
         printer = await printer_factory()
         state = _air_state()
-        monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: state)
+        assert refill_verdict.refill_owed(printer.id, state, trigger="T3", peaks=None).reason == "unknown"
         monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
-        assert spool_recovery.refill_owed(printer.id, state, trigger="T3").reason == "unknown"
+        assert spool_recovery._job_peaks(printer.id) is None
 
     async def test_a_filament_change_in_flight_is_the_amss(self, db_session, printer_factory, monkeypatch):
         printer = await printer_factory()
@@ -12169,7 +12175,7 @@ class TestTheRefillVerdict:
         assert set(verdicts.values()) == {"runout_demand"}
 
     def test_the_reason_vocabulary_is_closed(self):
-        assert set(get_args(spool_recovery.RefillReason)) == {
+        assert set(get_args(refill_verdict.RefillReason)) == {
             "owed",
             "fed",
             "maintenance",
@@ -12183,7 +12189,7 @@ class TestTheRefillVerdict:
             "eject_sweep",
             "unknown",
         }
-        assert set(get_args(spool_recovery.RefillTrigger)) == {"T2", "T3", "T4"}
+        assert set(get_args(refill_verdict.RefillTrigger)) == {"T2", "T3", "T4"}
 
     async def test_an_eject_sweep_is_filament_less_by_design(self, db_session, printer_factory, monkeypatch):
         """The farm's own eject job RUNS with the filament retracted: never air, never a refill."""
@@ -12440,7 +12446,7 @@ class TestTheResumeVerb:
             "physical",
         }
         # Every K7 reason has ONE resume decision — the table is total (a missing reason raises).
-        assert set(spool_recovery._RESUME_DECISION) == set(get_args(spool_recovery.RefillReason))
+        assert set(spool_recovery._RESUME_DECISION) == set(get_args(refill_verdict.RefillReason))
 
     def test_the_evidence_lanes_body_is_gone(self):
         """Delete, don't deprecate: the verb generalised it, and every caller moved."""

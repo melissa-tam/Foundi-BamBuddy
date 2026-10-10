@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'AMS 已动作，但加载未完成。',
         unloadActed: 'AMS 已动作，但卸载未完成。',
       },
+      reason: {
+        owed: '继续打印时会先加载料卷。',
+        maintenance: '维护模式：农场不加载任何耗材。请加载一个槽位后继续打印。',
+        physical: '清理耗材通道并加载一个槽位后继续打印。',
+        command_pending: 'AMS 保留着农场排队的指令。该指令执行后农场会为工具头加载耗材。',
+      },
     },
     plateCheck: {
       ignoreResume: '忽略并恢复',

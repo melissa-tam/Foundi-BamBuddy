@@ -44,6 +44,27 @@ AmsPostureFamily = Literal["mid_change", "outside_change"]
 #: empty" chip speaks of (:class:`ToolheadRefillState`).
 AmsMotionCommand = Literal["load", "unload"]
 
+#: What a Resume would do about an EMPTY toolhead — K7's closed reason (``refill_verdict.
+#: RefillReason``, pinned equal by ``test_printer_manager``): ``owed`` — the farm refills it, then
+#: resumes; the firmware feeds it itself (``before_first_layer`` — the start block's own load;
+#: ``change_in_flight``, ``runout_demand``, ``last_layer``, ``eject_sweep``, ``power_loss_prompt``);
+#: refused (``maintenance``, ``command_pending``, ``physical``, ``unknown``); ``fed`` never reaches a
+#: client (the field rides an empty feed only). :class:`ToolheadState`.
+ToolheadRefillReason = Literal[
+    "owed",
+    "fed",
+    "maintenance",
+    "physical",
+    "runout_demand",
+    "power_loss_prompt",
+    "before_first_layer",
+    "last_layer",
+    "change_in_flight",
+    "command_pending",
+    "eject_sweep",
+    "unknown",
+]
+
 #: The CLOSED set of reasons the resume of a paused print is REFUSED (K9, 2026-10-10 —
 #: ``spool_recovery.resume_paused_print``; the route maps each to a 409). The verb's own two —
 #: ``not_paused`` and ``farm_acting`` (a recovery driver is live and owns the printer's next
@@ -673,11 +694,14 @@ class ToolheadState(BaseModel):
     ``feed`` — ``fed`` (a real AMS feeder) / ``external`` (the external spool) / ``empty``
     (nothing fed) / ``unknown`` (nothing read); ``tray`` — the global tray when ``fed``;
     ``refill`` — set only while the feed reads empty or unknown and the farm is loading it or could
-    not."""
+    not; ``refill_reason`` — set only while the feed reads EMPTY: what a Resume would do about it
+    (:data:`ToolheadRefillReason`, the T3 verdict — a client keys its "Toolhead empty" copy off it and
+    never re-derives the verdict)."""
 
     feed: Literal["fed", "external", "empty", "unknown"]
     tray: int | None = None
     refill: ToolheadRefillState | None = None
+    refill_reason: ToolheadRefillReason | None = None
 
 
 class PrinterStatus(BaseModel):

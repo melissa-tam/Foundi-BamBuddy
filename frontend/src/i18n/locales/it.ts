@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'L’AMS si è mosso, ma il caricamento non è terminato.',
         unloadActed: 'L’AMS si è mosso, ma lo scaricamento non è terminato.',
       },
+      reason: {
+        owed: 'La ripresa carica prima una bobina.',
+        maintenance: 'Modalità manutenzione: la farm non carica nulla. Carica uno slot, poi riprendi.',
+        physical: 'Libera il percorso del filamento e carica uno slot, poi riprendi.',
+        command_pending: 'L’AMS trattiene il comando in coda della farm. La farm carica la testina quando viene eseguito.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignora e riprendi',

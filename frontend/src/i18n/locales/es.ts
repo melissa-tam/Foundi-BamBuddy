@@ -1313,6 +1313,12 @@ export default {
         loadActed: 'El AMS se movió, pero la carga no terminó.',
         unloadActed: 'El AMS se movió, pero la descarga no terminó.',
       },
+      reason: {
+        owed: 'Reanudar carga primero una bobina.',
+        maintenance: 'Modo mantenimiento: la granja no carga nada. Cargue una ranura y luego reanude.',
+        physical: 'Despeje la vía de filamento y cargue una ranura; luego reanude.',
+        command_pending: 'El AMS retiene el comando en cola de la granja. La granja carga el cabezal cuando se ejecute.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorar y reanudar',

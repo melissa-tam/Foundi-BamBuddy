@@ -7,12 +7,13 @@
  *      over ANY incident row (a failed refill under a jam row names the slot);
  *   2. the open incident row (own-surface kinds skipped) → the incident variant,
  *      so a plate check / power-loss pause on an empty toolhead keeps its own chip;
- *   3. a paused print on an empty toolhead with nothing open → the toolhead variant.
+ *   3. a paused print on an empty toolhead with nothing open → the toolhead variant,
+ *      ONLY for the backend verdicts a person should see (`refill_reason`).
  *
  * Every key the model emits must resolve in `en`, so a chip never prints a raw key.
  */
 import { describe, expect, it } from 'vitest';
-import type { OpenIncidentState, PrinterIncidentKind, ToolheadState } from '../../api/client';
+import type { OpenIncidentState, PrinterIncidentKind, ToolheadRefillReason, ToolheadState } from '../../api/client';
 import en from '../../i18n/locales/en';
 import { holdChip, type HoldChipStatus } from '../../utils/incidentChip';
 
@@ -33,7 +34,28 @@ function incident(
   };
 }
 
+/** An empty toolhead with NO verdict field — the shape an older backend sends. */
 const EMPTY: ToolheadState = { feed: 'empty', tray: null, refill: null };
+/** An empty toolhead carrying the backend's T3 verdict. */
+const emptyWith = (refillReason: ToolheadRefillReason | null): ToolheadState => ({
+  feed: 'empty',
+  tray: null,
+  refill: null,
+  refill_reason: refillReason,
+});
+/** The verdicts rule (3) speaks for — the hold a person should see. */
+const SPOKEN_REASONS = ['owed', 'maintenance', 'physical', 'command_pending'] as const satisfies readonly ToolheadRefillReason[];
+/** Every other verdict: the printer feeds itself, nothing is wrong, or nothing is known. */
+const SILENT_REASONS = [
+  'fed',
+  'runout_demand',
+  'power_loss_prompt',
+  'before_first_layer',
+  'last_layer',
+  'change_in_flight',
+  'eject_sweep',
+  'unknown',
+] as const satisfies readonly ToolheadRefillReason[];
 const FED: ToolheadState = { feed: 'fed', tray: 2, refill: null };
 const LOADING: ToolheadState = { feed: 'empty', tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } };
 const FAILED: ToolheadState = {
@@ -79,39 +101,77 @@ describe('holdChip precedence', () => {
   });
 
   it.each(['plate_vision', 'power_loss', 'z_reference_lost', 'jam', 'runout', 'physical'] as const)(
-    'keeps the %s row on a bare empty toolhead (no refill state)',
+    'keeps the %s row on an empty toolhead with no refill state, even when a resume is owed',
     (kind) => {
-      const chip = holdChip(status({ open_incident: incident(kind, 'escalated'), toolhead: EMPTY }));
-      expect(chip?.variant).toBe('incident');
-      expect(chip?.label.key).toBe(`printers.incident.${kind}`);
+      for (const toolhead of [EMPTY, emptyWith('owed')]) {
+        const chip = holdChip(status({ open_incident: incident(kind, 'escalated'), toolhead }));
+        expect(chip?.variant).toBe('incident');
+        expect(chip?.label.key).toBe(`printers.incident.${kind}`);
+      }
     },
   );
-
-  it('shows the empty toolhead on a paused print with nothing open', () => {
-    const chip = holdChip(status({ toolhead: EMPTY }));
-    expect(chip?.variant).toBe('toolhead');
-    expect(chip?.tone).toBe('held');
-    expect(keysOf(chip)).toEqual(['printers.incidentAction.toolhead_refill']);
-  });
-
-  it('shows the empty toolhead past a maintenance hold, which owns its own banner', () => {
-    const chip = holdChip(status({ open_incident: incident('service_hold', 'escalated'), toolhead: EMPTY }));
-    expect(chip?.variant).toBe('toolhead');
-  });
 
   it('shows nothing for a maintenance hold on a fed toolhead', () => {
     expect(holdChip(status({ open_incident: incident('service_hold', 'escalated'), toolhead: FED }))).toBeNull();
   });
 
-  it('shows nothing for an empty toolhead that is not paused', () => {
-    expect(holdChip(status({ state: 'IDLE', toolhead: EMPTY }))).toBeNull();
-    expect(holdChip(status({ state: 'RUNNING', toolhead: EMPTY }))).toBeNull();
+  it('shows nothing for an empty toolhead that is not paused, whatever the verdict', () => {
+    expect(holdChip(status({ state: 'IDLE', toolhead: emptyWith('owed') }))).toBeNull();
+    expect(holdChip(status({ state: 'RUNNING', toolhead: emptyWith('owed') }))).toBeNull();
   });
 
   it('shows nothing for a paused print on a fed or unread toolhead', () => {
     expect(holdChip(status({ toolhead: FED }))).toBeNull();
     expect(holdChip(status({ toolhead: { feed: 'unknown', tray: null, refill: null } }))).toBeNull();
     expect(holdChip(status({ toolhead: null }))).toBeNull();
+  });
+});
+
+/*
+ * Rule (3) — a paused print on an empty toolhead with nothing open — speaks ONLY
+ * for the backend's T3 verdict (`toolhead.refill_reason`, what a Resume would do
+ * now), never a client re-derivation. The defect it closes: 012-H2S 2026-10-10,
+ * PAUSEd at layer 0 at the plate-marker dialog with `tray_now` 255 and no row,
+ * read red "Toolhead empty · Load a slot, then resume." — before the first layer
+ * the printer loads filament itself.
+ */
+describe('holdChip rule (3): the resume verdict', () => {
+  it('shows no chip for the 012-H2S shape: paused before the first layer', () => {
+    expect(holdChip(status({ toolhead: emptyWith('before_first_layer') }))).toBeNull();
+  });
+
+  it.each(SILENT_REASONS)('shows no chip for a %s verdict', (reason) => {
+    expect(holdChip(status({ toolhead: emptyWith(reason) }))).toBeNull();
+  });
+
+  it('shows no chip with no verdict, or on an older backend that sends none', () => {
+    expect(holdChip(status({ toolhead: emptyWith(null) }))).toBeNull();
+    expect(holdChip(status({ toolhead: EMPTY }))).toBeNull();
+  });
+
+  it('shows no chip for a verdict this build does not know', () => {
+    const newer = emptyWith('a_newer_reason' as ToolheadRefillReason);
+    expect(holdChip(status({ toolhead: newer }))).toBeNull();
+  });
+
+  it.each(SPOKEN_REASONS)('shows red "Toolhead empty" for a %s verdict with its own tooltip', (reason) => {
+    const chip = holdChip(status({ toolhead: emptyWith(reason) }));
+    expect(chip?.variant).toBe('toolhead');
+    expect(chip?.tone).toBe('held');
+    expect(chip?.label.key).toBe('printers.incident.toolhead_refill');
+    expect(keysOf(chip)).toEqual([`printers.toolhead.reason.${reason}`]);
+  });
+
+  it('speaks the maintenance verdict past a maintenance-banner row, which never takes the chip', () => {
+    const chip = holdChip(
+      status({ open_incident: incident('service_hold', 'escalated'), toolhead: emptyWith('maintenance') }),
+    );
+    expect(keysOf(chip)).toEqual(['printers.toolhead.reason.maintenance']);
+  });
+
+  it('leaves rule (1) to the refill state, whatever the verdict says', () => {
+    const chip = holdChip(status({ toolhead: { ...LOADING, refill_reason: 'before_first_layer' } }));
+    expect(keysOf(chip)).toEqual(['printers.toolhead.loading']);
   });
 });
 
@@ -222,7 +282,7 @@ describe('holdChip states', () => {
           ),
         ),
       ),
-      holdChip(status({ toolhead: EMPTY })),
+      ...SPOKEN_REASONS.map((reason) => holdChip(status({ toolhead: emptyWith(reason) }))),
       holdChip(status({ open_incident: incident('toolhead_refill', 'recovering') })),
       holdChip(status({ open_incident: incident('toolhead_refill', 'escalated') })),
     ];

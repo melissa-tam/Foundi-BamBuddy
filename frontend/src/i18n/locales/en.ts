@@ -1339,6 +1339,13 @@ export default {
         loadActed: 'AMS moved but the load did not finish.',
         unloadActed: 'AMS moved but the unload did not finish.',
       },
+      // Rule (3)'s tooltip per the backend's T3 verdict (`toolhead.refill_reason`).
+      reason: {
+        owed: 'Resume loads a spool first.',
+        maintenance: 'Maintenance mode: the farm loads nothing. Load a slot, then resume.',
+        physical: 'Clear the filament path and load a slot, then resume.',
+        command_pending: "The AMS holds the farm's queued command. The farm loads the toolhead when it runs.",
+      },
     },
     // The human's turn at a paused plate check: the printer's own
     // "Ignore and resume" button on the card, behind a confirm.

@@ -10,6 +10,7 @@ import type {
   PrinterStatus,
   ToolheadRefillAnswer,
   ToolheadRefillCommand,
+  ToolheadRefillReason,
   ToolheadRefillState,
 } from '../api/client';
 import { incidentKindLabelKey } from './fleetMetrics';
@@ -95,9 +96,8 @@ const FAILED_COPY: Record<
   },
 };
 
-/** The toolhead variant's tooltip: what the farm is doing about the empty toolhead. */
-function toolheadTooltip(refill: ToolheadRefillState | null): ChipCopy[] {
-  if (refill === null) return [TOOLHEAD_EXIT];
+/** The refill variant's tooltip: the farm's load in flight, or the step that failed. */
+function refillTooltip(refill: ToolheadRefillState): ChipCopy[] {
   if (refill.phase === 'loading') {
     return [
       refill.slot
@@ -114,14 +114,42 @@ function toolheadTooltip(refill: ToolheadRefillState | null): ChipCopy[] {
   ];
 }
 
-function toolheadChip(refill: ToolheadRefillState | null): HoldChip {
-  return {
-    variant: 'toolhead',
-    tone: refill?.phase === 'loading' ? 'acting' : 'held',
-    label: TOOLHEAD_EMPTY_LABEL,
-    tooltip: toolheadTooltip(refill),
-    qualifier: null,
-  };
+/**
+ * Rule (3)'s tooltip per the backend's T3 verdict (`toolhead.refill_reason`: what a
+ * Bambuddy Resume would do about the empty toolhead NOW — served, never re-derived here),
+ * or `null`: the chip says nothing. Only four verdicts are a hold a person should see:
+ * `owed` (the Resume loads first), `maintenance` and `physical` (the farm will not load —
+ * a person does) and `command_pending` (the farm loads when the AMS runs its queued
+ * command). Every other verdict is the printer's own business or no hold at all —
+ * `before_first_layer` (the start block loads; 012-H2S 2026-10-10, PAUSEd at the
+ * plate-marker dialog with `tray_now` 255), `runout_demand` (the firmware asks for the
+ * same slot), `power_loss_prompt`, `last_layer`, `change_in_flight`, `eject_sweep` — or
+ * says nothing is wrong (`fed`) or nothing is known (`unknown`). A `Record` over EVERY
+ * verdict, so a new one fails `tsc -b` until it is given copy or silence here.
+ */
+const PAUSED_EMPTY_TOOLTIP: Record<ToolheadRefillReason, string | null> = {
+  owed: 'printers.toolhead.reason.owed',
+  maintenance: 'printers.toolhead.reason.maintenance',
+  physical: 'printers.toolhead.reason.physical',
+  command_pending: 'printers.toolhead.reason.command_pending',
+  fed: null,
+  runout_demand: null,
+  power_loss_prompt: null,
+  before_first_layer: null,
+  last_layer: null,
+  change_in_flight: null,
+  eject_sweep: null,
+  unknown: null,
+};
+
+/** Rule (3)'s tooltip key, or null — for no verdict (null / absent) and a verdict this build does not know. */
+function pausedEmptyTooltipKey(reason: ToolheadRefillReason | null | undefined): string | null {
+  if (reason === null || reason === undefined) return null;
+  return Object.prototype.hasOwnProperty.call(PAUSED_EMPTY_TOOLTIP, reason) ? PAUSED_EMPTY_TOOLTIP[reason] : null;
+}
+
+function toolheadChip(tone: HoldChipTone, tooltip: readonly ChipCopy[]): HoldChip {
+  return { variant: 'toolhead', tone, label: TOOLHEAD_EMPTY_LABEL, tooltip, qualifier: null };
 }
 
 function incidentChip(incident: OpenIncidentState): HoldChip {
@@ -152,17 +180,23 @@ function incidentChip(incident: OpenIncidentState): HoldChip {
  *    empty toolhead under them must not take the chip. A `toolhead_refill` row reads
  *    "Toolhead empty" once escalated and "Recovering" while the farm still acts.
  * 3. **A paused print on an empty toolhead** with nothing open → the toolhead variant,
- *    red: a person loads a slot (or a Bambuddy Resume refills it first).
+ *    red, ONLY when the backend's verdict (`refill_reason`) is one a person should see
+ *    (`PAUSED_EMPTY_TOOLTIP`); its tooltip says what a Resume would do. An empty toolhead
+ *    the printer fills itself (before the first layer, a runout demand, …), a null verdict
+ *    or an older backend with no verdict shows no chip.
  */
 export function holdChip(status: HoldChipStatus): HoldChip | null {
   const refill = status.toolhead?.refill ?? null;
-  if (refill !== null) return toolheadChip(refill);
+  if (refill !== null) return toolheadChip(refill.phase === 'loading' ? 'acting' : 'held', refillTooltip(refill));
 
   const incident = status.open_incident ?? null;
   if (incident !== null && !OWN_SURFACE_INCIDENT_KINDS.includes(incident.kind)) {
     return incidentChip(incident);
   }
 
-  if (status.state === 'PAUSE' && status.toolhead?.feed === 'empty') return toolheadChip(null);
+  if (status.state === 'PAUSE' && status.toolhead?.feed === 'empty') {
+    const key = pausedEmptyTooltipKey(status.toolhead.refill_reason);
+    if (key !== null) return toolheadChip('held', [{ key }]);
+  }
   return null;
 }

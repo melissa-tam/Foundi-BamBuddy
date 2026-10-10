@@ -549,7 +549,7 @@ class PendingCommand:
     04:36:01, 014-H2S 02:45:58 → 02:50:38), emptying the toolhead under a page that said "slot N is
     loaded". The step's own ledger columns: ``seq`` (the step to answer once it settles), ``name``
     (``load`` / ``unload``), ``target`` (a load's tray), ``feeder`` (the feeder kind read AT the
-    send — what ``ams_command.ran`` reads back), ``sent_at`` (naive UTC). ``incident_id`` names the
+    send — what ``refill_verdict.ran`` reads back), ``sent_at`` (naive UTC). ``incident_id`` names the
     row, because the printer-scoped reader (:func:`pending_command`) answers about one row.
     """
 
