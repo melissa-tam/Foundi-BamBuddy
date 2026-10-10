@@ -12,73 +12,79 @@ last progress, off its terminal payload), ``none`` for a run nobody measured.
 """
 
 from backend.app.services.job_terminal import compute_run_filament_grams
+from backend.app.services.usage_tracker import JobEvidence
+
+
+def _at(progress):
+    """The extent a terminal payload with this last progress (and nothing unfed) charges to."""
+    return JobEvidence.from_payload({"last_progress": progress}).charged_extent
 
 
 class TestComputeRunFilamentGrams:
     def test_completed_no_tracker_returns_archive_estimate(self):
         # Completed print without inventory tracking: the slicer estimate is
         # the canonical "this print used X" value.
-        assert compute_run_filament_grams("full", 100.0, 100, []) == 100.0
+        assert compute_run_filament_grams("full", 100.0, _at(100), []) == 100.0
 
     def test_completed_prefers_tracked_over_estimate(self):
         # #1390: when inventory tracked the AMS weight delta, Stats should
         # reflect that — same source that drives "Total Consumed" on the
         # Inventory page. Two halves of the app must show the same number.
-        assert compute_run_filament_grams("full", 100.0, 100, [{"weight_used": 96.5}]) == 96.5
+        assert compute_run_filament_grams("full", 100.0, _at(100), [{"weight_used": 96.5}]) == 96.5
 
     def test_failed_uses_tracked_spool_delta(self):
         # Failed reprint at 10g actual: inventory tracked the spool delta.
         # The estimate was 100g; we want 10g recorded for stats.
-        assert compute_run_filament_grams("partial", 100.0, 10, [{"weight_used": 10.0}]) == 10.0
+        assert compute_run_filament_grams("partial", 100.0, _at(10), [{"weight_used": 10.0}]) == 10.0
 
     def test_cancelled_uses_tracked_spool_delta(self):
         # Same logic for cancelled.
-        assert compute_run_filament_grams("partial", 100.0, 12, [{"weight_used": 8.5}]) == 8.5
+        assert compute_run_filament_grams("partial", 100.0, _at(12), [{"weight_used": 8.5}]) == 8.5
 
     def test_stopped_uses_tracked_spool_delta(self):
-        assert compute_run_filament_grams("partial", 100.0, 15, [{"weight_used": 12.0}]) == 12.0
+        assert compute_run_filament_grams("partial", 100.0, _at(15), [{"weight_used": 12.0}]) == 12.0
 
     def test_failed_with_no_tracked_falls_back_to_progress_scale(self):
         # No inventory tracking: scale estimate by progress% (10% of 100g = 10g).
-        assert compute_run_filament_grams("partial", 100.0, 10, []) == 10.0
+        assert compute_run_filament_grams("partial", 100.0, _at(10), []) == 10.0
 
     def test_failed_with_no_tracked_and_no_progress_returns_none(self):
         # Nothing to infer from — return None rather than guess the estimate.
-        assert compute_run_filament_grams("partial", 100.0, 0, []) is None
+        assert compute_run_filament_grams("partial", 100.0, _at(0), []) is None
 
     def test_failed_with_partial_progress_rounds_correctly(self):
         # 100g × 33% = 33.0g (rounded to 1 decimal)
-        assert compute_run_filament_grams("partial", 100.0, 33, []) == 33.0
+        assert compute_run_filament_grams("partial", 100.0, _at(33), []) == 33.0
 
     def test_failed_with_no_estimate_returns_none(self):
         # No estimate, no tracked usage → can't compute anything.
-        assert compute_run_filament_grams("partial", None, 50, []) is None
+        assert compute_run_filament_grams("partial", None, _at(50), []) is None
 
     def test_failed_with_no_estimate_but_tracked_uses_tracked(self):
         # Tracked spool delta is authoritative even without an estimate.
-        assert compute_run_filament_grams("partial", None, 50, [{"weight_used": 5.0}]) == 5.0
+        assert compute_run_filament_grams("partial", None, _at(50), [{"weight_used": 5.0}]) == 5.0
 
     def test_tracked_overrides_progress_scale_when_both_available(self):
         # If inventory says 8g but progress says 15g, trust inventory (it's measured).
-        assert compute_run_filament_grams("partial", 100.0, 15, [{"weight_used": 8.0}]) == 8.0
+        assert compute_run_filament_grams("partial", 100.0, _at(15), [{"weight_used": 8.0}]) == 8.0
 
     def test_progress_above_100_clamps_to_full_estimate(self):
         # Defensive: progress overshoot doesn't multiply past the estimate.
-        assert compute_run_filament_grams("partial", 100.0, 150, []) == 100.0
+        assert compute_run_filament_grams("partial", 100.0, _at(150), []) == 100.0
 
     def test_multiple_tracked_slots_summed(self):
         # Multi-filament print, two slots tracked.
         usage = [{"weight_used": 5.0}, {"weight_used": 3.5}, {"weight_used": 1.0}]
-        assert compute_run_filament_grams("partial", 100.0, 20, usage) == 9.5
+        assert compute_run_filament_grams("partial", 100.0, _at(20), usage) == 9.5
 
     def test_completed_with_none_estimate_returns_none(self):
         # Archive somehow has no estimate (rare; archive_print parsed nothing).
-        assert compute_run_filament_grams("full", None, 100, []) is None
+        assert compute_run_filament_grams("full", None, _at(100), []) is None
 
     def test_none_records_no_grams_whatever_the_estimate_and_progress_say(self):
         """A run nobody measured — the reconcile's unknown outcome, a job joined mid-way with no peak
         read — states no grams, exactly as it is charged nothing."""
-        assert compute_run_filament_grams("none", 100.0, 60, []) is None
+        assert compute_run_filament_grams("none", 100.0, _at(60), []) is None
         assert compute_run_filament_grams("none", 100.0, None, None) is None
 
     def test_none_still_reports_what_a_tracker_measured(self):
@@ -87,5 +93,21 @@ class TestComputeRunFilamentGrams:
         assert compute_run_filament_grams("none", 100.0, None, [{"weight_used": 4.0}]) == 4.0
 
     def test_partial_with_no_progress_reading_states_no_grams(self):
-        """``last_progress`` None — no terminal peak reached this lane."""
+        """No extent — no terminal peak reached this lane."""
         assert compute_run_filament_grams("partial", 100.0, None, []) is None
+
+
+class TestTheRunsGramsFollowTheFedExtent:
+    """The print log states what the run FED, by the same extent its spools are charged to: a layer
+    printed with nothing fed is no gram used (011-H2S 2026-10-09: FINISH at 167 of 167, nothing fed
+    from layer 93)."""
+
+    _011 = {"last_layer_num": 167, "last_progress": 100.0, "total_layers": 167, "first_unfed_layer": 93}
+
+    def test_a_partial_run_with_an_unfed_tail_states_the_grams_it_fed(self):
+        extent = JobEvidence.from_payload(self._011).charged_extent
+        assert compute_run_filament_grams("partial", 167.0, extent, []) == 93.0
+
+    def test_the_tracked_spool_deltas_still_lead(self):
+        extent = JobEvidence.from_payload(self._011).charged_extent
+        assert compute_run_filament_grams("partial", 167.0, extent, [{"weight_used": 90.0}]) == 90.0

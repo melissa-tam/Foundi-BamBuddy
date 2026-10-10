@@ -206,6 +206,7 @@ export default {
         staggerHold: 'Güç kademelendirme penceresi bekleniyor — birazdan başlıyor',
         spoolJamRecovering: 'Makara sıkışması — başka bir makaraya geçiliyor ve devam ediliyor',
         spoolJamRecoveryFailed: 'Makara sıkışması kurtarma başarısız — yazıcı bir kişi için duraklatıldı',
+        toolheadEmpty: 'Kafa boşken duraklatıldı',
       },
       printerState: {
         ok: 'Hazır',
@@ -878,6 +879,18 @@ export default {
       amsCommandSessionChanged: 'Komut sırasında yazıcı yeniden bağlandı. AMS durumunu kontrol edin.',
       amsLoadHeld: 'Yükleme kabul edildi. Duraklatılmış baskının filament değişiminin arkasında bekletiliyor.',
       amsUnloadHeld: 'Çıkarma kabul edildi. Duraklatılmış baskının filament değişiminin arkasında bekletiliyor.',
+      amsLoadHeldOutsideChange: 'Yükleme kabul edildi. Henüz çalıştırılmadı.',
+      amsUnloadHeldOutsideChange: 'Çıkarma kabul edildi. Henüz çalıştırılmadı. AMS bunu başka bir komut olmadan daha sonra çalıştırabilir.',
+      resumeRefilling: 'Kafa boş. {{slot}} yükleniyor, ardından devam ediliyor.',
+      resumeRefillingAnySlot: 'Kafa boş. Bir makara yükleniyor, ardından devam ediliyor.',
+      resumeRefused: {
+        not_paused: 'Baskı duraklatılmış değil.',
+        farm_acting: 'Bu yazıcıda kurtarma sürüyor. Devam ettirme reddedildi.',
+        maintenance: 'Kafa boş. Bakım modu: çiftlik hiçbir şey yüklemez. Bir yuva yükleyin, sonra devam ettirin.',
+        unknown: 'Kafa okunamıyor: yazıcıdan canlı rapor yok. Devam ettirme reddedildi.',
+        command_pending: 'Kafa boş. AMS çiftliğin kuyruktaki komutunu hâlâ tutuyor; komut çalıştığında çiftlik kafayı yeniden doldurur.',
+        physical: 'Kafa boş. Fiziksel bir arıza filaman yolunu tıkıyor. Giderin ve bir yuva yükleyin, sonra devam ettirin.',
+      },
     },
     // Bağlantı durumu
     connection: {
@@ -1127,6 +1140,14 @@ export default {
       partial: '{{succeeded}} başarılı, {{failed}} başarısız',
       noneApplicable: 'Seçilen yazıcılar bu işlem için doğru durumda değil',
       selectByState: 'Duruma Göre Seç',
+      resumeResumed_one: '{{count}} yazıcıda devam edildi.',
+      resumeResumed_other: '{{count}} yazıcıda devam edildi.',
+      resumeRefilling_one: '{{count}} yazıcıda kafa boş: yükleniyor, ardından devam ediliyor.',
+      resumeRefilling_other: '{{count}} yazıcıda kafa boş: yükleniyor, ardından devam ediliyor.',
+      resumeRefused_one: '{{count}} yazıcıda devam ettirme reddedildi.',
+      resumeRefused_other: '{{count}} yazıcıda devam ettirme reddedildi.',
+      resumeFailed_one: '{{count}} yazıcıda devam ettirme başarısız oldu.',
+      resumeFailed_other: '{{count}} yazıcıda devam ettirme başarısız oldu.',
     },
     // Keşif
     discovery: {
@@ -1258,6 +1279,7 @@ export default {
       plate_vision: 'Plaka kontrolü',
       z_reference_lost: 'Z referansı kayboldu',
       recovering: 'Kurtarılıyor',
+      toolhead_refill: 'Kafa boş',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1269,13 +1291,28 @@ export default {
       power_loss: 'Yazıcıdan sürdürün',
       plate_vision: 'Yok say ve sürdür ya da baskıyı durdur',
       z_reference_lost: 'Plakada parça varken yeniden başlatıldı — elle çıkarın, sonra “Plakayı temizlendi olarak işaretle”',
+      toolhead_refill: 'Bir yuva yükleyin, sonra devam ettirin.',
     },
     incidentRecoveringAction: {
       plate_vision: 'Çiftlik plakayı yeniden kontrol ediyor',
+      toolhead_refill: 'Çiftlik kafayı yeniden dolduruyor',
     },
     holdMessage: {
       reported: 'Yazıcı bildirdi: {{message}}',
       notShown: 'Artık yazıcıda gösterilmiyor',
+    },
+    toolhead: {
+      loading: '{{slot}} yükleniyor.',
+      loadingAnySlot: 'Bir makara yükleniyor.',
+      loadFailed: 'Yükleme başarısız: {{slot}}.',
+      loadFailedAnySlot: 'Yükleme başarısız.',
+      unloadFailed: 'Çıkarma başarısız: {{slot}}.',
+      unloadFailedAnySlot: 'Çıkarma başarısız.',
+      answer: {
+        no_movement: 'AMS hareket etmedi.',
+        loadActed: 'AMS hareket etti ancak yükleme tamamlanmadı.',
+        unloadActed: 'AMS hareket etti ancak çıkarma tamamlanmadı.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Yok say ve sürdür',
@@ -5597,6 +5634,7 @@ export default {
       powerFailure: 'Güç kesintisi',
       userCancelled: 'Kullanıcı iptal etti',
       other: 'Diğer',
+      printed_without_filament: 'Filamentsiz basıldı',
     },
     statuses: {
       completed: 'Tamamlandı',
@@ -7755,6 +7793,7 @@ export default {
       job_ended_unseen: 'İş gözlenmeden bitti',
       driver_ended: 'Çiftlik: kurtarma işi bitirdi',
       legacy_vision_stop: 'Eski tabla kontrolü durdurması',
+      refill_resumed: 'Çiftlik: kafa yeniden dolduruldu',
     },
     external: 'Harici makara',
     foreign: 'Çiftlik birimi değil',

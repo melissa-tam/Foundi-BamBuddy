@@ -107,6 +107,12 @@ export function waitingReasonText(reason: string | null, t: (k: string) => strin
       return t('productionRuns.detail.waiting.pinnedTrayUnavailable');
     case 'spool_physical_fault':
       return t('productionRuns.detail.waiting.spoolPhysicalFault');
+    case 'toolhead_empty':
+      // A `toolhead_refill` hold: the paused job's toolhead reads EMPTY and the
+      // farm is refilling it, or could not. Like the plate check, the token
+      // spans both, so the copy states the pause and names no exit — the
+      // printer card's "Toolhead empty" chip carries which, and the slot.
+      return t('productionRuns.detail.waiting.toolheadEmpty');
     default:
       // An unmapped token gets humanized (never shown raw to an operator); a
       // backend-authored sentence is already readable and passes through.

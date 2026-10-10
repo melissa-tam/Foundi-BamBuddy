@@ -206,6 +206,7 @@ export default {
         staggerHold: '전력 분산 시작 시간을 기다리는 중 — 곧 시작됩니다',
         spoolJamRecovering: '스풀 걸림 — 다른 스풀로 교체하고 재개 중',
         spoolJamRecoveryFailed: '스풀 걸림 복구 실패 — 프린터가 담당자용으로 일시정지됨',
+        toolheadEmpty: '툴헤드가 빈 상태로 일시정지됨',
       },
       printerState: {
         ok: '준비됨',
@@ -852,7 +853,19 @@ export default {
       amsCommandSessionChanged: '명령 중 프린터가 재연결되었습니다. AMS를 확인하세요.',
       amsLoadHeld: '로드 수락됨. 일시정지된 인쇄의 필라멘트 교체 뒤에 보류되었습니다.',
       amsUnloadHeld: '언로드 수락됨. 일시정지된 인쇄의 필라멘트 교체 뒤에 보류되었습니다.',
-      connectionFailedNotAdded: '프린터에 연결할 수 없습니다. IP, 시리얼 번호, 액세스 코드를 확인하고 LAN 전용 모드가 켜져 있는지 확인하세요. 프린터가 추가되지 않았습니다.'
+      connectionFailedNotAdded: '프린터에 연결할 수 없습니다. IP, 시리얼 번호, 액세스 코드를 확인하고 LAN 전용 모드가 켜져 있는지 확인하세요. 프린터가 추가되지 않았습니다.',
+      amsLoadHeldOutsideChange: '로드 수락됨. 아직 실행되지 않았습니다.',
+      amsUnloadHeldOutsideChange: '언로드 수락됨. 아직 실행되지 않았습니다. AMS가 추가 명령 없이 나중에 실행할 수 있습니다.',
+      resumeRefilling: '툴헤드가 비어 있습니다. {{slot}}을(를) 로드한 뒤 재개합니다.',
+      resumeRefillingAnySlot: '툴헤드가 비어 있습니다. 스풀을 로드한 뒤 재개합니다.',
+      resumeRefused: {
+        not_paused: '인쇄가 일시정지 상태가 아닙니다.',
+        farm_acting: '이 프린터에서 복구가 진행 중입니다. 재개가 거부되었습니다.',
+        maintenance: '툴헤드가 비어 있습니다. 유지보수 모드: 팜은 아무것도 로드하지 않습니다. 슬롯을 로드한 뒤 재개하세요.',
+        unknown: '툴헤드를 읽을 수 없습니다: 프린터의 실시간 보고가 없습니다. 재개가 거부되었습니다.',
+        command_pending: '툴헤드가 비어 있습니다. AMS가 아직 팜의 대기 중인 명령을 보유하고 있습니다. 명령이 실행되면 팜이 툴헤드를 다시 채웁니다.',
+        physical: '툴헤드가 비어 있습니다. 물리적 고장이 필라멘트 경로를 막고 있습니다. 해결하고 슬롯을 로드한 뒤 재개하세요.',
+      },
     },
     connection: {
       connected: '연결됨',
@@ -1091,7 +1104,15 @@ export default {
       success: '{{count}}개 프린터에서 {{action}} 완료',
       partial: '{{succeeded}}개 성공, {{failed}}개 실패',
       noneApplicable: '선택된 프린터 중 이 작업에 적합한 상태의 프린터가 없습니다',
-      selectByState: '상태별 선택'
+      selectByState: '상태별 선택',
+      resumeResumed_one: '프린터 {{count}}대 재개됨.',
+      resumeResumed_other: '프린터 {{count}}대 재개됨.',
+      resumeRefilling_one: '프린터 {{count}}대의 툴헤드가 비어 있음: 로드한 뒤 재개합니다.',
+      resumeRefilling_other: '프린터 {{count}}대의 툴헤드가 비어 있음: 로드한 뒤 재개합니다.',
+      resumeRefused_one: '프린터 {{count}}대에서 재개가 거부됨.',
+      resumeRefused_other: '프린터 {{count}}대에서 재개가 거부됨.',
+      resumeFailed_one: '프린터 {{count}}대에서 재개 실패.',
+      resumeFailed_other: '프린터 {{count}}대에서 재개 실패.',
     },
     discovery: {
       title: '프린터 검색',
@@ -1216,6 +1237,7 @@ export default {
       plate_vision: '플레이트 검사',
       z_reference_lost: 'Z 기준 손실',
       recovering: '복구 중',
+      toolhead_refill: '툴헤드 비어 있음',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1227,13 +1249,28 @@ export default {
       power_loss: '프린터에서 재개하세요',
       plate_vision: '무시하고 재개하거나 출력을 중지하세요',
       z_reference_lost: '플레이트에 출력물이 있는 상태로 재시작됨 — 손으로 제거한 뒤 ‘플레이트 비움으로 표시’',
+      toolhead_refill: '슬롯을 로드한 뒤 재개하세요.',
     },
     incidentRecoveringAction: {
       plate_vision: '팜이 플레이트를 다시 검사하는 중',
+      toolhead_refill: '팜이 툴헤드를 다시 채우는 중',
     },
     holdMessage: {
       reported: '프린터 보고: {{message}}',
       notShown: '프린터에 더 이상 표시되지 않음',
+    },
+    toolhead: {
+      loading: '{{slot}} 로드 중.',
+      loadingAnySlot: '스풀 로드 중.',
+      loadFailed: '로드 실패: {{slot}}.',
+      loadFailedAnySlot: '로드 실패.',
+      unloadFailed: '언로드 실패: {{slot}}.',
+      unloadFailedAnySlot: '언로드 실패.',
+      answer: {
+        no_movement: 'AMS가 움직이지 않았습니다.',
+        loadActed: 'AMS가 움직였지만 로드가 완료되지 않았습니다.',
+        unloadActed: 'AMS가 움직였지만 언로드가 완료되지 않았습니다.',
+      },
     },
     plateCheck: {
       ignoreResume: '무시하고 재개',
@@ -5375,7 +5412,8 @@ export default {
       underExtrusion: '압출 부족',
       powerFailure: '전원 실패',
       userCancelled: '사용자 취소',
-      other: '기타'
+      other: '기타',
+      printed_without_filament: '필라멘트 없이 인쇄됨',
     },
     statuses: {
       completed: '완료됨',
@@ -7452,6 +7490,7 @@ export default {
       job_ended_unseen: '작업 종료(관측 안 됨)',
       driver_ended: '팜: 복구로 작업 종료',
       legacy_vision_stop: '이전 플레이트 검사 중지',
+      refill_resumed: '팜: 툴헤드 다시 채움',
     },
     external: '외부 스풀',
     foreign: '팜 유닛 아님',

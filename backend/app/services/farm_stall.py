@@ -64,6 +64,7 @@ from backend.app.models.printer_incident import (
     KIND_PLATE_VISION,
     KIND_POWER_LOSS,
     KIND_RUNOUT,
+    KIND_TOOLHEAD_REFILL,
     KIND_Z_REFERENCE_LOST,
     STATUS_ESCALATED,
 )
@@ -71,7 +72,7 @@ from backend.app.services import notify_dedup
 from backend.app.services.dispatch_claim import ClaimEvidence, has_live_start_watchdog, judge
 from backend.app.services.hms_errors import current_runout_demand
 from backend.app.services.incident_resolution import driver_owns
-from backend.app.services.plate_occupancy import plate_occupancy
+from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
 from backend.app.services.printer_incidents import (
     RECOVERY_WAITING_REASONS,
     WAITING_REASON_RECOVERING,
@@ -954,6 +955,12 @@ async def _remind_paused(db, notif, printer_id, printer_name, job_name, minutes,
 _PHYSICAL_REMINDER_DETAIL = (
     "A physical filament fault is STILL unresolved — the printer is still PAUSED and no swap can clear it."
 )
+# K10 (2026-10-10): the farm could not refill the paused job's empty toolhead. The exit is
+# filament at the toolhead BEFORE the resume — a Bambuddy Resume retries the refill itself.
+_TOOLHEAD_REMINDER_DETAIL = (
+    "Toolhead STILL empty — the print is still PAUSED and the farm could not load a spool. "
+    "Load a spool on the printer, or press Resume to retry the refill."
+)
 
 # incident kind -> the reminder's detail copy. One line per kind, so the nag reads
 # like the alert it repeats. EVERY FAULT kind must appear: the lookup below falls back
@@ -974,6 +981,7 @@ _INCIDENT_REMINDER_DETAIL: dict[str, str] = {
     KIND_POWER_LOSS: _POWER_LOSS_REMINDER_REASON,
     KIND_PLATE_VISION: _PLATE_VISION_REMINDER_DETAIL,
     KIND_Z_REFERENCE_LOST: _Z_REFERENCE_REMINDER_DETAIL,
+    KIND_TOOLHEAD_REFILL: _TOOLHEAD_REMINDER_DETAIL,
 }
 
 # The same three holds when the printer is NOT paused. Every line above asserts
@@ -1014,7 +1022,21 @@ _INCIDENT_REMINDER_DETAIL_UNPAUSED: dict[str, str] = {
     # not waiting: state only what is true — the hold stands and blocks work.
     KIND_PLATE_VISION: "Plate check hold still open, but the printer is not paused. It takes no work while the hold stands.",
     KIND_Z_REFERENCE_LOST: _Z_REFERENCE_REMINDER_DETAIL,
+    # A toolhead hold ends with its job (``incident_resolution``'s toolhead cells): open on a printer
+    # that is not paused, it is only the gap before the terminal or the sweep's close.
+    KIND_TOOLHEAD_REFILL: "Toolhead hold still open, but the printer is not paused. It takes no work while the hold stands.",
 }
+
+
+# A job PRINTING — the plate authority's active states (the one origin of "a job owns the
+# printer") less the PAUSE every recovery hold is reminded in.
+_PRINTING_STATES: frozenset[str] = ACTIVE_PRINT_STATES - {"PAUSE"}
+
+# The kinds whose reminder re-fires an event of their OWN (not the recovery's
+# ``on_spool_recovery_failed``), with state-true copy of their own: a power-loss prompt and a plate
+# check both close on their job printing again, and a lost Z frame is a fact about the PLATE that
+# no running print answers.
+_OWN_EVENT_KINDS: frozenset[str] = frozenset({KIND_POWER_LOSS, KIND_PLATE_VISION, KIND_Z_REFERENCE_LOST})
 
 
 def _live_runout_slot(state) -> str | None:
@@ -1103,6 +1125,17 @@ async def _remind_open_incidents(
             st = manager.get_status(pid)
             live = (getattr(st, "state", None) or "").upper()
             if not live or live == "UNKNOWN":
+                continue
+            if live in _PRINTING_STATES and incident.kind not in _OWN_EVENT_KINDS:
+                # A job is PRINTING over the hold (2026-10-10). The recovery event's copy says the
+                # job is left PAUSED, or has ended, and the printer idle — none of it is true of a
+                # running print, and nothing waits on a person: every such row is answered by the
+                # running print's own evidence (a wire row's running edge, a repair row's running
+                # sighting after the sweep's dwell, a toolhead row's fed print), or the FARM still
+                # owns it — K11 keeps a row OPEN over a print a person's screen Retry resumed while
+                # the farm's pull-back is queued, and the per-push detector refills the toolhead the
+                # moment that command runs. Skipped BEFORE the key is held, so a print that pauses
+                # again (a re-jam) is nagged one full window after that pause, never at once.
                 continue
             held_keys.add(key)
 

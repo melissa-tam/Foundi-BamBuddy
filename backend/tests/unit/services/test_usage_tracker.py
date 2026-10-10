@@ -2347,6 +2347,265 @@ class TestTrayChangeSplit:
         assert {(0, 1), (0, 0)} <= handled
 
 
+class TestNothingPrintedWithoutFilamentIsCharged:
+    """Layers a job printed with NOTHING fed (the payload's ``first_unfed_layer``) charge nothing.
+
+    011-H2S and 014-H2S (2026-10-09) were resumed onto an empty toolhead and ran to the end on air;
+    the printer said FINISH and the farm charged the whole plate. 014-H2S unit 4289 (2026-10-10) was
+    stopped at layer 142 and charged to 142 though nothing fed after 134. The terminal outcome makes
+    such a terminal a ``partial`` charge (``terminal_outcome._charge_basis``); the tracker charges it
+    to the extent the job FED (``JobExtent.charged_extent``) and ends every feeder segment there.
+    """
+
+    # One linear-model gram per layer of a 167-layer plate, so every charge reads as a layer count.
+    _LAYER_GRAMS = (
+        (
+            "extract_layer_filament_usage_from_3mf",
+            {"return_value": {0: {0: 0.0}}},
+        ),
+        ("get_cumulative_usage_at_layer", {"side_effect": lambda data, layer: {0: layer * 100.0}}),
+        ("extract_filament_properties_from_3mf", {"return_value": {1: {"density": 1.24, "diameter": 1.75}}}),
+        ("mm_to_grams", {"side_effect": lambda mm, d, dens: round(mm * 0.01, 1)}),
+    )
+    _TWO_FEEDERS = [("archive", 300), None, ("assign", 10, 0, 0), ("spool", 10), ("assign", 20, 0, 1), ("spool", 20)]
+
+    async def _charge(self, payload, *, used_g, charge="partial", db=None, extra_patches=_NO_LAYER_DATA):
+        answers, _ = _resolve_db_plan(db or [("archive", 300), None, ("assign", 1, 0, 0), ("spool", 1)])
+        return await _run_track_from_3mf(
+            db_answers=answers,
+            payload={"tray_now": 0, "last_loaded_tray": 0, **payload},
+            filament_usage=[{"slot_id": 1, "used_g": used_g, "type": "PETG", "color": ""}],
+            handled_trays=set(),
+            extra_patches=extra_patches,
+            archive_id=300,
+            charge=charge,
+            status="failed",
+            print_name="Unfed tail",
+        )
+
+    # 011-H2S: FINISH at 167 of 167, nothing fed from layer 93.
+    _011 = {"last_progress": 100.0, "last_layer_num": 167, "total_layers": 167, "first_unfed_layer": 93}
+
+    async def test_a_finish_that_ran_on_air_is_charged_to_its_unfed_layer(self, existing_3mf_path):
+        results = await self._charge(self._011, used_g=167.0)
+        _assert_charges(results, [{"spool_id": 1, "weight_used": 93.0}])
+
+    async def test_the_gcode_cumulative_is_read_at_the_unfed_layer(self, existing_3mf_path):
+        results = await self._charge(self._011, used_g=167.0, extra_patches=self._LAYER_GRAMS)
+        _assert_charges(results, [{"spool_id": 1, "weight_used": 93.0}])
+
+    async def test_an_attach_still_bounds_the_charge_by_the_measured_layer(self, existing_3mf_path):
+        """``peaks_reliable`` False and no peak read: the unfed layer is absolute, so it still measures."""
+        attached = {"peaks_reliable": False, "last_progress": 0.0, "last_layer_num": 0, "total_layers": 167}
+        results = await self._charge({**attached, "first_unfed_layer": 93}, used_g=167.0)
+        _assert_charges(results, [{"spool_id": 1, "weight_used": 93.0}])
+
+    async def test_without_the_key_a_finish_still_charges_the_whole_plate(self, existing_3mf_path):
+        unmeasured = {key: value for key, value in self._011.items() if key != "first_unfed_layer"}
+        results = await self._charge(unmeasured, used_g=167.0, charge="full")
+        _assert_charges(results, [{"spool_id": 1, "weight_used": 167.0}])
+
+    @pytest.mark.parametrize("per_layer", [False, True], ids=["linear", "gcode_cumulative"])
+    async def test_the_4289_stop_charges_each_feeder_to_134_and_the_unfed_tail_nothing(
+        self, per_layer, existing_3mf_path
+    ):
+        """tray 0 fed [0, 92), tray 1 [92, 134); the refill back onto tray 0 at 134 printed on air to
+        the stop at 142, so tray 0's [134, 142) is charged nothing."""
+        payload = {
+            "last_progress": 85.0,
+            "last_layer_num": 142,
+            "total_layers": 167,
+            "first_unfed_layer": 134,
+            "tray_change_log": [(0, 0), (0, 0), (1, 92), (0, 134)],
+        }
+        results = await self._charge(
+            payload,
+            used_g=167.0,
+            db=self._TWO_FEEDERS,
+            extra_patches=self._LAYER_GRAMS if per_layer else _NO_LAYER_DATA,
+        )
+        _assert_charges(
+            results,
+            [
+                {"ams_id": 0, "tray_id": 0, "spool_id": 10, "weight_used": 92.0},
+                {"ams_id": 0, "tray_id": 1, "spool_id": 20, "weight_used": 42.0},
+            ],
+        )
+
+    async def test_a_feeder_change_after_the_unfed_layer_charges_nothing(self, existing_3mf_path):
+        """A spool loaded at layer 138 while the job still printed on air fed nothing either: every
+        segment that STARTS at or past the unfed layer is dropped, never charged a span past it."""
+        payload = {
+            "last_progress": 85.0,
+            "last_layer_num": 142,
+            "total_layers": 167,
+            "first_unfed_layer": 134,
+            "tray_change_log": [(0, 0), (1, 92), (0, 134), (2, 138)],
+        }
+        db = [*self._TWO_FEEDERS, ("assign", 30, 0, 2), ("spool", 30)]
+        results = await self._charge(payload, used_g=167.0, db=db)
+        _assert_charges(
+            results,
+            [
+                {"ams_id": 0, "tray_id": 0, "spool_id": 10, "weight_used": 92.0},
+                {"ams_id": 0, "tray_id": 1, "spool_id": 20, "weight_used": 42.0},
+            ],
+        )
+
+    async def test_the_014_536_finish_charges_each_feeder_to_layer_9(self, existing_3mf_path):
+        payload = {
+            "last_progress": 100.0,
+            "last_layer_num": 48,
+            "total_layers": 48,
+            "first_unfed_layer": 9,
+            "tray_change_log": [(0, 0), (0, 0), (1, 6), (0, 9)],
+        }
+        results = await self._charge(payload, used_g=48.0, db=self._TWO_FEEDERS)
+        _assert_charges(
+            results,
+            [
+                {"ams_id": 0, "tray_id": 0, "spool_id": 10, "weight_used": 6.0},
+                {"ams_id": 0, "tray_id": 1, "spool_id": 20, "weight_used": 3.0},
+            ],
+        )
+
+    async def test_a_partial_split_spans_the_layers_the_job_reached_not_the_plates(self, existing_3mf_path):
+        """The same rule with no unfed tail: a job stopped at layer 50 of 100 whose feeder changed at 30
+        fed 30 layers from tray 0 and 20 from tray 1. Splitting its half-plate charge over the PLATE's
+        100 layers handed tray 1 the remainder of the plate's span (15 g / 35 g)."""
+        payload = {
+            "last_progress": 50.0,
+            "last_layer_num": 50,
+            "total_layers": 100,
+            "tray_change_log": [(0, 0), (1, 30)],
+        }
+        results = await self._charge(payload, used_g=100.0, db=self._TWO_FEEDERS)
+        _assert_charges(
+            results,
+            [
+                {"ams_id": 0, "tray_id": 0, "weight_used": 30.0},
+                {"ams_id": 0, "tray_id": 1, "weight_used": 20.0},
+            ],
+        )
+
+
+class TestTheStartBlockPrimeIsTheFirstFeeders:
+    """The G-code parser buckets the start block's extrusion — the prime before ``M73 L1`` — under
+    layer 0 (``threemf_tools.parse_gcode_layer_filament_usage``). It runs on the tray loaded at print
+    start, the first entry of ``tray_change_log``, so the job's first segment starts from 0 g of its
+    filament; measured from layer 0's cumulative, the prime fell through to the last segment's
+    remainder and was charged to whichever tray the job ENDED on (capsule E's replay of the
+    2026-10-09/10 jobs: 0.123150 g per plate on the wrong roll, and on every ordinary T0 -> T1
+    auto-refill too). One gram per layer plus a 5 g prime here, so the prime is plain to see."""
+
+    _PRIMED = (
+        ("extract_layer_filament_usage_from_3mf", {"return_value": {0: {0: 500.0}}}),
+        ("get_cumulative_usage_at_layer", {"side_effect": lambda data, layer: {0: 500.0 + layer * 100.0}}),
+        ("extract_filament_properties_from_3mf", {"return_value": {1: {"density": 1.24, "diameter": 1.75}}}),
+        ("mm_to_grams", {"side_effect": lambda mm, d, dens: mm * 0.01}),
+    )
+
+    @staticmethod
+    def _db(first_tray, second_tray):
+        return [
+            ("archive", 400),
+            None,
+            ("assign", 10, 0, first_tray),
+            ("spool", 10),
+            ("assign", 20, 0, second_tray),
+            ("spool", 20),
+        ]
+
+    async def _split(self, payload, *, used_g, charge, first_tray=0, second_tray=1):
+        answers, _ = _resolve_db_plan(self._db(first_tray, second_tray))
+        return await _run_track_from_3mf(
+            db_answers=answers,
+            payload={"tray_now": 255, "last_loaded_tray": second_tray, "peaks_reliable": True, **payload},
+            filament_usage=[{"slot_id": 1, "used_g": used_g, "type": "PETG", "color": ""}],
+            handled_trays=set(),
+            extra_patches=self._PRIMED,
+            archive_id=400,
+            charge=charge,
+            status="completed" if charge == "full" else "failed",
+            print_name="Primed split",
+        )
+
+    async def test_an_auto_refill_finish_charges_the_prime_to_the_tray_it_started_on(self, existing_3mf_path):
+        """T0 primed and fed layers 0-50, T1 the rest: T0 is 5 g + 50, T1 the remaining 50."""
+        payload = {
+            "last_progress": 100.0,
+            "last_layer_num": 100,
+            "total_layers": 100,
+            "tray_change_log": [(0, 0), (1, 50)],
+        }
+        results = await self._split(payload, used_g=105.0, charge="full")
+        _assert_charges(
+            results,
+            [
+                {"ams_id": 0, "tray_id": 0, "spool_id": 10, "weight_used": 55.0},
+                {"ams_id": 0, "tray_id": 1, "spool_id": 20, "weight_used": 50.0},
+            ],
+        )
+
+    @pytest.mark.parametrize(
+        ("payload", "first_tray", "second_tray", "expect"),
+        [
+            pytest.param(
+                {
+                    "last_progress": 99.0,
+                    "last_layer_num": 167,
+                    "total_layers": 167,
+                    "first_unfed_layer": 93,
+                    "tray_change_log": [(1, 0), (2, 92), (1, 93)],
+                },
+                1,
+                2,
+                (97.0, 1.0),
+                id="011_fed_tray_1_to_92_and_tray_2_for_one_layer",
+            ),
+            pytest.param(
+                {
+                    "last_progress": 100.0,
+                    "last_layer_num": 167,
+                    "total_layers": 167,
+                    "first_unfed_layer": 9,
+                    "tray_change_log": [(0, 0), (0, 0), (1, 6), (0, 9)],
+                },
+                0,
+                1,
+                (11.0, 3.0),
+                id="014_536_fed_tray_0_to_6_and_tray_1_to_9",
+            ),
+            pytest.param(
+                {
+                    "last_progress": 94.0,
+                    "last_layer_num": 142,
+                    "total_layers": 167,
+                    "first_unfed_layer": 134,
+                    "tray_change_log": [(0, 0), (0, 0), (1, 92), (0, 134)],
+                },
+                0,
+                1,
+                (97.0, 42.0),
+                id="014_558_fed_tray_0_to_92_and_tray_1_to_134",
+            ),
+        ],
+    )
+    async def test_an_air_printed_job_charges_the_prime_to_its_first_feeder(
+        self, payload, first_tray, second_tray, expect, existing_3mf_path
+    ):
+        results = await self._split(
+            payload, used_g=172.0, charge="partial", first_tray=first_tray, second_tray=second_tray
+        )
+        _assert_charges(
+            results,
+            [
+                {"ams_id": 0, "tray_id": first_tray, "spool_id": 10, "weight_used": expect[0]},
+                {"ams_id": 0, "tray_id": second_tray, "spool_id": 20, "weight_used": expect[1]},
+            ],
+        )
+
+
 class TestDecodeMqttMapping:
     """`_decode_mqtt_mapping` turns the wire's snow-encoded slot words into global tray ids.
 

@@ -38,6 +38,7 @@ const RESOLVE_SOURCES: Record<IncidentResolveSource, true> = {
   driver_swap: true,
   driver_self_heal: true,
   driver_restart: true,
+  refill_resumed: true,
   startup_rearm: true,
   recheck_passed: true,
   plate_refused: true,

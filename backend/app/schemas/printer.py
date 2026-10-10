@@ -33,6 +33,27 @@ AmsCommandOutcome = Literal[
     "session_changed",
 ]
 
+#: The posture FAMILY an operator's AMS command was sent into (``ams_command.PostureFamily``,
+#: pinned equal by ``test_printers_api``): ``mid_change`` — inside the paused print's own filament
+#: change, where a command the firmware acknowledges is held behind it; ``outside_change`` — every
+#: other posture. A client keys its posture-specific copy off it; ``None`` for a refusal.
+AmsPostureFamily = Literal["mid_change", "outside_change"]
+
+#: An AMS MOTION command, as a client names it (``ams_command.Command`` — the only publisher of the
+#: ledger's command steps; pinned equal by ``test_printer_manager``): the motion the "Toolhead
+#: empty" chip speaks of (:class:`ToolheadRefillState`).
+AmsMotionCommand = Literal["load", "unload"]
+
+#: The CLOSED set of reasons the resume of a paused print is REFUSED (K9, 2026-10-10 —
+#: ``spool_recovery.resume_paused_print``; the route maps each to a 409). The verb's own two —
+#: ``not_paused`` and ``farm_acting`` (a recovery driver is live and owns the printer's next
+#: motion) — then the refill verdict's reasons whose resume would print air: ``maintenance`` (the
+#: farm loads nothing in maintenance mode), ``unknown`` (no live reading of the toolhead),
+#: ``command_pending`` (the AMS still holds the farm's queued command) and ``physical``. Here, in
+#: the dependency-free DTO layer, for ``RecheckOutcome``'s reason: the service is typed by it and
+#: the wire validates it.
+ResumeRefusalReason = Literal["not_paused", "farm_acting", "maintenance", "unknown", "command_pending", "physical"]
+
 #: The CLOSED set of answers a manual eject can give. ``eject/manual.manual_eject``
 #: returns exactly one :class:`~backend.app.services.eject.manual.EjectVerdict` carrying
 #: one of these, and ``api/routes/printer_eject.py`` maps each to its HTTP shape — the
@@ -628,6 +649,37 @@ class PrintOptionsResponse(BaseModel):
     filament_tangle_detect: bool = False
 
 
+class ToolheadRefillState(BaseModel):
+    """The farm's refill of an EMPTY toolhead, as the card's "Toolhead empty" chip reads it.
+
+    ``phase`` — ``loading``: a refill (or a recovery driver's load) is in flight on this printer;
+    ``failed``: the open row's last command did not reach its end. ``command`` — the motion the phase
+    speaks of: ``load`` while loading; the failed step's own command when failed (a failed UNLOAD is
+    an unload, never "Load failed"). ``slot`` — the slot it is loading or failed on (an unload names
+    no target: the row's slot); ``answer`` — what the AMS answered the failed command
+    (``no_movement`` / ``acted``), ``None`` while loading."""
+
+    phase: Literal["loading", "failed"]
+    command: AmsMotionCommand
+    slot: str | None = None
+    answer: str | None = None
+
+
+class ToolheadState(BaseModel):
+    """The printer's ACTIVE extruder feed (``tray_fields.toolhead_feed``, K1) and the farm's refill
+    of it — a DERIVED projection, built by ``printer_manager.toolhead_payload`` for both ``/status``
+    branches and the WS frame.
+
+    ``feed`` — ``fed`` (a real AMS feeder) / ``external`` (the external spool) / ``empty``
+    (nothing fed) / ``unknown`` (nothing read); ``tray`` — the global tray when ``fed``;
+    ``refill`` — set only while the feed reads empty or unknown and the farm is loading it or could
+    not."""
+
+    feed: Literal["fed", "external", "empty", "unknown"]
+    tray: int | None = None
+    refill: ToolheadRefillState | None = None
+
+
 class PrinterStatus(BaseModel):
     id: int
     name: str
@@ -745,6 +797,9 @@ class PrinterStatus(BaseModel):
     # on the printer's plate-check dialog through the farm, and when the farm stops the print
     # if nobody does. Same builder for both ``/status`` branches and the WS frame.
     plate_check_exit: PlateCheckExit | None = None
+    # The ACTIVE extruder's feed and the farm's refill of it (K10/C3c, 2026-10-10): what the card's
+    # "Toolhead empty" chip reads. Same builder for both ``/status`` branches and the WS frame.
+    toolhead: ToolheadState | None = None
     # AMS drying support
     supports_drying: bool = False
     # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;
@@ -883,4 +938,38 @@ class AmsCommandResponse(BaseModel):
     """
 
     outcome: AmsCommandOutcome
+    message: str
+    #: the posture family the command was sent into (``ams_command.AmsCommandResult.family``) —
+    #: ``None`` only for a refusal, which never reaches a 200
+    family: AmsPostureFamily | None = None
+
+
+class PrintResumeResponse(BaseModel):
+    """What ``POST /printers/{id}/print/resume`` answers with a 200 (K9, 2026-10-10).
+
+    ``status`` — ``resumed``: the resume went out (the toolhead read fed, or the firmware feeds it
+    itself — a same-slot runout demand, its own filament change, the start block); ``refilling``:
+    the toolhead read EMPTY, so the farm refills it first as the printer's recovery driver and
+    resumes once the load reached the toolhead — answered at once, the outcome arriving through the
+    status projection (``PrinterStatus.toolhead``) and, on a failure, a page. ``slot`` — the slot
+    the refill loads first ("AMS A slot 1"), ``None`` when the swap's selection decides (and for
+    ``resumed``). ``message`` is the non-UI-client fallback; a client keys its copy off ``status``.
+    """
+
+    success: bool = True
+    status: Literal["resumed", "refilling"]
+    slot: str | None = None
+    message: str
+
+
+class PrintResumeRefusal(BaseModel):
+    """The 409 ``detail`` of a refused resume (K9): nothing was sent, and the print is never
+    resumed onto an empty toolhead. ``reason`` (closed, :data:`ResumeRefusalReason`) is what a
+    client keys its copy off; ``slot`` / ``answer`` name a slot and an AMS answer when the refusal
+    has one (none of today's reasons does — a refill's slot and answer reach the client through the
+    status projection); ``message`` is the fallback sentence."""
+
+    reason: ResumeRefusalReason
+    slot: str | None = None
+    answer: str | None = None
     message: str

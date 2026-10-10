@@ -713,6 +713,108 @@ class TestOperatorStop:
         assert len(retries) == 1
 
 
+class TestAFinishThatPrintedWithoutFilament:
+    """A FINISH the farm records ``failed`` because the job printed layers with nothing fed
+    (``terminal_outcome``, 011-H2S / 014-H2S 2026-10-09) takes the ORDINARY failed disposition — no
+    branch of its own: the outcome carries no verdict and no stop, so ``_requeues_gracefully`` is
+    False and the ``final_status`` fork sends it to ``_on_item_failed`` like any other failure."""
+
+    # 011-H2S: resumed onto an empty toolhead at layer 93 of 167, ran to the end on air, said FINISH.
+    _PAYLOAD = {
+        "status": "completed",
+        "peaks_reliable": True,
+        "last_layer_num": 167,
+        "last_progress": 100.0,
+        "total_layers": 167,
+        "first_unfed_layer": 93,
+    }
+
+    def _outcome(self):
+        from backend.app.services.plate_occupancy import DepositEvidence
+        from backend.app.services.terminal_outcome import build_terminal_outcome
+
+        return build_terminal_outcome(
+            raw_status="completed",
+            verdict=None,
+            open_incidents=(),
+            job_id="J-011",
+            evidence=DepositEvidence.from_terminal_payload(self._PAYLOAD, is_dry_run=False),
+            first_article=False,
+            is_eject=False,
+            hms_errors=[],
+        )
+
+    async def _ended_unit(self, db, batch, prof, *, printer_id, outcome, pos):
+        """The unit as ``job_terminal.record_unit_outcome`` ends it: the outcome's recorded word."""
+        item = PrintQueueItem(
+            batch_id=batch.id,
+            status=outcome.recorded_status,
+            first_article=False,
+            printer_id=printer_id,
+            eject_profile_id=prof.id,
+            plate_id=1,
+            retry_count=0,
+            position=pos,
+            completed_at=datetime.now(timezone.utc),
+        )
+        db.add(item)
+        await db.commit()
+        return item
+
+    async def test_it_is_retried_once_within_the_cap(self, db_session):
+        batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[3], require_fa=False, retry_max=1)
+        outcome = self._outcome()
+        item = await self._ended_unit(db_session, batch, prof, printer_id=3, outcome=outcome, pos=90)
+
+        await farm_policy.on_unit_terminal(db_session, item.id, outcome.recorded_status, outcome=outcome)
+
+        retries = [i for i in await _items(db_session, batch.id) if i.retry_of_id == item.id]
+        assert len(retries) == 1
+        assert retries[0].status == "pending"
+        await db_session.refresh(batch)
+        # a failure, never the operator-stop hold (the run-pause helpers of the failed path ran: this
+        # fixture has no printer row, so the run reads ``no_available_printers``)
+        assert batch.pause_reason != "operator_stop"
+
+    async def test_it_counts_toward_quarantine(self, db_session):
+        """Two in a row on one printer quarantine it, exactly as two genuine failures do."""
+        batch, prof = await _mk_run(db_session, quantity=5, printer_ids=[0], require_fa=False, escalate=2)
+        printer = Printer(name="PWF", serial_number="SPWF", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db_session.add(printer)
+        await db_session.flush()
+        outcome = self._outcome()
+        await self._ended_unit(db_session, batch, prof, printer_id=printer.id, outcome=outcome, pos=91)
+        second = await self._ended_unit(db_session, batch, prof, printer_id=printer.id, outcome=outcome, pos=92)
+
+        await farm_policy.on_unit_terminal(db_session, second.id, outcome.recorded_status, outcome=outcome)
+
+        await db_session.refresh(printer)
+        assert printer.quarantined is True
+        assert printer.quarantine_reason == "2 consecutive farm print failures"
+
+    async def test_its_plate_is_gated_like_any_failure_that_deposited(self):
+        """The printer said FINISH, so the plate carries the part it printed up to the unfed layer:
+        the gate rises under the matched unit's cooldown sweep, as for any deposited farm failure."""
+        from backend.app.services.plate_occupancy import DepositEvidence
+
+        evidence = DepositEvidence.from_terminal_payload(self._PAYLOAD, is_dry_run=False)
+        plate_occupancy.note_terminal(
+            93,
+            farm_correlation.terminal_disposition(
+                verdict="matched",
+                item_id=7,
+                eject_profile_id=3,
+                first_article=False,
+                batch_id=1,
+                source_subtask_id="J-011",
+                evidence=evidence,
+                raise_gate=True,
+                refusal=self._outcome().plate_refusal,
+            ),
+        )
+        assert plate_occupancy.is_plate_occupied(93) is True
+
+
 class TestRunCompletion:
     async def test_last_plate_completes_run(self, db_session):
         batch, prof = await _mk_run(db_session, quantity=2, printer_ids=[9], require_fa=False)

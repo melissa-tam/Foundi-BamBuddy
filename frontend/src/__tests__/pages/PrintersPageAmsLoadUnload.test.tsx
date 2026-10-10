@@ -10,8 +10,9 @@
  * Unload is NOT a slot verb: `/ams/unload` takes no tray argument, so it lives
  * once in each AMS unit's header (B4 slot-verb consolidation) and needs no hover.
  *
- * A 200 answers `{ outcome, message }`; the toast is keyed off `outcome` and the
- * backend `message` is never rendered. `showToast` is spied (and still forwarded
+ * A 200 answers `{ outcome, message, family }`; the toast is keyed off `outcome`
+ * (and, for `held`, the posture `family`) and the backend `message` is never
+ * rendered. `showToast` is spied (and still forwarded
  * to the real provider) so each case pins both the rendered copy and the variant.
  *
  * While a recovery driver is live (`open_incident.driver_live`) a Load/Unload click
@@ -26,7 +27,7 @@ import { render } from '../utils';
 import { PrintersPage } from '../../pages/PrintersPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
-import type { AmsCommandOutcome, OpenIncidentState } from '../../api/client';
+import type { AmsCommandOutcome, AmsPostureFamily, OpenIncidentState } from '../../api/client';
 import type { ToastType } from '../../contexts/ToastContext';
 import en from '../../i18n/locales/en';
 
@@ -143,24 +144,26 @@ async function hoverSlot(slot: Element) {
 
 const toastCopy = en.printers.toast;
 
-/** [outcome, rendered copy, toast variant] for a Load click. */
-const loadOutcomes: Array<[AmsCommandOutcome, string, ToastType]> = [
-  ['complete', toastCopy.loadInitiated, 'success'],
-  ['acted', toastCopy.loadInitiated, 'success'],
-  ['no_movement', toastCopy.amsLoadNoMovement, 'warning'],
-  ['undecidable', toastCopy.amsUnloadNothingLoaded, 'info'],
-  ['session_changed', toastCopy.amsCommandSessionChanged, 'warning'],
-  ['held', toastCopy.amsLoadHeld, 'warning'],
+/** [outcome, posture family, rendered copy, toast variant] for a Load click. */
+const loadOutcomes: Array<[AmsCommandOutcome, AmsPostureFamily, string, ToastType]> = [
+  ['complete', 'outside_change', toastCopy.loadInitiated, 'success'],
+  ['acted', 'outside_change', toastCopy.loadInitiated, 'success'],
+  ['no_movement', 'outside_change', toastCopy.amsLoadNoMovement, 'warning'],
+  ['undecidable', 'mid_change', toastCopy.amsUnloadNothingLoaded, 'info'],
+  ['session_changed', 'outside_change', toastCopy.amsCommandSessionChanged, 'warning'],
+  ['held', 'mid_change', toastCopy.amsLoadHeld, 'warning'],
+  ['held', 'outside_change', toastCopy.amsLoadHeldOutsideChange, 'warning'],
 ];
 
-/** [outcome, rendered copy, toast variant] for an Unload click. */
-const unloadOutcomes: Array<[AmsCommandOutcome, string, ToastType]> = [
-  ['complete', toastCopy.unloadInitiated, 'success'],
-  ['acted', toastCopy.unloadInitiated, 'success'],
-  ['no_movement', toastCopy.amsUnloadNoMovement, 'warning'],
-  ['undecidable', toastCopy.amsUnloadNothingLoaded, 'info'],
-  ['session_changed', toastCopy.amsCommandSessionChanged, 'warning'],
-  ['held', toastCopy.amsUnloadHeld, 'warning'],
+/** [outcome, posture family, rendered copy, toast variant] for an Unload click. */
+const unloadOutcomes: Array<[AmsCommandOutcome, AmsPostureFamily, string, ToastType]> = [
+  ['complete', 'outside_change', toastCopy.unloadInitiated, 'success'],
+  ['acted', 'outside_change', toastCopy.unloadInitiated, 'success'],
+  ['no_movement', 'outside_change', toastCopy.amsUnloadNoMovement, 'warning'],
+  ['undecidable', 'mid_change', toastCopy.amsUnloadNothingLoaded, 'info'],
+  ['session_changed', 'outside_change', toastCopy.amsCommandSessionChanged, 'warning'],
+  ['held', 'mid_change', toastCopy.amsUnloadHeld, 'warning'],
+  ['held', 'outside_change', toastCopy.amsUnloadHeldOutsideChange, 'warning'],
 ];
 
 /** A backend sentence that must never reach the screen. */
@@ -314,13 +317,13 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
     });
   });
 
-  it.each(loadOutcomes)('Load answered %s renders "%s" as a %s toast', async (outcome, copy, type) => {
+  it.each(loadOutcomes)('Load answered %s (%s) renders "%s" as a %s toast', async (outcome, family, copy, type) => {
     const user = userEvent.setup();
 
     server.use(
       http.get('/api/v1/printers/:id/status', () => HttpResponse.json(mockIdleStatusWithAms)),
       http.post('/api/v1/printers/:id/ams/load', () =>
-        HttpResponse.json({ outcome, message: BACKEND_MESSAGE }),
+        HttpResponse.json({ outcome, message: BACKEND_MESSAGE, family }),
       ),
     );
 
@@ -339,13 +342,13 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
     expect(screen.queryByText(BACKEND_MESSAGE)).not.toBeInTheDocument();
   });
 
-  it.each(unloadOutcomes)('Unload answered %s renders "%s" as a %s toast', async (outcome, copy, type) => {
+  it.each(unloadOutcomes)('Unload answered %s (%s) renders "%s" as a %s toast', async (outcome, family, copy, type) => {
     const user = userEvent.setup();
 
     server.use(
       http.get('/api/v1/printers/:id/status', () => HttpResponse.json(mockIdleStatusWithAms)),
       http.post('/api/v1/printers/:id/ams/unload', () =>
-        HttpResponse.json({ outcome, message: BACKEND_MESSAGE }),
+        HttpResponse.json({ outcome, message: BACKEND_MESSAGE, family }),
       ),
     );
 
@@ -405,7 +408,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
       server.use(
         http.post('/api/v1/printers/:id/ams/load', ({ request }) => {
           sentTrayIds.push(new URL(request.url).searchParams.get('tray_id'));
-          return HttpResponse.json({ outcome: 'held', message: BACKEND_MESSAGE });
+          return HttpResponse.json({ outcome: 'held', message: BACKEND_MESSAGE, family: 'mid_change' });
         }),
       );
       await renderCard(statusWithIncident(true));
@@ -437,7 +440,7 @@ describe('PrintersPage - AMS load/unload (#891)', () => {
       server.use(
         http.post('/api/v1/printers/:id/ams/unload', () => {
           unloadCalls += 1;
-          return HttpResponse.json({ outcome: 'held', message: BACKEND_MESSAGE });
+          return HttpResponse.json({ outcome: 'held', message: BACKEND_MESSAGE, family: 'mid_change' });
         }),
       );
       await renderCard(statusWithIncident(true));

@@ -13,6 +13,9 @@ were deleted in both — one origin per helper and per sentinel).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal
+
 from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid
 
 # Firmware's "no tag" sentinels. The merge in ``bambu_mqtt._handle_ams_data``
@@ -109,6 +112,111 @@ def valid_feeder(value: object) -> int | None:
     if tray is None:
         return None
     return tray if 0 <= tray < TRAY_NOW_EXTERNAL_SPOOL else None
+
+
+# --- the toolhead feed: is THIS extruder fed, and from what -------------------------
+#
+# What a feeder reading says about the filament at ONE extruder. ``fed`` = a real AMS
+# feeder (:func:`valid_feeder`, global tray 0..253 — AMS-HT ids included); ``external`` =
+# the external spool holder (:data:`TRAY_NOW_EXTERNAL_SPOOL`); ``empty`` = nothing is
+# feeding (:data:`TRAY_NOW_NOTHING_FED` — never "the path is clear", invariant 8);
+# ``unknown`` = nothing parseable was read, which is never a stand-in for empty.
+FeedKind = Literal["fed", "external", "empty", "unknown"]
+
+
+@dataclass(frozen=True)
+class ExtruderFeed:
+    """One extruder's feed reading. ``tray`` is the global tray id exactly when
+    ``kind == "fed"``, else ``None`` — a sentinel is a kind, never a tray."""
+
+    kind: FeedKind
+    tray: int | None = None
+
+
+_EXTERNAL_FEED = ExtruderFeed("external")
+_EMPTY_FEED = ExtruderFeed("empty")
+_UNKNOWN_FEED = ExtruderFeed("unknown")
+
+# The extruder a single-nozzle machine feeds through: ``PrinterState.active_extruder``'s
+# own default, and the main (right) nozzle of the dual-nozzle id convention
+# (``0`` = right/main, ``1`` = left/deputy). Named so the fallback below reads as that
+# convention, not as a bare zero.
+MAIN_EXTRUDER_ID = 0
+
+
+def extruder_feed(value: object) -> ExtruderFeed:
+    """Classify ONE feeder reading (a ``tray_now`` or a per-extruder ``snow`` value,
+    already normalized to a global tray by the client). Pure and total: anything
+    unparseable, and any integer that is neither a feeder nor one of the two sentinels,
+    is ``unknown``."""
+    tray = valid_feeder(value)
+    if tray is not None:
+        return ExtruderFeed("fed", tray)
+    parsed = parse_int_field(value)
+    if parsed == TRAY_NOW_EXTERNAL_SPOOL:
+        return _EXTERNAL_FEED
+    if parsed == TRAY_NOW_NOTHING_FED:
+        return _EMPTY_FEED
+    return _UNKNOWN_FEED
+
+
+@dataclass(frozen=True)
+class ToolheadFeed:
+    """THE reading of "is the toolhead fed" (K1, the 011/014-H2S 2026-10-09/10 review fold):
+    every extruder's :class:`ExtruderFeed`, plus the ACTIVE extruder's.
+
+    The active reading is the one a refill or a "did it print air" decision needs: on a
+    dual-nozzle H2C an empty ACTIVE nozzle beside a loaded one prints air, so "is ANY
+    extruder fed" — the per-extruder map's union — answers the wrong question for it.
+    ``extruders`` is sorted by extruder id; ``active_extruder`` is ``None`` only when no
+    state was read at all. "A filament change is in flight" is NOT part of this reading:
+    that posture has one origin, ``bambu_mqtt.ams_mid_filament_change``, and consumers
+    compose the two.
+    """
+
+    extruders: tuple[tuple[int, ExtruderFeed], ...]
+    active_extruder: int | None
+    active: ExtruderFeed
+
+    def extruder(self, extruder_id: int) -> ExtruderFeed:
+        """One extruder's reading; ``unknown`` for an extruder the wire did not describe."""
+        return next((feed for eid, feed in self.extruders if eid == extruder_id), _UNKNOWN_FEED)
+
+
+def toolhead_feed(state: object) -> ToolheadFeed:
+    """Read the toolhead feed off a printer state — duck-typed, never raises.
+
+    It reads three fields by name, the ones the MQTT client keeps for exactly this
+    (``PrinterState``): ``h2d_extruder_snow`` (``{extruder_id: global_tray}``, normalized
+    from ``device.extruder.info[N].snow`` and populated ONLY on a dual-nozzle machine,
+    whose firmware sends two extruder blocks), ``active_extruder``, and ``tray_now``.
+
+    * Dual nozzle (the per-extruder map is non-empty): each listed extruder from its own
+      ``snow``; the active reading is ``snow[active_extruder]``, and ``unknown`` when the
+      map does not list the active extruder — ``tray_now`` there is a single value the
+      client had to guess onto an AMS unit, so it never stands in for a missing reading.
+    * Single nozzle: ``tray_now`` IS the one extruder's feeder, keyed by
+      ``active_extruder`` (:data:`MAIN_EXTRUDER_ID` when the state carries none).
+    * No state: no extruders, an ``unknown`` active reading.
+
+    A pure leaf (no client import) so it serves a live state and a recorded one alike;
+    it rides the ~1 Hz status callback, hence total (invariant 10).
+    """
+    if state is None:
+        return ToolheadFeed(extruders=(), active_extruder=None, active=_UNKNOWN_FEED)
+    active_id = parse_int_field(getattr(state, "active_extruder", None))
+    snow = getattr(state, "h2d_extruder_snow", None)
+    if isinstance(snow, dict) and snow:
+        readings: dict[int, ExtruderFeed] = {}
+        for raw_id, value in snow.items():
+            extruder_id = parse_int_field(raw_id)
+            if extruder_id is not None:
+                readings[extruder_id] = extruder_feed(value)
+        active = readings.get(active_id, _UNKNOWN_FEED) if active_id is not None else _UNKNOWN_FEED
+        return ToolheadFeed(extruders=tuple(sorted(readings.items())), active_extruder=active_id, active=active)
+    the_one = active_id if active_id is not None else MAIN_EXTRUDER_ID
+    reading = extruder_feed(getattr(state, "tray_now", None))
+    return ToolheadFeed(extruders=((the_one, reading),), active_extruder=the_one, active=reading)
 
 
 def parse_int_field(raw: object) -> int | None:

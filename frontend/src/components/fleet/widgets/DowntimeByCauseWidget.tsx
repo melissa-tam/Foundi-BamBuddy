@@ -13,9 +13,9 @@
  *
  * ## Why one hue
  *
- * All twelve causes are the same fact — the printer cannot take work — so they
- * share the down hue and separate by VALUE, actionable causes first. Twelve
- * hues would claim the causes are twelve different kinds of thing, and the only
+ * All thirteen causes are the same fact — the printer cannot take work — so they
+ * share the down hue and separate by VALUE, actionable causes first. Thirteen
+ * hues would claim the causes are thirteen different kinds of thing, and the only
  * other hues this palette owns already mean printing, between prints and
  * maintenance. The bands are NOT additionally hatched: in a chart where every
  * band is down, the hatch would be constant and would only flatten the shade
@@ -23,7 +23,7 @@
  * marking a bucket the recorder only partly covered.
  *
  * The legend lists only the causes that actually occurred in the window, so a
- * clean month does not print a twelve-entry legend of things that did not
+ * clean month does not print a thirteen-entry legend of things that did not
  * happen.
  */
 import { useTranslation } from 'react-i18next';

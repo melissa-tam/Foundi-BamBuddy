@@ -100,15 +100,24 @@ for _occupancy_code in PLATE_CHECK_HMS_CODES:
 # The category for a stop a HUMAN attributed and the printer explained nothing about.
 USER_CANCELLED_CATEGORY = "User cancelled"
 
+# The category of a FINISH the farm records ``failed`` because the job printed layers with NOTHING
+# fed (:func:`_printed_without_filament`). A KEY, not an English label like the printer's categories
+# above: the archive's and print log's ``failure_reason`` renders through the frontend's
+# ``editArchive.failureReasons`` copy, with the stored value as its own fallback (which is how the
+# legacy English categories still render), so this one is worded once per locale there. The
+# layer-specific sentence is the outcome's ``printer_message`` (:func:`_printed_without_filament_sentence`).
+PRINTED_WITHOUT_FILAMENT_CATEGORY = "printed_without_filament"
+
 # Raw firmware words a stop can arrive as. ``aborted`` is the client's word for a job
 # that ended in neither FINISH nor FAILED (``bambu_mqtt``), and the downtime reconcile's
 # for an outcome it could not read.
 _STOP_RAW_STATUSES: frozenset[str] = frozenset({"failed", "aborted"})
 
 # What the job that ended is charged for — :func:`_charge_basis` decides it, the usage tracker
-# obeys it. ``full`` = the whole plate's slicer grams; ``partial`` = scaled by the TERMINAL
-# PAYLOAD's own peaks (``last_progress`` / ``last_layer_num``, never the live printer's, which by
-# then may describe another job); ``none`` = nothing is charged.
+# obeys it. ``full`` = the whole plate's slicer grams; ``partial`` = to the extent the TERMINAL
+# PAYLOAD says the job fed (``job_extent.JobExtent.charged_extent``: its own peaks, ending at the
+# first layer it printed with nothing fed — never the live printer's, which by then may describe
+# another job); ``none`` = nothing is charged.
 ChargeBasis = Literal["full", "partial", "none"]
 
 # How far back the plate-check ladder looks for the farm's OTHER failed-re-check stops on the same
@@ -194,14 +203,17 @@ class TerminalOutcome:
     printer was already holding" is decided from this captured fact, never from a store
     read after the terminal's own closers have emptied it.
 
-    ``failure_category`` — the archive's / print log's ``failure_reason``: the printer's
-    mapped category for a non-completed terminal whose evidence carries one, "User
-    cancelled" for an operator-attributed stop the printer explained nothing about,
-    else None.
+    ``failure_category`` — the archive's / print log's ``failure_reason``:
+    :data:`PRINTED_WITHOUT_FILAMENT_CATEGORY` for a FINISH recorded failed because the job
+    printed on air, else the printer's mapped category for a non-completed terminal whose
+    evidence carries one, "User cancelled" for an operator-attributed stop the printer
+    explained nothing about, else None.
 
-    ``printer_message`` — the printer's own words for a non-completed terminal (the
-    queue row's ``error_message``, the notification's ``{reason}``), rendered by the one
-    HMS renderer; None when the printer said nothing.
+    ``printer_message`` — why a non-completed terminal ended, for the operator (the queue
+    row's ``error_message``, the notification's ``{reason}``): the farm's measured sentence
+    for a FINISH that printed without filament first ("Printed without filament from layer
+    93 of 167"), then the printer's own words, rendered by the one HMS renderer; None when
+    neither has anything to say.
 
     ``plate_refusal`` — set when the verdict is ``plate_refused`` and the refusal is
     ESCALATED: the plate authority's gate cause, carrying the printer's words for the check
@@ -245,6 +257,24 @@ def _recorded_messages(incident: Mapping[str, object]) -> tuple[PrinterMessage, 
     return tuple(messages)
 
 
+def _printed_without_filament(raw_status: str, evidence: DepositEvidence, *, is_eject: bool) -> bool:
+    """Did the printer say FINISH over layers it printed with NOTHING fed (``JobExtent.printed_unfed``)?
+
+    The FINISH is the firmware reaching the end of its G-code, not filament reaching the plate: a job
+    resumed onto an empty toolhead runs to the end on air (011-H2S from layer 93 of 167, 014-H2S from
+    layer 9, 2026-10-09; the firmware does not reload on resume). An eject sweep and a dry run are
+    motion-only files, which feed nothing by design, so an empty extruder under them proves nothing.
+    """
+    return raw_status == "completed" and evidence.printed_unfed and not is_eject and not evidence.is_dry_run
+
+
+def _printed_without_filament_sentence(evidence: DepositEvidence) -> str:
+    """The operator's sentence for :func:`_printed_without_filament` — the measured layer, and the
+    job's layer count when the slicer stated one."""
+    total = f" of {evidence.total_layers}" if evidence.total_layers else ""
+    return f"Printed without filament from layer {evidence.first_unfed_layer}{total}"
+
+
 def _recorded_status(
     raw_status: str,
     verdict: StopVerdict | None,
@@ -255,6 +285,12 @@ def _recorded_status(
 ) -> str:
     """The farm's word for this terminal. Every rewrite, with its reason, in one place.
 
+    * a FINISH that printed layers with nothing fed (:func:`_printed_without_filament`) → ``failed``,
+      a first article included: the part was not made past the unfed layer, so it is not a produced
+      unit. It takes the ordinary failed disposition — the plate's one retry, the printer's
+      consecutive-failure count, the plate gate of a deposit — instead of completing a unit and
+      charging the whole plate (011-H2S / 014-H2S, 2026-10-09). The only rewrite of a FINISH, so
+      first; an eject sweep and a dry run are excluded (motion-only).
     * a requeue verdict (``farm_correlation.REQUEUE_VERDICTS``) → ``cancelled``, a FIRST
       ARTICLE included. ``plate_refused``: the printer refused the plate; nothing was
       printed and nothing failed. ``fault_restart``: the farm stopped a job that had
@@ -279,6 +315,8 @@ def _recorded_status(
       holds, a human is paged, RESUME tops the deficit back up), and ONE word describes
       the terminal in the queue row, the archive and the page alike.
     """
+    if _printed_without_filament(raw_status, evidence, is_eject=is_eject):
+        return "failed"
     if verdict in REQUEUE_VERDICTS and raw_status != "completed":
         return "cancelled"
     if verdict == "operator_ui" and raw_status in _STOP_RAW_STATUSES:
@@ -299,6 +337,11 @@ def _charge_basis(raw_status: str, verdict: StopVerdict | None, evidence: Deposi
 
     * the downtime reconcile's unknown outcome (verdict ``reconcile_unknown``, the payload's
       ``outcome_unknown``) → ``none``: nobody observed how the job ended or how far it ran.
+    * the job printed a layer with NOTHING fed (a measured ``first_unfed_layer``) → ``partial``, to
+      the extent it fed (``JobExtent.charged_extent``) — a FINISH included, and after an attach too
+      (the layer number is absolute). A layer printed on air is not a layer fed: 011-H2S and 014-H2S
+      (2026-10-09) were resumed onto an empty toolhead, ran to the end on air, said FINISH and were
+      charged the whole plate.
     * the printer said FINISH (raw ``completed``) → ``full``: the whole plate ran through. The RAW
       word, because it is the printer's own statement that the job reached its end; a recorded
       rewrite (a dry run recorded ``cancelled``) does not un-extrude anything, and a motion-only
@@ -320,6 +363,8 @@ def _charge_basis(raw_status: str, verdict: StopVerdict | None, evidence: Deposi
     """
     if verdict == STOP_SOURCE_RECONCILE_UNKNOWN:
         return "none"
+    if evidence.first_unfed_layer is not None:
+        return "partial"
     if raw_status == "completed":
         return "full"
     if evidence.peaks_reliable:
@@ -408,15 +453,24 @@ def build_terminal_outcome(
 
     recorded_status = _recorded_status(raw_status, verdict, evidence, first_article=first_article, is_eject=is_eject)
     ended_without_part = recorded_status != "completed"
+    # A FINISH recorded failed for printing on air: the measured layer IS the failure's cause, ahead
+    # of whatever the printer's codes say (they describe the fault before the resume, not the air).
+    printed_without_filament = _printed_without_filament(raw_status, evidence, is_eject=is_eject)
 
     category: str | None = None
-    if ended_without_part:
+    if printed_without_filament:
+        category = PRINTED_WITHOUT_FILAMENT_CATEGORY
+    elif ended_without_part:
         category = next(
             (_HMS_FAILURE_REASONS[m.short_code] for m in printer_evidence if m.short_code in _HMS_FAILURE_REASONS),
             None,
         )
         if category is None and verdict in OPERATOR_STOP_VERDICTS:
             category = USER_CANCELLED_CATEGORY
+
+    message_parts = [_printed_without_filament_sentence(evidence)] if printed_without_filament else []
+    if printer_words := summary_of(printer_evidence):
+        message_parts.append(printer_words)
 
     retries = verdict == STOP_VERDICT_PLATE_REFUSED and farm_retries(plate_check, evidence=evidence)
     if retries and plate_check is not None and plate_check.item_id != resolved_item_id:
@@ -448,7 +502,7 @@ def build_terminal_outcome(
         verdict=verdict,
         faults_open=open_holds_at_terminal(open_incidents),
         failure_category=category,
-        printer_message=summary_of(printer_evidence) if ended_without_part else None,
+        printer_message="; ".join(message_parts) if ended_without_part and message_parts else None,
         plate_refusal=refusal,
         charge=_charge_basis(raw_status, verdict, evidence),
     )

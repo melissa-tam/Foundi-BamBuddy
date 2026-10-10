@@ -234,6 +234,31 @@ class TestEndedPayload:
         live.tray_change_log.append((2, 90))
         assert payload["tray_change_log"] == [(0, 0), (1, 60)]
 
+    @pytest.mark.parametrize("state", ["FINISH", "FAILED", "IDLE"])
+    def test_it_never_carries_an_unfed_layer_and_a_reconciled_finish_keeps_its_word(self, state):
+        """``first_unfed_layer`` is measured only by the client that WATCHED the job print
+        (``JobPeaks.terminal_fields``); a farm that was down measured nothing about what fed, so the
+        synthesis never carries the key — whatever the live state holds — and a reconciled FINISH
+        is recorded and charged exactly as before (``terminal_outcome``)."""
+        from backend.app.services.terminal_outcome import build_terminal_outcome
+
+        live = _ended_state(state, progress=100.0, layer=167, total_layers=167, first_unfed_layer=93)
+        payload = ended_payload(live, _GHOST)
+        assert "first_unfed_layer" not in payload
+
+        outcome = build_terminal_outcome(
+            raw_status=payload["status"],
+            verdict=None,
+            open_incidents=(),
+            job_id=payload["subtask_id"],
+            evidence=DepositEvidence.from_terminal_payload(payload, is_dry_run=False),
+            first_article=False,
+            is_eject=False,
+            hms_errors=None,
+        )
+        if state == "FINISH":
+            assert (outcome.recorded_status, outcome.charge) == ("completed", "full")
+
     def test_idle_synthesises_an_unknown_outcome(self):
         """The one classifier turns ``outcome_unknown`` into ``reconcile_unknown`` — the run HOLDS for
         a human instead of finishing one plate short (2026-09-19)."""

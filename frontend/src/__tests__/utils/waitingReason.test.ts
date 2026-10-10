@@ -75,6 +75,13 @@ describe('waitingReasonText', () => {
     );
   });
 
+  it('maps the empty-toolhead hold to operator copy, not a humanized token', () => {
+    // A `toolhead_refill` hold: "Toolhead empty" humanized would read as a
+    // fault statement; the copy states the pause, and the card's chip says
+    // whether the farm is loading or a load failed.
+    expect(waitingReasonText('toolhead_empty', t)).toBe('productionRuns.detail.waiting.toolheadEmpty');
+  });
+
   it('humanizes an unmapped bare token instead of returning it raw', () => {
     // Not in the tier-1 map → falls through to the humanizer.
     expect(waitingReasonText('some_new_hold', t)).toBe('Some new hold');

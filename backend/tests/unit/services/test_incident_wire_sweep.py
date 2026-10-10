@@ -418,14 +418,35 @@ class TestRepairClassSweep:
         assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 0
         assert await _row(db_session, printer.id) is not None
 
+    @staticmethod
+    def _running(tray_now: int):
+        """A RUNNING push whose ACTIVE extruder reads ``tray_now`` (single nozzle)."""
+        state = _state("RUNNING", [])
+        state.tray_now = tray_now
+        return state
+
     async def test_a_running_print_with_no_eject_closes_it(self, db_session, printer_factory, monkeypatch):
-        """The second evidence: a print is running THROUGH the path."""
+        """The second evidence: a print is FEEDING through the path — RUNNING with the active
+        extruder fed from an AMS tray (K12)."""
         printer = await printer_factory()
         await self._physical(db_session, printer.id)
-        _wire(monkeypatch, _state("RUNNING", []))
+        _wire(monkeypatch, self._running(1))
 
         assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
         assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 1
+
+    async def test_a_print_running_on_air_does_NOT_close_it(self, db_session, printer_factory, monkeypatch):
+        """011-H2S / 014-H2S 2026-10-09/10: a print resumed onto an EMPTY toolhead read RUNNING,
+        and a RUNNING print was "a print through the path" — the hold closed over air. A print
+        laying down nothing moves no filament through anything (K12)."""
+        printer = await printer_factory()
+        await self._physical(db_session, printer.id)
+        _wire(monkeypatch, self._running(255))
+
+        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
+        assert await spool_recovery.sweep_open_incidents(now=_DWELL + 1) == 0
+        assert await spool_recovery.rearm_incidents_on_startup() == 0
+        assert await _row(db_session, printer.id) is not None
 
     async def test_an_eject_sweep_running_is_NOT_evidence(self, db_session, printer_factory, monkeypatch):
         """An eject is filament-LESS: the toolhead crossing the plate says nothing
@@ -437,7 +458,7 @@ class TestRepairClassSweep:
 
         printer = await printer_factory()
         await self._physical(db_session, printer.id)
-        _wire(monkeypatch, _state("RUNNING", []))
+        _wire(monkeypatch, self._running(1))  # fed, so the eject is the one disqualifier
         plate_occupancy.reset_for_tests()
         try:
             plate_occupancy.hydrate_plate(printer.id, "task-0", EscalationOnly())
@@ -509,7 +530,7 @@ class TestRepairClassSweep:
     async def test_a_restart_onto_a_running_print_closes_it(self, db_session, printer_factory, monkeypatch):
         printer = await printer_factory()
         await self._physical(db_session, printer.id)
-        _wire(monkeypatch, _state("RUNNING", []))
+        _wire(monkeypatch, self._running(1))
 
         assert await spool_recovery.rearm_incidents_on_startup() == 1
         assert await _row(db_session, printer.id) is None

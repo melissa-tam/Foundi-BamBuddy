@@ -79,11 +79,13 @@ from backend.app.services.spool_tag_matcher import (
 )
 from backend.app.services.tray_fields import (
     TRAYS_PER_AMS_UNIT,
+    extruder_feed,
     filam_bak_groups,
     normalized_tag_uid,
     normalized_tray_uuid,
     parse_filam_bak,
     tray_presence_from_dict,
+    valid_feeder,
 )
 from backend.app.utils.tag_normalization import normalize_tag_uid, normalize_tray_uuid, tag_matches_row
 
@@ -1022,7 +1024,11 @@ async def _resolve_exhausted_tray(
     )
     item = result.scalar_one_or_none()
     tray_now = getattr(state, "tray_now", None)
-    live_ok = tray_now is not None and 0 <= tray_now <= 254
+    # The live feeder is admissible when it names a PHYSICAL feeder — an AMS tray or the
+    # external holder (``tray_fields.extruder_feed``: fed / external) — never "nothing fed"
+    # (255) or an unreadable value. An identity reading of ``tray_now`` (which tray), through
+    # the one vocabulary.
+    live_ok = extruder_feed(tray_now).kind in ("fed", "external")
 
     # The inference itself is UNCHANGED — it is computed once here so the topology
     # gate below applies to every one of its outcomes rather than to some of them.
@@ -1437,7 +1443,7 @@ def _update_stable_feeder(printer_id: int, current: int) -> None:
     if seen is None or seen[0] != current:
         _feeder_since[printer_id] = (current, now)
         return
-    if now - seen[1] >= _SWAP_CONFIRM_S and 0 <= current <= 253:
+    if now - seen[1] >= _SWAP_CONFIRM_S and valid_feeder(current) is not None:
         _stable_feeder[printer_id] = current
 
 
@@ -1748,9 +1754,11 @@ def sample_status_push(printer_id: int, state) -> list[int]:
 
     if prev is None or prev == current:
         return confirmed
-    if prev < 0 or prev >= 254:
+    # Both ends of the edge must be real AMS feeders (``tray_fields.valid_feeder`` — an
+    # identity reading of which tray departed and which arrived, never "is it fed").
+    if valid_feeder(prev) is None:
         return confirmed  # departed from an unloaded / external sentinel — not a swap edge
-    if not (0 <= current <= 253):
+    if valid_feeder(current) is None:
         return confirmed  # switched to unloaded/external, not an AMS backup switch
     if _consume_commanded_load(printer_id, current):
         return confirmed  # our own recovery/UI swap — never a firmware runout

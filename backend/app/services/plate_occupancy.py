@@ -40,7 +40,9 @@ hydrated: :class:`Evidence` carries ``live_state`` (the wire) and ``db_claim`` (
 derived facts derived is what stops a sixth store from growing here.
 
 **I/O-free by contract.** Stdlib only: no session, no models, no ``await``, no event
-loop, no imports from ``backend.app``. Every transition is a synchronous pure
+loop, and one import from ``backend.app`` — ``job_extent``, itself a stdlib-only leaf with no
+``backend.app`` import (the terminal payload's extent keys, read once, which
+:class:`DepositEvidence` is built on), so the closure stays stdlib-only. Every transition is a synchronous pure
 mutation of the in-memory record plus one fan-out. If this module ever needs an
 ``await``, the design is wrong — the I/O half is ``plate_occupancy_store`` and the
 four side effects are injected through :meth:`PlateOccupancy.configure`.
@@ -80,6 +82,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal
+
+from backend.app.services.job_extent import JobExtent
 
 if TYPE_CHECKING:
     # Annotation-only: the core stays stdlib-only at RUNTIME. The messages it stores are
@@ -217,8 +221,11 @@ class Evidence:
 
 
 @dataclass(frozen=True)
-class DepositEvidence:
+class DepositEvidence(JobExtent):
     """Did this terminal job leave something on the plate?
+
+    Built on the job's extent as its terminal payload states it (``job_extent.JobExtent`` — the one
+    parse the usage charge reads too), plus the terminal's own word and whether the file was a dry run.
 
     The 2026-08-29 restart cascade is the whole reason ``peaks_reliable`` exists.
     ``last_layer_num`` / ``last_progress`` are peaks tracked in the MQTT client's
@@ -243,9 +250,6 @@ class DepositEvidence:
 
     final_status: str
     is_dry_run: bool
-    peaks_reliable: bool
-    last_layer_num: int | None
-    last_progress: float | None
 
     @property
     def deposited(self) -> bool:
@@ -256,7 +260,7 @@ class DepositEvidence:
             return True
         if not self.peaks_reliable:
             return True
-        return not ((self.last_layer_num or 0) == 0 and (self.last_progress or 0) == 0)
+        return not (self.last_layer_num == 0 and self.last_progress == 0)
 
     @classmethod
     def from_terminal_payload(cls, data: Mapping[str, Any], *, is_dry_run: bool) -> DepositEvidence:
@@ -264,14 +268,13 @@ class DepositEvidence:
 
         ``peaks_reliable`` defaults to **False** when the key is absent: an older
         client, a virtual printer that has not caught up, or any payload shaped
-        before that key existed must all land on the fail-closed side.
+        before that key existed must all land on the fail-closed side. The extent
+        keys are ``JobExtent.payload_fields``' one parse.
         """
         return cls(
             final_status=str(data.get("status", "completed")),
             is_dry_run=bool(is_dry_run),
-            peaks_reliable=bool(data.get("peaks_reliable", False)),
-            last_layer_num=data.get("last_layer_num"),
-            last_progress=data.get("last_progress"),
+            **JobExtent.payload_fields(data),
         )
 
     @classmethod
@@ -281,13 +284,7 @@ class DepositEvidence:
         There are no peaks to be reliable about, so this is the fail-closed form by
         construction: anything but a dry run deposits.
         """
-        return cls(
-            final_status=final_status,
-            is_dry_run=False,
-            peaks_reliable=False,
-            last_layer_num=None,
-            last_progress=None,
-        )
+        return cls(final_status=final_status, is_dry_run=False)
 
     @classmethod
     def live(cls, peaks: JobPeaks) -> DepositEvidence:
@@ -302,7 +299,8 @@ class DepositEvidence:
         reading included (:attr:`JobPeaks.peak_layer_num`): a job paused mid-way through
         its first layer has saved nothing yet and must still read as deposited. Read by the
         recovery driver's restart rung (operator ruling 2026-09-29), which ends a job only
-        when this says nothing is on the plate.
+        when this says nothing is on the plate. It carries only what the deposit rule
+        reads: a live job has no layer count or unfed layer to charge yet.
         """
         return cls(
             final_status=_LIVE_JOB,

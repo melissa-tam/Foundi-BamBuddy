@@ -970,24 +970,32 @@ describe('PrintersPage', () => {
      * The chip's tooltip names a person's exits only once they exist. While the
      * farm still answers a plate check (re-check, stop-and-retry) there is no
      * "Ignore and resume" on the card and the backend answers a press with 409,
-     * so the amber chip says what the farm is doing instead.
+     * so the amber chip says what the farm is doing instead. The tooltip rides
+     * the chip's focusable InfoHint trigger (its accessible name is the
+     * tooltip), never a native `title` a keyboard user cannot reach.
      */
     it('names no exit on the plate-check chip while the farm is still acting', async () => {
       serveStatus({ state: 'PAUSE', hms_errors: [], open_incident: heldBy('plate_vision', [], { status: 'recovering' }) });
       render(<PrintersPage />);
 
-      const chip = await screen.findByTitle(en.printers.incidentRecoveringAction.plate_vision);
-      expect(chip).toHaveTextContent(en.printers.incident.recovering);
-      expect(screen.queryByTitle(en.printers.incidentAction.plate_vision)).not.toBeInTheDocument();
+      expect(
+        await screen.findByRole('button', { name: en.printers.incidentRecoveringAction.plate_vision }),
+      ).toBeInTheDocument();
+      expect(screen.getByText(en.printers.incident.recovering)).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: en.printers.incidentAction.plate_vision })).not.toBeInTheDocument();
     });
 
     it("names the exits on the plate-check chip on the person's turn", async () => {
       serveStatus({ state: 'PAUSE', hms_errors: [], open_incident: heldBy('plate_vision', [], { status: 'escalated' }) });
       render(<PrintersPage />);
 
-      const chip = await screen.findByTitle(en.printers.incidentAction.plate_vision);
-      expect(chip).toHaveTextContent(en.printers.incident.plate_vision);
-      expect(screen.queryByTitle(en.printers.incidentRecoveringAction.plate_vision)).not.toBeInTheDocument();
+      expect(
+        await screen.findByRole('button', { name: en.printers.incidentAction.plate_vision }),
+      ).toBeInTheDocument();
+      expect(screen.getByText(en.printers.incident.plate_vision)).toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: en.printers.incidentRecoveringAction.plate_vision }),
+      ).not.toBeInTheDocument();
     });
 
     // A runout row is `recovering` while it waits for the operator's refill, so
@@ -1003,10 +1011,60 @@ describe('PrintersPage', () => {
         render(<PrintersPage />);
 
         expect(
-          await screen.findByTitle(`${en.printers.incidentAction.runout} — AMS A slot 2`),
+          await screen.findByRole('button', { name: `${en.printers.incidentAction.runout} — AMS A slot 2` }),
         ).toBeInTheDocument();
       },
     );
+
+    /*
+     * The empty toolhead (operator requirement 2026-10-10: "when i click resume
+     * there MUST be filament loaded"). The card says "Toolhead empty" while the
+     * farm loads it, when a load failed — even under the jam row it ran on —
+     * and when a paused print sits on it with nothing open.
+     */
+    it('shows "Toolhead empty" with the slot the farm is loading', async () => {
+      serveStatus({
+        state: 'PAUSE',
+        hms_errors: [],
+        open_incident: heldBy('toolhead_refill', [], { status: 'recovering' }),
+        toolhead: { feed: 'empty', tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } },
+      });
+      render(<PrintersPage />);
+
+      expect(
+        await screen.findByRole('button', { name: en.printers.toolhead.loading.replace('{{slot}}', 'AMS A slot 1') }),
+      ).toBeInTheDocument();
+      expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
+    });
+
+    it('surfaces a failed refill under a jam row as "Toolhead empty"', async () => {
+      serveStatus({
+        state: 'PAUSE',
+        hms_errors: [],
+        open_incident: heldBy('jam', [], { status: 'escalated', slot_desc: 'AMS A slot 3' }),
+        toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'no_movement' } },
+      });
+      render(<PrintersPage />);
+
+      const tooltip = [
+        en.printers.toolhead.loadFailed.replace('{{slot}}', 'AMS A slot 1'),
+        en.printers.toolhead.answer.no_movement,
+        en.printers.incidentAction.toolhead_refill,
+      ].join(' ');
+      expect(await screen.findByRole('button', { name: tooltip })).toBeInTheDocument();
+      expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
+      expect(screen.queryByText(en.printers.incident.jam)).not.toBeInTheDocument();
+    });
+
+    it('shows "Toolhead empty" on a paused print with nothing fed and no hold open', async () => {
+      serveStatus({ state: 'PAUSE', hms_errors: [], toolhead: { feed: 'empty', tray: null, refill: null } });
+      render(<PrintersPage />);
+
+      expect(
+        await screen.findByRole('button', { name: en.printers.incidentAction.toolhead_refill }),
+      ).toBeInTheDocument();
+      expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();
+    });
 
     const refusedPlate =(refusal: { messages: Array<{ short_code: string; description: string }> } | null) => ({
       state: 'IDLE',
@@ -1220,6 +1278,138 @@ describe('PrintersPage', () => {
         await screen.findByText(en.printers.plateCheck.refused.replace('{{message}}', REFUSAL)),
       ).toBeInTheDocument();
       expect(screen.queryByText(en.printers.plateCheck.sent)).not.toBeInTheDocument();
+    });
+  });
+
+  /**
+   * A Bambuddy resume over an EMPTY toolhead loads first (operator requirement
+   * 2026-10-10: "when i click resume there MUST be filament loaded"): the backend
+   * answers `refilling` at once, or refuses with a closed reason and sends
+   * nothing. Each answer gets its own sentence; a bulk resume gets ONE toast
+   * that counts them. Copy is asserted through the `en` leaves.
+   */
+  describe('resume over an empty toolhead', () => {
+    const paused = { ...mockPrinterStatus, state: 'PAUSE', hms_errors: [] };
+
+    const refusal = (reason: string, message = 'server sentence') =>
+      HttpResponse.json({ detail: { reason, slot: null, answer: null, message } }, { status: 409 });
+
+    /** Press the card's Resume and confirm it. */
+    const resumeFromCard = async () => {
+      const user = userEvent.setup();
+      await user.click(await screen.findByRole('button', { name: en.printers.resume }));
+      const dialog = await screen.findByRole('dialog');
+      await user.click(within(dialog).getByRole('button', { name: en.printers.confirm.resumeButton }));
+    };
+
+    const serveOnePaused = (resume: Parameters<typeof http.post>[1]) => {
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([mockPrinters[0]])),
+        http.get('/api/v1/printers/:id/status', () => HttpResponse.json(paused)),
+        http.post('/api/v1/printers/:id/print/resume', resume),
+      );
+    };
+
+    it('says the print resumed when the resume went out', async () => {
+      serveOnePaused(() =>
+        HttpResponse.json({ success: true, status: 'resumed', slot: null, message: 'Print resume command sent' }),
+      );
+      render(<PrintersPage />);
+      await resumeFromCard();
+
+      expect(await screen.findByText(en.printers.toast.printResumed)).toBeInTheDocument();
+    });
+
+    it('names the slot the farm loads before it resumes', async () => {
+      serveOnePaused(() =>
+        HttpResponse.json({ success: true, status: 'refilling', slot: 'AMS A slot 1', message: 'fallback' }),
+      );
+      render(<PrintersPage />);
+      await resumeFromCard();
+
+      expect(
+        await screen.findByText(en.printers.toast.resumeRefilling.replace('{{slot}}', 'AMS A slot 1')),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(en.printers.toast.printResumed)).not.toBeInTheDocument();
+    });
+
+    it('says a spool loads when the selection picks the slot', async () => {
+      serveOnePaused(() =>
+        HttpResponse.json({ success: true, status: 'refilling', slot: null, message: 'fallback' }),
+      );
+      render(<PrintersPage />);
+      await resumeFromCard();
+
+      expect(await screen.findByText(en.printers.toast.resumeRefillingAnySlot)).toBeInTheDocument();
+    });
+
+    it("states a refusal in the reason's own words, not the server's", async () => {
+      serveOnePaused(() => refusal('maintenance'));
+      render(<PrintersPage />);
+      await resumeFromCard();
+
+      expect(await screen.findByText(en.printers.toast.resumeRefused.maintenance)).toBeInTheDocument();
+      expect(screen.queryByText('server sentence')).not.toBeInTheDocument();
+    });
+
+    it('falls back to the server sentence for a reason this build does not know', async () => {
+      serveOnePaused(() => refusal('a_newer_reason', 'Resume refused: newer reason.'));
+      render(<PrintersPage />);
+      await resumeFromCard();
+
+      expect(await screen.findByText('Resume refused: newer reason.')).toBeInTheDocument();
+    });
+
+    it('counts a bulk resume in ONE toast: refilling and refused', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', () => HttpResponse.json(paused)),
+        http.post('/api/v1/printers/:id/print/resume', ({ params }) =>
+          params.id === '1'
+            ? HttpResponse.json({ success: true, status: 'refilling', slot: 'AMS A slot 1', message: 'fallback' })
+            : refusal('physical'),
+        ),
+      );
+      render(<PrintersPage />);
+      await screen.findByText('P1S Backup');
+      await screen.findAllByRole('button', { name: en.printers.resume });
+
+      fireEvent.click(screen.getByTitle('Select'));
+      fireEvent.click(await screen.findByRole('button', { name: en.printers.bulk.selectAll }));
+      const toolbar = screen.getByRole('button', { name: en.printers.bulk.selectAll }).parentElement!;
+      const bulkResume = within(toolbar).getByRole('button', { name: en.printers.bulk.actions.resume });
+      await waitFor(() => expect(bulkResume).toBeEnabled());
+      fireEvent.click(bulkResume);
+
+      const summary = [
+        en.printers.bulk.resumeRefilling_one.replace('{{count}}', '1'),
+        en.printers.bulk.resumeRefused_one.replace('{{count}}', '1'),
+      ].join(' ');
+      expect(await screen.findByText(summary)).toBeInTheDocument();
+      // One toast for the batch: no per-printer sentence.
+      expect(screen.queryByText(en.printers.toast.resumeRefused.physical)).not.toBeInTheDocument();
+    });
+
+    it('counts a bulk resume that went out everywhere with the plural form', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', () => HttpResponse.json(paused)),
+        http.post('/api/v1/printers/:id/print/resume', () =>
+          HttpResponse.json({ success: true, status: 'resumed', slot: null, message: 'Print resume command sent' }),
+        ),
+      );
+      render(<PrintersPage />);
+      await screen.findByText('P1S Backup');
+      await screen.findAllByRole('button', { name: en.printers.resume });
+
+      fireEvent.click(screen.getByTitle('Select'));
+      fireEvent.click(await screen.findByRole('button', { name: en.printers.bulk.selectAll }));
+      const toolbar = screen.getByRole('button', { name: en.printers.bulk.selectAll }).parentElement!;
+      const bulkResume = within(toolbar).getByRole('button', { name: en.printers.bulk.actions.resume });
+      await waitFor(() => expect(bulkResume).toBeEnabled());
+      fireEvent.click(bulkResume);
+
+      expect(
+        await screen.findByText(en.printers.bulk.resumeResumed_other.replace('{{count}}', '2')),
+      ).toBeInTheDocument();
     });
   });
 

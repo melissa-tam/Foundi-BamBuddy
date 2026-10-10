@@ -583,8 +583,9 @@ async def _report_partial_usage(printer_id: int, tracking, evidence: "JobEvidenc
     multi-material tracking. Falls back to linear interpolation if G-code
     data is unavailable.
 
-    How far the job ran is ``evidence`` — the ENDING job's own last layer, layer count and last
-    progress, off its terminal payload (``usage_tracker.JobEvidence``). Never the live printer's:
+    How far the job FED is ``evidence.charged_extent`` — the ENDING job's own last layer and last
+    progress, ending at the first layer it printed with nothing fed, off its terminal payload
+    (``usage_tracker.JobEvidence``, the one extent parse ``job_extent.JobExtent``). Never the live printer's:
     by the time a terminal is processed the printer can be running another job, and a partial
     charge scaled by that job's progress is the 2026-09-16 → 24 phantom the internal-inventory
     charge made (~7.2 kg over 32 charges). The live printer is read only for the no-3MF branch's
@@ -606,12 +607,14 @@ async def _report_partial_usage(printer_id: int, tracking, evidence: "JobEvidenc
         if not spoolman_enabled or spoolman_enabled.lower() != "true":
             return
 
-    # The job's own last valid layer and slicer layer count — the firmware resets the live
-    # counters on a stop, the payload kept the last reading of THIS job.
-    current_layer = evidence.last_layer_num
+    # The layer the charge runs to and the job's slicer layer count — the firmware resets the live
+    # counters on a stop, the payload kept the last reading of THIS job, and a layer it printed with
+    # nothing fed ends the charge there (``JobExtent.charged_extent``).
+    extent = evidence.charged_extent
+    current_layer = extent.layer
     total_layers = evidence.total_layers
     last_progress = evidence.last_progress
-    progress_ratio_from_event = min(last_progress, 100.0) / 100.0 if last_progress > 0 else None
+    progress_ratio_from_event = extent.fraction if extent.fraction > 0 else None
 
     if current_layer <= 0 and progress_ratio_from_event and total_layers > 0:
         current_layer = max(1, int(round(total_layers * progress_ratio_from_event)))

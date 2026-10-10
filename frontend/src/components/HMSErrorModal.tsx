@@ -12,6 +12,7 @@ import type { HMSError, Permission } from '../api/client';
 import { api } from '../api/client';
 import { useToast } from '../contexts/ToastContext';
 import { formatHmsCode } from '../utils/hmsCode';
+import { refillingToast, refusalToast, resumeRefusalOf } from '../utils/printResume';
 import { Modal } from './ui/Modal';
 import { CardContent } from './Card';
 
@@ -72,15 +73,28 @@ export function HMSErrorModal({ printerName, errors, onClose, printerId, hasPerm
       print_error: data.print_error,
       job_id: data.job_id,
     }),
-    onSuccess: () => {
+    onSuccess: (answer) => {
       // Scope the invalidation to THIS printer. The prefix form
       // `['printerStatus']` would refresh every printer card on the page,
       // which is wasteful when only one printer's state actually changed.
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printerId] });
-      showToast(t('hmsErrors.actionSuccess', 'Action sent to printer'), 'success');
+      // A resume button over an empty toolhead: the farm loads first, then
+      // resumes (`utils/printResume`). Any other press answers as it always has.
+      if (answer.status === 'refilling') {
+        const toast = refillingToast(answer.slot, t);
+        showToast(toast.message, toast.type);
+      } else {
+        showToast(t('hmsErrors.actionSuccess', 'Action sent to printer'), 'success');
+      }
       onClose();
     },
     onError: (error: Error) => {
+      const refusal = resumeRefusalOf(error);
+      if (refusal !== null) {
+        const toast = refusalToast(refusal, t);
+        showToast(toast.message, toast.type);
+        return;
+      }
       showToast(
         `${t('hmsErrors.actionFailed', 'Failed to send action')}: ${error.message}`,
         'error',

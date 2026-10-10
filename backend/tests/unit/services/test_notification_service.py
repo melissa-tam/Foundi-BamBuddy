@@ -3189,6 +3189,37 @@ class TestSpoolRecoveryNotifications:
             assert "is left PAUSED" in mock_send.call_args.args[2]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("job_ended", [False, True])
+    async def test_a_toolhead_refill_page_names_the_toolhead_not_a_jam(
+        self, service, mock_provider, mock_db, job_ended
+    ):
+        """K10 (2026-10-10): the farm's refill of an EMPTY toolhead that could not load is its own
+        copy — never the jam's seeded swap-framed template (no swap was attempted)."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+
+            await service.on_spool_recovery_failed(
+                7,
+                "014-H2S",
+                "SKU007 plate",
+                "Load from AMS A slot 1 failed: no movement.",
+                mock_db,
+                kind="toolhead_refill",
+                job_ended=job_ended,
+            )
+
+            mock_build.assert_not_awaited()
+            title, message = mock_send.call_args.args[1], mock_send.call_args.args[2]
+            assert title == "Toolhead NOT refilled — 014-H2S"
+            assert "jam" not in f"{title} {message}".lower()
+            middle = "has ended." if job_ended else "is left PAUSED with an empty toolhead."
+            assert message == f"014-H2S: 'SKU007 plate' {middle} Load from AMS A slot 1 failed: no movement."
+
+    @pytest.mark.asyncio
     async def test_a_jam_give_up_over_a_live_pause_uses_the_paused_template(self, service, mock_provider, mock_db):
         from backend.app.models.notification_template import DEFAULT_TEMPLATES
 

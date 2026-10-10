@@ -3,7 +3,7 @@ import logging
 import re
 import zipfile
 from dataclasses import asdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
@@ -43,9 +43,12 @@ from backend.app.schemas.printer import (
     PrinterStatus,
     PrinterUpdate,
     PrintOptionsResponse,
+    PrintResumeRefusal,
+    PrintResumeResponse,
     RecoverResult,
     ServiceHoldState,
     SlotRecheckResponse,
+    ToolheadState,
 )
 from backend.app.services import ams_command, service_hold
 from backend.app.services.bambu_ftp import (
@@ -58,6 +61,7 @@ from backend.app.services.bambu_ftp import (
     get_storage_info_async,
     list_files_async,
 )
+from backend.app.services.bambu_mqtt import DIALOG_RESUME_ACTIONS
 from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.hms_actions import HMSAction
 from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, printer_message_from_full_code
@@ -81,17 +85,19 @@ from backend.app.services.printer_manager import (
     supports_chamber_temp,
     supports_drying,
     supports_drying_while_printing,
+    toolhead_payload,
 )
 from backend.app.services.slot_identity import resolve_slot_identity
 from backend.app.services.tray_fields import tray_presence_map
 from backend.app.utils.http import build_content_disposition
 
 if TYPE_CHECKING:
-    from backend.app.services.bambu_mqtt import CommandAck, SentCommand
+    from backend.app.services.bambu_mqtt import BambuMQTTClient, CommandAck, SentCommand
 
     # Type-only: the AMS services stay out of this module's runtime import graph (see the
     # local imports below — ``slot_recheck`` pulls the slot pipeline's model graph in with it).
     from backend.app.services.slot_recheck import RecheckVerdict
+    from backend.app.services.spool_recovery import ResumeRefused
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["printers"])
@@ -553,6 +559,9 @@ async def get_printer_status(
             # The plate-check human's turn — the one builder; with no session there is no
             # paused dialog to answer, so it reads null here.
             plate_check_exit=plate_check_exit_payload(printer_id, None),
+            # The toolhead — the one builder; with no session nothing is read (``unknown``), and the
+            # farm's refill state still reports (it is the incident store's own projection).
+            toolhead=ToolheadState(**toolhead_payload(printer_id, None)),
             # Hardware capabilities are facts about the MODEL, not about the MQTT
             # session, so they are reportable with no session — same as the sticky
             # flags above. Load-bearing: the printer card's chamber-fan and airduct
@@ -888,6 +897,8 @@ async def get_printer_status(
         open_incident=open_incident_payload(printer_id),
         # Same builder as the WS frame and the disconnected branch above.
         plate_check_exit=plate_check_exit,
+        # Same builder as the WS frame and the disconnected branch above.
+        toolhead=ToolheadState(**toolhead_payload(printer_id, state)),
         quarantined=printer.quarantined,
         quarantine_reason=printer.quarantine_reason,
         model_mismatch=printer_manager.is_model_mismatch(printer_id),
@@ -3132,27 +3143,57 @@ async def pause_print(
     return {"success": True, "message": "Print pause command sent"}
 
 
-@router.post("/{printer_id}/print/resume")
+@router.post("/{printer_id}/print/resume", response_model=PrintResumeResponse)
 async def resume_print(
     printer_id: int,
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
-):
-    """Resume a paused print job."""
+) -> PrintResumeResponse:
+    """Resume a paused print — the toolhead refilled first when it reads empty (K9, 2026-10-10).
+
+    The decision is ``spool_recovery.resume_paused_print``'s (Raymond 2026-10-10: "when i click
+    resume there MUST be filament loaded"); this maps its verdict. 200 ``resumed`` — the resume went
+    out; 200 ``refilling`` — answered AT ONCE: the farm refills the toolhead as the printer's
+    recovery driver and resumes once the load reached it (its outcome arrives in the status
+    projection's ``toolhead`` and, on a failure, a page); 409 with a :class:`PrintResumeRefusal`
+    detail — nothing sent, never a resume onto air; 400 not connected; 502 the publish did not go
+    out. The printers page's bulk resume is N calls of this route, each its own verdict.
+    """
+    from backend.app.services import spool_recovery
+
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
-    printer = result.scalar_one_or_none()
-    if not printer:
+    if result.scalar_one_or_none() is None:
         raise HTTPException(404, "Printer not found")
 
-    client = printer_manager.get_client(printer_id)
-    if not client:
-        raise HTTPException(400, "Printer not connected")
+    verdict = await spool_recovery.resume_paused_print(printer_id, actor="operator")
+    match verdict:
+        case spool_recovery.ResumeSent():
+            return PrintResumeResponse(status="resumed", message="Print resume command sent")
+        case spool_recovery.RefillStarted(slot=slot):
+            return PrintResumeResponse(status="refilling", slot=slot, message=_refilling_message(slot))
+        case spool_recovery.ResumeRefused():
+            raise HTTPException(409, detail=_resume_refusal(verdict))
+        case spool_recovery.ResumeNotSent(reason="not_connected"):
+            raise HTTPException(400, "Printer not connected")
+        case spool_recovery.ResumeNotSent():
+            raise HTTPException(
+                502, "Failed to resume print — printer MQTT session not connected, command not delivered"
+            )
+        case spool_recovery.ResumeStoodDown():
+            raise LookupError("an operator's resume carries no evidence to stand down on")
+        case _:
+            assert_never(verdict)
 
-    success = client.resume_print()
-    if not success:
-        raise HTTPException(502, "Failed to resume print — printer MQTT session not connected, command not delivered")
 
-    return {"success": True, "message": "Print resume command sent"}
+def _refilling_message(slot: str | None) -> str:
+    """The non-UI-client sentence of a ``refilling`` answer (sys-admin: the fact, then what follows)."""
+    source = f"from {slot}" if slot else "the toolhead"
+    return f"Toolhead empty. Refilling {source}, then resuming."
+
+
+def _resume_refusal(verdict: "ResumeRefused") -> dict:
+    """A refused resume → the typed 409 detail. The reason and the sentence are the service's."""
+    return PrintResumeRefusal(reason=verdict.reason, message=verdict.message).model_dump()
 
 
 @router.post("/{printer_id}/print-speed")
@@ -4144,7 +4185,7 @@ async def ams_load(
     - 255: Ext-R on dual-nozzle H2D
 
     ``services/ams_command`` sends the load in every AMS posture, reads the wire for its
-    operator window and answers 200 ``{outcome, message}`` with the measured outcome.
+    operator window and answers 200 ``{outcome, message, family}`` with the measured outcome.
     400 when the printer has no client or the publish did not go out; 409 while the
     printer is PAUSEd holding for a same-slot refill (the load would latch in firmware —
     006-H2S 2026-07-26).
@@ -4168,7 +4209,7 @@ async def ams_unload(
     """Unload the currently loaded filament — publish, observe, report.
 
     ``services/ams_command`` sends the unload in every AMS posture, reads the wire for
-    its operator window and answers 200 ``{outcome, message}`` with the measured
+    its operator window and answers 200 ``{outcome, message, family}`` with the measured
     outcome. 400 when the printer has no client or the publish did not go out.
     """
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
@@ -4179,12 +4220,13 @@ async def ams_unload(
 
 
 def _ams_command_response(result: ams_command.AmsCommandResult) -> AmsCommandResponse:
-    """Outcome → HTTP. The service decides and composes the sentence; this only maps."""
+    """Outcome → HTTP. The service decides and composes the sentence; this only maps — the posture
+    family the command was sent into included, which a client keys its posture-specific copy off."""
     if result.outcome == "refused_not_connected":
         raise HTTPException(400, result.message)
     if result.outcome == "refused_runout_hold":
         raise HTTPException(409, result.message)
-    return AmsCommandResponse(outcome=result.outcome, message=result.message)
+    return AmsCommandResponse(outcome=result.outcome, message=result.message, family=result.family)
 
 
 @router.get("/{printer_id}/runtime-debug")
@@ -4275,12 +4317,49 @@ async def execute_hms_action(
             raise HTTPException(409, "No paused plate check on this printer")
         return _hms_action_answer(verdict.sent, verdict.ack)
 
+    if body.action in DIALOG_RESUME_ACTIONS:
+        # A button whose frame RESUMES the paused print is the resume of a paused print (K9): the
+        # one verb decides — the button's own frame goes out over a fed toolhead (its ACK read as
+        # any press's), an empty one is refilled first and answered ``refilling`` at once.
+        return await _resume_button(printer_id, body, client)
+
     # The dialog frames echo the pressed job's subtask id; a fault with no job sends "".
     sent = client.execute_hms_action(body.print_error, body.action, body.job_id or "")
     ack = None
     if sent is not None and sent.sequence_id is not None:
         ack = await client.await_ack(sent, HMS_ACTION_ACK_WAIT_SECONDS, HMS_ACTION_ACK_POLL_SECONDS)
     return _hms_action_answer(sent, ack)
+
+
+async def _resume_button(printer_id: int, body: HmsActionBody, client: "BambuMQTTClient") -> dict:
+    """A dialog button of :data:`DIALOG_RESUME_ACTIONS`, through ``spool_recovery.resume_paused_print``
+    with the button's own frame as the press. Its verdict → HTTP: a press that went out answers from
+    its ACK (:func:`_hms_action_answer`); ``refilling`` → 200 with the slot; a refusal → the typed
+    409; a press that did not go out → 400."""
+    from backend.app.services import spool_recovery
+
+    verdict = await spool_recovery.resume_paused_print(
+        printer_id,
+        actor="operator",
+        # The dialog frames echo the pressed job's subtask id; a fault with no job sends "".
+        press=lambda live: live.execute_hms_action(body.print_error, body.action, body.job_id or ""),
+    )
+    match verdict:
+        case spool_recovery.ResumeSent(sent=sent):
+            ack = None
+            if sent.sequence_id is not None:
+                ack = await client.await_ack(sent, HMS_ACTION_ACK_WAIT_SECONDS, HMS_ACTION_ACK_POLL_SECONDS)
+            return _hms_action_answer(sent, ack)
+        case spool_recovery.RefillStarted(slot=slot):
+            return {"success": True, "status": "refilling", "slot": slot, "message": _refilling_message(slot)}
+        case spool_recovery.ResumeRefused():
+            raise HTTPException(409, detail=_resume_refusal(verdict))
+        case spool_recovery.ResumeNotSent():
+            raise HTTPException(400, "Failed to execute HMS action")
+        case spool_recovery.ResumeStoodDown():
+            raise LookupError("an operator's resume carries no evidence to stand down on")
+        case _:
+            assert_never(verdict)
 
 
 def _hms_action_answer(sent: "SentCommand | None", ack: "CommandAck | None") -> dict:

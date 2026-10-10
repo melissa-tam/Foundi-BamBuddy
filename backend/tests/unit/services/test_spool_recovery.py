@@ -44,7 +44,7 @@ from backend.app.services.spool_recovery import (
     clear_on_reinsert,
     on_ams_fault,
 )
-from backend.app.services.tray_fields import valid_feeder
+from backend.app.services.tray_fields import ExtruderFeed, valid_feeder
 from backend.tests._fixtures.clock import FakeClock
 
 _NONE_TAG = "0000000000000000"
@@ -241,9 +241,9 @@ class FakeClient:
     wire: six commands, each echoed ``success``), and :meth:`ack` enqueues one by hand.
     """
 
-    # The nozzle TOPOLOGY question every feeder reader asks through the client
-    # (``_dual_nozzle_feeders``). Single-nozzle by default, like the H2S fleet the
-    # replays come from; a dual-nozzle case brings its own stub.
+    # The client's nozzle TOPOLOGY flag. Single-nozzle by default, like the H2S fleet the
+    # replays come from. The driver's feeder readers no longer ask it — the per-extruder map
+    # on the state is the topology they read (``tray_fields.toolhead_feed``).
     is_dual_nozzle = False
 
     def __init__(
@@ -544,6 +544,25 @@ def _repause_after_running(times=1, *, hms=None):
         seen["left"] -= 1
         st.state = "PAUSE"
         st.hms_errors = list(hms) if hms is not None else list(first_fault)
+
+    return _poll
+
+
+def _operator_resumes_after_reads(reads=2):
+    """``on_poll``: the operator resumes on the screen right after the driver has read its PAUSE
+    ``reads`` times — at the driver's first boundary, BEFORE it sends anything, so no farm
+    command pends and the takeover's abort closes the row (the K11 hold applies only while a
+    farm command the AMS has not run is queued under the job)."""
+    seen = {"n": 0}
+
+    def _poll(_n, st):
+        if seen["n"] >= reads:
+            if seen["n"] == reads:
+                st.state = "RUNNING"
+                seen["n"] += 1
+            return
+        if st.state == "PAUSE":
+            seen["n"] += 1
 
     return _poll
 
@@ -2081,7 +2100,9 @@ async def test_every_candidate_round_unloads_again_after_a_failed_load(
 
     ONE unload per ATTEMPTED LOAD since 004-H2S 2026-09-17 (incident 192): the third
     round finds no candidate and abandons at selection, so it commits no unload. The
-    claim this pins is unchanged — every load is preceded by its own unload cycle."""
+    claim this pins is unchanged — every load is preceded by its own unload cycle — and
+    since 2026-10-10 that includes the give-up's refill of the empty toolhead (K8: the
+    unload first, invariant 8, then the job's own spool)."""
     install_settings()
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -2095,12 +2116,19 @@ async def test_every_candidate_round_unloads_again_after_a_failed_load(
     await task
 
     # Two candidate rounds ran, each with its own unload; the third escalated at
-    # selection with nothing to load, and therefore nothing to unload.
-    assert client.calls.count(("unload",)) == 2
-    assert ("load", 1) in client.calls and ("load", 2) in client.calls
+    # selection with nothing to load, and the give-up's refill unloaded before ITS load.
     motion = [c for c in client.calls if c[0] in ("unload", "load")]
-    assert motion.index(("unload",)) < motion.index(("load", 1))
-    assert motion[motion.index(("load", 1)) :].count(("unload",)) == 1  # round 2 unloaded again
+    assert motion == [
+        ("unload",),
+        ("load", 1),
+        ("load", 1),
+        ("unload",),  # round 2 unloaded again
+        ("load", 2),
+        ("load", 2),
+        ("unload",),  # the refill: unload first after a feed fault...
+        ("load", 0),  # ...then the job's own spool
+        ("load", 0),
+    ]
 
 
 async def test_unload_confirms_only_after_the_ams_returns_to_idle(
@@ -2370,11 +2398,11 @@ async def test_confirmed_unloads_with_every_load_failing_escalates_feed_path_blo
     blockage is downstream of the spool (buffer / PTFE), so say so.
 
     One unload per attempted load (004-H2S 2026-09-17): the third round finds no
-    candidate and abandons at selection without unloading, and the give-up then tries to
-    put the jammed spool BACK. The AMS does not move on that reload either — so the page
-    states the left-behind state and the wire's answer instead of implying it, and the
-    reason is unchanged (the restore is not a candidate and is not counted as evidence).
-    A reload the AMS did not move on is a FAILED reload — the page says so."""
+    candidate and abandons at selection without unloading, and the give-up then refills the
+    EMPTY toolhead with the job's own spool (K8: its unload first, then the load). The AMS
+    does not move on that load either — so the page states the measured toolhead and the
+    wire's answer instead of implying them, and the reason is unchanged (the refill is not a
+    candidate and is not counted as evidence)."""
     install_settings()
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -2388,13 +2416,17 @@ async def test_confirmed_unloads_with_every_load_failing_escalates_feed_path_blo
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert client.calls.count(("unload",)) == 2  # one per attempted load
+    assert client.calls.count(("unload",)) == 3  # one per attempted load, the refill's included
     assert _escalated_reasons(caplog) == ["feed_path_blocked"]
-    assert ("load", 0) in client.calls  # the restore tried to reload the jammed tray
+    assert ("load", 0) in client.calls  # the refill tried the job's own spool
     assert state.tray_now == 255  # ...and it did not take: nothing is loaded
+    detail = failed.call_args.kwargs["detail"]
+    assert detail.startswith(spool_recovery._EMPTY_TOOLHEAD_DETAIL["feed_path_blocked"])
     assert (
-        "No filament is loaded: AMS A slot 1 was unloaded and the reload failed." in failed.call_args.kwargs["detail"]
+        "Toolhead empty. Load from AMS A slot 1 failed: no movement. Load a spool on the printer, then resume."
+        in detail
     )
+    assert "resume on the printer" not in detail
 
 
 async def test_drying_refusal_escalates_ams_drying_without_burning_attempts(
@@ -2459,13 +2491,15 @@ def test_every_escalation_reason_has_operator_facing_copy():
         "Open the AMS and free the filament at the feeder, then press Continue on the printer."
     )
     # Two wedge give-ups, each true of its own case: every verb spent and the change still
-    # held (whether each verb was sent or not), or a release followed by a held swap.
+    # held (whether each verb was sent or not), or a swap command held behind a change the AMS
+    # went back into — after a ladder release OR a round top that read it out of the change
+    # (2026-10-10: a command held OUTSIDE a change is the driver's to wait for, never this).
     assert spool_recovery._ESCALATE_DETAIL["wedge_unreleased"] == (
         "The AMS is holding the paused print's filament change and no release verb the firmware accepts "
         "released it. Free the spool, then press Retry on the printer."
     )
     assert spool_recovery._ESCALATE_DETAIL["swap_held_after_release"] == (
-        "The AMS released the paused print's filament change, then held the farm's swap command. Free the "
+        "The AMS went back into a filament change and holds the farm's swap command behind it. Free the "
         "spool, then press Retry on the printer."
     )
     assert spool_recovery._ESCALATE_DETAIL["wedge_ended_print"] == "A release verb ended the print."
@@ -2668,8 +2702,8 @@ async def test_every_verb_wedged_on_an_empty_path_gives_up_unreleased_with_nothi
     at the same ``ams_status``): every lever of the table is pulled ONCE, in order, and
     each reads ``wedged``. The give-up is ``wedge_unreleased`` with NOTHING sent into the
     change — no unload, no load, and no stamp, because no replacement was ever committed
-    to. The page is the copy plus the chronological log; the feeder reads 255 and the
-    farm emptied nothing, so no clause claims an unload."""
+    to. The page is the copy plus the chronological log plus the MEASURED toolhead —
+    empty, claiming no unload, and with no refill: nothing goes into a held change."""
     install_settings(step_timeout_s=0.05)
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
@@ -2689,7 +2723,7 @@ async def test_every_verb_wedged_on_an_empty_path_gives_up_unreleased_with_nothi
     assert failed.call_args.kwargs["detail"] == (
         spool_recovery._ESCALATE_DETAIL["wedge_unreleased"]
         + " Sent: resume: wedged; resume then pause: wedged; ams_control resume: wedged; clean_print_error: wedged; retry after clear ×2: wedged; "
-        "ams_control abort: wedged; ams_control reset: wedged; ams_control pause: wedged."
+        "ams_control abort: wedged; ams_control reset: wedged; ams_control pause: wedged. Toolhead empty."
     )
     oor.assert_not_awaited()
     assert state.state == "PAUSE"  # never resumed blind
@@ -4700,14 +4734,16 @@ async def test_the_same_fault_after_an_abort_is_not_re_entered(
     db_session, printer_factory, install_settings, monkeypatch
 ):
     """An external actor took over: re-entering would fight the operator. The bar
-    lifts only when the wire says this is no longer the same standing fault."""
+    lifts only when the wire says this is no longer the same standing fault. (The resume
+    lands at the driver's first boundary, before it sends anything: a takeover over a
+    farm command still queued keeps the row open instead — TestTheDriverOwnsItsHeldCommand.)"""
     install_settings()
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
     await _bind_spool(db_session, printer.id, 0, 0)
     state = _make_state()
-    client = FakeClient(state, external_resume_on_unload=True)  # someone resumed mid-recovery
-    _wire(monkeypatch, state, client)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client, on_poll=_operator_resumes_after_reads())  # someone resumed
 
     task = await on_ams_fault(printer.id, state)
     await task
@@ -4730,9 +4766,10 @@ async def test_the_wire_re_arms_a_barred_fault_when_it_clears(
     await _farm_item(db_session, printer.id)
     await _bind_spool(db_session, printer.id, 0, 0)
     state = _make_state()
-    client = FakeClient(state, external_resume_on_unload=True)
-    _wire(monkeypatch, state, client)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client, on_poll=_operator_resumes_after_reads())
     await (await on_ams_fault(printer.id, state))
+    assert (await _incident_rows(db_session, printer.id))[0].status == "aborted"  # the bar is set
 
     # The fault clears from the wire...
     cleared = _make_state(gcode_state="RUNNING", hms=[])
@@ -6325,7 +6362,69 @@ class TestTheReader:
 
         assert read.reading == "released"  # paused back, out of the change — never a self-heal
         assert ("pause",) in client.calls
-        assert spool_recovery._feeder_position(state, 0, None).kind == kind
+        assert spool_recovery._feeding_position(state, 0).kind == kind  # the reading the reader takes
+
+    @staticmethod
+    def _h2c(state, *, deputy_tray):
+        """An H2C/H2D whose ACTIVE (right, 0) nozzle is EMPTY beside a deputy (left, 1) fed from
+        ``deputy_tray`` — ``tray_now`` is the client's single value, here naming the jammed tray."""
+        state.h2d_extruder_snow = {0: 255, 1: deputy_tray}
+        state.active_extruder = 0
+        return state
+
+    async def test_an_empty_active_nozzle_beside_the_jammed_deputy_is_no_self_heal(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """K1 (2026-10-10): "the print is feeding" is the ACTIVE extruder's question. The jammed
+        tray still loaded on the DEPUTY while the active nozzle is empty prints air: never a
+        self-heal — the window runs out and the reader pauses it back (the hung arm)."""
+        printer = await printer_factory()
+        state = self._h2c(_make_state(tray_now=0, ams_status_main=1), deputy_tray=0)
+        client = _SelfHealClient(state)  # RUNNING, quiet, AMS idle — and the map unchanged
+        _wire(monkeypatch, state, client)
+
+        read, _evidence = await self._read(db_session, printer.id, client, "resume", step_timeout_s=0.1)
+
+        assert read.reading != "self_healed"
+        assert read.position == _position("empty", 0)
+        assert ("pause",) in client.calls
+
+    async def test_an_empty_active_nozzle_beside_another_fed_deputy_is_no_swap(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The swap contract's own resume (not a release): a deputy fed from ANOTHER tray beside
+        an empty active nozzle is not the print running on a replacement — never ``swapped``."""
+        printer = await printer_factory()
+        state = self._h2c(_make_state(tray_now=0, ams_status_main=1), deputy_tray=1)
+        client = _SelfHealClient(state)
+        _wire(monkeypatch, state, client)
+
+        read, _evidence = await self._read(db_session, printer.id, client, "resume", budgeted=False, step_timeout_s=0.1)
+
+        assert read.reading != "swapped"
+        assert ("pause",) in client.calls
+
+    async def test_resume_then_pause_pauses_an_empty_active_nozzle_beside_a_fed_deputy(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The empty-path pause fires off the ACTIVE extruder: the first RUNNING sample with the
+        active nozzle empty is paused at once, whatever the deputy holds."""
+        printer = await printer_factory()
+        state = self._h2c(_make_state(tray_now=0, ams_status_main=1), deputy_tray=0)
+        client = _SelfHealClient(state)
+        running_polls_before_pause: list[int] = []
+
+        def _on_poll(_n, st):
+            if st.state == "RUNNING" and ("pause",) not in client.calls:
+                running_polls_before_pause.append(1)
+
+        _wire(monkeypatch, state, client, on_poll=_on_poll)
+
+        read, _evidence = await self._read(db_session, printer.id, client, "resume_then_pause", step_timeout_s=5.0)
+
+        assert read.reading == "released"
+        assert [c for c in client.calls if c[0] in ("resume", "pause")] == [("resume",), ("pause",)]
+        assert len(running_polls_before_pause) == 1  # the first RUNNING sample decided
 
     async def test_resume_then_pause_on_a_loaded_wedge_waits_for_the_retract(
         self, db_session, printer_factory, monkeypatch, caplog
@@ -6907,7 +7006,7 @@ class TestTheLoadedWedge:
         assert _escalated_reasons(caplog) == ["swap_held_after_release"]
         lines = [r.getMessage() for r in caplog.records]
         assert any("command=unload" in m and "posture=mid_change_loaded" in m and "answer=held" in m for m in lines)
-        assert not any("verdict=restore_" in m for m in lines)  # it moved nothing: nothing to restore
+        assert not any("verdict=refill_" in m for m in lines)  # held: nothing is sent behind it
         detail = failed.call_args.kwargs["detail"]
         assert detail == (
             f"{spool_recovery._ESCALATE_DETAIL['swap_held_after_release']} Sent: {_FOUR_WEDGED}; retry after "
@@ -6917,6 +7016,14 @@ class TestTheLoadedWedge:
         )
         assert detail.count("An unload is held") == 1  # the held command is named in ONE place
         assert "then resume on the printer" not in detail
+        # Held INSIDE a change is a give-up at once (the human frees the spool), and the row stays
+        # OPEN on the farm's held command (K11): escalated, the pending unload on the projection
+        # for the hand-over's refill, the closers standing while it pends.
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.resolved_at) == ("escalated", None)
+        pending = printer_incidents.pending_command(printer.id)
+        assert pending is not None and (pending.incident_id, pending.name) == (row.id, "unload")
+        assert await spool_recovery.on_observed_running(printer.id) is False  # a resume does not close it
 
     async def test_released_then_a_held_load_gives_up_swap_held_naming_the_held_load(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
@@ -6948,7 +7055,7 @@ class TestTheLoadedWedge:
         assert _escalated_reasons(caplog) == ["swap_held_after_release"]
         lines = [r.getMessage() for r in caplog.records]
         assert any("command=load" in m and "answer=held" in m for m in lines)
-        assert not any("verdict=restore_" in m for m in lines)
+        assert not any("verdict=refill_" in m for m in lines)
         slot = f"AMS A slot {target + 1}"
         detail = failed.call_args.kwargs["detail"]
         assert detail.startswith(spool_recovery._ESCALATE_DETAIL["swap_held_after_release"])
@@ -7087,6 +7194,763 @@ class TestTheLoadedWedge:
         assert any("command=load" in m and "answer=complete" in m for m in lines)
         assert state.state == "RUNNING"
         succeeded.assert_awaited_once()
+
+
+# ===========================================================================
+# 011-H2S 2026-10-09 (#538) and 014-H2S 2026-10-10 (#558): the pull-back the AMS ran ON
+# ITS OWN. Jam `0300_801E`; the replacement load completed; the change hung (1/5); the
+# ladder's `ams_control resume` released it into assist (1 → 3); the swap round's
+# pull-back for the next candidate was ACKNOWLEDGED (`result=success`) and nothing moved
+# for the whole 90 s step window — then, ~4.5 min after the send (011: 04:31:27 →
+# 04:36:01; 014: 02:45:58 → 02:50:38), the AMS ran it with no farm publish, emptying the
+# toolhead under a page that said "slot N is loaded … press Continue". The driver now
+# OWNS that held command: it waits until the command runs (``ams_command.ran``) and
+# continues the contract — the load, the resume, the read.
+# ===========================================================================
+
+
+class _ReleasedIntoAssistClient(FakeClient):
+    """The 011/014-H2S wire after the replacement load: the swap's resumes hang in the change
+    (``resume_unwedges=False`` keeps ``ams_status_main`` at 1) and the ladder's ``ams_control
+    resume`` RELEASES it — into ASSIST (1 → 3), the posture both pull-backs were sent into."""
+
+    def ams_control(self, action, *, request_pushall=False):
+        self.calls.append(("ams_control", action))
+        self._sent("ams_control")
+        if action == "resume" and self.state.ams_status_main == 1:
+            self.state.ams_status_main = 3
+        return True
+
+
+def _held_pull_back_wire(*, tray_now=2):
+    """PAUSEd on an extruder overload with the replacement loaded at ``tray_now``, the AMS
+    hung in the change (1/5); the pull-back is acknowledged and does not move (``unload_deaf``
+    + ``ack_motion``) until the case runs it."""
+    state = _make_state(
+        tray_now=tray_now,
+        ams_status_main=1,
+        hms=[_extruder_hms()],
+        trays=[_ams_tray(0), _ams_tray(1), _ams_tray(2), _ams_tray(3)],
+    )
+    state.ams_status_sub = 5
+    client = _ReleasedIntoAssistClient(state, resume_unwedges=False, unload_deaf=True, ack_motion=True)
+    return state, client
+
+
+def _pull_back_runs_on_its_own(client, printer_id, *, after_polls, seen):
+    """``on_poll``: ``after_polls`` wire reads after the pull-back went out — far past its step
+    window — the AMS runs it with NO farm publish (tray_now → 255, ams 0/0). ``seen`` records
+    what the store projected on the read before the run, and that the run happened."""
+
+    def _poll(n, st):
+        if ("unload",) not in client.calls or "ran_at_poll" in seen:
+            return
+        seen.setdefault("sent_at_poll", n)
+        if n - seen["sent_at_poll"] == after_polls - 1:
+            snap = printer_incidents.snapshots(printer_id)[0]
+            seen["before_run"] = (snap["status"], snap["driver_live"], printer_incidents.pending_command(printer_id))
+        if n - seen["sent_at_poll"] >= after_polls:
+            seen["ran_at_poll"] = n
+            st.tray_now = 255
+            st.ams_status_main = 0
+            st.ams_status_sub = 0
+
+    return _poll
+
+
+class TestTheDriverOwnsItsHeldCommand:
+    """K6: a command the AMS accepted and has not run, OUTSIDE a change, is the driver's to wait
+    for — the row stays ``recovering``, the driver live — never a give-up."""
+
+    # Each incident's own self-run, in wire reads after the send (one read per poll, the step
+    # window ~10 reads): 014-H2S 02:45:58 → 02:50:38 (280 s), 011-H2S 04:31:27 → 04:36:01 (274 s),
+    # scaled 1 s : 0.2 reads — both far past the window that answers ``held``.
+    @pytest.mark.parametrize("label,after_polls", [("014-H2S #558", 56), ("011-H2S #538", 55)])
+    async def test_the_held_pull_back_runs_and_the_swap_recovers(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog, label, after_polls
+    ):
+        """THE REPLAY: released into assist → the pull-back ACKed, unmoved → ``held`` at the step
+        bound → the driver waits → the wire empties on its own → ``ran`` → the candidate's load →
+        the resume → ``swapped``: RECOVERED, zero human touch. The pull-back is never resent, and
+        while it pends the row reads ``recovering`` with a live driver and the pending command
+        on the projection."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[2, -1, -1, -1]")
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _held_pull_back_wire()
+        seen: dict = {}
+        _wire(
+            monkeypatch,
+            state,
+            client,
+            on_poll=_pull_back_runs_on_its_own(client, printer.id, after_polls=after_polls, seen=seen),
+        )
+
+        with _driver_logs(caplog):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert seen.get("ran_at_poll") == seen["sent_at_poll"] + after_polls, label
+        assert client.calls.count(("unload",)) == 1  # held: never resent
+        (target,) = _loads(client)
+        assert target != 2
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("command=unload" in m and "posture=assist_loaded" in m and "answer=held" in m for m in lines)
+        assert any("the AMS ran the held unload" in m for m in lines)
+        status, live, pending = seen["before_run"]
+        assert (status, live) == ("recovering", True)
+        assert pending is not None and pending.name == "unload"
+        (row,) = await _incident_rows(db_session, printer.id)
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.kind, s.name, s.outcome) for s in steps] == [
+            ("lever", "resume", "wedged"),
+            ("lever", "resume_then_pause", "wedged"),
+            ("lever", "ams_control_resume", "released"),
+            ("command", "unload", "complete"),  # held, then ran: the classifier's own completion token
+            ("command", "load", "complete"),
+        ]
+        assert (row.status, row.resolve_source) == ("resolved", "driver_swap")
+        assert state.tray_now == target and state.state == "RUNNING"
+        succeeded.assert_awaited_once()
+        failed.assert_not_awaited()
+
+    async def test_past_the_liveness_bound_it_pages_once_and_keeps_waiting(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """The bound (``_HELD_COMMAND_PAGE_S``) decides only WHEN a human hears, never what the
+        farm does: ONE page naming the queued command, through the recovery's own notification
+        event — no hand-over, no status change (the row stays ``recovering``, the driver live),
+        no escalation-ledger row, no quarantine count — and the wait goes on until the command
+        runs, when the swap recovers as before."""
+        install_settings(step_timeout_s=0.05)
+        monkeypatch.setattr(spool_recovery, "_HELD_COMMAND_PAGE_S", 0.1)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[2, -1, -1, -1]")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        at_page: list[tuple] = []
+
+        async def _page(**kwargs):
+            snap = printer_incidents.snapshots(printer.id)[0]
+            at_page.append((snap["status"], snap["driver_live"], kwargs["detail"], kwargs["kind"], kwargs["job_ended"]))
+
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        failed.side_effect = _page
+        state, client = _held_pull_back_wire()
+        seen: dict = {}
+        _wire(
+            monkeypatch,
+            state,
+            client,
+            on_poll=_pull_back_runs_on_its_own(client, printer.id, after_polls=200, seen=seen),
+        )
+
+        with _driver_logs(caplog):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert "ran_at_poll" in seen
+        assert at_page == [
+            (
+                "recovering",
+                True,
+                "The AMS accepted the pull-back and has not run it. Recovery resumes when it runs.",
+                "jam",
+                False,
+            )
+        ]
+        assert client.calls.count(("unload",)) == 1
+        assert await _escalation_rows(db_session, printer.id) == []  # a page, not a give-up
+        rows = await _incident_rows(db_session, printer.id)
+        assert [(r.status, r.resolve_source, r.escalated_at) for r in rows] == [("resolved", "driver_swap", None)]
+        succeeded.assert_awaited_once()
+
+    @staticmethod
+    def _act_during_the_wait(client, *, after_polls, act):
+        """``on_poll``: ``after_polls`` reads after the pull-back went out (past its window, so it
+        reads ``held`` and the driver is waiting), somebody acts — ``act(state)`` — once."""
+        seen = {}
+
+        def _poll(n, st):
+            if ("unload",) not in client.calls or "acted" in seen:
+                return
+            seen.setdefault("sent_at_poll", n)
+            if n - seen["sent_at_poll"] >= after_polls:
+                seen["acted"] = n
+                act(st)
+
+        return _poll
+
+    async def test_an_operator_resume_during_the_wait_stands_aside_and_keeps_the_row_open(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """A takeover ends the wait exactly as everywhere (``resumed``: the operator resumed on the
+        screen) — but the AMS still holds the farm's pull-back, which runs on its own and empties
+        the toolhead under the running print (K11). So the row stays OPEN — escalated, the driver
+        released, no ABORTED close, nothing barred — for the hand-over's refill to find; and no
+        page: a takeover is never a give-up."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id, ams_mapping="[2, -1, -1, -1]")
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _held_pull_back_wire()
+
+        def _resume(st):
+            st.state = "RUNNING"
+
+        _wire(monkeypatch, state, client, on_poll=self._act_during_the_wait(client, after_polls=40, act=_resume))
+
+        with _driver_logs(caplog):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert client.calls.count(("unload",)) == 1 and _loads(client) == []
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("recovery aborted (resumed) during await_unload" in m for m in lines)
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.resolved_at, row.resolve_source) == ("escalated", None, None)
+        pending = printer_incidents.pending_command(printer.id)
+        assert pending is not None and (pending.incident_id, pending.name) == (row.id, "unload")
+        assert printer_incidents.driver_live(printer.id) is False
+        assert spool_recovery._blocked == {}  # nothing barred: the row is still the record
+        failed.assert_not_awaited()
+        db_session.expunge_all()
+        assert (await db_session.get(PrintQueueItem, item.id)).waiting_reason is None  # the recovering token
+
+    async def test_the_job_ending_during_the_wait_closes_the_row_as_today(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """The job's end ends the wait (``job_ended``), and with it the reason to hold the row: a
+        job that is over has no toolhead to print air with — the row closes ABORTED, exactly as a
+        takeover always did."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[2, -1, -1, -1]")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _held_pull_back_wire()
+
+        def _stop(st):
+            st.state = "FAILED"
+
+        _wire(monkeypatch, state, client, on_poll=self._act_during_the_wait(client, after_polls=40, act=_stop))
+
+        with _driver_logs(caplog):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.resolve_source) == ("aborted", "operator")
+        assert client.calls.count(("unload",)) == 1
+
+    async def test_a_reclassified_row_during_the_wait_is_handed_over_open(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """``reclassified`` (the store re-read the row as a worse fault) ends the wait as a
+        hand-over: no close, no abort — the row is its new owner's, and the pending command
+        stays on it."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[2, -1, -1, -1]")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _held_pull_back_wire()
+        upgraded = {"now": False}
+
+        def _upgrade(_st):
+            upgraded["now"] = True
+
+        original = printer_incidents.cached_kind
+        monkeypatch.setattr(
+            spool_recovery.printer_incidents,
+            "cached_kind",
+            lambda pid, iid: "physical" if upgraded["now"] else original(pid, iid),
+        )
+        _wire(monkeypatch, state, client, on_poll=self._act_during_the_wait(client, after_polls=40, act=_upgrade))
+
+        with _driver_logs(caplog):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("recovery aborted (reclassified) during await_unload" in m for m in lines)
+        assert any("handing over" in m for m in lines)
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert row.resolved_at is None
+        assert printer_incidents.pending_command(printer.id) is not None
+
+
+class TestTheRefillStep:
+    """K8 (2026-10-10): the farm never pages with the toolhead EMPTY when a spool will load. At
+    every give-up whose active extruder reads empty — outside a change, with no farm command
+    pending — the driver refills it first (``_refill_toolhead``): the job's last feeder when it
+    is present and not spent (an out-of-rotation stamp does NOT disqualify it: Raymond
+    2026-09-17, "reload original spool that was faulty raise the gate and let human fix"), else
+    the swap's selection; the unload first unless invariant 8 lets it skip; the load through
+    ``ams_command``; "reached the toolhead" read off the K1 toolhead feed. It REPLACES the
+    restore, and reverses the 2026-09 agent design "the restore undoes only the driver's own
+    motion" (never an operator ruling): an empty toolhead is refilled whoever emptied it."""
+
+    async def _give_up_over(
+        self, db_session, printer_id, state, client, monkeypatch, *, steps=(), reason="feed_path_blocked"
+    ):
+        item = await _farm_item(db_session, printer_id)
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _wire(monkeypatch, state, client)
+        incident = await _owned_incident(db_session, printer_id, step_timeout_s=0.05, item_id=item.id)
+        evidence = await _log(db_session, incident.incident_id)
+        for command, answer in steps:
+            await _logged_command(evidence, command, answer)
+        await spool_recovery._give_up(incident, reason, evidence=evidence)
+        return failed
+
+    async def test_the_jobs_last_feeder_is_reloaded_even_out_of_rotation(
+        self, db_session, printer_factory, monkeypatch, caplog
+    ):
+        printer = await printer_factory()
+        jammed = await _bind_spool(
+            db_session, printer.id, 0, 0, feed_fault_at=datetime.utcnow(), feed_fault_code="0700_8010"
+        )
+        state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state)
+
+        with _driver_logs(caplog):
+            failed = await self._give_up_over(
+                db_session, printer.id, state, client, monkeypatch, steps=[("unload", "complete")]
+            )
+
+        assert [c for c in client.calls if c[0] in ("unload", "load")] == [("unload",), ("load", 0)]
+        assert state.tray_now == 0
+        assert "The jammed spool was unloaded and reloaded (AMS A slot 1)." in failed.call_args.kwargs["detail"]
+        assert any("verdict=refill_loaded" in r.getMessage() for r in caplog.records)
+        db_session.expunge_all()
+        assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # the stamp stays
+
+    async def test_a_spent_last_feeder_is_passed_over_for_the_selection(self, db_session, printer_factory, monkeypatch):
+        """``spent_at`` is the exhaustion truth (doctrine rule 8): a spent roll is not loaded, and
+        the swap's own selection names the spool instead."""
+        printer = await printer_factory()
+        await _bind_spool(db_session, printer.id, 0, 0, spent_at=datetime.utcnow())
+        state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state)
+
+        failed = await self._give_up_over(
+            db_session, printer.id, state, client, monkeypatch, steps=[("unload", "complete")]
+        )
+
+        assert _loads(client) == [1]
+        assert "Toolhead refilled from AMS A slot 2." in failed.call_args.kwargs["detail"]
+
+    async def test_no_candidate_pages_the_empty_toolhead(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        await _bind_spool(db_session, printer.id, 0, 0, spent_at=datetime.utcnow())
+        state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0)])
+        client = FakeClient(state)
+
+        failed = await self._give_up_over(
+            db_session, printer.id, state, client, monkeypatch, steps=[("unload", "complete")]
+        )
+
+        assert _loads(client) == []
+        detail = failed.call_args.kwargs["detail"]
+        assert "Toolhead empty. No spool to load. Load a spool on the printer, then resume." in detail
+        assert "press Continue" not in detail
+
+    @pytest.mark.parametrize(
+        "hms,unloads", [([_feed_fault_hms()], 1), ([], 0)], ids=["after_a_feed_fault", "on_a_clean_path"]
+    )
+    async def test_the_unload_first_is_invariant_8s(self, db_session, printer_factory, monkeypatch, hms, unloads):
+        """After a feed fault the unload is never skipped (``tray_now`` 255 is "nothing is
+        feeding", not "the path is clear" — the 009 proof); on the genuinely clean path
+        (``_unload_skippable``: nothing fed, AMS idle, no feed fault) nothing is unloaded."""
+        printer = await printer_factory()
+        await _bind_spool(db_session, printer.id, 0, 0)
+        state = _make_state(tray_now=255, ams_status_main=0, hms=hms, trays=[_ams_tray(0)])
+        client = FakeClient(state)
+
+        await self._give_up_over(db_session, printer.id, state, client, monkeypatch)
+
+        assert client.calls.count(("unload",)) == unloads
+        assert _loads(client) == [0]
+
+    async def test_a_failed_refill_names_the_slot_and_the_ams_answer(self, db_session, printer_factory, monkeypatch):
+        """Item 4: the page states the MEASURED toolhead — empty — with the slot that failed and
+        what the AMS answered, plus the exit. Never "press Continue" over an empty toolhead."""
+        printer = await printer_factory()
+        await _bind_spool(db_session, printer.id, 0, 0)
+        state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0)])
+        client = FakeClient(state, load_ok_targets=set())
+
+        failed = await self._give_up_over(
+            db_session,
+            printer.id,
+            state,
+            client,
+            monkeypatch,
+            steps=[("unload", "no_movement")],
+            reason="unload_failed",
+        )
+
+        assert client.calls.count(("load", 0)) == 2  # both attempts spent on the refill
+        detail = failed.call_args.kwargs["detail"]
+        assert (
+            "Toolhead empty. Load from AMS A slot 1 failed: no movement. Load a spool on the printer, then resume."
+            in detail
+        )
+        assert "press Continue" not in detail
+
+    async def test_no_refill_goes_into_a_change(self, db_session, printer_factory, monkeypatch):
+        """Inside a filament change the AMS owns the toolhead's next motion — the print's own head
+        — and anything sent into it is held and runs at the release (012-H2S 2026-09-23). No
+        refill goes in; the page says the toolhead is empty."""
+        printer = await printer_factory()
+        await _bind_spool(db_session, printer.id, 0, 0)
+        state = _make_state(tray_now=255, ams_status_main=1, trays=[_ams_tray(0)])
+        client = FakeClient(state)
+
+        failed = await self._give_up_over(
+            db_session,
+            printer.id,
+            state,
+            client,
+            monkeypatch,
+            steps=[("unload", "complete")],
+            reason="wedge_unreleased",
+        )
+
+        assert not any(c[0] in ("unload", "load") for c in client.calls)
+        assert "Toolhead empty." in failed.call_args.kwargs["detail"]
+
+    async def test_no_refill_goes_behind_a_pending_command(self, db_session, printer_factory, monkeypatch):
+        """A command the AMS holds runs when it runs (K11): a refill sent behind it would run too.
+        Its refill is the hand-over's, when it runs."""
+        printer = await printer_factory()
+        await _bind_spool(db_session, printer.id, 0, 0)
+        state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0)])
+        client = FakeClient(state)
+
+        await self._give_up_over(
+            db_session,
+            printer.id,
+            state,
+            client,
+            monkeypatch,
+            steps=[("load", "held")],
+            reason="swap_held_after_release",
+        )
+
+        assert not any(c[0] in ("unload", "load") for c in client.calls)
+
+    def test_the_restore_is_gone(self):
+        """Delete, don't deprecate: the refill step replaced it, whole."""
+        assert not hasattr(spool_recovery, "_restore_jammed_feeder")
+        assert not hasattr(spool_recovery, "RestoreVerdict")
+        assert not hasattr(spool_recovery._RecoveryEvidence, "unload_moved_ams")
+
+    async def test_the_014_replay_with_a_candidate_that_will_not_load_gives_up_loaded(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        """The 014 shape again, but the candidate will not load once the held pull-back ran: the
+        rounds run out — and the give-up refills the toolhead with the job's own spool (the
+        jammed tray) BEFORE it pages, so the operator's Resume prints filament, not air."""
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[2, -1, -1, -1]")
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        state, client = _held_pull_back_wire()
+        state.raw_data = {"ams": [{"id": 0, "tray": [_ams_tray(0), _ams_tray(2)]}]}
+        client.load_ok_targets = {2}  # only the job's own spool loads
+        seen: dict = {}
+        runs = _pull_back_runs_on_its_own(client, printer.id, after_polls=60, seen=seen)
+
+        def _poll(n, st):
+            runs(n, st)
+            if "ran_at_poll" in seen:
+                # The candidate's load goes unacknowledged — ``no_movement``, a candidate that
+                # will not load (an ACKed one would read ``held`` and be waited for).
+                client.ack_motion = False
+
+        _wire(monkeypatch, state, client, on_poll=_poll)
+
+        with _driver_logs(caplog):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        assert "ran_at_poll" in seen
+        assert _loads(client)[-1] == 2 and state.tray_now == 2  # the toolhead is LOADED
+        detail = failed.call_args.kwargs["detail"]
+        assert "The jammed spool was unloaded and reloaded (AMS A slot 3)." in detail
+        assert "Toolhead empty" not in detail
+
+
+class TestAFirmwareRebootVoidsThePendingCommand:
+    """A power cycle empties the AMS's queue: a command it had accepted and not run will never
+    run. The reboot's witness is the firmware's power-loss prompt (``hms_errors.
+    power_loss_prompt_standing`` — ``0300_8007``), and the fact is recorded ONCE, durably, on the
+    step ledger through its one writer: the pending step is answered ``session_changed`` (the
+    classifier's own "its answer was lost with its session" token). The projection then re-derives
+    no pending command — at once, and after any later restart."""
+
+    async def test_the_waiting_driver_voids_it_and_the_contract_starts_a_fresh_round(
+        self, db_session, printer_factory, install_settings, monkeypatch, caplog
+    ):
+        install_settings(step_timeout_s=0.05)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id, ams_mapping="[2, -1, -1, -1]")
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        state, client = _held_pull_back_wire()
+
+        def _reboot(st):
+            st.hms_errors = [_power_loss_prompt_hms()]  # the printer came back at the prompt
+            client.unload_deaf = False  # a fresh AMS runs a fresh command
+
+        _wire(
+            monkeypatch,
+            state,
+            client,
+            on_poll=TestTheDriverOwnsItsHeldCommand._act_during_the_wait(client, after_polls=40, act=_reboot),
+        )
+
+        with _driver_logs(caplog):
+            task = await on_ams_fault(printer.id, state)
+            await task
+
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("power-loss prompt" in m and "void" in m for m in lines)
+        (row,) = await _incident_rows(db_session, printer.id)
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.kind, s.name, s.outcome) for s in steps][-3:] == [
+            ("command", "unload", "session_changed"),  # voided: it will never run
+            ("command", "unload", "complete"),  # a fresh pull-back, not one behind a queued one
+            ("command", "load", "complete"),
+        ]
+        assert (row.status, row.resolve_source) == ("resolved", "driver_swap")
+        succeeded.assert_awaited_once()
+
+    async def test_with_no_driver_live_the_sampler_voids_it(self, db_session, printer_factory, monkeypatch):
+        """The row a hand-over left OPEN on a pending command (no driver to watch it): the per-push
+        sampler sees the prompt and voids the command through the same writer, registering the
+        lane in the liveness slot first so the next push cannot spawn a second one."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await _open_incident_row(db_session, printer.id)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind="command", name="unload", feeder="jammed")
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="held")
+        await printer_incidents.mark_escalated(db_session, row.id)
+        assert printer_incidents.pending_command(printer.id) is not None
+
+        quiet = _make_state(tray_now=0, hms=[])
+        spool_recovery.note_demand_watch(printer.id, quiet)
+        assert [name for name, _t in spawned if (name or "").startswith("void-pending")] == []  # no prompt: nothing
+
+        rebooted = _make_state(tray_now=0, hms=[_power_loss_prompt_hms()])
+        spool_recovery.note_demand_watch(printer.id, rebooted)
+        assert printer_incidents.driver_live(printer.id) is True  # registered with the spawn
+        spool_recovery.note_demand_watch(printer.id, rebooted)  # the next push spawns no second one
+        voids = [t for name, t in spawned if (name or "").startswith("void-pending")]
+        assert len(voids) == 1
+        await voids[0]
+
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.outcome) for s in steps] == [("unload", "session_changed")]
+        assert printer_incidents.pending_command(printer.id) is None
+        assert printer_incidents.driver_live(printer.id) is False
+
+
+class TestARestartedDriverNeverSendsBehindAPendingCommand:
+    """Item 2 of the 2026-10-10 contract: a driver re-entered after a farm restart whose log ENDS
+    in a command the AMS has not run (answered ``held``, or sent and never read — the process
+    died between the send and the read) runs the same wait (``ams_command.ran``), never a fresh
+    send — a second command behind a queued one runs too — and then continues the contract from
+    that command."""
+
+    @pytest.fixture(autouse=True)
+    def _settings(self, install_settings):
+        install_settings(step_timeout_s=0.05)
+
+    async def _zombie(self, db, printer_id, item_id, steps):
+        """A ``recovering`` jam row a restart left mid-swap, with the dead driver's ledger."""
+        from backend.app.models.printer_incident import KIND_JAM, STATUS_RECOVERING
+
+        row = await _seed_incident(
+            db,
+            printer_id,
+            kind=KIND_JAM,
+            status=STATUS_RECOVERING,
+            item_id=item_id,
+            code="0700_8010",
+            codes="mechanical_feed:0700_8010",
+            slot_global_tray=0,
+        )
+        for seq, (name, target, feeder, outcome) in enumerate(steps, start=1):
+            await printer_incidents.note_step(
+                db, row.id, seq=seq, kind="command", name=name, target=target, feeder=feeder
+            )
+            if outcome is not None:
+                await printer_incidents.answer_step(db, row.id, seq, outcome=outcome)
+        return row
+
+    @staticmethod
+    def _runs_after(reads, act):
+        """``on_poll``: after ``reads`` wire reads, the queued command runs — ``act(state)``."""
+        seen = {"n": 0}
+
+        def _poll(_n, st):
+            seen["n"] += 1
+            if seen["n"] == reads:
+                act(st)
+
+        return _poll
+
+    async def _rearm_and_await(self, printer_id):
+        await spool_recovery.rearm_incidents_on_startup()
+        task = printer_incidents._drivers.get(printer_id)  # noqa: SLF001 — the re-entered driver
+        assert task is not None, "the re-entry spawned no driver"
+        await task
+
+    async def test_an_unanswered_load_is_waited_for_and_the_contract_resumes_at_the_resume(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The dead driver unloaded and sent the load of tray 1; nobody read its answer. The
+        re-entered driver sends NOTHING — no unload, no load — until the load runs (tray 1 at
+        the toolhead), then continues with the contract's next verb: the resume, read to
+        ``swapped``."""
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        row = await self._zombie(
+            db_session, printer.id, item.id, [("unload", None, "jammed", "complete"), ("load", 1, "empty", None)]
+        )
+        state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state)
+
+        def _the_load_runs(st):
+            st.tray_now = 1
+
+        _wire(monkeypatch, state, client, on_poll=self._runs_after(40, _the_load_runs))
+
+        await self._rearm_and_await(printer.id)
+
+        assert not any(c[0] in ("unload", "load") for c in client.calls)  # never sent behind it
+        assert ("resume",) in client.calls
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.target, s.outcome) for s in steps] == [("unload", None, "complete"), ("load", 1, "complete")]
+        (closed,) = await _incident_rows(db_session, printer.id)
+        assert (closed.status, closed.resolve_source) == ("resolved", "driver_swap")
+        succeeded.assert_awaited_once()
+
+    @pytest.mark.parametrize("answer", [None, "held"], ids=["unanswered", "held"])
+    async def test_a_pending_pull_back_is_waited_for_and_the_contract_resumes_at_the_load(
+        self, db_session, printer_factory, monkeypatch, answer
+    ):
+        """The dead driver's last step is a pull-back of the LOADED jammed tray — never read, or
+        held at its bound. The re-entered driver waits (no unload is resent), the AMS runs it, and
+        the contract continues at the load of a candidate — the pull-back that ran IS the
+        unload before that load (invariant 8) — then the resume."""
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        row = await self._zombie(db_session, printer.id, item.id, [("unload", None, "jammed", answer)])
+        state = _make_state(tray_now=0, ams_status_main=3, trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state)
+
+        def _the_pull_back_runs(st):
+            st.tray_now = 255
+            st.ams_status_main = 0
+
+        _wire(monkeypatch, state, client, on_poll=self._runs_after(40, _the_pull_back_runs))
+
+        await self._rearm_and_await(printer.id)
+
+        assert ("unload",) not in client.calls  # waited for, never resent
+        assert _loads(client) == [1]
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.outcome) for s in steps] == [("unload", "complete"), ("load", "complete")]
+        (closed,) = await _incident_rows(db_session, printer.id)
+        assert (closed.status, closed.resolve_source) == ("resolved", "driver_swap")
+        succeeded.assert_awaited_once()
+
+    async def test_a_quiet_path_re_entry_with_a_pending_command_waits_instead_of_escalating(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The released-into-assist case after a restart: no fault left on the wire and the AMS
+        out of the change — a quiet path, which re-enters as ``recovery_interrupted`` — but the
+        log ends in a held pull-back. That command is still the driver's: the row re-enters the
+        machine (never a page over it), waits for the pull-back to run, and continues."""
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
+        await self._zombie(db_session, printer.id, item.id, [("unload", None, "jammed", "held")])
+        state = _make_state(tray_now=0, ams_status_main=3, hms=[], trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state)
+
+        def _the_pull_back_runs(st):
+            st.tray_now = 255
+            st.ams_status_main = 0
+
+        _wire(monkeypatch, state, client, on_poll=self._runs_after(40, _the_pull_back_runs))
+
+        await self._rearm_and_await(printer.id)
+
+        failed.assert_not_awaited()  # no recovery_interrupted page over the farm's own command
+        assert ("unload",) not in client.calls and _loads(client) == [1]
+        succeeded.assert_awaited_once()
+
+    async def test_a_printer_resumed_during_the_downtime_keeps_the_row_open_on_its_pending_command(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """Somebody resumed the print while the farm was down, and the dead driver's pull-back
+        still pends. The re-entered driver never sees the PAUSE it waits for — which used to close
+        the row ``aborted`` as a transient — but the farm's queued pull-back can still drain under
+        the RUNNING print, so the row stays OPEN (escalated, driver released) on it (K11)."""
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        row = await self._zombie(db_session, printer.id, item.id, [("unload", None, "jammed", "held")])
+        state = _make_state(tray_now=0, ams_status_main=3, gcode_state="RUNNING", trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        await self._rearm_and_await(printer.id)
+
+        assert not any(c[0] in ("unload", "load", "resume") for c in client.calls)
+        (kept,) = await _incident_rows(db_session, printer.id)
+        assert (kept.id, kept.status, kept.resolved_at) == (row.id, "escalated", None)
+        assert printer_incidents.pending_command(printer.id) is not None
+
+    async def test_an_unanswered_unload_sent_with_nothing_loaded_settles_undecidable(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """An unload sent with nothing loaded (the feeder read ``empty`` at the send) that nobody
+        answered can never be shown to have run — and with the toolhead still empty its running
+        can pull nothing back. It settles ``undecidable`` (the classifier's token for exactly that)
+        and the contract continues at the load: nothing physical waits on it."""
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        await _bind_spool(db_session, printer.id, 0, 0)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        row = await self._zombie(db_session, printer.id, item.id, [("unload", None, "empty", None)])
+        state = _make_state(tray_now=255, ams_status_main=0, trays=[_ams_tray(0), _ams_tray(1)])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        await self._rearm_and_await(printer.id)
+
+        assert ("unload",) not in client.calls
+        assert _loads(client) == [1]
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.outcome) for s in steps] == [("unload", "undecidable"), ("load", "complete")]
 
 
 # ===========================================================================
@@ -7290,7 +8154,9 @@ class TestTheConfirmWindow:
         """Case (v). With the 409 gone an operator's Unload can land inside the driver's
         own confirm window. ``_takeover`` reads it (``operator_command``) and the driver
         stands down: the operator owns the printer, and the wire's next reading is THEIR
-        command's answer, never the driver's."""
+        command's answer, never the driver's. The driver's own unload went out and nobody read
+        its answer — it is still the farm's (K11) — so the row stays OPEN, escalated, the
+        driver released, and the pending unload stays on the projection."""
         install_settings(max_attempts=2, step_timeout_s=1.0)
         printer = await printer_factory()
         await _farm_item(db_session, printer.id)
@@ -7318,7 +8184,9 @@ class TestTheConfirmWindow:
         assert _loads(client) == []
         failed.assert_not_awaited()  # a takeover is never a give-up
         rows = await _incident_rows(db_session, printer.id)
-        assert [r.status for r in rows] == ["aborted"]
+        assert [(r.status, r.resolved_at) for r in rows] == [("escalated", None)]
+        assert printer_incidents.pending_command(printer.id).name == "unload"
+        assert printer_incidents.driver_live(printer.id) is False
 
     async def test_an_answer_lost_to_a_reconnect_starts_a_fresh_round_and_the_resend_is_a_new_step(
         self, db_session, printer_factory, install_settings, monkeypatch, caplog
@@ -8385,94 +9253,267 @@ def _position(kind, global_tray):
     return spool_recovery.FeederPosition(kind, global_tray)
 
 
-def test_feeder_position_table():
-    """The ONE classifier, over the module's existing sentinel vocabulary."""
-    assert spool_recovery._feeder_position(_make_state(tray_now=0), 0, None) == _position("jammed", 0)
-    assert spool_recovery._feeder_position(_make_state(tray_now=255), 0, None) == _position("empty", 0)
-    assert spool_recovery._feeder_position(_make_state(tray_now=3), 0, None) == _position("other", 3)
-    assert spool_recovery._feeder_position(_make_state(tray_now=254), 0, None) == _position("external", None)
-    # No live state, no jammed tray to be relative to, or a tray_now that names
-    # neither a tray nor a sentinel: the farm says nothing rather than guessing.
-    assert spool_recovery._feeder_position(None, 0, None) == _position("unknown", None)
-    assert spool_recovery._feeder_position(_make_state(tray_now=0), None, None) == _position("unknown", None)
-    assert spool_recovery._feeder_position(_make_state(tray_now=None), 0, None) == _position("unknown", None)
+def test_feeding_position_table():
+    """The ONE classifier (``_position_of``) over the ACTIVE extruder's reading, in the module's
+    sentinel vocabulary."""
+    assert spool_recovery._feeding_position(_make_state(tray_now=0), 0) == _position("jammed", 0)
+    assert spool_recovery._feeding_position(_make_state(tray_now=255), 0) == _position("empty", 0)
+    assert spool_recovery._feeding_position(_make_state(tray_now=3), 0) == _position("other", 3)
+    assert spool_recovery._feeding_position(_make_state(tray_now=254), 0) == _position("external", None)
+    # No live state, or a tray_now that names neither a tray nor a sentinel: the farm says
+    # nothing rather than guessing.
+    assert spool_recovery._feeding_position(None, 0) == _position("unknown", None)
+    assert spool_recovery._feeding_position(_make_state(tray_now=None), 0) == _position("unknown", None)
+    # No jammed tray to be relative to: a fed extruder is still a LOADED reading, "other" —
+    # the tray it prints from is known (a toolhead_refill row whose job named no last feeder).
+    assert spool_recovery._feeding_position(_make_state(tray_now=0), None) == _position("other", 0)
     # An AMS-HT id (128-191) is a real feeder with no letter+slot name — "other",
     # and the clause names it "tray 130", never "tray None".
-    ht = spool_recovery._feeder_position(_make_state(tray_now=130), 0, None)
+    ht = spool_recovery._feeding_position(_make_state(tray_now=130), 0)
     assert ht == _position("other", 130)
-    assert spool_recovery._feeder_clause(ht, None, reason="feed_path_blocked") == "tray 130 is loaded."
-
-
-def test_feeder_position_reads_the_dual_nozzle_map_first(monkeypatch):
-    """On an O1C2/H2D `tray_now` is SINGLE-valued and describes only the active hotend.
-
-    The jammed slot feeding the DEPUTY nozzle would read "empty" off `tray_now` alone,
-    and the give-up would then load on top of filament that never left — so the
-    per-extruder map answers first, exactly as `slot_was_feeding` orders its witnesses."""
-
-    class _DualNozzle:
-        is_dual_nozzle = True
-
-    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: _DualNozzle())
-    state = _make_state(tray_now=255)
-    state.h2d_extruder_snow = {0: 255, 1: 3}  # the deputy hotend is fed from tray 3
-
-    position = spool_recovery._feeder_position(state, 3, 7)
-
-    assert position == _position("jammed", 3)
-    assert "The jammed spool is still loaded (AMS A slot 4)" in spool_recovery._feeder_clause(
-        position, None, reason="feed_path_blocked"
+    assert (
+        spool_recovery._feeder_clause(ExtruderFeed("fed", 130), None, jammed=0, reason="feed_path_blocked")
+        == "tray 130 is loaded."
     )
-    # A hotend fed from a tray that is NOT the jammed one is "other", never "empty".
-    assert spool_recovery._feeder_position(state, 0, 7) == _position("other", 3)
+
+
+def test_feeding_position_reads_the_per_extruder_map_off_the_state(monkeypatch):
+    """K1: on a dual nozzle the active extruder's reading is ``tray_fields.toolhead_feed``'s, off
+    the STATE's per-extruder map (populated only on a dual-nozzle machine) — no client lookup
+    gates it, and the single ``tray_now`` (here a stale 255) never stands in for it."""
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
+    state = _make_state(tray_now=255)
+    state.h2d_extruder_snow = {0: 3, 1: 255}
+
+    assert spool_recovery._feeding_position(state, 3) == _position("jammed", 3)
+
+
+def test_feeding_position_never_lets_a_guessed_tray_now_stand_in_for_the_map():
+    """Both hotends read empty on the per-extruder map: ``tray_now`` there is the client's guess
+    onto an AMS unit (its ``ams_extruder_map`` fallback), never a reading — the filament is NOT
+    at the feeder, and the reader must not take a lever for a self-heal on that guess."""
+    state = _make_state(tray_now=1)
+    state.h2d_extruder_snow = {0: 255, 1: 255}
+
+    assert spool_recovery._feeding_position(state, 1) == _position("empty", 1)
+
+
+def test_a_command_step_records_the_active_extruder_it_acts_on(monkeypatch):
+    """K1 + K5: a command step records the feeder the command ACTS ON — the active extruder at
+    the send — which is what ``ams_command.posture`` keys the answer by and ``ams_command.ran``
+    reads back. H2C: the jammed tray on the DEPUTY beside an empty active nozzle records
+    ``empty``, so the unload is never read as having run the moment it is sent."""
+    state = _make_state(tray_now=0)
+    state.h2d_extruder_snow = {0: 255, 1: 0}
+    state.active_extruder = 0
+    _wire(monkeypatch, state, FakeClient(state))
+    incident = _incident(7, step_timeout_s=0.05)
+
+    kind = spool_recovery._feeder_kind(incident)
+    step = spool_recovery.CommandStep.draft("unload", None, kind).entry()
+
+    assert kind == "empty"
+    assert ams_command.ran(step, spool_recovery.tray_fields.toolhead_feed(state)) is not True
+
+
+def test_a_refill_rows_unload_with_no_jammed_tray_can_be_read_as_ran(monkeypatch):
+    """A ``toolhead_refill`` row whose job named no last feeder carries no jammed tray. The
+    active extruder fed at the send is still a LOADED entry (``other``), so the unload's run —
+    the active extruder reading empty afterwards — is readable (``ran`` True), never ``None``."""
+    state = _make_state(tray_now=2)
+    _wire(monkeypatch, state, FakeClient(state))
+    incident = replace(_incident(7, step_timeout_s=0.05), jammed_global_tray=None)
+
+    kind = spool_recovery._feeder_kind(incident)
+    step = spool_recovery.CommandStep.draft("unload", None, kind).entry()
+    state.tray_now = 255  # the unload ran
+
+    assert kind == "other"
+    assert ams_command.ran(step, spool_recovery.tray_fields.toolhead_feed(state)) is True
+
+
+@pytest.mark.parametrize(
+    ("tray_now", "snow", "clears"),
+    [
+        pytest.param(0, {0: 3, 1: 255}, False, id="tray_now_names_the_jammed_tray_the_active_nozzle_feeds_another"),
+        pytest.param(5, {0: 0, 1: 255}, True, id="the_active_nozzle_feeds_the_jammed_tray"),
+        pytest.param(0, {}, True, id="single_nozzle_on_the_jammed_tray"),
+        pytest.param(1, {}, False, id="single_nozzle_on_another_tray"),
+    ],
+)
+async def test_the_oor_clear_reads_the_active_extruders_tray(db_session, monkeypatch, tray_now, snow, clears):
+    """R3: an operator who resumed ON the jammed feeder declared that spool usable. "On the
+    jammed feeder" is the tray the ACTIVE extruder prints from (``tray_fields.toolhead_feed``) —
+    on a dual nozzle ``tray_now`` is the client's single guess onto a unit."""
+    state = _make_state(tray_now=tray_now, gcode_state="RUNNING", hms=[])
+    state.h2d_extruder_snow = dict(snow)
+    state.active_extruder = 0
+    _wire(monkeypatch, state, FakeClient(state))
+    clear = AsyncMock()
+    monkeypatch.setattr(spool_recovery, "_clear_out_of_rotation_for_slot", clear)
+
+    await spool_recovery._clear_oor_if_resumed_on_jammed_feeder(db_session, _incident(7, step_timeout_s=0.05))
+
+    assert clear.await_count == (1 if clears else 0)
+
+
+@pytest.mark.parametrize(
+    ("tray_now", "snow", "active", "skippable"),
+    [
+        pytest.param(3, {0: 255, 1: 3}, 0, True, id="active_empty_beside_a_fed_deputy"),
+        pytest.param(3, {0: 255, 1: 3}, 1, False, id="active_fed"),
+        pytest.param(255, {0: 2, 1: 255}, 0, False, id="tray_now_empty_but_the_active_map_reads_fed"),
+        pytest.param(255, {}, 0, True, id="single_nozzle_nothing_fed"),
+        pytest.param(2, {}, 0, False, id="single_nozzle_fed"),
+    ],
+)
+def test_unload_skippable_reads_the_active_extruder(tray_now, snow, active, skippable):
+    """Nothing to unload is the ACTIVE extruder's reading (``tray_fields.toolhead_feed``, K1):
+    the unload acts on the active hotend, and on a dual nozzle ``tray_now`` is a single value
+    the client guessed onto a unit. AMS idle and no feed fault stand as before (invariant 8)."""
+    state = _make_state(tray_now=tray_now, hms=[])
+    state.h2d_extruder_snow = dict(snow)
+    state.active_extruder = active
+
+    assert spool_recovery._unload_skippable(state) is skippable
+
+
+def test_slot_was_feeding_reads_the_deputy_off_the_state(monkeypatch):
+    """The presence lane's question at a loss edge: was this slot feeding EITHER hotend? The
+    per-extruder witness is ``tray_fields.toolhead_feed``'s, off the state — no client topology
+    lookup can hide it."""
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
+    state = _make_state(tray_now=0)
+    state.last_loaded_tray = 0
+    state.h2d_extruder_snow = {0: 0, 1: 2}  # the deputy feeds AMS A slot 3
+
+    assert spool_recovery.slot_was_feeding(state, 0, 2, printer_id=7) is True
+    assert spool_recovery.slot_was_feeding(state, 0, 3, printer_id=7) is False
+
+
+def test_the_page_reads_the_active_extruder_on_a_dual_nozzle(monkeypatch):
+    """The PAGE, unlike the reader above, states the ACTIVE extruder (K1,
+    ``tray_fields.toolhead_feed``): on an H2C an empty active nozzle beside a loaded deputy
+    prints air, so "is ANY extruder fed" is the wrong question for what the operator walks up
+    to. The deputy fed from the jammed tray while the active nozzle is empty: "Toolhead empty"."""
+    state = _make_state(tray_now=255)
+    state.h2d_extruder_snow = {0: 255, 1: 3}
+
+    def clause(active):
+        state.active_extruder = active
+        feed = spool_recovery.tray_fields.toolhead_feed(state).active
+        return spool_recovery._feeder_clause(feed, None, jammed=3, reason="feed_path_blocked")
+
+    assert clause(1).startswith("The jammed spool is still loaded (AMS A slot 4)")
+    assert clause(0) == "Toolhead empty. Load a spool on the printer, then resume."
 
 
 def test_feeder_clause_table():
-    """The sentence per (position, restore verdict, reason). `restore` is the DRIVER's own
-    statement about an extruder it emptied — never inferred from the wire."""
-    jammed = _position("jammed", 0)
-    empty = _position("empty", 0)
+    """The sentence per (MEASURED toolhead, refill result, reason) — item 4 of 2026-10-10. The
+    toolhead is the ACTIVE extruder's live reading (K1); the refill is the DRIVER's own
+    statement of what it attempted and what the AMS answered — never inferred from the wire.
+    "Slot N is loaded" only when the active extruder is fed from N; never a resume or a
+    Continue over an empty toolhead."""
+    fed0, fed1, empty = ExtruderFeed("fed", 0), ExtruderFeed("fed", 1), ExtruderFeed("empty")
+    loaded, failed = spool_recovery.RefillLoaded, spool_recovery.RefillFailed
 
-    def clause(position, restore, reason="feed_path_blocked"):
-        return spool_recovery._feeder_clause(position, restore, reason=reason)
+    def clause(feed, refill, reason="feed_path_blocked", jammed=0):
+        return spool_recovery._feeder_clause(feed, refill, jammed=jammed, reason=reason)
 
-    assert clause(jammed, None) == (
+    assert clause(fed0, None) == (
         "The jammed spool is still loaded (AMS A slot 1). Clear the extruder, then resume on the printer."
     )
-    assert clause(jammed, "ok") == (
+    assert clause(fed0, loaded(0)) == (
         "The jammed spool was unloaded and reloaded (AMS A slot 1). Clear the extruder, then resume on the printer."
     )
-    assert clause(empty, "fail") == (
-        "No filament is loaded: AMS A slot 1 was unloaded and the reload failed. "
-        "Check the filament path, load a spool, then resume on the printer."
+    assert clause(fed1, None) == "AMS A slot 2 is loaded."
+    assert clause(fed1, loaded(1)) == "Toolhead refilled from AMS A slot 2."
+    assert clause(empty, failed(0, "load", "no_movement")) == (
+        "Toolhead empty. Load from AMS A slot 1 failed: no movement. Load a spool on the printer, then resume."
     )
-    assert clause(empty, "skipped_drying") == (
-        "No filament is loaded: AMS A slot 1 was unloaded; the AMS is drying, so no reload was attempted. "
-        "Load a spool after the cycle, then resume on the printer."
+    assert clause(empty, failed(0, "unload", "acted")) == (
+        "Toolhead empty. The unload before the load from AMS A slot 1 failed: acted. "
+        "Load a spool on the printer, then resume."
     )
-    # 255 with no restore verdict: the farm did not empty it and cannot say why it
-    # reads empty (invariant 8 — 255 is "nothing is feeding", not "the path is clear").
-    assert clause(empty, None) is None
-    assert clause(_position("other", 1), None) == "AMS A slot 2 is loaded."
-    # No AMS slot to name, or nothing to be relative to: no clause at any verdict.
+    assert clause(empty, failed(0, "unload", "drying")) == (
+        "Toolhead empty. The unload before the load from AMS A slot 1 failed: drying. "
+        "Load a spool after the drying cycle, then resume on the printer."
+    )
+    assert clause(empty, failed(None, "load", "session_changed")) == (
+        "Toolhead empty. Refill failed: session changed. Load a spool on the printer, then resume."
+    )
+    assert clause(empty, spool_recovery.RefillNoCandidate()) == (
+        "Toolhead empty. No spool to load. Load a spool on the printer, then resume."
+    )
+    # No refill was attempted (an entry escalation, a command pending, a change in flight): the
+    # measured toolhead and the exit — never a claim about an unload nobody did.
+    assert clause(empty, None) == "Toolhead empty. Load a spool on the printer, then resume."
+    # No AMS slot to name, or nothing read: no clause at any refill result.
     for kind in ("external", "unknown"):
-        for restore in (None, "ok", "fail", "skipped_drying"):
-            assert clause(_position(kind, None), restore) is None
-    # The two wedge give-ups: the slot is named and NO instruction rides beside the copy's
-    # own Retry — the _retract_clause pattern, one instruction per page.
-    for reason in ("wedge_unreleased", "swap_held_after_release"):
-        assert clause(jammed, None, reason) == "The jammed spool is still loaded (AMS A slot 1)."
+        for refill in (None, loaded(0), failed(0, "load", "no_movement"), spool_recovery.RefillNoCandidate()):
+            assert clause(ExtruderFeed(kind), refill) is None
+    assert clause(None, None) is None
+    # The slot named is the one the ACTIVE extruder is fed from, and only it.
+    for tray in range(4):
         assert (
-            clause(empty, "fail", reason) == "No filament is loaded: AMS A slot 1 was unloaded and the reload failed."
+            clause(ExtruderFeed("fed", tray), None, jammed=None)
+            == f"{printer_incidents.runout_slot_desc(tray)} is loaded."
         )
-        for position in (jammed, empty, _position("other", 1)):
-            for restore in (None, "ok", "fail", "skipped_drying"):
-                assert "resume on the printer" not in (clause(position, restore, reason) or "")
+    # The two wedge give-ups: the slot is named and NO instruction rides beside the copy's own
+    # Retry — the _retract_clause pattern, one instruction per page.
+    for reason in ("wedge_unreleased", "swap_held_after_release"):
+        assert clause(fed0, None, reason) == "The jammed spool is still loaded (AMS A slot 1)."
+        assert clause(empty, failed(0, "load", "no_movement"), reason) == (
+            "Toolhead empty. Load from AMS A slot 1 failed: no movement."
+        )
+        assert clause(empty, None, reason) == "Toolhead empty."
+        for feed in (fed0, empty, fed1):
+            for refill in (None, loaded(0), failed(0, "load", "no_movement")):
+                assert "resume" not in (clause(feed, refill, reason) or "")
     # wedge_ended_print: the print is over — where the filament sits is no instruction. The
     # gate is the composer's (``_job_ended`` — the reason, or the restart stop on the ledger),
     # asked once for the clause and the page: TestTheRestartRung pins every ended reason.
     assert spool_recovery._job_ended("wedge_ended_print", None) is True
     assert spool_recovery._job_ended("wedge_unreleased", None) is False
+
+
+# The jam-kind reasons a page can be composed for over a live EMPTY toolhead (the external, the
+# runout and the physical reasons carry their own instruction and no feeder clause; the ended
+# reasons take the ended copy).
+_JAM_PAGE_REASONS = (
+    "multi_feeder_job",
+    "jammed_tray_unresolved",
+    "no_eligible_spool",
+    "candidate_loads_failed",
+    "feed_path_blocked",
+    "ams_drying",
+    "only_low_spools_in_protected_layers",
+    "candidates_exhausted",
+    "unload_failed",
+    "wedge_unreleased",
+    "swap_held_after_release",
+    "printer_offline",
+    "repeated_jams",
+    "recovery_interrupted",
+)
+
+
+@pytest.mark.parametrize("reason", _JAM_PAGE_REASONS)
+async def test_no_page_says_resume_or_continue_over_an_empty_toolhead(db_session, printer_factory, monkeypatch, reason):
+    """Item 4 of 2026-10-10, over every jam reason: with the active extruder reading EMPTY on a
+    live session the page never says "press Continue" or "resume on the printer" before a load —
+    a reason whose paused copy instructs a resume takes its empty-side copy
+    (``_EMPTY_TOOLHEAD_DETAIL``), and the feeder clause carries the exit, which loads first."""
+    printer = await printer_factory()
+    state = _make_state(tray_now=255, ams_status_main=0)
+    _wire(monkeypatch, state, FakeClient(state))
+    incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05)
+    evidence = await _log(db_session, incident.incident_id)
+
+    detail = spool_recovery._compose_detail(incident, reason, refill=None, evidence=evidence)
+
+    assert "Toolhead empty." in detail
+    assert "press continue" not in detail.lower() and "resume on the printer" not in detail.lower(), detail
 
 
 async def test_a_runout_escalation_carries_no_feeder_clause(db_session, printer_factory, monkeypatch):
@@ -8512,15 +9553,16 @@ async def test_the_slot_label_has_one_origin(db_session, printer_factory, monkey
 # --- the give-up boundary: restore what the swap moved, then page ------------
 
 
-async def test_the_give_up_restores_the_jammed_feeder(
+async def test_the_give_up_refills_the_toolhead_with_the_jammed_spool(
     db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
-    """Every candidate failed to load and the round after them found none left — the
-    residual shape in which the extruder is empty at a give-up. The driver puts the
-    jammed spool back BEFORE it pages, so no resume can print air.
+    """Every candidate failed to load and the round after them found none left — an EMPTY
+    toolhead at the give-up. The refill puts the job's own spool back BEFORE it pages (the
+    jammed tray: present, not spent, its out-of-rotation stamp no disqualifier — Raymond
+    2026-09-17), so no resume can print air.
 
     The stamp stays (it did jam; the flag only bars auto-selection) and the escalation
-    reason is untouched — the restore is not a candidate and buys no evidence."""
+    reason is untouched — the refill is not a candidate and buys no evidence."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -8540,7 +9582,7 @@ async def test_the_give_up_restores_the_jammed_feeder(
     assert state.tray_now == 0  # the jammed spool is back on the feeder
     assert _escalated_reasons(caplog) == ["feed_path_blocked"]  # evidence unchanged
     assert "The jammed spool was unloaded and reloaded (AMS A slot 1)" in failed.call_args.kwargs["detail"]
-    assert any("verdict=restore_ok" in r.getMessage() for r in caplog.records)
+    assert any("verdict=refill_loaded" in r.getMessage() for r in caplog.records)
     db_session.expunge_all()
     assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None  # the stamp STAYS
 
@@ -8548,21 +9590,21 @@ async def test_the_give_up_restores_the_jammed_feeder(
 @pytest.mark.parametrize(
     "client_kw,verdict,clause",
     [
-        # The reload went out and the AMS did not move: ``no_movement`` → ``fail``.
+        # The refill's load went out and the AMS did not move: ``no_movement``.
         (
             {"load_ok_targets": set()},
-            "fail",
-            "No filament is loaded: AMS A slot 1 was unloaded and the reload failed.",
+            "refill_failed_load_no_movement",
+            "Toolhead empty. Load from AMS A slot 1 failed: no movement.",
         ),
-        # The reload never went out (every publish refused): ``fail``.
-        ({"load_ret": False}, "fail", "No filament is loaded: AMS A slot 1 was unloaded and the reload failed."),
+        # The refill's load never went out (every publish refused): ``refused``.
+        ({"load_ret": False}, "refill_failed_load_refused", "Toolhead empty. Load from AMS A slot 1 failed: refused."),
     ],
 )
-async def test_the_give_up_pages_a_restore_that_did_not_land(
+async def test_the_give_up_pages_a_refill_that_did_not_land(
     db_session, printer_factory, install_settings, monkeypatch, caplog, client_kw, verdict, clause
 ):
-    """The odd case is PAGED, not machined: the reload was attempted and did not land,
-    so the printer really is empty — and the page says what the wire answered."""
+    """The odd case is PAGED, not machined: the refill was attempted and did not land,
+    so the printer really is empty — and the page says which slot and what the AMS answered."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -8577,14 +9619,14 @@ async def test_the_give_up_pages_a_restore_that_did_not_land(
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert client.calls.count(("load", 0)) == 2  # both attempts spent on the restore
+    assert client.calls.count(("load", 0)) == 2  # both attempts spent on the refill
     assert state.tray_now == 255  # ...and nothing is loaded
     # A candidate load the client refused to publish gives up at once; one the AMS did
     # not move on moves to the next candidate, and the rounds run out on the path.
     expected = "candidate_loads_failed" if client_kw.get("load_ret") is False else "feed_path_blocked"
     assert _escalated_reasons(caplog) == [expected]
     assert clause in failed.call_args.kwargs["detail"]
-    assert any(f"verdict=restore_{verdict}" in r.getMessage() for r in caplog.records)
+    assert any(f"verdict={verdict}" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_takeover_during_the_restore_keeps_the_stamp(
@@ -8628,9 +9670,15 @@ async def test_an_ams_back_in_a_change_over_an_extruder_the_farm_emptied_withhol
     """The candidate's load moved the AMS into a change and never completed; round 2
     finds the AMS mid-change over an extruder the FARM emptied. No release verb is pulled
     over it (2026-09-17 ruling: a resume there prints air), and no swap goes into it: the
-    round gives up on what failed (the loads). The restore goes out once, the firmware
-    acknowledges it and holds it behind the change — ``fail``, never resent — and the
-    page names the held reload and what it will do."""
+    round gives up on what failed (the loads). No REFILL goes into it either (K8, 2026-10-10:
+    the AMS owns the toolhead's next motion in a change, and anything sent into it is held and
+    runs at the release — 012-H2S 2026-09-23): the page states the measured toolhead, empty,
+    and the exit, which loads first.
+
+    The firmware acknowledges motion only once the AMS is in the change: an acknowledged,
+    unmoved load into an empty path OUTSIDE a change is ``held`` at the step bound
+    (011/014-H2S 2026-10-09/10) and is never resent, so the candidate loads that drive
+    this case into round 2 go out unacknowledged (``no_movement``, resent)."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -8638,11 +9686,12 @@ async def test_an_ams_back_in_a_change_over_an_extruder_the_farm_emptied_withhol
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
     _spy(monkeypatch, "on_spool_out_of_rotation")
     state = _make_state(trays=[_ams_tray(0), _ams_tray(1)])
-    client = FakeClient(state, load_ok_targets=set(), resume_unwedges=False, ack_motion=True)
+    client = FakeClient(state, load_ok_targets=set(), resume_unwedges=False, ack_motion=False)
 
     def _poll(_n, st):
         if client.calls.count(("load", 1)) >= 2:
             st.ams_status_main = 1  # the AMS wedges mid-change under the driver
+            client.ack_motion = True  # and acknowledges what is sent into the change
 
     _wire(monkeypatch, state, client, on_poll=_poll)
 
@@ -8650,23 +9699,24 @@ async def test_an_ams_back_in_a_change_over_an_extruder_the_farm_emptied_withhol
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert client.calls.count(("load", 0)) == 1  # the restore went out, once: held, never resent
+    assert ("load", 0) not in client.calls  # no refill into the change
     assert ("resume",) not in client.calls  # no verb over the extruder the farm emptied
     assert _escalated_reasons(caplog) == ["feed_path_blocked"]
     lines = [r.getMessage() for r in caplog.records]
     assert any("ladder withheld" in m for m in lines)
-    assert any("verdict=restore_fail" in m for m in lines)
+    assert not any("verdict=refill_" in m for m in lines)
     detail = failed.call_args.kwargs["detail"]
-    assert "load AMS A slot 1: held. A load of AMS A slot 1 is held in the AMS and runs at the next release." in detail
-    assert "No filament is loaded: AMS A slot 1 was unloaded and the reload failed." in detail
+    assert detail.startswith(spool_recovery._EMPTY_TOOLHEAD_DETAIL["feed_path_blocked"])
+    assert detail.endswith("Toolhead empty. Load a spool on the printer, then resume.")
 
 
-async def test_a_drying_ams_at_the_unload_refuses_the_restore(
+async def test_a_drying_ams_at_the_unload_refuses_the_refill(
     db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
     """The drying lockout arrives between rounds: round 2's unload pre-flight answers
-    `drying`, so the round gives up — and the restore's own pre-flight answers the same,
-    because it is the SAME `_load_and_confirm` the swap uses."""
+    `drying`, so the round gives up — and the refill's own unload pre-flight answers the same,
+    because it is the SAME `_unload_and_confirm` the swap uses: nothing is written to a drying
+    AMS, and the page says when a spool can go in."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -8686,19 +9736,20 @@ async def test_a_drying_ams_at_the_unload_refuses_the_restore(
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert client.calls.count(("unload",)) == 1  # round 2 never wrote to a drying AMS
+    assert client.calls.count(("unload",)) == 1  # round 2 and the refill never wrote to a drying AMS
     assert ("load", 2) not in client.calls and ("load", 0) not in client.calls
     assert _escalated_reasons(caplog) == ["ams_drying"]
-    assert any("verdict=restore_skipped_drying" in r.getMessage() for r in caplog.records)
-    assert "the AMS is drying, so no reload was attempted" in failed.call_args.kwargs["detail"]
+    assert any("verdict=refill_failed_unload_drying" in r.getMessage() for r in caplog.records)
+    detail = failed.call_args.kwargs["detail"]
+    assert "failed: drying. Load a spool after the drying cycle, then resume on the printer." in detail
 
 
-async def test_a_drying_ams_between_the_unload_and_the_load_refuses_the_restore(
+async def test_a_drying_ams_between_the_unload_and_the_load_refuses_the_refill(
     db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
     """The other drying site: the unload confirmed and the dry cycle started before the
-    replacement load. The extruder IS empty (the driver emptied it) and no reload can be
-    commanded until the cycle ends — the page states both."""
+    replacement load. The toolhead IS empty and no refill can be commanded until the cycle
+    ends — the page states both."""
     install_settings(max_attempts=2, step_timeout_s=0.05)
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -8721,15 +9772,18 @@ async def test_a_drying_ams_between_the_unload_and_the_load_refuses_the_restore(
     assert ("unload",) in client.calls  # the unload landed...
     assert not any(c[0] == "load" for c in client.calls)  # ...and no load followed it
     assert _escalated_reasons(caplog) == ["ams_drying"]
-    assert any("verdict=restore_skipped_drying" in r.getMessage() for r in caplog.records)
-    assert "the AMS is drying, so no reload was attempted" in failed.call_args.kwargs["detail"]
+    assert any("verdict=refill_failed_unload_drying" in r.getMessage() for r in caplog.records)
+    assert "Load a spool after the drying cycle, then resume on the printer." in failed.call_args.kwargs["detail"]
 
 
-@pytest.mark.parametrize("ams_main", [3, 1])
-async def test_the_restore_is_attempted_in_every_posture(db_session, printer_factory, monkeypatch, caplog, ams_main):
-    """The reload is SENT whatever ``ams_status_main`` reads — assist (3, the steady
-    state of every RUNNING H2S) and mid filament-change (1) alike — and the wire's answer
-    decides the verdict. The wedge refusal this replaces rested on an unmeasured premise."""
+@pytest.mark.parametrize("ams_main,refills", [(3, True), (0, True), (1, False)])
+async def test_the_refill_runs_outside_a_change_and_never_inside_one(
+    db_session, printer_factory, monkeypatch, caplog, ams_main, refills
+):
+    """Outside a change the refill is SENT whatever ``ams_status_main`` reads — assist (3, the
+    steady state of every RUNNING H2S) or idle — and the wire's answer decides the verdict.
+    Inside a change (1) nothing goes in: the print's own head owns the toolhead's next motion,
+    and a refill sent into it would be held and run at the release (012-H2S 2026-09-23)."""
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
     _spy(monkeypatch, "on_spool_recovery_failed")
@@ -8743,19 +9797,22 @@ async def test_the_restore_is_attempted_in_every_posture(db_session, printer_fac
         await _logged_command(evidence, "unload", "complete")
         await spool_recovery._give_up(incident, "feed_path_blocked", evidence=evidence)
 
-    assert ("load", 0) in client.calls
-    assert any("verdict=restore_fail" in r.getMessage() for r in caplog.records)
+    assert (("load", 0) in client.calls) is refills
+    assert any("verdict=refill_failed_load_refused" in r.getMessage() for r in caplog.records) is refills
 
 
-async def test_a_no_candidate_give_up_at_255_never_loads_what_it_did_not_unload(
+async def test_a_no_candidate_give_up_at_255_reloads_the_jobs_own_spool(
     db_session, printer_factory, install_settings, monkeypatch, caplog
 ):
     """The firmware retracted after the fault, so `tray_now` reads 255 before the farm
     touches anything — and no replacement exists to swap to.
 
-    Nothing is committed and nothing is restored: a load with no explicit unload behind
-    it is the one a post-fault AMS drops (invariant 8), and the printer is left exactly
-    as the firmware left it."""
+    REVERSED 2026-10-10 (K8): this pinned "the restore undoes only the driver's own motion",
+    an agent's 2026-09 design, never an operator ruling — and it handed the operator an empty
+    toolhead whose resume prints air. Nothing is COMMITTED (no out-of-rotation stamp: there is
+    no swap), but the refill puts the job's own spool back before the page: its unload first
+    (invariant 8 — after a feed fault 255 is "nothing is feeding", never "the path is clear"),
+    then the load."""
     install_settings()
     printer = await printer_factory()
     await _farm_item(db_session, printer.id)
@@ -8772,11 +9829,14 @@ async def test_a_no_candidate_give_up_at_255_never_loads_what_it_did_not_unload(
         task = await on_ams_fault(printer.id, state)
         await task
 
-    assert ("unload",) not in client.calls
-    assert not any(c[0] == "load" for c in client.calls)
+    assert [c for c in client.calls if c[0] in ("unload", "load")] == [("unload",), ("load", 0)]
+    assert state.tray_now == 0  # the toolhead is loaded
     oor.assert_not_awaited()
     assert _escalated_reasons(caplog) == ["no_eligible_spool"]
-    assert failed.call_args.kwargs["detail"] == spool_recovery._ESCALATE_DETAIL["no_eligible_spool"]
+    assert failed.call_args.kwargs["detail"] == (
+        f"{spool_recovery._ESCALATE_DETAIL['no_eligible_spool']} Sent: unload: complete; load AMS A slot 1: complete. "
+        "The jammed spool was unloaded and reloaded (AMS A slot 1). Clear the extruder, then resume on the printer."
+    )
     db_session.expunge_all()
     assert (await db_session.get(Spool, jammed.id)).feed_fault_at is None
 
@@ -8789,8 +9849,8 @@ async def test_the_clause_never_claims_an_unload_the_driver_did_not_do(
 ):
     """After a feed fault `tray_now` frequently already reads 255 BEFORE the farm does
     anything, and five jam reasons escalate straight from the entry gate with nothing
-    unloaded. The clause therefore reads the driver's own restore verdict, never the
-    wire: no verdict, no claim about an unload."""
+    unloaded. The clause states the MEASURED toolhead and the driver's own refill statement,
+    never an act inferred from the wire: no refill, no claim about an unload."""
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
@@ -8802,18 +9862,21 @@ async def test_the_clause_never_claims_an_unload_the_driver_did_not_do(
         incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
         await spool_recovery._escalate(incident, reason)
         detail = failed.call_args.kwargs["detail"]
-        assert detail == spool_recovery._ESCALATE_DETAIL[reason]
-        assert "was unloaded" not in detail
+        assert (
+            detail
+            == f"{spool_recovery._ESCALATE_DETAIL[reason]} Toolhead empty. Load a spool on the printer, then resume."
+        )
+        assert "unload" not in detail
         await _close_row(db_session, printer.id)
 
     # The same wire state, after the driver's OWN completed unload and a refused
-    # reload, does carry it.
+    # refill, carries what the refill attempted and what the AMS answered.
     incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
     evidence = await _log(db_session, incident.incident_id)
     await _logged_command(evidence, "unload", "complete")
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
         await spool_recovery._give_up(incident, "feed_path_blocked", evidence=evidence)
-    assert "AMS A slot 1 was unloaded and the reload failed" in failed.call_args.kwargs["detail"]
+    assert "Toolhead empty. Load from AMS A slot 1 failed: refused." in failed.call_args.kwargs["detail"]
 
 
 async def test_the_stamp_lands_after_selection_and_before_the_unload(
@@ -8859,45 +9922,55 @@ async def test_the_stamp_lands_after_selection_and_before_the_unload(
     assert client.calls.index(("select", 1)) < client.calls.index(("oor",)) < client.calls.index(("unload",))
 
 
-async def test_the_clause_follows_the_classifier_not_tray_now(db_session, printer_factory, monkeypatch):
-    """`_feeder_position` is the ONE reading behind the clause: monkeypatch it and the
-    escalation follows it even though `tray_now` says the opposite."""
+def _toolhead_reads(kind, tray=None):
+    """A stand-in for the K1 reader whose ACTIVE extruder reads ``kind``."""
+
+    def _reader(_state):
+        feed = ExtruderFeed(kind, tray)
+        return spool_recovery.tray_fields.ToolheadFeed(extruders=((0, feed),), active_extruder=0, active=feed)
+
+    return _reader
+
+
+async def test_the_clause_follows_the_k1_toolhead_feed_not_tray_now(db_session, printer_factory, monkeypatch):
+    """``tray_fields.toolhead_feed`` (K1) is the ONE reading behind the clause: replace it and
+    the escalation follows it even though ``tray_now`` says the opposite."""
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
     failed = _spy(monkeypatch, "on_spool_recovery_failed")
     state = _make_state(tray_now=0)  # the wire says the jammed tray is feeding
     _wire(monkeypatch, state, FakeClient(state))
-    monkeypatch.setattr(spool_recovery, "_feeder_position", lambda *_a, **_k: _position("empty", 0))
+    monkeypatch.setattr(spool_recovery.tray_fields, "toolhead_feed", _toolhead_reads("empty"))
     incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
 
-    await spool_recovery._escalate(incident, "feed_path_blocked", restore="fail")
-
-    assert (
-        "No filament is loaded: AMS A slot 1 was unloaded and the reload failed" in (failed.call_args.kwargs["detail"])
+    await spool_recovery._escalate(
+        incident, "feed_path_blocked", refill=spool_recovery.RefillFailed(0, "load", "no_movement")
     )
 
+    assert "Toolhead empty. Load from AMS A slot 1 failed: no movement." in failed.call_args.kwargs["detail"]
 
-@pytest.mark.parametrize("kind,expect_load", [("empty", True), ("jammed", False)])
-async def test_the_restore_follows_the_classifier_not_tray_now(
+
+@pytest.mark.parametrize("kind,expect_load", [("empty", True), ("fed", False)])
+async def test_the_refill_gate_follows_the_k1_toolhead_feed_not_tray_now(
     db_session, printer_factory, monkeypatch, kind, expect_load
 ):
-    """Same pin on the other projection: the restore decision reads the classifier, so
-    a `tray_now` that disagrees changes nothing."""
+    """Same pin on the other projection: the give-up's refill decision reads the K1 toolhead
+    feed (the ACTIVE extruder), so a ``tray_now`` that disagrees changes nothing."""
     printer = await printer_factory()
     item = await _farm_item(db_session, printer.id)
-    # The wire is set to the OPPOSITE of the classifier's verdict in both cases.
-    state = _make_state(tray_now=255 if kind == "jammed" else 0)
+    _spy(monkeypatch, "on_spool_recovery_failed")
+    # The wire is set to the OPPOSITE of the reader's verdict in both cases.
+    state = _make_state(tray_now=255 if kind == "fed" else 0)
     client = FakeClient(state, load_ret=False)
     _wire(monkeypatch, state, client)
-    monkeypatch.setattr(spool_recovery, "_feeder_position", lambda *_a, **_k: _position(kind, 0))
+    monkeypatch.setattr(
+        spool_recovery.tray_fields, "toolhead_feed", _toolhead_reads(kind, 0 if kind == "fed" else None)
+    )
     incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
 
-    verdict = await spool_recovery._restore_jammed_feeder(
-        incident, evidence=await _log(db_session, incident.incident_id)
-    )
+    await spool_recovery._give_up(incident, "feed_path_blocked", evidence=await _log(db_session, incident.incident_id))
 
     assert (("load", 0) in client.calls) is expect_load
-    assert verdict == ("fail" if expect_load else None)
 
 
 def _module_ast():
@@ -9480,7 +10553,7 @@ class TestTheEvidenceLog:
         state = _make_state(tray_now=3)
         _wire(monkeypatch, state, FakeClient(state))
         detail = spool_recovery._compose_detail(
-            replace(incident, jammed_global_tray=3), "swap_held_after_release", restore=None, evidence=evidence
+            replace(incident, jammed_global_tray=3), "swap_held_after_release", refill=None, evidence=evidence
         )
         assert detail == (
             f"{spool_recovery._ESCALATE_DETAIL['swap_held_after_release']} {sentence} "
@@ -9499,14 +10572,15 @@ class TestTheEvidenceLog:
 
     @pytest.mark.parametrize(
         "answer,restores",
-        [("complete", True), ("acted", True), ("no_movement", False), ("held", False), ("undecidable", False)],
+        [("complete", True), ("acted", True), ("no_movement", True), ("held", False), ("undecidable", True)],
     )
-    async def test_the_restore_is_gated_on_an_unload_that_moved_the_ams(
+    async def test_the_refill_is_gated_on_an_empty_toolhead_and_no_pending_command(
         self, db_session, printer_factory, monkeypatch, answer, restores
     ):
-        """The restore undoes the FARM's own motion: only an unload that MOVED the AMS
-        (``complete`` / ``acted``) owes it. One that moved nothing, answered nothing, or is
-        held (it runs at the next release — nothing may be sent behind it) does not."""
+        """The refill fills an EMPTY toolhead whoever emptied it (K8, 2026-10-10 — the reversal of
+        "the restore undoes the farm's own motion", whose ``no_movement`` / ``undecidable`` cells
+        left the toolhead empty under the page). One gate is left from the log: a command the AMS
+        HOLDS runs when it runs, and nothing is sent behind it (its refill is the hand-over's)."""
         printer = await printer_factory()
         item = await _farm_item(db_session, printer.id)
         _spy(monkeypatch, "on_spool_recovery_failed")
@@ -9688,9 +10762,9 @@ class TestASessionGapIsAWait:
     ):
         """The unload went out, the session dropped, and the AMS unloaded while the farm
         could not see it (idle + nothing fed on the new session's first report). It reads
-        ``complete`` — so ``unload_moved_ams`` is true, and when the only replacement
-        then fails to load, the give-up RESTORES the jammed spool the farm unloaded
-        instead of handing a human an empty extruder (the 2026-09-17 invariant)."""
+        ``complete``, and when the only replacement then fails to load, the give-up REFILLS
+        the empty toolhead with the job's own spool — its unload first — instead of handing a
+        human an empty extruder (K8, 2026-10-10)."""
         install_settings(max_attempts=1, step_timeout_s=0.1)
         printer = await printer_factory()
         await _farm_item(db_session, printer.id)
@@ -9713,10 +10787,10 @@ class TestASessionGapIsAWait:
 
         lines = [r.getMessage() for r in caplog.records]
         assert any("command=unload" in m and "answer=complete" in m for m in lines)
-        assert client.calls.count(("unload",)) == 1
+        assert client.calls.count(("unload",)) == 2  # the swap's, then the refill's own
         assert ("load", 1) in client.calls  # the replacement was tried and did not load
         assert client.calls[-1] == ("load", 0)  # ...and the give-up put the jammed spool back
-        assert any("verdict=restore_ok" in m for m in lines)
+        assert any("verdict=refill_loaded" in m for m in lines)
         assert _escalated_reasons(caplog) == ["feed_path_blocked"]
         (row,) = await _incident_rows(db_session, printer.id)
         steps = await printer_incidents.steps_of(db_session, row.id)
@@ -9848,10 +10922,14 @@ class TestASessionGapIsAWait:
     ):
         """The process dies mid-load, after the swap committed (the jammed spool stamped
         and paged, the unload done). The startup re-entry hydrates the step log, reads the
-        commit boundary off it — a command went out — and runs the swap to the end on the
-        next candidate WITHOUT stamping or paging the jammed spool a second time. The
-        commit used to be a local flag of the dead driver, which the re-entry began
-        without."""
+        commit boundary off it — a command went out — and runs the swap to the end WITHOUT
+        stamping or paging the jammed spool a second time. The commit used to be a local flag
+        of the dead driver, which the re-entry began without.
+
+        The dead driver's load of tray 1 went out and nobody read its answer, so it is the
+        re-entry's to WAIT for, never to resend (2026-10-10, item 2) — here it ran while the
+        farm was down (tray 1 at the toolhead), so the contract continues at the resume: one
+        load on the wire, ever."""
         install_settings(step_timeout_s=0.2)
         printer = await printer_factory()
         await _farm_item(db_session, printer.id)
@@ -9859,7 +10937,7 @@ class TestASessionGapIsAWait:
         oor = _spy(monkeypatch, "on_spool_out_of_rotation")
         succeeded = _spy(monkeypatch, "on_spool_recovery_succeeded")
         state = _make_state(trays=[_ams_tray(0), _ams_tray(1), _ams_tray(2)])
-        client = FakeClient(state, load_ok_targets={2})
+        client = FakeClient(state, load_ok_targets=set())  # the load does not take while the farm watches
         driver: dict[str, asyncio.Task] = {}
         after_load = {"n": 0}
 
@@ -9882,6 +10960,7 @@ class TestASessionGapIsAWait:
         db_session.expunge_all()
         stamped_at = (await db_session.get(Spool, jammed.id)).feed_fault_at
         assert stamped_at is not None
+        state.tray_now = 1  # the queued load ran while the farm was down
 
         await spool_recovery.rearm_incidents_on_startup()
         reentered = printer_incidents._drivers.get(printer.id)  # noqa: SLF001
@@ -9891,7 +10970,7 @@ class TestASessionGapIsAWait:
         oor.assert_awaited_once()  # not re-paged
         db_session.expunge_all()
         assert (await db_session.get(Spool, jammed.id)).feed_fault_at == stamped_at  # not re-stamped
-        assert _loads(client) == [1, 2]
+        assert _loads(client) == [1]  # never resent behind itself
         rows = await _incident_rows(db_session, printer.id)
         assert [(r.status, r.resolve_source) for r in rows] == [("resolved", "driver_swap")]
         succeeded.assert_awaited_once()
@@ -10778,6 +11857,39 @@ class TestTheRestartRung:
         db_session.expunge_all()
         assert (await db_session.get(Spool, jammed.id)).feed_fault_at is not None
 
+    async def test_a_deploy_mid_unload_waits_for_the_unanswered_unload_and_never_resends(
+        self, db_session, printer_factory, monkeypatch, caplog
+    ):
+        """The stop went out, the continuation's unload went out, and the process died before
+        its answer. The re-entered continuation sends NO second unload behind it: it waits, the
+        AMS runs it (the tube empties), and the continuation parks and closes ``driver_restart``."""
+        printer = await printer_factory()
+        item, jammed, _backup = await _restart_setup(db_session, printer.id)
+        _spy(monkeypatch, "on_spool_out_of_rotation")
+        row = await self._stopped_row(db_session, printer.id, item.id, unloaded=False)
+        seq = len(await printer_incidents.steps_of(db_session, row.id)) + 1
+        await printer_incidents.note_step(db_session, row.id, seq=seq, kind="command", name="unload", feeder="jammed")
+        state, client = _wedge_013()
+        state.state, state.ams_status_main, state.hms_errors = "IDLE", 0, []
+        reads = {"n": 0}
+
+        def _poll(_n, st):
+            reads["n"] += 1
+            if reads["n"] == 40:
+                st.tray_now = 255  # the queued unload ran
+
+        _wire(monkeypatch, state, client, on_poll=_poll)
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            await spool_recovery.rearm_incidents_on_startup()
+            await printer_incidents._drivers[printer.id]  # noqa: SLF001 — the re-entered driver
+
+        assert not any(c[0] in ("stop", "unload", "load") for c in client.calls)
+        (closed,) = await _incident_rows(db_session, printer.id)
+        assert (closed.id, closed.status, closed.resolve_source) == (row.id, "resolved", "driver_restart")
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert (steps[-1].name, steps[-1].outcome) == ("unload", "complete")
+
     async def test_a_deploy_after_the_unload_completed_re_enters_to_park_and_close(
         self, db_session, printer_factory, monkeypatch, caplog
     ):
@@ -10888,7 +12000,7 @@ class TestTheRestartRung:
         evidence = await _log(db_session, incident.incident_id)
 
         assert spool_recovery._job_ended(reason, evidence) is True
-        detail = spool_recovery._compose_detail(incident, reason, restore=None, evidence=evidence)
+        detail = spool_recovery._compose_detail(incident, reason, refill=None, evidence=evidence)
         assert "paused" not in detail.lower() and "resume on the printer" not in detail.lower(), detail
 
     async def test_the_offline_bound_after_the_stop_pages_the_ended_copy(
@@ -10903,13 +12015,943 @@ class TestTheRestartRung:
         incident = replace(await _owned_incident(db_session, printer.id, step_timeout_s=0.05), jammed_global_tray=2)
         evidence = await _log(db_session, incident.incident_id)
 
-        paused = spool_recovery._compose_detail(incident, "printer_offline", restore=None, evidence=evidence)
+        paused = spool_recovery._compose_detail(incident, "printer_offline", refill=None, evidence=evidence)
         assert spool_recovery._job_ended("printer_offline", evidence) is False
         assert paused.startswith(spool_recovery._ESCALATE_DETAIL["printer_offline"])
         assert "resume on the printer" in paused
 
         seq = await evidence.note(spool_recovery.LeverStep.draft(printer_incidents.FAULT_RESTART_STEP))
         await evidence.answer(seq, "stopped", moved=True)
-        ended = spool_recovery._compose_detail(incident, "printer_offline", restore=None, evidence=evidence)
+        ended = spool_recovery._compose_detail(incident, "printer_offline", refill=None, evidence=evidence)
         assert spool_recovery._job_ended("printer_offline", evidence) is True
         assert ended == f"{spool_recovery._ENDED_JOB_DETAIL['printer_offline']} Sent: print stop: stopped."
+
+
+# ===========================================================================
+# K7 (2026-10-10) — is a toolhead refill OWED here? ONE owner of the exclusions
+# ===========================================================================
+
+
+def _air_state(*, tray_now=255, layer=50, total=100, gcode_state="PAUSE", hms=None, ams_status_main=0):
+    """A live printer whose ACTIVE extruder reads ``tray_now`` (255 = nothing fed) at ``layer`` of
+    ``total`` — the shape every K7 cell is read against."""
+    state = _make_state(tray_now=tray_now, layer=layer, gcode_state=gcode_state, hms=hms or [])
+    state.ams_status_main = ams_status_main
+    state.total_layers = total
+    return state
+
+
+class TestTheRefillVerdict:
+    """``spool_recovery.refill_owed(printer_id, state, *, trigger)`` — the ONE answer to "may the farm
+    refill this toolhead now", read by the resume verb (T3), the per-push detectors (T2 / T4) and
+    nothing else. Closed reasons; every trigger is an EVENT (Raymond 2026-10-10: "time is not the
+    right signal"); ``physical`` excludes T2 only (T3/T4 still try and report); ``last_layer`` is
+    T4's (the end-of-print retract reads empty at the last layer)."""
+
+    _TRIGGERS = ("T2", "T3", "T4")
+
+    async def _verdicts(self, monkeypatch, printer_id, state, client=None):
+        _wire(monkeypatch, state, client if client is not None else FakeClient(state))
+        return {t: spool_recovery.refill_owed(printer_id, state, trigger=t).reason for t in self._TRIGGERS}
+
+    async def test_an_empty_toolhead_mid_print_is_owed_on_every_trigger(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state())
+        assert verdicts == {"T2": "owed", "T3": "owed", "T4": "owed"}
+        assert spool_recovery.refill_owed(printer.id, _air_state(), trigger="T3").owed is True
+
+    @pytest.mark.parametrize("tray_now", [0, 3, 254], ids=["fed_slot_1", "fed_slot_4", "external_spool"])
+    async def test_a_fed_toolhead_owes_nothing(self, db_session, printer_factory, monkeypatch, tray_now):
+        printer = await printer_factory()
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(tray_now=tray_now))
+        assert set(verdicts.values()) == {"fed"}
+
+    async def test_no_live_reading_is_unknown(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        gone = _air_state()
+        gone.connected = False
+        assert set((await self._verdicts(monkeypatch, printer.id, gone)).values()) == {"unknown"}
+        assert set((await self._verdicts(monkeypatch, printer.id, None)).values()) == {"unknown"}
+        unparsed = _air_state(tray_now=None)
+        assert set((await self._verdicts(monkeypatch, printer.id, unparsed)).values()) == {"unknown"}
+
+    async def test_no_client_is_unknown(self, db_session, printer_factory, monkeypatch):
+        """``before_first_layer`` is read off the client's one peaks reader; with no client the
+        job's layer is not a measurement, so nothing is decided."""
+        printer = await printer_factory()
+        state = _air_state()
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: state)
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
+        assert spool_recovery.refill_owed(printer.id, state, trigger="T3").reason == "unknown"
+
+    async def test_a_filament_change_in_flight_is_the_amss(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(ams_status_main=1))
+        assert set(verdicts.values()) == {"change_in_flight"}
+
+    async def test_the_power_loss_prompt_is_the_reboots(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(hms=[_power_loss_prompt_hms()]))
+        assert set(verdicts.values()) == {"power_loss_prompt"}
+
+    async def test_a_runout_demand_is_the_refill_lanes(self, db_session, printer_factory, monkeypatch):
+        """The firmware asks for the SAME slot (invariant 9): the refill LANE owns it — on the wire,
+        and on the open runout row once the demand has cleared (the refill lane's own evidence)."""
+        printer = await printer_factory()
+        on_wire = await self._verdicts(monkeypatch, printer.id, _air_state(hms=[_runout_demand_hms(0, 2)]))
+        assert set(on_wire.values()) == {"runout_demand"}
+
+        await _seed_incident(db_session, printer.id)  # an open runout row, the demand gone from the wire
+        on_row = await self._verdicts(monkeypatch, printer.id, _air_state())
+        assert set(on_row.values()) == {"runout_demand"}
+
+    async def test_maintenance_mode_loads_nothing(self, db_session, printer_factory, monkeypatch):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        printer = await printer_factory()
+        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state())
+        assert set(verdicts.values()) == {"maintenance"}
+        # A fed toolhead is fed in maintenance too: the operator's own resume is their verb.
+        assert set((await self._verdicts(monkeypatch, printer.id, _air_state(tray_now=1))).values()) == {"fed"}
+
+    async def test_a_physical_hold_excludes_only_t2(self, db_session, printer_factory, monkeypatch):
+        """An open PHYSICAL hold: the exit is the operator's load, so the farm's own command running
+        after the hand-over (T2) does not refill — but a person's Resume (T3) and a screen resume onto
+        air (T4) still try the refill and report a failure."""
+        from backend.app.models.printer_incident import KIND_PHYSICAL
+
+        printer = await printer_factory()
+        await _seed_incident(db_session, printer.id, kind=KIND_PHYSICAL, code="0700_8004", codes="physical:0700_8004")
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state())
+        assert verdicts == {"T2": "physical", "T3": "owed", "T4": "owed"}
+
+    async def test_before_the_first_layer_the_start_block_loads(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(layer=0))
+        assert set(verdicts.values()) == {"before_first_layer"}
+
+    async def test_the_last_layer_is_t4s_end_of_print_retract(self, db_session, printer_factory, monkeypatch):
+        """The end-of-print retract reads empty AT the last layer of a RUNNING job (JobPeaks'
+        ``first_unfed_layer`` rule): not air. A paused print there still has layer left to print."""
+        printer = await printer_factory()
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(layer=100, total=100))
+        assert verdicts == {"T2": "owed", "T3": "owed", "T4": "last_layer"}
+
+    async def test_a_farm_command_still_queued_is_never_sent_behind(self, db_session, printer_factory, monkeypatch):
+        """A command the AMS accepted and has not run runs when it runs; anything sent behind it runs
+        too (012-H2S 2026-09-23). A queued LOAD the wire does not show run is ``command_pending``; a
+        queued pull-back the wire shows RAN (recorded loaded, the toolhead now empty) is settled
+        bookkeeping, not a queue — the detectors answer it."""
+        printer = await printer_factory()
+        row = await _open_incident_row(db_session, printer.id)
+        await printer_incidents.note_step(
+            db_session, row.id, seq=1, kind="command", name="load", target=1, feeder="empty"
+        )
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="held")
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state())
+        assert set(verdicts.values()) == {"command_pending"}
+
+        await printer_incidents.note_step(db_session, row.id, seq=2, kind="command", name="unload", feeder="jammed")
+        assert printer_incidents.pending_command(printer.id).name == "unload"
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state())
+        assert verdicts == {"T2": "owed", "T3": "owed", "T4": "owed"}
+
+    async def test_the_firmware_feeding_itself_outranks_maintenance(self, db_session, printer_factory, monkeypatch):
+        """Precedence is part of the contract: where the FIRMWARE owns the toolhead's next motion (a
+        change in flight, a same-slot demand, the reboot prompt, the start block) that is the answer,
+        whatever else holds — a resume there prints no air."""
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        printer = await printer_factory()
+        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(hms=[_runout_demand_hms(0, 2)]))
+        assert set(verdicts.values()) == {"runout_demand"}
+
+    def test_the_reason_vocabulary_is_closed(self):
+        assert set(get_args(spool_recovery.RefillReason)) == {
+            "owed",
+            "fed",
+            "maintenance",
+            "physical",
+            "runout_demand",
+            "power_loss_prompt",
+            "before_first_layer",
+            "last_layer",
+            "change_in_flight",
+            "command_pending",
+            "eject_sweep",
+            "unknown",
+        }
+        assert set(get_args(spool_recovery.RefillTrigger)) == {"T2", "T3", "T4"}
+
+    async def test_an_eject_sweep_is_filament_less_by_design(self, db_session, printer_factory, monkeypatch):
+        """The farm's own eject job RUNS with the filament retracted: never air, never a refill."""
+        from backend.app.services.plate_occupancy import PendingEject, plate_occupancy
+
+        printer = await printer_factory()
+        plate_occupancy.hydrate_eject(printer.id, PendingEject(purpose="production", run_id=None, queue_item_id=1))
+        try:
+            verdicts = await self._verdicts(
+                monkeypatch, printer.id, _air_state(gcode_state="RUNNING", layer=1, total=0)
+            )
+        finally:
+            plate_occupancy.reset_for_tests()
+        assert set(verdicts.values()) == {"eject_sweep"}
+
+
+# ===========================================================================
+# K9 / K10 (2026-10-10) — ONE resume of a paused print; every refill a registered driver of a row
+# ===========================================================================
+
+
+def _empty_toolhead_wire(*, last_loaded=0, hms=None, **kw):
+    """A print PAUSEd at layer 50 of 100 whose toolhead reads EMPTY, the job last fed from
+    ``last_loaded``; trays 0 and 1 seated."""
+    state = _air_state(hms=hms, **kw)
+    state.last_loaded_tray = last_loaded
+    state.raw_data = {"ams": [{"id": 0, "tray": [_ams_tray(0), _ams_tray(1)]}]}
+    return state
+
+
+async def _drivers_done(spawned):
+    """Await every task the stubbed spawner scheduled, the refill drivers included."""
+    for _name, task in list(spawned):
+        await task
+
+
+class TestTheResumeVerb:
+    """``spool_recovery.resume_paused_print`` — THE resume of a paused print (K9), the one body the
+    operator's Resume, the HMS dialog's resume buttons, the refill lane and the repair self-heal all
+    publish through. At publish time it asks K7: fed → ONE resume; a refill owed → it opens or
+    re-enters the row, spawns the refill as a REGISTERED driver and answers AT ONCE (the refill can
+    take minutes); refused → nothing is sent. Raymond 2026-10-10: "when i click resume there MUST be
+    filament loaded"."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch, install_settings):
+        install_settings(step_timeout_s=0.05)
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_CONFIRM_S", 0.2)
+
+    async def test_a_fed_toolhead_resumes_as_today(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(tray_now=0)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+
+        assert isinstance(verdict, spool_recovery.ResumeSent)
+        assert verdict.sent is not None and verdict.sent.command == "resume"
+        assert client.calls == [("resume",)]
+        assert await _incident_rows(db_session, printer.id) == []  # nothing to hold
+
+    async def test_an_empty_toolhead_is_refilled_then_resumed(self, db_session, printer_factory, monkeypatch, caplog):
+        """THE requirement. The verb answers at once — ``RefillStarted`` naming the slot the refill
+        loads first — with the refill already registered as the printer's driver; the driver loads
+        the job's last feeder, publishes ONE resume, sees it RUNNING fed and closes its own row."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        item = await _farm_item(db_session, printer.id)
+        state = _empty_toolhead_wire()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        with _driver_logs(caplog):
+            verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+            assert isinstance(verdict, spool_recovery.RefillStarted)
+            assert verdict.slot == "AMS A slot 1"
+            assert printer_incidents.driver_live(printer.id) is True  # registered with the spawn
+            assert client.calls == []  # nothing on the wire before the answer
+            (row,) = await _incident_rows(db_session, printer.id)
+            assert (row.kind, row.status, row.item_id, row.slot_global_tray) == (
+                "toolhead_refill",
+                "recovering",
+                item.id,
+                0,
+            )
+            await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("unload", "load", "resume")] == [("load", 0), ("resume",)]
+        assert state.state == "RUNNING" and state.tray_now == 0
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.resolve_source) == ("resolved", "refill_resumed")
+        assert printer_incidents.driver_live(printer.id) is False
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.kind, s.name, s.target, s.outcome) for s in steps] == [("command", "load", 0, "complete")]
+
+    async def test_a_failed_refill_never_resumes_and_pages_the_slot_and_the_answer(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _empty_toolhead_wire()
+        client = FakeClient(state, load_ok_targets=set())  # no load reaches the toolhead
+        _wire(monkeypatch, state, client)
+
+        verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+        assert isinstance(verdict, spool_recovery.RefillStarted)
+        await _drivers_done(spawned)
+
+        assert ("resume",) not in client.calls and state.state == "PAUSE"
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.kind, row.status, row.resolved_at) == ("toolhead_refill", "escalated", None)
+        failed.assert_awaited_once()
+        kwargs = failed.call_args.kwargs
+        assert kwargs["kind"] == "toolhead_refill"
+        assert "Load from AMS A slot 1 failed: no movement." in kwargs["detail"]
+        assert "Load a spool on the printer, then resume." in kwargs["detail"]
+
+    async def test_maintenance_refuses_and_sends_nothing(self, db_session, printer_factory, monkeypatch):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        printer = await printer_factory()
+        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+        state = _empty_toolhead_wire()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+
+        assert verdict == spool_recovery.ResumeRefused(
+            reason="maintenance",
+            message="Toolhead empty. Maintenance mode: the farm loads nothing. Load a slot, then resume.",
+        )
+        assert client.calls == []
+        assert printer_incidents.open_kinds(printer.id) == {KIND_SERVICE_HOLD}
+
+    async def test_where_the_firmware_feeds_the_resume_goes_out_unrefilled(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """A same-slot runout demand: the firmware loads that slot itself on the resume (the refill
+        lane's own path) — the resume goes out, no refill, no row."""
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(hms=[_runout_demand_hms(0, 2)])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+
+        assert isinstance(verdict, spool_recovery.ResumeSent)
+        assert client.calls == [("resume",)]
+
+    async def test_a_live_driver_owns_the_printer(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        state = _empty_toolhead_wire()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+        printer_incidents.register_driver(printer.id, _FakeRecoveryTask(done=False), incident_id=None)
+
+        verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+
+        assert isinstance(verdict, spool_recovery.ResumeRefused) and verdict.reason == "farm_acting"
+        assert client.calls == []
+
+    @pytest.mark.parametrize("live", ["RUNNING", "IDLE"])
+    async def test_a_print_that_is_not_paused_is_refused(self, db_session, printer_factory, monkeypatch, live):
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(gcode_state=live)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+
+        assert isinstance(verdict, spool_recovery.ResumeRefused) and verdict.reason == "not_paused"
+        assert client.calls == []
+
+    async def test_no_client_is_not_connected(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(tray_now=0)
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: state)
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
+
+        assert await spool_recovery.resume_paused_print(printer.id, actor="operator") == spool_recovery.ResumeNotSent(
+            reason="not_connected"
+        )
+
+    async def test_the_refill_re_enters_an_open_ams_row(self, db_session, printer_factory, monkeypatch):
+        """K10: with an AMS row open (here a jam the driver gave up on, escalated) the refill runs on
+        THAT row — its steps land on its ledger — and no toolhead row opens beside it."""
+        from backend.app.models.printer_incident import STATUS_ESCALATED
+
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        jam = await _seed_incident(
+            db_session,
+            printer.id,
+            kind="jam",
+            status=STATUS_ESCALATED,
+            code="0700_8010",
+            codes="mechanical_feed:0700_8010",
+            slot_global_tray=0,
+        )
+        state = _empty_toolhead_wire()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        verdict = await spool_recovery.resume_paused_print(printer.id, actor="operator")
+        assert isinstance(verdict, spool_recovery.RefillStarted) and verdict.incident_id == jam.id
+        await _drivers_done(spawned)
+
+        rows = await _incident_rows(db_session, printer.id)
+        assert [r.kind for r in rows] == ["jam"]
+        steps = await printer_incidents.steps_of(db_session, jam.id)
+        assert [(s.name, s.target, s.outcome) for s in steps] == [("load", 0, "complete")]
+        assert ("resume",) in client.calls and state.tray_now == 0
+
+    async def test_a_refill_whose_resume_runs_on_air_pauses_again_and_pages(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """Bounded by EVENTS, never a loop: if the farm's own resume after the refill reads RUNNING
+        with nothing fed, the driver pauses the print itself (it is air) and hands it to a person —
+        the paused print can no longer re-trigger the RUNNING detector."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _empty_toolhead_wire()
+        client = FakeClient(state)
+
+        class _Pulled(FakeClient):
+            def resume_print(self):
+                sent = super().resume_print()
+                self.state.tray_now = 255  # the filament the refill loaded is not at the toolhead
+                return sent
+
+        client = _Pulled(state)
+        _wire(monkeypatch, state, client)
+
+        await spool_recovery.resume_paused_print(printer.id, actor="operator")
+        await _drivers_done(spawned)
+
+        assert client.calls[-1] == ("pause",) and state.state == "PAUSE"
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert row.status == "escalated"
+        assert "not at toolhead" in failed.call_args.kwargs["detail"]
+
+    def test_the_verdict_vocabulary_is_closed(self):
+        assert set(get_args(spool_recovery.ResumeRefusalReason)) == {
+            "not_paused",
+            "farm_acting",
+            "maintenance",
+            "unknown",
+            "command_pending",
+            "physical",
+        }
+        # Every K7 reason has ONE resume decision — the table is total (a missing reason raises).
+        assert set(spool_recovery._RESUME_DECISION) == set(get_args(spool_recovery.RefillReason))
+
+    def test_the_evidence_lanes_body_is_gone(self):
+        """Delete, don't deprecate: the verb generalised it, and every caller moved."""
+        assert not hasattr(spool_recovery, "_resume_after_evidence")
+
+
+# ===========================================================================
+# K11 detectors (2026-10-10) — D1 (PAUSE) and D2 (RUNNING), in the one per-push sampler
+# ===========================================================================
+
+
+async def _held_pull_back_row(db, printer_id, *, slot=2, kind="jam"):
+    """The 014-H2S hand-over: the driver's pull-back acknowledged and not run (``held``) on an
+    ESCALATED row, recorded while the toolhead was loaded from ``slot`` (feeder ``jammed``)."""
+    from backend.app.models.printer_incident import STATUS_ESCALATED
+
+    row = await _seed_incident(
+        db,
+        printer_id,
+        kind=kind,
+        status=STATUS_ESCALATED,
+        code="0300_801E",
+        codes="mechanical_feed:0300_801E",
+        slot_global_tray=slot,
+    )
+    await printer_incidents.note_step(db, row.id, seq=1, kind="command", name="unload", feeder="jammed")
+    await printer_incidents.answer_step(db, row.id, 1, outcome="held")
+    assert printer_incidents.pending_command(printer_id) is not None
+    return row
+
+
+def _toolhead_spawns(spawned) -> list:
+    return [task for name, task in spawned if (name or "").startswith("toolhead-refill")]
+
+
+class TestTheD1DetectorAfterTheHandOver:
+    """D1 (PAUSE): an open row's pending farm command RAN after the hand-over, with no driver live —
+    the consequence is the farm's: answer the step ``complete`` through the one writer, then refill
+    the now-empty toolhead on that row (T2, K7's exclusions) — and the print STAYS paused. The 014-H2S
+    shape: the pull-back accepted at 02:45:58 ran on its own at 02:50:38, after the give-up."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, install_settings):
+        install_settings(step_timeout_s=0.05)
+
+    async def test_the_014_pull_back_runs_after_the_hand_over_and_the_toolhead_is_refilled(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await _held_pull_back_row(db_session, printer.id, slot=2)
+        state = _empty_toolhead_wire(tray_now=2, last_loaded=2)
+        state.raw_data = {"ams": [{"id": 0, "tray": [_ams_tray(0), _ams_tray(1), _ams_tray(2)]}]}
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)  # the paused print, still loaded: nothing
+        assert _toolhead_spawns(spawned) == []
+
+        state.tray_now = 255  # +280 s: the AMS runs the queued pull-back on its own, the print paused
+        spool_recovery.note_demand_watch(printer.id, state)
+        assert printer_incidents.driver_live(printer.id) is True  # registered with the spawn
+        spool_recovery.note_demand_watch(printer.id, state)  # the next push spawns no second one
+        (task,) = _toolhead_spawns(spawned)
+        await task
+
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.target, s.outcome) for s in steps] == [("unload", None, "complete"), ("load", 2, "complete")]
+        assert (state.state, state.tray_now) == ("PAUSE", 2)  # the print stays paused, now with filament
+        assert ("resume",) not in client.calls
+        assert printer_incidents.pending_command(printer.id) is None
+        assert printer_incidents.driver_live(printer.id) is False
+
+    async def test_a_humans_screen_unload_with_nothing_pending_is_left_alone(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        await _seed_incident(db_session, printer.id, kind="jam", code="0700_8010", codes="mechanical_feed:0700_8010")
+        state = _empty_toolhead_wire(tray_now=2, last_loaded=2)
+        _wire(monkeypatch, state, FakeClient(state))
+
+        spool_recovery.note_demand_watch(printer.id, state)
+        state.tray_now = 255  # a person unloaded at the screen: no farm command pends
+        spool_recovery.note_demand_watch(printer.id, state)
+
+        assert _toolhead_spawns(spawned) == []
+        assert printer_incidents.driver_live(printer.id) is False
+
+    @pytest.mark.parametrize("exclusion", ["maintenance", "runout_demand", "change_in_flight", "physical"])
+    async def test_an_excluded_toolhead_just_settles_the_step(
+        self, db_session, printer_factory, monkeypatch, exclusion
+    ):
+        """The farm's command that ran is answered whatever holds — a fact on the ledger — but K7's
+        exclusions decide the refill: maintenance mode, a same-slot runout demand, a change in
+        flight, a physical hold (T2's own)."""
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        kind = "physical" if exclusion == "physical" else "jam"
+        row = await _held_pull_back_row(db_session, printer.id, kind=kind)
+        if exclusion == "maintenance":
+            await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+        state = _empty_toolhead_wire(
+            tray_now=255,
+            last_loaded=2,
+            hms=[_runout_demand_hms(0, 2)] if exclusion == "runout_demand" else None,
+            ams_status_main=1 if exclusion == "change_in_flight" else 0,
+        )
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)
+        for task in _toolhead_spawns(spawned):
+            await task
+
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.outcome) for s in steps] == [("unload", "complete")]
+        assert not any(c[0] in ("load", "unload", "resume") for c in client.calls)
+
+    async def test_a_reboot_voids_the_command_and_nothing_is_refilled(self, db_session, printer_factory, monkeypatch):
+        """The power-loss prompt: the reboot emptied the AMS's queue (the void lane answers the step
+        ``session_changed``) — no refill rides a reboot."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await _held_pull_back_row(db_session, printer.id)
+        state = _empty_toolhead_wire(tray_now=255, hms=[_power_loss_prompt_hms()])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)
+        assert _toolhead_spawns(spawned) == []
+        for _name, task in spawned:
+            await task
+
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.outcome) for s in steps] == [("unload", "session_changed")]
+        assert not any(c[0] in ("load", "unload") for c in client.calls)
+
+
+class TestTheD2DetectorOfAPrintRunningOnAir:
+    """D2 (RUNNING): the ACTIVE extruder reads empty, no change in flight, 1 <= layer < total, no
+    driver live, and K7(T4) owes a refill: pause on the FIRST push (Raymond 2026-09-17: "If nothing is
+    feedingg after 20secs the print is ruined already"), refill, resume. A LEVEL check — the first
+    sample after a restart included — never twice for one episode (the registered driver guards it
+    while it lives; after it, the wire is fed again)."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, install_settings, monkeypatch):
+        install_settings(step_timeout_s=0.05)
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_CONFIRM_S", 0.2)
+
+    async def test_a_screen_resume_onto_an_empty_toolhead_is_paused_refilled_and_resumed(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(gcode_state="RUNNING", last_loaded=0)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)  # the first push after the screen resume
+        assert printer_incidents.driver_live(printer.id) is True
+        spool_recovery.note_demand_watch(printer.id, state)  # still air: no second spawn
+        (task,) = _toolhead_spawns(spawned)
+        await task
+
+        assert [c for c in client.calls if c[0] in ("pause", "load", "unload", "resume")] == [
+            ("pause",),
+            ("load", 0),
+            ("resume",),
+        ]
+        assert (state.state, state.tray_now) == ("RUNNING", 0)
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.kind, row.status, row.resolve_source) == ("toolhead_refill", "resolved", "refill_resumed")
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            pytest.param({"layer": 100, "total": 100}, id="end-of-print_retract_at_the_last_layer"),
+            pytest.param({"layer": 0}, id="layer_0_start_block"),
+            pytest.param({"ams_status_main": 1}, id="change_in_flight"),
+            pytest.param({"tray_now": 1}, id="fed"),
+        ],
+    )
+    async def test_what_is_not_air_is_ignored(self, db_session, printer_factory, monkeypatch, shape):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(gcode_state="RUNNING", **shape)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)
+        spool_recovery.note_demand_watch(printer.id, state)
+
+        assert _toolhead_spawns(spawned) == []
+        assert client.calls == []
+
+    async def test_a_restart_mid_air_acts_on_the_first_fresh_sample(self, db_session, printer_factory, monkeypatch):
+        """The sampler's seed-only first push is for NEGATIVE edges; D2 is a level — a printer printing
+        air after a farm restart is acted on at once."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(gcode_state="RUNNING")
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+        assert printer.id not in spool_recovery._wire_sample  # the process just started
+
+        spool_recovery.note_demand_watch(printer.id, state)
+
+        assert len(_toolhead_spawns(spawned)) == 1
+        await _toolhead_spawns(spawned)[0]
+        assert ("pause",) in client.calls
+
+    async def test_the_promise_is_open_before_the_pause_and_a_pause_that_never_lands_leaves_none(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """T4 opens its row BEFORE it pauses — the durable promise the AMS entry reads covers the whole
+        episode — and a pause that does not land (the printer refused it) closes the row it opened as
+        transient: a ``recovering`` promise nobody keeps would hold the printer for good. The next push
+        re-detects a print still running on air."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(gcode_state="RUNNING")
+        client = FakeClient(state, pause_ret=False)
+        seen_at_pause: list = []
+        real_pause = client.pause_print
+
+        def _pause():
+            seen_at_pause.append(printer_incidents.open_kinds(printer.id))
+            return real_pause()
+
+        client.pause_print = _pause
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)
+        await _drivers_done(spawned)
+
+        assert seen_at_pause == [{"toolhead_refill"}]
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.kind, row.status, row.resolve_source) == ("toolhead_refill", "aborted", None)
+        assert not any(c[0] in ("load", "resume") for c in client.calls)
+
+    async def test_a_session_not_yet_fresh_is_not_a_reading(self, db_session, printer_factory, monkeypatch):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        state = _empty_toolhead_wire(gcode_state="RUNNING")
+        state.report_epoch = None  # a reconnect re-broadcasting the previous session's cache
+        _wire(monkeypatch, state, FakeClient(state))
+
+        spool_recovery.note_demand_watch(printer.id, state)
+
+        assert _toolhead_spawns(spawned) == []
+
+    async def test_a_pending_pull_back_drained_under_a_running_print(self, db_session, printer_factory, monkeypatch):
+        """T2-running: a person's screen Retry resumed the print over the farm's pending pull-back (K11
+        kept the row open), and the pull-back drained mid-print: the step is answered ``complete``, the
+        print paused, refilled from the job's spool on THAT row, and resumed."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await _held_pull_back_row(db_session, printer.id, slot=2)
+        state = _empty_toolhead_wire(gcode_state="RUNNING", tray_now=255, last_loaded=2)
+        state.raw_data = {"ams": [{"id": 0, "tray": [_ams_tray(0), _ams_tray(1), _ams_tray(2)]}]}
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)
+        (task,) = _toolhead_spawns(spawned)
+        await task
+
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.target, s.outcome) for s in steps] == [("unload", None, "complete"), ("load", 2, "complete")]
+        assert [c for c in client.calls if c[0] in ("pause", "load", "resume")] == [
+            ("pause",),
+            ("load", 2),
+            ("resume",),
+        ]
+        assert (state.state, state.tray_now) == ("RUNNING", 2)
+        rows = await _incident_rows(db_session, printer.id)
+        assert [r.kind for r in rows] == ["jam"]  # the refill ran on the open AMS row
+
+    async def test_maintenance_mode_never_pauses_a_print(self, db_session, printer_factory, monkeypatch):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+        state = _empty_toolhead_wire(gcode_state="RUNNING")
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        spool_recovery.note_demand_watch(printer.id, state)
+
+        assert _toolhead_spawns(spawned) == [] and client.calls == []
+
+
+class TestTheEvidenceLanesResumeThroughTheVerb:
+    """K9 callers (c) and (d): the runout refill lane and the repaired-path self-heal publish their
+    resume through ``resume_paused_print`` — its settle, its K7 question, its one publish and confirm."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, install_settings, monkeypatch, _fast_resume):
+        install_settings(step_timeout_s=0.05)
+
+    async def test_the_refill_lane_is_the_verbs_refill_lane_actor(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        await _runout_held_item(db_session, printer.id)
+        state = _runout_paused_state(tray_id=2)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+        actors: list[str] = []
+        real = spool_recovery.resume_paused_print
+
+        async def _spy_verb(printer_id, **kw):
+            actors.append(kw["actor"])
+            return await real(printer_id, **kw)
+
+        monkeypatch.setattr(spool_recovery, "resume_paused_print", _spy_verb)
+
+        assert await spool_recovery.maybe_auto_resume_on_refill(printer.id, 0, 2) is True
+        assert actors == ["refill_lane"]
+        # The open runout row is K7's ``runout_demand``: the firmware loads the SAME slot on the
+        # resume (invariant 9) — no refill, no swap.
+        assert not any(c[0] in ("load", "unload") for c in client.calls)
+
+    async def test_the_repair_self_heal_never_resumes_onto_an_empty_toolhead(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The hazard it had: the operator freed the path and loaded a slot (the load edge), and the
+        farm's queued pull-back then ran — the toolhead reads EMPTY at the self-heal's publish. The
+        verb refills on the physical row FIRST and its driver resumes; the lane itself sends nothing
+        onto air."""
+        from backend.app.models.printer_incident import KIND_PHYSICAL
+
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await _seed_incident(
+            db_session, printer.id, kind=KIND_PHYSICAL, code="0700_8004", codes="physical:0700_8004", slot_global_tray=0
+        )
+        _stamp_load_edge(printer.id, datetime.utcnow())
+        state = _empty_toolhead_wire(last_loaded=0)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        assert await spool_recovery._resume_after_repair(printer.id, row.id) is False
+        assert client.calls == []  # nothing onto air
+        await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("load", "resume")] == [("load", 0), ("resume",)]
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.target, s.outcome) for s in steps] == [("load", 0, "complete")]
+
+
+class TestAFaultDuringARefillIsTheRefillsReading:
+    """While the farm refills a toolhead on its own ``toolhead_refill`` row (``recovering`` — the
+    durable PROMISE, the authority the AMS entry reads, as it reads a plate-check job pause; liveness
+    stays observability there), a feed fault its own load raises is that refill's reading — its load
+    answers it, and a failure pages on its row — so the AMS entry opens no second incident and spawns
+    no second driver onto one AMS. The raw alert is the operator's word meanwhile (``owned_full_codes``
+    mirrors the gate), and once the refill has handed the row to a person (escalated) a fault still
+    standing is owned on the next push, its own row beside it."""
+
+    async def test_no_second_driver_is_spawned(self, db_session, printer_factory, install_settings, monkeypatch):
+        from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL, STATUS_RECOVERING
+
+        install_settings()
+        printer = await printer_factory()
+        await _farm_item(db_session, printer.id)
+        state = _make_state()  # PAUSE with the 0700_8010 feed fault standing
+        _wire(monkeypatch, state, FakeClient(state))
+        refill = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_TOOLHEAD_REFILL,
+            code="",
+            codes="",
+            slot_global_tray=0,
+            status=STATUS_RECOVERING,
+        )
+
+        assert await on_ams_fault(printer.id, state) is None
+        assert [r.kind for r in await _incident_rows(db_session, printer.id)] == ["toolhead_refill"]
+        assert await spool_recovery.owned_full_codes(db_session, printer.id, state) == frozenset()
+
+        await printer_incidents.mark_escalated(db_session, refill.id)  # the refill failed: a person's hold
+        task = await on_ams_fault(printer.id, state)
+        assert task is not None
+        task.cancel()
+        assert sorted(r.kind for r in await _incident_rows(db_session, printer.id)) == ["jam", "toolhead_refill"]
+
+
+class TestARestartReEntersTheRefill:
+    """K10 / restart-durability: the ``toolhead_refill`` row plus its step ledger are the durable
+    state. A deploy mid-refill leaves the row ``recovering`` with no driver — ``driver_owns`` reads it
+    owned, so the sweep never closes it, and only the startup re-entry can answer it — and the
+    re-entered driver resumes from the LOG: a load the process died waiting for is waited on, never
+    sent again."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, install_settings, monkeypatch):
+        install_settings(step_timeout_s=0.05)
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_CONFIRM_S", 0.2)
+
+    async def _refill_row(self, db, printer_id, *, slot=0):
+        from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL, STATUS_RECOVERING
+
+        return await printer_incidents.open_new(
+            db,
+            printer_id=printer_id,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_TOOLHEAD_REFILL,
+            code="",
+            codes="",
+            slot_global_tray=slot,
+            status=STATUS_RECOVERING,
+        )
+
+    async def test_a_paused_print_is_refilled_and_resumed(self, db_session, printer_factory, monkeypatch):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await self._refill_row(db_session, printer.id)
+        state = _empty_toolhead_wire()
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        assert await spool_recovery.rearm_incidents_on_startup() == 0
+        assert printer_incidents.driver_live(printer.id) is True
+        await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("load", "resume")] == [("load", 0), ("resume",)]
+        db_session.expunge_all()
+        assert (await db_session.get(PrinterIncident, row.id)).resolve_source == "refill_resumed"
+
+    async def test_a_load_the_process_died_waiting_for_is_never_sent_again(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The log ends in the refill's own load, sent and never read; the toolhead now reads it at
+        the active nozzle — it RAN while the farm was down. The re-entered driver settles it and
+        goes on to the resume: no second load."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await self._refill_row(db_session, printer.id)
+        await printer_incidents.note_step(
+            db_session, row.id, seq=1, kind="command", name="load", target=0, feeder="empty"
+        )
+        state = _empty_toolhead_wire(tray_now=0)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        await spool_recovery.rearm_incidents_on_startup()
+        await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("load", "resume")] == [("resume",)]
+        steps = await printer_incidents.steps_of(db_session, row.id)
+        assert [(s.name, s.outcome) for s in steps] == [("load", "complete")]
+
+    async def test_a_print_running_fed_closes_at_startup(self, db_session, printer_factory, monkeypatch):
+        printer = await printer_factory()
+        row = await self._refill_row(db_session, printer.id)
+        state = _empty_toolhead_wire(gcode_state="RUNNING", tray_now=0)
+        _wire(monkeypatch, state, FakeClient(state))
+
+        assert await spool_recovery.rearm_incidents_on_startup() == 1
+
+        db_session.expunge_all()
+        assert (await db_session.get(PrinterIncident, row.id)).resolve_source == "startup_rearm"
+        assert printer_incidents.driver_live(printer.id) is False
+
+    async def test_a_job_that_ended_before_the_printer_reported_is_closed_not_orphaned(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The startup sweep ran before the printer reported, so the row was re-entered; the first
+        LIVE reading is a job already over. The re-entered driver asks the rule table's ``startup``
+        occasion of that reading and closes the row — a ``recovering`` row left driverless would be
+        skipped by the sweep forever (``driver_owns``) and hold the printer off dispatch."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await self._refill_row(db_session, printer.id)
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: None)
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
+
+        assert await spool_recovery.rearm_incidents_on_startup() == 0  # nothing reported yet
+        state = _empty_toolhead_wire(gcode_state="IDLE")
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+        await _drivers_done(spawned)
+
+        db_session.expunge_all()
+        closed = await db_session.get(PrinterIncident, row.id)
+        assert (closed.status, closed.resolve_source) == ("resolved", "startup_rearm")
+        assert client.calls == []
+
+    async def test_a_print_running_on_air_after_the_restart_is_paused_first(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        await self._refill_row(db_session, printer.id)
+        state = _empty_toolhead_wire(gcode_state="RUNNING")
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        await spool_recovery.rearm_incidents_on_startup()
+        await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("pause", "load", "resume")] == [
+            ("pause",),
+            ("load", 0),
+            ("resume",),
+        ]

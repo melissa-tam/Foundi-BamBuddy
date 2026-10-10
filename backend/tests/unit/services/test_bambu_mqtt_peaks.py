@@ -272,17 +272,251 @@ class TestTheOnePeaksReader:
         assert mqtt_client.job_peaks().progress == 2.0
         assert self._live_deposited(mqtt_client) is True
 
-    def test_the_terminal_payload_carries_the_readers_three_keys(self, mqtt_client):
+    def test_the_terminal_payload_carries_the_readers_keys(self, mqtt_client):
         """One reader: the payload's ``last_progress`` / ``last_layer_num`` / ``peaks_reliable``
-        are exactly ``job_peaks().terminal_fields()`` at the terminal."""
+        / ``first_unfed_layer`` are exactly ``job_peaks().terminal_fields()`` at the terminal."""
         payload: dict = {}
         self._start(mqtt_client)
         mqtt_client.on_print_complete = lambda data: payload.update(data)
         for layer in (1, 2, 3):
             mqtt_client._process_message({"print": {"layer_num": layer}})
-        expected = {"last_progress": 0.0, "last_layer_num": 2, "peaks_reliable": True}
+        expected = {"last_progress": 0.0, "last_layer_num": 2, "peaks_reliable": True, "first_unfed_layer": None}
         assert mqtt_client.job_peaks().terminal_fields() == expected
 
         mqtt_client._process_message({"print": {"gcode_state": "FAILED"}})
 
         assert {key: payload[key] for key in expected} == expected
+
+
+# --- K2: the first layer printed with nothing fed -------------------------------------
+#
+# ``JobPeaks.first_unfed_layer`` — the layer L at which a run of RUNNING pushes began with
+# the ACTIVE extruder empty (``tray_fields.toolhead_feed``) and no filament change in flight
+# (``ams_mid_filament_change``), stamped only once ``layer_num`` ADVANCES past L while still
+# empty: a layer printed with nothing fed, an event and never a time. 011-H2S 2026-10-09: an
+# accepted pull-back ran on its own while the print sat PAUSED, a resume then printed from
+# layer 93 to the end with ``tray_now=255``, and the FINISH was recorded completed.
+
+_TOTAL = 150
+_FED = "2"
+_EMPTY = "255"
+
+
+def _started(client, *, total: int = _TOTAL) -> None:
+    """A job this client watched START (past the #1304 first-push guard), fed from slot 2.
+
+    The slicer total lands on the push AFTER the start: the start block zeroes
+    ``total_layers`` once the field handlers have run (#1771), and the firmware repeats the
+    field on every report."""
+    client.on_print_start = lambda data: None
+    client.on_print_running_observed = lambda data: None
+    client.on_print_complete = lambda data: None
+    client._previous_gcode_state = "IDLE"
+    client._was_running = False
+    _push(client, gcode_state="RUNNING", gcode_file=RUNNING_FILE, ams={"tray_now": _FED})
+    _push(client, total_layer_num=total)
+    assert client.state.total_layers == total
+
+
+def _layer(client, layer: int, tray_now: str, **fields) -> None:
+    _push(client, layer_num=layer, ams={"tray_now": tray_now}, **fields)
+
+
+def _unfed(client) -> int | None:
+    return client.job_peaks().first_unfed_layer
+
+
+class TestFirstUnfedLayer:
+    def test_the_011_shape_stamps_the_layer_the_air_began_at(self, mqtt_client):
+        """Fed to layer 92, empty from 93 to the end: layer 93 is the first printed with
+        nothing fed, and the FINISH payload says so."""
+        payload: dict = {}
+        _started(mqtt_client)
+        mqtt_client.on_print_complete = lambda data: payload.update(data)
+        for layer in range(1, 93):
+            _layer(mqtt_client, layer, _FED)
+        assert mqtt_client.state.tray_now == 2
+        assert _unfed(mqtt_client) is None
+
+        _layer(mqtt_client, 93, _EMPTY)
+        assert mqtt_client.state.tray_now == 255
+        assert _unfed(mqtt_client) is None  # nothing printed empty YET: the layer has not advanced
+
+        for layer in range(94, _TOTAL + 1):
+            _layer(mqtt_client, layer, _EMPTY)
+        assert _unfed(mqtt_client) == 93
+
+        _push(mqtt_client, gcode_state="FINISH")
+        assert payload["status"] == "completed"
+        assert payload["first_unfed_layer"] == 93
+
+    def test_a_sub_layer_empty_blip_refilled_before_the_layer_advances_never_stamps(self, mqtt_client):
+        _started(mqtt_client)
+        _layer(mqtt_client, 50, _FED)
+        _layer(mqtt_client, 50, _EMPTY)
+        _layer(mqtt_client, 50, _FED)
+        _layer(mqtt_client, 51, _FED)
+
+        assert _unfed(mqtt_client) is None
+
+    def test_a_pause_refill_and_resume_inside_one_layer_never_stamps(self, mqtt_client):
+        """T4's shape: the farm pauses within a push, refills and resumes. The layer that
+        was entered empty was finished fed."""
+        _started(mqtt_client)
+        _layer(mqtt_client, 50, _EMPTY)
+        _push(mqtt_client, gcode_state="PAUSE")
+        _push(mqtt_client, ams={"tray_now": _FED})
+        _push(mqtt_client, gcode_state="RUNNING")
+        _layer(mqtt_client, 51, _FED)
+
+        assert _unfed(mqtt_client) is None
+
+    def test_empty_during_a_filament_change_never_stamps(self, mqtt_client):
+        """Mid-change (``ams_status_main == 1``) the AMS owns the path: 255 there is the change
+        in flight, not air."""
+        _started(mqtt_client)
+        mid_change = 0x0105  # main 1, sub 5
+        _layer(mqtt_client, 50, _EMPTY, ams_status=mid_change)
+        assert mqtt_client.state.ams_status_main == 1
+        _layer(mqtt_client, 51, _EMPTY, ams_status=mid_change)
+        _layer(mqtt_client, 51, _FED, ams_status=0x0300)
+
+        assert _unfed(mqtt_client) is None
+
+    def test_the_end_of_print_retract_at_the_last_layer_never_stamps(self, mqtt_client):
+        payload: dict = {}
+        _started(mqtt_client)
+        mqtt_client.on_print_complete = lambda data: payload.update(data)
+        _layer(mqtt_client, _TOTAL - 1, _FED)
+        _layer(mqtt_client, _TOTAL, _FED)
+        _layer(mqtt_client, _TOTAL, _EMPTY)
+        _push(mqtt_client, gcode_state="FINISH")
+
+        assert payload["first_unfed_layer"] is None
+
+    def test_an_unknown_total_stamps_nothing(self, mqtt_client):
+        """L must be below ``total_layers``: with no slicer total read yet nothing can show
+        the layer was not the last one, and a false stamp fails a finished print."""
+        _started(mqtt_client, total=0)
+        _layer(mqtt_client, 40, _EMPTY)
+        _layer(mqtt_client, 41, _EMPTY)
+
+        assert _unfed(mqtt_client) is None
+
+    def test_an_empty_layer_0_does_not_stamp_the_print_start(self, mqtt_client):
+        """Before the first layer the start block loads the filament: a 255 there is the
+        load still to come."""
+        _started(mqtt_client)
+        _layer(mqtt_client, 0, _EMPTY)
+        _layer(mqtt_client, 0, _FED)
+        _layer(mqtt_client, 1, _FED)
+        _layer(mqtt_client, 2, _FED)
+
+        assert _unfed(mqtt_client) is None
+
+    def test_a_first_layer_printed_with_nothing_fed_stamps_layer_1(self, mqtt_client):
+        """Empty from the start block on: layer 0 is no printed layer, so the run is read
+        from the first one, layer 1, finished with nothing fed."""
+        _started(mqtt_client)
+        _layer(mqtt_client, 0, _EMPTY)
+        _layer(mqtt_client, 1, _EMPTY)
+        assert _unfed(mqtt_client) is None
+        _layer(mqtt_client, 2, _EMPTY)
+
+        assert _unfed(mqtt_client) == 1
+
+    def test_the_lowest_layer_is_kept(self, mqtt_client):
+        _started(mqtt_client)
+        _layer(mqtt_client, 40, _EMPTY)
+        _layer(mqtt_client, 41, _EMPTY)
+        _layer(mqtt_client, 42, _FED)
+        _layer(mqtt_client, 120, _EMPTY)
+        _layer(mqtt_client, 121, _EMPTY)
+
+        assert _unfed(mqtt_client) == 40
+
+    def test_an_attach_mid_air_stamps_the_first_observed_advancing_empty_layer(self, mqtt_client):
+        """NOT gated on ``reliable``: layer numbers are absolute, so a layer printed empty
+        after an attach is a real measurement of THIS job."""
+        mqtt_client.on_print_running_observed = lambda data: None
+        mqtt_client.on_print_complete = lambda data: None
+        _push(
+            mqtt_client,
+            gcode_state="RUNNING",
+            gcode_file=RUNNING_FILE,
+            total_layer_num=_TOTAL,
+            layer_num=80,
+            ams={"tray_now": _EMPTY},
+        )
+        _layer(mqtt_client, 81, _EMPTY)
+
+        assert mqtt_client.job_peaks().reliable is False
+        assert _unfed(mqtt_client) == 80
+
+    def test_a_new_job_starts_unstamped(self, mqtt_client):
+        _started(mqtt_client)
+        _layer(mqtt_client, 9, _EMPTY)
+        _layer(mqtt_client, 10, _EMPTY)
+        _push(mqtt_client, gcode_state="FINISH")
+        assert _unfed(mqtt_client) == 9
+
+        _push(mqtt_client, gcode_state="RUNNING", gcode_file="/data/Metadata/plate_2.gcode", ams={"tray_now": _FED})
+
+        assert _unfed(mqtt_client) is None
+
+    def test_an_attach_after_a_watched_job_clears_the_predecessors_stamp(self, mqtt_client):
+        """The reconnect-gap attach clears the predecessor's peaks, its unfed layer too."""
+        _started(mqtt_client)
+        _layer(mqtt_client, 9, _EMPTY)
+        _layer(mqtt_client, 10, _EMPTY)
+        _push(mqtt_client, gcode_state="FINISH")
+        assert _unfed(mqtt_client) == 9
+
+        _push(mqtt_client, gcode_state="PAUSE", gcode_file="/data/Metadata/plate_2.gcode")
+
+        assert mqtt_client.job_peaks().reliable is False
+        assert _unfed(mqtt_client) is None
+
+    def test_a_run_open_at_the_job_boundary_does_not_carry_into_the_next_job(self, mqtt_client):
+        """An empty run still open when the next job starts (no terminal in between) must not
+        stamp that job's first layer advance."""
+        _started(mqtt_client)
+        _layer(mqtt_client, 30, _EMPTY)  # a run open at layer 30, never advanced
+        _push(
+            mqtt_client,
+            gcode_state="RUNNING",
+            gcode_file="/data/Metadata/plate_2.gcode",
+            layer_num=0,
+            ams={"tray_now": _EMPTY},
+        )
+        _push(mqtt_client, total_layer_num=_TOTAL)
+        _layer(mqtt_client, 1, _EMPTY)
+        _layer(mqtt_client, 2, _EMPTY)
+
+        assert _unfed(mqtt_client) == 1  # the new job's own first empty layer, never the old run's
+
+    def test_the_active_nozzle_decides_on_a_dual_nozzle_machine(self, mqtt_client):
+        """The H2C hazard: the RIGHT nozzle (0) still holds slot 5 while the LEFT (1), the
+        active one, is empty. Read through ``toolhead_feed``, that is air."""
+        _started(mqtt_client)
+        dual = {
+            "extruder": {
+                "state": 0x100,  # bit 8 = 1: the LEFT extruder is active
+                "info": [{"id": 0, "snow": (1 << 8) | 1}, {"id": 1, "snow": 0xFFFF}],
+            }
+        }
+        _push(mqtt_client, layer_num=60, device=dual)
+        assert mqtt_client.state.active_extruder == 1
+        assert mqtt_client.state.h2d_extruder_snow == {0: 5, 1: 255}
+        _push(mqtt_client, layer_num=61, device=dual)
+
+        assert _unfed(mqtt_client) == 60
+
+    def test_the_terminal_fields_carry_the_key(self, mqtt_client):
+        """Capsule C reads exactly ``first_unfed_layer`` off the terminal payload."""
+        _started(mqtt_client)
+        assert mqtt_client.job_peaks().terminal_fields()["first_unfed_layer"] is None
+        _layer(mqtt_client, 12, _EMPTY)
+        _layer(mqtt_client, 13, _EMPTY)
+
+        assert mqtt_client.job_peaks().terminal_fields()["first_unfed_layer"] == 12

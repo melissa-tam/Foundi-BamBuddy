@@ -79,7 +79,7 @@ from sqlalchemy.orm import selectinload
 
 from backend.app.core.websocket import ws_manager
 from backend.app.services import hms_errors
-from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT_STATES
+from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT_STATES, filament_engaged
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
 from backend.app.services.tray_fields import parse_int_field, tray_identity_asserted
@@ -97,16 +97,6 @@ logger = logging.getLogger(__name__)
 # ``_ECHO_PENDING_STALE_S`` (120): that value is only a GC bound for a command lost
 # to a race, not a statement that an identify is still active.
 _IDENTIFY_ACTIVE_S = 30
-
-# The ``tray_now`` sentinel bambu_mqtt.PrinterState uses for "no filament engaged"
-# (``tray_now: int = 255``; the client's ``ams_refresh_tray`` guard is literally
-# ``tray_now != 255``). bambu_mqtt exposes no named constant or predicate for it, so —
-# per the fork's mirror-don't-duplicate rule — the value lives ONCE here, consumed only
-# by :func:`_filament_engaged`, whose docstring names the client guard it mirrors. If
-# bambu_mqtt later grows a ``TRAY_UNLOADED`` constant / ``filament_engaged`` predicate,
-# import it and delete this (the single-origin treatment ``TRAY_PRESENT_STATES`` and
-# ``AMS_STATUS_IDENTIFYING`` already get above).
-_TRAY_UNLOADED = 255
 
 # --- Module-level edge state (matches the fork's other event-edge bookkeeping,
 #     e.g. farm_staging._tray_signatures). Lost on restart; startup priming and
@@ -920,27 +910,29 @@ def unit_drying(printer_id: int, ams_id: int) -> bool:
 
 
 def _filament_engaged(printer_id: int) -> bool:
-    """True while filament is loaded in the extruder path — a MIRROR of the client's own
-    ``BambuMQTTClient.ams_refresh_tray`` guard ``self.state.tray_now != 255``.
+    """True while filament is engaged at the toolhead — a MIRROR of the client's own
+    ``BambuMQTTClient.ams_refresh_tray`` guard: both read ``bambu_mqtt.filament_engaged``
+    (the ACTIVE extruder, ``tray_fields.toolhead_feed``), so the two cannot disagree about
+    what "engaged" means.
 
     A commanded ``ams_get_rfid`` has to move filament, so the client REFUSES one (with a
-    WARNING) whenever any tray is engaged — regardless of which slot the read targets.
-    Its refusal message even names the ENGAGED slot (decoded from ``tray_now``), not the
-    slot asked for, so two eligible tagged slots swept while one is engaged produce two
-    IDENTICAL warnings in the same instant (the live 07-20 double log). Pre-checking the
-    same predicate here lets the need-driven sweep / idle-gain re-read defer QUIETLY
-    instead of provoking that (doubled) WARNING after the fact.
+    WARNING) whenever filament is engaged — regardless of which slot the read targets.
+    Its refusal message even names the ENGAGED slot, not the slot asked for, so two
+    eligible tagged slots swept while one is engaged produce two IDENTICAL warnings in the
+    same instant (the live 07-20 double log). Pre-checking the same predicate here lets the
+    need-driven sweep / idle-gain re-read defer QUIETLY instead of provoking that (doubled)
+    WARNING after the fact.
 
-    Reads the live ``PrinterState.tray_now`` via ``printer_manager.get_status`` — the
-    exact field the client guards on (``get_status`` returns ``client.state``), so this
-    stays single-origin with the guard. A missing/None value reads as unloaded so a
-    partial state never false-blocks a read; the client's own guard remains the backstop.
-    Never raises — an unreadable state is treated as not-engaged."""
+    Reads the live state via ``printer_manager.get_status`` — the client's own
+    ``client.state``. Engaged only on a POSITIVE reading (``True``): an unreadable feed reads
+    as not-engaged so a partial state never false-blocks a read; the client's own guard,
+    which refuses on it, remains the backstop. Never raises — an unreadable state is treated
+    as not-engaged."""
     try:
-        tray_now = getattr(printer_manager.get_status(printer_id), "tray_now", _TRAY_UNLOADED)
+        state = printer_manager.get_status(printer_id)
     except Exception:  # noqa: BLE001 — must never break the identify path
         return False
-    return tray_now is not None and tray_now != _TRAY_UNLOADED
+    return filament_engaged(state) is True
 
 
 def read_unavailable_reason(printer_id: int, ams_id: int, tray_id: int) -> str | None:
@@ -1214,7 +1206,7 @@ async def command_identify(
         return False, "Printer not connected"
 
     # Engaged-filament pre-check — NEED-driven paths only (terminal sweep, idle gain).
-    # The client refuses an ams_get_rfid while any filament is loaded (tray_now != 255)
+    # The client refuses an ams_get_rfid while filament is engaged (bambu_mqtt.filament_engaged)
     # and logs a WARNING that names the engaged slot — twice when two tagged slots are
     # eligible (see :func:`_filament_engaged`). Defer QUIETLY here and stamp NOTHING (no
     # identity-learned, no echo arm, no discovery stamp): the slot's eligibility is left

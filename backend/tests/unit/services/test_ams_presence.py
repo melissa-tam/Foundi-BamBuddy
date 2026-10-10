@@ -1411,8 +1411,8 @@ class TestEngagedFilamentDefer:
         client.ams_refresh_tray.assert_called_once_with(0, 0)  # reached the client, not pre-empted
 
     def test_engaged_helper_mirrors_the_client_sentinel(self, monkeypatch):
-        # _filament_engaged reads the live PrinterState.tray_now (get_status) against the
-        # single-origin 255 sentinel; None / missing / 255 all read as not-engaged.
+        # _filament_engaged reads the live state (get_status) through bambu_mqtt.filament_engaged
+        # (the ACTIVE extruder's feed); None / missing / 255 all read as not-engaged.
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(tray_now=255))
         assert ams_presence._filament_engaged(1) is False
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(tray_now=1))
@@ -1423,6 +1423,53 @@ class TestEngagedFilamentDefer:
         assert ams_presence._filament_engaged(1) is False  # missing attr → unloaded default
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: None)
         assert ams_presence._filament_engaged(1) is False  # printer gone → not engaged
+
+    @pytest.mark.parametrize(
+        ("tray_now", "snow", "engaged"),
+        [
+            pytest.param(5, {0: 255, 1: 5}, False, id="active_empty_beside_a_fed_deputy"),
+            pytest.param(255, {0: 2, 1: 255}, True, id="active_fed_while_tray_now_lags"),
+        ],
+    )
+    def test_engaged_reads_the_active_extruder(self, monkeypatch, tray_now, snow, engaged):
+        """K1: on a dual nozzle the engaged filament is the ACTIVE extruder's
+        (``h2d_extruder_snow``), the reading the client's own guard takes — never the single
+        ``tray_now`` the client guessed onto a unit."""
+        status = SimpleNamespace(tray_now=tray_now, h2d_extruder_snow=snow, active_extruder=0)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+
+        assert ams_presence._filament_engaged(1) is engaged
+
+    @pytest.mark.parametrize(
+        ("tray_now", "snow", "active"),
+        [
+            pytest.param(255, {}, 0, id="single_empty"),
+            pytest.param(2, {}, 0, id="single_fed"),
+            pytest.param(254, {}, 0, id="single_external"),
+            pytest.param(None, {}, 0, id="single_unread"),
+            pytest.param(5, {0: 255, 1: 5}, 0, id="dual_active_empty"),
+            pytest.param(255, {0: 2, 1: 255}, 0, id="dual_active_fed"),
+            pytest.param(255, {1: 255}, 0, id="dual_map_missing_the_active"),
+        ],
+    )
+    def test_the_mirror_never_defers_a_read_the_client_would_allow(self, monkeypatch, tray_now, snow, active):
+        """The quiet pre-check exists to spare the client's WARNING, so it may defer ONLY where
+        the client's own guard refuses (``BambuMQTTClient.ams_refresh_tray``) — over every
+        reading. Driven through a real client, so the two cannot drift apart unseen."""
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        client = BambuMQTTClient(serial_number="MIRROR1", ip_address="192.168.1.100", access_code="12345678")
+        client._client = MagicMock()
+        client.state.connected = True
+        client.state.tray_now = tray_now
+        client.state.h2d_extruder_snow = dict(snow)
+        client.state.active_extruder = active
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: client.state)
+
+        ok, _msg = client.ams_refresh_tray(0, 0)
+
+        if ams_presence._filament_engaged(1):
+            assert ok is False, "the mirror deferred a read the client would have allowed"
 
     def test_read_unavailable_reason_reports_only_the_unclearable_refusal(self, monkeypatch):
         """The public view spool_tagless's config-settle gate asks: "can a commanded

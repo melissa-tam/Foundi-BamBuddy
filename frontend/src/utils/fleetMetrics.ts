@@ -108,6 +108,7 @@ export const FAULT_KIND_ORDER: readonly FleetFaultKind[] = [
   'physical',
   'runout',
   'jam',
+  'toolhead_refill',
   'power_loss',
   'plate_vision',
   'z_reference_lost',
@@ -620,19 +621,21 @@ export const TIME_SPLIT_BAND_TEXT: Record<'printing' | 'other' | 'down', string>
 };
 
 /**
- * Down causes as a 12-step shade ladder inside the down hue.
+ * Down causes as a 13-step shade ladder inside the down hue.
  *
- * All twelve are the same fact — the printer cannot take work — so they share
- * red and separate by VALUE, in the actionable-first order. Twelve distinct
- * hues would say the causes are twelve different kinds of thing, and would have
- * to come from somewhere; the only other hues in this palette already mean
+ * All thirteen are the same fact — the printer cannot take work — so they share
+ * red and separate by VALUE, in the actionable-first order. Thirteen distinct
+ * hues would say the causes are thirteen different kinds of thing, and would
+ * have to come from somewhere; the only other hues in this palette already mean
  * printing, between prints and maintenance.
  *
  * The ladder deliberately JUMPS between step 5 (`#d45c5c`, L 0.224) and step 6
  * (`#ce4646`, L 0.179). Between those luminances lies a dead band where a red
  * tile carries neither white text (< 4.5:1) nor dark text (< 4.5:1); an evenly
  * spaced ramp put a shade in it, and that shade could not legibly carry a
- * figure. Steps 0–5 take dark text, 6–11 take white.
+ * figure. Steps 0–5 take dark text, 6–12 take white. The thirteenth step
+ * (`#6a1c1c`, 2026-10-10: the `toolhead_refill` fault) extends the dark end, so
+ * every existing step keeps its value.
  */
 const DOWN_CAUSE_SHADES: readonly string[] = [
   '#e8adad',
@@ -647,12 +650,13 @@ const DOWN_CAUSE_SHADES: readonly string[] = [
   '#a42b2b',
   '#912727',
   '#7d2121',
+  '#6a1c1c',
 ];
 
 /** Where the shade ladder crosses from dark text to white text. */
 const DOWN_CAUSE_WHITE_TEXT_FROM = 6;
 
-const lastShade = DOWN_CAUSE_SHADES[DOWN_CAUSE_SHADES.length - 1] ?? '#7d2121';
+const lastShade = DOWN_CAUSE_SHADES[DOWN_CAUSE_SHADES.length - 1] ?? '#6a1c1c';
 
 /** The band colour for one down cause. Unknown causes take the darkest shade. */
 export function downCauseColor(cause: FleetCause): string {
@@ -676,7 +680,7 @@ const SERVICE_HOLD_KIND: PrinterIncidentKind = 'service_hold';
  * The classifier spells a fault as `fault:<kind>`, so this is the one place the
  * prefix is applied to a ledger kind — an incident-derived surface can then
  * reach the cause's label, colour and shade through the ordinary lookups
- * instead of inventing a parallel vocabulary for the same twelve facts.
+ * instead of inventing a parallel vocabulary for the same thirteen facts.
  */
 export function incidentKindCause(kind: PrinterIncidentKind): FleetCause {
   return `${FAULT_PREFIX}${kind}` as FleetCause;

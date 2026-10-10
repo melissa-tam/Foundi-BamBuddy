@@ -573,23 +573,11 @@ def _inject_unit_into_usage_session(printer_id: int, unit, logger: logging.Logge
         logger.debug("[CALLBACK] usage-session injection failed for printer %s", printer_id, exc_info=True)
 
 
-def _partial_progress_scale(progress: int | float | None) -> float:
-    """Clamp ``progress / 100`` into [0.0, 1.0] for partial-print scaling.
-
-    Used by every site that multiplies a "would-have-used" slicer estimate
-    down to "actually-used" for failed / cancelled / stopped prints. Centralised
-    so the three sites in ``_background_notifications`` (and the per-plate
-    override helper) can't drift apart on the coercion shape.
-    """
-    return max(0.0, min((progress or 0) / 100.0, 1.0))
-
-
 def _scope_notification_archive_data_to_plate(
     archive_data: dict,
     archive_file_path: str | None,
     plate_id: int | None,
-    print_status: str,
-    progress: int | float | None,
+    share: float,
     base_dir: Path,
 ) -> dict:
     """Override summed-across-plates totals in ``archive_data`` with the values
@@ -602,6 +590,10 @@ def _scope_notification_archive_data_to_plate(
     notification of a single-plate print. The queue UI already re-reads the
     3MF per-plate at print_queue.py:272-285; this helper mirrors that for the
     notification payload (filament grams, time estimate, per-slot breakdown).
+
+    ``share`` is the plate's share this terminal is charged (``job_extent.plate_share``),
+    the one scale the notification's grams take — so the plate's values are scaled exactly
+    as the spools and the print log were charged.
 
     No-ops when ``plate_id`` is None, the file is missing, or the 3MF carries
     no per-plate values — in every fail case the original ``archive_data`` is
@@ -623,7 +615,7 @@ def _scope_notification_archive_data_to_plate(
     plate_grams = sum(f.get("used_g", 0) for f in plate_slots)
     plate_time = extract_print_time_from_3mf(archive_path, plate_id)
 
-    scale = 1.0 if print_status == "completed" else _partial_progress_scale(progress)
+    scale = share
 
     if plate_time:
         archive_data["print_time_seconds"] = plate_time
@@ -3848,6 +3840,9 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                 eject=_is_eject_job,
                 job_id=data.get("subtask_id"),
                 plate_refused=_outcome.plate_refusal is not None,
+                # A FINISH over an empty toolhead is no repair evidence (011/014-H2S 2026-10-09):
+                # the payload's own measurement, off the same parse the outcome was built from.
+                printed_unfed=_evidence.printed_unfed,
             ),
         )
     except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
@@ -4492,9 +4487,10 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                     printer_id=printer_id,
                     printer_name=p_info.name if p_info else None,
                     status=data.get("status", "completed"),
-                    # the run's grams on the charge's own basis and the job's own last progress
+                    # the run's grams on the charge's own basis and extent — how far the job FED, read
+                    # off the same parse of this payload the basis was decided from
                     charge=_outcome.charge,
-                    last_progress=data.get("last_progress"),
+                    extent=_evidence.charged_extent,
                     usage_results=usage_results,
                     print_user=_print_user_info,
                 )
@@ -4807,21 +4803,25 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                             "created_by_id": archive.created_by_id,
                         }
 
-                        # Scale filament usage for partial prints — by the job's OWN last progress
-                        # (the terminal payload's ``last_progress``; it carries no ``progress``
-                        # key, which is why a stopped print used to be reported at 0 g).
-                        run_progress = data.get("last_progress") or 0
+                        # The notification's grams are what this terminal is CHARGED: the plate's
+                        # share on the charge's own basis and the extent the job FED
+                        # (``job_extent.plate_share``) — the spools', the print log's and the archive
+                        # cost's one scale, so a FINISH that printed on air from layer 93 never
+                        # notifies the whole plate. The progress shown is the job's own last
+                        # reading, off the same parse of this payload.
+                        from backend.app.services.job_extent import plate_share
+
+                        share = plate_share(_outcome.charge, _evidence.charged_extent)
+                        if share < 1.0 and archive.filament_used_grams:
+                            archive_data["actual_filament_grams"] = round(archive.filament_used_grams * share, 1)
                         if print_status != "completed" and archive.filament_used_grams:
-                            scale = _partial_progress_scale(run_progress)
-                            archive_data["actual_filament_grams"] = round(archive.filament_used_grams * scale, 1)
-                            archive_data["progress"] = run_progress
+                            archive_data["progress"] = _evidence.last_progress
 
                         # Pass per-slot data from archive.extra_data
                         if archive.extra_data and archive.extra_data.get("filament_slots"):
                             slots = archive.extra_data["filament_slots"]
-                            if print_status != "completed":
-                                scale = _partial_progress_scale(run_progress)
-                                slots = [{**s, "used_g": round(s["used_g"] * scale, 1)} for s in slots]
+                            if share < 1.0:
+                                slots = [{**s, "used_g": round(s["used_g"] * share, 1)} for s in slots]
                             archive_data["filament_slots"] = slots
 
                         # Scope project-summed totals down to the plate that was
@@ -4831,8 +4831,7 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                             archive_data,
                             archive.file_path,
                             notify_plate_id,
-                            print_status,
-                            run_progress,
+                            share,
                             app_settings.base_dir,
                         )
 

@@ -10,10 +10,14 @@ that quietly moved a dialect code into the "empty" bucket would authorize a dest
 release on a possibly-loaded tray.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from backend.app.services import bambu_mqtt, tray_fields
 from backend.app.services.tray_fields import (
+    TRAY_NOW_EXTERNAL_SPOOL,
+    TRAY_NOW_NOTHING_FED,
     TRAY_PRESENT_STATES,
     TRAY_STATE_DIALECT,
     TRAY_STATE_EMPTY,
@@ -21,8 +25,10 @@ from backend.app.services.tray_fields import (
     TRAY_STATE_SEATED,
     TRAY_STATE_TRANSITIONAL,
     TRAY_STATE_UNREPORTED,
+    ExtruderFeed,
     filam_bak_groups,
     parse_filam_bak,
+    toolhead_feed,
     tray_presence,
 )
 
@@ -206,3 +212,109 @@ def test_module_exports_the_vocabulary_by_name():
         "TRAY_STATE_DIALECT",
     ):
         assert hasattr(tray_fields, name), name
+
+
+# --- the toolhead feed (K1: ONE reader of "is the toolhead fed") ----------------------
+#
+# ``toolhead_feed`` reads the three wire fields the client keeps for it — ``tray_now``,
+# ``h2d_extruder_snow`` (``{extruder_id: global_tray}``, populated only on dual-nozzle
+# machines) and ``active_extruder`` — and answers per extruder plus for the ACTIVE one.
+# The active reading is the one a refill decision needs: on an H2C an empty active nozzle
+# beside a loaded one prints air, so "any extruder fed" is the wrong question.
+
+
+def _feed_state(**fields: object) -> SimpleNamespace:
+    """A duck-typed state: the reader asks for three fields by name, nothing else."""
+    base: dict[str, object] = {"tray_now": 255, "h2d_extruder_snow": {}, "active_extruder": 0}
+    base.update(fields)
+    return SimpleNamespace(**base)
+
+
+@pytest.mark.parametrize(
+    ("tray_now", "expected"),
+    [
+        (3, ExtruderFeed("fed", 3)),
+        (0, ExtruderFeed("fed", 0)),
+        (128, ExtruderFeed("fed", 128)),  # an AMS-HT unit's one tray is a real feeder
+        (TRAY_NOW_EXTERNAL_SPOOL, ExtruderFeed("external", None)),
+        (TRAY_NOW_NOTHING_FED, ExtruderFeed("empty", None)),
+        (None, ExtruderFeed("unknown", None)),
+        ("garbage", ExtruderFeed("unknown", None)),
+        (300, ExtruderFeed("unknown", None)),
+        (-1, ExtruderFeed("unknown", None)),
+    ],
+)
+def test_a_single_nozzle_reads_tray_now(tray_now, expected):
+    feed = toolhead_feed(_feed_state(tray_now=tray_now))
+
+    assert feed.active == expected
+    assert feed.active_extruder == 0
+    assert feed.extruders == ((0, expected),)
+    assert feed.extruder(0) == expected
+
+
+def test_a_numeric_string_is_parsed_like_every_tray_field():
+    assert toolhead_feed(_feed_state(tray_now="5")).active == ExtruderFeed("fed", 5)
+
+
+def test_no_state_is_unknown_with_no_extruders():
+    """No status yet: nothing was read, so nothing is claimed — never "empty"."""
+    feed = toolhead_feed(None)
+
+    assert feed.active == ExtruderFeed("unknown", None)
+    assert feed.active_extruder is None
+    assert feed.extruders == ()
+
+
+def test_a_state_without_the_fields_is_unknown():
+    feed = toolhead_feed(SimpleNamespace(state="RUNNING"))
+
+    assert feed.active == ExtruderFeed("unknown", None)
+
+
+def test_a_dual_nozzle_reads_the_active_extruders_own_feeder():
+    """The H2C hazard: the RIGHT nozzle (0) is loaded from slot 5, the LEFT (1) is active
+    and empty. ``tray_now`` still names slot 5 — the active reading must not."""
+    feed = toolhead_feed(_feed_state(tray_now=5, h2d_extruder_snow={0: 5, 1: 255}, active_extruder=1))
+
+    assert feed.active == ExtruderFeed("empty", None)
+    assert feed.active_extruder == 1
+    assert feed.extruder(0) == ExtruderFeed("fed", 5)
+    assert feed.extruder(1) == ExtruderFeed("empty", None)
+    assert feed.extruders == ((0, ExtruderFeed("fed", 5)), (1, ExtruderFeed("empty", None)))
+
+
+def test_a_dual_nozzle_reads_a_fed_and_an_external_active_extruder():
+    assert toolhead_feed(_feed_state(h2d_extruder_snow={0: 2, 1: 6}, active_extruder=1)).active == ExtruderFeed(
+        "fed", 6
+    )
+    assert toolhead_feed(
+        _feed_state(h2d_extruder_snow={0: 2, 1: TRAY_NOW_EXTERNAL_SPOOL}, active_extruder=1)
+    ).active == ExtruderFeed("external", None)
+
+
+def test_a_dual_nozzle_whose_active_extruder_has_no_reading_is_unknown():
+    """The per-extruder map is the dual-nozzle truth; an extruder it does not list was
+    not read, and ``tray_now`` (a single value guessed onto a unit) does not stand in."""
+    feed = toolhead_feed(_feed_state(tray_now=2, h2d_extruder_snow={0: 2}, active_extruder=1))
+
+    assert feed.active == ExtruderFeed("unknown", None)
+    assert feed.extruder(1) == ExtruderFeed("unknown", None)
+
+
+def test_an_unlisted_extruder_is_unknown():
+    assert toolhead_feed(_feed_state(tray_now=3)).extruder(1) == ExtruderFeed("unknown", None)
+
+
+def test_the_reader_is_a_leaf_that_imports_no_client():
+    """K1: a pure leaf — the MQTT client imports THIS module, so the reverse would be a
+    cycle, and a reader that needed the client could not be used on a recorded state."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(tray_fields.__file__).read_text(encoding="utf-8"))
+    imported = {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} | {
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+    }
+
+    assert not any("bambu_mqtt" in name or "printer_manager" in name for name in imported), imported

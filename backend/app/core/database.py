@@ -6033,6 +6033,55 @@ async def run_migrations(conn):
             "printing archive (non-fatal; the next boot retries after the replay repair)"
         )
 
+    # Repair (2026-10-10, 011-H2S / 014-H2S, observed-incidents shape 46): three jobs printed AIR.
+    #
+    # A resume after the AMS's delayed pull-back emptied the toolhead printed with nothing fed. The
+    # forward fix (the terminal's measured fed extent) cannot reach a terminal already recorded, so
+    # this records the two FINISHes ``failed`` / ``printed_without_filament`` and re-charges all three
+    # jobs to their fed extent. The rows, their literals with provenance and the per-job rules live in
+    # ``services/unfed_tail_repair.py``.
+    #
+    # Shape B (durable settings marker), as in the replay repair above. The marker INSERT rides the
+    # SAME savepoint as every write, so a crash leaves nothing half-applied and the next boot
+    # retries. A job whose rows moved since the report is skipped whole by its own nested savepoint
+    # (the module says why drift is per job). Every write is logged at WARNING with its before-values;
+    # that log is the repair's rollback record beside the pre-deploy DB backup. Fully guarded: a repair
+    # must never take startup down for every install.
+    _unfed_repair_marker = "repair_unfed_tail_20261010"
+    _unfed_repair_done = (
+        await conn.execute(text("SELECT 1 FROM settings WHERE key = :key"), {"key": _unfed_repair_marker})
+    ).scalar()
+    if not _unfed_repair_done:
+        _unfed_log_tag = f"[REPAIR] {_unfed_repair_marker}:"
+        try:
+            from backend.app.services import unfed_tail_repair as _unfed_repair
+
+            async with conn.begin_nested():
+                _unfed_tally = await _unfed_repair.repair_unfed_tail_20261010(conn)
+                # Logged once applied, so a rolled-back boot never reads as a repaired one.
+                for _unfed_level, _unfed_line in _unfed_tally.lines:
+                    logger.log(_unfed_level, "%s %s", _unfed_log_tag, _unfed_line)
+                await conn.execute(
+                    text(
+                        "INSERT INTO settings (key, value) SELECT :key, 'true' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = :key)"
+                    ),
+                    {"key": _unfed_repair_marker},
+                )
+            # An install that holds none of these rows (a fresh one, a dev copy) is not worth a warning.
+            logger.log(
+                logging.WARNING if _unfed_tally.wrote_or_refused else logging.INFO,
+                "%s %s",
+                _unfed_log_tag,
+                _unfed_tally.summary(),
+            )
+        except Exception:  # noqa: BLE001 — a repair must never take startup down for every install
+            logger.exception(
+                "[REPAIR] %s failed and was rolled back (non-fatal); the marker stays unwritten so a later "
+                "boot retries it",
+                _unfed_repair_marker,
+            )
+
     # The eject line follows MEASURED shop air (2026-09-25, user ruling: ONE value). The
     # per-profile ``eject_profiles.cooldown_temp_c`` and the per-run
     # ``print_batches.cooldown_temp_c_override`` are no longer read or written; both

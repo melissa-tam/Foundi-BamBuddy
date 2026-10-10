@@ -18,15 +18,15 @@ sequence:
     → load the replacement → confirm ``tray_now == target`` (the first load may not
     take — resend) → resume → the reader sees the print RUNNING, the path quiet and the
     replacement feeding, held stable (a lingering fault may need one retry) → SUCCESS.
-    If nothing works: give up — restore what the swap moved, notify, and leave the
-    printer PAUSED for a human, never resume blind.
+    If nothing works: give up — refill an EMPTY toolhead (whoever emptied it), notify, and
+    leave the printer PAUSED for a human, never resume blind.
 
     SELECTION PRECEDES THE COMMIT (004-H2S 2026-09-17, incident 192). The swap used to
     stamp and unload before it knew a replacement existed, so an honest "no eligible
     spool" verdict left a printer with an empty extruder that no copy described; the
     operator's Resume then printed 4 h of air. With nothing to load there is now no
-    unload, and a driver that DID empty the extruder reloads the jammed spool before it
-    pages (:func:`_give_up`) — the machine is symmetric.
+    unload, and a give-up over an EMPTY toolhead refills it before it pages
+    (:func:`_give_up` → :func:`_refill_toolhead`, 2026-10-10) — the machine is symmetric.
 
     Out-of-rotation stamping/notification is bound to the SWAP-COMMIT boundary (the
     step just before the first unload), NOT to entry: a no-swap firmware self-heal
@@ -54,8 +54,12 @@ sequence:
     ``wedge_unreleased``, with NOTHING sent. A non-``1`` non-idle state is NOT a
     wedge: 006-H2S 2026-07-21 faulted at ``ams_status_main == 3`` (assist) with the
     feeder still engaged and the unload was accepted immediately — that round runs the
-    swap machine directly. A swap command the AMS acknowledges and HOLDS after a release
-    (the AMS re-entered a change before it ran) is never resent: ``swap_held_after_release``.
+    swap machine directly. A swap command the AMS acknowledges and HOLDS is never resent:
+    held INSIDE a change (the AMS re-entered one before it ran) it is the give-up
+    ``swap_held_after_release``; held OUTSIDE a change — the AMS accepted it and has not run
+    it, and runs it on its own minutes later (011/014-H2S 2026-10-09/10) — the driver waits
+    for it to run and continues the contract (:func:`_await_pending_command`), and never sends
+    behind a command still pending, after a farm restart included.
 
     Repeat-jam quarantine: a printer whose recovery escalates repeatedly within a rolling window is
     quarantined off the durable ``recovery_escalation`` ledger — a recurring AMS jam
@@ -135,14 +139,19 @@ duplicates that policy.
 
 Entries (all spawned guarded from ``main``, none ever raises):
 :func:`on_ams_fault` (per status push), :func:`note_demand_watch` (the per-push
-wire sampler that drives refill auto-resume and closes a hold the moment the
-printer runs again), :func:`on_observed_running`, :func:`on_job_terminal`,
+wire sampler that drives refill auto-resume, closes a hold the moment the
+printer runs again, and runs the empty-toolhead detectors D1 / D2 —
+:func:`_sample_toolhead`), :func:`on_observed_running`, :func:`on_job_terminal`,
 :func:`sweep_open_incidents` (the scheduler-tick close for a hold whose FAULT
 cleared — the one lifecycle path that did not exist before 2026-08-29),
 :func:`rearm_incidents_on_startup`, and :func:`clear_on_reinsert` (from the
 ``ams_presence`` presence-GAIN edge). ``clear_hms_errors()`` is NEVER called — the
 resume clears the firmware dialog itself and clearing would corrupt main.py's HMS
-dedup/grace bookkeeping.
+dedup/grace bookkeeping. From the routes: :func:`resume_paused_print` — THE resume of a
+paused print (K9, 2026-10-10), which refills an EMPTY toolhead first (Raymond 2026-10-10:
+"when i click resume there MUST be filament loaded"); every refill runs as a registered
+driver of an open row (:func:`_refill_episode`, K10), and whether one is owed is
+:func:`refill_owed`'s alone (K7).
 """
 
 from __future__ import annotations
@@ -151,7 +160,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal, TypeGuard, assert_never, get_args
@@ -165,12 +174,15 @@ from backend.app.models.printer_incident import (
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_RUNOUT,
+    KIND_TOOLHEAD_REFILL,
+    REFILL_KINDS,
     RESOLVE_AUTO_RESUME,
     RESOLVE_DRIVER_RESTART,
     RESOLVE_DRIVER_SELF_HEAL,
     RESOLVE_DRIVER_SWAP,
     RESOLVE_OPERATOR,
     RESOLVE_PAUSED_ELSEWHERE,
+    RESOLVE_REFILL_RESUMED,
     STATUS_ABORTED,
     STATUS_ESCALATED,
     STATUS_RECOVERING,
@@ -180,6 +192,7 @@ from backend.app.models.printer_incident import (
 from backend.app.models.printer_incident_step import STEP_KIND_COMMAND, STEP_KIND_LEVER, PrinterIncidentStep
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
+from backend.app.schemas.printer import ResumeRefusalReason
 from backend.app.services import (
     ams_command,
     farm_correlation,
@@ -189,7 +202,7 @@ from backend.app.services import (
     spool_respool,
     tray_fields,
 )
-from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, ams_mid_filament_change
+from backend.app.services.bambu_mqtt import AMS_STATUS_IDLE, SentCommand, ams_mid_filament_change
 from backend.app.services.hms_errors import (
     ACTIONABLE_CLASSES,
     AmsFaultClass,
@@ -214,7 +227,7 @@ from backend.app.services.incident_resolution import (
     ledger,
 )
 from backend.app.services.job_identity import same_job
-from backend.app.services.plate_occupancy import DepositEvidence
+from backend.app.services.plate_occupancy import DepositEvidence, plate_occupancy
 from backend.app.services.printer_incidents import (
     FAULT_RESTART_STEP,
     WAITING_REASON_RECOVERING,
@@ -331,6 +344,15 @@ _POLL_INTERVAL_S = 1.0  # live-state poll spacing during every confirm wait
 _POST_RESUME_STABLE_S = 60  # a quiet RUNNING on a real feeder must hold this long = success
 _MAX_CANDIDATES = 3  # distinct replacement trays tried before escalating
 
+# The LIVENESS bound of the wait on the farm's own pending command (:func:`_await_pending_command`,
+# K6): past it — measured from the command's durable send stamp — the driver sends ONE page
+# naming the queued command, and keeps waiting. It decides only WHEN a human hears; it decides
+# nothing about filament, the row or the driver (operator ruling 2026-10-10: "time is not the
+# right signal"). Set above the measured self-run of an accepted pull-back: 274 s (011-H2S
+# 2026-10-09 04:31:27 → 04:36:01) and 280 s (014-H2S 2026-10-10 02:45:58 → 02:50:38), so the
+# measured case runs before anybody is paged.
+_HELD_COMMAND_PAGE_S = 600.0
+
 # Refill auto-resume timing (code constants, NOT operator knobs — precedent
 # ``ams_command.UNLOAD_GRACE_S``). The AMS needs to register the freshly-inserted
 # filament before a resume can land: a resume published on the presence edge itself
@@ -340,10 +362,6 @@ _MAX_CANDIDATES = 3  # distinct replacement trays tried before escalating
 _RUNOUT_RESUME_SETTLE_S = 15.0
 # Bound on how long we wait for RUNNING after the resume before standing aside.
 _RUNOUT_RESUME_CONFIRM_S = 30.0
-
-# tray_now sentinel: no filament fed (unloaded). The value lives with the tray
-# vocabulary (``tray_fields``, one origin per magic value); this is the module's name for it.
-_NO_FILAMENT = tray_fields.TRAY_NOW_NOTHING_FED
 
 # The client's AMS write-refusal reason (a ``bambu_mqtt._AMS_REFUSAL_LOG_TEXT`` key)
 # that recovery must NOT try to wait out: a drying cycle holds the lockout for hours,
@@ -364,6 +382,15 @@ _DEFAULT_RUNOUT_AUTO_RESUME = True
 
 # Human-facing escalation reasons for the failed notification.
 _ESCALATE_DETAIL: dict[str, str] = {
+    # The refill episode's three (K10, 2026-10-10 — :func:`_refill_then_resume`). Each page also
+    # carries the MEASURED toolhead and what the refill attempted and the AMS answered
+    # (:func:`_feeder_clause`, for every kind: :data:`_TOOLHEAD_REASONS`).
+    "toolhead_refill_failed": "The farm could not refill the empty toolhead.",
+    "toolhead_refill_withheld": (
+        "The toolhead reads empty and the farm did not refill it: maintenance mode, a queued farm command, "
+        "or no live reading."
+    ),
+    "toolhead_resume_unconfirmed": "The printer did not report RUNNING after the farm's resume. Resume on the printer.",
     "multi_feeder_job": (
         "Multi-filament job — a mid-print tray swap is unsound (the firmware re-loads the "
         "originally mapped slot at the next filament change). Left PAUSED for a human."
@@ -415,11 +442,13 @@ _ESCALATE_DETAIL: dict[str, str] = {
         "The AMS is holding the paused print's filament change and no release verb the firmware accepts "
         "released it. Free the spool, then press Retry on the printer."
     ),
-    # A lever read ``released`` and the swap command that followed was acknowledged and
-    # HELD: the AMS re-entered a change before it ran. The evidence sentence names the ONE
+    # A swap command was acknowledged and HELD behind a filament change the AMS went back into
+    # before it ran — after a lever read ``released``, or after a round top read the AMS out of
+    # the change. Inside a change only (2026-10-10): a command held OUTSIDE one is the driver's
+    # to wait for (``_held_outcome``), never this give-up. The evidence sentence names the ONE
     # held command and what it does at the next release — that is its one place.
     "swap_held_after_release": (
-        "The AMS released the paused print's filament change, then held the farm's swap command. Free the "
+        "The AMS went back into a filament change and holds the farm's swap command behind it. Free the "
         "spool, then press Retry on the printer."
     ),
     # A release verb with an unmeasured effect ENDED the print inside its own read window
@@ -612,7 +641,7 @@ def _restart_refusal(incident: RecoveryIncident) -> str | None:
 #   (002-H2S 2026-09-11; 012-H2S 2026-09-23, re-PAUSEd in 47 s; 012-H2S 2026-09-25,
 #   incidents 341/343, read ``wedged`` twice).
 # * ``resume_then_pause`` — ``print.resume``, then ``print.pause`` on the first RUNNING
-#   sample whose feeder reads EMPTY (:func:`_feeder_position` kind ``empty``) — the July
+#   sample whose feeder reads EMPTY (:func:`_feeding_position` kind ``empty``) — the July
 #   2026-07-20 "workable PAUSE", a pause that lands outside the change with nothing
 #   loaded. On an EMPTY-path wedge that is the FIRST RUNNING sample (009, unchanged). On
 #   a LOADED stall it is the firmware's own retract of the jammed filament: 012-H2S
@@ -620,8 +649,9 @@ def _restart_refusal(incident: RecoveryIncident) -> str | None:
 #   reading ``tray_now`` 2 → 255 → 2 every ~12 s (13:28:34 → 13:29:22), while a pause on
 #   the first RUNNING sample (13:32:06, ``tray_now=2``) landed LOADED and read wedged.
 #   Second in the pull order: it is the only lever whose pause is timed to a posture the
-#   swap can go out from. Dual-nozzle: ``_feeder_position`` prefers the per-extruder map,
-#   which may never read empty through a retract — that case degrades to the ``hung``
+#   swap can go out from. Dual-nozzle: the feeder is the ACTIVE extruder's own reading
+#   (``tray_fields.toolhead_feed``, K1), so an empty active nozzle pauses at once whatever
+#   the deputy holds; a retract the per-extruder map never reports degrades to the ``hung``
 #   arm at the deadline.
 # * ``ams_control_resume`` — ``ams_control("resume")``: the error dialog's CONTINUE for
 #   ``07008006`` / ``07008005``, its RETRY, and the extruder-switch panel's "Retry".
@@ -994,8 +1024,8 @@ class _RecoveryEvidence(printer_incidents.EvidenceLog[LeverStep | CommandStep]):
 
     @property
     def loads_attempted(self) -> int:
-        """Distinct trays a load went out for. The give-up's restore reload is sent after
-        the reason is chosen, so it never feeds one."""
+        """Distinct trays a load went out for. The give-up's refill load is sent after the
+        reason is chosen, so it never feeds one."""
         return len(self.tried)
 
     @property
@@ -1017,17 +1047,31 @@ class _RecoveryEvidence(printer_incidents.EvidenceLog[LeverStep | CommandStep]):
         return sum(1 for s in self._unloads() if s.answer == "complete")
 
     @property
-    def unload_moved_ams(self) -> bool:
-        """Did a FARM unload MOVE the AMS (``complete`` or ``acted``)? The give-up's restore
-        precondition: the restore undoes the driver's own motion, and an unload that was
-        held, answered nothing, or moved nothing emptied nothing."""
-        return any(s.answer in ("complete", "acted") for s in self._unloads())
-
-    @property
     def held_command(self) -> CommandStep | None:
         """The LAST command the firmware acknowledged and held behind the print's change
         (``held``) — it runs at the next release, so nothing may be sent behind it."""
         return next((s for s in reversed(self.command_steps) if s.answer == "held"), None)
+
+    @property
+    def pending_command(self) -> CommandStep | None:
+        """The farm's motion command that has NOT RUN — the log's LAST command step while it
+        pends (``printer_incidents.command_pends``: answered ``held``, or sent and never read).
+        The same one rule the open-row projection derives ``printer_incidents.PendingCommand``
+        by, over the same ledger rows. Nothing is sent behind it: a second command behind a
+        queued one runs too (012-H2S 2026-09-23), and a queued pull-back runs on its own
+        (011/014-H2S 2026-10-09/10) — the driver waits for it (:func:`_await_pending_command`)."""
+        steps = self.command_steps
+        if steps and printer_incidents.command_pends(steps[-1].answer):
+            return steps[-1]
+        return None
+
+    def command_step(self, seq: int) -> CommandStep:
+        """The command step ``seq`` as the log holds it now. A seq the log does not hold as a
+        command RAISES: a driver that lost its own step is drift, never a skipped read."""
+        step = next((s for s in self.command_steps if s.seq == seq), None)
+        if step is None:
+            raise LookupError(f"spool_recovery: incident {self.incident_id} has no command step {seq}")
+        return step
 
     @property
     def extruder_emptied_by_farm(self) -> bool:
@@ -1256,14 +1300,14 @@ _EVAL_THROTTLE_S = 10.0
 _guidance_sent: set[tuple[int, int]] = set()
 
 # printer_id -> the last per-push wire sample :func:`note_demand_watch` took, as
-# (gcode_state, demanded slot or None, live actionable short codes, connection_epoch,
-# feeding tray or None). Edges over this sample drive the refill auto-resume, the
-# "the printer is running again" close, and the completed-load edge that is a
-# ``physical`` hold's repair evidence. The epoch rides along because a sample from a
-# PREVIOUS MQTT session cannot be compared for a code DISAPPEARING — a reboot wipes
-# the standing HMS list, so every negative edge fires at once (2026-09-04, printer 8)
-# — and for the same reason it cannot be compared for a tray CHANGING.
-_wire_sample: dict[int, tuple[str, tuple[int, int] | None, frozenset[str], int, int | None]] = {}
+# (gcode_state, demanded slot or None, live actionable short codes, connection_epoch).
+# Edges over this sample drive the refill auto-resume and the "the printer is running
+# again" close. The epoch rides along because a sample from a PREVIOUS MQTT session
+# cannot be compared for a code DISAPPEARING — a reboot wipes the standing HMS list, so
+# every negative edge fires at once (2026-09-04, printer 8). The completed-load edge — a
+# ``physical`` hold's repair evidence — is the motion ledger's, over its OWN seed
+# (``incident_resolution.MotionLedger``), so no feeder rides here.
+_wire_sample: dict[int, tuple[str, tuple[int, int] | None, frozenset[str], int]] = {}
 
 # (printer_id, job_id) -> fault fingerprints an ABORTED close barred from re-entry,
 # while they are STILL the same standing fault. The loop bound the per-push entry
@@ -1363,7 +1407,20 @@ _NON_QUARANTINE_REASONS: frozenset[str] = frozenset(
         "printer_offline",  # the printer stopped reporting — a network / power gap, not AMS hardware
         # inventory, as ``no_eligible_spool``: the path unloaded cleanly and nothing matched
         "restart_no_candidate",
+        # The refill episode's (K10): the farm's reaction to an EMPTY toolhead whatever emptied it
+        # (a queued pull-back, a screen unload, a resume onto air) — not by itself a buffer /
+        # feeder diagnosis; a jam its load raises opens its own incident, which counts.
+        "toolhead_refill_failed",
+        "toolhead_refill_withheld",
+        "toolhead_resume_unconfirmed",
     }
+)
+
+# The escalation reasons of the refill episode — whatever the row's kind (an AMS row the refill
+# re-entered, or its own ``toolhead_refill`` row), their page states the measured toolhead and the
+# refill (:func:`_compose_detail`).
+_TOOLHEAD_REASONS: frozenset[str] = frozenset(
+    {"toolhead_refill_failed", "toolhead_refill_withheld", "toolhead_resume_unconfirmed"}
 )
 
 
@@ -1461,7 +1518,7 @@ def _eval_throttled(printer_id: int, job_id: str, fingerprint: str) -> bool:
 
 def _log_candidate_outcome(incident: RecoveryIncident, *, gtid: int | None, verdict: str) -> None:
     """One parseable INFO line after an unload/load answer other than ``complete``, at
-    each restore and at candidate-loop end, carrying the live telemetry that explains WHY
+    each refill and at candidate-loop end, carrying the live telemetry that explains WHY
     a step didn't take — candidate global tray, verdict, live tray_now,
     ams_status_main/sub, the pending tray target the firmware is honoring, and the
     recoverable codes STILL standing (without them a wedge line says the AMS did not
@@ -1835,7 +1892,9 @@ def _resolve_jammed_tray(
        last tray that actually fed THIS job, reset at every print start). After a feed
        fault ``tray_now`` frequently reads 255 "nothing feeding" while the jam is on
        the tray that was feeding a second earlier, which is exactly what
-       ``last_loaded_tray`` still holds.
+       ``last_loaded_tray`` still holds. An IDENTITY reading ("which tray"), read through
+       ``tray_fields.valid_feeder`` — allowlisted in
+       ``test_code_quality.TestToolheadFeedOwnership``.
     4. The single mapped feeder, when the wire named none.
     """
     slot = _candidate_slot(candidates, AmsFaultClass.MECHANICAL_FEED)
@@ -1857,42 +1916,23 @@ def _resolve_jammed_tray(
     return None, "none"
 
 
-def _dual_nozzle_feeders(state, printer_id: int | None) -> list[int]:
-    """Every extruder's own feeder on a DUAL-NOZZLE machine, from the per-extruder map.
+def _fed_trays(feed: tray_fields.ToolheadFeed) -> list[int]:
+    """Every extruder's AMS feeder, in extruder-id order, repeats collapsed — the UNION.
 
-    ``state.tray_now`` is a SINGLE value, and on an H2C/H2D it describes only whichever
-    hotend is active — so a slot feeding the OTHER nozzle reads as "not feeding" and every
-    consumer of :func:`_feeder_before_edge` silently answers False for it. The wire carries
-    the honest answer: ``bambu_mqtt`` normalizes ``device.extruder.info[N].snow`` into
-    ``PrinterState.h2d_extruder_snow`` (``{extruder_id: global_tray}``) on exactly these
-    machines. A slot feeding EITHER nozzle was feeding.
+    Read off the one toolhead reader (``tray_fields.toolhead_feed``, K1): per extruder on a
+    dual-nozzle machine — its ``h2d_extruder_snow`` map, which the client fills ONLY there —
+    and the one ``tray_now`` reading on a single nozzle. ``state.tray_now`` alone describes
+    only whichever hotend is active on an H2C/H2D, so a slot feeding the OTHER nozzle read
+    as "not feeding" there; the per-extruder map is the honest answer, and no client lookup
+    gates it any more (the map's presence IS the topology the state describes).
 
-    Gated on ``BambuMQTTClient.is_dual_nozzle`` — the public topology question, which is
-    also the fork's stated rule that "the nozzle TOPOLOGY changes what a wire field is
-    allowed to mean". Read through the client because the flag is runtime wire state and
-    ``PrinterState`` does not carry it; ``printer_id`` is therefore required for this
-    witness, and a caller that cannot supply one (or a disconnected client) simply
-    contributes nothing here and falls back to the single-tray path.
-
-    Empty list = no per-extruder evidence: a single-nozzle printer, a dual-nozzle one whose
-    firmware has not sent the extruder block yet, or an unreadable client. Never raises.
+    The union is the answer to ONE identity question — :func:`slot_was_feeding`'s "was this
+    slot feeding" at a presence-loss edge (a slot feeding EITHER nozzle was feeding) — never to
+    "is the print fed": that is the ACTIVE extruder's alone (:func:`_feeding_position`),
+    because an empty active nozzle beside a loaded one prints air. The external holder and an
+    empty or unread extruder contribute nothing. Pure and total.
     """
-    if printer_id is None:
-        return []
-    try:
-        client = printer_manager.get_client(printer_id)
-        if client is None or not client.is_dual_nozzle:
-            return []
-        snow = getattr(state, "h2d_extruder_snow", None) or {}
-        feeders: list[int] = []
-        for value in snow.values():
-            tray = tray_fields.valid_feeder(value)
-            if tray is not None and tray not in feeders:
-                feeders.append(tray)
-        return feeders
-    except Exception:  # noqa: BLE001 — an unreadable topology contributes no evidence
-        logger.exception("spool_recovery: per-extruder feeder read failed for printer %s", printer_id)
-        return []
+    return list(dict.fromkeys(reading.tray for _extruder, reading in feed.extruders if reading.tray is not None))
 
 
 def _feeder_before_edge(state, *, item: PrintQueueItem | None = None, printer_id: int | None = None) -> int | None:
@@ -1924,7 +1964,10 @@ def _feeder_before_edge(state, *, item: PrintQueueItem | None = None, printer_id
     SINGLE-tray by contract, and that is why it cannot answer a dual-nozzle machine on its
     own: two hotends can be feeding at once, so "the feeder" is not a well-formed question
     there. :func:`slot_was_feeding` asks the per-extruder witness separately
-    (:func:`_dual_nozzle_feeders`) and treats this as the fallback tier.
+    (:func:`_fed_trays`) and treats this as the fallback tier.
+
+    ``tray_now`` here is an IDENTITY reading ("which tray"), read through
+    ``tray_fields.valid_feeder`` — allowlisted in ``test_code_quality.TestToolheadFeedOwnership``.
     """
     fed = tray_fields.valid_feeder(getattr(state, "last_loaded_tray", None))
     if fed is not None:
@@ -1946,22 +1989,25 @@ def slot_was_feeding(
     :func:`_feeder_before_edge` composes the same witnesses, and the comparison rides
     ``spool_respool.decode_global_tray``, the one origin for the global-tray encoding.
 
-    ``printer_id`` unlocks two witnesses that are unreachable from ``state`` alone, and
-    both were silently missing before 2026-08-20:
+    Two witnesses, in order:
 
-    * the job's SLICER mapping (``_job_feeders`` → ``_slicer_mapping``), which the client
-      captures off the request topic — so the contracted order "``last_loaded_tray`` +
-      mapping AHEAD of ``tray_now``" only actually had its mapping tier for callers that
-      passed an ``item``;
-    * the DUAL-NOZZLE per-extruder feeders (:func:`_dual_nozzle_feeders`), asked FIRST
-      because a positive there is a direct wire statement about a specific hotend, while
-      everything ``_feeder_before_edge`` composes is a single-value approximation of a
-      two-value fact.
+    * every extruder's own feeder (:func:`_fed_trays` over ``tray_fields.toolhead_feed`` —
+      per extruder on a dual nozzle, the per-extruder map), asked FIRST because a positive
+      there is a direct wire statement about a specific hotend, while everything
+      ``_feeder_before_edge`` composes is a single-value approximation of a two-value fact.
+      On a single nozzle it is the one live ``tray_now`` reading, which can only ADD a match
+      — a tray feeding now was feeding — and never take one away, so
+      ``_feeder_before_edge``'s "``tray_now`` LAST" order still governs every negative;
+    * :func:`_feeder_before_edge`. ``printer_id`` unlocks its SLICER-mapping witness
+      (``_job_feeders`` → ``_slicer_mapping``), which the client captures off the request
+      topic — missing before 2026-08-20, so the contracted order "``last_loaded_tray`` +
+      mapping AHEAD of ``tray_now``" only had its mapping tier for callers that passed an
+      ``item``.
 
     Never raises: an unreadable state answers False (not evidence of a feed).
     """
     try:
-        for feeder in _dual_nozzle_feeders(state, printer_id):
+        for feeder in _fed_trays(tray_fields.toolhead_feed(state)):
             if decode_global_tray(feeder) == (ams_id, tray_id):
                 return True
         feeder = _feeder_before_edge(state, item=item, printer_id=printer_id)
@@ -1977,38 +2023,76 @@ def slot_was_feeding(
 
 FeederKind = Literal["jammed", "empty", "other", "external", "unknown"]
 
-# What the DRIVER did about an extruder IT emptied, stated by the driver and never
-# inferred from the wire (:func:`_restore_jammed_feeder`). Five jam-kind reasons reach
-# :func:`_escalate` straight from the entry gate with nothing unloaded, and after a feed
-# fault ``tray_now`` frequently already reads 255 — so a wire-inferred "was unloaded"
-# would attribute an act to the farm that never happened, and a bare boolean would claim
-# a failed reload on the give-ups where none is attempted. ``fail`` = every reload that
-# never reached ``complete`` — one the AMS did not move on, or held behind the print's
-# change, included (the page's evidence sentence names a held one).
-RestoreVerdict = Literal["ok", "fail", "skipped_drying"]
+# What the refill step did (:func:`_refill_toolhead`, K8 2026-10-10), stated by the driver and
+# never inferred from the wire: the page says what was ATTEMPTED and what the AMS answered, and
+# the toolhead's state is read separately, live (:func:`_compose_detail`). Five jam-kind reasons
+# reach :func:`_escalate` straight from the entry gate with nothing attempted — those carry no
+# refill at all (``None``), and the page states only the measured toolhead.
+
+
+@dataclass(frozen=True)
+class RefillLoaded:
+    """The refill's load reached the toolhead: ``tray`` answered ``complete`` AND the ACTIVE
+    extruder reads fed from it (``tray_fields.toolhead_feed``)."""
+
+    tray: int
+
+
+@dataclass(frozen=True)
+class RefillFailed:
+    """The refill of ``tray`` did not reach the toolhead. ``command`` is the step that failed —
+    the unload before the load, or the load — and ``answer`` what the AMS answered it: an
+    ``ams_command.Answer``, the step's own ``refused`` / ``drying``, or ``not_at_toolhead`` (the
+    load answered ``complete`` and the ACTIVE extruder does not read it). ``tray`` is ``None``
+    only when the printer left its session before a spool was picked."""
+
+    tray: int | None
+    command: ams_command.Command
+    answer: str
+
+
+@dataclass(frozen=True)
+class RefillNoCandidate:
+    """No spool to load: the job's last feeder is absent or spent, and the swap's own selection
+    found nothing either."""
+
+
+# What the page states about a refill (:func:`_feeder_clause`).
+RefillResult = RefillLoaded | RefillFailed | RefillNoCandidate
+# What :func:`_refill_toolhead` returns: its result, or a takeover (:func:`_takeover`) — closed,
+# dispatched by ``match`` + ``assert_never`` at its one caller.
+RefillVerdict = RefillResult | StepTakeover
 
 
 @dataclass(frozen=True)
 class FeederPosition:
     """Where the filament sits right now, read RELATIVE to this incident's jammed tray.
 
-    ONE owner for that question. Nine one-line ``tray_now`` comparisons in this module
-    each ask a different one ("is the AMS unloaded", "did the load take", "did the
-    operator resume on the jammed feeder"); this is the only one that classifies the
-    feeder for the operator page and for the give-up's restore decision, and neither
-    projection may re-derive it from ``tray_now`` itself (pinned by test).
+    ONE vocabulary, ONE classifier (:func:`_position_of`, over one extruder's
+    ``tray_fields.ExtruderFeed``), ONE reading: :func:`_feeding_position` — what the PRINT is
+    fed from, the ACTIVE extruder (K1, 2026-10-10). Every verdict about the print or a command
+    reads it: THE reader's (:func:`_read_after` — self-heal, swap, the empty-path pause, the
+    swapped tray), the feeder kind a command step records at its send (:func:`_feeder_kind` —
+    what the command acts on, which ``ams_command.posture`` keys the answer by and
+    ``ams_command.ran`` reads back), and the operator's resume on the jammed feeder
+    (:func:`_clear_oor_if_resumed_on_jammed_feeder`). On a dual nozzle an empty active hotend
+    beside a loaded deputy prints air, so no either-extruder reading of it exists.
+
+    What the OPERATOR PAGE states and what the give-up's refill decides are the active
+    extruder's too (``tray_fields.toolhead_feed`` read directly).
 
     ``kind``:
 
     * ``jammed``  — the jammed tray is still the feeder (nothing was unloaded, or a
-      restore put it back);
+      refill put it back);
     * ``empty``   — the 255 sentinel: NOTHING is feeding. After a feed fault that is
       never "the path is clear" (invariant 8);
     * ``other``   — a different regular tray feeds (a replacement that loaded, or an
-      AMS-HT id that has no letter+slot name);
+      AMS-HT id that has no letter+slot name) — or a fed extruder on an incident that names no
+      jammed tray (a ``toolhead_refill`` row whose job had no last feeder): the tray it prints
+      from is known, so the command it acts on has a LOADED entry;
     * ``external``— the external spool holder (254): no AMS slot is involved;
-    * ``unknown`` — no live state, no jammed tray to be relative to, or a ``tray_now``
-      that names neither a tray nor a sentinel.
+    * ``unknown`` — no live state, or an unread feed.
 
     ``global_tray`` is the slot the operator must be TOLD about — the jammed tray for
     ``jammed``/``empty`` (the one still loaded, or the one that was unloaded), the tray
@@ -2020,33 +2104,36 @@ class FeederPosition:
     global_tray: int | None
 
 
-def _feeder_position(state, jammed_global_tray: int | None, printer_id: int | None) -> FeederPosition:
-    """Classify the feeder against ``jammed_global_tray``. Never raises.
+def _position_of(reading: tray_fields.ExtruderFeed, jammed_global_tray: int | None) -> FeederPosition:
+    """ONE extruder's reading, classified relative to the jammed tray — the one classifier of
+    :class:`FeederPosition`. Fed from the jammed tray → ``jammed``; from any other (none named)
+    → ``other``; the rest is the reading's own kind. Pure and total."""
+    match reading.kind:
+        case "fed":
+            kind: FeederKind = "jammed" if reading.tray == jammed_global_tray else "other"
+            return FeederPosition(kind, reading.tray)
+        case "empty":
+            return FeederPosition("empty", jammed_global_tray)
+        case "external":
+            return FeederPosition("external", None)
+        case "unknown":
+            return FeederPosition("unknown", None)
+        case _:
+            assert_never(reading.kind)
 
-    Witness order is :func:`slot_was_feeding`'s, for its reason: on dual-nozzle
-    hardware ``tray_now`` is SINGLE-valued and describes only the active hotend, so a
-    jammed slot feeding the other nozzle would read ``empty`` here and a restore would
-    load on top of filament that never left. The per-extruder map answers first, and
-    only a machine that carries none falls through to ``tray_now``.
+
+def _feeding_position(state, jammed_global_tray: int | None) -> FeederPosition:
+    """What the PRINT is fed from — the ACTIVE extruder (``tray_fields.toolhead_feed``, K1),
+    relative to the jammed tray. Never raises; no state reads ``unknown``.
+
+    THE reading for every "is the print feeding / self-healed / swapped" verdict and for the
+    feeder a command acts on (:class:`FeederPosition`): on an H2C/H2D an empty ACTIVE nozzle
+    beside a deputy still holding the jammed tray prints air, and an either-extruder reading
+    would call that print ``jammed`` — a self-heal over air. On a dual nozzle the reading is
+    the per-extruder map's, never ``tray_now`` (the client's guess onto a unit); a map that
+    does not describe the active hotend reads ``unknown``.
     """
-    if state is None or jammed_global_tray is None:
-        return FeederPosition("unknown", None)
-    feeders = _dual_nozzle_feeders(state, printer_id)
-    if jammed_global_tray in feeders:
-        return FeederPosition("jammed", jammed_global_tray)
-    if feeders:
-        # A hotend IS fed, just not from the jammed slot — mapping order decides which
-        # one the page names, exactly as the mapping witnesses order themselves.
-        return FeederPosition("other", feeders[0])
-    raw = getattr(state, "tray_now", None)
-    feeder = tray_fields.valid_feeder(raw)
-    if feeder is not None:
-        return FeederPosition("jammed" if feeder == jammed_global_tray else "other", feeder)
-    if raw == _NO_FILAMENT:
-        return FeederPosition("empty", jammed_global_tray)
-    if raw == tray_fields.TRAY_NOW_EXTERNAL_SPOOL:
-        return FeederPosition("external", None)
-    return FeederPosition("unknown", None)
+    return _position_of(tray_fields.toolhead_feed(state).active, jammed_global_tray)
 
 
 # The reasons whose feeder clause names the slot and gives NO instruction: the AMS holds
@@ -2087,45 +2174,107 @@ def _job_ended(reason: str, evidence: _RecoveryEvidence | None) -> bool:
     return reason in _JOB_ENDED_REASONS or (evidence is not None and evidence.restart_stop is not None)
 
 
-def _feeder_clause(position: FeederPosition, restore: RestoreVerdict | None, *, reason: str) -> str | None:
+# Reasons whose paused copy instructs a RESUME (or Continue) — right over a loaded toolhead,
+# printing air over an empty one (011/014-H2S 2026-10-09/10: "slot N is loaded … press
+# Continue" over a toolhead the queued pull-back had emptied). Each has a second copy for the
+# EMPTY side, its instruction dropped: the feeder clause then carries the exit, which loads a
+# spool BEFORE the resume (:func:`_feeder_clause`). The ``_ENDED_JOB_DETAIL`` precedent — one
+# reason, a copy per side. Asked of the jam kind only, the one whose page reads the toolhead.
+_EMPTY_TOOLHEAD_DETAIL: dict[str, str] = {
+    "unload_failed": "The unload did not complete. Open the AMS and free the filament at the feeder.",
+    "feed_path_blocked": (
+        "Replacement spools failed to load repeatedly — the filament path (buffer / PTFE) is likely "
+        "blocked. Clear the buffer and PTFE path. Left PAUSED for a human."
+    ),
+    "printer_offline": (
+        "The printer stopped reporting during recovery, so the farm could not read what the AMS did. Check the "
+        "printer's connection and the AMS."
+    ),
+    "recovery_interrupted": (
+        "A recovery was interrupted (the server restarted mid-swap) and the printer is still PAUSED with no "
+        "fault the wire can still name — check the filament path."
+    ),
+}
+
+
+def _slot_name(global_tray: int | None) -> str:
+    """A tray's human name through the one slot-name origin (``runout_slot_desc``)."""
+    return runout_slot_desc(global_tray) or f"tray {global_tray}"
+
+
+def _refill_sentence(refill: RefillResult) -> str:
+    """What the refill attempted and what the AMS answered — facts, no instruction."""
+    match refill:
+        case RefillLoaded(tray=tray):
+            return f"{_slot_name(tray)} was refilled and no longer reads at the active nozzle."
+        case RefillFailed(tray=None, answer=answer):
+            return f"Refill failed: {answer.replace('_', ' ')}."
+        case RefillFailed(tray=tray, command="unload", answer=answer):
+            return f"The unload before the load from {_slot_name(tray)} failed: {answer.replace('_', ' ')}."
+        case RefillFailed(tray=tray, answer=answer):
+            return f"Load from {_slot_name(tray)} failed: {answer.replace('_', ' ')}."
+        case RefillNoCandidate():
+            return "No spool to load."
+        case _:
+            assert_never(refill)
+
+
+def _feeder_clause(
+    feed: tray_fields.ExtruderFeed | None, refill: RefillResult | None, *, jammed: int | None, reason: str
+) -> str | None:
     """The sentence a jam escalation appends to its static reason copy, or None.
 
-    The reason copy says WHY the farm gave up; this says what state the printer is in
-    while it waits, which is the half incident 192 (004-H2S 2026-09-17) was missing:
-    the page never said the extruder was empty, so a Resume was the natural next click
-    and the print ran four hours on air.
+    The reason copy says WHY the farm gave up; this says what state the printer is in while it
+    waits — the MEASURED toolhead (item 4 of 2026-10-10): ``feed`` is the ACTIVE extruder's live
+    reading (``tray_fields.toolhead_feed``, the one reader of "is the toolhead fed" — per
+    extruder on a dual nozzle), never ``tray_now`` alone. Incident 192 (004-H2S 2026-09-17) was
+    the first half of this: the page never said the extruder was empty, so a Resume was the
+    natural next click and the print ran four hours on air. 011/014-H2S 2026-10-09/10 was the
+    second: the page said "slot N is loaded … press Continue" over a toolhead a queued pull-back
+    had emptied.
 
-    ``restore`` is the driver's own statement about an extruder IT emptied, so a
-    give-up that unloaded nothing renders nothing about unloading. Runout / physical /
-    external kinds get no clause at all (their copy already carries the slot
-    instruction, and the swap machine never moved their filament). ``reason`` gates the
-    instruction half (:data:`_CLAUSE_WITHOUT_INSTRUCTION`), the ``_retract_clause`` pattern
-    — one instruction per page, never two. A page composed after the job ended asks for no
-    clause at all (:func:`_job_ended`, :func:`_compose_detail`).
+    * fed from ``N``: "``N`` is loaded" (or, the jammed tray, "The jammed spool is still loaded",
+      with its instruction) — only when the active extruder reads fed from ``N``;
+    * EMPTY: "Toolhead empty." plus what the refill attempted and what the AMS answered
+      (``refill``, the driver's own statement), plus the exit — load a spool, THEN resume —
+      never a resume or a Continue over the empty toolhead;
+    * external / unknown: nothing (no AMS slot to name, or nothing read).
+
+    ``reason`` gates the instruction half (:data:`_CLAUSE_WITHOUT_INSTRUCTION`), the
+    ``_retract_clause`` pattern — one instruction per page, never two. Runout / physical / external
+    kinds get no clause at all, and a page composed after the job ended asks for none
+    (:func:`_job_ended`, :func:`_compose_detail`).
     """
-    instruct = reason not in _CLAUSE_WITHOUT_INSTRUCTION
-    slot = runout_slot_desc(position.global_tray) or f"tray {position.global_tray}"
-    if position.kind == "jammed":
-        state = (
-            f"The jammed spool was unloaded and reloaded ({slot})."
-            if restore == "ok"
-            else f"The jammed spool is still loaded ({slot})."
-        )
-        return f"{state} Clear the extruder, then resume on the printer." if instruct else state
-    if position.kind == "empty":
-        if restore == "fail":
-            state = f"No filament is loaded: {slot} was unloaded and the reload failed."
-            return f"{state} Check the filament path, load a spool, then resume on the printer." if instruct else state
-        if restore == "skipped_drying":
-            state = f"No filament is loaded: {slot} was unloaded; the AMS is drying, so no reload was attempted."
-            return f"{state} Load a spool after the cycle, then resume on the printer." if instruct else state
-        # The farm did not empty it and cannot say why it reads empty — 255 is
-        # "nothing is feeding", not "the path is clear" (invariant 8). The reason
-        # copy stands on its own.
+    if feed is None:
         return None
-    if position.kind == "other":
-        return f"{slot} is loaded."
-    return None
+    instruct = reason not in _CLAUSE_WITHOUT_INSTRUCTION
+    match feed.kind:
+        case "fed":
+            slot = _slot_name(feed.tray)
+            refilled = isinstance(refill, RefillLoaded) and refill.tray == feed.tray
+            if feed.tray == jammed:
+                state = (
+                    f"The jammed spool was unloaded and reloaded ({slot})."
+                    if refilled
+                    else f"The jammed spool is still loaded ({slot})."
+                )
+                return f"{state} Clear the extruder, then resume on the printer." if instruct else state
+            return f"Toolhead refilled from {slot}." if refilled else f"{slot} is loaded."
+        case "empty":
+            facts = "Toolhead empty." if refill is None else f"Toolhead empty. {_refill_sentence(refill)}"
+            if not instruct:
+                return facts
+            drying = isinstance(refill, RefillFailed) and refill.answer == "drying"
+            exit_ = (
+                "Load a spool after the drying cycle, then resume on the printer."
+                if drying
+                else "Load a spool on the printer, then resume."
+            )
+            return f"{facts} {exit_}"
+        case "external" | "unknown":
+            return None
+        case _:
+            assert_never(feed.kind)
 
 
 def _retract_clause(incident: RecoveryIncident) -> str:
@@ -2225,7 +2374,7 @@ def _compose_detail(
     incident: RecoveryIncident,
     reason: str,
     *,
-    restore: RestoreVerdict | None,
+    refill: RefillResult | None,
     evidence: _RecoveryEvidence | None,
 ) -> str:
     """THE human detail of an escalation: static reason copy plus the kind's clauses.
@@ -2241,8 +2390,10 @@ def _compose_detail(
     * JAM → :func:`_evidence_sentence` (what the driver sent and what the wire
       answered — ``evidence`` is a PARAMETER, the incident's own log, never re-read
       from the wire here; ``None`` for the entry escalations, which sent nothing), then
-      :func:`_feeder_clause` — where the filament sits, read off the live wire plus the
-      driver's own restore verdict (incident 192's missing half), gated by the reason.
+      :func:`_feeder_clause` — the MEASURED toolhead (the ACTIVE extruder, live) plus the
+      driver's own refill statement (incident 192's and 014-H2S's missing half), gated by the
+      reason. Over an EMPTY toolhead a reason whose copy instructs a resume takes its empty-side
+      copy (:data:`_EMPTY_TOOLHEAD_DETAIL`), so no page says resume or Continue over air.
     * PHYSICAL, and only under the ``physical_fault`` reason → :func:`_retract_clause`
       — what the screen's Retry will do (incident 289's missing half).
 
@@ -2262,24 +2413,31 @@ def _compose_detail(
     and the print is over.
     """
     ended = _job_ended(reason, evidence)
-    detail = (_ENDED_JOB_DETAIL.get(reason) if ended else None) or _ESCALATE_DETAIL.get(reason, reason)
+    # Where the filament sits is read off a LIVE wire only (:func:`_reads_live`): a printer off
+    # its session still carries its last session's cached feeder fields, and a clause read from
+    # them would describe a printer the farm cannot see. The ACTIVE extruder (K1), never "any".
+    feed: tray_fields.ExtruderFeed | None = None
+    refill_page = reason in _TOOLHEAD_REASONS
+    if (incident.is_feed_fault or refill_page) and not ended:
+        st = _get_state(incident.printer_id)
+        if _reads_live(st):
+            feed = tray_fields.toolhead_feed(st).active
+    empty = feed is not None and feed.kind == "empty"
+    detail = (
+        (_ENDED_JOB_DETAIL.get(reason) if ended else None)
+        or (_EMPTY_TOOLHEAD_DETAIL.get(reason) if empty else None)
+        or _ESCALATE_DETAIL.get(reason, reason)
+    )
     clauses: list[str] = []
     if incident.is_feed_fault:
         sent = _evidence_sentence(evidence) if evidence is not None else None
-        # Where the filament sits is read off a LIVE wire only (:func:`_reads_live`): a
-        # printer off its session still carries its last session's cached ``tray_now``,
-        # and a clause read from it would describe a printer the farm cannot see.
-        st = _get_state(incident.printer_id)
-        feeder = (
-            None
-            if ended
-            else _feeder_clause(
-                _feeder_position(st if _reads_live(st) else None, incident.jammed_global_tray, incident.printer_id),
-                restore,
-                reason=reason,
-            )
-        )
+        feeder = _feeder_clause(feed, refill, jammed=incident.jammed_global_tray, reason=reason)
         clauses = [clause for clause in (sent, feeder) if clause is not None]
+    elif refill_page:
+        # A refill on a row of another kind (its own toolhead row, a physical or runout row it
+        # re-entered): the measured toolhead and the refill, nothing of a swap.
+        feeder = _feeder_clause(feed, refill, jammed=incident.jammed_global_tray, reason=reason)
+        clauses = [feeder] if feeder is not None else []
     elif incident.kind == KIND_PHYSICAL and reason == "physical_fault":
         clauses = [_retract_clause(incident)]
     return " ".join([detail, *clauses])
@@ -2375,8 +2533,20 @@ def _new_fault_verdict(row: PrinterIncident, state, printer_id: int) -> incident
     return incident_resolution.resolve(
         row,
         "new_fault",
-        Context(state=state, ledger=ledger, driver_live=printer_incidents.driver_live(printer_id)),
+        Context(
+            state=state,
+            ledger=ledger,
+            driver_live=printer_incidents.driver_live(printer_id),
+            command_pending=_pending_on(row),
+        ),
     )
+
+
+def _pending_on(row: PrinterIncident) -> bool:
+    """Does the farm's last motion command on ``row`` still pend? The store's DB-free projection
+    (``printer_incidents.pending_command``, the ledger's one derivation), handed to the rule table
+    as ``Context.command_pending`` by every closer here — the one place each asks it."""
+    return printer_incidents.pending_command(row.printer_id, incident_id=row.id) is not None
 
 
 async def _close_for_new_fault(db: AsyncSession, row: PrinterIncident, verdict: incident_resolution.Verdict) -> None:
@@ -2496,6 +2666,21 @@ async def on_ams_fault(printer_id: int, state) -> asyncio.Task | None:
                     fingerprint,
                     "not opened — this printer already has an open AMS incident",
                     detail=f"incident {existing.id} {existing.status} kind={existing.kind}: {stands}",
+                )
+                return None
+
+            if existing is None and printer_incidents.refill_in_progress(printer_id):
+                # The farm is refilling this printer's toolhead on its own row (K10 — an open
+                # ``toolhead_refill`` row, ``recovering``: the durable promise, read like a job
+                # pause, never liveness). The fault is that refill's reading — its own load answers
+                # it and a failure pages on its row — and opening a row here would spawn a SECOND
+                # driver onto one AMS. Owned on the next push once the refill has closed its row or
+                # handed it to a person, if it still stands; ``owned_full_codes`` mirrors this gate.
+                _note_outcome(
+                    printer_id,
+                    job_id,
+                    fingerprint,
+                    "not owned — the farm is refilling this printer's toolhead; its own load reads this fault",
                 )
                 return None
 
@@ -2719,9 +2904,11 @@ async def _entry_would_open(db: AsyncSession, printer_id: int, state, candidates
     Its remaining durable gates, mirrored: while the printer's job is paused at its own
     plate check no NEW AMS incident opens, so nothing speaks for the fault and its raw
     alert is the only word the operator gets; and a fault an ABORTED close barred will
-    never be owned again — its raw alert goes through rather than into silence.
+    never be owned again — its raw alert goes through rather than into silence. And while the farm
+    is refilling the toolhead on its own row (``printer_incidents.refill_in_progress``), the entry
+    opens nothing either.
     """
-    if printer_incidents.job_pause_held(printer_id):
+    if printer_incidents.refill_in_progress(printer_id) or printer_incidents.job_pause_held(printer_id):
         return False
     job_id = (getattr(state, "subtask_id", None) or "").strip()
     return not await _fault_already_closed(db, printer_id, job_id, candidate_fingerprint(candidates))
@@ -2809,6 +2996,13 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
     #     gate would otherwise re-open an incident every throttle window. A session
     #     gap inside the wait is not "never PAUSEd": the wait stops its clock for it.
     if not await _await_live_state(incident, frozenset({"PAUSE"}), incident.settings.step_timeout_s):
+        if evidence.pending_command is not None:
+            # Not a transient: a re-entered incident whose log holds a farm command the AMS has
+            # not run, on a printer somebody resumed while the farm was down. That command can
+            # still drain under the RUNNING print, so the row is kept the way every takeover
+            # keeps it while one pends (K11) — :func:`_abort`'s one rule, never a second.
+            await _abort(incident)
+            return
         await _close_incident(incident, status=STATUS_ABORTED, source=None)
         logger.info("spool_recovery: printer %s never PAUSEd (firmware rescue / transient) — incident closed", pid)
         return
@@ -2860,6 +3054,41 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
     for _round in range(_MAX_CANDIDATES):
         if await _takeover_exit(incident, awaiting="PAUSE", step="round_start"):
             return
+
+        # (0) NEVER SEND BEHIND A PENDING COMMAND (2026-10-10, 011/014-H2S). A driver
+        # re-entered after a farm restart can find its log ENDING in a command the AMS has not
+        # run — held at its bound, or sent and never read (the process died between the two).
+        # A fresh send would queue behind it and both would run (012-H2S 2026-09-23), so the
+        # round waits for it (:func:`_await_pending_command`) and continues the contract FROM
+        # it: a load that ran → the resume; an unload that ran (or that nothing physical can
+        # answer) → the load, the pull-back being that load's unload. Inside a round a held
+        # command is waited on in its own confirm, so only a restarted driver meets one here.
+        settled: CommandStep | None = None
+        pending = evidence.pending_command
+        if pending is not None:
+            waited = await _await_pending_command(incident, pending, evidence=evidence)
+            match waited:
+                case "ran" | "undecidable":
+                    settled = pending
+                case "void":
+                    pass  # the reboot emptied the queue: this round starts from the live wire
+                case "abort":
+                    await _abort(incident)
+                    return
+                case "handover":
+                    _hand_over(incident)
+                    return
+                case _:
+                    assert_never(waited)
+            if settled.command == "load" and settled.target is not None:
+                tail = await _resume_and_read(incident, settled.target, evidence=evidence)
+                match tail:
+                    case "over":
+                        return
+                    case "next_round":
+                        continue
+                    case _:
+                        assert_never(tail)
 
         # (a) The AMS's own state word decides whether the swap may go out at all.
         st, _waited = await _live_reading(incident)
@@ -2947,15 +3176,28 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
         # KEEPS it; only a clean swap-and-resume, a self-heal on the jammed feeder or
         # an external-takeover abort resolves it (the latter's _clear reverses it
         # when the operator resumed on the jammed feeder — never on a feeder the
-        # driver restored). Whether a stamp is written at all is
+        # driver refilled). Whether a stamp is written at all is
         # `_commit_out_of_rotation`'s call: an extruder-side fault commits the SWAP
         # and parks nothing (006-H2S 2026-09-21, incident 289).
         if not evidence.swap_committed and incident.jammed_global_tray is not None:
             await _commit_out_of_rotation(incident, incident.jammed_global_tray, role="jammed")
 
         # (c) The unload — unconditional before a load (invariant 8), never behind a
-        # held command.
-        unload = await _unload_and_confirm(incident, evidence=evidence, attempts=incident.settings.max_attempts)
+        # held command. A pull-back the round top found pending and saw settle IS this load's
+        # unload: it went out after the fault, and resending it is the second command behind a
+        # queued one the wait exists to prevent.
+        unload: UnloadStep
+        if settled is not None:
+            logger.info(
+                "spool_recovery: printer %s the farm's pull-back (step %s) settled %s — it is this load's unload; "
+                "not resent",
+                pid,
+                settled.seq,
+                evidence.command_step(settled.seq).answer,
+            )
+            unload = "complete"
+        else:
+            unload = await _unload_and_confirm(incident, evidence=evidence, attempts=incident.settings.max_attempts)
         if unload not in ("complete", "skipped"):
             _log_candidate_outcome(incident, gtid=incident.jammed_global_tray, verdict=f"unload_{unload}")
         match unload:
@@ -2965,9 +3207,11 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
                 # it, so the load is the next measurement.
                 pass
             case "held":
-                # The AMS re-entered a change under the driver and acknowledged the
-                # unload without moving: it runs at the next release. Nothing may be
-                # sent behind it — the page names the held unload.
+                # Held INSIDE a change: the AMS re-entered one under the driver and
+                # acknowledged the unload without moving, so it runs at the next release,
+                # which only a human causes there. Nothing may be sent behind it — the page
+                # names the held unload, and the row stays open on it. (Held OUTSIDE a change
+                # never arrives here: the confirm waited for it to run — :func:`_held_outcome`.)
                 await _give_up(incident, "swap_held_after_release", evidence=evidence)
                 return
             case "acted" | "refused" | "no_movement":
@@ -2996,7 +3240,8 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
                 pass
             case "held":
                 # Held behind a change the AMS re-entered: it runs at the next release,
-                # refilling the extruder there — never resent, and no restore behind it.
+                # refilling the extruder there — never resent, and no refill behind it (the
+                # command pends). Held OUTSIDE a change was waited on (:func:`_held_outcome`).
                 await _give_up(incident, "swap_held_after_release", evidence=evidence)
                 return
             case "acted" | "no_movement":
@@ -3025,91 +3270,113 @@ async def _drive_recovery(incident: RecoveryIncident, evidence: _RecoveryEvidenc
             case _:
                 assert_never(load)
 
-        # (d) The resume — the SAME reader, reading the contract's own verb for
-        #     ``swapped``. Not a release attempt, so the lever budget does not apply.
-        first = await _read_after(incident, "resume", evidence=evidence, budgeted=False)
-        match first.reading:
-            case "swapped":
-                await _succeed(incident, _swapped_tray(first))
+        # (d) The resume — the contract's own verb, read by THE reader (:func:`_resume_and_read`).
+        tail = await _resume_and_read(incident, target, evidence=evidence)
+        match tail:
+            case "over":
                 return
-            case "self_healed" | "wedged" | "released":
-                # One more resume (mirrors the live 16:21:24 → 16:22:57 recovery where
-                # the first resume did not stick): the printer is back at PAUSE.
-                pass
-            case "ended":
-                await _close_ended_by_driver(incident, evidence=evidence)
-                return
-            case "no_pause" | "not_sent":
+            case "next_round":
                 continue
-            case "abort":
-                # ``paused_elsewhere`` among the tokens: another actor's quiet PAUSE after
-                # this resume ran — stand aside, no second resume, no park.
-                await _abort(incident, token=first.takeover)
-                return
-            case "handover":
-                _hand_over(incident)
-                return
-            case "stopped":
-                raise LookupError("the swap round's resume read 'stopped' — only a rung that ends the job can")
             case _:
-                assert_never(first.reading)
-
-        retry = await _read_after(incident, "resume", evidence=evidence, budgeted=False)
-        match retry.reading:
-            case "swapped":
-                await _succeed(incident, _swapped_tray(retry))
-                return
-            case "self_healed" | "wedged" | "released":
-                if not retry.moved:
-                    # The print never ran, so nothing faulted and there is NOTHING to
-                    # conclude about this spool. 002-H2S 2026-09-11: this branch used to
-                    # be spelled the same as a re-jam and stamped the operator's healthy
-                    # slot-1 roll out of rotation against a printer they had just stopped.
-                    logger.info(
-                        "spool_recovery: printer %s resume never took on tray %s — no fault evidence, "
-                        "replacement kept in rotation; trying the next candidate",
-                        pid,
-                        target,
-                    )
-                    continue
-                # The print RAN and stopped again — the ONE path on which a replacement
-                # may be parked at all. Ask the WIRE which tray it blames (the same
-                # evidence order the entry gate used; ``item=None`` because the dispatch
-                # mapping now names the replacement itself, so it cannot corroborate
-                # anything). The extruder-side rule lives in `_commit_out_of_rotation`.
-                st, _waited = await _live_reading(incident)
-                jammed_now, _verdict = _resolve_jammed_tray(
-                    st, candidates=live_candidates(st), item=None, printer_id=pid
-                )
-                if jammed_now == target:
-                    await _commit_out_of_rotation(incident, target, role="replacement")
-                else:
-                    logger.info(
-                        "spool_recovery: printer %s re-PAUSEd with the fault attributed to tray %s, not the "
-                        "replacement %s — kept in rotation",
-                        pid,
-                        jammed_now,
-                        target,
-                    )
-            case "ended":
-                await _close_ended_by_driver(incident, evidence=evidence)
-                return
-            case "no_pause" | "not_sent":
-                continue
-            case "abort":
-                await _abort(incident, token=retry.takeover)
-                return
-            case "handover":
-                _hand_over(incident)
-                return
-            case "stopped":
-                raise LookupError("the swap round's resume read 'stopped' — only a rung that ends the job can")
-            case _:
-                assert_never(retry.reading)
+                assert_never(tail)
 
     # (4) Every candidate exhausted.
     _log_candidate_outcome(incident, gtid=None, verdict="candidates_exhausted")
     await _give_up(incident, evidence.exhaustion_reason(), evidence=evidence)
+
+
+# How the swap round's resume ended (:func:`_resume_and_read`): the incident's outcome was
+# written (``over`` — recovered, ended by the driver, stood aside, handed over), or the round
+# moves on to the next candidate (``next_round``).
+RoundTail = Literal["over", "next_round"]
+
+
+async def _resume_and_read(incident: RecoveryIncident, target: int, *, evidence: _RecoveryEvidence) -> RoundTail:
+    """The contract's resume once ``target`` is at the toolhead — the SAME reader
+    (:func:`_read_after`, ``budgeted=False``: not a release attempt, so the lever budget does not
+    apply), reading the contract's own verb for ``swapped``, with one retry (the live 16:21:24 →
+    16:22:57 recovery, where the first resume did not stick). Shared by the round's own load and
+    by a round whose top saw the previous driver's pending load run (item 2 of 2026-10-10: the
+    contract continues at the resume, never a second load)."""
+    pid = incident.printer_id
+    first = await _read_after(incident, "resume", evidence=evidence, budgeted=False)
+    match first.reading:
+        case "swapped":
+            await _succeed(incident, _swapped_tray(first))
+            return "over"
+        case "self_healed" | "wedged" | "released":
+            # One more resume (mirrors the live 16:21:24 → 16:22:57 recovery where
+            # the first resume did not stick): the printer is back at PAUSE.
+            pass
+        case "ended":
+            await _close_ended_by_driver(incident, evidence=evidence)
+            return "over"
+        case "no_pause" | "not_sent":
+            return "next_round"
+        case "abort":
+            # ``paused_elsewhere`` among the tokens: another actor's quiet PAUSE after
+            # this resume ran — stand aside, no second resume, no park.
+            await _abort(incident, token=first.takeover)
+            return "over"
+        case "handover":
+            _hand_over(incident)
+            return "over"
+        case "stopped":
+            raise LookupError("the swap round's resume read 'stopped' — only a rung that ends the job can")
+        case _:
+            assert_never(first.reading)
+
+    retry = await _read_after(incident, "resume", evidence=evidence, budgeted=False)
+    match retry.reading:
+        case "swapped":
+            await _succeed(incident, _swapped_tray(retry))
+            return "over"
+        case "self_healed" | "wedged" | "released":
+            if not retry.moved:
+                # The print never ran, so nothing faulted and there is NOTHING to
+                # conclude about this spool. 002-H2S 2026-09-11: this branch used to
+                # be spelled the same as a re-jam and stamped the operator's healthy
+                # slot-1 roll out of rotation against a printer they had just stopped.
+                logger.info(
+                    "spool_recovery: printer %s resume never took on tray %s — no fault evidence, "
+                    "replacement kept in rotation; trying the next candidate",
+                    pid,
+                    target,
+                )
+                return "next_round"
+            # The print RAN and stopped again — the ONE path on which a replacement
+            # may be parked at all. Ask the WIRE which tray it blames (the same
+            # evidence order the entry gate used; ``item=None`` because the dispatch
+            # mapping now names the replacement itself, so it cannot corroborate
+            # anything). The extruder-side rule lives in `_commit_out_of_rotation`.
+            st, _waited = await _live_reading(incident)
+            jammed_now, _verdict = _resolve_jammed_tray(st, candidates=live_candidates(st), item=None, printer_id=pid)
+            if jammed_now == target:
+                await _commit_out_of_rotation(incident, target, role="replacement")
+            else:
+                logger.info(
+                    "spool_recovery: printer %s re-PAUSEd with the fault attributed to tray %s, not the "
+                    "replacement %s — kept in rotation",
+                    pid,
+                    jammed_now,
+                    target,
+                )
+            return "next_round"
+        case "ended":
+            await _close_ended_by_driver(incident, evidence=evidence)
+            return "over"
+        case "no_pause" | "not_sent":
+            return "next_round"
+        case "abort":
+            await _abort(incident, token=retry.takeover)
+            return "over"
+        case "handover":
+            _hand_over(incident)
+            return "over"
+        case "stopped":
+            raise LookupError("the swap round's resume read 'stopped' — only a rung that ends the job can")
+        case _:
+            assert_never(retry.reading)
 
 
 # --- the session gate: a gap in the printer's session is a WAIT, never an exit ---------
@@ -3398,6 +3665,11 @@ def _hand_over(incident: RecoveryIncident) -> None:
     kind and that kind's owner produces the outcome. Aborting here would close a row
     that is no longer ours and bar re-entry for a fault nobody has handled (the
     ``_blocked`` ledger is keyed by the fault, not by who gave up on it).
+
+    K11 (2026-10-10) asks nothing more of it: a hand-over never closed the row, so a farm
+    command still pending on it stays on the row's ledger and projection
+    (``printer_incidents.pending_command``) for the hand-over's refill, and the re-classifier
+    has escalated the row (every kind that outranks a jam escalates at entry).
     """
     logger.info(
         "spool_recovery: printer %s incident %s re-classified under the driver — handing over (no abort, no stamp)",
@@ -3591,15 +3863,16 @@ async def _watch_lever(
     * RUNNING — a quiet path (``incident_resolution.path_quiet``) on a real feeder
       (:func:`_success_reading`) held for :data:`_POST_RESUME_STABLE_S` is the success;
       at the deadline the success reads at once (the stable hold cannot outlast the
-      window). For a lever with :attr:`LeverSpec.pause_on_empty_path`, a RUNNING sample
-      whose feeder reads ``empty`` (:func:`_feeder_position`) → ``path_empty``, quiet or
-      not: on a loaded stall that is the firmware's own retract of the jammed filament
-      (012-H2S 2026-09-25, ``tray_now`` 2 → 255 every ~12 s after a resume), on an empty
-      path it is the first sample, and a quiet RUNNING with nothing fed prints air
-      (shape 39), so pausing it at once is the safe direction. Still no success at the
-      deadline → ``hung`` (the live 009 case, ~2.5 min RUNNING in an incomplete change;
-      and the fallback when no retract is ever seen — a dual-nozzle per-extruder map may
-      never read empty).
+      window). The feeder is the ACTIVE extruder's (:func:`_feeding_position`, K1): on a
+      dual nozzle the jammed tray still loaded on the deputy beside an empty active nozzle
+      is a print on air, never a self-heal or a swap. For a lever with
+      :attr:`LeverSpec.pause_on_empty_path`, a RUNNING sample whose feeder reads ``empty``
+      → ``path_empty``, quiet or not: on a loaded stall that is the firmware's own retract
+      of the jammed filament (012-H2S 2026-09-25, ``tray_now`` 2 → 255 every ~12 s after a
+      resume), on an empty path it is the first sample, and a quiet RUNNING with nothing fed
+      prints air (shape 39), so pausing it at once is the safe direction. Still no success
+      at the deadline → ``hung`` (the live 009 case, ~2.5 min RUNNING in an incomplete
+      change; and the fallback when no retract is ever seen).
     * PAUSE after the printer LEFT it, or with the AMS's state word changed →
       ``wedged`` / ``released`` at once (:func:`_pause_reading`); PAUSE never left →
       the same reading at the deadline, with ``moved`` False. In the swap contract's own
@@ -3627,7 +3900,7 @@ async def _watch_lever(
             holding = None
         at_deadline = _now() >= deadline
         live = _live_state(st)
-        position = _feeder_position(st, jammed, pid)
+        position = _feeding_position(st, jammed)
         if position.kind in ("jammed", "other"):
             last_fed = position
         if live not in _DRIVER_STATES:
@@ -3706,7 +3979,7 @@ async def _paused_read(
     phase: its quiet PAUSE is not another actor's."""
     pid = incident.printer_id
     st, _waited = await _live_reading(incident)
-    position = _feeder_position(st, incident.jammed_global_tray, pid)
+    position = _feeding_position(st, incident.jammed_global_tray)
     if landed:
         return LeverRead(_pause_reading(st), moved=True, position=position)
     live = _live_state(st)
@@ -3783,7 +4056,7 @@ async def _read_after(
             return LeverRead(
                 _note_takeover(incident, "job_ended", f"lever={lever}"),
                 moved=False,
-                position=_feeder_position(st, incident.jammed_global_tray, pid),
+                position=_feeding_position(st, incident.jammed_global_tray),
                 takeover="job_ended",
             )
     seq = await evidence.note(LeverStep.draft(lever)) if budgeted else None
@@ -3811,7 +4084,7 @@ async def _read_after(
     client = printer_manager.get_client(pid)
     if client is None or not spec.publish(client):
         logger.warning("spool_recovery: printer %s lever %s send returned False (offline?)", pid, lever)
-        read = LeverRead("not_sent", moved=False, position=_feeder_position(st, incident.jammed_global_tray, pid))
+        read = LeverRead("not_sent", moved=False, position=_feeding_position(st, incident.jammed_global_tray))
     else:
         watched = await _watch_lever(
             incident, spec, lever, entry_ams=entry_ams, published_at=published_at, budgeted=budgeted
@@ -3959,7 +4232,7 @@ async def _close_ended_by_driver(incident: RecoveryIncident, *, evidence: _Recov
     from backend.app.services.notification_service import notification_service
 
     await _log_tray_snapshot(incident)
-    detail = _compose_detail(incident, "wedge_ended_print", restore=None, evidence=evidence)
+    detail = _compose_detail(incident, "wedge_ended_print", refill=None, evidence=evidence)
     try:
         async with async_session() as db:
             row = await printer_incidents.close(
@@ -4036,13 +4309,32 @@ async def _restart(incident: RecoveryIncident, *, evidence: _RecoveryEvidence) -
        parks nothing), crossed once per incident: a swap round that committed before the
        stop parked the jammed spool then (:attr:`_RecoveryEvidence.committed_before_restart`).
        Then the close, ``RESOLVE_DRIVER_RESTART`` (a farm close: ``auto_recovered``). Every
-       give-up routes through :func:`_give_up`, which restores nothing after the stop and
+       give-up routes through :func:`_give_up`, which refills nothing after the stop and
        re-classifies the row a physical hold.
     """
     pid = incident.printer_id
     await _await_stop_settled(incident)
     if await _takeover_exit(incident, awaiting="job_over", step="restart"):
         return
+
+    # A continuation re-entered after a farm restart can find its own unload still pending
+    # (sent, never read). It is waited for, never resent (item 2 of 2026-10-10): once it runs
+    # it is the continuation's unload answered ``complete`` after the stop
+    # (:attr:`_RecoveryEvidence.restart_unloaded`), and nothing goes out behind it.
+    pending = evidence.pending_command
+    if pending is not None:
+        waited = await _await_pending_command(incident, pending, evidence=evidence, awaiting="job_over")
+        match waited:
+            case "ran" | "undecidable" | "void":
+                pass
+            case "abort":
+                await _abort(incident)
+                return
+            case "handover":
+                _hand_over(incident)
+                return
+            case _:
+                assert_never(waited)
 
     if not evidence.restart_unloaded:
         unload = await _unload_and_confirm(
@@ -4169,18 +4461,20 @@ async def _restart_refault(incident: RecoveryIncident) -> str | None:
 def _unload_skippable(state) -> bool:
     """True only for the genuinely-clean "nothing to unload" state.
 
-    ALL THREE must hold: nothing is feeding (``tray_now == 255``), the AMS state
-    machine is idle (``ams_status_main == 0``), and no feed-fault code is standing.
-    That is the restart / firmware-already-unloaded path the original short-circuit
-    was written for.
+    ALL THREE must hold: nothing is feeding at the ACTIVE extruder — the hotend an unload
+    acts on (``tray_fields.toolhead_feed``, K1: per extruder on a dual nozzle, where
+    ``tray_now`` is the client's single guess) — the AMS state machine is idle
+    (``ams_status_main == 0``), and no feed-fault code is standing. That is the restart /
+    firmware-already-unloaded path the original short-circuit was written for. An unread
+    feed is not "nothing feeding".
 
     Anything else — above all a live feed fault, or an ``ams_status_main`` stuck at
     ``1`` (filament_change) — means an explicit unload is exactly what the AMS needs,
-    because after a feed fault ``tray_now == 255`` says only "nothing is feeding".
+    because after a feed fault an empty reading says only "nothing is feeding".
     """
     if state is None:
         return False
-    if getattr(state, "tray_now", None) != _NO_FILAMENT:
+    if tray_fields.toolhead_feed(state).active.kind != "empty":
         return False
     if getattr(state, "ams_status_main", None) != AMS_STATUS_IDLE:
         return False
@@ -4223,8 +4517,13 @@ async def _wait_ams_write_window(printer_id: int, ams_id: int) -> str | None:
 
 
 def _feeder_kind(incident: RecoveryIncident) -> str:
-    """The feeder position AT a send (:func:`_feeder_position`), for the command's step."""
-    return _feeder_position(_get_state(incident.printer_id), incident.jammed_global_tray, incident.printer_id).kind
+    """The feeder the command ACTS ON, at its send: the ACTIVE extruder relative to the jammed
+    tray (:func:`_feeding_position`) — the entry ``ams_command.posture`` keys the answer by and
+    ``ams_command.ran`` reads back, so the record and the answer describe one extruder. On an
+    H2C the jammed tray on the deputy beside an empty active nozzle records ``empty``, never
+    ``jammed`` (an unload then reads as run the moment it is sent); a fed extruder on a row
+    that names no jammed tray records ``other``, so its unload's run stays readable."""
+    return _feeding_position(_get_state(incident.printer_id), incident.jammed_global_tray).kind
 
 
 async def _unload_and_confirm(
@@ -4239,11 +4538,16 @@ async def _unload_and_confirm(
 
     Up to ``attempts`` publishes: an unload the AMS moved and never completed
     (``acted``), one it neither moved on nor acknowledged (``no_movement``) and a refusal
-    are resent. ``held`` is NEVER resent: the firmware acknowledged it and holds it behind
-    the print's change, where it runs at the next release — so a second command behind
-    it would run too (012-H2S 2026-09-23). ``session_changed`` is not resent HERE either:
-    its answer was lost with its session, and the driver's next round re-reads the AMS
-    before anything else goes out. Every other answer returns at once. Every publish that
+    are resent. ``held`` is NEVER resent — a second command behind a queued one runs too
+    (012-H2S 2026-09-23) — and what follows it depends on the posture it was SENT into
+    (``bambu_mqtt.ams_mid_filament_change`` over the send's entry snapshot, the one origin):
+    held INSIDE the print's own change, it runs at the next release, which only a human can
+    cause there (free the spool, Retry) — ``held`` is returned and the round gives up
+    ``swap_held_after_release``; held OUTSIDE a change (the AMS accepted it and has not run
+    it), it is the driver's to wait for (:func:`_await_pending_command`, 011/014-H2S
+    2026-10-09/10) and a run answers ``complete``. ``session_changed`` is not resent HERE
+    either: its answer was lost with its session, and the driver's next round re-reads the
+    AMS before anything else goes out. Every other answer returns at once. Every publish that
     went out is a :class:`CommandStep` on the evidence log, noted at the send.
 
     The unload is sent even when ``tray_now`` already reads 255 — the client encodes
@@ -4266,6 +4570,7 @@ async def _unload_and_confirm(
     if refusal == _REFUSAL_DRYING:
         return "drying"
 
+    awaiting: Awaiting = "job_over" if after_stop else "PAUSE"
     verdict: UnloadStep = "refused"
     for _ in range(max(1, attempts)):
         sent = ams_command.unload(incident.printer_id, actor="driver")
@@ -4278,19 +4583,63 @@ async def _unload_and_confirm(
             verdict = "refused"
             continue
         seq = await evidence.note(CommandStep.draft("unload", None, _feeder_kind(incident)))
-        answer = await _confirm_unloaded(incident, sent, awaiting="job_over" if after_stop else "PAUSE")
+        answer = await _confirm_unloaded(incident, sent, awaiting=awaiting)
         match answer:
             case "acted" | "no_movement":
                 await evidence.answer(seq, answer)
                 verdict = answer
-            case "complete" | "held" | "undecidable" | "session_changed":
+            case "complete" | "undecidable" | "session_changed":
                 await evidence.answer(seq, answer)
                 return answer
+            case "held":
+                await evidence.answer(seq, answer)
+                return await _held_outcome(incident, sent, seq, evidence=evidence, awaiting=awaiting)
             case "abort" | "handover":
+                await _settle_cut_short(incident, seq, evidence=evidence)
                 return answer
             case _:
                 assert_never(answer)
     return verdict
+
+
+async def _held_outcome(
+    incident: RecoveryIncident,
+    sent: ams_command.Sent,
+    seq: int,
+    *,
+    evidence: _RecoveryEvidence,
+    awaiting: Awaiting,
+) -> Literal["held", "complete", "session_changed", "abort", "handover"]:
+    """What a command answered ``held`` (step ``seq``, already on the log) comes to — decided by
+    the posture it was SENT into, never by a clock.
+
+    * INSIDE the print's own filament change (``bambu_mqtt.ams_mid_filament_change`` over the
+      send's entry snapshot — the one origin of "mid-change"): it waits behind the print's head
+      and runs at the next release, which only a human causes there (free the spool, Retry) —
+      ``held``: the caller gives up ``swap_held_after_release``, the page naming the queued
+      command, and the row stays open on it (``printer_incidents.pending_command``).
+    * OUTSIDE a change: the AMS accepted it and has not run it, and it runs on its own
+      (011/014-H2S 2026-10-09/10) — the driver waits for it (:func:`_await_pending_command`) and a
+      run is ``complete``.
+    """
+    if ams_mid_filament_change(sent.entry):
+        return "held"
+    waited = await _await_pending_command(incident, evidence.command_step(seq), evidence=evidence, awaiting=awaiting)
+    match waited:
+        case "ran":
+            return "complete"
+        case "void":
+            # The printer rebooted under it: the queue is gone, the command will never run, and
+            # its step reads ``session_changed`` — the round re-reads the wire and sends afresh.
+            return "session_changed"
+        case "undecidable":
+            # A held command was ACKNOWLEDGED with its entry feeder able to move (the classifier
+            # holds only those), so the wire always answers whether it ran.
+            raise LookupError("a held command settled 'undecidable' — only an unload sent with nothing loaded can")
+        case "abort" | "handover":
+            return waited
+        case _:
+            assert_never(waited)
 
 
 async def _observe_command(
@@ -4351,6 +4700,240 @@ async def _observe_command(
             )
             return answer
         await asyncio.sleep(_POLL_INTERVAL_S)
+
+
+# How a wait on the farm's OWN pending command ended (:func:`_await_pending_command`). Closed.
+# ``ran`` — the wire shows the command ran (``ams_command.ran``), answered ``complete`` on the
+# log; ``undecidable`` — an unload sent with nothing loaded, and the toolhead still empty:
+# nothing physical can answer it and its running can pull nothing back, answered
+# ``undecidable`` (the classifier's own token for that); ``void`` — the printer rebooted (the
+# power-loss prompt), which empties the AMS's queue, so the command will never run: answered
+# ``session_changed`` (:func:`_void_on_reboot`); ``abort`` / ``handover`` — :func:`_takeover`
+# (an operator's act, the job ending, a re-classified row), exactly as it ends every other wait
+# of the driver.
+PendingWait = Literal["ran", "undecidable", "void", "abort", "handover"]
+
+
+async def _await_pending_command(
+    incident: RecoveryIncident,
+    step: CommandStep,
+    *,
+    evidence: _RecoveryEvidence,
+    awaiting: Awaiting = "PAUSE",
+) -> PendingWait:
+    """Wait for the AMS to RUN a motion command the farm sent and it has not run — and send
+    nothing behind it. THE driver's one wait on its own pending command (K6/C2, 011/014-H2S
+    2026-10-09/10), for the command held OUTSIDE a change at its step bound
+    (:func:`_unload_and_confirm` / :func:`_load_and_confirm`) and for the one a restarted driver
+    finds pending on its log.
+
+    The measured reason it waits instead of giving up: an acknowledged, unmoved pull-back sent
+    into assist ran ON ITS OWN ~4.5 min after the send — 011-H2S 04:31:27 → 04:36:01, 014-H2S
+    02:45:58 → 02:50:38 — with the print paused and no farm publish in between, emptying the
+    toolhead. The give-up that used to follow the 90 s window (``unload_failed``, "slot N is
+    loaded … press Continue") was the farm walking away from a command still queued, and the
+    operator's resume printed air. So the driver stays the owner — the row ``recovering``, the
+    driver live — until the command runs, and then continues the contract (the load, the
+    resume, the read). NO elapsed time decides anything here (operator ruling 2026-10-10: "time
+    is not the right signal"); the wait ends only on an EVENT:
+
+    * the command RAN — ``ams_command.ran`` over the step's own ledger columns and the live
+      toolhead (``tray_fields.toolhead_feed``, the ACTIVE extruder): the step is re-answered
+      ``complete`` through the log's one writer — the classifier's own completion token, which
+      is what "held, then ran" settles to (the C1 contract: "it then answers complete"); the
+      ``held`` reading stays in the ``[ams-command] answer=held`` line and this module's;
+    * a takeover (:func:`_takeover`, asked on EVERY poll exactly as :func:`_observe_command`
+      does): somebody else's act, or the job's end — ``abort`` / ``handover``, the caller's to
+      answer as everywhere else.
+
+    Every read goes through the session gate (:func:`_live_reading`): a gap is a wait, and past
+    the offline bound it raises :class:`_PrinterOffline` (the ``printer_offline`` give-up) — the
+    session, never the command, decides that.
+
+    LIVENESS only: once the command has been out :data:`_HELD_COMMAND_PAGE_S` since its send,
+    ONE page names it (:func:`_page_pending_command`) — no hand-over, no status change, no
+    escalation ledger row — and the wait goes on.
+    """
+    pid = incident.printer_id
+    paged = False
+    state_word = "held" if step.answer == printer_incidents.COMMAND_HELD else "unanswered"
+    logger.info(
+        "[spool_recovery] printer %s waits for the AMS to run its %s %s (step %s%s) — nothing is sent behind it",
+        pid,
+        state_word,
+        step.command,
+        step.seq,
+        f", target {step.target}" if step.target is not None else "",
+    )
+    while True:
+        st, _waited = await _live_reading(incident)
+        token = _takeover(incident, st, awaiting=awaiting, target=step.target if step.command == "load" else None)
+        if token is not None:
+            await _settle_cut_short(incident, step.seq, evidence=evidence)
+            return _note_takeover(incident, token, f"await_{step.command}")
+        if power_loss_prompt_standing(getattr(st, "hms_errors", None) or []):
+            await _void_on_reboot(incident.printer_id, step.seq, step.command, evidence=evidence)
+            return "void"
+        settles = _pending_settles(step.entry(), tray_fields.toolhead_feed(st))
+        if settles == "undecidable":
+            # Only a restart meets this: an unload sent with NOTHING loaded (its recorded
+            # feeder names no loaded tray) and nobody read its answer. No reading of the wire
+            # can say it ran, and with the toolhead empty its running pulls nothing back — so
+            # it settles as the classifier settles that send, and nothing waits on it.
+            await evidence.answer(step.seq, "undecidable")
+            logger.info(
+                "[spool_recovery] printer %s: the %s unload (step %s) was sent with nothing loaded and the toolhead "
+                "reads empty — settled undecidable",
+                pid,
+                state_word,
+                step.seq,
+            )
+            return "undecidable"
+        if settles == "complete":
+            await evidence.answer(step.seq, "complete")
+            logger.info(
+                "[spool_recovery] printer %s: the AMS ran the %s %s (step %s) %.0fs after the send "
+                "(tray_now=%s ams_status=%s/%s) — recovery continues",
+                pid,
+                state_word,
+                step.command,
+                step.seq,
+                _outstanding_s(step),
+                getattr(st, "tray_now", None),
+                getattr(st, "ams_status_main", None),
+                getattr(st, "ams_status_sub", None),
+            )
+            return "ran"
+        if not paged and _outstanding_s(step) >= _HELD_COMMAND_PAGE_S:
+            paged = True
+            await _page_pending_command(incident, step, job_ended=awaiting == "job_over")
+        await asyncio.sleep(_POLL_INTERVAL_S)
+
+
+def _pending_sentence(step: CommandStep) -> str:
+    """The page-only bound's sentence: the queued command, and what happens when it runs.
+    Sys-admin register — the fact, then what follows; nothing is asked of anyone."""
+    queued = "the pull-back" if step.command == "unload" else f"the load of {_command_slot(step)}"
+    return f"The AMS accepted {queued} and has not run it. Recovery resumes when it runs."
+
+
+async def _page_pending_command(incident: RecoveryIncident, step: CommandStep, *, job_ended: bool) -> None:
+    """ONE page while the driver waits on its own pending command past :data:`_HELD_COMMAND_PAGE_S`.
+
+    PAGE ONLY — the page-only variant of :func:`_escalate`, through the same notification owner
+    and event (``notification_service.on_spool_recovery_failed``, the recovery's own channel and
+    audience), WITHOUT the escalation: no ``mark_escalated`` (the row stays ``recovering`` and the
+    driver live — it still owns the command), no hold token on the unit, no
+    ``recovery_escalation`` row, no quarantine count. Best-effort: a page that fails is logged
+    and the wait goes on. Never raises.
+    """
+    from backend.app.core.database import async_session
+    from backend.app.models.printer import Printer
+    from backend.app.services.notification_service import notification_service
+
+    detail = _pending_sentence(step)
+    try:
+        async with async_session() as db:
+            printer = await db.get(Printer, incident.printer_id)
+            printer_name = (printer.name if printer else None) or f"printer {incident.printer_id}"
+            await notification_service.on_spool_recovery_failed(
+                printer_id=incident.printer_id,
+                printer_name=printer_name,
+                job_name=incident.job_name,
+                detail=detail,
+                db=db,
+                kind=incident.kind,
+                runout_slot=runout_slot_desc(incident.jammed_global_tray),
+                foreign=incident.item_id is None,
+                job_ended=job_ended,
+            )
+        logger.warning(
+            "[spool_recovery] printer %s incident %s: the %s (step %s) has not run %.0fs after the send — paged "
+            "(page only; the driver keeps waiting)",
+            incident.printer_id,
+            incident.incident_id,
+            step.command,
+            step.seq,
+            _outstanding_s(step),
+        )
+    except Exception:  # noqa: BLE001 — a liveness page must never end the wait
+        logger.exception("spool_recovery: pending-command page failed for printer %s", incident.printer_id)
+
+
+async def _void_on_reboot(printer_id: int, seq: int, command: str, *, evidence: _RecoveryEvidence) -> None:
+    """Record that a firmware REBOOT voided the farm's pending command ``seq``: a power cycle
+    empties the AMS's queue, so a command it had accepted and not run will never run.
+
+    THE one place that fact is written, and its home is the step ledger — durable, through the
+    log's one writer (``EvidenceLog.answer``): the step is answered ``session_changed``, the
+    classifier's own token for "its answer was lost with its session", which settles it
+    (``printer_incidents.command_pends``), so the open-row projection re-derives no pending
+    command now and after any later restart. A reconnect alone voids nothing — a network blip
+    keeps the firmware's queue — the reboot's witness is the firmware's power-loss prompt
+    (``hms_errors.power_loss_prompt_standing``, ``0300_8007``, the one reader the power-loss lane
+    reads too). Two callers: the driver's own wait (:func:`_await_pending_command`) and, with
+    no driver live, the per-push sampler's lane (:func:`_void_pending_after_reboot`)."""
+    await evidence.answer(seq, "session_changed")
+    logger.info(
+        "[spool_recovery] printer %s rebooted (the power-loss prompt stands) — the farm's queued %s (step %s) is "
+        "void: the AMS's queue is gone, so it will never run",
+        printer_id,
+        command,
+        seq,
+    )
+
+
+async def _void_pending_after_reboot(printer_id: int, pending: printer_incidents.PendingCommand) -> None:
+    """The DRIVERLESS void: a row the hand-over left OPEN on a pending command, on a printer that
+    rebooted. Spawned by :func:`note_demand_watch` (the one per-push entry point) and registered
+    in the liveness slot in the same synchronous stretch, so the next push spawns no second one.
+    Re-reads the ledger (``from_row``, the one constructor) and voids the step only while it
+    still pends; releases the slot on exit. Never raises."""
+    from backend.app.core.database import async_session
+
+    try:
+        async with async_session() as db:
+            evidence = await _RecoveryEvidence.from_row(db, pending.incident_id)
+        still = evidence.pending_command
+        if still is not None and still.seq == pending.seq:
+            await _void_on_reboot(printer_id, pending.seq, still.command, evidence=evidence)
+    except Exception:  # noqa: BLE001 — a background lane must never raise
+        logger.exception("spool_recovery: voiding the pending command failed for printer %s", printer_id)
+    finally:
+        task = asyncio.current_task()
+        if task is not None:
+            printer_incidents.release_driver(printer_id, task)
+
+
+async def _settle_cut_short(incident: RecoveryIncident, seq: int, *, evidence: _RecoveryEvidence) -> None:
+    """A takeover cut command ``seq``'s observation short, so the classifier never answered it.
+    Settle what the wire ALREADY shows: a command the toolhead shows RAN (``ams_command.ran``
+    over the step's own ledger columns and the live ``tray_fields.toolhead_feed``) is answered
+    ``complete`` through the log's one writer; anything else stays as it is — unanswered or
+    ``held`` — and so stays the farm's pending command (K11), which keeps the row open for the
+    hand-over while the job lives (:func:`_abort`). Without it a load that LANDED in the same
+    push as an operator's Resume would read as queued, and hold a row open for nothing. A
+    printer that is not reporting live settles nothing."""
+    st = _get_state(incident.printer_id)
+    if st is None or not _reads_live(st):
+        return
+    step = evidence.command_step(seq)
+    if printer_incidents.command_pends(step.answer) and ams_command.ran(step.entry(), tray_fields.toolhead_feed(st)):
+        await evidence.answer(seq, "complete")
+        logger.info(
+            "spool_recovery: printer %s the %s (step %s) cut short by a takeover had already run — answered complete",
+            incident.printer_id,
+            step.command,
+            seq,
+        )
+
+
+def _outstanding_s(step: CommandStep) -> float:
+    """How long ``step`` has been out, measured from its durable send stamp (wall clock, naive
+    UTC like the ledger's ``sent_at``) — so a restart does not reset it. 0 for a step with none."""
+    if step.at is None:
+        return 0.0
+    return max(0.0, (datetime.utcnow() - step.at).total_seconds())
 
 
 async def _confirm_unloaded(
@@ -4544,21 +5127,6 @@ async def _match_candidates(
         match_filaments_to_slots,
     )
 
-    def _present(f: dict) -> bool:
-        # Drop a candidate whose tray reports an explicit non-present state (e.g.
-        # 9 = seated-but-unsensed): a LOAD there is doomed. FAIL OPEN when the state
-        # is None/unparseable — dialect variance must never exclude a real candidate.
-        #
-        # This is the LOAD-VIABILITY reading of the shared rule, deliberately
-        # stricter than the release/consumer reading: for a replacement load the
-        # tray's residual config must not soften a non-present state code (a
-        # configured-but-unsensed tray is precisely the doomed case), so the
-        # ``tray_type`` argument is pinned to the asserted-empty ``""``. The state
-        # vocabulary and its parse still come from ONE origin
-        # (``tray_fields.tray_presence`` / ``TRAY_PRESENT_STATES``), and the
-        # tri-state is mapped fail-open with ``is not False`` exactly as before.
-        return tray_fields.tray_presence(tray_fields.parse_tray_state(f.get("state")), "") is not False
-
     loaded_all = scheduler._build_loaded_filaments(status)
     candidates = [
         f
@@ -4566,7 +5134,9 @@ async def _match_candidates(
         if not f.get("is_external")
         and f.get("global_tray_id") != incident.jammed_global_tray
         and f.get("global_tray_id") not in tried
-        and _present(f)
+        # A tray reporting an explicit non-present state (9 = seated-but-unsensed) dooms a load
+        # — the load-viability reading, shared with the refill (:func:`_tray_load_viable`).
+        and _tray_load_viable(f.get("state"))
     ]
     if not candidates:
         return None, False
@@ -4778,8 +5348,9 @@ async def _load_and_confirm(incident: RecoveryIncident, target: int, *, evidence
     an attempt at once, no confirm wait) / ``abort`` / ``handover``.
 
     Up to ``max_attempts`` publishes (the live incident needed two sends before the load
-    took): ``acted``, ``no_movement`` and a refusal are resent; ``held`` is NEVER resent
-    (the firmware holds it behind the print's change and runs it at the next release).
+    took): ``acted``, ``no_movement`` and a refusal are resent; ``held`` is NEVER resent —
+    inside the print's change it is returned (it runs at the next release), outside one the
+    driver waits for it to run (:func:`_held_outcome`).
     ``ams_command.load`` owns the pre-send ``note_commanded_load`` mark and the entry
     snapshot; a ``pending_tray_target`` that turns into something other than ``target``
     is :func:`_takeover`'s ``hijacked_load``. Every publish that went out is a
@@ -4808,10 +5379,14 @@ async def _load_and_confirm(incident: RecoveryIncident, target: int, *, evidence
             case "acted" | "no_movement":
                 await evidence.answer(seq, answer)
                 verdict = answer
-            case "complete" | "held" | "session_changed":
+            case "complete" | "session_changed":
                 await evidence.answer(seq, answer)
                 return answer
+            case "held":
+                await evidence.answer(seq, answer)
+                return await _held_outcome(incident, sent, seq, evidence=evidence, awaiting="PAUSE")
             case "abort" | "handover":
+                await _settle_cut_short(incident, seq, evidence=evidence)
                 return answer
             case "undecidable":
                 # ``ams_command``'s table gives no load row this answer; a classifier
@@ -5137,143 +5712,427 @@ async def _succeed(incident: RecoveryIncident, target: int, *, swapped: bool = T
         logger.exception("spool_recovery: succeed handler failed for printer %s", incident.printer_id)
 
 
-async def _restore_jammed_feeder(
-    incident: RecoveryIncident, *, evidence: _RecoveryEvidence
-) -> RestoreVerdict | StepTakeover | None:
-    """Put the jammed spool back when the swap emptied the extruder and failed.
+def _tray_load_viable(state: object) -> bool:
+    """Is a tray whose live ``state`` field reads ``state`` worth a LOAD? The load-viability
+    reading of the one tri-state presence rule (``tray_fields.tray_presence`` over
+    ``parse_tray_state``): an explicit non-present state (``9`` — seated-but-unsensed) dooms a
+    load; unknown or unparseable FAILS OPEN — dialect variance must never exclude a real roll.
+    The ``tray_type`` argument is pinned to the asserted-empty ``""`` so a tray's residual config
+    never softens a non-present state code. ONE reading for the swap's candidates
+    (:func:`_match_candidates`) and the refill's last feeder (:func:`_refill_pick`)."""
+    return tray_fields.tray_presence(tray_fields.parse_tray_state(state), "") is not False
 
-    The invariant the driver owns: it never hands a printer to a human with NOTHING
-    loaded when the AMS would load something. After the selection reorder the only way
-    the extruder is empty at a give-up is the residual — the swap committed, a
-    replacement load did not complete, and no further candidate exists — and at that
-    boundary a reload is state RESTORATION, not re-selection: invariant 7 holds (the
-    stamp neither moves nor clears; it did jam, and the flag only bars auto-selection)
-    and invariant 8 holds (this incident's unload precedes the reload).
 
-    ``None`` = not needed (the feeder is not empty, or there is no jammed tray to load
-    back). The outcomes are :data:`RestoreVerdict`; ``abort`` / ``handover`` propagate
-    exactly as they do from every other step.
+async def _bound_spool(printer_id: int, global_tray: int) -> Spool | None:
+    """The spool bound to ``global_tray`` on this printer, or ``None`` (unbound, or a tray the
+    codec cannot name). Best-effort: a failed read answers ``None``."""
+    from backend.app.core.database import async_session
 
-    The reload is ATTEMPTED in every posture, a mid filament-change included, and the
-    wire's answer is what the page reports: ``complete`` → ``ok``; ``drying`` →
-    ``skipped_drying``; anything else that never completed — the AMS not moving, or
-    holding the reload behind the print's change — → ``fail`` (the evidence sentence
-    names a held one). The pre-2026-09-23 refusal in a mid-change AMS rested on "the
-    firmware drops every load" — measured only for a load into an empty path while the
-    change-error modal stood; this sends and reads.
-
-    Called ONLY by :func:`_give_up`, and only once that has established that a farm
-    unload MOVED the AMS and that no command is held
-    (``_RecoveryEvidence.unload_moved_ams`` / ``held_command``) — this function reads the
-    WIRE, and the wire cannot tell an extruder the farm emptied from one the firmware
-    retracted. What it adds is the other half: a driver that unloaded but whose jammed
-    tray reads loaded again has nothing left to restore.
-
-    It reuses :func:`_load_and_confirm` whole, so the drying pre-flight, the
-    ``ams_command`` verb (its ``note_commanded_load`` mark — the backup-swap detector
-    must not spend the departed spool) and the takeover handling are the swap's own, not
-    a second copy. The reload is recorded as a command that went out, but it is NOT a
-    candidate: :attr:`_RecoveryEvidence.loads_attempted` does not count it, and the
-    escalation reason is chosen before it runs.
-
-    A restore is a command the farm sends AND reads, so it needs a printer reporting on a
-    live session (:func:`_reads_live`): a give-up met while the printer is off its session
-    — the ``printer_offline`` one above all — restores nothing (``None``), and a reload
-    whose answer the session took with it, or whose printer went offline mid-read, never
-    demonstrably completed: ``fail``, never inferred ``ok``. It never raises
-    :class:`_PrinterOffline`, so a give-up always reaches its page.
-    """
-    jammed = incident.jammed_global_tray
-    state = _get_state(incident.printer_id)
-    if jammed is None or not _reads_live(state):
-        return None
-    if _feeder_position(state, jammed, incident.printer_id).kind != "empty":
+    ams_id, tray_id = decode_global_tray(global_tray)
+    if ams_id is None:
         return None
     try:
-        load: LoadStep = await _load_and_confirm(incident, jammed, evidence=evidence)
+        async with async_session() as db:
+            assignment = await db.scalar(
+                select(SpoolAssignment)
+                .options(selectinload(SpoolAssignment.spool))
+                .where(
+                    SpoolAssignment.printer_id == printer_id,
+                    SpoolAssignment.ams_id == ams_id,
+                    SpoolAssignment.tray_id == tray_id,
+                )
+            )
+    except Exception:  # noqa: BLE001 — a spool lookup must not crash the refill
+        logger.exception("spool_recovery: bound-spool read failed for printer %s tray %s", printer_id, global_tray)
+        return None
+    return assignment.spool if assignment is not None else None
+
+
+async def _refill_pick(
+    incident: RecoveryIncident, evidence: _RecoveryEvidence, status: PrinterState
+) -> tuple[int | None, str]:
+    """WHICH spool refills the toolhead, and why: ``(global tray | None, source)``.
+
+    1. The job's LAST FEEDER — the incident's jammed tray, the feeder the job was printing from
+       when the fault interrupted it (the row's own fact, durable across a restart) — when it is
+       physically present (:func:`_tray_load_viable` over its live tray) and its spool is not
+       SPENT (``spent_at``, the exhaustion truth — doctrine rule 8). An out-of-rotation stamp
+       does NOT disqualify it: Raymond 2026-09-17, "is it not better to reload original spool
+       that was faulty raise the gate and let human fix?" — the farm puts the job's own spool
+       back, pages, and the human fixes it. Not ``last_loaded_tray`` while a jammed tray is
+       known: that wire field names the last tray that REACHED the toolhead — after a committed
+       swap, the farm's own replacement, not what the job fed from — and a farm restart re-reads
+       it from scratch. It is the fallback only for a row that names no jammed tray (the wire's
+       per-job record; on a dual nozzle a bare slot). Not the ledger's last completed load: a
+       replacement the farm loaded is not the job's spool, and the swap round tried it already.
+    2. Otherwise the swap's own selection (:func:`_select_replacement`): the dispatcher's rules,
+       the jammed and already-tried trays excluded, spent / out-of-rotation / archived rolls
+       hard-excluded inside the matcher.
+    """
+    last = await _refill_last_feeder(incident, status)
+    if last is not None:
+        return last, "the job's last feeder"
+    target, _only_low = await _select_replacement(incident, evidence.tried)
+    return target, "the swap's selection"
+
+
+async def _refill_last_feeder(incident: RecoveryIncident, status) -> int | None:
+    """Tier 1 of :func:`_refill_pick`: the job's LAST FEEDER (the incident's jammed tray, else the
+    wire's per-job ``last_loaded_tray``) when it is physically present and its spool is not spent —
+    else ``None``. ONE reading, shared with the resume verb, which names the slot a refill loads
+    first before the refill runs (:func:`_start_refill`)."""
+    jammed = incident.jammed_global_tray
+    last = jammed if jammed is not None else tray_fields.valid_feeder(getattr(status, "last_loaded_tray", None))
+    if last is None:
+        return None
+    ams_id, tray_id = decode_global_tray(last)
+    live = _live_tray_dict(status, ams_id, tray_id) if ams_id is not None and tray_id is not None else None
+    spool = await _bound_spool(incident.printer_id, last)
+    if live is not None and _tray_load_viable(live.get("state")) and (spool is None or spool.spent_at is None):
+        return last
+    logger.info(
+        "spool_recovery: printer %s refill passes over the job's last feeder tray %s (%s)",
+        incident.printer_id,
+        last,
+        "not present" if live is None or not _tray_load_viable(live.get("state")) else "its spool is spent",
+    )
+    return None
+
+
+def _refill_failed(
+    incident: RecoveryIncident, tray: int | None, command: ams_command.Command, answer: str
+) -> RefillFailed:
+    """The refill's failure, logged where it is decided (the parseable candidate-outcome line)."""
+    _log_candidate_outcome(incident, gtid=tray, verdict=f"refill_failed_{command}_{answer}")
+    return RefillFailed(tray=tray, command=command, answer=answer)
+
+
+async def _refill_toolhead(incident: RecoveryIncident, *, evidence: _RecoveryEvidence) -> RefillVerdict:
+    """THE refill step (K8, 2026-10-10): put a spool at an EMPTY toolhead, and say what happened.
+
+    The rule it serves (operator requirement, Raymond 2026-10-10: "when i click resume there MUST
+    be filament loaded. It's not the users job to know whether or not there's filament in there,
+    the fact that it's unloaded is the farms POOR auto recovery mechanics"): a paused farm job
+    never sits with an empty toolhead the firmware will not refill itself. ONE implementation —
+    it replaces the give-up's restore of the jammed feeder, which it generalises.
+
+    1. The spool: :func:`_refill_pick` — the job's last feeder when present and not spent (an
+       out-of-rotation stamp does not disqualify it), else the swap's selection; none →
+       :class:`RefillNoCandidate`.
+    2. The unload first, invariant 8's decision, through the swap's own helper
+       (:func:`_unload_and_confirm`: skipped only on the genuinely clean path,
+       :func:`_unload_skippable` — never after a feed fault, where 255 is "nothing is feeding",
+       not "the path is clear"). Anything but ``complete`` / ``undecidable`` / ``skipped`` is
+       :class:`RefillFailed` on the unload.
+    3. The load, through the swap's own helper (:func:`_load_and_confirm` → ``ams_command.load``,
+       its drying pre-flight and its ``note_commanded_load`` mark, answered by
+       ``ams_command.classify``; a load the AMS accepted and has not run outside a change is
+       waited on there).
+    4. "Reached the toolhead" = the load answered ``complete`` AND the ACTIVE extruder reads fed
+       from the target (``tray_fields.toolhead_feed`` — on a dual nozzle a load can complete onto
+       the other nozzle) → :class:`RefillLoaded`; else :class:`RefillFailed`.
+
+    Every command is a step on this incident's ledger (the helpers note it at the send). Takeovers
+    propagate (``abort`` / ``handover``). The caller establishes the preconditions — the toolhead
+    reads empty, no command pends, no change is in flight (the AMS owns the toolhead's next motion
+    there, and anything sent into it is held: 012-H2S 2026-09-23) — and the printer reporting on a
+    live session; a session that drops mid-refill answers :class:`RefillFailed` (``session_changed``),
+    never :class:`_PrinterOffline`, so a give-up always reaches its page.
+
+    The refill's load is a command that went out, but it is NOT a candidate in the swap's
+    accounting that matters: the give-up chooses its reason before the refill runs.
+    """
+    pid = incident.printer_id
+    tray: int | None = None
+    command: ams_command.Command = "load"
+    try:
+        st, _waited = await _live_reading(incident)
+        tray, source = await _refill_pick(incident, evidence, st)
+        if tray is None:
+            st, _waited = await _live_reading(incident)
+            token = _takeover(incident, st, awaiting="PAUSE")
+            if token is not None:
+                return _note_takeover(incident, token, "refill_pick")
+            _log_candidate_outcome(incident, gtid=None, verdict="refill_no_candidate")
+            return RefillNoCandidate()
+        logger.info("spool_recovery: printer %s refills the toolhead from tray %s (%s)", pid, tray, source)
+
+        command = "unload"
+        unload = await _unload_and_confirm(incident, evidence=evidence, attempts=incident.settings.max_attempts)
+        match unload:
+            case "complete" | "undecidable" | "skipped":
+                pass
+            case "abort" | "handover":
+                return unload
+            case "held" | "acted" | "no_movement" | "refused" | "drying" | "session_changed":
+                return _refill_failed(incident, tray, command, unload)
+            case _:
+                assert_never(unload)
+
+        command = "load"
+        load = await _load_and_confirm(incident, tray, evidence=evidence)
+        match load:
+            case "complete":
+                pass
+            case "abort" | "handover":
+                return load
+            case "held" | "acted" | "no_movement" | "refused" | "drying" | "session_changed":
+                return _refill_failed(incident, tray, command, load)
+            case _:
+                assert_never(load)
     except _PrinterOffline:
-        logger.warning(
-            "spool_recovery: printer %s went off its session during the restore reload — restore unread",
-            incident.printer_id,
-        )
-        load = "session_changed"
-    verdict: RestoreVerdict
-    match load:
-        case "abort" | "handover":
-            return load
-        case "complete":
-            verdict = "ok"
-        case "drying":
-            verdict = "skipped_drying"
-        case "acted" | "no_movement" | "held" | "refused" | "session_changed":
-            verdict = "fail"
+        logger.warning("spool_recovery: printer %s went off its session during the refill — refill unread", pid)
+        return _refill_failed(incident, tray, command, "session_changed")
+
+    live = _get_state(pid)
+    feed = tray_fields.toolhead_feed(live if _reads_live(live) else None).active
+    if feed.kind == "fed" and feed.tray == tray:
+        _log_candidate_outcome(incident, gtid=tray, verdict="refill_loaded")
+        return RefillLoaded(tray=tray)
+    return _refill_failed(incident, tray, "load", "not_at_toolhead")
+
+
+# --- K7: is a toolhead refill OWED here? (2026-10-10) ------------------------------
+#
+# The operator requirement this serves, verbatim (Raymond 2026-10-10 03:55 EDT): "when i click
+# resume there MUST be filament loaded. It's not the users job to know whether or not there's
+# filament in there, the fact that it's unloaded is the farms POOR auto recovery mechanics".
+# Three EVENTS can owe a refill (the plan's triggers; "time is not the right signal", Raymond the
+# same day, so none of them is a clock):
+#
+# * ``T2`` — a FARM command the step ledger still held as pending RAN after the hand-over (an
+#   accepted pull-back runs on its own ~4.5 min after the send: 011-H2S 04:31:27 → 04:36:01,
+#   014-H2S 02:45:58 → 02:50:38) — the consequence is the farm's to undo;
+# * ``T3`` — a person pressed Resume in Bambuddy (the route, the HMS dialog's resume buttons) or the
+#   farm resumes on a person's behalf (the refill lane, the repair self-heal);
+# * ``T4`` — the first RUNNING push with nothing fed (a screen resume onto an empty toolhead, or a
+#   pending pull-back that drained under a running print): Raymond 2026-09-17, "If nothing is
+#   feedingg after 20secs the print is ruined already" — so the first push, never a dwell.
+
+RefillTrigger = Literal["T2", "T3", "T4"]
+
+# Why a refill is (not) owed — CLOSED, first match wins in :func:`refill_owed`'s order:
+#
+# * ``owed``               — the ACTIVE extruder reads EMPTY and nothing below holds: refill it.
+# * ``fed``                — the active extruder is fed (an AMS feeder, or the external spool).
+# * ``unknown``            — no live reading to decide on: the printer is not reporting on its
+#                            session (``_reads_live``), there is no client to read the job's layer
+#                            from, or the toolhead reading names nothing.
+# * ``eject_sweep``        — the farm's own eject job owns the printer (``plate_occupancy.
+#                            eject_identity``): it runs with the filament retracted by design — a
+#                            sweep is filament-less, never air.
+# * ``change_in_flight``   — a filament change is in flight (``bambu_mqtt.ams_mid_filament_change``):
+#                            the AMS owns the toolhead's next motion — the print's own change is the
+#                            head of its work, and anything sent into it is held (012-H2S 2026-09-23).
+# * ``command_pending``    — a farm motion command on an open row is still QUEUED (the ledger holds it
+#                            pending and the wire does not show it ran): nothing goes behind it — a
+#                            second command behind a queued one runs too — and when it runs, its
+#                            consequence is T2's.
+# * ``power_loss_prompt``  — the firmware's post-reboot prompt stands (``0300_8007``): the reboot's own
+#                            answer is the power-loss lane's (``pause_recovery``), and a ``tray_now``
+#                            read across a reboot is the firmware's reset, not a measurement.
+# * ``runout_demand``      — the firmware asks for the SAME slot (``hms_errors.current_runout_demand``),
+#                            or the printer holds an open RUNOUT row (the demand the refill lane is
+#                            answering, after it cleared off the wire): invariant 9 — a runout is a
+#                            same-slot refill, never a swap, and a load during the hold LATCHES in
+#                            firmware (006-H2S 2026-07-26). The refill LANE owns it.
+# * ``maintenance``        — maintenance mode (``printer_incidents.automation_held``): the farm loads
+#                            nothing on a printer with hands in it.
+# * ``physical``           — an open PHYSICAL hold — T2 ONLY: its exit is the operator's own load, so
+#                            the farm's command running after the hand-over does not reach for the
+#                            path; a person's Resume (T3) and a screen resume onto air (T4) still try
+#                            the refill and report a failure.
+# * ``before_first_layer`` — the job has not printed layer 1 (``JobPeaks.layer_num`` through the
+#                            client's one peaks reader, behind its stale-predecessor gate): the start
+#                            block's own load is still to come, so a 255 there is not air.
+# * ``last_layer``         — T4 ONLY: a RUNNING job AT its last layer (``total_layers`` known) reads
+#                            empty because of the end-of-print retract, not air — ``JobPeaks.
+#                            first_unfed_layer``'s own rule (``L`` below ``total_layers``).
+RefillReason = Literal[
+    "owed",
+    "fed",
+    "maintenance",
+    "physical",
+    "runout_demand",
+    "power_loss_prompt",
+    "before_first_layer",
+    "last_layer",
+    "change_in_flight",
+    "command_pending",
+    "eject_sweep",
+    "unknown",
+]
+
+
+@dataclass(frozen=True)
+class RefillOwed:
+    """:func:`refill_owed`'s verdict: the trigger it was asked for and the closed reason."""
+
+    trigger: RefillTrigger
+    reason: RefillReason
+
+    @property
+    def owed(self) -> bool:
+        return self.reason == "owed"
+
+
+# What settles a farm command the step ledger still holds pending, read off the live toolhead —
+# ``complete`` (``ams_command.ran`` says it ran) or ``undecidable`` (an unload sent with NOTHING
+# loaded, or with no reading of what was, while the toolhead reads empty: no wire reading can say
+# it ran, and its running pulls nothing back). ``None``: still queued.
+PendingSettle = Literal["complete", "undecidable"]
+
+
+def _pending_settles(step: printer_incidents.StepEntry, live: tray_fields.ToolheadFeed) -> PendingSettle | None:
+    """Has the farm's pending motion command ``step`` (its ledger columns) stopped being a queue?
+    THE one rule, read by the driver's own wait (:func:`_await_pending_command`), the refill verdict
+    (:func:`refill_owed`) and the per-push detectors (:func:`_sample_toolhead`). Pure."""
+    ran = ams_command.ran(step, live)
+    if ran is True:
+        return "complete"
+    if ran is None and step.name == "unload" and live.active.kind == "empty":
+        return "undecidable"
+    return None
+
+
+def _pending_entry(pending: printer_incidents.PendingCommand) -> printer_incidents.StepEntry:
+    """The ledger columns of the open-row projection's pending command, as ``ams_command.ran``
+    reads a step."""
+    return printer_incidents.StepEntry(
+        kind=STEP_KIND_COMMAND, name=pending.name, target=pending.target, feeder=pending.feeder
+    )
+
+
+def refill_owed(printer_id: int, state, *, trigger: RefillTrigger) -> RefillOwed:
+    """Is a toolhead refill OWED on this printer now, for ``trigger``? THE one owner of the
+    exclusions (K7) — no other module, and no other function here, composes these predicates for a
+    refill decision (``test_code_quality.TestResumeOwnership``).
+
+    Pure, sync and DB-free — every fact it reads is the wire (``state``), the open-row projection
+    (``printer_incidents``' cache: maintenance, the open kinds, the pending command) or the client's
+    one peaks reader — because the per-push detectors ask it on every status push (invariant 10).
+    The reasons and their order are :data:`RefillReason`'s; the toolhead is the ACTIVE extruder's
+    (``tray_fields.toolhead_feed``, K1 — an empty active nozzle beside a loaded one prints air).
+    """
+    if state is None or not _reads_live(state):
+        return RefillOwed(trigger, "unknown")
+    client = printer_manager.get_client(printer_id)
+    if client is None:
+        return RefillOwed(trigger, "unknown")
+    if plate_occupancy.eject_identity(printer_id) is not None:
+        return RefillOwed(trigger, "eject_sweep")
+    feed = tray_fields.toolhead_feed(state)
+    match feed.active.kind:
+        case "fed" | "external":
+            return RefillOwed(trigger, "fed")
+        case "unknown":
+            return RefillOwed(trigger, "unknown")
+        case "empty":
+            pass
         case _:
-            assert_never(load)
-    _log_candidate_outcome(incident, gtid=jammed, verdict=f"restore_{verdict}")
-    return verdict
+            assert_never(feed.active.kind)
+    if ams_mid_filament_change(state):
+        return RefillOwed(trigger, "change_in_flight")
+    pending = printer_incidents.pending_command(printer_id)
+    if pending is not None and _pending_settles(_pending_entry(pending), feed) is None:
+        return RefillOwed(trigger, "command_pending")
+    hms_list = getattr(state, "hms_errors", None) or []
+    if power_loss_prompt_standing(hms_list):
+        return RefillOwed(trigger, "power_loss_prompt")
+    open_kinds = printer_incidents.open_kinds(printer_id)
+    if current_runout_demand(hms_list) is not None or KIND_RUNOUT in open_kinds:
+        return RefillOwed(trigger, "runout_demand")
+    if printer_incidents.automation_held(printer_id):
+        return RefillOwed(trigger, "maintenance")
+    if trigger == "T2" and KIND_PHYSICAL in open_kinds:
+        return RefillOwed(trigger, "physical")
+    layer = client.job_peaks().layer_num
+    if layer < 1:
+        return RefillOwed(trigger, "before_first_layer")
+    total = int(getattr(state, "total_layers", 0) or 0)
+    if trigger == "T4" and 0 < total <= layer:
+        return RefillOwed(trigger, "last_layer")
+    return RefillOwed(trigger, "owed")
 
 
 async def _give_up(incident: RecoveryIncident, reason: str, *, evidence: _RecoveryEvidence) -> None:
-    """THE give-up boundary: restore what the swap moved, then escalate.
+    """THE give-up boundary: refill an EMPTY toolhead, then escalate.
 
-    Every ``_escalate`` reachable inside :func:`_drive_recovery`'s candidate loop and
-    after it routes through here, so the restore decision is made ONCE from live state
-    instead of inline conditions drifting apart, and the page is composed from the
-    incident's own evidence log — and so does the offline bound (:class:`_PrinterOffline`,
-    answered in :func:`_run_recovery`), whose restore is skipped by the restore's own
-    live-session precondition rather than by a reason test. The escalations that never
-    enter the loop (the entry gate, the runout branch) call :func:`_escalate` directly
-    with ``restore=None`` and no evidence: they sent nothing, so they have nothing to
-    restore and nothing to claim; the startup re-entry passes the hydrated log and
-    restores nothing.
+    Every ``_escalate`` reachable inside :func:`_drive_recovery`'s candidate loop and after it
+    routes through here, so the refill decision is made ONCE from live state instead of inline
+    conditions drifting apart, and the page is composed from the incident's own evidence log and
+    the MEASURED toolhead — and so does the offline bound (:class:`_PrinterOffline`, answered in
+    :func:`_run_recovery`), whose refill is skipped by the live-session precondition rather than
+    by a reason test. The escalations that never enter the loop (the entry gate, the runout
+    branch) call :func:`_escalate` directly with no refill and no evidence: they sent nothing;
+    the startup re-entry passes the hydrated log.
 
-    :func:`_abort` and :func:`_hand_over` deliberately leave the extruder as it is —
-    another actor owns the printer, and a takeover is never a give-up.
+    **The refill (K8, 2026-10-10; T1 of the plan).** When the ACTIVE extruder reads EMPTY
+    (``tray_fields.toolhead_feed``, live), the driver runs :func:`_refill_toolhead` BEFORE it
+    pages — the farm never pages with the toolhead empty when a spool will load. Three
+    preconditions, each an event-state, never a time:
 
-    A give-up AFTER the restart stop (:attr:`_RecoveryEvidence.restart_stop` — the restart
-    continuation's, or the offline bound met inside it) differs twice, both because the
-    job is over by the farm's own act. It restores nothing: the restore exists so a PAUSED
-    print is never handed over an extruder the farm emptied, which a resume would print
-    air from (shape 39, invariants 7/8), and a stopped job has no resume — so an unload the
-    continuation completed stays done, the path empty. And the row is re-classified a
-    PHYSICAL hold before it pages (:func:`_hold_the_path`): a jam row is a wire-class JOB
-    hold, which the sweep closes on an idle quiet printer, and the job it held is already
+    * no command PENDS on the log (``_RecoveryEvidence.pending_command``) — a command the AMS
+      holds runs when it runs, a refill sent behind it would run too, and its refill is the
+      hand-over's when it does (K11);
+    * no filament change in flight (``bambu_mqtt.ams_mid_filament_change``) — the AMS owns the
+      toolhead's next motion there, and anything sent into it is held behind the print's head
+      (012-H2S 2026-09-23); a held refill unload would drain the extruder at the release;
+    * no restart stop on the ledger — after the farm's OWN stop (operator ruling R1 2026-09-29,
+      shape 45) no resume exists to print air, an unload the continuation completed stays done,
+      and the row is held physical with the path empty.
+
+    **A named reversal.** The restore this replaces (``_restore_jammed_feeder``, the 2026-09
+    agent design) "undid only the driver's own motion": it reloaded only after a FARM unload
+    moved the AMS, so a toolhead the firmware retracted — or a queued pull-back the AMS ran on
+    its own, 011/014-H2S 2026-10-09/10 — was paged empty as "slot N is loaded". That rule was an
+    agent's design, never an operator ruling, and it is reversed: an empty toolhead is refilled
+    whoever emptied it, because the operator's resume prints air either way.
+
+    :func:`_abort` and :func:`_hand_over` deliberately leave the extruder as it is — another
+    actor owns the printer, and a takeover is never a give-up. A takeover DURING the refill
+    aborts with ``restored=True``: the operator resumed on a feeder the FARM had just loaded.
+
+    A give-up AFTER the restart stop (:attr:`_RecoveryEvidence.restart_stop`) also re-classifies
+    the row a PHYSICAL hold before it pages (:func:`_hold_the_path`): a jam row is a wire-class
+    JOB hold, which the sweep closes on an idle quiet printer, and the job it held is already
     over — the printer must stay held until the path is shown clear.
     """
-    # The counters are read BEFORE the restore: the restore reload is not a candidate
-    # and must not feed the numbers the reason was chosen from.
+    # The counters are read BEFORE the refill: the refill load is not a candidate and must not
+    # feed the numbers the reason was chosen from.
     unloads_sent, unloads_confirmed = evidence.unloads_sent, evidence.confirmed_unloads
     loads_attempted, loads_confirmed = evidence.loads_attempted, evidence.loads_confirmed
-    # The restore exists to undo the DRIVER's OWN motion — nothing else. A give-up whose
-    # unloads moved nothing (a CONTINUE-only ladder, a no-candidate verdict while
-    # ``tray_now`` already read 255 because the firmware retracted after the fault — see
-    # :func:`_resolve_jammed_tray` — or an unload the AMS held) leaves the printer exactly
-    # as the firmware left it: moving filament there would be the farm acting on a state
-    # it never created (invariant 8). The wire position alone cannot tell those apart,
-    # because 255 is what they all look like. And never behind a HELD command: it runs at
-    # the next release, so a reload sent behind it would run too — a held candidate load
-    # already refills the extruder there.
-    verdict = (
-        await _restore_jammed_feeder(incident, evidence=evidence)
-        if evidence.unload_moved_ams and evidence.held_command is None and evidence.restart_stop is None
-        else None
-    )
-    if verdict == "abort":
-        # A takeover DURING the restore must not un-stamp the spool: the operator
-        # resumed on a feeder the FARM had just reloaded, so the click is not the
-        # "I declare this spool usable" statement _clear_oor_if_resumed_on_jammed_feeder
-        # reads it as.
-        await _abort(incident, restored=True)
-        return
-    if verdict == "handover":
-        _hand_over(incident)
-        return
+    refill: RefillVerdict | None = None
+    if evidence.restart_stop is None and evidence.pending_command is None:
+        st = _get_state(incident.printer_id)
+        if (
+            st is not None
+            and _reads_live(st)
+            and not ams_mid_filament_change(st)
+            and tray_fields.toolhead_feed(st).active.kind == "empty"
+        ):
+            refill = await _refill_toolhead(incident, evidence=evidence)
+    result: RefillResult | None
+    match refill:
+        case "abort":
+            # A takeover DURING the refill must not un-stamp the spool: the operator resumed on
+            # a feeder the FARM had just loaded, so the click is not the "I declare this spool
+            # usable" statement _clear_oor_if_resumed_on_jammed_feeder reads it as.
+            await _abort(incident, restored=True)
+            return
+        case "handover":
+            _hand_over(incident)
+            return
+        case None | RefillLoaded() | RefillFailed() | RefillNoCandidate():
+            result = refill
+        case _:
+            assert_never(refill)
     logger.info(
-        "[spool_recovery] give-up printer=%s reason=%s restore=%s unloads_sent=%s unloads_confirmed=%s "
+        "[spool_recovery] give-up printer=%s reason=%s refill=%s unloads_sent=%s unloads_confirmed=%s "
         "loads_attempted=%s loads_confirmed=%s levers=%s",
         incident.printer_id,
         reason,
-        verdict,
+        result,
         unloads_sent,
         unloads_confirmed,
         loads_attempted,
@@ -5282,7 +6141,7 @@ async def _give_up(incident: RecoveryIncident, reason: str, *, evidence: _Recove
     )
     if evidence.restart_stop is not None:
         await _hold_the_path(incident)
-    await _escalate(incident, reason, restore=verdict, evidence=evidence)
+    await _escalate(incident, reason, refill=result, evidence=evidence)
 
 
 async def _hold_the_path(incident: RecoveryIncident) -> None:
@@ -5329,7 +6188,7 @@ async def _escalate(
     incident: RecoveryIncident,
     reason: str,
     *,
-    restore: RestoreVerdict | None = None,
+    refill: RefillResult | None = None,
     evidence: _RecoveryEvidence | None = None,
 ) -> None:
     """Give up: hold the incident ESCALATED, project the token, notify, leave PAUSED.
@@ -5344,11 +6203,12 @@ async def _escalate(
     roll (``spool_respool.mark_spent_on_runout_hold``, guarded) — see the call below for
     why an escalation, and not a wire edge, is what a hold spanning a deploy can rely on.
 
-    ``restore`` is :func:`_give_up`'s statement about an extruder the DRIVER emptied,
-    and ``evidence`` its records of what it sent and what the wire answered; together
-    they let the composed detail say what the farm did and where the filament is
-    (:func:`_compose_detail`). Both are passed explicitly and never inferred: the
-    defaults (``None``) are the truthful answer for every caller that sent nothing.
+    ``refill`` is :func:`_give_up`'s statement about the refill it ran over an EMPTY toolhead
+    (:func:`_refill_toolhead`), and ``evidence`` its records of what it sent and what the wire
+    answered; together with the live toolhead they let the composed detail say what the farm
+    did and where the filament is (:func:`_compose_detail`). Both are passed explicitly and
+    never inferred: the defaults (``None``) are the truthful answer for every caller that sent
+    nothing.
 
     The KIND of the hold is the ROW's fact, read off the row ``mark_escalated`` returns —
     never the in-memory ``incident.kind``, which is the kind the driver was BUILT with.
@@ -5368,7 +6228,7 @@ async def _escalate(
     # The DRIVER's account — what it sent and what the wire answered — keyed on the kind
     # it ran as: a jam machine that ended in a physical hold still sent a jam machine's
     # steps, and the page must say so.
-    detail = _compose_detail(incident, reason, restore=restore, evidence=evidence)
+    detail = _compose_detail(incident, reason, refill=refill, evidence=evidence)
     slot_hint = "the external spool holder" if incident.external else runout_slot_desc(incident.jammed_global_tray)
     try:
         async with async_session() as db:
@@ -5580,26 +6440,51 @@ async def _abort(incident: RecoveryIncident, *, token: TakeoverToken | None = No
     source that token implies (:func:`_abort_source` — ONE abort path, the source per
     token). ``None`` covers the callers that only ever see the step VERDICT.
 
-    If that actor resumed ON the jammed feeder (live RUNNING with ``tray_now`` ==
-    the jammed global tray), they declared that spool usable — clear its
+    If that actor resumed ON the jammed feeder (live RUNNING with the active extruder fed
+    from the jammed global tray), they declared that spool usable — clear its
     out-of-rotation flag the same way a physical re-insert would, so a self-cleared
     jam does not leave the spool excluded from all future dispatch. Any other live
     state keeps the flag (a physical reseat stays the canonical clear).
 
     ``restored`` is the one thing that reading cannot survive: the driver ITSELF put
-    the jammed spool back on the feeder (:func:`_restore_jammed_feeder`), so "they
+    the jammed spool back on the feeder (:func:`_refill_toolhead`), so "they
     resumed on the jammed feeder" says nothing about what the operator thinks of the
     spool — the farm chose that feeder, not them. The stamp stays; remove+re-insert or
-    the Inventory control clears it."""
+    the Inventory control clears it.
+
+    ONE exception to the close (K11, 011/014-H2S 2026-10-09/10): the AMS still holds a motion
+    command the farm sent on this row (``printer_incidents.pending_command``) AND the job it
+    holds still lives. That command is the farm's until it runs — an accepted pull-back ran on
+    its own ~4.5 min after the send and emptied the toolhead under the print — so the row stays
+    OPEN, ESCALATED (a human's now), the driver released, no ABORTED close and nothing barred:
+    the hand-over's refill reads the row when the command runs, and the closers stand while it
+    pends (``incident_resolution.Context.command_pending``). A job that is OVER (a terminal,
+    another job — a ``job_ended`` / ``job_changed`` takeover) has no toolhead left to print air
+    with: that row closes as it always did, the job terminal's exception to the same rule."""
     from backend.app.core.database import async_session
 
-    # Close FIRST (before any await that could fail): an external actor owns this
-    # printer now — an ABORTED close both frees the open slot and bars re-entry for
-    # this exact fault on this job, so a sibling code cannot restart recovery under
-    # them. An external actor is the only thing that reaches this path; the token
-    # says which kind (:func:`_abort_source`).
-    source = _abort_source(token)
-    await _close_incident(incident, status=STATUS_ABORTED, source=source)
+    pending = printer_incidents.pending_command(incident.printer_id, incident_id=incident.incident_id)
+    if pending is not None and _job_lives(incident):
+        # Keep the row: the farm's command is queued under a job that can still print air.
+        await _hold_for_pending_command(incident)
+        source = "-"
+        logger.info(
+            "spool_recovery: printer %s recovery stood aside (%s) — the AMS still holds farm %s step %s; "
+            "incident %s stays OPEN (escalated) until it runs, a reboot voids it, or the job ends",
+            incident.printer_id,
+            token or "external_interference",
+            pending.name,
+            pending.seq,
+            incident.incident_id,
+        )
+    else:
+        # Close FIRST (before any await that could fail): an external actor owns this
+        # printer now — an ABORTED close both frees the open slot and bars re-entry for
+        # this exact fault on this job, so a sibling code cannot restart recovery under
+        # them. An external actor is the only thing that reaches this path; the token
+        # says which kind (:func:`_abort_source`).
+        source = _abort_source(token)
+        await _close_incident(incident, status=STATUS_ABORTED, source=source)
 
     logger.info(
         "spool_recovery: printer %s recovery aborted (%s) source=%s",
@@ -5619,19 +6504,48 @@ async def _abort(incident: RecoveryIncident, *, token: TakeoverToken | None = No
         logger.exception("spool_recovery: abort cleanup failed for printer %s", incident.printer_id)
 
 
+def _job_lives(incident: RecoveryIncident) -> bool:
+    """Does the printer still hold the job this incident interrupted — PAUSE or RUNNING (the
+    driver's own procedure states, :data:`_DRIVER_STATES`) on that job (``job_identity.same_job``
+    answering anything but ``other``)? Read off the live state the takeover was just read from;
+    a terminal, an idle printer, another job or no state at all reads False."""
+    st = _get_state(incident.printer_id)
+    return _live_state(st) in _DRIVER_STATES and same_job(getattr(st, "subtask_id", None), incident.job_id) != "other"
+
+
+async def _hold_for_pending_command(incident: RecoveryIncident) -> None:
+    """Keep the row OPEN as a human's hold while the farm's command on it still pends (K11):
+    ``printer_incidents.mark_escalated`` — the row still open, ``escalated_at`` stamped once —
+    and nothing else: no page (a takeover is never a give-up), no ledger row, no bar.
+    Best-effort: a failed write leaves the row ``recovering``, which the startup re-entry
+    re-drives (its log holds the pending command, so it waits rather than sends)."""
+    from backend.app.core.database import async_session
+
+    try:
+        async with async_session() as db:
+            await printer_incidents.mark_escalated(db, incident.incident_id)
+    except Exception:  # noqa: BLE001 — a stand-aside must never crash the driver
+        logger.exception(
+            "spool_recovery: printer %s incident %s could not be held open for its pending command",
+            incident.printer_id,
+            incident.incident_id,
+        )
+
+
 async def _clear_oor_if_resumed_on_jammed_feeder(db: AsyncSession, incident: RecoveryIncident) -> None:
-    """R3: an operator who resumes ON the jammed feeder (live RUNNING with
-    ``tray_now`` == the jammed global tray) has declared that spool usable — clear
-    its out-of-rotation flag the same way a physical re-insert would. Any other live
-    state (or a different feeding tray) keeps the flag; a physical reseat stays the
-    canonical clear. Best-effort — ``_abort`` must never raise."""
+    """R3: an operator who resumes ON the jammed feeder (live RUNNING with the ACTIVE
+    extruder fed from the jammed global tray — ``tray_fields.toolhead_feed``, K1; on a dual
+    nozzle ``tray_now`` is the client's single guess onto a unit) has declared that spool
+    usable — clear its out-of-rotation flag the same way a physical re-insert would. Any
+    other live state (or a different feeding tray) keeps the flag; a physical reseat stays
+    the canonical clear. Best-effort — ``_abort`` must never raise."""
     jammed = incident.jammed_global_tray
     if jammed is None:
         return
     st = _get_state(incident.printer_id)
     if st is None or getattr(st, "state", None) != "RUNNING":
         return
-    if getattr(st, "tray_now", None) != jammed:
+    if _feeding_position(st, jammed).kind != "jammed":
         return
     ams_id, tray_id = decode_global_tray(jammed)
     if ams_id is None or tray_id is None:
@@ -5692,7 +6606,9 @@ async def on_observed_running(printer_id: int) -> bool:
         closed: list[tuple[int, str, str, bool]] = []
         async with async_session() as db:
             for incident in await printer_incidents.open_rows(db, printer_id):
-                verdict = incident_resolution.resolve(incident, "running_edge", ctx)
+                verdict = incident_resolution.resolve(
+                    incident, "running_edge", replace(ctx, command_pending=_pending_on(incident))
+                )
                 if not verdict.close:
                     logger.info(
                         "spool_recovery: printer %s RUNNING edge — %s incident %s left OPEN: %s",
@@ -5758,7 +6674,9 @@ async def on_job_terminal(printer_id: int, terminal: TerminalEvent) -> bool:
         closed: list[tuple[int, str, str]] = []
         async with async_session() as db:
             for incident in await printer_incidents.open_rows(db, printer_id):
-                verdict = incident_resolution.resolve(incident, "job_terminal", ctx)
+                verdict = incident_resolution.resolve(
+                    incident, "job_terminal", replace(ctx, command_pending=_pending_on(incident))
+                )
                 if not verdict.close:
                     logger.info(
                         "spool_recovery: printer %s reached a terminal (%s) — %s incident %s left OPEN: %s",
@@ -5848,7 +6766,7 @@ async def sweep_open_incidents(*, now: float | None = None) -> int:
                     verdict = incident_resolution.resolve(
                         incident,
                         "sweep_tick",
-                        Context(state=state, ledger=ledger, driver_live=False),
+                        Context(state=state, ledger=ledger, driver_live=False, command_pending=_pending_on(incident)),
                     )
                     if not verdict.close:
                         _hold_over_since.pop(incident.id, None)
@@ -5961,7 +6879,7 @@ async def rearm_incidents_on_startup() -> int:
     try:
         from backend.app.core.database import async_session
 
-        driverless: list[tuple[int, int]] = []
+        driverless: list[tuple[int, int, str]] = []
         async with async_session() as db:
             for incident in await printer_incidents.all_open(db):
                 pid = incident.printer_id
@@ -5975,10 +6893,17 @@ async def rearm_incidents_on_startup() -> int:
                 # and another kind's ledger is another driver's vocabulary (a plate-check
                 # episode's ``dialog`` / ``stop`` steps, ``pause_recovery``), which this
                 # driver's log cannot read and must not report as drift.
-                restart_owed = False
-                if incident.kind in AMS_FAULT_KINDS:
+                #
+                # The same log answers the second question the wire cannot: does a motion
+                # command the farm sent on this row still pend (K11 — held, or sent and never
+                # read)? Read off the hydrated log here, not the projection: the projection is
+                # rebuilt from the same ledger below (``rehydrate``), after this loop.
+                restart_owed = command_pending = False
+                if incident.kind in AMS_FAULT_KINDS | REFILL_KINDS:
                     try:
-                        restart_owed = (await _RecoveryEvidence.from_row(db, incident.id)).restart_stop is not None
+                        log = await _RecoveryEvidence.from_row(db, incident.id)
+                        restart_owed = log.restart_stop is not None
+                        command_pending = log.pending_command is not None
                     except LookupError:
                         # A ledger the driver cannot read is drift (``_step_of``); it must not
                         # cost every other row its startup verdict.
@@ -5988,11 +6913,17 @@ async def rearm_incidents_on_startup() -> int:
                 verdict = incident_resolution.resolve(
                     incident,
                     "startup",
-                    Context(state=_get_state(pid), ledger=ledger, driver_live=live, restart_owed=restart_owed),
+                    Context(
+                        state=_get_state(pid),
+                        ledger=ledger,
+                        driver_live=live,
+                        restart_owed=restart_owed,
+                        command_pending=command_pending,
+                    ),
                 )
                 if not verdict.close:
                     if driver_owns(incident, live=live):
-                        driverless.append((incident.id, pid))
+                        driverless.append((incident.id, pid, incident.kind))
                     continue
                 await printer_incidents.close(db, incident.id, status=STATUS_RESOLVED, source=verdict.source)
                 await printer_incidents.clear_hold_projection(db, incident.item_id)
@@ -6006,9 +6937,13 @@ async def rearm_incidents_on_startup() -> int:
                 )
             open_now = await printer_incidents.rehydrate(db)
         # After the cache rebuild, so a re-entry's own escalate/close writes are the
-        # last word on the projection rather than being overwritten by it.
-        for incident_id, printer_id in driverless:
-            await _reenter_recovering_incident(incident_id, printer_id)
+        # last word on the projection rather than being overwritten by it. A toolhead row is the
+        # refill driver's (K10): its own re-entry, never the AMS machine's.
+        for incident_id, printer_id, kind in driverless:
+            if kind in REFILL_KINDS:
+                _reenter_refill_incident(incident_id, printer_id)
+            else:
+                await _reenter_recovering_incident(incident_id, printer_id)
         if closed or open_now:
             logger.info(
                 "spool_recovery: startup incident sweep — %d closed, %d still held, %d re-entered",
@@ -6019,6 +6954,25 @@ async def rearm_incidents_on_startup() -> int:
     except Exception:  # noqa: BLE001 — startup hygiene must never block the lifespan
         logger.exception("spool_recovery: startup incident sweep failed")
     return closed
+
+
+def _reenter_refill_incident(incident_id: int, printer_id: int) -> None:
+    """Give a driver back to a ``toolhead_refill`` row a restart left ``recovering`` (K10). The row and
+    its step ledger are the durable state (``bambu-ams-behavior`` restart-durability): the episode is
+    re-spawned on the row and registered in the same synchronous stretch, and it decides from the
+    first LIVE reading (:func:`_refill_episode` with no trigger) — a paused print is refilled and
+    resumed (T3), a print running on air is paused first (T4) — waiting, never resending, on a
+    command its log holds pending. Never raises."""
+    from backend.app.core.tasks import spawn_background_task
+
+    try:
+        task = spawn_background_task(
+            _refill_episode(printer_id, trigger=None, incident_id=incident_id), name=f"toolhead-refill-p{printer_id}"
+        )
+        printer_incidents.register_driver(printer_id, task, incident_id=incident_id)
+        logger.info("spool_recovery: startup — printer %s toolhead refill %s re-entered", printer_id, incident_id)
+    except Exception:  # noqa: BLE001 — startup hygiene must never block the lifespan
+        logger.exception("spool_recovery: re-entering refill %s failed for printer %s", incident_id, printer_id)
 
 
 def _recorded_candidates(full_codes: str | None) -> frozenset[FaultCandidate]:
@@ -6105,7 +7059,10 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                 kind, external = row.kind, False
                 code, fingerprint = row.code, row.codes
                 tray = row.slot_global_tray
-                if incident_resolution.path_quiet(state):
+                if incident_resolution.path_quiet(state) and evidence.pending_command is None:
+                    # A quiet path is not "fine" mid-swap — but a log that ends in a command
+                    # the AMS has not run is the driver's still (item 2 of 2026-10-10): that
+                    # row re-enters the machine below, whose round top waits for the command.
                     escalate_reason = "recovery_interrupted"
                 else:
                     escalate_reason = await _route_fault(
@@ -6129,6 +7086,14 @@ async def _reenter_recovering_incident(incident_id: int, printer_id: int) -> asy
                 tray, verdict = _resolve_fault_tray(
                     item, state, kind=kind, external=external, candidates=candidates, printer_id=printer_id
                 )
+                if evidence.swap_committed and row.slot_global_tray is not None:
+                    # Past the swap-commit boundary the live feeder is the farm's OWN motion —
+                    # an unload, a replacement it loaded, a queued load that ran while the farm
+                    # was down — so it no longer names the jammed tray: the ROW's recorded slot
+                    # does (it was opened on it). Re-resolving it from ``tray_now`` would hand
+                    # the re-entered driver its own replacement as the "jammed" spool, and its
+                    # resume read would park and page it.
+                    tray = row.slot_global_tray
                 if _outranks(fault_class, row.kind):
                     # The live fault OUTRANKS the row's reading: re-classify the row, the
                     # entry gate's own upgrade rule. The kind of the hold is the ROW's fact —
@@ -6375,60 +7340,256 @@ async def _resume_ready(db: AsyncSession, printer_id: int, gained: tuple[int, in
     return "ready" if await _open_runout_incident(db, printer_id) is not None else "no"
 
 
-async def _resume_after_evidence(printer_id: int, *, ready, name: str) -> bool:
-    """Settle, re-check, publish ONE resume, confirm RUNNING. Never raises.
+# --- K9: THE resume of a paused print (2026-10-10) ------------------------------------
+#
+# ONE body every resume of a PAUSED print publishes through — the printer card's Resume and the
+# printers page's bulk resume (N independent route calls), the HMS dialog's resume buttons, the
+# runout refill lane and the repaired-path self-heal — so no resume path bypasses the toolhead
+# refill. It generalises the shared evidence-lane body it replaced (``_resume_after_evidence``,
+# deleted with it — every caller moved). The operator requirement it enforces, verbatim (Raymond
+# 2026-10-10): "when i click resume there MUST be filament loaded. It's not the users job to know
+# whether or not there's filament in there, the fact that it's unloaded is the farms POOR auto
+# recovery mechanics".
+#
+# OUTSIDE it, each with its reason (``test_code_quality.TestResumeOwnership``): the release
+# ladder's verbs (``_LEVERS``, read by ``_read_after``) — releases INSIDE the driver's own
+# segment, where the driver itself reads what the wire answered; the power-loss prompt's answer
+# (``pause_recovery`` — the firmware's own post-reboot recovery, ``0300_8007`` accepts the plain
+# resume); the plate-check presses (``pause_recovery`` — before the first layer, where the start
+# block loads); and CONTINUE / RETRY (``ams_control resume`` — a filament-change release: the
+# firmware re-feeds the change it holds).
 
-    The shared body behind every evidence-driven auto-resume — the runout refill
-    (006-H2S 2026-07-26) and the repaired filament path (003-H2S 2026-09-11). What it
-    owns is the SHAPE, which is the part that must not be re-derived per lane: settle
-    before publishing (a resume sent on the edge itself races the firmware's own
-    settle and is simply rejected), re-ask the caller's evidence AFTER the settle
-    because the world moves, send exactly ONE resume, and stand aside on ANY doubt —
-    no retry, no quarantine, no stamp, the escalation's guidance untouched, so the
-    operator's manual resume stays the reliable path.
+# Who resumes — every actor is trigger T3 (a person's resume, or the farm resuming on a person's
+# behalf). ``operator``: a person's click is its own evidence — no settle, no confirm wait (the HTTP
+# request answers at once). ``refill_lane`` / ``repair``: the farm resuming on evidence the lane
+# re-asks before AND after a settle (a resume published on the edge itself races the firmware's own
+# settle and is rejected), with RUNNING confirmed — the runout refill (006-H2S 2026-07-26) and the
+# repaired filament path (003-H2S 2026-09-11).
+ResumeActor = Literal["operator", "refill_lane", "repair"]
 
-    ``ready`` is the lane's own evidence, asked twice; ``name`` names the occasion in
-    every stand-aside line. Returns True only on a CONFIRMED RUNNING — the caller
-    owns what that success means for its own bookkeeping.
-    """
+# Why a resume of a paused print is refused — CLOSED, ``schemas.printer.ResumeRefusalReason`` (the
+# DTO layer's one spelling, which the route's 409 validates against): the verb's own two
+# (``not_paused``, ``farm_acting``: a recovery driver is live and owns the printer's next motion),
+# then the K7 reasons whose resume would print air (:data:`_RESUME_DECISION`'s refusal rows).
+
+# What the verb does for a K7 reason: publish the resume, refill first, or refuse (the refusal IS
+# the K7 reason, so a 409 names the fact that decided it).
+ResumeDecision = Literal["resume", "refill", "maintenance", "unknown", "command_pending", "physical"]
+
+# TOTAL over :data:`RefillReason` — a reason without a row RAISES at the lookup
+# (:func:`_resume_decision`, the ``_LEVERS`` idiom), so a new K7 reason cannot reach a resume by
+# default. Read for every trigger that ends in a resume (T3, T4).
+_RESUME_DECISION: dict[RefillReason, ResumeDecision] = {
+    "owed": "refill",
+    "fed": "resume",
+    # The FIRMWARE feeds the toolhead itself on this resume — no air:
+    "change_in_flight": "resume",  # the print's own filament change is the head; the resume re-runs it
+    "runout_demand": "resume",  # the firmware loads the SAME slot it asks for (the refill lane's path)
+    "power_loss_prompt": "resume",  # the resume answers the prompt — the firmware's power-loss recovery
+    "before_first_layer": "resume",  # the start block's own load is still to come
+    "last_layer": "resume",  # T4's: the end-of-print retract, not air
+    "eject_sweep": "resume",  # the farm's own sweep is filament-less by design
+    # The farm will not load and the toolhead is EMPTY — never resume onto air:
+    "maintenance": "maintenance",
+    "unknown": "unknown",
+    "command_pending": "command_pending",
+    "physical": "physical",  # T2's alone — a T3 / T4 verdict never carries it
+}
+
+# The sentence a refusal answers with (sys-admin register: the fact, then the action). The 409's
+# ``message``; a client keys its own copy off the ``reason`` token.
+_RESUME_REFUSAL_COPY: dict[ResumeRefusalReason, str] = {
+    "not_paused": "Print is not paused.",
+    "farm_acting": "Recovery in progress on this printer. Resume refused.",
+    "maintenance": "Toolhead empty. Maintenance mode: the farm loads nothing. Load a slot, then resume.",
+    "unknown": "Toolhead not readable: no live report from the printer. Resume refused.",
+    "command_pending": (
+        "Toolhead empty. The AMS still holds the farm's queued command; the farm refills the toolhead when it runs."
+    ),
+    "physical": "Toolhead empty. A physical fault holds the filament path. Clear it and load a slot, then resume.",
+}
+
+
+def _resume_decision(reason: RefillReason) -> ResumeDecision:
     try:
-        if not await ready():
-            return False
+        return _RESUME_DECISION[reason]
+    except KeyError:
+        raise LookupError(
+            f"spool_recovery: no resume decision for refill reason {reason!r} — every reason needs its own row"
+        ) from None
 
-        # Let the printer register what just happened; see the docstring.
-        await asyncio.sleep(_RUNOUT_RESUME_SETTLE_S)
 
-        st = _get_state(printer_id)
-        if st is not None and getattr(st, "state", None) == "RUNNING":
-            logger.info(
-                "spool_recovery: printer %s already RUNNING after the %s (operator resumed) — auto-resume stood down",
-                printer_id,
-                name,
-            )
-            return False
-        if not await ready():
-            logger.info(
-                "spool_recovery: printer %s %s auto-resume stood down after settle (state/wire/hold changed)",
-                printer_id,
-                name,
-            )
-            return False
+@dataclass(frozen=True)
+class ResumeSent:
+    """ONE resume went out. ``sent`` is its frame's handle — the plain resume's, or the dialog
+    button the caller pressed — which the caller reads the firmware's ACK by; ``confirmed`` whether
+    the printer reported RUNNING inside :data:`_RUNOUT_RESUME_CONFIRM_S` (the evidence lanes ask;
+    ``None``: a person's click, not awaited)."""
 
+    sent: SentCommand
+    confirmed: bool | None = None
+
+
+@dataclass(frozen=True)
+class RefillStarted:
+    """The toolhead reads EMPTY and a refill is owed: the refill runs as the printer's REGISTERED
+    driver on ``incident_id`` (the open AMS row, or the ``toolhead_refill`` row it opened) and
+    publishes the resume itself once the load reached the toolhead (:func:`_refill_episode`).
+    ``slot`` is what it loads first — the job's last feeder when it is present and not spent — or
+    ``None`` when the swap's own selection decides."""
+
+    incident_id: int
+    slot: str | None
+
+
+@dataclass(frozen=True)
+class ResumeRefused:
+    """Nothing was sent: ``reason`` (closed) and the sentence that says so."""
+
+    reason: ResumeRefusalReason
+    message: str
+
+
+@dataclass(frozen=True)
+class ResumeNotSent:
+    """No resume went out: no client (``not_connected``) or the publish did not go out (``not_sent``)."""
+
+    reason: Literal["not_connected", "not_sent"]
+
+
+@dataclass(frozen=True)
+class ResumeStoodDown:
+    """An evidence lane's evidence no longer held — asked before and after the settle — or the
+    printer was resumed meanwhile. Nothing was sent; ``why`` is the log's word for it."""
+
+    why: str
+
+
+ResumeVerdict = ResumeSent | RefillStarted | ResumeRefused | ResumeNotSent | ResumeStoodDown
+
+
+def _refused(reason: ResumeRefusalReason) -> ResumeRefused:
+    return ResumeRefused(reason=reason, message=_RESUME_REFUSAL_COPY[reason])
+
+
+def _plain_resume(client: BambuMQTTClient) -> SentCommand | None:
+    """THE plain resume of a paused print (``print.resume``, BambuStudio's ``command_task_resume``)
+    — the K9 body's publisher, and the frame the refill driver resumes with once its load reached
+    the toolhead. ``None`` when the publish did not go out."""
+    if not client.resume_print():
+        return None
+    return SentCommand(command="resume", sequence_id=client.last_sent_sequence_id("resume"))
+
+
+async def _settle_evidence(
+    printer_id: int, ready: Callable[[], Awaitable[bool]], *, name: str
+) -> ResumeStoodDown | None:
+    """The evidence lanes' SHAPE, the part that must not be re-derived per lane: the lane's own
+    evidence asked, a settle, the printer re-read (somebody may have resumed it), the evidence
+    asked AGAIN — the world moves. ``None`` to go on; else the stand-down, logged."""
+    if not await ready():
+        return ResumeStoodDown("no evidence")
+    # Let the printer register what just happened: a resume sent on the edge itself races the
+    # firmware's own tray-state settle and is rejected.
+    await asyncio.sleep(_RUNOUT_RESUME_SETTLE_S)
+    st = _get_state(printer_id)
+    if st is not None and getattr(st, "state", None) == "RUNNING":
+        logger.info(
+            "spool_recovery: printer %s already RUNNING after the %s (operator resumed) — auto-resume stood down",
+            printer_id,
+            name,
+        )
+        return ResumeStoodDown("already running")
+    if not await ready():
+        logger.info(
+            "spool_recovery: printer %s %s auto-resume stood down after settle (state/wire/hold changed)",
+            printer_id,
+            name,
+        )
+        return ResumeStoodDown("evidence changed")
+    return None
+
+
+async def resume_paused_print(
+    printer_id: int,
+    *,
+    actor: ResumeActor,
+    ready: Callable[[], Awaitable[bool]] | None = None,
+    press: Callable[[BambuMQTTClient], SentCommand | None] | None = None,
+) -> ResumeVerdict:
+    """Resume this printer's PAUSED print — refilling an EMPTY toolhead first. THE one body (K9).
+    Never raises (an assist lane must never crash its caller; a failure is logged and answers
+    ``not_sent``).
+
+    At publish time it asks K7 (:func:`refill_owed`, trigger ``T3``) and acts on the one decision
+    table (:data:`_RESUME_DECISION`):
+
+    * ``resume`` — a fed toolhead, or the firmware feeding it itself: ONE resume, the dialog button
+      ``press`` names (the HMS route's resume buttons) or the plain resume (:func:`_plain_resume`);
+      an evidence lane (``ready`` given) confirms RUNNING.
+    * ``refill`` — the toolhead is EMPTY: the refill runs as the printer's REGISTERED driver of an
+      open row (:func:`_start_refill`, K10) and this answers AT ONCE, ``RefillStarted`` — the refill
+      can take minutes, and its outcome reaches a person through the status projection and, on a
+      failure, a page naming the slot and what the AMS answered.
+    * a refusal — never a resume onto air: ``ResumeRefused`` with the reason, nothing sent.
+
+    Before it: the evidence lanes' settle (:func:`_settle_evidence`), a client, a LIVE reading of a
+    PAUSEd print, and no driver live — a live driver owns the printer's next motion.
+    """
+    name = "refill" if actor == "refill_lane" else "path repair"
+    try:
+        if ready is not None:
+            stood = await _settle_evidence(printer_id, ready, name=name)
+            if stood is not None:
+                return stood
         client = printer_manager.get_client(printer_id)
         if client is None:
-            logger.info("spool_recovery: printer %s has no client — %s auto-resume skipped", printer_id, name)
-            return False
-        if not client.resume_print():
+            return ResumeNotSent("not_connected")
+        st = _get_state(printer_id)
+        if st is None or not _reads_live(st):
+            return _refused("unknown")
+        if _live_state(st) != "PAUSE":
+            return _refused("not_paused")
+        if printer_incidents.driver_live(printer_id):
+            return _refused("farm_acting")
+        verdict = refill_owed(printer_id, st, trigger="T3")
+        decision = _resume_decision(verdict.reason)
+        match decision:
+            case "resume":
+                pass
+            case "refill":
+                return await _start_refill(printer_id, st, trigger="T3")
+            case "maintenance" | "unknown" | "command_pending" | "physical":
+                logger.info(
+                    "spool_recovery: printer %s resume (%s) refused — the toolhead reads empty and the farm will not "
+                    "refill it (%s)",
+                    printer_id,
+                    actor,
+                    verdict.reason,
+                )
+                return _refused(decision)
+            case _:
+                assert_never(decision)
+        sent = (press or _plain_resume)(client)
+        if sent is None:
             logger.info(
-                "spool_recovery: printer %s resume_print send returned False (offline?) — "
-                "%s auto-resume stands aside, escalation guidance stands",
+                "spool_recovery: printer %s resume (%s) send did not go out (offline?) — nothing sent",
                 printer_id,
-                name,
+                actor,
             )
-            return False
-        if not await printer_manager.await_state(
+            return ResumeNotSent("not_sent")
+        logger.info(
+            "spool_recovery: printer %s resume (%s) published — the toolhead reads %s",
+            printer_id,
+            actor,
+            verdict.reason,
+        )
+        if ready is None:
+            return ResumeSent(sent)
+        confirmed = await printer_manager.await_state(
             printer_id, {"RUNNING"}, _RUNOUT_RESUME_CONFIRM_S, poll_interval_s=_POLL_INTERVAL_S
-        ):
+        )
+        if not confirmed:
             logger.info(
                 "spool_recovery: printer %s did not reach RUNNING within %.0fs after the %s resume — "
                 "standing aside (no retry); the escalation guidance stands",
@@ -6436,11 +7597,429 @@ async def _resume_after_evidence(printer_id: int, *, ready, name: str) -> bool:
                 _RUNOUT_RESUME_CONFIRM_S,
                 name,
             )
-            return False
-        return True
-    except Exception:  # noqa: BLE001 — an assist lane must never crash its caller
-        logger.exception("spool_recovery: %s auto-resume failed for printer %s", name, printer_id)
+        return ResumeSent(sent, confirmed)
+    except Exception:  # noqa: BLE001 — a resume lane must never crash its caller
+        logger.exception("spool_recovery: %s resume failed for printer %s", name, printer_id)
+        return ResumeNotSent("not_sent")
+
+
+# --- K10: every refill runs as a REGISTERED driver of an OPEN row ----------------------
+
+
+async def _refill_row(db: AsyncSession, printer_id: int, state) -> tuple[PrinterIncident | None, bool]:
+    """The OPEN row a refill on this printer runs on (K10): the printer's open AMS row (jam /
+    physical / runout — the refill re-enters it, its steps on its ledger), else its open
+    ``toolhead_refill`` row (a person's next Resume after a failed refill), else a NEW
+    ``toolhead_refill`` row, ``recovering`` — the job the printer names, its farm unit (none for a
+    foreign print), and the job's last feeder (``last_loaded_tray``, the wire's per-job record) as
+    its slot. ``(row, opened)`` — ``opened`` True when THIS call opened it; ``(None, False)`` when
+    another lane won the open race."""
+    ams = await printer_incidents.get_open(db, printer_id, kinds=AMS_FAULT_KINDS)
+    if ams is not None:
+        return ams, False
+    existing = await printer_incidents.get_open(db, printer_id, kinds=REFILL_KINDS)
+    if existing is not None:
+        return existing, False
+    job_id = (getattr(state, "subtask_id", None) or "").strip()
+    item = await _resolve_farm_item(db, printer_id, job_id)
+    row = await printer_incidents.open_new(
+        db,
+        printer_id=printer_id,
+        job_id=job_id,
+        item_id=item.id if item is not None else None,
+        kind=KIND_TOOLHEAD_REFILL,
+        code="",
+        codes="",
+        slot_global_tray=tray_fields.valid_feeder(getattr(state, "last_loaded_tray", None)),
+        status=STATUS_RECOVERING,
+    )
+    return row, row is not None
+
+
+async def _incident_of_row(db: AsyncSession, row: PrinterIncident, state) -> RecoveryIncident:
+    """The driver context of an open row the refill runs on — through THE one construction
+    (:func:`_build_incident`), from the ROW's facts: its recorded codes through the taxonomy, its
+    kind, slot, job and unit."""
+    from backend.app.models.printer import Printer
+
+    settings = await _read_settings(db)
+    printer = await db.get(Printer, row.printer_id)
+    return _build_incident(
+        state,
+        _recorded_candidates(row.hms_full_codes),
+        incident_id=row.id,
+        printer_id=row.printer_id,
+        job_id=row.job_id,
+        settings=settings,
+        item_id=row.item_id,
+        kind=row.kind,
+        code=row.code,
+        fingerprint=row.codes,
+        tray=row.slot_global_tray,
+        external=printer_incidents.row_external(row),
+        printer_name=(printer.name if printer else None) or f"printer {row.printer_id}",
+        fallback_code=row.code or None,
+    )
+
+
+async def _start_refill(printer_id: int, state, *, trigger: RefillTrigger) -> RefillStarted | ResumeRefused:
+    """Open or re-enter the row (:func:`_refill_row`), name the slot the refill loads first, then
+    spawn the refill (:func:`_refill_episode`) and register it as the printer's driver in ONE
+    synchronous stretch — after the last await, so a second click that raced the first finds the
+    driver live (``farm_acting``) instead of spawning a second one."""
+    from backend.app.core.database import async_session
+    from backend.app.core.tasks import spawn_background_task
+
+    async with async_session() as db:
+        row, _opened = await _refill_row(db, printer_id, state)
+        if row is None:
+            return _refused("farm_acting")
+        incident = await _incident_of_row(db, row, state)
+    first = await _refill_last_feeder(incident, state)
+    if printer_incidents.driver_live(printer_id):
+        return _refused("farm_acting")
+    task = spawn_background_task(
+        _refill_episode(printer_id, trigger=trigger, incident_id=incident.incident_id),
+        name=f"toolhead-refill-p{printer_id}",
+    )
+    printer_incidents.register_driver(printer_id, task, incident_id=incident.incident_id)
+    slot = _slot_name(first) if first is not None else None
+    logger.info(
+        "spool_recovery: printer %s toolhead EMPTY at the resume (%s) — refilling on %s incident %s%s, then resuming",
+        printer_id,
+        trigger,
+        incident.kind,
+        incident.incident_id,
+        f" from {slot}" if slot else "",
+    )
+    return RefillStarted(incident_id=incident.incident_id, slot=slot)
+
+
+async def _stop_air_print(printer_id: int) -> bool:
+    """Pause a print running onto an EMPTY toolhead (T4: the first push that showed it — Raymond
+    2026-09-17, "If nothing is feedingg after 20secs the print is ruined already as the printer
+    won't go back to reprint the past 20seconds that had empty filament") and wait for the PAUSE to
+    land, within one step window. THE one pause publisher of the refill (the release frames' pin):
+    the T4 episode's first act, and the refill driver's answer to its own resume reading RUNNING
+    with nothing fed. False when the pause did not go out or did not land — a print still running
+    is re-detected on the next push."""
+    from backend.app.core.database import async_session
+
+    client = printer_manager.get_client(printer_id)
+    if client is None or not client.pause_print():
+        logger.warning("spool_recovery: printer %s is printing air and the pause did not go out", printer_id)
         return False
+    async with async_session() as db:
+        settings = await _read_settings(db)
+    landed = await printer_manager.await_state(
+        printer_id, {"PAUSE"}, settings.step_timeout_s, poll_interval_s=_POLL_INTERVAL_S
+    )
+    logger.info(
+        "spool_recovery: printer %s RUNNING with nothing at the toolhead — paused (%s)",
+        printer_id,
+        "landed" if landed else "not landed",
+    )
+    return landed
+
+
+async def _settle_pending(printer_id: int, pending: printer_incidents.PendingCommand) -> None:
+    """Answer the farm's pending motion command the wire now shows settled (:func:`_pending_settles`)
+    — through the log's one writer (``EvidenceLog.answer``), so the projection re-derives no pending
+    command. Re-reads the ledger (``from_row``) and settles the step only while it still pends: the
+    detector saw it on a push, and the world moves."""
+    from backend.app.core.database import async_session
+
+    async with async_session() as db:
+        evidence = await _RecoveryEvidence.from_row(db, pending.incident_id)
+    still = evidence.pending_command
+    if still is None or still.seq != pending.seq:
+        return
+    st = _get_state(printer_id)
+    if st is None or not _reads_live(st):
+        return
+    settles = _pending_settles(still.entry(), tray_fields.toolhead_feed(st))
+    if settles is None:
+        return
+    await evidence.answer(still.seq, settles)
+    logger.info(
+        "[spool_recovery] printer %s: the AMS ran the farm's queued %s (step %s) after the hand-over — answered %s",
+        printer_id,
+        still.command,
+        still.seq,
+        settles,
+    )
+
+
+async def _refill_episode(
+    printer_id: int,
+    *,
+    trigger: RefillTrigger | None,
+    incident_id: int | None = None,
+    settle: printer_incidents.PendingCommand | None = None,
+) -> None:
+    """THE refill driver (K10): one episode on one open row, spawned already REGISTERED as the
+    printer's driver (:func:`_start_refill`, :func:`_sample_toolhead`, the startup re-entry). Never
+    raises; releases its liveness slot on exit and hands a RUNNING level to the closers (the
+    ``_run_recovery`` handover: the running edge stood aside while this driver lived).
+
+    * ``settle`` — the farm's pending command the detector saw RUN (D1 / D2): answered first.
+    * the row — ``incident_id`` (the verb opened or re-entered it, or the detector's pending command
+      names it), else found or opened now (:func:`_refill_row`): the durable promise, open before
+      anything is sent.
+    * ``T4`` — the print is RUNNING onto air: pause it (:func:`_stop_air_print`); a pause that does
+      not land ends the episode and closes a row it opened (the next push re-detects a print still
+      running).
+    * ``None`` — the startup re-entry (:func:`_reenter_refill_incident`): the first LIVE reading
+      decides — RUNNING with K7(T4) owed is paused first (T4), a PAUSE is T3; anything else is the
+      row's closers' (a print running fed, a job over).
+    * then :func:`_refill_then_resume`.
+    """
+    pid = printer_id
+    try:
+        from backend.app.core.database import async_session
+
+        if settle is not None:
+            await _settle_pending(pid, settle)
+        st = _get_state(pid)
+        async with async_session() as db:
+            row, opened = (
+                (await db.get(PrinterIncident, incident_id), False)
+                if incident_id is not None
+                else await _refill_row(db, pid, st)
+            )
+            if row is None or row.resolved_at is not None:
+                logger.info(
+                    "spool_recovery: printer %s refill episode (%s) has no open row — nothing to do", pid, trigger
+                )
+                return
+            incident = await _incident_of_row(db, row, st)
+            evidence = await _RecoveryEvidence.from_row(db, row.id)
+        if trigger == "T4" and not await _stop_air_print(pid):
+            # The row is opened BEFORE the pause — the promise the AMS entry reads covers the whole
+            # episode — so a pause that never lands closes the row it opened as transient (it never
+            # held the printer): a ``recovering`` promise nobody keeps would hold the printer for
+            # good. The next push re-detects a print still running on air.
+            if opened:
+                await _close_incident(incident, status=STATUS_ABORTED, source=None)
+            return
+        try:
+            if trigger is None:
+                trigger = await _reentered_trigger(incident)
+                if trigger is None:
+                    await _close_answered_reentry(incident)
+                    return
+            await _refill_then_resume(incident, evidence, trigger=trigger)
+        except _PrinterOffline as gap:
+            logger.warning(
+                "spool_recovery: printer %s refill episode — the printer stayed off its session past %.0fs",
+                pid,
+                gap.bound_s,
+            )
+            await _escalate(incident, "printer_offline", evidence=evidence)
+    except Exception:  # noqa: BLE001 — a driver must never crash the event loop
+        logger.exception("spool_recovery: refill episode crashed for printer %s", pid)
+    finally:
+        task = asyncio.current_task()
+        if task is not None:
+            printer_incidents.release_driver(pid, task)
+        st = _get_state(pid)
+        if st is not None and _reads_live(st) and _live_state(st) == "RUNNING":
+            await on_observed_running(pid)
+
+
+async def _close_answered_reentry(incident: RecoveryIncident) -> None:
+    """A re-entered refill whose first LIVE reading owes nothing (a print running fed, a job over):
+    the rule table's ``startup`` occasion, asked of THAT reading, closes the row — the startup
+    sweep ran before the printer reported, and a ``recovering`` row left driverless is skipped by
+    every sweep (``incident_resolution.driver_owns``) and holds the printer off dispatch. A row the
+    table keeps (a reading it cannot place) is escalated to a person, never left a driverless
+    promise."""
+    from backend.app.core.database import async_session
+
+    async with async_session() as db:
+        row = await db.get(PrinterIncident, incident.incident_id)
+        if row is None or row.resolved_at is not None:
+            return
+        verdict = incident_resolution.resolve(
+            row,
+            "startup",
+            Context(
+                state=_get_state(incident.printer_id),
+                ledger=ledger,
+                driver_live=False,
+                command_pending=_pending_on(row),
+            ),
+        )
+        if not verdict.close:
+            await printer_incidents.mark_escalated(db, row.id)
+            logger.info(
+                "spool_recovery: printer %s re-entered refill %s owes no refill and stands (%s) — a person's hold now",
+                incident.printer_id,
+                row.id,
+                verdict.evidence,
+            )
+            return
+        await printer_incidents.close(db, row.id, status=STATUS_RESOLVED, source=verdict.source)
+        await printer_incidents.clear_hold_projection(db, row.item_id)
+    logger.info(
+        "spool_recovery: printer %s re-entered refill %s closed — %s", incident.printer_id, row.id, verdict.evidence
+    )
+
+
+async def _reentered_trigger(incident: RecoveryIncident) -> RefillTrigger | None:
+    """The trigger a re-entered refill episode runs under, from its first LIVE reading: PAUSE → T3
+    (every toolhead row ends in a resume); RUNNING with K7(T4) owed → T4, paused first; anything else
+    (a print running fed, a job over, a printing-air reading K7 excludes) → ``None``: the row's own
+    closers answer it."""
+    st, _waited = await _live_reading(incident)
+    match _live_state(st):
+        case "PAUSE":
+            return "T3"
+        case "RUNNING" if refill_owed(incident.printer_id, st, trigger="T4").owed:
+            return "T4" if await _stop_air_print(incident.printer_id) else None
+        case _:
+            return None
+
+
+async def _refill_then_resume(
+    incident: RecoveryIncident, evidence: _RecoveryEvidence, *, trigger: RefillTrigger
+) -> None:
+    """The episode's contract on its row: wait for a command the AMS still holds on it (a restarted
+    episode's own queued load — never send behind it), ask K7 at publish time, refill when owed
+    (:func:`_refill_toolhead`, K8), and for T3 / T4 publish ONE resume and read it.
+
+    * a failed refill (no spool, or none reached the toolhead) escalates the row — a page naming the
+      slot and what the AMS answered — and nothing is resumed;
+    * a refusal at publish (the world moved: maintenance mode, a queued command, no live reading):
+      T2 leaves the print as it is; T3 / T4 hand it to a person (``toolhead_refill_withheld``);
+    * T2 (D1) never resumes: the print stays PAUSED, now with filament — the human's hold stands;
+    * the resume: RUNNING within :data:`_RUNOUT_RESUME_CONFIRM_S` (else ``toolhead_resume_unconfirmed``)
+      with the toolhead FED closes a ``toolhead_refill`` row (``refill_resumed``, the farm's own
+      recovery); RUNNING on air is paused again at once and handed to a person — events, never a
+      loop: a paused print cannot re-trigger the RUNNING detector."""
+    pid = incident.printer_id
+    pending = evidence.pending_command
+    if pending is not None:
+        waited = await _await_pending_command(incident, pending, evidence=evidence)
+        match waited:
+            case "ran" | "undecidable" | "void":
+                pass
+            case "abort":
+                await _abort(incident, restored=True)
+                return
+            case "handover":
+                _hand_over(incident)
+                return
+            case _:
+                assert_never(waited)
+    st, _waited = await _live_reading(incident)
+    owed = refill_owed(pid, st, trigger=trigger)
+    result: RefillLoaded | None = None
+    decision = _resume_decision(owed.reason)
+    match decision:
+        case "refill":
+            refill = await _refill_toolhead(incident, evidence=evidence)
+            match refill:
+                case "abort":
+                    # The operator took the printer during the refill: the stamp stays, the farm chose
+                    # the feeder (``_give_up``'s rule).
+                    await _abort(incident, restored=True)
+                    return
+                case "handover":
+                    _hand_over(incident)
+                    return
+                case RefillLoaded():
+                    result = refill
+                case RefillFailed() | RefillNoCandidate():
+                    await _escalate(incident, "toolhead_refill_failed", refill=refill, evidence=evidence)
+                    return
+                case _:
+                    assert_never(refill)
+        case "resume":
+            pass
+        case "maintenance" | "unknown" | "command_pending" | "physical":
+            logger.info("spool_recovery: printer %s refill (%s) withheld at publish — %s", pid, trigger, owed.reason)
+            if trigger != "T2":
+                await _escalate(incident, "toolhead_refill_withheld", evidence=evidence)
+            return
+        case _:
+            assert_never(decision)
+    if trigger == "T2":
+        logger.info(
+            "spool_recovery: printer %s incident %s — the farm's command ran after the hand-over; the toolhead %s; "
+            "the print stays PAUSED",
+            pid,
+            incident.incident_id,
+            f"is refilled from tray {result.tray}" if result is not None else f"reads {owed.reason}",
+        )
+        return
+    client = printer_manager.get_client(pid)
+    sent = _plain_resume(client) if client is not None else None
+    if sent is None or not await _await_live_state(incident, frozenset({"RUNNING"}), _RUNOUT_RESUME_CONFIRM_S):
+        await _escalate(incident, "toolhead_resume_unconfirmed", refill=result, evidence=evidence)
+        return
+    st, _waited = await _live_reading(incident)
+    if tray_fields.toolhead_feed(st).active.kind not in ("fed", "external"):
+        await _stop_air_print(pid)
+        tray = result.tray if result is not None else None
+        not_there = RefillFailed(tray=tray, command="load", answer="not_at_toolhead")
+        await _escalate(incident, "toolhead_refill_failed", refill=not_there, evidence=evidence)
+        return
+    if incident.kind == KIND_TOOLHEAD_REFILL:
+        await _close_incident(incident, status=STATUS_RESOLVED, source=RESOLVE_REFILL_RESUMED)
+        await _clear_hold_projection_of(incident)
+    logger.info(
+        "spool_recovery: printer %s RESUMED with the toolhead fed (%s, incident %s, %s)",
+        pid,
+        trigger,
+        incident.incident_id,
+        result or "fed at publish",
+    )
+
+
+async def _clear_hold_projection_of(incident: RecoveryIncident) -> None:
+    """Drop the closed row's hold token from its unit (``printer_incidents.clear_hold_projection``,
+    the one clear). Best-effort."""
+    from backend.app.core.database import async_session
+
+    try:
+        async with async_session() as db:
+            await printer_incidents.clear_hold_projection(db, incident.item_id)
+    except Exception:  # noqa: BLE001 — bookkeeping must not undo a successful resume
+        logger.exception("spool_recovery: hold-token clear failed for printer %s", incident.printer_id)
+
+
+def _resume_confirmed(verdict: ResumeVerdict, printer_id: int, name: str) -> bool:
+    """An evidence lane's reading of the verb: True only on a CONFIRMED RUNNING — the lane owns
+    what that success means for its own bookkeeping. Every other verdict stands the lane aside (no
+    retry, no quarantine, no stamp, its guidance untouched), logged where the verb did not."""
+    match verdict:
+        case ResumeSent(confirmed=confirmed):
+            return confirmed is True
+        case RefillStarted(incident_id=incident_id):
+            logger.info(
+                "spool_recovery: printer %s %s resume — the toolhead reads empty; the refill on incident %s resumes",
+                printer_id,
+                name,
+                incident_id,
+            )
+            return False
+        case ResumeRefused(reason=reason):
+            logger.info("spool_recovery: printer %s %s auto-resume refused (%s)", printer_id, name, reason)
+            return False
+        case ResumeNotSent(reason=reason):
+            logger.info(
+                "spool_recovery: printer %s %s resume not sent (%s) — auto-resume stands aside, escalation "
+                "guidance stands",
+                printer_id,
+                name,
+                reason,
+            )
+            return False
+        case ResumeStoodDown():
+            return False
+        case _:
+            assert_never(verdict)
 
 
 async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) -> bool:
@@ -6457,9 +8036,11 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
     naming a slot that was ALREADY loaded — could never resume, and auto-resume had
     never fired in production at all.
 
-    The resume MECHANICS are :func:`_resume_after_evidence`'s; this owns the evidence
-    (``runout_auto_resume_enabled`` + :func:`_resume_ready`) and the success
-    bookkeeping. Returns True only on a confirmed RUNNING.
+    The resume is THE resume (:func:`resume_paused_print`, K9 — its settle, its re-ask, its one
+    publish and its confirm); this owns the evidence (``runout_auto_resume_enabled`` +
+    :func:`_resume_ready`) and the success bookkeeping. The open runout row is K7's
+    ``runout_demand``: the firmware loads the SAME slot on the resume, so no refill goes out
+    (invariant 9). Returns True only on a confirmed RUNNING.
     """
 
     async def _ready() -> bool:
@@ -6482,8 +8063,8 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
             # The runout incident stays OPEN and its guidance stands: the operator
             # resuming on the screen closes it on the wire exactly as it does today.
             # Logged because a refill that visibly does not resume needs a reason in
-            # the log, and it is the first ask — ``_resume_after_evidence`` short-circuits
-            # before its settle — so this is ONE line per spawn, not one per poll.
+            # the log, and it is the first ask — the verb short-circuits before its
+            # settle — so this is ONE line per spawn, not one per poll.
             logger.info(
                 "spool_recovery: printer %s in maintenance mode — refill seen, not resuming; "
                 "resume on the printer or release the hold",
@@ -6511,7 +8092,8 @@ async def _resume_after_refill(printer_id: int, slot: tuple[int, int] | None) ->
                 return False
             return await _resume_ready(db, printer_id, slot) == "ready"
 
-    if not await _resume_after_evidence(printer_id, ready=_ready, name="refill"):
+    verdict = await resume_paused_print(printer_id, actor="refill_lane", ready=_ready)
+    if not _resume_confirmed(verdict, printer_id, "refill"):
         return False
     await _close_runout_hold_and_notify(printer_id, slot)
     logger.info(
@@ -6538,8 +8120,10 @@ async def _resume_after_repair(printer_id: int, incident_id: int) -> bool:
 
     Its ``ready`` re-asks everything that could have moved: the printer is still
     PAUSEd, the row is still open and still repair-resolved, it is still the SAME job
-    the fault interrupted, and the rule table's own repair evidence still holds. On a
-    confirmed RUNNING
+    the fault interrupted, and the rule table's own repair evidence still holds. The resume
+    is THE resume (:func:`resume_paused_print`, K9): a toolhead that reads EMPTY at publish —
+    a farm pull-back the AMS ran after the operator's load (011/014-H2S 2026-10-09/10) — is
+    refilled on this row before it resumes, never resumed onto air. On a confirmed RUNNING
     it logs and does nothing else — the sweep's own (b) arm closes the row after the
     dwell, so there stays ONE closer.
     """
@@ -6596,10 +8180,16 @@ async def _resume_after_repair(printer_id: int, incident_id: int) -> bool:
             return incident_resolution.resolve(
                 row,
                 "sweep_tick",
-                Context(state=st, ledger=ledger, driver_live=printer_incidents.driver_live(printer_id)),
+                Context(
+                    state=st,
+                    ledger=ledger,
+                    driver_live=printer_incidents.driver_live(printer_id),
+                    command_pending=_pending_on(row),
+                ),
             ).close
 
-    if not await _resume_after_evidence(printer_id, ready=_ready, name="path repair"):
+    verdict = await resume_paused_print(printer_id, actor="repair", ready=_ready)
+    if not _resume_confirmed(verdict, printer_id, "path repair"):
         return False
     logger.info(
         "spool_recovery: printer %s RESUMED automatically after the path repair (incident %s)",
@@ -6635,7 +8225,11 @@ def note_demand_watch(printer_id: int, state) -> None:
       slot that was demanded (the firmware answered "filament is back");
     * while PAUSEd, an EXTERNAL-runout code disappearing → the same, with no slot.
       The demand decoder covers AMS slots only, so the external lane watches CLASS
-      MEMBERSHIP instead: no ``runout_external`` code standing, no runout.
+      MEMBERSHIP instead: no ``runout_external`` code standing, no runout;
+    * the empty-toolhead detectors (K11, 2026-10-10 — :func:`_sample_toolhead`): LEVELS, not
+      edges, so they run on every push, the first after a restart included — D1, a farm
+      command that RAN after the hand-over on a PAUSEd print (refill, stay paused); D2, a
+      print RUNNING on nothing fed (pause, refill, resume).
 
     That watch is scoped to the runout CLASS on purpose, not to "external faults".
     An external FEED fault (``external_feed_fault``) is an interactive firmware
@@ -6661,15 +8255,15 @@ def note_demand_watch(printer_id: int, state) -> None:
         # farm must not double-drive (see the docstring).
         externals = frozenset(c.short_code for c in candidates if c.fault_class is AmsFaultClass.RUNOUT_EXTERNAL)
         epoch = int(getattr(state, "connection_epoch", 0) or 0)
-        feeder = tray_fields.valid_feeder(getattr(state, "tray_now", None))
         prev = _wire_sample.get(printer_id)
-        _wire_sample[printer_id] = (live, demand, externals, epoch, feeder)
+        _wire_sample[printer_id] = (live, demand, externals, epoch)
 
         # THE one writer of the motion ledger. This sampler is the only thing in the
         # farm that sees every push, so it hands each reading to the ledger that owns
         # the repair evidence — the completed-load EDGE (session-scoped: the epoch
         # goes with it, because a reconnect re-seeds every wire fact at once) and the
-        # "a non-eject print was RUNNING here" sighting. Deliberately BEFORE the
+        # "a print FED through the path here" sighting; whether a driver is live is the
+        # ledger's own question (K12), never this caller's. Deliberately BEFORE the
         # first-sample return below: the ledger keeps its own seed, so the two facts
         # it derives never depend on which of this sampler's edges ran first.
         ledger.observe(printer_id, state, epoch)
@@ -6682,11 +8276,30 @@ def note_demand_watch(printer_id: int, state) -> None:
             paused_edge=(live == "PAUSE" and (prev is None or prev[0] != "PAUSE")),
         )
 
+        # A REBOOT voids the farm's queued command on a row no driver watches (K11): a LEVEL
+        # check, on every push — the first after a farm restart included, since the prompt and
+        # the pending command are both states, not edges. A live driver voids its own (its wait
+        # reads the same prompt); the slot is taken in this synchronous stretch, so the next push
+        # cannot spawn a second lane.
+        if power_loss_prompt_standing(hms_list) and not printer_incidents.driver_live(printer_id):
+            pending = printer_incidents.pending_command(printer_id)
+            if pending is not None:
+                from backend.app.core.tasks import spawn_background_task
+
+                task = spawn_background_task(
+                    _void_pending_after_reboot(printer_id, pending), name=f"void-pending-p{printer_id}"
+                )
+                printer_incidents.register_driver(printer_id, task, incident_id=pending.incident_id)
+
+        # The K11 detectors (D1 / D2): LEVEL checks, so BEFORE the seed-only return below — a printer
+        # printing air when this process first looks is acted on at once.
+        _sample_toolhead(printer_id, state, live)
+
         if prev is None:
             # First sample after a (re)start seeds only — a demand that was already
             # gone before we looked is not an edge we witnessed.
             return
-        prev_state, prev_demand, prev_externals, prev_epoch, prev_feeder = prev
+        prev_state, prev_demand, prev_externals, prev_epoch = prev
 
         from backend.app.core.tasks import spawn_background_task
 
@@ -6726,6 +8339,61 @@ def note_demand_watch(printer_id: int, state) -> None:
             )
     except Exception:  # noqa: BLE001 — a per-push sampler must never crash the status flow
         logger.exception("spool_recovery: wire sampler failed for printer %s", printer_id)
+
+
+def _sample_toolhead(printer_id: int, state, live: str) -> None:
+    """The K11 detectors, on one status push (2026-10-10). Sync, DB-free and total — they ride the
+    ~1 Hz callback (invariant 10; the caller's guard covers them) — and they read the refill verdict
+    (:func:`refill_owed`, K7), never its predicates. Each spawns :func:`_refill_episode` and
+    registers it as the printer's driver in the SAME synchronous stretch (the
+    ``pause_recovery._sample_plate_check`` pattern), so the next push finds the driver live and
+    spawns no second one. Nothing here decides on elapsed time (Raymond 2026-10-10: "time is not the
+    right signal"): every trigger is the wire's own event.
+
+    * **D1 — PAUSE.** An open row's farm command the ledger holds PENDING has RUN
+      (:func:`_pending_settles` over the projection and the live ACTIVE extruder) with no driver
+      live: the AMS ran it after the hand-over (an accepted pull-back runs on its own ~4.5 min after
+      the send — 011-H2S 04:31:27 → 04:36:01, 014-H2S 02:45:58 → 02:50:38). The episode answers the
+      step, then refills the now-empty toolhead on that row when K7(T2) owes it; the print STAYS
+      paused. A toolhead a HUMAN emptied at the screen with nothing pending is not the farm's: left
+      alone.
+    * **D2 — RUNNING.** The print runs with nothing fed and K7(T4) owes a refill (no change in flight,
+      layer 1 up to below the last, no eject, …): pause, refill, resume — a screen resume onto an empty
+      toolhead (T4), or a pending pull-back that drained under a running print after a person's screen
+      Retry (T2-running: the step is answered first). A LEVEL, so the first fresh sample after a farm
+      restart acts; never twice for one episode, because the registered driver guards it while it
+      lives and after it the wire reads fed again (or the print is paused, which D2 never reads)."""
+    if printer_incidents.driver_live(printer_id) or not _reads_live(state):
+        return
+    pending = printer_incidents.pending_command(printer_id)
+    ran = (
+        pending is not None and _pending_settles(_pending_entry(pending), tray_fields.toolhead_feed(state)) is not None
+    )
+    if live == "PAUSE":
+        if pending is None or not ran:
+            return
+        trigger: RefillTrigger = "T2"
+    elif live == "RUNNING":
+        if not refill_owed(printer_id, state, trigger="T4").owed:
+            return
+        trigger = "T4"
+    else:
+        return
+    from backend.app.core.tasks import spawn_background_task
+
+    incident_id = pending.incident_id if pending is not None else None
+    task = spawn_background_task(
+        _refill_episode(printer_id, trigger=trigger, incident_id=incident_id, settle=pending if ran else None),
+        name=f"toolhead-refill-p{printer_id}",
+    )
+    printer_incidents.register_driver(printer_id, task, incident_id=incident_id)
+    logger.info(
+        "spool_recovery: printer %s %s — %s; the farm %s",
+        printer_id,
+        "PAUSED and the farm's queued command ran" if trigger == "T2" else "RUNNING with nothing at the toolhead",
+        f"pending {pending.name} step {pending.seq} on incident {pending.incident_id}" if pending else "no row",
+        "answers it and refills the toolhead" if trigger == "T2" else "pauses, refills and resumes",
+    )
 
 
 async def _close_runout_hold_and_notify(printer_id: int, slot: tuple[int, int] | None) -> None:

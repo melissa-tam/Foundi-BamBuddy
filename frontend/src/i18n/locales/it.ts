@@ -206,6 +206,7 @@ export default {
         staggerHold: 'In attesa della finestra di scaglionamento energetico — inizia a breve',
         spoolJamRecovering: 'Inceppamento bobina — passaggio a un\'altra bobina e ripresa',
         spoolJamRecoveryFailed: 'Recupero inceppamento bobina non riuscito — stampante lasciata in pausa per una persona',
+        toolheadEmpty: 'In pausa con la testina vuota',
       },
       printerState: {
         ok: 'Pronta',
@@ -878,6 +879,18 @@ export default {
       amsCommandSessionChanged: 'Stampante riconnessa durante il comando. Controlla l’AMS.',
       amsLoadHeld: 'Caricamento accettato. In attesa dietro il cambio filamento della stampa in pausa.',
       amsUnloadHeld: 'Scaricamento accettato. In attesa dietro il cambio filamento della stampa in pausa.',
+      amsLoadHeldOutsideChange: 'Caricamento accettato. Non ancora eseguito.',
+      amsUnloadHeldOutsideChange: 'Scaricamento accettato. Non ancora eseguito. L’AMS può eseguirlo più tardi senza un altro comando.',
+      resumeRefilling: 'Testina vuota. Caricamento di {{slot}}, poi ripresa.',
+      resumeRefillingAnySlot: 'Testina vuota. Caricamento di una bobina, poi ripresa.',
+      resumeRefused: {
+        not_paused: 'La stampa non è in pausa.',
+        farm_acting: 'Ripristino in corso su questa stampante. Ripresa rifiutata.',
+        maintenance: 'Testina vuota. Modalità manutenzione: la farm non carica nulla. Carica uno slot, poi riprendi.',
+        unknown: 'Testina non leggibile: nessun rapporto in tempo reale dalla stampante. Ripresa rifiutata.',
+        command_pending: 'Testina vuota. L’AMS trattiene ancora il comando in coda della farm; la farm ricarica la testina quando viene eseguito.',
+        physical: 'Testina vuota. Un guasto fisico blocca il percorso del filamento. Risolvilo e carica uno slot, poi riprendi.',
+      },
     },
     // Connection status
     connection: {
@@ -1127,6 +1140,14 @@ export default {
       partial: '{{succeeded}} riuscito/i, {{failed}} fallito/i',
       noneApplicable: 'Nessuna stampante selezionata è nello stato corretto per questa azione',
       selectByState: 'Seleziona per stato',
+      resumeResumed_one: '{{count}} stampante ripresa.',
+      resumeResumed_other: '{{count}} stampanti riprese.',
+      resumeRefilling_one: 'Testina vuota su {{count}} stampante: caricamento, poi ripresa.',
+      resumeRefilling_other: 'Testina vuota su {{count}} stampanti: caricamento, poi ripresa.',
+      resumeRefused_one: 'Ripresa rifiutata su {{count}} stampante.',
+      resumeRefused_other: 'Ripresa rifiutata su {{count}} stampanti.',
+      resumeFailed_one: 'Ripresa non riuscita su {{count}} stampante.',
+      resumeFailed_other: 'Ripresa non riuscita su {{count}} stampanti.',
     },
     // Discovery
     discovery: {
@@ -1258,6 +1279,7 @@ export default {
       plate_vision: 'Controllo del piatto',
       z_reference_lost: 'Riferimento Z perso',
       recovering: 'Ripristino',
+      toolhead_refill: 'Testina vuota',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1269,13 +1291,28 @@ export default {
       power_loss: 'Riprendi sulla stampante',
       plate_vision: 'Ignora e riprendi, oppure ferma la stampa',
       z_reference_lost: 'Riavvio con un pezzo sul piatto — rimuovilo a mano, poi «Segna il piatto come liberato»',
+      toolhead_refill: 'Carica uno slot, poi riprendi.',
     },
     incidentRecoveringAction: {
       plate_vision: 'La farm sta ricontrollando il piatto',
+      toolhead_refill: 'La farm sta ricaricando la testina',
     },
     holdMessage: {
       reported: 'La stampante ha segnalato: {{message}}',
       notShown: 'Non più mostrato sulla stampante',
+    },
+    toolhead: {
+      loading: 'Caricamento di {{slot}}.',
+      loadingAnySlot: 'Caricamento di una bobina.',
+      loadFailed: 'Caricamento non riuscito: {{slot}}.',
+      loadFailedAnySlot: 'Caricamento non riuscito.',
+      unloadFailed: 'Scaricamento non riuscito: {{slot}}.',
+      unloadFailedAnySlot: 'Scaricamento non riuscito.',
+      answer: {
+        no_movement: 'L’AMS non si è mosso.',
+        loadActed: 'L’AMS si è mosso, ma il caricamento non è terminato.',
+        unloadActed: 'L’AMS si è mosso, ma lo scaricamento non è terminato.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignora e riprendi',
@@ -5612,6 +5649,7 @@ export default {
       powerFailure: 'Mancanza corrente',
       userCancelled: 'Annullato dall\'utente',
       other: 'Altro',
+      printed_without_filament: 'Stampato senza filamento',
     },
     // Archive statuses
     statuses: {
@@ -7814,6 +7852,7 @@ export default {
       job_ended_unseen: 'Lavoro terminato senza osservazione',
       driver_ended: 'Farm: lavoro terminato dal ripristino',
       legacy_vision_stop: 'Vecchio arresto del controllo piatto',
+      refill_resumed: 'Farm: ricarica della testina',
     },
     external: 'Bobina esterna',
     foreign: 'Non è un’unità della farm',

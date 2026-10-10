@@ -129,7 +129,6 @@ import {
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, discoveryApi, firmwareApi, withStreamToken, ApiError } from '../api/client';
 import { formatDateOnly, formatETA, formatDuration, formatTimeOnly, parseUTCDate } from '../utils/date';
-import { OWN_SURFACE_INCIDENT_KINDS } from '../api/client';
 import type { Printer, PrinterCreate, PrinterStatus, AMSUnit, DiscoveredPrinter, FirmwareUpdateInfo, FirmwareUploadStatus, LinkedSpoolInfo, SpoolAssignment, HMSError, InventorySpool, SmartPlug, PrinterDiagnosticResult, FarmPrinterContext, SlotRecheckResult, PlateCheckAction, PlateCheckExit } from '../api/client';
 import { findGeometry } from '../types/modelGeometries';
 import { Card, CardContent } from '../components/Card';
@@ -148,7 +147,9 @@ import { unshownPrinterMessages } from '../utils/printerMessages';
 import { FarmUnitChip } from '../components/FarmUnitChip';
 import { hmsTone } from '../utils/hmsTone';
 import { showNoUsbChip } from '../utils/noUsbChip';
-import { incidentActionKey } from '../utils/incidentChip';
+import { holdChip } from '../utils/incidentChip';
+import { HoldChip } from '../components/HoldChip';
+import { bulkResumeToast, refillingToast, refusalToast, resumeRefusalOf, tallyResumes } from '../utils/printResume';
 import { PrinterQueueWidget } from '../components/PrinterQueueWidget';
 import { AMSHistoryModal } from '../components/AMSHistoryModal';
 import { AmsBackupModal } from '../components/AmsBackupModal';
@@ -2218,6 +2219,8 @@ function PrinterCard({
   // A refused plate: the operator stopped a print the printer's own plate check
   // had paused. The stop wiped the printer's words, so the gate carries them.
   const plateRefusal = status?.occupancy?.plate.refusal;
+  // The hold chip: the open incident row, or the empty toolhead (`utils/incidentChip`).
+  const cardHoldChip = status ? holdChip(status) : null;
   // While a cooldown eject watch is armed, marking the plate cleared cancels
   // the pending auto-eject (the watch exits without sweeping). Surface that as a
   // hint on the mark-cleared button so the operator isn't surprised.
@@ -2459,13 +2462,29 @@ function PrinterCard({
     onError: (error: Error) => showToast(error.message || t('printers.toast.failedToPausePrint'), 'error'),
   });
 
+  // The resume of a paused print: over an empty toolhead the backend refills it
+  // first and answers `refilling` at once; a refusal is a typed 409
+  // (`utils/printResume` owns all three sentences).
   const resumePrintMutation = useMutation({
     mutationFn: () => api.resumePrint(printer.id),
-    onSuccess: () => {
-      showToast(t('printers.toast.printResumed'));
+    onSuccess: (answer) => {
+      if (answer.status === 'refilling') {
+        const toast = refillingToast(answer.slot, t);
+        showToast(toast.message, toast.type);
+      } else {
+        showToast(t('printers.toast.printResumed'));
+      }
       queryClient.invalidateQueries({ queryKey: ['printerStatus', printer.id] });
     },
-    onError: (error: Error) => showToast(error.message || t('printers.toast.failedToResumePrint'), 'error'),
+    onError: (error: Error) => {
+      const refusal = resumeRefusalOf(error);
+      if (refusal !== null) {
+        const toast = refusalToast(refusal, t);
+        showToast(toast.message, toast.type);
+      } else {
+        showToast(error.message || t('printers.toast.failedToResumePrint'), 'error');
+      }
+    },
   });
 
   // The printer's own plate-check "Ignore and resume" button. A refusal (409:
@@ -2992,7 +3011,7 @@ function PrinterCard({
   const loadAmsTrayMutation = useMutation({
     mutationFn: ({ trayId }: { trayId: number }) => api.loadAmsTray(printer.id, trayId),
     onSuccess: (data) => {
-      const { key, type } = amsCommandToast('load', data.outcome);
+      const { key, type } = amsCommandToast('load', data.outcome, data.family);
       showToast(t(key), type);
     },
     onError: (error: Error) => {
@@ -3003,7 +3022,7 @@ function PrinterCard({
   const unloadAmsMutation = useMutation({
     mutationFn: () => api.unloadAms(printer.id),
     onSuccess: (data) => {
-      const { key, type } = amsCommandToast('unload', data.outcome);
+      const { key, type } = amsCommandToast('unload', data.outcome, data.family);
       showToast(t(key), type);
     },
     onError: (error: Error) => {
@@ -4315,39 +4334,15 @@ function PrinterCard({
                 </span>
               )}
 
-              {/* Open AMS incident: a jam / runout / physical fault holding
-                  this printer. Rendered from the printer's OWN state, not from a
-                  queue unit — a foreign print's hold has no queue row, so without
-                  this chip it is invisible in the UI entirely (12 foreign runouts
-                  held printers with nothing on screen to say so). Amber while the
-                  machine is still acting, red once it escalated to a human.
-                  Kinds that own a surface of their own are skipped here — a
-                  service hold is the maintenance banner, and a second chip for
-                  the same fact is a duplicate surface. */}
-              {status?.open_incident && !OWN_SURFACE_INCIDENT_KINDS.includes(status.open_incident.kind) && (
-                <span
-                  className={`flex items-center gap-1 px-2 py-1 rounded-full text-xs ${
-                    status.open_incident.status === 'escalated'
-                      ? 'bg-status-error/20 text-status-error'
-                      : 'bg-yellow-500/20 text-yellow-400'
-                  }`}
-                  title={
-                    // The pill names the hold; the tooltip says what it asks for
-                    // (one label per control, the consequence in the title —
-                    // react-best-practices §9), slot-qualified when the hold names one.
-                    // The key follows the hold's state: a person's exits are named
-                    // only once they exist (`utils/incidentChip`).
-                    status.open_incident.slot_desc
-                      ? `${t(incidentActionKey(status.open_incident))} — ${status.open_incident.slot_desc}`
-                      : t(incidentActionKey(status.open_incident))
-                  }
-                >
-                  <AlertTriangle className="w-3 h-3" />
-                  {status.open_incident.status === 'escalated'
-                    ? t(`printers.incident.${status.open_incident.kind}`)
-                    : t('printers.incident.recovering')}
-                </span>
-              )}
+              {/* The hold chip: an open incident (a jam / runout / physical fault,
+                  a pause cause) or the empty toolhead holding this printer.
+                  Rendered from the printer's OWN state, not from a queue unit — a
+                  foreign print's hold has no queue row, so without this chip it is
+                  invisible in the UI entirely (12 foreign runouts held printers
+                  with nothing on screen to say so). Which hold, its tone and its
+                  tooltip are `utils/incidentChip.holdChip`'s; kinds that own a
+                  surface of their own (the maintenance banner) never reach it. */}
+              {cardHoldChip && <HoldChip chip={cardHoldChip} />}
               </div>
               {/* One-line HMS summary under the badge row — names the fault (incl.
                   unknown codes) without opening the modal (H1/F3). Self-hides when
@@ -9236,25 +9231,32 @@ export function PrintersPage() {
       return;
     }
 
-    const apiCall = {
-      stop: api.stopPrint,
-      pause: api.pausePrint,
-      resume: api.resumePrint,
-      clearPlate: api.clearPlate,
-      clearHMS: api.clearHMSErrors,
-    }[action];
-
-    const results = await Promise.allSettled(
-      applicableIds.map(id => apiCall(id))
-    );
-
-    const succeeded = results.filter(r => r.status === 'fulfilled').length;
-    const failed = results.filter(r => r.status === 'rejected').length;
-
-    if (failed === 0) {
-      showToast(t('printers.bulk.success', { action: t(`printers.bulk.actions.${action}`), count: succeeded }));
+    if (action === 'resume') {
+      // N independent resumes, each its own verdict (resumed / refilling /
+      // refused): ONE toast counting them, never one per printer.
+      const results = await Promise.allSettled(applicableIds.map(id => api.resumePrint(id)));
+      const toast = bulkResumeToast(tallyResumes(results), t);
+      showToast(toast.message, toast.type);
     } else {
-      showToast(t('printers.bulk.partial', { succeeded, failed }), 'error');
+      const apiCall = {
+        stop: api.stopPrint,
+        pause: api.pausePrint,
+        clearPlate: api.clearPlate,
+        clearHMS: api.clearHMSErrors,
+      }[action];
+
+      const results = await Promise.allSettled(
+        applicableIds.map(id => apiCall(id))
+      );
+
+      const succeeded = results.filter(r => r.status === 'fulfilled').length;
+      const failed = results.filter(r => r.status === 'rejected').length;
+
+      if (failed === 0) {
+        showToast(t('printers.bulk.success', { action: t(`printers.bulk.actions.${action}`), count: succeeded }));
+      } else {
+        showToast(t('printers.bulk.partial', { succeeded, failed }), 'error');
+      }
     }
 
     // Invalidate status queries for affected printers

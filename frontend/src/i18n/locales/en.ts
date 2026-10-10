@@ -207,6 +207,7 @@ export default {
         staggerHold: 'Waiting for the power-stagger window — starts shortly',
         spoolJamRecovering: 'Spool jam — swapping to another spool and resuming',
         spoolJamRecoveryFailed: 'Spool jam recovery failed — printer left paused for a human',
+        toolheadEmpty: 'Paused with an empty toolhead',
       },
       printerState: {
         ok: 'Ready',
@@ -888,6 +889,21 @@ export default {
       amsCommandSessionChanged: 'Printer reconnected during the command. Check the AMS.',
       amsLoadHeld: "Load accepted. Held behind the paused print's filament change.",
       amsUnloadHeld: "Unload accepted. Held behind the paused print's filament change.",
+      // `held` outside a filament change (`utils/amsCommand`): acknowledged, not
+      // run, and the AMS can run it later on its own.
+      amsLoadHeldOutsideChange: 'Load accepted. Not run yet.',
+      amsUnloadHeldOutsideChange: 'Unload accepted. Not run yet. The AMS can run it later without another command.',
+      // A resume over an empty toolhead: the farm loads first (`utils/printResume`).
+      resumeRefilling: 'Toolhead empty. Loading {{slot}}, then resuming.',
+      resumeRefillingAnySlot: 'Toolhead empty. Loading a spool, then resuming.',
+      resumeRefused: {
+        not_paused: 'Print is not paused.',
+        farm_acting: 'Recovery in progress on this printer. Resume refused.',
+        maintenance: 'Toolhead empty. Maintenance mode: the farm loads nothing. Load a slot, then resume.',
+        unknown: 'Toolhead not readable: no live report from the printer. Resume refused.',
+        command_pending: "Toolhead empty. The AMS still holds the farm's queued command; the farm refills the toolhead when it runs.",
+        physical: 'Toolhead empty. A physical fault holds the filament path. Clear it and load a slot, then resume.',
+      },
     },
     // Connection status
     connection: {
@@ -1143,6 +1159,14 @@ export default {
       partial: '{{succeeded}} succeeded, {{failed}} failed',
       noneApplicable: 'No selected printers are in the right state for this action',
       selectByState: 'Select by State',
+      resumeResumed_one: '{{count}} printer resumed.',
+      resumeResumed_other: '{{count}} printers resumed.',
+      resumeRefilling_one: 'Toolhead empty on {{count}} printer: loading, then resuming.',
+      resumeRefilling_other: 'Toolhead empty on {{count}} printers: loading, then resuming.',
+      resumeRefused_one: 'Resume refused on {{count}} printer.',
+      resumeRefused_other: 'Resume refused on {{count}} printers.',
+      resumeFailed_one: 'Resume failed on {{count}} printer.',
+      resumeFailed_other: 'Resume failed on {{count}} printers.',
     },
     // Discovery
     discovery: {
@@ -1275,6 +1299,7 @@ export default {
       plate_vision: 'Plate check',
       z_reference_lost: 'Z reference lost',
       recovering: 'Recovering',
+      toolhead_refill: 'Toolhead empty',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1286,18 +1311,34 @@ export default {
       power_loss: 'Resume at the printer',
       plate_vision: 'Ignore and resume, or stop the print',
       z_reference_lost: 'Restarted with a part on the plate — remove it by hand, then Mark plate cleared',
+      toolhead_refill: 'Load a slot, then resume.',
     },
     // The chip's tooltip while the farm still acts (`recovering`), for the
     // kinds whose `incidentAction` names a person's exits that do not exist
     // yet; every other kind keeps its `incidentAction` in both states.
     incidentRecoveringAction: {
       plate_vision: 'The farm is re-checking the plate',
+      toolhead_refill: 'The farm is refilling the toolhead',
     },
     // A hold's RECORDED printer words, one line under the chip while the
     // printer no longer shows them live; `notShown` is that line's tooltip.
     holdMessage: {
       reported: 'Printer reported: {{message}}',
       notShown: 'No longer shown on the printer',
+    },
+    // The "Toolhead empty" chip's tooltip sentences (`utils/incidentChip`).
+    toolhead: {
+      loading: 'Loading {{slot}}.',
+      loadingAnySlot: 'Loading a spool.',
+      loadFailed: 'Load failed: {{slot}}.',
+      loadFailedAnySlot: 'Load failed.',
+      unloadFailed: 'Unload failed: {{slot}}.',
+      unloadFailedAnySlot: 'Unload failed.',
+      answer: {
+        no_movement: 'AMS did not move.',
+        loadActed: 'AMS moved but the load did not finish.',
+        unloadActed: 'AMS moved but the unload did not finish.',
+      },
     },
     // The human's turn at a paused plate check: the printer's own
     // "Ignore and resume" button on the card, behind a confirm.
@@ -5670,6 +5711,7 @@ export default {
       powerFailure: 'Power failure',
       userCancelled: 'User cancelled',
       other: 'Other',
+      printed_without_filament: 'Printed without filament',
     },
     // Archive statuses
     statuses: {
@@ -7874,6 +7916,7 @@ export default {
       job_ended_unseen: 'Job ended, unobserved',
       driver_ended: 'Farm: job ended by recovery',
       legacy_vision_stop: 'Legacy plate-check stop',
+      refill_resumed: 'Farm: toolhead refill',
     },
     external: 'External spool',
     foreign: 'Not a farm unit',

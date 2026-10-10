@@ -206,6 +206,7 @@ export default {
         staggerHold: 'En attente de la fenêtre d\'échelonnement de l\'alimentation — démarre sous peu',
         spoolJamRecovering: 'Bourrage de bobine — bascule vers une autre bobine et reprise',
         spoolJamRecoveryFailed: 'Échec de la récupération du bourrage de bobine — imprimante laissée en pause pour un humain',
+        toolheadEmpty: 'En pause avec la tête vide',
       },
       printerState: {
         ok: 'Prête',
@@ -878,6 +879,18 @@ export default {
       amsCommandSessionChanged: 'Imprimante reconnectée pendant la commande. Vérifiez l’AMS.',
       amsLoadHeld: 'Chargement accepté. En attente derrière le changement de filament de l’impression en pause.',
       amsUnloadHeld: 'Déchargement accepté. En attente derrière le changement de filament de l’impression en pause.',
+      amsLoadHeldOutsideChange: 'Chargement accepté. Pas encore exécuté.',
+      amsUnloadHeldOutsideChange: 'Déchargement accepté. Pas encore exécuté. L’AMS peut l’exécuter plus tard sans autre commande.',
+      resumeRefilling: 'Tête vide. Chargement de {{slot}}, puis reprise.',
+      resumeRefillingAnySlot: 'Tête vide. Chargement d’une bobine, puis reprise.',
+      resumeRefused: {
+        not_paused: 'L’impression n’est pas en pause.',
+        farm_acting: 'Récupération en cours sur cette imprimante. Reprise refusée.',
+        maintenance: 'Tête vide. Mode maintenance : la ferme ne charge rien. Chargez un emplacement, puis reprenez.',
+        unknown: 'Tête illisible : aucun rapport en direct de l’imprimante. Reprise refusée.',
+        command_pending: 'Tête vide. L’AMS retient encore la commande en file de la ferme ; la ferme recharge la tête quand elle s’exécute.',
+        physical: 'Tête vide. Une panne physique bloque le chemin du filament. Corrigez-la et chargez un emplacement, puis reprenez.',
+      },
     },
     // Connection status
     connection: {
@@ -1127,6 +1140,14 @@ export default {
       partial: '{{succeeded}} réussi(s), {{failed}} échoué(s)',
       noneApplicable: 'Aucune imprimante sélectionnée n\'est dans le bon état pour cette action',
       selectByState: 'Sélectionner par état',
+      resumeResumed_one: '{{count}} imprimante reprise.',
+      resumeResumed_other: '{{count}} imprimantes reprises.',
+      resumeRefilling_one: 'Tête vide sur {{count}} imprimante : chargement, puis reprise.',
+      resumeRefilling_other: 'Tête vide sur {{count}} imprimantes : chargement, puis reprise.',
+      resumeRefused_one: 'Reprise refusée sur {{count}} imprimante.',
+      resumeRefused_other: 'Reprise refusée sur {{count}} imprimantes.',
+      resumeFailed_one: 'Reprise échouée sur {{count}} imprimante.',
+      resumeFailed_other: 'Reprise échouée sur {{count}} imprimantes.',
     },
     // Discovery
     discovery: {
@@ -1258,6 +1279,7 @@ export default {
       plate_vision: 'Contrôle du plateau',
       z_reference_lost: 'Référence Z perdue',
       recovering: 'Récupération',
+      toolhead_refill: 'Tête vide',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1269,13 +1291,28 @@ export default {
       power_loss: 'Reprenez sur l\'imprimante',
       plate_vision: 'Ignorer et reprendre, ou arrêter l\'impression',
       z_reference_lost: 'Redémarrage avec une pièce sur le plateau — retirez-la à la main, puis « Marquer le plateau comme dégagé »',
+      toolhead_refill: 'Chargez un emplacement, puis reprenez.',
     },
     incidentRecoveringAction: {
       plate_vision: 'La ferme revérifie le plateau',
+      toolhead_refill: 'La ferme recharge la tête',
     },
     holdMessage: {
       reported: 'L\'imprimante a signalé : {{message}}',
       notShown: 'N\'est plus affiché sur l\'imprimante',
+    },
+    toolhead: {
+      loading: 'Chargement de {{slot}}.',
+      loadingAnySlot: 'Chargement d’une bobine.',
+      loadFailed: 'Échec du chargement : {{slot}}.',
+      loadFailedAnySlot: 'Échec du chargement.',
+      unloadFailed: 'Échec du déchargement : {{slot}}.',
+      unloadFailedAnySlot: 'Échec du déchargement.',
+      answer: {
+        no_movement: 'L’AMS n’a pas bougé.',
+        loadActed: 'L’AMS a bougé, mais le chargement n’a pas abouti.',
+        unloadActed: 'L’AMS a bougé, mais le déchargement n’a pas abouti.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorer et reprendre',
@@ -5613,6 +5650,7 @@ export default {
       powerFailure: 'Coupure courant',
       userCancelled: 'Annulé par l\'utilisateur',
       other: 'Autre',
+      printed_without_filament: 'Imprimé sans filament',
     },
     // Archive statuses
     statuses: {
@@ -7815,6 +7853,7 @@ export default {
       job_ended_unseen: 'Tâche terminée sans observation',
       driver_ended: 'Ferme : tâche arrêtée par la reprise',
       legacy_vision_stop: 'Ancien arrêt du contrôle du plateau',
+      refill_resumed: 'Ferme : recharge de la tête',
     },
     external: 'Bobine externe',
     foreign: 'Hors unités de la ferme',
