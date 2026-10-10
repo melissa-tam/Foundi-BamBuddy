@@ -31,6 +31,7 @@ from typing import get_args
 
 import pytest
 
+from backend.app.models.printer_incident_step import STEP_KIND_COMMAND, STEP_KIND_LEVER
 from backend.app.schemas.printer import AmsCommandOutcome
 from backend.app.services import ams_command, spool_respool
 from backend.app.services.ams_command import (
@@ -42,6 +43,7 @@ from backend.app.services.ams_command import (
     Command,
     Observation,
     Posture,
+    PostureFamily,
     Refusal,
     Sent,
     ack_of,
@@ -50,9 +52,12 @@ from backend.app.services.ams_command import (
     observe,
     operator_commanded_since,
     posture,
+    ran,
     snapshot,
 )
 from backend.app.services.bambu_mqtt import CommandAck, PrinterState, ams_mid_filament_change
+from backend.app.services.printer_incidents import StepEntry
+from backend.app.services.tray_fields import ExtruderFeed, ToolheadFeed, extruder_feed, toolhead_feed
 from backend.tests._fixtures.ast_tree import ParsedModule, ParsedTree
 from backend.tests._fixtures.clock import FakeClock
 
@@ -90,7 +95,15 @@ def _snap(
         connection_epoch=epoch,
         fresh=fresh,
         taken_at=0.0,
+        feed=extruder_feed(tray_now),
     )
+
+
+def _with(snap: AmsWireSnapshot, **fields: int | bool | None) -> AmsWireSnapshot:
+    """``dataclasses.replace`` that keeps the K1 ``feed`` in step with a changed ``tray_now``
+    (the single-nozzle reading :func:`_snap` builds)."""
+    out = replace(snap, **fields)
+    return replace(out, feed=extruder_feed(out.tray_now)) if "tray_now" in fields else out
 
 
 def _ack(result: str | None, *, seq: str = "7", command: str = "ams_change_filament") -> CommandAck:
@@ -133,16 +146,19 @@ class TestPosture:
     @pytest.mark.parametrize(
         "snap, expected",
         [
-            pytest.param(_snap(main=0, tray_now=255), "idle", id="idle_empty"),
-            pytest.param(_snap(main=0, tray_now=2), "idle", id="idle_loaded"),
-            pytest.param(_snap(main=3, tray_now=2), "assist", id="assist_is_a_running_h2s"),
+            pytest.param(_snap(main=0, tray_now=255), "idle_empty", id="idle_empty"),
+            pytest.param(_snap(main=0, tray_now=2), "idle_loaded", id="idle_loaded"),
+            pytest.param(_snap(main=0, tray_now=254), "idle_empty", id="idle_external_is_no_feeder"),
+            pytest.param(_snap(main=3, tray_now=2), "assist_loaded", id="assist_loaded_is_a_running_h2s"),
+            pytest.param(_snap(main=3, tray_now=255), "assist_empty", id="assist_empty_the_011_posture_after"),
             pytest.param(_snap(main=1, tray_now=3), "mid_change_loaded", id="mid_change_real_feeder"),
             pytest.param(_snap(main=1, tray_now=255), "mid_change_empty", id="mid_change_nothing_fed"),
             pytest.param(_snap(main=1, tray_now=254), "mid_change_empty", id="mid_change_external_is_no_feeder"),
             pytest.param(_snap(main=1, tray_now=None), "mid_change_empty", id="mid_change_unread_tray"),
-            pytest.param(_snap(main=2, tray_now=2), "other", id="identifying"),
-            pytest.param(_snap(main=4, tray_now=2), "other", id="calibration"),
-            pytest.param(_snap(main=None, tray_now=None), "other", id="unreadable_state"),
+            pytest.param(_snap(main=2, tray_now=2), "other_loaded", id="identifying"),
+            pytest.param(_snap(main=4, tray_now=2), "other_loaded", id="calibration"),
+            pytest.param(_snap(main=4, tray_now=255), "other_empty", id="calibration_empty"),
+            pytest.param(_snap(main=None, tray_now=None), "other_empty", id="unreadable_state"),
         ],
     )
     def test_posture_of_a_snapshot(self, snap: AmsWireSnapshot, expected: Posture) -> None:
@@ -150,6 +166,28 @@ class TestPosture:
         # The two mid-change postures are exactly what a mid filament-change snapshot
         # reads as — the one-origin predicate decides membership, case by case.
         assert (posture(snap) in {"mid_change_loaded", "mid_change_empty"}) is ams_mid_filament_change(snap)
+
+    def test_every_posture_is_named_in_the_type(self) -> None:
+        assert set(get_args(Posture)) == {
+            f"{family}_{feed}" for family in ("idle", "assist", "other", "mid_change") for feed in ("loaded", "empty")
+        }
+
+    @pytest.mark.parametrize(
+        "active, expected",
+        [
+            pytest.param(0, "assist_loaded", id="the_loaded_right_nozzle_is_active"),
+            pytest.param(1, "assist_empty", id="the_empty_left_nozzle_is_active"),
+        ],
+    )
+    def test_a_dual_nozzle_entry_feeder_is_the_active_extruders(self, active: int, expected: Posture) -> None:
+        """K1: the entry feeder is the ACTIVE extruder's own (``h2d_extruder_snow``), not the
+        single ``tray_now`` the client guessed onto a unit — here still naming slot 5 from
+        the right nozzle while the left one is the active, empty one."""
+        state = PrinterState(
+            tray_now=5, ams_status_main=3, h2d_extruder_snow={0: 5, 1: 255}, active_extruder=active, connection_epoch=1
+        )
+
+        assert posture(snapshot(state)) == expected
 
 
 class TestSnapshot:
@@ -208,9 +246,9 @@ class TestClassifierTable:
         assert set(ams_command._ROWS) == set(itertools.product(get_args(Command), get_args(Posture)))
 
     def test_a_missing_row_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delitem(ams_command._ROWS, ("unload", "idle"))
+        monkeypatch.delitem(ams_command._ROWS, ("unload", "idle_loaded"))
 
-        with pytest.raises(LookupError, match=r"no classifier row for \(command='unload', posture='idle'\)"):
+        with pytest.raises(LookupError, match=r"no classifier row for \(command='unload', posture='idle_loaded'\)"):
             _run("unload", None, _snap(main=0, tray_now=3), [(1.0, _snap(main=0, tray_now=3))])
 
     def test_an_unknown_command_raises_rather_than_borrowing_a_row(self) -> None:
@@ -233,18 +271,31 @@ class TestClassifierTable:
 
 # Entry snapshots, one per posture.
 _ENTRY: dict[Posture, AmsWireSnapshot] = {
-    "idle": _snap(main=0, tray_now=3),
-    "assist": _snap(main=3, tray_now=3),
-    "other": _snap(main=4, tray_now=3),
+    "idle_loaded": _snap(main=0, tray_now=3),
+    "idle_empty": _snap(main=0, tray_now=255),
+    "assist_loaded": _snap(main=3, tray_now=3),
+    "assist_empty": _snap(main=3, tray_now=255),
+    "other_loaded": _snap(main=4, tray_now=3),
+    "other_empty": _snap(main=4, tray_now=255),
     "mid_change_loaded": _snap(main=1, sub=5, tray_now=3),
     "mid_change_empty": _snap(main=1, sub=5, tray_now=255),
 }
 
 
+# The postures outside a filament change, by entry feeder.
+_OUTSIDE_LOADED: list[Posture] = ["idle_loaded", "assist_loaded", "other_loaded"]
+_OUTSIDE_EMPTY: list[Posture] = ["idle_empty", "assist_empty", "other_empty"]
+
+
+def test_every_posture_has_an_entry_snapshot_that_reads_as_it() -> None:
+    assert {posture(entry) for entry in _ENTRY.values()} == set(get_args(Posture))
+    assert all(posture(entry) == name for name, entry in _ENTRY.items())
+
+
 def _new_session(entry: AmsWireSnapshot, *, fresh: bool, **fields: int | None) -> AmsWireSnapshot:
     """A reading on the session AFTER the entry's: ``fresh`` False is the new session's
     cache (the old session's fields, before its first report lands)."""
-    return replace(entry, connection_epoch=(entry.connection_epoch or 0) + 1, fresh=fresh, **fields)
+    return _with(entry, connection_epoch=(entry.connection_epoch or 0) + 1, fresh=fresh, **fields)
 
 
 class TestSessionChanged:
@@ -258,10 +309,10 @@ class TestSessionChanged:
         assert set(ams_command._ACROSS_ROWS) == set(itertools.product(get_args(Command), get_args(Posture)))
 
     def test_a_missing_cross_session_row_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delitem(ams_command._ACROSS_ROWS, ("load", "idle"))
-        entry = _ENTRY["idle"]
+        monkeypatch.delitem(ams_command._ACROSS_ROWS, ("load", "idle_loaded"))
+        entry = _ENTRY["idle_loaded"]
 
-        with pytest.raises(LookupError, match=r"no cross-session row for \(command='load', posture='idle'\)"):
+        with pytest.raises(LookupError, match=r"no cross-session row for \(command='load', posture='idle_loaded'\)"):
             _run("load", 5, entry, [(1.0, _new_session(entry, fresh=True))])
 
     @pytest.mark.parametrize("command, entry_posture", sorted(ams_command._ROWS))
@@ -279,7 +330,7 @@ class TestSessionChanged:
             _DRIVER_DEADLINE_S,
         )
 
-    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other", "mid_change_loaded", "mid_change_empty"])
+    @pytest.mark.parametrize("entry_posture", get_args(Posture))
     def test_a_load_whose_feeder_reads_the_target_on_the_first_fresh_report_is_complete(
         self, entry_posture: Posture
     ) -> None:
@@ -287,7 +338,7 @@ class TestSessionChanged:
 
         assert _run("load", 5, entry, [(0.5, _new_session(entry, fresh=True, tray_now=5))]) == ("complete", 0.5)
 
-    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other", "mid_change_loaded"])
+    @pytest.mark.parametrize("entry_posture", [*_OUTSIDE_LOADED, *_OUTSIDE_EMPTY, "mid_change_loaded"])
     def test_an_unload_whose_ams_reads_idle_and_empty_on_the_first_fresh_report_is_complete(
         self, entry_posture: Posture
     ) -> None:
@@ -314,19 +365,19 @@ class TestSessionChanged:
 
     @pytest.mark.parametrize("command", ["load", "unload"])
     def test_a_moved_field_short_of_completion_is_acted(self, command: Command) -> None:
-        entry = _ENTRY["idle"]
+        entry = _ENTRY["idle_loaded"]
         now = _new_session(entry, fresh=True, ams_status_sub=4)
 
         assert _run(command, 5, entry, [(0.5, now)]) == ("acted", 0.5)
 
     def test_motion_seen_on_the_old_session_still_counts_after_the_reconnect(self) -> None:
-        entry = _ENTRY["idle"]
+        entry = _ENTRY["idle_loaded"]
         polls = [(0.5, replace(entry, ams_status_sub=4)), (1.0, _new_session(entry, fresh=True))]
 
         assert _run("load", 5, entry, polls) == ("acted", 1.0)
 
     @pytest.mark.parametrize("command", ["load", "unload"])
-    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other", "mid_change_loaded"])
+    @pytest.mark.parametrize("entry_posture", [*_OUTSIDE_LOADED, "mid_change_loaded"])
     def test_nothing_moved_is_session_changed_the_honest_cannot_tell(
         self, command: Command, entry_posture: Posture
     ) -> None:
@@ -355,18 +406,19 @@ class TestSessionChanged:
 
 
 class TestUnloadOutsideAChange:
-    """``(unload, idle | assist | other)`` — the recovery driver's two evidence paths."""
+    """``(unload, idle | assist | other, loaded | empty)`` — the recovery driver's two
+    evidence paths."""
 
-    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other"])
+    @pytest.mark.parametrize("entry_posture", [*_OUTSIDE_LOADED, *_OUTSIDE_EMPTY])
     def test_a_cycle_then_idle_and_empty_is_complete_at_once(self, entry_posture: Posture) -> None:
         entry = _ENTRY[entry_posture]
         polls = [(1.0, _snap(main=1, sub=4, tray_now=3)), (3.0, _snap(main=0, tray_now=255))]
 
         assert _run("unload", None, entry, polls) == ("complete", 3.0)
 
-    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other"])
+    @pytest.mark.parametrize("entry_posture", _OUTSIDE_EMPTY)
     def test_no_cycle_seen_needs_idle_and_empty_held_for_the_grace(self, entry_posture: Posture) -> None:
-        entry = replace(_ENTRY[entry_posture], tray_now=255)
+        entry = _ENTRY[entry_posture]
         settled = _snap(main=0, tray_now=255)
 
         assert _run("unload", None, entry, _held(settled, 1.0, 1.0 + UNLOAD_GRACE_S - 0.1)) == (None, None)
@@ -394,7 +446,8 @@ class TestUnloadOutsideAChange:
             _DRIVER_DEADLINE_S,
         )
 
-    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other"])
+    # Not ``idle_empty``: a stirred idle, empty AMS is the dwell's completion (above).
+    @pytest.mark.parametrize("entry_posture", [*_OUTSIDE_LOADED, "assist_empty", "other_empty"])
     def test_a_moved_field_without_completion_is_acted_at_the_deadline(self, entry_posture: Posture) -> None:
         entry = _ENTRY[entry_posture]
         stirred = replace(entry, ams_status_sub=(entry.ams_status_sub or 0) + 1)
@@ -402,8 +455,9 @@ class TestUnloadOutsideAChange:
         assert _run("unload", None, entry, _held(stirred, 1.0, _DRIVER_DEADLINE_S - 0.1)) == (None, None)
         assert _run("unload", None, entry, _held(stirred, 1.0, _DRIVER_DEADLINE_S)) == ("acted", _DRIVER_DEADLINE_S)
 
-    @pytest.mark.parametrize("entry_posture", ["idle", "assist", "other"])
+    @pytest.mark.parametrize("entry_posture", _OUTSIDE_LOADED)
     def test_nothing_moved_is_no_movement_at_the_deadline(self, entry_posture: Posture) -> None:
+        """No ACK read: nothing says the AMS accepted the pull-back, so nothing is held."""
         entry = _ENTRY[entry_posture]
 
         assert _run("unload", None, entry, _held(entry, 1.0, _DRIVER_DEADLINE_S)) == (
@@ -413,7 +467,7 @@ class TestUnloadOutsideAChange:
 
     def test_movement_is_sticky(self) -> None:
         """A field that moved and moved back still moved."""
-        entry = _ENTRY["idle"]
+        entry = _ENTRY["idle_loaded"]
         polls = [(1.0, _snap(main=0, tray_now=3, tray_tar=3)), (2.0, entry), (_DRIVER_DEADLINE_S, entry)]
 
         assert _run("unload", None, entry, polls) == ("acted", _DRIVER_DEADLINE_S)
@@ -497,7 +551,7 @@ class TestLoadInEveryPosture:
     @pytest.mark.parametrize("entry_posture", get_args(Posture))
     def test_reaching_the_target_is_complete(self, entry_posture: Posture) -> None:
         entry = _ENTRY[entry_posture]
-        polls = [(1.0, replace(entry, tray_now=255)), (4.0, replace(entry, tray_now=5, ams_status_main=0))]
+        polls = [(1.0, _with(entry, tray_now=255)), (4.0, _with(entry, tray_now=5, ams_status_main=0))]
 
         assert _run("load", 5, entry, polls) == ("complete", 4.0)
 
@@ -520,6 +574,51 @@ class TestLoadInEveryPosture:
         entry = _snap(main=0, tray_now=255)
 
         assert _run("load", 255, entry, _held(entry, 1.0, _DRIVER_DEADLINE_S)) == ("no_movement", _DRIVER_DEADLINE_S)
+
+    def test_a_load_of_the_external_spool_completes_on_the_external_holder_feeding(self) -> None:
+        entry = _snap(main=0, tray_now=255)
+
+        assert _run("load", 254, entry, [(2.0, _snap(main=0, tray_now=254))]) == ("complete", 2.0)
+
+
+def _dual(snap: AmsWireSnapshot, active: ExtruderFeed) -> AmsWireSnapshot:
+    """A dual-nozzle reading: ``tray_now`` is the client's single value, guessed onto a unit,
+    while the ACTIVE extruder's own feed (``h2d_extruder_snow``) says something else."""
+    return replace(snap, feed=active)
+
+
+class TestCompletionReadsTheActiveExtruder:
+    """K1: what the AMS answered a motion command is read off the ACTIVE extruder's feed
+    (``AmsWireSnapshot.feed``, ``tray_fields.toolhead_feed``) — the reading the posture, ``ran``
+    and the refill's confirm already take — never the single ``tray_now`` a dual-nozzle client
+    had to guess onto an AMS unit."""
+
+    def test_a_load_completes_when_the_active_extruder_reads_the_target(self) -> None:
+        entry = _snap(main=0, tray_now=255)
+        now = _dual(_snap(main=0, tray_now=5), ExtruderFeed("fed", 3))
+
+        assert _run("load", 3, entry, [(2.0, now)]) == ("complete", 2.0)
+
+    def test_a_tray_now_on_target_over_an_empty_active_extruder_is_no_load(self) -> None:
+        entry = _snap(main=0, tray_now=255)
+        now = _dual(_snap(main=0, tray_now=3), ExtruderFeed("empty"))
+
+        assert _run("load", 3, entry, [(2.0, now)]) == (None, None)
+
+    def test_an_unload_settles_on_the_active_extruder_reading_empty(self) -> None:
+        entry = _snap(main=0, tray_now=5)
+        settled = _dual(_snap(main=0, tray_now=5), ExtruderFeed("empty"))
+
+        assert _run("unload", None, entry, _held(settled, 1.0, 1.0 + UNLOAD_GRACE_S)) == (
+            "complete",
+            1.0 + UNLOAD_GRACE_S,
+        )
+
+    def test_an_unload_read_across_a_reconnect_reads_the_active_extruder(self) -> None:
+        entry = _snap(main=0, tray_now=5)
+        now = _dual(_new_session(entry, fresh=True), ExtruderFeed("empty"))
+
+        assert _run("unload", None, entry, [(0.5, now)]) == ("complete", 0.5)
 
 
 class TestFoldAck:
@@ -673,7 +772,7 @@ class TestHeldBehindTheChange:
     @pytest.mark.parametrize("entry_posture", ["mid_change_loaded", "mid_change_empty"])
     def test_a_load_that_reaches_its_target_after_the_grace_is_still_complete(self, entry_posture: Posture) -> None:
         entry = _ENTRY[entry_posture]
-        polls = [(1.0, entry), (10.0, replace(entry, tray_tar=2)), (40.0, replace(entry, tray_now=2, tray_tar=2))]
+        polls = [(1.0, entry), (10.0, replace(entry, tray_tar=2)), (40.0, _with(entry, tray_now=2, tray_tar=2))]
 
         assert _run("load", 2, entry, polls, ack=_ack("success")) == ("complete", 40.0)
 
@@ -687,18 +786,10 @@ class TestHeldBehindTheChange:
             UNLOAD_GRACE_S,
         )
 
-    @pytest.mark.parametrize(
-        "command, entry_posture",
-        [(c, p) for c, p in sorted(ams_command._ROWS) if not ams_mid_filament_change(_ENTRY[p])],
-    )
-    def test_outside_a_change_a_command_is_never_held(self, command: Command, entry_posture: Posture) -> None:
-        entry = _ENTRY[entry_posture]
-        polls = _held(entry, 1.0, UNLOAD_GRACE_S, 50.0, _DRIVER_DEADLINE_S)
-
-        assert _run(command, 5, entry, polls, ack=_ack("success")) == ("no_movement", _DRIVER_DEADLINE_S)
-
-    def test_held_is_reachable_from_exactly_the_mid_change_rows_that_can_move(self) -> None:
-        """The table-level pin: every row, fed an acknowledged and unmoved window."""
+    def test_held_is_reachable_from_exactly_the_rows_whose_feeder_can_move(self) -> None:
+        """The table-level pin: every row, fed an acknowledged and unmoved window — the
+        mid-change rows that can move, and outside a change the loaded unload and the load
+        into an empty path (:class:`TestHeldOutsideAChange`)."""
         held_rows = {
             (command, entry_posture)
             for command, entry_posture in ams_command._ROWS
@@ -712,7 +803,207 @@ class TestHeldBehindTheChange:
             == "held"
         }
 
-        assert held_rows == {(command, entry_posture) for command, entry_posture, _ in _HELD_ROWS}
+        assert held_rows == {(command, entry_posture) for command, entry_posture, _ in _HELD_ROWS} | {
+            (command, entry_posture) for command, entry_posture, _ in _HELD_AT_THE_BOUND_ROWS
+        }
+
+
+# Outside a change, the rows whose entry feeder could move: an unload with filament loaded,
+# a load into an empty path.
+_HELD_AT_THE_BOUND_ROWS: list[tuple[Command, Posture, int | None]] = [
+    ("unload", "idle_loaded", None),
+    ("unload", "assist_loaded", None),
+    ("unload", "other_loaded", None),
+    ("load", "idle_empty", 2),
+    ("load", "assist_empty", 2),
+    ("load", "other_empty", 2),
+]
+
+
+class TestHeldOutsideAChange:
+    """``held`` outside a filament change, at the step bound (K5, 2026-10-10). 011-H2S
+    2026-10-09 04:31:27 and 014-H2S 2026-10-10 02:45:58: a pull-back sent with filament
+    loaded into an AMS in assist (after the ladder's ``ams_control resume`` released the
+    change, the print PAUSED) was echoed ``result=success`` and moved nothing for the
+    driver's 90 s, which answered ``no_movement`` and gave up — and the AMS ran it ON ITS
+    OWN at 04:36:01 and 02:50:38, emptying the toolhead under the paused print."""
+
+    def test_the_measured_cell_an_acknowledged_unmoved_pull_back_in_assist_is_held_at_the_bound(self) -> None:
+        entry = _ENTRY["assist_loaded"]
+
+        assert _run("unload", None, entry, _held(entry, 1.0, 50.0, _DRIVER_DEADLINE_S - 0.1), ack=_ack("success")) == (
+            None,
+            None,
+        )
+        assert _run("unload", None, entry, _held(entry, 1.0, 50.0, _DRIVER_DEADLINE_S), ack=_ack("success")) == (
+            "held",
+            _DRIVER_DEADLINE_S,
+        )
+
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_AT_THE_BOUND_ROWS)
+    def test_held_only_at_the_bound_never_early_at_the_grace(
+        self, command: Command, entry_posture: Posture, target: int | None
+    ) -> None:
+        """Outside a change a command normally runs at once, so the grace is no evidence of
+        holding: the answer waits for the whole step window."""
+        entry = _ENTRY[entry_posture]
+        polls = _held(entry, 1.0, UNLOAD_GRACE_S, 50.0)
+
+        assert _run(command, target, entry, polls, ack=_ack("success")) == (None, None)
+        assert _run(command, target, entry, [*polls, (_DRIVER_DEADLINE_S, entry)], ack=_ack("success")) == (
+            "held",
+            _DRIVER_DEADLINE_S,
+        )
+
+    @pytest.mark.parametrize("result", ["fail", None])
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_AT_THE_BOUND_ROWS)
+    def test_no_ack_or_a_failure_ack_is_no_movement(
+        self, command: Command, entry_posture: Posture, target: int | None, result: str | None
+    ) -> None:
+        entry = _ENTRY[entry_posture]
+        polls = _held(entry, 1.0, _DRIVER_DEADLINE_S)
+
+        assert _run(command, target, entry, polls) == ("no_movement", _DRIVER_DEADLINE_S)
+        assert _run(command, target, entry, polls, ack=_ack(result)) == ("no_movement", _DRIVER_DEADLINE_S)
+
+    @pytest.mark.parametrize("command, entry_posture, target", _HELD_AT_THE_BOUND_ROWS)
+    def test_a_movement_is_acted_never_held(self, command: Command, entry_posture: Posture, target: int | None) -> None:
+        entry = _ENTRY[entry_posture]
+        stirred = replace(entry, ams_status_sub=6)
+
+        assert _run(command, target, entry, _held(stirred, 1.0, _DRIVER_DEADLINE_S), ack=_ack("success")) == (
+            "acted",
+            _DRIVER_DEADLINE_S,
+        )
+
+    @pytest.mark.parametrize("entry_posture", ["assist_empty", "other_empty"])
+    def test_an_unload_with_nothing_loaded_is_not_held(self, entry_posture: Posture) -> None:
+        """Nothing at the feeder to pull back: an ACK does not make a no-op a hold."""
+        entry = _ENTRY[entry_posture]
+
+        assert _run("unload", None, entry, _held(entry, 1.0, _DRIVER_DEADLINE_S), ack=_ack("success")) == (
+            "no_movement",
+            _DRIVER_DEADLINE_S,
+        )
+
+    def test_an_idle_unload_with_nothing_loaded_is_still_the_dwells_completion(self) -> None:
+        entry = _ENTRY["idle_empty"]
+
+        assert _run("unload", None, entry, _held(entry, 1.0, 1.0 + UNLOAD_GRACE_S), ack=_ack("success")) == (
+            "complete",
+            1.0 + UNLOAD_GRACE_S,
+        )
+
+    @pytest.mark.parametrize("entry_posture", _OUTSIDE_LOADED)
+    def test_a_load_into_a_loaded_path_is_not_held(self, entry_posture: Posture) -> None:
+        """Unmeasured, and never the farm's own send (the unload goes first, invariant 8):
+        the deadline rule answers it."""
+        entry = _ENTRY[entry_posture]
+
+        assert _run("load", 5, entry, _held(entry, 1.0, _DRIVER_DEADLINE_S), ack=_ack("success")) == (
+            "no_movement",
+            _DRIVER_DEADLINE_S,
+        )
+
+    def test_the_operator_window_answers_held_at_its_end(self) -> None:
+        """An operator's Unload click with filament loaded, acknowledged and not run within
+        the 5 s window, is told it is held — never "did not move"."""
+        entry = _ENTRY["idle_loaded"]
+        polls = _held(entry, 1.0, OPERATOR_ACK_S)
+
+        assert _run("unload", None, entry, polls, deadline_s=OPERATOR_ACK_S, ack=_ack("success")) == (
+            "held",
+            OPERATOR_ACK_S,
+        )
+
+
+# --- did a recorded motion command run ----------------------------------------------------
+
+
+def _command_step(command: str, *, target: int | None = None, feeder: str | None = None) -> StepEntry:
+    """A ``command`` step as the step ledger records it (``printer_incident_step``)."""
+    return StepEntry(kind=STEP_KIND_COMMAND, name=command, target=target, feeder=feeder)
+
+
+def _live(tray_now: object) -> ToolheadFeed:
+    return toolhead_feed(SimpleNamespace(tray_now=tray_now, h2d_extruder_snow={}, active_extruder=0))
+
+
+class TestRan:
+    """``ran(step, live)`` — did a RECORDED motion command run, read off the step's own
+    recorded columns and the live K1 reading. Pure and DB-free: its readers are the driver's
+    round top after a restart (never send behind a command that may still run) and the
+    per-push detector of a farm command that ran after the hand-over (011/014-H2S: an
+    accepted pull-back ran on its own ~4.5 min after the send)."""
+
+    @pytest.mark.parametrize("recorded", ["jammed", "other"])
+    @pytest.mark.parametrize(
+        "tray_now, expected",
+        [
+            pytest.param(255, True, id="the_toolhead_now_reads_empty"),
+            pytest.param(3, False, id="still_fed"),
+            pytest.param(254, False, id="the_external_spool_feeds"),
+            pytest.param(None, None, id="no_reading"),
+        ],
+    )
+    def test_an_unload_sent_loaded_ran_when_the_active_extruder_reads_empty(
+        self, recorded: str, tray_now: object, expected: bool | None
+    ) -> None:
+        assert ran(_command_step("unload", feeder=recorded), _live(tray_now)) is expected
+
+    @pytest.mark.parametrize("recorded", ["empty", "external", "unknown", None])
+    @pytest.mark.parametrize("tray_now", [255, 3, 254])
+    def test_an_unload_sent_with_no_feeder_loaded_is_undecidable(self, recorded: str | None, tray_now: int) -> None:
+        """Nothing was at the feeder for it to pull back (or nobody read what was): no live
+        reading is its answer."""
+        assert ran(_command_step("unload", feeder=recorded), _live(tray_now)) is None
+
+    @pytest.mark.parametrize(
+        "tray_now, expected",
+        [
+            pytest.param(2, True, id="the_target_feeds"),
+            pytest.param(3, False, id="another_tray_feeds"),
+            pytest.param(255, False, id="nothing_fed"),
+            pytest.param(254, False, id="the_external_spool_feeds"),
+            pytest.param("x", None, id="no_reading"),
+        ],
+    )
+    def test_a_load_ran_when_the_active_feeder_is_its_target(self, tray_now: object, expected: bool | None) -> None:
+        assert ran(_command_step("load", target=2, feeder="empty"), _live(tray_now)) is expected
+
+    @pytest.mark.parametrize("target", [None, 254, 255])
+    def test_a_load_whose_target_is_no_ams_feeder_is_undecidable(self, target: int | None) -> None:
+        assert ran(_command_step("load", target=target), _live(254)) is None
+
+    def test_a_dual_nozzle_reads_the_active_extruder(self) -> None:
+        """The right nozzle still holds slot 5; the left, active one is empty — the pull-back
+        from the active nozzle ran."""
+        live = toolhead_feed(SimpleNamespace(tray_now=5, h2d_extruder_snow={0: 5, 1: 255}, active_extruder=1))
+
+        assert ran(_command_step("unload", feeder="jammed"), live) is True
+        assert ran(_command_step("load", target=5), live) is False
+
+    @pytest.mark.parametrize(
+        "step",
+        [
+            pytest.param(StepEntry(kind=STEP_KIND_LEVER, name="resume"), id="a_lever"),
+            pytest.param(StepEntry(kind=STEP_KIND_COMMAND, name="purge"), id="an_unknown_command"),
+        ],
+    )
+    def test_only_a_motion_command_can_be_asked(self, step: StepEntry) -> None:
+        """Motion-only: a lever's effect is the release reader's, and a token the module
+        cannot name is ledger drift, never a skipped row."""
+        with pytest.raises(LookupError):
+            ran(step, _live(255))
+
+    def test_the_loaded_kinds_are_the_drivers_own_feeder_vocabulary(self) -> None:
+        """``ran`` reads the feeder-position kind the recovery driver RECORDS at the send
+        (``spool_recovery.FeederKind``): both kinds that name a real feeder at the extruder
+        count as loaded, and every kind it reads is one the driver can write."""
+        from backend.app.services.spool_recovery import FeederKind
+
+        assert {"jammed", "other"} == ams_command._RECORDED_LOADED_FEEDERS
+        assert set(get_args(FeederKind)) >= ams_command._RECORDED_LOADED_FEEDERS
 
 
 # --- the verbs -----------------------------------------------------------------------------
@@ -1063,7 +1354,7 @@ class TestCommandForOperator:
         _install(monkeypatch, _FakeManager(client=None, state=None))
 
         assert await command_for_operator(_PID, "unload") == AmsCommandResult(
-            "refused_not_connected", "Printer not connected"
+            "refused_not_connected", "Printer not connected", None
         )
 
     async def test_a_runout_hold_maps_to_refused_runout_hold_with_its_sentence(
@@ -1078,6 +1369,7 @@ class TestCommandForOperator:
 
         assert result.outcome == "refused_runout_hold"
         assert "AMS A slot 3" in result.message and "latch" in result.message
+        assert result.family is None  # nothing was sent, so no posture was read
 
     async def test_a_load_that_reaches_its_tray_is_complete(
         self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float
@@ -1090,7 +1382,7 @@ class TestCommandForOperator:
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=lands), state=state))
 
         assert await command_for_operator(_PID, "load", 5) == AmsCommandResult(
-            "complete", "Loading filament from AMS 1 slot 2"
+            "complete", "Loading filament from AMS 1 slot 2", "outside_change"
         )
 
     @pytest.mark.parametrize(
@@ -1107,7 +1399,7 @@ class TestCommandForOperator:
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=stirs), state=state))
 
         assert await command_for_operator(_PID, "load", tray_id) == AmsCommandResult(
-            "acted", f"Loading filament from {label}"
+            "acted", f"Loading filament from {label}", "outside_change"
         )
 
     @pytest.mark.parametrize(
@@ -1125,7 +1417,9 @@ class TestCommandForOperator:
     ) -> None:
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=_state(tray_now=1, ams_status_main=0)))
 
-        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("no_movement", message)
+        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult(
+            "no_movement", message, "outside_change"
+        )
 
     @pytest.mark.parametrize(
         "command, tray_id, message",
@@ -1148,7 +1442,32 @@ class TestCommandForOperator:
         state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, echo="success"), state=state))
 
-        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("held", message)
+        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("held", message, "mid_change")
+
+    @pytest.mark.parametrize(
+        "command, tray_id, tray_now, message",
+        [
+            ("load", 2, 255, "Load accepted. Not run yet."),
+            ("unload", None, 3, "Unload accepted. Not run yet. The AMS can run it later without another command."),
+        ],
+    )
+    async def test_an_acknowledged_click_outside_a_change_is_held_with_its_own_sentence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        call_log: list[str],
+        short_ack: float,
+        command: Command,
+        tray_id: int | None,
+        tray_now: int,
+        message: str,
+    ) -> None:
+        """Outside a change there is no paused change to be held behind, so the in-change
+        sentence would be false: the outside-change family carries its own (011/014-H2S: an
+        accepted pull-back ran on its own ~4.5 min later)."""
+        state = _state(tray_now=tray_now, ams_status_main=0)
+        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, echo="success"), state=state))
+
+        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("held", message, "outside_change")
 
     @pytest.mark.parametrize("command, tray_id", [("load", 2), ("unload", None)])
     async def test_a_failure_ack_into_a_wedge_is_no_movement(
@@ -1171,7 +1490,7 @@ class TestCommandForOperator:
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=state))
 
         assert await command_for_operator(_PID, "unload") == AmsCommandResult(
-            "undecidable", "Unload sent. Nothing was loaded."
+            "undecidable", "Unload sent. Nothing was loaded.", "mid_change"
         )
 
     async def test_an_unload_that_empties_a_mid_change_feeder_is_acted(
@@ -1184,7 +1503,9 @@ class TestCommandForOperator:
 
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=empties), state=state))
 
-        assert await command_for_operator(_PID, "unload") == AmsCommandResult("acted", "Unloading filament")
+        assert await command_for_operator(_PID, "unload") == AmsCommandResult(
+            "acted", "Unloading filament", "mid_change"
+        )
 
     @pytest.mark.parametrize("command, tray_id", [("load", 5), ("unload", None)])
     async def test_a_reconnect_during_the_command_is_session_changed(
@@ -1208,7 +1529,7 @@ class TestCommandForOperator:
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=reconnects), state=state))
 
         assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult(
-            "session_changed", "Printer reconnected during the command. Check the AMS."
+            "session_changed", "Printer reconnected during the command. Check the AMS.", "outside_change"
         )
 
     def test_the_operator_window_is_five_seconds(self) -> None:
@@ -1229,18 +1550,31 @@ class TestCommandForOperator:
         _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=reconnects_loaded), state=state))
 
         assert await command_for_operator(_PID, "load", 5) == AmsCommandResult(
-            "complete", "Loading filament from AMS 1 slot 2"
+            "complete", "Loading filament from AMS 1 slot 2", "outside_change"
         )
 
     async def test_a_load_without_a_tray_is_a_programming_error(self) -> None:
         with pytest.raises(ValueError, match="needs a tray_id"):
             await command_for_operator(_PID, "load")
 
-    def test_the_copy_covers_exactly_the_answers_each_command_can_get(self) -> None:
-        reachable = {("unload", a) for a in get_args(Answer)} | {
-            ("load", a) for a in get_args(Answer) if a != "undecidable"
+    def test_the_copy_covers_exactly_the_answers_each_command_can_get_in_each_family(self) -> None:
+        """Keyed by posture family: only an unload into a mid-change AMS with nothing loaded
+        is ``undecidable``, so that cell exists in the mid-change family alone."""
+        reachable = {
+            (command, answer, family)
+            for command in get_args(Command)
+            for answer in get_args(Answer)
+            for family in get_args(PostureFamily)
+            if answer != "undecidable" or (command, family) == ("unload", "mid_change")
         }
         assert set(ams_command._ANSWER_COPY) == reachable
+
+    def test_held_has_a_sentence_of_its_own_in_each_family(self) -> None:
+        for command in get_args(Command):
+            assert (
+                ams_command._ANSWER_COPY[(command, "held", "mid_change")]
+                != ams_command._ANSWER_COPY[(command, "held", "outside_change")]
+            )
 
     def test_the_operator_window_is_the_documented_five_seconds(self) -> None:
         assert OPERATOR_ACK_S == 5.0

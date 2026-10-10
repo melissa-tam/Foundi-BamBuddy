@@ -1583,6 +1583,16 @@ class TestTrayNowSingleNozzleX1E:
         assert mqtt_client.state.tray_now == 255
         assert mqtt_client.state.last_loaded_tray == 2
 
+    def test_the_external_spool_is_a_feeder_a_job_fed_from_but_nothing_fed_is_not(self, mqtt_client):
+        """``last_loaded_tray`` and the ``tray_change_log`` record the PHYSICAL feeder a job fed
+        from — an AMS tray or the external holder, ``tray_fields.extruder_feed``'s ``fed`` /
+        ``external`` — and never the "nothing fed" sentinel."""
+        mqtt_client._process_message(_ams_payload(254))
+        assert mqtt_client.state.last_loaded_tray == 254
+
+        mqtt_client._process_message(_ams_payload(255))
+        assert mqtt_client.state.last_loaded_tray == 254
+
 
 # 2. Single-nozzle P2S — multiple AMS, global IDs pass through
 
@@ -4484,6 +4494,32 @@ class TestAmsWriteRefusalHelper:
 
         assert ok is False
         assert msg == _AMS_REFRESH_REFUSAL_MESSAGE[reason]
+
+    @pytest.mark.parametrize(
+        ("tray_now", "snow", "refused"),
+        [
+            pytest.param(255, {}, False, id="single_nozzle_nothing_fed"),
+            pytest.param(2, {}, True, id="single_nozzle_fed"),
+            pytest.param(254, {}, True, id="single_nozzle_external_spool"),
+            pytest.param(1, {0: 255, 1: 255}, False, id="dual_both_empty_tray_now_a_guess"),
+            pytest.param(255, {0: 2, 1: 255}, True, id="dual_active_fed_tray_now_lagging"),
+            pytest.param(255, {1: 255}, True, id="dual_map_missing_the_active_fails_closed"),
+        ],
+    )
+    def test_the_engaged_filament_guard_reads_the_active_extruder(self, tray_now, snow, refused):
+        """An ``ams_get_rfid`` has to move filament, so the client refuses one while filament is
+        ENGAGED at the toolhead — ``bambu_mqtt.filament_engaged``, the ACTIVE extruder
+        (``tray_fields.toolhead_feed``, K1), never the single ``tray_now`` a dual-nozzle client
+        guessed onto a unit. A feed nobody can read refuses: the wire's own backstop fails
+        closed (``ams_presence``'s quiet mirror fails open in front of it)."""
+        client = _make_client(serial="RFID1", connected=True, tray_now=tray_now)
+        client.state.h2d_extruder_snow = dict(snow)
+        client.state.active_extruder = 0
+
+        ok, msg = client.ams_refresh_tray(0, 0)
+
+        assert ok is (not refused)
+        assert msg.startswith("Please unload filament first") is refused
 
     def test_public_accessor_is_read_only(self, mqtt_client, caplog):
         """``ams_write_refusal`` is the advisory form callers may poll: it neither logs

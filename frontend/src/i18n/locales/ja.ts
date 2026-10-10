@@ -206,6 +206,7 @@ export default {
         staggerHold: '電力スタッガー枠を待機中 — まもなく開始します',
         spoolJamRecovering: 'スプール詰まり — 別のスプールに切り替えて再開中',
         spoolJamRecoveryFailed: 'スプール詰まりの復旧に失敗 — プリンターは担当者向けに一時停止のまま',
+        toolheadEmpty: 'ツールヘッドが空のまま一時停止中',
       },
       printerState: {
         ok: '準備完了',
@@ -877,6 +878,18 @@ export default {
       amsCommandSessionChanged: 'コマンド実行中にプリンターが再接続しました。AMS を確認してください。',
       amsLoadHeld: 'ロードを受け付けました。一時停止中の印刷のフィラメント交換の後で保留中です。',
       amsUnloadHeld: 'アンロードを受け付けました。一時停止中の印刷のフィラメント交換の後で保留中です。',
+      amsLoadHeldOutsideChange: 'ロードを受け付けました。まだ実行されていません。',
+      amsUnloadHeldOutsideChange: 'アンロードを受け付けました。まだ実行されていません。AMS は追加のコマンドなしで後から実行することがあります。',
+      resumeRefilling: 'ツールヘッドが空です。{{slot}} をロードしてから再開します。',
+      resumeRefillingAnySlot: 'ツールヘッドが空です。スプールをロードしてから再開します。',
+      resumeRefused: {
+        not_paused: '印刷は一時停止していません。',
+        farm_acting: 'このプリンターで復旧処理中です。再開を拒否しました。',
+        maintenance: 'ツールヘッドが空です。メンテナンスモード: ファームは何もロードしません。スロットをロードしてから再開してください。',
+        unknown: 'ツールヘッドを読み取れません: プリンターからのライブ報告がありません。再開を拒否しました。',
+        command_pending: 'ツールヘッドが空です。AMS はファームのキュー済みコマンドをまだ保持しています。実行されるとファームがツールヘッドを補充します。',
+        physical: 'ツールヘッドが空です。物理的な故障がフィラメント経路を塞いでいます。解消してスロットをロードしてから再開してください。',
+      },
     },
     // Connection status
     connection: {
@@ -1126,6 +1139,14 @@ export default {
       partial: '{{succeeded}}件成功、{{failed}}件失敗',
       noneApplicable: '選択したプリンターにこのアクションに適した状態のものがありません',
       selectByState: 'ステータスで選択',
+      resumeResumed_one: '{{count}} 台のプリンターを再開しました。',
+      resumeResumed_other: '{{count}} 台のプリンターを再開しました。',
+      resumeRefilling_one: '{{count}} 台のプリンターでツールヘッドが空です: ロードしてから再開します。',
+      resumeRefilling_other: '{{count}} 台のプリンターでツールヘッドが空です: ロードしてから再開します。',
+      resumeRefused_one: '{{count}} 台のプリンターで再開を拒否しました。',
+      resumeRefused_other: '{{count}} 台のプリンターで再開を拒否しました。',
+      resumeFailed_one: '{{count}} 台のプリンターで再開に失敗しました。',
+      resumeFailed_other: '{{count}} 台のプリンターで再開に失敗しました。',
     },
     // Discovery
     discovery: {
@@ -1257,6 +1278,7 @@ export default {
       plate_vision: 'プレート検査',
       z_reference_lost: 'Z基準喪失',
       recovering: '復旧中',
+      toolhead_refill: 'ツールヘッド空',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1268,13 +1290,28 @@ export default {
       power_loss: 'プリンター側で再開してください',
       plate_vision: '無視して再開、または印刷を停止',
       z_reference_lost: '部品がプレートに載ったまま再起動 — 手で取り除いてから「プレートをクリア済みにする」',
+      toolhead_refill: 'スロットをロードしてから再開してください。',
     },
     incidentRecoveringAction: {
       plate_vision: 'ファームがプレートを再検査中',
+      toolhead_refill: 'ファームがツールヘッドを補充中',
     },
     holdMessage: {
       reported: 'プリンターの報告: {{message}}',
       notShown: 'プリンターには表示されなくなりました',
+    },
+    toolhead: {
+      loading: '{{slot}} をロード中。',
+      loadingAnySlot: 'スプールをロード中。',
+      loadFailed: 'ロード失敗: {{slot}}。',
+      loadFailedAnySlot: 'ロード失敗。',
+      unloadFailed: 'アンロード失敗: {{slot}}。',
+      unloadFailedAnySlot: 'アンロード失敗。',
+      answer: {
+        no_movement: 'AMS は動作しませんでした。',
+        loadActed: 'AMS は動作しましたが、ロードは完了しませんでした。',
+        unloadActed: 'AMS は動作しましたが、アンロードは完了しませんでした。',
+      },
     },
     plateCheck: {
       ignoreResume: '無視して再開',
@@ -5624,6 +5661,7 @@ export default {
       powerFailure: '電源障害',
       userCancelled: 'ユーザーによるキャンセル',
       other: 'その他',
+      printed_without_filament: 'フィラメントなしで印刷',
     },
     // Archive statuses
     statuses: {
@@ -7826,6 +7864,7 @@ export default {
       job_ended_unseen: 'ジョブ終了（未観測）',
       driver_ended: 'ファーム: 復旧によりジョブ終了',
       legacy_vision_stop: '旧プレート確認停止',
+      refill_resumed: 'ファーム: ツールヘッド補充',
     },
     external: '外部スプール',
     foreign: 'ファームのユニットではありません',

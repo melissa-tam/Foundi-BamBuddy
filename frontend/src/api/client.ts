@@ -371,7 +371,10 @@ export type PrinterIncidentKind =
   | 'power_loss'
   | 'plate_vision'
   | 'z_reference_lost'
-  | 'service_hold';
+  | 'service_hold'
+  // The farm refills an EMPTY toolhead on a printer no AMS row holds; failing,
+  // a person's hold (`models/printer_incident.KIND_TOOLHEAD_REFILL`).
+  | 'toolhead_refill';
 
 /**
  * Incident kinds that carry their OWN surface, so the generic incident chip must
@@ -677,10 +680,101 @@ export type AmsCommandOutcome =
   | 'session_changed'
   | 'held';
 
-/** `message` is the non-UI-client fallback; the UI renders copy keyed off `outcome`. */
+/**
+ * The posture FAMILY an operator AMS command was sent into (`schemas/printer.AmsPostureFamily`):
+ *   - `mid_change`     inside the paused print's own filament change, where a command the
+ *                      firmware acknowledges is held behind that change
+ *   - `outside_change` every other posture
+ */
+export type AmsPostureFamily = 'mid_change' | 'outside_change';
+
+/**
+ * `message` is the non-UI-client fallback; the UI renders copy keyed off `outcome` and,
+ * where the copy differs by posture, `family` (null only on a refusal, which never
+ * reaches a 200).
+ */
 export interface AmsCommandResult {
   outcome: AmsCommandOutcome;
   message: string;
+  family: AmsPostureFamily | null;
+}
+
+/**
+ * `POST /printers/{id}/print/resume` 200 body (`schemas/printer.PrintResumeResponse`):
+ *   - `resumed`   the resume went out (the toolhead read fed, or the firmware feeds it itself)
+ *   - `refilling` the toolhead read EMPTY: the farm loads `slot` first (null when the swap's
+ *                 selection decides) and resumes once the load reached the toolhead. Answered
+ *                 at once; the outcome arrives through `PrinterStatus.toolhead`.
+ * `message` is the non-UI-client fallback.
+ */
+export type PrintResumeResponse =
+  | { success: boolean; status: 'resumed'; slot: null; message: string }
+  | { success: boolean; status: 'refilling'; slot: string | null; message: string };
+
+/**
+ * Why a resume of a paused print was REFUSED (`schemas/printer.ResumeRefusalReason`) — the
+ * resume verb's own two (`not_paused`, `farm_acting`), then the refill verdict's reasons
+ * whose resume would print air.
+ */
+export type ResumeRefusalReason =
+  | 'not_paused'
+  | 'farm_acting'
+  | 'maintenance'
+  | 'unknown'
+  | 'command_pending'
+  | 'physical';
+
+/**
+ * The 409 `detail` of a refused resume (`schemas/printer.PrintResumeRefusal`): nothing was
+ * sent. Arrives on `ApiError.detail`; read it through `utils/printResume.resumeRefusalOf`.
+ */
+export interface PrintResumeRefusal {
+  reason: ResumeRefusalReason;
+  slot: string | null;
+  answer: string | null;
+  message: string;
+}
+
+/**
+ * `POST /printers/{id}/hms/execute-action` 200 body. A press that went out answers as it
+ * always has (no `status`); a dialog button that RESUMES a paused print over an empty
+ * toolhead answers `refilling` at once, exactly like `PrintResumeResponse`.
+ */
+export type HmsActionResult =
+  | { success: boolean; message: string; status?: undefined }
+  | { success: boolean; status: 'refilling'; slot: string | null; message: string };
+
+/** What the AMS answered a farm motion command that did not reach its end. */
+export type ToolheadRefillAnswer = 'no_movement' | 'acted';
+
+/** The farm motion step a refill state names: the load in flight, or the step that failed. */
+export type ToolheadRefillCommand = 'load' | 'unload';
+
+/**
+ * The farm's refill of an empty toolhead (`schemas/printer.ToolheadRefillState`):
+ * `loading` while a refill (or a recovery driver's load) is in flight, `failed` once the
+ * open row's last command did not reach its end. `command` is that step — always `load`
+ * while loading; for `failed`, the load or the unload before it. Absent on a backend
+ * predating the field, which only ever reported a load: read it as `load`.
+ */
+export type ToolheadRefillState =
+  | { phase: 'loading'; slot: string | null; answer: null; command?: 'load' }
+  | {
+      phase: 'failed';
+      slot: string | null;
+      answer: ToolheadRefillAnswer | null;
+      command?: ToolheadRefillCommand;
+    };
+
+/**
+ * `PrinterStatus.toolhead` (`schemas/printer.ToolheadState`): the ACTIVE extruder's feed —
+ * `fed` (an AMS feeder, `tray` set) / `external` / `empty` / `unknown` (nothing read) — and
+ * the farm's refill of it, set only while the feed reads empty or unknown.
+ */
+export interface ToolheadState {
+  feed: 'fed' | 'external' | 'empty' | 'unknown';
+  tray: number | null;
+  refill: ToolheadRefillState | null;
 }
 
 export interface NozzleInfo {
@@ -894,6 +988,11 @@ export interface PrinterStatus {
   // dialog on the held job. Its own field because `open_incident` shows only the
   // top-ranked hold. Never re-derive it from `open_incident` or `hms_errors`.
   plate_check_exit?: PlateCheckExit | null;
+  // The ACTIVE extruder's feed and the farm's refill of it — what the card's
+  // "Toolhead empty" chip reads (`utils/incidentChip.holdChip`). Same backend
+  // builder for both REST branches and the WS frame; never re-derived from
+  // `tray_now` here.
+  toolhead?: ToolheadState | null;
   // Operator maintenance hold, mirrored onto the status frame (including the
   // disconnected branch) so a card rendered from a stale fleet list still shows
   // it. `Printer.service_hold` is the primary origin; this is the fallback.
@@ -4501,8 +4600,10 @@ export const api = {
     request<{ success: boolean; message: string }>(`/printers/${printerId}/print/pause`, {
       method: 'POST',
     }),
+  // A refused resume (nothing sent, never a resume onto an empty toolhead) is a
+  // 409 whose detail is a `PrintResumeRefusal`.
   resumePrint: (printerId: number) =>
-    request<{ success: boolean; message: string }>(`/printers/${printerId}/print/resume`, {
+    request<PrintResumeResponse>(`/printers/${printerId}/print/resume`, {
       method: 'POST',
     }),
   clearPlate: (printerId: number) =>
@@ -4698,8 +4799,10 @@ export const api = {
   // HMS Errors
   clearHMSErrors: (printerId: number) =>
     request<{ success: boolean; message: string }>(`/printers/${printerId}/hms/clear`, { method: 'POST' }),
+  // A resume button refused over an empty toolhead is a 409 whose detail is a
+  // `PrintResumeRefusal`, as on `resumePrint`.
   executeHMSAction: (printerId: number, data: HMSActionBody) =>
-    request<{ success: boolean; message: string }>(`/printers/${printerId}/hms/execute-action`, {
+    request<HmsActionResult>(`/printers/${printerId}/hms/execute-action`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),

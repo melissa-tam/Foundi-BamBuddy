@@ -206,6 +206,7 @@ export default {
         staggerHold: 'Warten auf das Strom-Staffelungsfenster — startet in Kürze',
         spoolJamRecovering: 'Spulenstau — Wechsel auf eine andere Spule und Fortsetzen',
         spoolJamRecoveryFailed: 'Spulenstau-Wiederherstellung fehlgeschlagen — Drucker für einen Menschen pausiert',
+        toolheadEmpty: 'Pausiert mit leerem Druckkopf',
       },
       printerState: {
         ok: 'Bereit',
@@ -878,6 +879,18 @@ export default {
       amsCommandSessionChanged: 'Drucker während des Befehls neu verbunden. AMS prüfen.',
       amsLoadHeld: 'Laden angenommen. Wartet hinter dem Filamentwechsel des pausierten Drucks.',
       amsUnloadHeld: 'Entladen angenommen. Wartet hinter dem Filamentwechsel des pausierten Drucks.',
+      amsLoadHeldOutsideChange: 'Laden angenommen. Noch nicht ausgeführt.',
+      amsUnloadHeldOutsideChange: 'Entladen angenommen. Noch nicht ausgeführt. Das AMS kann es später ohne weiteren Befehl ausführen.',
+      resumeRefilling: 'Druckkopf leer. {{slot}} wird geladen, dann wird fortgesetzt.',
+      resumeRefillingAnySlot: 'Druckkopf leer. Eine Spule wird geladen, dann wird fortgesetzt.',
+      resumeRefused: {
+        not_paused: 'Druck ist nicht pausiert.',
+        farm_acting: 'Wiederherstellung auf diesem Drucker läuft. Fortsetzen abgelehnt.',
+        maintenance: 'Druckkopf leer. Wartungsmodus: Die Farm lädt nichts. Einen Slot laden, dann fortsetzen.',
+        unknown: 'Druckkopf nicht lesbar: keine Live-Meldung vom Drucker. Fortsetzen abgelehnt.',
+        command_pending: 'Druckkopf leer. Das AMS hält noch den eingereihten Befehl der Farm; die Farm füllt den Druckkopf nach, sobald er ausgeführt wird.',
+        physical: 'Druckkopf leer. Ein physischer Fehler blockiert den Filamentweg. Beheben und einen Slot laden, dann fortsetzen.',
+      },
     },
     // Connection status
     connection: {
@@ -1127,6 +1140,14 @@ export default {
       partial: '{{succeeded}} erfolgreich, {{failed}} fehlgeschlagen',
       noneApplicable: 'Keine ausgewählten Drucker sind im richtigen Zustand für diese Aktion',
       selectByState: 'Nach Status auswählen',
+      resumeResumed_one: '{{count}} Drucker fortgesetzt.',
+      resumeResumed_other: '{{count}} Drucker fortgesetzt.',
+      resumeRefilling_one: 'Druckkopf leer auf {{count}} Drucker: wird geladen, dann fortgesetzt.',
+      resumeRefilling_other: 'Druckkopf leer auf {{count}} Druckern: wird geladen, dann fortgesetzt.',
+      resumeRefused_one: 'Fortsetzen auf {{count}} Drucker abgelehnt.',
+      resumeRefused_other: 'Fortsetzen auf {{count}} Druckern abgelehnt.',
+      resumeFailed_one: 'Fortsetzen auf {{count}} Drucker fehlgeschlagen.',
+      resumeFailed_other: 'Fortsetzen auf {{count}} Druckern fehlgeschlagen.',
     },
     // Discovery
     discovery: {
@@ -1258,6 +1279,7 @@ export default {
       plate_vision: 'Plattenprüfung',
       z_reference_lost: 'Z-Referenz verloren',
       recovering: 'Wiederherstellung',
+      toolhead_refill: 'Druckkopf leer',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1269,13 +1291,28 @@ export default {
       power_loss: 'Am Drucker fortsetzen',
       plate_vision: 'Ignorieren und fortsetzen oder den Druck stoppen',
       z_reference_lost: 'Nach Neustart liegt ein Teil auf der Platte — von Hand entfernen, dann „Platte als freigegeben markieren“',
+      toolhead_refill: 'Einen Slot laden, dann fortsetzen.',
     },
     incidentRecoveringAction: {
       plate_vision: 'Die Farm prüft die Platte erneut',
+      toolhead_refill: 'Die Farm füllt den Druckkopf nach',
     },
     holdMessage: {
       reported: 'Drucker meldete: {{message}}',
       notShown: 'Wird am Drucker nicht mehr angezeigt',
+    },
+    toolhead: {
+      loading: '{{slot}} wird geladen.',
+      loadingAnySlot: 'Eine Spule wird geladen.',
+      loadFailed: 'Laden fehlgeschlagen: {{slot}}.',
+      loadFailedAnySlot: 'Laden fehlgeschlagen.',
+      unloadFailed: 'Entladen fehlgeschlagen: {{slot}}.',
+      unloadFailedAnySlot: 'Entladen fehlgeschlagen.',
+      answer: {
+        no_movement: 'AMS hat sich nicht bewegt.',
+        loadActed: 'AMS hat sich bewegt, aber das Laden wurde nicht abgeschlossen.',
+        unloadActed: 'AMS hat sich bewegt, aber das Entladen wurde nicht abgeschlossen.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorieren und fortsetzen',
@@ -5623,6 +5660,7 @@ export default {
       powerFailure: 'Stromausfall',
       userCancelled: 'Vom Benutzer abgebrochen',
       other: 'Sonstiges',
+      printed_without_filament: 'Ohne Filament gedruckt',
     },
     // Archive statuses
     statuses: {
@@ -7827,6 +7865,7 @@ export default {
       job_ended_unseen: 'Auftrag unbeobachtet beendet',
       driver_ended: 'Farm: Auftrag durch Wiederherstellung beendet',
       legacy_vision_stop: 'Alter Stopp der Plattenprüfung',
+      refill_resumed: 'Farm: Druckkopf nachgefüllt',
     },
     external: 'Externe Spule',
     foreign: 'Keine Farm-Einheit',

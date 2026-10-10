@@ -42,6 +42,8 @@ export type IncidentResolveSource =
   | 'driver_swap'
   | 'driver_self_heal'
   | 'driver_restart'
+  // The refill driver refilled an EMPTY toolhead and its resume ran fed.
+  | 'refill_resumed'
   | 'startup_rearm'
   | 'recheck_passed'
   | 'plate_refused'

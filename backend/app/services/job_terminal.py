@@ -64,6 +64,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services import farm_policy, print_binding
 from backend.app.services.farm_correlation import STOP_SOURCE_RECONCILE_UNKNOWN
+from backend.app.services.job_extent import ChargedExtent
 from backend.app.services.mqtt_relay import mqtt_relay
 from backend.app.services.plate_occupancy import DepositEvidence
 from backend.app.services.print_log import write_log_entry
@@ -113,21 +114,22 @@ async def announce_archive_closed(archive_id: int, *, status: str, print_name: s
 def compute_run_filament_grams(
     charge: ChargeBasis,
     archive_filament_used_grams: float | None,
-    last_progress: float | int | None,
+    extent: ChargedExtent | None,
     usage_results: list[dict] | None,
 ) -> float | None:
     """Per-run filament for PrintLogEntry, partial- and tracker-aware (#1378, #1390).
 
-    The grams a run is RECORDED as having used follow the same basis as the grams it is
-    CHARGED (``terminal_outcome.ChargeBasis``), so the print log (Stats, the accounting feed)
-    and the spool ledger tell one story. Priority:
+    The grams a run is RECORDED as having used follow the same basis AND extent as the grams it
+    is CHARGED (``terminal_outcome.ChargeBasis``, ``job_extent.ChargedExtent``), so the print log
+    (Stats, the accounting feed) and the spool ledger tell one story. Priority:
         1. Sum of tracked spool deltas in ``usage_results`` (AMS-measured
            weight delta — same source that drives "Total Consumed" on the
            Inventory page, so Stats and Inventory totals stay aligned).
         2. ``full``: the slicer estimate (no tracker available, fall back to
            the canonical "this print used X" value).
-        3. ``partial``: ``estimate * last_progress%`` — the job's OWN last
-           progress, off its terminal payload, never the live printer's.
+        3. ``partial``: ``estimate * extent.fraction`` — the share the job FED, off
+           its terminal payload (its last progress, ending at the first layer it
+           printed with nothing fed), never the live printer's.
         4. ``None`` — a ``none`` basis, or a partial with nothing to scale: nobody
            measured the run, so the row states no grams rather than inventing them.
     """
@@ -138,10 +140,8 @@ def compute_run_filament_grams(
     if charge == "full":
         return archive_filament_used_grams
 
-    if charge == "partial" and archive_filament_used_grams:
-        scale = max(0.0, min(((last_progress or 0) / 100.0), 1.0))
-        if scale > 0:
-            return round(archive_filament_used_grams * scale, 1)
+    if charge == "partial" and archive_filament_used_grams and extent is not None and extent.fraction > 0:
+        return round(archive_filament_used_grams * extent.fraction, 1)
 
     return None
 
@@ -154,7 +154,7 @@ async def write_run_log(
     printer_name: str | None,
     status: str,
     charge: ChargeBasis,
-    last_progress: float | int | None,
+    extent: ChargedExtent | None,
     usage_results: list[dict] | None,
     print_user: dict | None,
 ) -> PrintLogEntry:
@@ -165,8 +165,8 @@ async def write_run_log(
     read AFTER its close (``completed_at`` and ``failure_reason`` are the close's).
 
     ``status`` is the recorded word; the grams and the cost follow ``charge`` — the run's charge
-    basis — and ``last_progress``, the job's own last progress off its terminal payload (None
-    where no terminal was observed), exactly as the spool charge does
+    basis — and ``extent``, how far the job fed by its terminal payload (``JobExtent.charged_extent``;
+    None where no terminal was observed), exactly as the spool charge does
     (:func:`compute_run_filament_grams`).
 
     Back-fills ``created_by_id`` on an unattributed archive from the print-session user (#730):
@@ -178,7 +178,7 @@ async def write_run_log(
     print_user_id = print_user.get("user_id") if print_user else None
     if archive.created_by_id is None and print_user_id is not None:
         archive.created_by_id = print_user_id
-    run_grams = compute_run_filament_grams(charge, archive.filament_used_grams, last_progress, usage_results)
+    run_grams = compute_run_filament_grams(charge, archive.filament_used_grams, extent, usage_results)
 
     # Per-run cost — prefer the usage_results sum. For partial prints the topup-to-estimate logic
     # in usage_tracker (which assumes the print completed) is deliberately skipped; the raw
@@ -575,8 +575,9 @@ async def _charge_spoolman(printer_id: int, data: dict, outcome: TerminalOutcome
     """The Spoolman lane of the charge, on the outcome's basis — every basis retires the tracking row.
 
     ``full`` reports the plate's usage (``spoolman_tracking.report_usage``); ``partial`` reports the
-    share the job's OWN evidence measures (its terminal payload — ``usage_tracker.JobEvidence``,
-    never the live printer's layer); ``none`` reports nothing — nobody measured the job.
+    share the job's OWN evidence says it fed (its terminal payload — ``usage_tracker.JobEvidence``'s
+    ``charged_extent``, never the live printer's layer); ``none`` reports nothing — nobody measured
+    the job.
     """
     from backend.app.services import spoolman_tracking
     from backend.app.services.usage_tracker import JobEvidence
@@ -649,7 +650,7 @@ async def close_observed(
             # The unit's own terminal recorded how the run ended: a completed run ran the whole
             # plate; any other end was measured by nobody here (no peaks reach this lane).
             charge="full" if run_unit.status == "completed" else "none",
-            last_progress=None,
+            extent=None,
             usage_results=None,
             print_user=None,
         )
@@ -705,7 +706,7 @@ async def close_superseded(
         printer_name=_printer_name(printer_id),
         status="cancelled",
         charge="none",  # an unobserved end — :func:`unobserved_outcome`'s basis, by construction
-        last_progress=None,
+        extent=None,
         usage_results=None,
         print_user=None,
     )

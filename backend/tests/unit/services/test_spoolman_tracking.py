@@ -465,6 +465,68 @@ class TestTheSpoolmanChargeFollowsTheTerminalsOwnEvidence:
         assert report.await_args.args[1] == [(1, 40.0)]
         live.get_status.assert_not_called()
 
+    @staticmethod
+    async def _partial_report(evidence, *, layer_usage=None):
+        """Drive ``_report_partial_usage`` over a 167 g plate; what each slot was reported, and the
+        layer the G-code cumulative was read at (when it was)."""
+        from backend.app.services.spoolman_tracking import _report_partial_usage
+
+        tracking = SimpleNamespace(
+            archive_id=7,
+            filament_usage=[{"slot_id": 1, "used_g": 167.0}],
+            layer_usage=layer_usage,
+            filament_properties={"1": {"density": 1.24}},
+            ams_trays={},
+            slot_to_tray=None,
+            tray_remain_start={},
+        )
+        report = AsyncMock(return_value=1)
+        cumulative = MagicMock(side_effect=lambda usage, layer: {0: layer * 100.0})
+        with (
+            patch("backend.app.api.routes.settings.get_setting", AsyncMock(return_value="true")),
+            patch("backend.app.services.spoolman_tracking._get_spoolman_client_with_fallback", AsyncMock()),
+            patch("backend.app.services.spoolman_tracking._get_printer_serial", AsyncMock(return_value="serial")),
+            patch("backend.app.services.spoolman_tracking._report_spool_usage_for_slots", report),
+            patch("backend.app.utils.threemf_tools.get_cumulative_usage_at_layer", cumulative),
+            patch("backend.app.utils.threemf_tools.mm_to_grams", lambda mm, d, dens: mm * 0.01),
+        ):
+            await _report_partial_usage(1, tracking, evidence)
+        read_at = cumulative.call_args.args[1] if cumulative.called else None
+        return report.await_args.args[1], read_at
+
+    @pytest.mark.parametrize(
+        ("payload", "fed_to"),
+        [
+            pytest.param(
+                {
+                    "last_layer_num": 142,
+                    "last_progress": 85.0,
+                    "total_layers": 167,
+                    "first_unfed_layer": 134,
+                },
+                134,
+                id="the_4289_stop_reports_what_fed_before_134",
+            ),
+            pytest.param(
+                {"last_layer_num": 167, "last_progress": 100.0, "total_layers": 167, "first_unfed_layer": 93},
+                93,
+                id="the_011_finish_reports_what_fed_before_93",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("gcode", [False, True], ids=["linear", "gcode_cumulative"])
+    @pytest.mark.asyncio
+    async def test_a_partial_report_ends_at_the_first_layer_printed_without_filament(self, payload, fed_to, gcode):
+        """Layers printed with nothing fed are reported to no spool — one gram per layer here."""
+        from backend.app.services.usage_tracker import JobEvidence
+
+        reported, read_at = await self._partial_report(
+            JobEvidence.from_payload(payload), layer_usage={"0": {"0": 0.0}} if gcode else None
+        )
+
+        assert reported == [(1, float(fed_to))]
+        assert read_at == (fed_to if gcode else None)
+
     @pytest.mark.asyncio
     async def test_a_none_basis_reports_nothing_and_still_retires_the_row(self):
         from backend.app.services import spoolman_tracking

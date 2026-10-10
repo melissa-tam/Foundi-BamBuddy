@@ -206,6 +206,7 @@ export default {
         staggerHold: 'Aguardando a janela de escalonamento de energia — começa em breve',
         spoolJamRecovering: 'Travamento de bobina — trocando para outra bobina e retomando',
         spoolJamRecoveryFailed: 'Falha na recuperação do travamento de bobina — impressora deixada em pausa para uma pessoa',
+        toolheadEmpty: 'Pausada com o cabeçote vazio',
       },
       printerState: {
         ok: 'Pronta',
@@ -878,6 +879,18 @@ export default {
       amsCommandSessionChanged: 'A impressora reconectou durante o comando. Verifique o AMS.',
       amsLoadHeld: 'Carregamento aceito. Retido atrás da troca de filamento da impressão pausada.',
       amsUnloadHeld: 'Descarregamento aceito. Retido atrás da troca de filamento da impressão pausada.',
+      amsLoadHeldOutsideChange: 'Carregamento aceito. Ainda não executado.',
+      amsUnloadHeldOutsideChange: 'Descarregamento aceito. Ainda não executado. O AMS pode executá-lo mais tarde sem outro comando.',
+      resumeRefilling: 'Cabeçote vazio. Carregando {{slot}} e depois retomando.',
+      resumeRefillingAnySlot: 'Cabeçote vazio. Carregando uma bobina e depois retomando.',
+      resumeRefused: {
+        not_paused: 'A impressão não está pausada.',
+        farm_acting: 'Recuperação em andamento nesta impressora. Retomada recusada.',
+        maintenance: 'Cabeçote vazio. Modo manutenção: a fazenda não carrega nada. Carregue um slot e depois retome.',
+        unknown: 'Cabeçote ilegível: nenhum relatório ao vivo da impressora. Retomada recusada.',
+        command_pending: 'Cabeçote vazio. O AMS ainda retém o comando enfileirado da fazenda; a fazenda reabastece o cabeçote quando ele for executado.',
+        physical: 'Cabeçote vazio. Uma falha física bloqueia o caminho do filamento. Resolva-a e carregue um slot, depois retome.',
+      },
     },
     // Connection status
     connection: {
@@ -1127,6 +1140,14 @@ export default {
       partial: '{{succeeded}} bem-sucedido(s), {{failed}} falhou/falharam',
       noneApplicable: 'Nenhuma impressora selecionada está no estado correto para esta ação',
       selectByState: 'Selecionar por estado',
+      resumeResumed_one: '{{count}} impressora retomada.',
+      resumeResumed_other: '{{count}} impressoras retomadas.',
+      resumeRefilling_one: 'Cabeçote vazio em {{count}} impressora: carregando e depois retomando.',
+      resumeRefilling_other: 'Cabeçote vazio em {{count}} impressoras: carregando e depois retomando.',
+      resumeRefused_one: 'Retomada recusada em {{count}} impressora.',
+      resumeRefused_other: 'Retomada recusada em {{count}} impressoras.',
+      resumeFailed_one: 'Retomada falhou em {{count}} impressora.',
+      resumeFailed_other: 'Retomada falhou em {{count}} impressoras.',
     },
     // Discovery
     discovery: {
@@ -1258,6 +1279,7 @@ export default {
       plate_vision: 'Verificação da placa',
       z_reference_lost: 'Referência Z perdida',
       recovering: 'Recuperando',
+      toolhead_refill: 'Cabeçote vazio',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1269,13 +1291,28 @@ export default {
       power_loss: 'Retome na impressora',
       plate_vision: 'Ignorar e retomar, ou parar a impressão',
       z_reference_lost: 'Reiniciada com uma peça na placa — remova-a à mão e depois «Marcar placa como liberada»',
+      toolhead_refill: 'Carregue um slot e depois retome.',
     },
     incidentRecoveringAction: {
       plate_vision: 'A fazenda está verificando a placa novamente',
+      toolhead_refill: 'A fazenda está reabastecendo o cabeçote',
     },
     holdMessage: {
       reported: 'A impressora informou: {{message}}',
       notShown: 'Não é mais exibido na impressora',
+    },
+    toolhead: {
+      loading: 'Carregando {{slot}}.',
+      loadingAnySlot: 'Carregando uma bobina.',
+      loadFailed: 'Falha no carregamento: {{slot}}.',
+      loadFailedAnySlot: 'Falha no carregamento.',
+      unloadFailed: 'Falha no descarregamento: {{slot}}.',
+      unloadFailedAnySlot: 'Falha no descarregamento.',
+      answer: {
+        no_movement: 'O AMS não se moveu.',
+        loadActed: 'O AMS se moveu, mas o carregamento não terminou.',
+        unloadActed: 'O AMS se moveu, mas o descarregamento não terminou.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorar e retomar',
@@ -5612,6 +5649,7 @@ export default {
       powerFailure: 'Falha de energia',
       userCancelled: 'Cancelado pelo usuário',
       other: 'Outro',
+      printed_without_filament: 'Impresso sem filamento',
     },
     // Archive statuses
     statuses: {
@@ -7814,6 +7852,7 @@ export default {
       job_ended_unseen: 'Trabalho encerrado sem observação',
       driver_ended: 'Fazenda: trabalho encerrado pela recuperação',
       legacy_vision_stop: 'Parada antiga da verificação da placa',
+      refill_resumed: 'Fazenda: reabastecimento do cabeçote',
     },
     external: 'Carretel externo',
     foreign: 'Não é unidade da fazenda',

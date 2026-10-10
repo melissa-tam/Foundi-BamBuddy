@@ -29,6 +29,8 @@ const INCIDENT_KINDS: Record<PrinterIncidentKind, true> = {
   z_reference_lost: true,
   // The operator's own maintenance hold: chip-suppressed, see below.
   service_hold: true,
+  // The farm's refill of an empty toolhead.
+  toolhead_refill: true,
 };
 
 describe('printer incident chip labels', () => {

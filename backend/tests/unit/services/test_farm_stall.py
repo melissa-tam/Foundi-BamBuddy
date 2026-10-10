@@ -615,9 +615,9 @@ class TestAttentionReminders:
         # ...and EVERY incident kind has reminder copy, so a new kind cannot land
         # silently. Derived from the model's own kind sets rather than a literal, since
         # a hand-listed expectation is exactly what let three kinds ship without copy.
-        from backend.app.models.printer_incident import AMS_FAULT_KINDS, PAUSE_CAUSE_KINDS
+        from backend.app.models.printer_incident import FAULT_KINDS
 
-        assert set(farm_stall._INCIDENT_REMINDER_DETAIL) == AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS
+        assert set(farm_stall._INCIDENT_REMINDER_DETAIL) == FAULT_KINDS
 
 
 class TestSchedulerHookGuard:
@@ -1359,6 +1359,33 @@ class TestRemindOpenIncidentsNonPause:
             await farm_stall.check_attention_reminders(db_session, manager=mgr, now=_W)
             mock_n.assert_not_awaited()
 
+    @pytest.mark.parametrize("live", ["RUNNING", "PREPARE"])
+    async def test_a_hold_the_farm_keeps_open_over_a_running_print_never_nags(self, db_session, live):
+        """2026-10-10 (K11): a person's screen Retry resumed the print over the farm's pending
+        pull-back, so the row stays OPEN (escalated) while the print RUNS — the farm owns what the
+        queued command does (the per-push detector refills when it runs). Neither reminder copy is
+        true of a printing job ("still PAUSED", "idle", "has ended"), and nothing waits on a person:
+        no page, however long it runs."""
+        from backend.app.services import printer_incidents
+
+        await _add_incident_held(db_session, 66, "jam", item=False)
+        row = await printer_incidents.get_open(db_session, 66)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind="command", name="unload", feeder="jammed")
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="held")
+        mgr = _FakeManager({66: True}, {66: _FakeState(live)})
+        with patch.object(notification_service, "on_spool_recovery_failed", new_callable=AsyncMock) as mock_n:
+            for now in (0.0, _W, 2 * _W, 3 * _W):
+                await farm_stall.check_attention_reminders(db_session, manager=mgr, now=now)
+            mock_n.assert_not_awaited()
+
+            # The print pauses again (a re-jam): the hold is a person's now, nagged one window later.
+            mgr._states[66] = _FakeState("PAUSE")
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=3 * _W + 1)
+            mock_n.assert_not_awaited()
+            await farm_stall.check_attention_reminders(db_session, manager=mgr, now=4 * _W + 1)
+            mock_n.assert_awaited_once()
+            assert mock_n.await_args.kwargs["job_ended"] is False
+
     async def test_every_incident_kind_has_non_pause_copy(self):
         """A new incident kind must not land with a hole where its nag should be.
 
@@ -1372,9 +1399,9 @@ class TestRemindOpenIncidentsNonPause:
         skipped whole (``automation_held``). Copy for a branch that cannot execute would
         be worse than no copy — it would imply the nag exists.
         """
-        from backend.app.models.printer_incident import AMS_FAULT_KINDS, DECLARED_KINDS, PAUSE_CAUSE_KINDS
+        from backend.app.models.printer_incident import DECLARED_KINDS, FAULT_KINDS
 
-        faults = AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS
+        faults = FAULT_KINDS
         assert set(farm_stall._INCIDENT_REMINDER_DETAIL_UNPAUSED) == faults
         assert set(farm_stall._INCIDENT_REMINDER_DETAIL) == faults
         assert not (DECLARED_KINDS & set(farm_stall._INCIDENT_REMINDER_DETAIL))
@@ -1679,10 +1706,10 @@ class TestAttendedPauseDerivation:
     un-attended and start double-notifying the moment it ships."""
 
     async def test_every_incident_kinds_token_is_attended(self):
-        from backend.app.models.printer_incident import AMS_FAULT_KINDS, PAUSE_CAUSE_KINDS
+        from backend.app.models.printer_incident import FAULT_KINDS
         from backend.app.services import printer_incidents
 
-        for kind in AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS:
+        for kind in FAULT_KINDS:
             assert printer_incidents.waiting_reason_for(kind) in farm_stall._ATTENDED_PAUSE_REASONS
 
     async def test_the_recovering_token_stays_unattended(self):

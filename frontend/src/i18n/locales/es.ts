@@ -206,6 +206,7 @@ export default {
         staggerHold: 'Esperando la ventana de escalonamiento de energía — comenzará en breve',
         spoolJamRecovering: 'Atasco de bobina — cambiando a otra bobina y reanudando',
         spoolJamRecoveryFailed: 'Falló la recuperación del atasco de bobina — impresora en pausa para una persona',
+        toolheadEmpty: 'En pausa con el cabezal vacío',
       },
       printerState: {
         ok: 'Lista',
@@ -878,6 +879,18 @@ export default {
       amsCommandSessionChanged: 'La impresora se reconectó durante el comando. Revise el AMS.',
       amsLoadHeld: 'Carga aceptada. Retenida tras el cambio de filamento de la impresión en pausa.',
       amsUnloadHeld: 'Descarga aceptada. Retenida tras el cambio de filamento de la impresión en pausa.',
+      amsLoadHeldOutsideChange: 'Carga aceptada. Aún no ejecutada.',
+      amsUnloadHeldOutsideChange: 'Descarga aceptada. Aún no ejecutada. El AMS puede ejecutarla más tarde sin otro comando.',
+      resumeRefilling: 'Cabezal vacío. Cargando {{slot}} y luego reanudando.',
+      resumeRefillingAnySlot: 'Cabezal vacío. Cargando una bobina y luego reanudando.',
+      resumeRefused: {
+        not_paused: 'La impresión no está en pausa.',
+        farm_acting: 'Recuperación en curso en esta impresora. Reanudación rechazada.',
+        maintenance: 'Cabezal vacío. Modo mantenimiento: la granja no carga nada. Cargue una ranura y luego reanude.',
+        unknown: 'Cabezal ilegible: sin informe en vivo de la impresora. Reanudación rechazada.',
+        command_pending: 'Cabezal vacío. El AMS aún retiene el comando en cola de la granja; la granja recarga el cabezal cuando se ejecute.',
+        physical: 'Cabezal vacío. Un fallo físico bloquea la vía de filamento. Resuélvalo, cargue una ranura y luego reanude.',
+      },
     },
     // Connection status
     connection: {
@@ -1127,6 +1140,14 @@ export default {
       partial: '{{succeeded}} con éxito, {{failed}} con error',
       noneApplicable: 'Ninguna de las impresoras seleccionadas está en el estado adecuado para esta acción',
       selectByState: 'Seleccionar por estado',
+      resumeResumed_one: '{{count}} impresora reanudada.',
+      resumeResumed_other: '{{count}} impresoras reanudadas.',
+      resumeRefilling_one: 'Cabezal vacío en {{count}} impresora: cargando y luego reanudando.',
+      resumeRefilling_other: 'Cabezal vacío en {{count}} impresoras: cargando y luego reanudando.',
+      resumeRefused_one: 'Reanudación rechazada en {{count}} impresora.',
+      resumeRefused_other: 'Reanudación rechazada en {{count}} impresoras.',
+      resumeFailed_one: 'Reanudación fallida en {{count}} impresora.',
+      resumeFailed_other: 'Reanudación fallida en {{count}} impresoras.',
     },
     // Discovery
     discovery: {
@@ -1258,6 +1279,7 @@ export default {
       plate_vision: 'Comprobación de la cama',
       z_reference_lost: 'Referencia Z perdida',
       recovering: 'Recuperando',
+      toolhead_refill: 'Cabezal vacío',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1269,13 +1291,28 @@ export default {
       power_loss: 'Reanude en la impresora',
       plate_vision: 'Ignorar y reanudar, o detener la impresión',
       z_reference_lost: 'Reiniciada con una pieza en la cama — retírela a mano y luego «Marcar cama como despejada»',
+      toolhead_refill: 'Cargue una ranura y luego reanude.',
     },
     incidentRecoveringAction: {
       plate_vision: 'La granja está volviendo a comprobar la cama',
+      toolhead_refill: 'La granja está recargando el cabezal',
     },
     holdMessage: {
       reported: 'La impresora informó: {{message}}',
       notShown: 'Ya no se muestra en la impresora',
+    },
+    toolhead: {
+      loading: 'Cargando {{slot}}.',
+      loadingAnySlot: 'Cargando una bobina.',
+      loadFailed: 'Carga fallida: {{slot}}.',
+      loadFailedAnySlot: 'Carga fallida.',
+      unloadFailed: 'Descarga fallida: {{slot}}.',
+      unloadFailedAnySlot: 'Descarga fallida.',
+      answer: {
+        no_movement: 'El AMS no se movió.',
+        loadActed: 'El AMS se movió, pero la carga no terminó.',
+        unloadActed: 'El AMS se movió, pero la descarga no terminó.',
+      },
     },
     plateCheck: {
       ignoreResume: 'Ignorar y reanudar',
@@ -5632,6 +5669,7 @@ export default {
       powerFailure: 'Corte de corriente',
       userCancelled: 'Cancelada por el usuario',
       other: 'Otro',
+      printed_without_filament: 'Impreso sin filamento',
     },
     // Archive statuses
     statuses: {
@@ -7836,6 +7874,7 @@ export default {
       job_ended_unseen: 'Trabajo finalizado sin observar',
       driver_ended: 'Granja: trabajo finalizado por la recuperación',
       legacy_vision_stop: 'Parada antigua de revisión de cama',
+      refill_resumed: 'Granja: recarga del cabezal',
     },
     external: 'Bobina externa',
     foreign: 'No es unidad de la granja',

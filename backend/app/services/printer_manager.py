@@ -1316,6 +1316,29 @@ def open_incident_payload(printer_id: int | None) -> dict | None:
     return printer_incidents.snapshot(printer_id)
 
 
+def toolhead_payload(printer_id: int | None, state: PrinterState | None) -> dict:
+    """The printer's ACTIVE extruder feed and the farm's refill of it, as the card's "Toolhead empty"
+    chip reads it (K10/C3c, 2026-10-10): ``{"feed", "tray", "refill"}``.
+
+    DERIVED on every broadcast, never stored: ``feed`` / ``tray`` are ``tray_fields.toolhead_feed``'s
+    ACTIVE reading (K1 — the one reader of "is the toolhead fed"; on a dual nozzle an empty active
+    nozzle beside a loaded one is empty), and ``refill`` is ``printer_incidents.refill_state``
+    (``{"phase", "command", "slot", "answer"}`` — the open-row projection and the liveness slot,
+    passed through as is) — carried only while the feed reads empty or unknown,
+    because a toolhead that reads fed again was loaded, and a failed refill under it is history.
+
+    ONE builder for all three construction sites (the WS serializer below and BOTH REST ``/status``
+    branches), like :func:`open_incident_payload`. JSON primitives only. Total: ``state`` may be
+    ``None`` (no session) — the feed is then ``unknown``.
+    """
+    from backend.app.services import printer_incidents
+    from backend.app.services.tray_fields import toolhead_feed
+
+    active = toolhead_feed(state).active
+    refill = printer_incidents.refill_state(printer_id) if active.kind in ("empty", "unknown") else None
+    return {"feed": active.kind, "tray": active.tray, "refill": refill}
+
+
 def plate_check_exit_payload(printer_id: int | None, state: PrinterState | None) -> dict | None:
     """The plate-check human's turn as the card reads it, or None (operator ruling 2026-10-05).
 
@@ -1727,6 +1750,9 @@ def printer_state_to_dict(
         # The plate-check human's turn (2026-10-05): {print_error, job_id, actions,
         # deadline_at} or null — its own field, same builder as BOTH /status branches.
         "plate_check_exit": plate_check_exit,
+        # The ACTIVE extruder's feed and the farm's refill of it (2026-10-10): {feed, tray,
+        # refill} — what the "Toolhead empty" chip reads; same builder as BOTH /status branches.
+        "toolhead": toolhead_payload(printer_id, state),
     }
     # Add cover URL if there's an active print and printer_id is provided
     # Include PAUSE state so skip objects modal can show cover

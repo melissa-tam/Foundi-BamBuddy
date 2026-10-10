@@ -89,6 +89,18 @@ KIND_Z_REFERENCE_LOST = "z_reference_lost"  # rebooted with a part on the plate;
 # 3. The DECLARED vocabulary — a hold no fault produced. A human declared it with a
 #    verb, and only that verb's counterpart ends it (see ``RESOLUTION_DECLARED``):
 KIND_SERVICE_HOLD = "service_hold"  # maintenance mode: hands are in the machine, every automatic lane stands down
+#
+# 4. The REFILL vocabulary (2026-10-10, K10 — ``services/spool_recovery.py``'s refill of an EMPTY
+#    toolhead, operator requirement Raymond 2026-10-10: "when i click resume there MUST be filament
+#    loaded"). Every refill runs as a registered driver of an OPEN row: it re-enters an open AMS row
+#    when the printer carries one, and opens this kind on a printer no AMS row holds (a screen
+#    resume onto an empty toolhead, a person's Resume over one). Deliberately NOT an AMS kind: the
+#    AMS exclusion index is built from ``AMS_FAULT_KINDS`` (joining it would be DDL), and the AMS
+#    entry gate would read this row as an AMS owner its outrank test cannot rank — a real jam raised
+#    by the refill's own load would then be swallowed. A FAULT kind by subtraction: an operator Stop
+#    over it means the job could not go on because the farm could not put filament at the toolhead
+#    (the farm's "POOR auto recovery mechanics", Raymond's words), so the plate goes back in line.
+KIND_TOOLHEAD_REFILL = "toolhead_refill"  # the farm refills an empty toolhead; failing, a human's hold
 
 PAUSE_CAUSE_KINDS: frozenset[str] = frozenset({KIND_POWER_LOSS, KIND_PLATE_VISION, KIND_Z_REFERENCE_LOST})
 AMS_FAULT_KINDS: frozenset[str] = frozenset({KIND_JAM, KIND_RUNOUT, KIND_PHYSICAL})
@@ -96,10 +108,11 @@ AMS_FAULT_KINDS: frozenset[str] = frozenset({KIND_JAM, KIND_RUNOUT, KIND_PHYSICA
 # automation lane reads (``printer_incidents.automation_held``) is membership in this
 # set, so a second declared kind joins the fleet-wide quiesce by registering here.
 DECLARED_KINDS: frozenset[str] = frozenset({KIND_SERVICE_HOLD})
+REFILL_KINDS: frozenset[str] = frozenset({KIND_TOOLHEAD_REFILL})
 
-# Every kind this store knows, as the UNION of the three vocabularies above — so a
-# fourth vocabulary joins by being registered rather than by being remembered here.
-ALL_KINDS: frozenset[str] = AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS
+# Every kind this store knows, as the UNION of the four vocabularies above — so a
+# fifth vocabulary joins by being registered rather than by being remembered here.
+ALL_KINDS: frozenset[str] = AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS | REFILL_KINDS
 # **A HOLD IS NOT A FAULT.** The kinds that mean *the equipment is faulted* — everything
 # a fault produced, which is everything a human did NOT simply declare. DERIVED by
 # subtraction rather than re-listed, so a new declared kind leaves this set the moment it
@@ -149,6 +162,12 @@ RECURRENCE_KINDS: frozenset[str] = FAULT_KINDS - {KIND_RUNOUT, KIND_POWER_LOSS, 
 #               would dispatch onto a printer with hands in it. "Recover the plate"
 #               and "I am done working on this machine" are two statements, and only
 #               the second may release the automation.
+# ``"toolhead"`` the paused job's ACTIVE extruder reads EMPTY and the farm is refilling it, or
+#               could not (2026-10-10, K10). A RUNNING edge is NOT its end by itself — a screen
+#               resume onto an empty toolhead runs and prints air, which is the hold — only a
+#               print running FED is; and, like a job pause, it cannot outlive its job. Recover
+#               (a human inspected the machine) ends it; a routine plate clear says nothing
+#               about the toolhead.
 #
 # Keyed on ``(kind, external)`` because the SAME class of fault returns to normal
 # differently on the two hardwares, and only the data says which. Of the 8 physical
@@ -164,6 +183,7 @@ RESOLUTION_REPAIR = "repair"
 RESOLUTION_OPERATOR = "operator"
 RESOLUTION_JOB_PAUSE = "job_pause"
 RESOLUTION_DECLARED = "declared"
+RESOLUTION_TOOLHEAD = "toolhead"
 
 RESOLVES_ON: dict[tuple[str, bool], str] = {
     (KIND_JAM, False): RESOLUTION_WIRE,
@@ -180,6 +200,8 @@ RESOLVES_ON: dict[tuple[str, bool], str] = {
     # A declared hold has no external variant either — there is no hardware for it to
     # sit on. It is a statement about the MACHINE, not about a spool path.
     (KIND_SERVICE_HOLD, False): RESOLUTION_DECLARED,
+    # The refill hold carries no fault code, so no holder variant: it is about the extruder.
+    (KIND_TOOLHEAD_REFILL, False): RESOLUTION_TOOLHEAD,
 }
 
 # Does the operator's **Recover** verb end a hold of this CLASS? One attribute per class,
@@ -194,13 +216,16 @@ RESOLVES_ON: dict[tuple[str, bool], str] = {
 #                  the class admits beside its two motion evidences;
 # * ``wire``     — no: a runout hold is not answered by somebody clearing a plate;
 # * ``job_pause`` — no: the answer is RESUME or STOP of the paused job, never a plate act;
-# * ``declared`` — no, by definition: only the verb that declared it ends it.
+# * ``declared`` — no, by definition: only the verb that declared it ends it;
+# * ``toolhead`` — yes: "an operator inspected this machine" is a statement about its toolhead,
+#                  and the next resume (T3) or a print run onto air (T4) re-derives the rest.
 RECOVER_ENDS: dict[str, bool] = {
     RESOLUTION_WIRE: False,
     RESOLUTION_REPAIR: True,
     RESOLUTION_OPERATOR: True,
     RESOLUTION_JOB_PAUSE: False,
     RESOLUTION_DECLARED: False,
+    RESOLUTION_TOOLHEAD: True,
 }
 
 # The kinds whose hold is a PAUSED JOB a human must answer (class ``job_pause``). DERIVED
@@ -225,6 +250,9 @@ KIND_PRECEDENCE: tuple[str, ...] = (
     KIND_PHYSICAL,
     KIND_RUNOUT,
     KIND_JAM,
+    # Right after the AMS head: an empty toolhead is filament, and it is what keeps the paused job
+    # from going on — but an AMS row beside it names the fault the refill is answering.
+    KIND_TOOLHEAD_REFILL,
     KIND_POWER_LOSS,
     KIND_PLATE_VISION,
     KIND_Z_REFERENCE_LOST,
@@ -300,6 +328,10 @@ RESOLVE_DRIVER_SELF_HEAL = "driver_self_heal"
 # ruling 2026-09-29, 013-H2S incidents 410/411). A farm recovery, so it counts toward
 # the zero-human tally beside the swap and the self-heal.
 RESOLVE_DRIVER_RESTART = "driver_restart"
+# The refill driver (K10, 2026-10-10) refilled an EMPTY toolhead and its own resume ran FED: the
+# farm recovered the paused job — counted with the swap, the self-heal and the restart. 14
+# characters, inside ``resolve_source``'s VARCHAR(24).
+RESOLVE_REFILL_RESUMED = "refill_resumed"
 # The startup rearm found the printer positive and closed the row: a RESTART's
 # reconciliation, not a witnessed resume — the edge itself was never observed.
 RESOLVE_REARM = "startup_rearm"

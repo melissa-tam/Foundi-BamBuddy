@@ -98,6 +98,31 @@ class TestExecuteHmsActionDispatch:
     def _all_payloads(self, client):
         return [json.loads(call.args[1]) for call in client._client.publish.call_args_list]
 
+    def test_the_resume_family_is_exactly_the_arms_that_resume_the_print(self):
+        """K9 (2026-10-10): ``DIALOG_RESUME_ACTIONS`` is the set the ``/hms/execute-action`` route
+        sends through ``spool_recovery.resume_paused_print`` — so it must be EXACTLY the buttons whose
+        frame resumes the paused print (a ``resume`` — plain or err-scoped — or an ``ignore``), read
+        off the dispatcher itself for every action: a new resume arm cannot bypass the toolhead
+        refill, and a change release (``ams_control resume``) never joins it."""
+        from backend.app.services.bambu_mqtt import DIALOG_RESUME_ACTIONS
+
+        resuming: set[str] = set()
+        for action in HMSAction:
+            client = BambuMQTTClient(ip_address="192.168.1.100", serial_number="03W-TEST", access_code="12345678")
+            client._client = MagicMock()
+            client.state.connected = True
+            client.execute_hms_action(_PLATE_ERR_HEX, action, "task-1")
+            commands = {
+                json.loads(call.args[1]).get("print", {}).get("command")
+                for call in client._client.publish.call_args_list
+            }
+            if commands & {"resume", "ignore"}:
+                resuming.add(str(action))
+        assert resuming == set(DIALOG_RESUME_ACTIONS)
+        assert {HMSAction.CONTINUE, HMSAction.RETRY_PROBLEM_SOLVED, HMSAction.NO_REMINDER_NEXT_TIME}.isdisjoint(
+            DIALOG_RESUME_ACTIONS
+        )
+
     def test_returns_none_when_disconnected(self, client):
         client.state.connected = False
         assert client.execute_hms_action(_PLATE_ERR_HEX, HMSAction.PROBLEM_SOLVED_RESUME, "") is None

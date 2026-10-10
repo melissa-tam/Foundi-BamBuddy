@@ -335,6 +335,153 @@ class TestChargeBasis:
         assert outcome.charge == "none"
 
 
+# The three production shapes of 2026-10-09 / 10, as their terminal payloads carry them (``bambu_mqtt``:
+# ``JobPeaks.terminal_fields`` + ``job_consumption_evidence``). ``first_unfed_layer`` is the lowest layer
+# the job PRINTED with its active extruder empty.
+# 011-H2S: resumed onto an empty toolhead at layer 93, ran to the end on air; the printer said FINISH.
+_SHAPE_011 = {
+    "status": "completed",
+    "peaks_reliable": True,
+    "last_layer_num": 167,
+    "last_progress": 100.0,
+    "total_layers": 167,
+    "first_unfed_layer": 93,
+}
+# 014-H2S #536: the same from layer 9.
+_SHAPE_014_536 = {
+    "status": "completed",
+    "peaks_reliable": True,
+    "last_layer_num": 48,
+    "last_progress": 100.0,
+    "total_layers": 48,
+    "first_unfed_layer": 9,
+    "tray_change_log": [(0, 0), (0, 0), (1, 6), (0, 9)],
+}
+# 014-H2S unit 4289: the operator stopped it at layer 142; nothing fed after the refill at 134.
+_SHAPE_4289 = {
+    "status": "failed",
+    "peaks_reliable": True,
+    "last_layer_num": 142,
+    "last_progress": 85.0,
+    "total_layers": 167,
+    "first_unfed_layer": 134,
+    "tray_change_log": [(0, 0), (0, 0), (1, 92), (0, 134)],
+}
+
+
+def _from_payload(payload, verdict=None, *, eject=False, dry_run=False, holds=(), hms=None, first_article=False):
+    """The outcome of a terminal built the way ``main.on_print_complete`` builds it: from its payload."""
+    return build_terminal_outcome(
+        raw_status=payload["status"],
+        verdict=verdict,
+        open_incidents=holds,
+        job_id=_JOB,
+        evidence=DepositEvidence.from_terminal_payload(payload, is_dry_run=dry_run),
+        first_article=first_article,
+        is_eject=eject,
+        hms_errors=hms,
+    )
+
+
+class TestPrintedWithoutFilament:
+    """A layer printed with NOTHING fed (``first_unfed_layer``) bounds what the job is charged and
+    what the farm records: the printer's FINISH no longer means "the whole plate fed" (011-H2S and
+    014-H2S, 2026-10-09: resumed onto an empty toolhead, ran to the end on air, recorded completed
+    and charged full grams)."""
+
+    @pytest.mark.parametrize("shape", [_SHAPE_011, _SHAPE_014_536], ids=["011", "014_536"])
+    def test_a_finish_that_printed_without_filament_is_charged_partial(self, shape):
+        assert _from_payload(shape).charge == "partial"
+
+    def test_an_operator_stop_that_printed_without_filament_is_charged_partial(self):
+        assert _from_payload(_SHAPE_4289, "operator_ui").charge == "partial"
+
+    def test_a_measured_unfed_layer_bounds_the_charge_after_an_attach_too(self):
+        """Layer numbers are absolute: a client that attached mid-job (``peaks_reliable`` False)
+        still measured the layer it watched print with nothing fed."""
+        attached = {**_SHAPE_011, "peaks_reliable": False}
+        assert _from_payload(attached).charge == "partial"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {key: value for key, value in _SHAPE_011.items() if key != "first_unfed_layer"},
+            {**_SHAPE_011, "first_unfed_layer": None},
+        ],
+        ids=["key_absent", "not_measured"],
+    )
+    def test_without_a_measured_unfed_layer_a_finish_charges_the_whole_plate(self, payload):
+        """An older payload, the reconcile's synthesis, or a job that never printed unfed: unchanged."""
+        assert _from_payload(payload).charge == "full"
+
+    @pytest.mark.parametrize("shape", [_SHAPE_011, _SHAPE_014_536], ids=["011", "014_536"])
+    def test_a_finish_that_printed_without_filament_is_recorded_failed(self, shape):
+        """No part was made past the unfed layer, so the FINISH is a failure: it takes the ordinary
+        failed disposition (retry, the consecutive-failure count) instead of counting as a unit."""
+        outcome = _from_payload(shape, hms=[])
+        assert outcome.raw_status == "completed"
+        assert outcome.recorded_status == "failed"
+        assert outcome.failure_category == "printed_without_filament"
+        assert outcome.verdict is None
+        assert outcome.operator_stopped is False
+
+    def test_the_operator_reads_the_layer_it_ran_out_from(self):
+        """The queue row's ``error_message`` and the notification's ``{reason}``."""
+        assert _from_payload(_SHAPE_011, hms=[]).printer_message == "Printed without filament from layer 93 of 167"
+
+    def test_the_printers_own_words_follow_the_measured_sentence(self):
+        jam = {
+            "kind": "jam",
+            "job_id": _JOB,
+            "printer_messages": [{"short_code": "0300_801E", "description": "The extrusion motor is overloaded."}],
+        }
+        outcome = _from_payload(_SHAPE_011, holds=[jam], hms=[])
+        assert outcome.printer_message == (
+            "Printed without filament from layer 93 of 167; [0300_801E] The extrusion motor is overloaded."
+        )
+        assert outcome.failure_category == "printed_without_filament"
+
+    def test_an_operator_stop_that_printed_without_filament_stays_the_operators_stop(self):
+        """4289: the operator's Stop is the true word — recorded ``cancelled``, never a failure."""
+        outcome = _from_payload(_SHAPE_4289, "operator_ui", hms=[])
+        assert outcome.recorded_status == "cancelled"
+        assert outcome.failure_category == "User cancelled"
+
+    def test_an_eject_sweep_with_an_empty_extruder_keeps_its_word(self):
+        """A motion-only file feeds nothing by design: an empty extruder under it proves nothing."""
+        outcome = _from_payload(_SHAPE_011, eject=True, hms=[])
+        assert outcome.recorded_status == "completed"
+        assert outcome.failure_category is None
+
+    def test_a_dry_run_with_an_empty_extruder_is_not_a_failure(self):
+        """Recorded as any dry run is (it deposited nothing), never as printing without filament."""
+        outcome = _from_payload(_SHAPE_011, dry_run=True, hms=[])
+        assert outcome.recorded_status == "cancelled"
+        assert outcome.failure_category is None
+
+    def test_a_first_article_that_printed_without_filament_is_failed_too(self):
+        """It was not made, so it keeps its one retry rather than awaiting approval."""
+        assert _from_payload(_SHAPE_011, first_article=True, hms=[]).recorded_status == "failed"
+
+    def test_a_finish_whose_unfed_layer_is_not_below_its_last_layer_keeps_its_word(self):
+        """Nothing was printed past the unfed layer, so nothing was printed on air."""
+        assert _from_payload({**_SHAPE_011, "first_unfed_layer": 167}, hms=[]).recorded_status == "completed"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {key: value for key, value in _SHAPE_011.items() if key != "first_unfed_layer"},
+            {**_SHAPE_011, "first_unfed_layer": None},
+        ],
+        ids=["key_absent", "not_measured"],
+    )
+    def test_without_a_measured_unfed_layer_a_finish_is_completed(self, payload):
+        outcome = _from_payload(payload, hms=[])
+        assert outcome.recorded_status == "completed"
+        assert outcome.failure_category is None
+        assert outcome.printer_message is None
+
+
 def _refused(plate_check, *, deposited, resolved_item_id=7):
     """A ``plate_refused`` terminal of THIS job, whose plate-check hold recorded the printer's words.
     ``resolved_item_id`` is the unit the terminal itself resolved (the one a retry requeues)."""

@@ -206,6 +206,7 @@ export default {
         staggerHold: '正在等待電源錯峰啟動時段 — 即將開始',
         spoolJamRecovering: '料卷卡料 — 正在切換到其他料卷並繼續',
         spoolJamRecoveryFailed: '料卷卡料復原失敗 — 印表機為人工保持暫停',
+        toolheadEmpty: '工具頭無耗材，已暫停',
       },
       printerState: {
         ok: '就緒',
@@ -878,6 +879,18 @@ export default {
       amsCommandSessionChanged: '指令執行期間印表機重新連線。請檢查 AMS。',
       amsLoadHeld: '載入指令已接受。排在暫停列印的換料之後。',
       amsUnloadHeld: '卸載指令已接受。排在暫停列印的換料之後。',
+      amsLoadHeldOutsideChange: '載入指令已接受。尚未執行。',
+      amsUnloadHeldOutsideChange: '卸載指令已接受。尚未執行。AMS 可能稍後自行執行，無需再次傳送指令。',
+      resumeRefilling: '工具頭無耗材。正在載入 {{slot}}，隨後繼續列印。',
+      resumeRefillingAnySlot: '工具頭無耗材。正在載入料卷，隨後繼續列印。',
+      resumeRefused: {
+        not_paused: '列印未暫停。',
+        farm_acting: '此印表機正在復原中。已拒絕繼續列印。',
+        maintenance: '工具頭無耗材。維護模式：農場不載入任何耗材。請載入一個槽位後繼續列印。',
+        unknown: '無法讀取工具頭：印表機無即時回報。已拒絕繼續列印。',
+        command_pending: '工具頭無耗材。AMS 仍保留著農場排隊的指令；該指令執行後農場會為工具頭補充耗材。',
+        physical: '工具頭無耗材。實體故障阻塞了耗材通道。請排除故障並載入一個槽位後繼續列印。',
+      },
     },
     // Connection status
     connection: {
@@ -1127,6 +1140,14 @@ export default {
       partial: '{{succeeded}}成功，{{failed}}失敗',
       noneApplicable: '沒有選中的印表機處於適合此操作的狀態',
       selectByState: '按狀態選擇',
+      resumeResumed_one: '已在 {{count}} 台印表機上繼續列印。',
+      resumeResumed_other: '已在 {{count}} 台印表機上繼續列印。',
+      resumeRefilling_one: '{{count}} 台印表機工具頭無耗材：正在載入，隨後繼續列印。',
+      resumeRefilling_other: '{{count}} 台印表機工具頭無耗材：正在載入，隨後繼續列印。',
+      resumeRefused_one: '{{count}} 台印表機已拒絕繼續列印。',
+      resumeRefused_other: '{{count}} 台印表機已拒絕繼續列印。',
+      resumeFailed_one: '{{count}} 台印表機繼續列印失敗。',
+      resumeFailed_other: '{{count}} 台印表機繼續列印失敗。',
     },
     // Discovery
     discovery: {
@@ -1258,6 +1279,7 @@ export default {
       plate_vision: '列印板偵測',
       z_reference_lost: 'Z 基準遺失',
       recovering: '恢復中',
+      toolhead_refill: '工具頭無耗材',
     },
     // The chip's tooltip: the instruction each hold asks for. The pill itself
     // carries only the noun (one label per control; the consequence rides the
@@ -1269,13 +1291,28 @@ export default {
       power_loss: '請在印表機上繼續',
       plate_vision: '忽略並恢復，或停止列印',
       z_reference_lost: '重新啟動時列印板上仍有零件 — 手動取下後點選「將列印板標記為已清理」',
+      toolhead_refill: '請載入一個槽位後繼續列印。',
     },
     incidentRecoveringAction: {
       plate_vision: '農場正在重新偵測列印板',
+      toolhead_refill: '農場正在為工具頭補充耗材',
     },
     holdMessage: {
       reported: '印表機回報：{{message}}',
       notShown: '印表機上已不再顯示',
+    },
+    toolhead: {
+      loading: '正在載入 {{slot}}。',
+      loadingAnySlot: '正在載入料卷。',
+      loadFailed: '載入失敗：{{slot}}。',
+      loadFailedAnySlot: '載入失敗。',
+      unloadFailed: '卸載失敗：{{slot}}。',
+      unloadFailedAnySlot: '卸載失敗。',
+      answer: {
+        no_movement: 'AMS 未動作。',
+        loadActed: 'AMS 已動作，但載入未完成。',
+        unloadActed: 'AMS 已動作，但卸載未完成。',
+      },
     },
     plateCheck: {
       ignoreResume: '忽略並恢復',
@@ -5612,6 +5649,7 @@ export default {
       powerFailure: '斷電',
       userCancelled: '使用者取消',
       other: '其他',
+      printed_without_filament: '無耗材列印',
     },
     // Archive statuses
     statuses: {
@@ -7813,6 +7851,7 @@ export default {
       job_ended_unseen: '工作結束（未觀測）',
       driver_ended: '農場：復原流程結束工作',
       legacy_vision_stop: '舊版列印板檢查停止',
+      refill_resumed: '農場：工具頭補料',
     },
     external: '外部線軸',
     foreign: '非農場單元',

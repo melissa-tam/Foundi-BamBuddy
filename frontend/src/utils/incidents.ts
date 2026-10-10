@@ -72,6 +72,7 @@ export const RESOLVE_SOURCE_LABEL_KEY: Record<IncidentResolveSource, string> = {
   driver_swap: 'incidents.closedBy.driver_swap',
   driver_self_heal: 'incidents.closedBy.driver_self_heal',
   driver_restart: 'incidents.closedBy.driver_restart',
+  refill_resumed: 'incidents.closedBy.refill_resumed',
   startup_rearm: 'incidents.closedBy.startup_rearm',
   recheck_passed: 'incidents.closedBy.recheck_passed',
   plate_refused: 'incidents.closedBy.plate_refused',

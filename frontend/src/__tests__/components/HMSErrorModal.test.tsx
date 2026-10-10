@@ -226,4 +226,62 @@ describe('HMSErrorModal', () => {
       );
     });
   });
+
+  // A dialog button that RESUMES a paused print goes through the farm's one
+  // resume verb (operator requirement 2026-10-10): over an empty toolhead the
+  // farm loads first and answers `refilling`; a refusal is a typed 409.
+  describe('resume buttons over an empty toolhead', () => {
+    const feedFault: HMSError = {
+      attr: 0x07008000,
+      code: '0x8001',
+      module: 7,
+      severity: 2,
+      full_code: '0700800100010001',
+      short_code: '0700_8001',
+      description: 'AMS A Slot 1 failed to feed',
+      actions: ['RESUME_PRINTING'],
+      job_id: '4711',
+      wiki_url: WIKI,
+    };
+    const RESUME = en.hmsErrors.actions.RESUME_PRINTING;
+
+    it('names the slot the farm loads before it resumes', async () => {
+      server.use(
+        http.post('/api/v1/printers/:id/hms/execute-action', () =>
+          HttpResponse.json({ success: true, status: 'refilling', slot: 'AMS A slot 2', message: 'fallback' }),
+        ),
+      );
+      const onClose = vi.fn();
+      const user = userEvent.setup();
+      render(<HMSErrorModal {...defaultProps} onClose={onClose} errors={[feedFault]} />);
+
+      await user.click(screen.getByRole('button', { name: RESUME }));
+
+      expect(
+        await screen.findByText(en.printers.toast.resumeRefilling.replace('{{slot}}', 'AMS A slot 2')),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(en.hmsErrors.actionSuccess)).not.toBeInTheDocument();
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('states a refused resume in its reason’s own words and keeps the dialog open', async () => {
+      server.use(
+        http.post('/api/v1/printers/:id/hms/execute-action', () =>
+          HttpResponse.json(
+            { detail: { reason: 'command_pending', slot: null, answer: null, message: 'server sentence' } },
+            { status: 409 },
+          ),
+        ),
+      );
+      const onClose = vi.fn();
+      const user = userEvent.setup();
+      render(<HMSErrorModal {...defaultProps} onClose={onClose} errors={[feedFault]} />);
+
+      await user.click(screen.getByRole('button', { name: RESUME }));
+
+      expect(await screen.findByText(en.printers.toast.resumeRefused.command_pending)).toBeInTheDocument();
+      expect(screen.queryByText(/server sentence/)).not.toBeInTheDocument();
+      expect(onClose).not.toHaveBeenCalled();
+    });
+  });
 });

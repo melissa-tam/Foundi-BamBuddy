@@ -727,6 +727,53 @@ class TestPrintersAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    @pytest.mark.parametrize("connected", [False, True])
+    async def test_printers_status_toolhead(self, async_client: AsyncClient, printer_factory, db_session, connected):
+        """BOTH ``/status`` branches carry ``toolhead`` (K10/C3c, 2026-10-10), the one builder: the
+        connected branch reads the ACTIVE extruder; with no session the feed is ``unknown`` while the
+        farm's failed refill — the incident store's own projection — still reports, naming its command
+        (a failed UNLOAD is an unload, on the row's slot)."""
+        from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL, STATUS_ESCALATED
+        from backend.app.services import printer_incidents
+        from backend.app.services.bambu_mqtt import PrinterState
+        from backend.app.services.printer_manager import printer_manager
+
+        printer = await printer_factory(name=f"Toolhead Printer {connected}")
+        row = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="job-1",
+            item_id=None,
+            kind=KIND_TOOLHEAD_REFILL,
+            code="",
+            codes="",
+            slot_global_tray=0,
+            status=STATUS_ESCALATED,
+        )
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind="command", name="unload")
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="acted")
+
+        state = None
+        if connected:
+            state = PrinterState()
+            state.connected = True
+            state.state = "PAUSE"
+            state.tray_now = 255
+        try:
+            with patch.object(printer_manager, "get_status", return_value=state):
+                response = await async_client.get(f"/api/v1/printers/{printer.id}/status")
+
+            assert response.status_code == 200, response.text
+            assert response.json()["toolhead"] == {
+                "feed": "empty" if connected else "unknown",
+                "tray": None,
+                "refill": {"phase": "failed", "command": "unload", "slot": "AMS A slot 1", "answer": "acted"},
+            }
+        finally:
+            printer_incidents._reset_state()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_printers_status_open_incident_is_null_when_nothing_is_held(
         self, async_client: AsyncClient, printer_factory, db_session
     ):
@@ -1817,20 +1864,76 @@ class TestPrintControlAPI:
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_resume_print_success(self, async_client: AsyncClient, printer_factory):
-        """Verify successful resume print request."""
+        """A paused print with a FED toolhead resumes as before (K9: the route no longer publishes
+        the resume itself — ``spool_recovery.resume_paused_print`` does, the one body)."""
         printer = await printer_factory(name="Paused Printer")
+        client = _dialog_client(result="success")
 
-        mock_client = MagicMock()
-        mock_client.resume_print.return_value = True
-
-        with patch("backend.app.api.routes.printers.printer_manager") as mock_pm:
-            mock_pm.get_client.return_value = mock_client
-
+        with _paused_and_fed(client):
             response = await async_client.post(f"/api/v1/printers/{printer.id}/print/resume")
 
-            assert response.status_code == 200
-            assert response.json()["success"] is True
-            mock_client.resume_print.assert_called_once()
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "status": "resumed",
+            "slot": None,
+            "message": "Print resume command sent",
+        }
+        assert _published_print_frames(client) == [{"command": "resume", "sequence_id": "1"}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_empty_toolhead_answers_refilling_at_once(self, async_client: AsyncClient, printer_factory):
+        """Refill owed: the route answers AT ONCE (the refill can take minutes) — ``refilling`` and the
+        slot the refill loads first; the verdict is the service's, the route only maps it."""
+        from backend.app.services import spool_recovery
+
+        printer = await printer_factory(name="Paused Printer")
+        verdict = spool_recovery.RefillStarted(incident_id=41, slot="AMS A slot 1")
+        with patch.object(spool_recovery, "resume_paused_print", new_callable=AsyncMock, return_value=verdict) as verb:
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/print/resume")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "status": "refilling",
+            "slot": "AMS A slot 1",
+            "message": "Toolhead empty. Refilling from AMS A slot 1, then resuming.",
+        }
+        verb.assert_awaited_once_with(printer.id, actor="operator")
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_refused_resume_is_a_typed_409(self, async_client: AsyncClient, printer_factory):
+        from backend.app.services import spool_recovery
+
+        printer = await printer_factory(name="Paused Printer")
+        verdict = spool_recovery.ResumeRefused(
+            reason="maintenance",
+            message="Toolhead empty. Maintenance mode: the farm loads nothing. Load a slot, then resume.",
+        )
+        with patch.object(spool_recovery, "resume_paused_print", new_callable=AsyncMock, return_value=verdict):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/print/resume")
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "reason": "maintenance",
+            "slot": None,
+            "answer": None,
+            "message": "Toolhead empty. Maintenance mode: the farm loads nothing. Load a slot, then resume.",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_resume_that_did_not_go_out_is_502(self, async_client: AsyncClient, printer_factory):
+        from backend.app.services import spool_recovery
+
+        printer = await printer_factory(name="Paused Printer")
+        verdict = spool_recovery.ResumeNotSent(reason="not_sent")
+        with patch.object(spool_recovery, "resume_paused_print", new_callable=AsyncMock, return_value=verdict):
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/print/resume")
+
+        assert response.status_code == 502
 
 
 class TestAMSSlotRecheckAPI:
@@ -1997,7 +2100,11 @@ class TestAMSLoadUnloadAPI:
 
         assert response.status_code == 200
         mock_client.ams_load_filament.assert_called_once_with(5)
-        assert response.json() == {"outcome": "complete", "message": "Loading filament from AMS 1 slot 2"}
+        assert response.json() == {
+            "outcome": "complete",
+            "message": "Loading filament from AMS 1 slot 2",
+            "family": "outside_change",
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2031,7 +2138,11 @@ class TestAMSLoadUnloadAPI:
 
         assert response.status_code == 200
         mock_client.ams_load_filament.assert_called_once_with(255)
-        assert response.json() == {"outcome": "acted", "message": "Loading filament from Ext-R"}
+        assert response.json() == {
+            "outcome": "acted",
+            "message": "Loading filament from Ext-R",
+            "family": "outside_change",
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2081,7 +2192,7 @@ class TestAMSLoadUnloadAPI:
 
         assert response.status_code == 200
         mock_client.ams_unload_filament.assert_called_once_with()
-        assert response.json() == {"outcome": "acted", "message": "Unloading filament"}
+        assert response.json() == {"outcome": "acted", "message": "Unloading filament", "family": "outside_change"}
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2872,6 +2983,26 @@ async def _plate_check_row(db_session, printer_id, *, status, job_id="771234"):
 
 
 @contextmanager
+def _paused_and_fed(client, *, tray_now=0):
+    """The printer PAUSEd, reporting on its live session, with the ACTIVE extruder fed from
+    ``tray_now`` — the shape in which a resume goes out at once (K9). Both readers see it: the
+    route's manager and the resume verb's (``spool_recovery`` reads the singleton)."""
+    from backend.app.services.printer_manager import printer_manager
+
+    client.state.state = "PAUSE"
+    client.state.tray_now = tray_now
+    client.state.layer_num = 12
+    client.state.total_layers = 100
+    client.state.report_epoch = client.state.connection_epoch
+    with (
+        patch.object(printer_manager, "get_client", return_value=client),
+        patch.object(printer_manager, "get_status", return_value=client.state),
+        patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
+    ):
+        yield
+
+
+@contextmanager
 def _plate_check_paused(client, *, job_id="771234", print_error=0x0500808C):
     """The printer PAUSEd at its plate-check dialog, as both the route and the plate-check lane
     (``pause_recovery``, which reads the manager singleton) see it — the dialog merged onto the HMS
@@ -3008,12 +3139,9 @@ class TestExecuteHMSActionAPI:
         printer = await printer_factory(name="Test Printer")
         client = _dialog_client(result="success")
 
-        with (
-            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
-        ):
-            mock_pm.get_client.return_value = client
-
+        # IGNORE_RESUME resumes the print, so it goes through the resume verb (K9), which reads
+        # the live printer — paused, its toolhead fed.
+        with _paused_and_fed(client):
             body = {"print_error": "03008070", "action": "IGNORE_RESUME", "job_id": None}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
@@ -3028,12 +3156,7 @@ class TestExecuteHMSActionAPI:
         printer = await printer_factory(name="Test Printer")
         client = _dialog_client(result="fail", reason="err mismatch")
 
-        with (
-            patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch("backend.app.api.routes.printers.HMS_ACTION_ACK_WAIT_SECONDS", 0.05),
-        ):
-            mock_pm.get_client.return_value = client
-
+        with _paused_and_fed(client):
             body = {"print_error": "03008070", "action": "IGNORE_RESUME", "job_id": None}
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
@@ -3042,6 +3165,99 @@ class TestExecuteHMSActionAPI:
         assert "ignore" in detail
         assert "result=fail" in detail
         assert "reason=err mismatch" in detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("action", ["RESUME_PRINTING", "IGNORE_RESUME", "PROBLEM_SOLVED_RESUME"])
+    async def test_a_resume_button_goes_through_the_resume_verb(
+        self, async_client: AsyncClient, printer_factory, action
+    ):
+        """K9: a dialog button whose frame RESUMES the print (``bambu_mqtt.DIALOG_RESUME_ACTIONS``)
+        is the resume of a paused print, so the verb decides — an EMPTY toolhead answers
+        ``refilling`` at once and the button's own frame is not pressed (the refill driver resumes
+        once the load reached the toolhead)."""
+        from backend.app.services import spool_recovery
+
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+        verdict = spool_recovery.RefillStarted(incident_id=9, slot="AMS A slot 2")
+
+        with (
+            _paused_and_fed(client, tray_now=255),
+            patch.object(spool_recovery, "resume_paused_print", new_callable=AsyncMock, return_value=verdict) as verb,
+        ):
+            body = {"print_error": "03008070", "action": action, "job_id": "task-7"}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "status": "refilling",
+            "slot": "AMS A slot 2",
+            "message": "Toolhead empty. Refilling from AMS A slot 2, then resuming.",
+        }
+        assert verb.await_args.kwargs["actor"] == "operator"
+        assert verb.await_args.kwargs["press"] is not None
+        assert _published_print_frames(client) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_resume_button_over_a_fed_toolhead_presses_its_own_frame(
+        self, async_client: AsyncClient, printer_factory
+    ):
+        """Fed: the button's OWN frame goes out (here the plain resume), read by its ACK as before."""
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+
+        with _paused_and_fed(client):
+            body = {"print_error": "03008070", "action": "RESUME_PRINTING", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "message": "HMS action executed"}
+        assert _published_print_frames(client) == [{"command": "resume", "sequence_id": "1"}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_refused_resume_button_is_a_typed_409(self, async_client: AsyncClient, printer_factory):
+        from backend.app.services import spool_recovery
+
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+        verdict = spool_recovery.ResumeRefused(
+            reason="farm_acting", message="Recovery in progress on this printer. Resume refused."
+        )
+
+        with (
+            _paused_and_fed(client, tray_now=255),
+            patch.object(spool_recovery, "resume_paused_print", new_callable=AsyncMock, return_value=verdict),
+        ):
+            body = {"print_error": "03008070", "action": "RESUME_PRINTING", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["reason"] == "farm_acting"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_change_release_stays_outside_the_resume_verb(self, async_client: AsyncClient, printer_factory):
+        """CONTINUE / RETRY are ``ams_control resume`` — a filament-change release: the firmware
+        re-feeds the change it holds. They are pressed as before, never through the verb."""
+        from backend.app.services import spool_recovery
+
+        printer = await printer_factory(name="Test Printer")
+        client = _dialog_client(result="success")
+
+        with (
+            _paused_and_fed(client, tray_now=255),
+            patch.object(spool_recovery, "resume_paused_print", new_callable=AsyncMock) as verb,
+        ):
+            body = {"print_error": "07008006", "action": "CONTINUE", "job_id": None}
+            response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
+
+        assert response.status_code == 200
+        verb.assert_not_awaited()
+        assert _published_print_frames(client)[0]["command"] == "ams_control"
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5417,7 +5633,11 @@ class TestAmsMidFilamentChangeIsMeasured:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=2")
 
         assert response.status_code == 200
-        assert response.json() == {"outcome": "no_movement", "message": "Load sent. AMS did not move."}
+        assert response.json() == {
+            "outcome": "no_movement",
+            "message": "Load sent. AMS did not move.",
+            "family": "mid_change",
+        }
         mock_client.ams_load_filament.assert_called_once_with(2)
 
     @pytest.mark.asyncio
@@ -5433,7 +5653,11 @@ class TestAmsMidFilamentChangeIsMeasured:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/unload")
 
         assert response.status_code == 200
-        assert response.json() == {"outcome": "no_movement", "message": "Unload sent. AMS did not move."}
+        assert response.json() == {
+            "outcome": "no_movement",
+            "message": "Unload sent. AMS did not move.",
+            "family": "mid_change",
+        }
         mock_client.ams_unload_filament.assert_called_once_with()
 
     @pytest.mark.asyncio
@@ -5469,7 +5693,7 @@ class TestAmsMidFilamentChangeIsMeasured:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/{path}")
 
         assert response.status_code == 200
-        assert response.json() == {"outcome": "held", "message": message}
+        assert response.json() == {"outcome": "held", "message": message, "family": "mid_change"}
         mock_client.ack_for.assert_called_with("ams_change_filament", _SENT_SEQ)
 
     @pytest.mark.asyncio
@@ -5486,7 +5710,11 @@ class TestAmsMidFilamentChangeIsMeasured:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=2")
 
         assert response.status_code == 200
-        assert response.json() == {"outcome": "complete", "message": "Loading filament from AMS 0 slot 3"}
+        assert response.json() == {
+            "outcome": "complete",
+            "message": "Loading filament from AMS 0 slot 3",
+            "family": "mid_change",
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5502,7 +5730,22 @@ class TestAmsMidFilamentChangeIsMeasured:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/unload")
 
         assert response.status_code == 200
-        assert response.json() == {"outcome": "undecidable", "message": "Unload sent. Nothing was loaded."}
+        assert response.json() == {
+            "outcome": "undecidable",
+            "message": "Unload sent. Nothing was loaded.",
+            "family": "mid_change",
+        }
+
+    def test_the_family_has_one_spelling(self):
+        """The wire's ``family`` (``schemas.printer.AmsPostureFamily``) and the classifier's
+        (``ams_command.PostureFamily``) are one vocabulary: the DTO layer cannot import a service, so
+        this pin is what keeps the two spellings one."""
+        from typing import get_args
+
+        from backend.app.schemas.printer import AmsPostureFamily
+        from backend.app.services import ams_command
+
+        assert get_args(AmsPostureFamily) == get_args(ams_command.PostureFamily)
 
     @pytest.mark.asyncio
     @pytest.mark.integration

@@ -3042,6 +3042,8 @@ class NotificationService:
         * ``"physical"`` — a breakage/clog/hardware fault. The farm never swaps on
           these (a fresh roll cannot clear a broken filament or a clogged extruder),
           so the copy must NOT imply an attempt was made or that one will follow.
+        * ``"toolhead_refill"`` — the farm's refill of an EMPTY toolhead could not load a
+          spool (2026-10-10); toolhead-framed copy, never the jam's swap template.
 
         ``foreign`` marks a print the farm did not dispatch: the job is named but no
         unit/run is, and the operator is told the farm cannot act on it.
@@ -3066,11 +3068,19 @@ class NotificationService:
         foreign_txt = " (a print Bambuddy did not dispatch)" if foreign else ""
 
         if job_ended:
-            label = {"runout": "Filament runout NOT recovered", "physical": "Filament hardware fault"}.get(
-                kind, "Spool jam NOT recovered"
-            )
+            label = {
+                "runout": "Filament runout NOT recovered",
+                "physical": "Filament hardware fault",
+                "toolhead_refill": "Toolhead NOT refilled",
+            }.get(kind, "Spool jam NOT recovered")
             title = f"{label} — {printer_name}"
             message = f"{printer_name}: '{job_name}'{foreign_txt} has ended. {detail}"
+        elif kind == "toolhead_refill":
+            # K10 (2026-10-10): the farm's refill of an EMPTY toolhead could not load a spool. No
+            # swap was attempted, so never the jam's swap-framed template; ``detail`` names the
+            # slot, what the AMS answered and the exit.
+            title = f"Toolhead NOT refilled — {printer_name}"
+            message = f"{printer_name}: '{job_name}'{foreign_txt} is left PAUSED with an empty toolhead. {detail}"
         elif kind == "runout":
             slot_txt = f" into {runout_slot}" if runout_slot else ""
             title = f"Filament runout NOT recovered — {printer_name}"

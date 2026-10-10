@@ -630,15 +630,64 @@ class TestTheKindVocabularies:
     maintenance mode silently requeued the plate and the run never held for RESUME.
     """
 
-    async def test_all_kinds_is_the_union_of_the_three_vocabularies(self):
+    async def test_all_kinds_is_the_union_of_the_four_vocabularies(self):
         from backend.app.models.printer_incident import (
             ALL_KINDS,
             AMS_FAULT_KINDS,
             DECLARED_KINDS,
             PAUSE_CAUSE_KINDS,
+            REFILL_KINDS,
         )
 
-        assert ALL_KINDS == AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS
+        assert ALL_KINDS == AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS | REFILL_KINDS
+
+    async def test_the_toolhead_refill_kind(self):
+        """K10 (2026-10-10): the farm's own refill of an empty toolhead, opened on a printer no AMS
+        row holds. A FAULT kind (an operator Stop over it requeues the plate: the job could not go
+        on because the farm could not put filament at the toolhead), NOT an AMS kind (the AMS
+        exclusion index is built from ``AMS_FAULT_KINDS`` — joining it would be DDL — and the AMS
+        entry gate would read the row as an AMS owner it cannot outrank), ranked right after the
+        AMS head on the chip, and a recurrence kind by subtraction."""
+        from backend.app.models.printer_incident import (
+            AMS_FAULT_KINDS,
+            AMS_OPEN_PREDICATE,
+            FAULT_KINDS,
+            KIND_JAM,
+            KIND_POWER_LOSS,
+            KIND_PRECEDENCE,
+            KIND_TOOLHEAD_REFILL,
+            RECURRENCE_KINDS,
+            REFILL_KINDS,
+        )
+
+        assert KIND_TOOLHEAD_REFILL == "toolhead_refill"
+        assert {KIND_TOOLHEAD_REFILL} == REFILL_KINDS
+        assert KIND_TOOLHEAD_REFILL in FAULT_KINDS
+        assert KIND_TOOLHEAD_REFILL in RECURRENCE_KINDS
+        assert KIND_TOOLHEAD_REFILL not in AMS_FAULT_KINDS
+        assert KIND_TOOLHEAD_REFILL not in AMS_OPEN_PREDICATE
+        assert KIND_PRECEDENCE.index(KIND_JAM) < KIND_PRECEDENCE.index(KIND_TOOLHEAD_REFILL)
+        assert KIND_PRECEDENCE.index(KIND_TOOLHEAD_REFILL) < KIND_PRECEDENCE.index(KIND_POWER_LOSS)
+        assert printer_incidents.is_known_kind(KIND_TOOLHEAD_REFILL)
+
+    async def test_a_toolhead_refill_row_opens_beside_an_ams_row(self, db_session, printer_factory):
+        """Per-kind exclusivity only: the AMS exclusion is not the refill row's."""
+        from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL
+
+        printer = await printer_factory()
+        assert await _open(db_session, printer.id, kind=KIND_JAM) is not None
+        refill = await printer_incidents.open_new(
+            db_session,
+            printer_id=printer.id,
+            job_id="task-1",
+            item_id=None,
+            kind=KIND_TOOLHEAD_REFILL,
+            code="",
+            codes="",
+            slot_global_tray=0,
+        )
+        assert refill is not None
+        assert printer_incidents.open_kinds(printer.id) == {KIND_JAM, KIND_TOOLHEAD_REFILL}
 
     async def test_fault_kinds_is_everything_a_human_did_not_declare(self):
         from backend.app.models.printer_incident import ALL_KINDS, DECLARED_KINDS, FAULT_KINDS, KIND_SERVICE_HOLD
@@ -672,10 +721,19 @@ class TestWaitingReasonVocabulary:
     async def test_every_kind_has_a_token(self):
         """The pin that makes registration total. A new kind added to the model without
         a row here fails HERE, not in production as jam copy on an unrelated hold."""
-        from backend.app.models.printer_incident import AMS_FAULT_KINDS, DECLARED_KINDS, PAUSE_CAUSE_KINDS
+        from backend.app.models.printer_incident import ALL_KINDS
 
-        for kind in AMS_FAULT_KINDS | PAUSE_CAUSE_KINDS | DECLARED_KINDS:
+        for kind in ALL_KINDS:
             assert printer_incidents.waiting_reason_for(kind)
+
+    async def test_the_toolhead_refill_token(self):
+        """K10: an empty-toolhead hold projects ``toolhead_empty`` onto its farm unit, and the token
+        is an incident's own (attended by the pause-stall watch by construction)."""
+        from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL
+
+        assert printer_incidents.waiting_reason_for(KIND_TOOLHEAD_REFILL) == "toolhead_empty"
+        assert printer_incidents.WAITING_REASON_TOOLHEAD_EMPTY == "toolhead_empty"
+        assert "toolhead_empty" in printer_incidents.RECOVERY_WAITING_REASONS
 
     async def test_the_service_hold_token(self):
         """Registered for vocabulary hygiene: ``waiting_reason_for`` RAISES on an
@@ -2342,6 +2400,238 @@ class TestThePlateCheckLedgerProjection:
         assert (plate_snap[printer_incidents.PAYLOAD_FAULT_RESTART_STOP], plate_snap["last_stop"]) == (
             False,
             {"name": "retry_stop", "outcome": None},
+        )
+
+
+class TestTheRefillProjection:
+    """What the card's "Toolhead empty" chip reads of the farm's refill (K10/C3c, 2026-10-10) — DERIVED,
+    no process dict: ``loading`` while a driver is live loading this printer's toolhead (a
+    ``toolhead_refill`` row it is ``recovering``, or a load in flight on any open row), ``failed`` when
+    an open row's ledger says its LAST command did not reach the toolhead (``failed_command``, a
+    projection fact of the ledger's one derivation — ``acted`` / ``no_movement``), else nothing.
+    ``command`` names the motion the chip speaks of — ``load`` while loading, the failed step's own
+    name when failed (a failed UNLOAD is never "Load failed")."""
+
+    async def _refill_row(self, db_session, printer_id, *, status=STATUS_RECOVERING):
+        from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL
+
+        return await _open(
+            db_session, printer_id, kind=KIND_TOOLHEAD_REFILL, code="", codes="", slot_global_tray=0, status=status
+        )
+
+    async def test_the_last_failed_command_is_a_projection_of_the_ledger(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010", status=STATUS_ESCALATED)
+        assert printer_incidents.snapshot(printer.id)["failed_command"] is None
+
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=1)
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="no_movement")
+        assert printer_incidents.snapshot(printer.id)["failed_command"] == {
+            "incident_id": row.id,
+            "seq": 1,
+            "name": "load",
+            "target": 1,
+            "answer": "no_movement",
+        }
+
+        await printer_incidents.note_step(db_session, row.id, seq=2, kind=STEP_KIND_COMMAND, name="load", target=1)
+        await printer_incidents.answer_step(db_session, row.id, 2, outcome="complete")
+        assert printer_incidents.snapshot(printer.id)["failed_command"] is None  # the last one reached it
+
+        printer_incidents._reset_state()  # a restart re-derives it from the table
+        await printer_incidents.note_step(db_session, row.id, seq=3, kind=STEP_KIND_COMMAND, name="unload")
+        await printer_incidents.answer_step(db_session, row.id, 3, outcome="acted")
+        await printer_incidents.rehydrate(db_session)
+        assert printer_incidents.snapshot(printer.id)["failed_command"]["answer"] == "acted"
+
+    async def test_no_refill_on_a_printer_with_nothing_open(self, db_session, printer_factory):
+        printer = await printer_factory()
+        assert printer_incidents.refill_state(printer.id) is None
+
+    async def test_a_live_refill_row_is_loading(self, db_session, printer_factory):
+        printer = await printer_factory()
+        await self._refill_row(db_session, printer.id)
+        assert printer_incidents.refill_state(printer.id) is None  # the promise, but no driver live
+
+        printer_incidents.register_driver(printer.id, _LiveTask(), incident_id=None)
+        assert printer_incidents.refill_state(printer.id) == {
+            "phase": "loading",
+            "command": "load",
+            "slot": "AMS A slot 1",
+            "answer": None,
+        }
+
+    async def test_a_load_in_flight_on_an_ams_row_is_loading_that_slot(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010", status=STATUS_ESCALATED)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=6)
+        printer_incidents.register_driver(printer.id, _LiveTask(), incident_id=row.id)
+
+        assert printer_incidents.refill_state(printer.id) == {
+            "phase": "loading",
+            "command": "load",
+            "slot": "AMS B slot 3",
+            "answer": None,
+        }
+
+    async def test_a_failed_refill_names_the_slot_and_the_answer(self, db_session, printer_factory):
+        printer = await printer_factory()
+        row = await self._refill_row(db_session, printer.id, status=STATUS_ESCALATED)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=0)
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="no_movement")
+
+        assert printer_incidents.refill_state(printer.id) == {
+            "phase": "failed",
+            "command": "load",
+            "slot": "AMS A slot 1",
+            "answer": "no_movement",
+        }
+
+    async def test_a_failed_unload_is_named_an_unload_on_the_rows_slot(self, db_session, printer_factory):
+        """The defect the docs pass found: a failed refill UNLOAD rendered "Load failed". The command is
+        the failed step's own name; an unload names no target, so the slot is the row's."""
+        printer = await printer_factory()
+        row = await self._refill_row(db_session, printer.id, status=STATUS_ESCALATED)
+        await printer_incidents.note_step(db_session, row.id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+        await printer_incidents.answer_step(db_session, row.id, 1, outcome="acted")
+
+        assert printer_incidents.refill_state(printer.id) == {
+            "phase": "failed",
+            "command": "unload",
+            "slot": "AMS A slot 1",
+            "answer": "acted",
+        }
+
+
+class _LiveTask:
+    """A driver task that is still running (``driver_live`` asks ``done()``)."""
+
+    def done(self) -> bool:
+        return False
+
+
+class TestThePendingCommandProjection:
+    """``pending_command`` on the open-row projection (K11, 011/014-H2S 2026-10-09/10): the row's
+    LAST motion command step, answered ``held`` (the AMS acknowledged it and has not run it) or not
+    answered at all (sent, never read). A projection of the step ledger for the DB-free readers —
+    the per-push detector, the closers' ``Context``, the driver's stand-aside — never a column: the
+    ledger's one writer re-derives it at the send and the read, ``rehydrate`` after a restart, and
+    every re-projection of the row keeps it."""
+
+    @staticmethod
+    async def _jam(db_session, printer_factory):
+        printer = await printer_factory()
+        row = await _open(db_session, printer.id, kind=KIND_JAM, codes="jam:0700_8010", status=STATUS_RECOVERING)
+        return printer.id, row.id
+
+    async def test_a_fresh_row_projects_none(self, db_session, printer_factory):
+        printer_id, _row_id = await self._jam(db_session, printer_factory)
+
+        assert printer_incidents.snapshot(printer_id)["pending_command"] is None
+        assert printer_incidents.pending_command(printer_id) is None
+
+    async def test_it_follows_the_one_writer_at_the_send_and_the_read(self, db_session, printer_factory):
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+
+        await printer_incidents.note_step(
+            db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload", target=None, feeder="jammed"
+        )
+        pending = printer_incidents.pending_command(printer_id)
+        assert pending is not None
+        assert (pending.incident_id, pending.seq, pending.name, pending.target, pending.feeder) == (
+            row_id,
+            1,
+            "unload",
+            None,
+            "jammed",
+        )
+        assert isinstance(pending.sent_at, datetime)
+
+        await printer_incidents.answer_step(db_session, row_id, 1, outcome=printer_incidents.COMMAND_HELD)
+        assert printer_incidents.pending_command(printer_id) == pending  # held: accepted, not run
+
+        await printer_incidents.answer_step(db_session, row_id, 1, outcome="complete")
+        assert printer_incidents.pending_command(printer_id) is None  # it ran
+
+        await printer_incidents.note_step(db_session, row_id, seq=2, kind=STEP_KIND_COMMAND, name="load", target=2)
+        assert printer_incidents.pending_command(printer_id).name == "load"
+        await printer_incidents.answer_step(db_session, row_id, 2, outcome="no_movement")
+        assert printer_incidents.pending_command(printer_id) is None  # answered: nothing is queued
+
+    async def test_only_the_last_command_counts_and_no_other_kind_pends(self, db_session, printer_factory):
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+        await printer_incidents.answer_step(db_session, row_id, 1, outcome=printer_incidents.COMMAND_HELD)
+        await printer_incidents.note_step(db_session, row_id, seq=2, kind=STEP_KIND_COMMAND, name="unload")
+        await printer_incidents.answer_step(db_session, row_id, 2, outcome="complete")
+        # A lever (sent, never read) is no motion command: it never pends.
+        await printer_incidents.note_step(db_session, row_id, seq=3, kind=STEP_KIND_LEVER, name="resume")
+
+        assert printer_incidents.pending_command(printer_id) is None
+
+    async def test_rehydrate_derives_it_from_the_ledger(self, db_session, printer_factory):
+        pending_printer, pending_row = await self._jam(db_session, printer_factory)
+        quiet_printer, quiet_row = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(
+            db_session, pending_row, seq=1, kind=STEP_KIND_COMMAND, name="load", target=3, feeder="empty"
+        )
+        await printer_incidents.note_step(db_session, quiet_row, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+        await printer_incidents.answer_step(db_session, quiet_row, 1, outcome="complete")
+        printer_incidents._reset_state()  # a restart: the projection is gone, the ledger is not
+
+        assert await printer_incidents.rehydrate(db_session) == 2
+
+        rehydrated = printer_incidents.pending_command(pending_printer)
+        assert (rehydrated.incident_id, rehydrated.name, rehydrated.target) == (pending_row, "load", 3)
+        assert printer_incidents.pending_command(quiet_printer) is None
+
+    async def test_a_re_projection_keeps_it(self, db_session, printer_factory):
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+
+        await printer_incidents.mark_escalated(db_session, row_id)
+        assert printer_incidents.pending_command(printer_id) is not None
+        await printer_incidents.upgrade(
+            db_session, row_id, kind=KIND_PHYSICAL, code="0700_8010", codes="jam:0700_8010", slot_global_tray=2
+        )
+        assert printer_incidents.pending_command(printer_id) is not None
+
+    async def test_it_is_scoped_to_the_row_asked_about(self, db_session, printer_factory):
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="unload")
+
+        assert printer_incidents.pending_command(printer_id, incident_id=row_id) is not None
+        assert printer_incidents.pending_command(printer_id, incident_id=row_id + 99) is None
+        assert printer_incidents.pending_command(None) is None
+
+    async def test_the_projection_is_json_primitives(self, db_session, printer_factory):
+        """The WS lane dumps the projection with a bare ``json.dumps``."""
+        import json
+
+        printer_id, row_id = await self._jam(db_session, printer_factory)
+        await printer_incidents.note_step(db_session, row_id, seq=1, kind=STEP_KIND_COMMAND, name="load", target=1)
+
+        json.dumps(printer_incidents.snapshot(printer_id))
+
+    async def test_the_held_token_is_the_classifiers_own(self):
+        """One spelling of ``held``: the store may not import ``ams_command`` (it imports this
+        module), so the token it reads is pinned into the classifier's answer vocabulary."""
+        from typing import get_args
+
+        from backend.app.services import ams_command
+
+        assert printer_incidents.COMMAND_HELD in get_args(ams_command.Answer)
+        assert printer_incidents.command_pends(None) and printer_incidents.command_pends("held")
+
+    async def test_the_failed_answers_are_the_classifiers_own(self):
+        """The chip's ``failed`` phase reads these tokens off the ledger; they are the classifier's."""
+        from typing import get_args
+
+        from backend.app.services import ams_command
+
+        assert set(get_args(ams_command.Answer)) >= printer_incidents.COMMAND_FAILED_ANSWERS == {"acted", "no_movement"}
+        assert not any(
+            printer_incidents.command_pends(answer) for answer in get_args(ams_command.Answer) if answer != "held"
         )
 
 

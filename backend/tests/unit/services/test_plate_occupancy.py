@@ -243,6 +243,22 @@ class TestDepositEvidence:
         assert (evidence.final_status, evidence.last_layer_num, evidence.last_progress) == ("cancelled", 0, 0.0)
         assert evidence.deposited is False
 
+    def test_from_terminal_payload_reads_the_unfed_layer_and_still_deposits_a_finish(self):
+        """The extent keys are the one ``job_extent`` parse; the unfed layer bounds the CHARGE and
+        changes nothing about the plate: a job that printed to layer 93 and then on air left a part."""
+        payload = {
+            "status": "completed",
+            "peaks_reliable": True,
+            "last_layer_num": 167,
+            "last_progress": 100.0,
+            "total_layers": 167,
+            "first_unfed_layer": 93,
+        }
+        evidence = po.DepositEvidence.from_terminal_payload(payload, is_dry_run=False)
+
+        assert (evidence.total_layers, evidence.first_unfed_layer) == (167, 93)
+        assert evidence.deposited is True
+
     def test_from_terminal_payload_defaults_status_to_completed(self):
         evidence = po.DepositEvidence.from_terminal_payload({}, is_dry_run=False)
         assert evidence.final_status == "completed"

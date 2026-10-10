@@ -176,12 +176,12 @@ describe('parseClassKey', () => {
     expect(() => parseClassKey('down:fault:')).toThrow(RangeError);
   });
 
-  it('covers all eight groups and all twelve down causes', () => {
+  it('covers all eight groups and all thirteen down causes', () => {
     const keys = allClassKeys();
-    // printing + 2 cycle + idle + 6 conditions + 6 faults + planned + the three
+    // printing + 2 cycle + idle + 6 conditions + 7 faults + planned + the three
     // absence groups.
-    expect(keys).toHaveLength(20);
-    expect(DOWN_CAUSE_ORDER).toHaveLength(12);
+    expect(keys).toHaveLength(21);
+    expect(DOWN_CAUSE_ORDER).toHaveLength(13);
     // Actionable causes lead, so the first band a reader sees is a fixable one.
     expect(DOWN_CAUSE_ORDER.slice(0, 4)).toEqual([
       'plate_held',
@@ -250,6 +250,7 @@ describe('label keys', () => {
       'power_loss',
       'plate_vision',
       'z_reference_lost',
+      'toolhead_refill',
       // The declared kind — the one the old spelling got wrong.
       'service_hold',
     ];
@@ -275,11 +276,10 @@ describe('label keys', () => {
     // rule is that only `incidentKindLabelKey` and `causeLabelKey` assemble it.
     const ALLOWED = new Set([
       // THE owner: `causeLabelKey` builds it and `incidentKindLabelKey` guards
-      // the declared kind away from it.
+      // the declared kind away from it. The printer card's hold chip
+      // (`utils/incidentChip`) asks `incidentKindLabelKey` too, so no second
+      // builder is allowed.
       path.join('utils', 'fleetMetrics.ts'),
-      // The printer card's own chip, whose kinds are all faults and which is
-      // pinned by `__tests__/i18n/incidentKinds.test.ts`.
-      path.join('pages', 'PrintersPage.tsx'),
     ]);
     const builder = /printers\.incident\.(?:\$\{|['"`]\s*\+)|['"`]printers\.incident\.['"`]\s*\+/;
 

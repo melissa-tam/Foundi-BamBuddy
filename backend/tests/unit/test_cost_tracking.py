@@ -705,6 +705,86 @@ class TestCostAggregation:
         assert archive.cost == 1.10
 
     @pytest.mark.asyncio
+    async def test_the_topup_never_prices_layers_printed_without_filament(self, existing_3mf_path):
+        """The #1344 top-up covers the untracked share of what the terminal CHARGED, never of the
+        whole plate: 011-H2S (2026-10-09) fed 93 of its 167 layers and printed the rest on air, so
+        its archive cost is the 93 g it fed — not 93 g tracked plus the 74 g of air at the default
+        rate."""
+        spool = _make_spool(spool_id=1, label_weight=1000, cost_per_kg=10.0)
+        assignment = _make_assignment(spool_id=1)
+        archive = _make_archive(archive_id=10)
+        archive.cost = None
+        archive.print_name = "TestPrint"
+        archive.printer_id = 1
+        archive.filament_used_grams = 167.0  # the whole plate, from the slicer
+
+        _active_sessions[1] = PrintSession(
+            printer_id=1,
+            print_name="TestPrint",
+            started_at=datetime.now(timezone.utc),
+            tray_remain_start={},
+            tray_now_at_start=0,
+        )
+
+        printer_manager = MagicMock()
+        printer_manager.get_status.return_value = SimpleNamespace(raw_data={})
+
+        responses = [
+            ("scalar_one_or_none", None),  # idempotency guard: started_at -> None (skip)
+            # _resolve_run_context's durable ARCHIVE plate tier (session has no plate_id).
+            ("scalar_one_or_none", None),
+            ("scalar_one_or_none", archive),
+            ("scalar_one_or_none", None),  # queue item
+            ("scalar_one_or_none", assignment),
+            ("scalar_one_or_none", spool),
+            ("scalar_one_or_none", archive),  # cost-update select
+        ]
+
+        db = AsyncMock()
+        call_count = [0]
+
+        async def mock_execute(*args, **kwargs):
+            idx = call_count[0]
+            call_count[0] += 1
+            result = MagicMock()
+            if idx < len(responses):
+                _, value = responses[idx]
+                result.scalar.return_value = value
+                result.scalar_one_or_none.return_value = value
+            else:
+                result.scalar_one_or_none.return_value = None
+                result.scalar.return_value = None
+            return result
+
+        db.execute = mock_execute
+        filament_usage = [{"slot_id": 1, "used_g": 167.0, "type": "PETG", "color": "#000000"}]
+
+        with (
+            patch("backend.app.api.routes.settings.get_setting", return_value="10.0"),
+            patch("backend.app.utils.threemf_tools.extract_filament_usage_from_3mf", return_value=filament_usage),
+            patch("backend.app.utils.threemf_tools.extract_layer_filament_usage_from_3mf", return_value=None),
+        ):
+            results = await on_print_complete(
+                printer_id=1,
+                data={
+                    "status": "failed",  # the outcome's word: a FINISH that printed on air
+                    "tray_now": 0,
+                    "peaks_reliable": True,
+                    "last_progress": 100.0,
+                    "last_layer_num": 167,
+                    "total_layers": 167,
+                    "first_unfed_layer": 93,
+                },
+                printer_manager=printer_manager,
+                charge="partial",
+                db=db,
+                archive_id=10,
+            )
+
+        assert [(r["weight_used"], r["cost"]) for r in results] == [(93.0, 0.93)]
+        assert archive.cost == 0.93
+
+    @pytest.mark.asyncio
     async def test_archive_cost_fully_tracked_unchanged_by_topup(self, existing_3mf_path):
         """When every gram is covered by inventory spools, the default-rate
         top-up adds nothing -- the archive cost is just the sum of tracked

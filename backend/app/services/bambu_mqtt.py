@@ -25,10 +25,12 @@ import paho.mqtt.client as mqtt
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
 from backend.app.services.hms_errors import hms_severity, print_error_dialog
 from backend.app.services.tray_fields import (
+    TRAY_NOW_EXTERNAL_SPOOL,
     TRAY_PRESENT_STATES,
     TRAYS_PER_AMS_UNIT,
     ZERO_TAG_UID,
     ZERO_TRAY_UUID,
+    extruder_feed,
     normalized_tag_uid,
     normalized_tray_uuid,
     parse_int_field,
@@ -36,6 +38,7 @@ from backend.app.services.tray_fields import (
     parse_tray_state,
     slot_exist_bit,
     slot_exist_bit_set,
+    toolhead_feed,
     unit_exist_bit_set,
 )
 
@@ -102,6 +105,25 @@ def ams_mid_filament_change(state) -> bool:
     cannot read the wire must never refuse an operator.
     """
     return getattr(state, "ams_status_main", None) == AMS_STATUS_FILAMENT_CHANGE
+
+
+def filament_engaged(state) -> bool | None:
+    """Is filament ENGAGED at the toolhead — the state a commanded RFID read (``ams_get_rfid``)
+    cannot run in, because the read has to move filament?
+
+    Read off the ACTIVE extruder (``tray_fields.toolhead_feed``, K1: per extruder on a
+    dual-nozzle machine, where ``tray_now`` is a single value guessed onto an AMS unit).
+    Tri-state: True = fed from an AMS tray or the external holder, False = nothing fed,
+    None = no readable feed. ONE origin for the two readers, each choosing its own fail
+    direction on None: the client's own guard (:meth:`BambuMQTTClient.ams_refresh_tray`)
+    refuses unless it reads False — the wire's backstop fails closed — and
+    ``ams_presence``'s quiet pre-check defers only on True, so an unreadable state never
+    false-blocks a read in front of that backstop. Pure and total.
+    """
+    kind = toolhead_feed(state).active.kind
+    if kind == "unknown":
+        return None
+    return kind != "empty"
 
 
 # The AMS write commands the firmware ACKs on the REPORT topic. An echo is the
@@ -200,6 +222,34 @@ class SentCommand:
 
 # The hex digits an 8-char dialog ``err`` may spell (see ``_decimal_dialog_err``).
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+# The printer-dialog buttons whose frame RESUMES the paused print — the arms of
+# :meth:`BambuMQTTClient.execute_hms_action`'s match that publish a ``resume`` (the plain resume, and
+# ``command_hms_resume``: "Problem solved, resume") or an ``ignore`` (``command_hms_ignore``: skip the
+# check and resume). ONE set (K9, 2026-10-10): the ``/hms/execute-action`` route sends these through
+# ``spool_recovery.resume_paused_print``, so no resume of a paused print bypasses the toolhead refill
+# (Raymond 2026-10-10: "when i click resume there MUST be filament loaded"). Pinned to the match by
+# ``test_hms_actions`` (every arm that publishes a resume or an ignore frame is a member, and only
+# those). OUTSIDE it, by design: ``NO_REMINDER_NEXT_TIME`` (``idle_ignore`` — it resumes nothing),
+# CONTINUE / RETRY (``ams_control resume`` — a filament-change release; the firmware re-feeds the
+# change it holds), FILAMENT_EXTRUDED / ABORT and the OK buttons. A PLATE-CHECK dialog's press never
+# reaches this set: the route hands it to ``pause_recovery.human_dialog_action`` first (the episode's
+# turn — before the first layer, where the start block loads).
+DIALOG_RESUME_ACTIONS: frozenset[str] = frozenset(
+    {
+        HMSAction.RESUME_PRINTING,
+        HMSAction.RESUME_PRINTING_DEFECTS,
+        HMSAction.FILAMENT_LOAD_RESUME,
+        HMSAction.PROCEED,
+        HMSAction.DBL_CHECK_RESUME,
+        HMSAction.PROBLEM_SOLVED_RESUME,
+        HMSAction.RESUME_PRINTING_PROBELM_SOLVED,
+        HMSAction.IGNORE_RESUME,
+        HMSAction.IGNORE_NO_REMINDER_NEXT_TIME,
+        HMSAction.DONT_REMIND_NEXT_TIME,
+    }
+)
 
 
 def _decimal_dialog_err(print_error: object) -> str | None:
@@ -814,6 +864,17 @@ class JobPeaks:
       read as having printed its predecessor's 100 %.
     * ``reliable`` — this client watched the job START, so the numbers are a measurement
       (``_peaks_reliable``; an attach mid-job is not).
+    * ``first_unfed_layer`` — the lowest layer this job PRINTED WITH NOTHING FED, or ``None``
+      when none was observed (:meth:`BambuMQTTClient._track_unfed_layer`, the one writer). An
+      EVENT, never a time: the layer L at which a run of RUNNING pushes began with the ACTIVE
+      extruder empty (``tray_fields.toolhead_feed``) and no filament change in flight
+      (:func:`ams_mid_filament_change`), stamped only once ``layer_num`` advances past L
+      still empty — so a sub-second pause-and-refill inside one layer never stamps it, and
+      neither does the end-of-print retract (L must be below ``total_layers``). NOT gated
+      on ``reliable``: layer numbers are absolute, so a layer printed empty after an attach
+      is a real measurement of this job. 011-H2S 2026-10-09 is the shape it measures: a
+      resume after an accepted pull-back ran on its own printed from layer 93 to the end
+      with ``tray_now=255``, and the FINISH was recorded completed.
 
     A LIVE job's current reading is part of how far it got — a job paused mid-way through
     its first layer reads ``layer_num == 1`` while nothing has been saved yet — so a live
@@ -826,6 +887,9 @@ class JobPeaks:
     progress: float
     layer_num: int
     reliable: bool
+    # Defaulted for the readers that build a JobPeaks by hand (tests): "no unfed layer
+    # observed" is the honest absence. The client's one reader always passes it.
+    first_unfed_layer: int | None = None
 
     @property
     def peak_progress(self) -> float:
@@ -837,13 +901,16 @@ class JobPeaks:
         """The highest layer this job has shown so far."""
         return max(self.last_layer_num, self.layer_num)
 
-    def terminal_fields(self) -> dict[str, float | int | bool]:
-        """The three keys a terminal payload carries (``DepositEvidence.from_terminal_payload``
-        and the usage charge read them)."""
+    def terminal_fields(self) -> dict[str, float | int | bool | None]:
+        """The keys a terminal payload carries (``DepositEvidence.from_terminal_payload``
+        and the usage charge read them). ``first_unfed_layer`` is produced HERE only: the
+        downtime reconcile's ``ended`` synthesis never measured the job's layers and does
+        not invent one."""
         return {
             "last_progress": self.last_progress,
             "last_layer_num": self.last_layer_num,
             "peaks_reliable": self.reliable,
+            "first_unfed_layer": self.first_unfed_layer,
         }
 
 
@@ -1084,6 +1151,13 @@ class BambuMQTTClient:
         # a print start observed HERE (below) may set it True. Every attach sets it False,
         # so a job adopted after one this client DID watch never inherits that job's True.
         self._peaks_reliable: bool = False
+        # The first layer this job printed with nothing fed (JobPeaks.first_unfed_layer) and
+        # the open run it is measured from: the layer at which the current unbroken run of
+        # RUNNING + active-extruder-empty + no-change-in-flight pushes began, None when the
+        # latest push broke it. Process memory with the peaks' own rehydrate story — reset at
+        # every print start and every attach, re-measured from the wire after a restart.
+        self._unfed_run_layer: int | None = None
+        self._first_unfed_layer: int | None = None
         # Stale-predecessor gate for the two "last valid" captures above. The firmware
         # keeps republishing the PREVIOUS job's layer/percent for the seconds a new job
         # spends heating and levelling, so a reading arriving just after a print start
@@ -2816,7 +2890,10 @@ class BambuMQTTClient:
 
                         # Best source: use snow value from device.extruder.info if available
                         snow_tray = self.state.h2d_extruder_snow.get(active_ext)
-                        if snow_tray is not None and snow_tray != 255:
+                        # Something IS at the active extruder (an AMS tray or the external
+                        # holder — ``tray_fields.extruder_feed``); an unloaded or absent snow
+                        # cannot disambiguate.
+                        if extruder_feed(snow_tray).kind in ("fed", "external"):
                             # snow_tray is already normalized to global ID
                             # Verify the slot matches what we see in tray_now
                             # Regular AMS: slot = global_id % 4; AMS HT (128-135): single slot = 0
@@ -2921,12 +2998,12 @@ class BambuMQTTClient:
                     # or before Bambuddy connected) fall through unchanged.
                     captured = self._captured_ams_mapping
                     if captured and all(s == -1 for s in captured):
-                        if self.state.tray_now != 254:
+                        if extruder_feed(self.state.tray_now).kind != "external":
                             logger.debug(
                                 f"[{self.serial_number}] tray_now external-spool override (#1822): "
                                 f"slot {parsed_tray_now} -> 254 (ams_mapping={captured})"
                             )
-                        self.state.tray_now = 254
+                        self.state.tray_now = TRAY_NOW_EXTERNAL_SPOOL
                     else:
                         # P2S (and possibly other models) with multiple AMS units sends LOCAL slot IDs
                         # in tray_now, not global tray IDs (#420). Use the MQTT mapping field
@@ -2965,10 +3042,11 @@ class BambuMQTTClient:
                     # Trust the printer's reported value.
                     self.state.tray_now = parsed_tray_now
 
-                # Track last valid tray for usage tracking (survives retract → 255 at print end)
-                # Valid physical trays: 0-15 (regular AMS), 128-135 (AMS-HT), 254 (external spool)
+                # Track last valid tray for usage tracking (survives retract → 255 at print end).
+                # A physical feeder: an AMS tray or the external spool holder — the one
+                # definition, ``tray_fields.extruder_feed`` (fed / external), never "nothing fed".
                 tn = self.state.tray_now
-                if (0 <= tn <= 15) or (128 <= tn <= 135) or tn == 254:
+                if extruder_feed(tn).kind in ("fed", "external"):
                     # Log tray change for mid-print usage splitting. Gate on the
                     # print-lifecycle flags (`_was_running` set on first RUNNING /
                     # new print, `_completion_triggered` set when on_print_complete
@@ -3451,7 +3529,42 @@ class BambuMQTTClient:
             progress=self.state.progress if self._job_progress_baseline_seen else 0.0,
             layer_num=self.state.layer_num if self._job_layer_baseline_seen else 0,
             reliable=self._peaks_reliable,
+            first_unfed_layer=self._first_unfed_layer,
         )
+
+    def _track_unfed_layer(self) -> None:
+        """Measure :attr:`JobPeaks.first_unfed_layer` from this push — its ONE writer.
+
+        A run is open while the job is RUNNING with the ACTIVE extruder reading empty
+        (``tray_fields.toolhead_feed``: on a dual-nozzle machine an empty active nozzle beside
+        a loaded one prints air) and no filament change in flight
+        (:func:`ams_mid_filament_change` — mid-change, a 255 is the AMS owning the path, not
+        air). Any other push closes it. The run's layer is where it began, and never below
+        layer 1: layer 0 is the start block, where a 255 is the load still to come, so a run
+        that began there is read from the first printed layer. The stamp is the event "a
+        layer was printed with nothing fed": ``layer_num`` advancing past the run's layer
+        while the run is open, the run's layer below ``total_layers`` (an unknown total, 0,
+        stamps nothing; the end-of-print retract happens AT the last layer). The lowest such
+        layer is kept. The layer is read through :meth:`job_peaks` (the stale-predecessor
+        gate: a predecessor's republished layer is never this job's). Total: it rides the
+        status callback (invariant 10).
+        """
+        empty_and_running = (
+            self.state.state == "RUNNING"
+            and not ams_mid_filament_change(self.state)
+            and toolhead_feed(self.state).active.kind == "empty"
+        )
+        if not empty_and_running:
+            self._unfed_run_layer = None
+            return
+        layer = self.job_peaks().layer_num
+        if self._unfed_run_layer is None:
+            self._unfed_run_layer = max(layer, 1)
+            return
+        run = self._unfed_run_layer
+        if layer > run and run < self.state.total_layers:
+            if self._first_unfed_layer is None or run < self._first_unfed_layer:
+                self._first_unfed_layer = run
 
     def _update_state(self, data: dict):
         """Update printer state from message data."""
@@ -4672,6 +4785,8 @@ class BambuMQTTClient:
                 self._peaks_reliable = False
                 self._last_valid_progress = 0.0
                 self._last_valid_layer_num = 0
+                self._unfed_run_layer = None
+                self._first_unfed_layer = None
                 self.state.tray_change_log.clear()
         if self.state.state == "RUNNING" and current_file:
             self._was_running = True
@@ -4725,6 +4840,8 @@ class BambuMQTTClient:
             # Reset last valid progress/layer for usage tracking
             self._last_valid_progress = 0.0
             self._last_valid_layer_num = 0
+            self._unfed_run_layer = None
+            self._first_unfed_layer = None
             # This client watched THIS job start, so from here its peaks measure this
             # job and a zero reading at the terminal is a real zero (see the flag's
             # rationale at __init__). Set only here: the restart-recovery attach above
@@ -4737,7 +4854,7 @@ class BambuMQTTClient:
             # Clear and seed tray change log for mid-print usage splitting
             self.state.tray_change_log.clear()
             tn = self.state.tray_now
-            if (0 <= tn <= 15) or (128 <= tn <= 135) or tn == 254:
+            if extruder_feed(tn).kind in ("fed", "external"):  # a physical feeder (as at the AMS merge)
                 self.state.tray_change_log.append((tn, 0))
             # Initialize timelapse tracking based on current state
             # NOTE: xcam data is parsed BEFORE this code runs in _process_message,
@@ -4788,6 +4905,11 @@ class BambuMQTTClient:
                     "ams_mapping": self._captured_ams_mapping,
                 }
             )
+
+        # Every field of this push is applied (tray_now and ams_status above _update_state,
+        # the active extruder and its snow inside it) and the job baseline is set, so the
+        # unfed-layer run reads one consistent push.
+        self._track_unfed_layer()
 
         # Detect print completion (FINISH = success, FAILED = error, IDLE = aborted)
         # Use _was_running flag in addition to _previous_gcode_state for more robust detection
@@ -6799,11 +6921,11 @@ class BambuMQTTClient:
         tray_now = self.state.tray_now
         logger.info("[%s] Unload requested, tray_now=%s", self.serial_number, tray_now)
 
-        # Determine source ams_id for the unload command
-        if tray_now == 255 or tray_now == 254:
-            ams_id = 255  # No filament or external spool
-        else:
-            ams_id = tray_now // 4  # Source AMS
+        # Determine source ams_id for the unload command: the AMS unit of the tray at the
+        # feeder (an identity reading of ``tray_now`` through ``tray_fields.extruder_feed``);
+        # no filament, the external spool or an unreadable value have no unit (255).
+        feeder = extruder_feed(tray_now)
+        ams_id = feeder.tray // 4 if feeder.tray is not None else 255  # Source AMS
 
         # Wire-safety refusal via the shared _refuse_ams_write helper (drying →
         # identifying → per-printer identify gate; it owns the WARNING log). The
@@ -7007,19 +7129,22 @@ class BambuMQTTClient:
         if refusal is not None:
             return False, _AMS_REFRESH_REFUSAL_MESSAGE[refusal]
 
-        # Check if filament is currently loaded (tray_now != 255)
-        # RFID refresh requires the AMS to move filament, which can't happen if one is loaded
-        tray_now = self.state.tray_now
-        if tray_now != 255:
+        # RFID refresh requires the AMS to move filament, which can't happen if one is loaded:
+        # refused unless the toolhead reads positively EMPTY (``filament_engaged`` — the
+        # ACTIVE extruder; an unreadable feed refuses, the backstop fails closed).
+        if filament_engaged(self.state) is not False:
             # Decode which tray is loaded for the message
-            if tray_now == 254:
+            feed = toolhead_feed(self.state).active
+            if feed.kind == "external":
                 loaded_tray = "external spool"
-            elif tray_now >= 0 and tray_now < 128:
-                loaded_ams = tray_now // 4
-                loaded_slot = tray_now % 4
+            elif feed.tray is not None and feed.tray < 128:
+                loaded_ams = feed.tray // 4
+                loaded_slot = feed.tray % 4
                 loaded_tray = f"AMS {loaded_ams + 1} slot {loaded_slot + 1}"
+            elif feed.tray is not None:
+                loaded_tray = f"tray {feed.tray}"
             else:
-                loaded_tray = f"tray {tray_now}"
+                loaded_tray = "unknown"
             logger.warning("[%s] Cannot refresh AMS tray: filament loaded from %s", self.serial_number, loaded_tray)
             return False, f"Please unload filament first. Currently loaded: {loaded_tray}"
 

@@ -34,6 +34,17 @@ mid-change rows: the firmware's ACK for THIS send — correlated by the send's o
 AND nothing moved. A held command is a hazard, not a tool: a held UNLOAD that drains
 while the print is RUNNING empties the extruder mid-print.
 
+The same answer OUTSIDE a change, at the step bound (2026-10-10). 011-H2S 2026-10-09
+04:31:27 and 014-H2S 2026-10-10 02:45:58: a pull-back sent with filament loaded into an
+AMS in assist — the print PAUSED, after the ladder's ``ams_control resume`` had released
+the change — echoed ``result=success`` and moved nothing for the driver's whole 90 s
+window, which this module then answered ``no_movement``. The AMS ran it ON ITS OWN at
+04:36:01 and 02:50:38 (no farm publish in between), emptying the toolhead under the
+paused print. So an acknowledged, unmoved command whose entry feeder COULD move (an
+unload with filament loaded, a load into an empty path) answers ``held`` there too — but
+only at the deadline, never early at the grace: outside a change a command normally runs
+at once, so a quiet grace is no evidence of holding.
+
 What it owns
 ------------
 * The two verbs :func:`load` and :func:`unload` — the ONLY callers of
@@ -46,6 +57,8 @@ What it owns
   line.
 * :func:`classify` — the ONE reading of "what did the wire answer this command" — and
   :func:`ack_of`, the ONE correlation of a send to the firmware's ACK for it.
+* :func:`ran` — "did this RECORDED command run", read later off its step-ledger columns
+  and the live toolhead feed, for a command whose answer nobody watched to the end.
 * The operator facade :func:`command_for_operator` and its wait :func:`observe`.
 * :func:`operator_commanded_since` — the attribution a recovery driver's takeover
   predicate reads, so a driver's verdict can never be an operator's move.
@@ -58,7 +71,9 @@ decides what to do about the answer. No refusal is ever derived from a posture h
 
 The table rule
 --------------
-:data:`_ROWS` is keyed by ``(command, posture(entry))`` and spells out every cell. A
+:data:`_ROWS` is keyed by ``(command, posture(entry))`` and spells out every cell — four
+AMS-state families (idle, assist, other, mid-change) split by the ACTIVE extruder's entry
+feeder (loaded / empty, ``tray_fields.toolhead_feed``), because what can move differs. A
 missing key RAISES (``LookupError``) — the ``incident_resolution`` rule-table pattern:
 a new command or posture must be given its own row, never inherit another row's
 evidence from an ``else`` nobody considered it for.
@@ -88,8 +103,9 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
+from backend.app.models.printer_incident_step import STEP_KIND_COMMAND
 from backend.app.schemas.printer import AmsCommandOutcome
 from backend.app.services import print_reconcile, spool_respool
 from backend.app.services.bambu_mqtt import (
@@ -101,12 +117,16 @@ from backend.app.services.bambu_mqtt import (
     ams_mid_filament_change,
 )
 from backend.app.services.hms_errors import current_runout_demand, runout_hold_active
-from backend.app.services.printer_incidents import runout_slot_desc
+from backend.app.services.printer_incidents import StepEntry, runout_slot_desc
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.tray_fields import (
     TRAY_NOW_EXTERNAL_SPOOL,
     TRAY_NOW_NOTHING_FED,
+    ExtruderFeed,
+    ToolheadFeed,
+    extruder_feed,
     parse_int_field,
+    toolhead_feed,
     valid_feeder,
 )
 
@@ -114,7 +134,20 @@ logger = logging.getLogger(__name__)
 
 Command = Literal["load", "unload"]
 Actor = Literal["driver", "operator"]
-Posture = Literal["idle", "assist", "mid_change_loaded", "mid_change_empty", "other"]
+Posture = Literal[
+    "idle_loaded",
+    "idle_empty",
+    "assist_loaded",
+    "assist_empty",
+    "other_loaded",
+    "other_empty",
+    "mid_change_loaded",
+    "mid_change_empty",
+]
+#: The posture's FAMILY — inside a job-owned filament change or outside one. What an answer
+#: MEANS differs between them (a ``held`` mid-change waits behind the print's own change; a
+#: ``held`` outside one is accepted and not yet run), so the operator copy is keyed by it.
+PostureFamily = Literal["mid_change", "outside_change"]
 Answer = Literal["complete", "acted", "no_movement", "held", "undecidable", "session_changed"]
 RefusalReason = Literal["not_connected", "runout_hold"]
 
@@ -168,6 +201,9 @@ class AmsWireSnapshot:
 
     Taken BEFORE every send (the entry) and at every poll after it (``now``). ``None``
     means the state did not carry a parseable value — never a stand-in for a reading.
+    ``feed`` is the ACTIVE extruder's feed (``tray_fields.toolhead_feed`` — the one reader
+    of "is the toolhead fed": per extruder on a dual-nozzle machine, where ``tray_now`` is a
+    single value guessed onto an AMS unit); :func:`posture` reads the entry feeder from it.
     ``fresh`` is whether the state describes its CURRENT MQTT session
     (``print_reconcile.is_fresh`` — the one spelling): what lets :func:`classify` tell a
     new session's cached, previous-session fields from its first real report.
@@ -181,6 +217,7 @@ class AmsWireSnapshot:
     connection_epoch: int | None
     fresh: bool
     taken_at: float
+    feed: ExtruderFeed
 
 
 def snapshot(state: PrinterState | None) -> AmsWireSnapshot:
@@ -195,24 +232,36 @@ def snapshot(state: PrinterState | None) -> AmsWireSnapshot:
         connection_epoch=parse_int_field(getattr(state, "connection_epoch", None)),
         fresh=print_reconcile.is_fresh(state),
         taken_at=_monotonic(),
+        feed=toolhead_feed(state).active,
     )
 
 
 def posture(snap: AmsWireSnapshot) -> Posture:
     """The posture a command is sent INTO — the key the classifier's rows are read by.
 
-    Mid-change is ``bambu_mqtt.ams_mid_filament_change`` (the one origin of that
-    comparison), split by whether a real feeder is loaded (``tray_fields.valid_feeder``);
-    ``assist`` / ``idle`` are the ``AMS_STATUS_*`` constants; anything else — including
-    an unreadable state — is ``other``.
+    Two readings, each from its one origin. The AMS state: mid-change is
+    ``bambu_mqtt.ams_mid_filament_change``, ``assist`` / ``idle`` are the ``AMS_STATUS_*``
+    constants, and anything else — an unreadable state included — is ``other``. The entry
+    feeder: ``loaded`` when the ACTIVE extruder is fed from a real AMS feeder
+    (``snap.feed``, ``tray_fields.toolhead_feed`` — per extruder on a dual-nozzle machine),
+    else ``empty`` (nothing fed, the external spool, or no reading). Split in every family,
+    because what can MOVE differs: an unload can pull back only a loaded feeder, and a load
+    feeds into an empty path.
     """
+    loaded = snap.feed.kind == "fed"
     if ams_mid_filament_change(snap):
-        return "mid_change_loaded" if valid_feeder(snap.tray_now) is not None else "mid_change_empty"
+        return "mid_change_loaded" if loaded else "mid_change_empty"
     if snap.ams_status_main == AMS_STATUS_ASSIST:
-        return "assist"
+        return "assist_loaded" if loaded else "assist_empty"
     if snap.ams_status_main == AMS_STATUS_IDLE:
-        return "idle"
-    return "other"
+        return "idle_loaded" if loaded else "idle_empty"
+    return "other_loaded" if loaded else "other_empty"
+
+
+def _posture_family(snap: AmsWireSnapshot) -> PostureFamily:
+    """The family of the posture a command was sent into: the one origin of "mid-change"
+    (``bambu_mqtt.ams_mid_filament_change``), read off the same entry :func:`posture` reads."""
+    return "mid_change" if ams_mid_filament_change(snap) else "outside_change"
 
 
 # --- the classifier -------------------------------------------------------------------
@@ -240,8 +289,9 @@ class Observation:
     #: ``elapsed_s`` at which the current unbroken run of "idle AND nothing fed" began;
     #: ``None`` when the latest poll broke it.
     idle_empty_since_s: float | None = None
-    #: ``elapsed_s`` at which the current unbroken run of "nothing fed" (tray_now 255)
-    #: began, whatever the AMS state; ``None`` when the latest poll broke it.
+    #: ``elapsed_s`` at which the current unbroken run of "nothing fed" (the ACTIVE
+    #: extruder's ``feed`` reading empty) began, whatever the AMS state; ``None`` when the
+    #: latest poll broke it.
     empty_since_s: float | None = None
     #: The firmware's ACK for THIS send: ``None`` = no ACK seen yet, ``True`` = a
     #: success result, ``False`` = any other result.
@@ -260,11 +310,15 @@ class Observation:
         self.acked = ack.succeeded
 
     def fold(self, entry: AmsWireSnapshot, now: AmsWireSnapshot, elapsed_s: float) -> None:
-        """Fold one poll into the running facts. Idempotent for a repeated ``now``."""
+        """Fold one poll into the running facts. Idempotent for a repeated ``now``.
+
+        "Nothing fed" is the ACTIVE extruder's reading (``now.feed``, K1) — the one the
+        posture and :func:`ran` read — never the single ``tray_now`` a dual-nozzle client
+        guessed onto a unit; ``tray_now`` stays a MOVEMENT field (:func:`_moving_fields`)."""
         if _moving_fields(now) != _moving_fields(entry):
             self.moved = True
         idle = now.ams_status_main == AMS_STATUS_IDLE
-        empty = now.tray_now == TRAY_NOW_NOTHING_FED
+        empty = now.feed.kind == "empty"
         if now.ams_status_main is not None and not idle:
             self.cycle_seen = True
         if idle and empty:
@@ -302,8 +356,8 @@ def _unload_settled(
         no-op): idle + nothing fed must HOLD for :data:`UNLOAD_GRACE_S`; any contrary
         poll restarts the dwell.
 
-    ``tray_now == 255`` alone is never completion: after a feed fault it already reads
-    255 before the unload (009-H2S 2026-07-20).
+    "Nothing fed" alone is never completion: after a feed fault the toolhead already reads
+    empty before the unload (009-H2S 2026-07-20).
     """
     if obs.idle_empty_since_s is None:
         return None
@@ -326,11 +380,32 @@ def _held_behind_the_change(obs: Observation, elapsed_s: float, deadline_s: floa
     return None
 
 
+def _held_at_the_bound(obs: Observation, elapsed_s: float, deadline_s: float) -> Answer | None:
+    """``held`` OUTSIDE a filament change — the 011-H2S / 014-H2S measurement in the module
+    docstring: the firmware ACKNOWLEDGED this send (``obs.acked is True``) and nothing moved
+    by the DEADLINE (the step bound). Never earlier: outside a change the AMS runs a command
+    it accepts at once, so only the whole window unmoved is the reading; the measured run
+    came ~4.5 min after the send. No ACK, or a failure ACK, stays ``no_movement`` (the
+    deadline rule); a movement is never ``held``."""
+    if obs.acked is True and not obs.moved and elapsed_s >= deadline_s:
+        return "held"
+    return None
+
+
+def _unload_loaded_outside_a_change(
+    target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
+) -> Answer | None:
+    """An unload sent with filament loaded into an AMS that is NOT mid-change (idle, assist
+    or other): complete exactly as :func:`_unload_settled`; otherwise ``held`` at the bound
+    when acknowledged and unmoved (:func:`_held_at_the_bound` — 011-H2S / 014-H2S, assist)."""
+    return _unload_settled(target, now, obs, elapsed_s, deadline_s) or _held_at_the_bound(obs, elapsed_s, deadline_s)
+
+
 def _unload_mid_change_loaded(
     target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
 ) -> Answer | None:
-    """An unload sent into a mid-change AMS with a real feeder loaded: complete when
-    ``tray_now`` left that feeder for 255 and the empty reading has held for
+    """An unload sent into a mid-change AMS with a real feeder loaded: complete when the
+    active extruder left that feeder for nothing fed and the empty reading has held for
     :data:`UNLOAD_GRACE_S`. The AMS may legitimately STAY in state 1 — the print still
     owes the change — so idle is not required. Otherwise ``held`` when acknowledged
     and unmoved (:func:`_held_behind_the_change`) — the 012-H2S 2026-09-23 posture."""
@@ -355,14 +430,31 @@ def _unload_mid_change_empty(
 def _load_reached_target(
     target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
 ) -> Answer | None:
-    """A load, in any posture: complete when ``tray_now`` reads the commanded tray.
+    """A load, in any posture: complete when the ACTIVE extruder reads the commanded feeder
+    (``now.feed``, K1 — the reading :func:`ran` and the refill's confirm take): fed from the
+    target tray, or the external holder for a load of the external spool
+    (``tray_fields.extruder_feed`` of the target names which).
 
     Never on the "nothing fed" sentinel: a load of Ext-R (``target`` 255 on a
-    dual-nozzle H2D) reading ``tray_now == 255`` is the absence of a load, not its
-    evidence (``tray_fields`` names that sentinel for exactly this reason)."""
-    if target is not None and target != TRAY_NOW_NOTHING_FED and now.tray_now == target:
+    dual-nozzle H2D) reading nothing fed is the absence of a load, not its evidence
+    (``tray_fields`` names that sentinel for exactly this reason)."""
+    want = extruder_feed(target)
+    if want.kind in ("fed", "external") and now.feed == want:
         return "complete"
     return None
+
+
+def _load_into_an_empty_path_outside_a_change(
+    target: int | None, now: AmsWireSnapshot, obs: Observation, elapsed_s: float, deadline_s: float
+) -> Answer | None:
+    """A load into an EMPTY path of an AMS that is NOT mid-change: complete exactly as
+    :func:`_load_reached_target`; otherwise ``held`` at the bound when acknowledged and
+    unmoved (:func:`_held_at_the_bound`). The posture of the farm's refill load. A load into
+    a LOADED path keeps the plain :func:`_load_reached_target` row: never measured, and never
+    the farm's own send, which unloads first (doctrine invariant 8)."""
+    return _load_reached_target(target, now, obs, elapsed_s, deadline_s) or _held_at_the_bound(
+        obs, elapsed_s, deadline_s
+    )
 
 
 def _load_mid_change(
@@ -377,18 +469,26 @@ def _load_mid_change(
 
 
 # EXPLICIT, every cell, no default: a missing key RAISES at the lookup (``_row``).
-# ``held`` is reachable only from the mid-change rows that can MOVE: an unload with
-# nothing loaded (``mid_change_empty``) has no physical answer, so it stays
-# ``undecidable``, and outside a change a command is never held behind one.
+# ``held`` is reachable only from the rows whose entry feeder can MOVE: mid-change, early
+# at the grace (behind the print's change); outside a change, an unload with filament
+# loaded and a load into an empty path, at the bound. An unload with nothing loaded has no
+# physical answer (``undecidable`` mid-change; outside a change the idle dwell or the
+# deadline rule), and a load into a loaded path keeps the plain reached-target row.
 _ROWS: dict[tuple[Command, Posture], Row] = {
-    ("unload", "idle"): _unload_settled,
-    ("unload", "assist"): _unload_settled,
-    ("unload", "other"): _unload_settled,
+    ("unload", "idle_loaded"): _unload_loaded_outside_a_change,
+    ("unload", "idle_empty"): _unload_settled,
+    ("unload", "assist_loaded"): _unload_loaded_outside_a_change,
+    ("unload", "assist_empty"): _unload_settled,
+    ("unload", "other_loaded"): _unload_loaded_outside_a_change,
+    ("unload", "other_empty"): _unload_settled,
     ("unload", "mid_change_loaded"): _unload_mid_change_loaded,
     ("unload", "mid_change_empty"): _unload_mid_change_empty,
-    ("load", "idle"): _load_reached_target,
-    ("load", "assist"): _load_reached_target,
-    ("load", "other"): _load_reached_target,
+    ("load", "idle_loaded"): _load_reached_target,
+    ("load", "idle_empty"): _load_into_an_empty_path_outside_a_change,
+    ("load", "assist_loaded"): _load_reached_target,
+    ("load", "assist_empty"): _load_into_an_empty_path_outside_a_change,
+    ("load", "other_loaded"): _load_reached_target,
+    ("load", "other_empty"): _load_into_an_empty_path_outside_a_change,
     ("load", "mid_change_loaded"): _load_mid_change,
     ("load", "mid_change_empty"): _load_mid_change,
 }
@@ -413,9 +513,10 @@ def _unload_idle_and_empty(
     """An unload read across a reconnect, from ONE fresh snapshot: ``complete`` when the
     AMS reads idle with nothing fed. No dwell — the dwell of :func:`_unload_settled` guards
     a reading still inside the change cycle the farm watched, and nothing was watched
-    across the gap; idle AND empty is the strict reading, so a mid-change 255 (the AMS still
-    owing the print's change) is not completion here, whatever it would be on one session."""
-    if now.ams_status_main == AMS_STATUS_IDLE and now.tray_now == TRAY_NOW_NOTHING_FED:
+    across the gap; idle AND empty is the strict reading, so a mid-change empty toolhead (the
+    AMS still owing the print's change) is not completion here, whatever it would be on one
+    session. Empty is the ACTIVE extruder's ``feed`` (K1)."""
+    if now.ams_status_main == AMS_STATUS_IDLE and now.feed.kind == "empty":
         return "complete"
     return None
 
@@ -433,14 +534,20 @@ def _unload_nothing_was_loaded(
 # only on a FRESH snapshot of a newer session; a row's ``None`` falls to the motion rule in
 # :func:`_across_sessions` (moved → ``acted``, nothing moved → ``session_changed``).
 _ACROSS_ROWS: dict[tuple[Command, Posture], Row] = {
-    ("unload", "idle"): _unload_idle_and_empty,
-    ("unload", "assist"): _unload_idle_and_empty,
-    ("unload", "other"): _unload_idle_and_empty,
+    ("unload", "idle_loaded"): _unload_idle_and_empty,
+    ("unload", "idle_empty"): _unload_idle_and_empty,
+    ("unload", "assist_loaded"): _unload_idle_and_empty,
+    ("unload", "assist_empty"): _unload_idle_and_empty,
+    ("unload", "other_loaded"): _unload_idle_and_empty,
+    ("unload", "other_empty"): _unload_idle_and_empty,
     ("unload", "mid_change_loaded"): _unload_idle_and_empty,
     ("unload", "mid_change_empty"): _unload_nothing_was_loaded,
-    ("load", "idle"): _load_reached_target,
-    ("load", "assist"): _load_reached_target,
-    ("load", "other"): _load_reached_target,
+    ("load", "idle_loaded"): _load_reached_target,
+    ("load", "idle_empty"): _load_reached_target,
+    ("load", "assist_loaded"): _load_reached_target,
+    ("load", "assist_empty"): _load_reached_target,
+    ("load", "other_loaded"): _load_reached_target,
+    ("load", "other_empty"): _load_reached_target,
     ("load", "mid_change_loaded"): _load_reached_target,
     ("load", "mid_change_empty"): _load_reached_target,
 }
@@ -508,8 +615,8 @@ def classify(
     The firmware's ACK is the CALLER's to fold: before every call, the caller folds the
     ACK for its send into ``observation`` (``observation.fold_ack(ack_of(printer_id,
     sent))``) — :func:`observe` does, and so must any loop that runs this classifier
-    itself. A caller that never folds one never gets ``held``: the mid-change rows then
-    answer as if no ACK arrived (``no_movement`` at the deadline).
+    itself. A caller that never folds one never gets ``held``: the rows then answer as if
+    no ACK arrived (``no_movement`` at the deadline).
 
     Order, for every command:
 
@@ -520,7 +627,8 @@ def classify(
        ``acted`` on a moved field and ``session_changed`` on none. Never ``held``.
     2. The row for ``(command, posture(entry))`` — a missing row raises ``LookupError``.
        The mid-change rows that can move answer ``held`` early (acknowledged + unmoved,
-       :func:`_held_behind_the_change`).
+       :func:`_held_behind_the_change`); outside a change the loaded unload and the load
+       into an empty path answer ``held`` at the deadline (:func:`_held_at_the_bound`).
     3. At ``elapsed_s >= deadline_s``: a moved field → ``acted``, nothing moved →
        ``no_movement``.
     """
@@ -536,6 +644,55 @@ def classify(
     if elapsed_s >= deadline_s:
         return "acted" if observation.moved else "no_movement"
     return None
+
+
+# --- did a recorded motion command run -------------------------------------------------
+
+#: The feeder-position kinds a recovery driver RECORDS at a send that name a real AMS feeder
+#: at the extruder — the jammed tray, or another one (``spool_recovery.FeederKind``, written
+#: on ``printer_incident_step.feeder``). Read here, never re-spelled there: the vocabulary is
+#: the driver's (its module imports this one, so the reverse import would be a cycle), and
+#: ``test_ams_command.TestRan`` pins this subset against it.
+_RECORDED_LOADED_FEEDERS: frozenset[str] = frozenset({"jammed", "other"})
+
+_COMMANDS: frozenset[str] = frozenset(get_args(Command))
+
+
+def ran(step: StepEntry, live: ToolheadFeed) -> bool | None:
+    """Did this RECORDED motion command run? Read off the step's own ledger columns
+    (``printer_incidents.StepEntry``: the command ``name``, the load's ``target``, the
+    feeder-position kind read at the send) and the LIVE toolhead feed
+    (``tray_fields.toolhead_feed`` — the ACTIVE extruder). Pure and DB-free.
+
+    Its readers ask it about a command that may still run after nobody watched it answer:
+    the recovery driver's round top after a restart (never send behind a pending command)
+    and the per-push detector of a farm command that ran after the hand-over. The measured
+    reason: an accepted pull-back ran ON ITS OWN ~4.5 min after the send (011-H2S
+    2026-10-09 04:31:27 → 04:36:01; 014-H2S 2026-10-10 02:45:58 → 02:50:38).
+
+    * unload — ran ⇔ the recorded entry feeder was LOADED (:data:`_RECORDED_LOADED_FEEDERS`)
+      and the active extruder now reads empty. Sent with nothing loaded, or with no
+      reading of what was: ``None`` (nothing physical can answer it).
+    * load — ran ⇔ the active feeder now IS the target. A target that is no AMS feeder
+      (the external spool, Ext-R, none): ``None`` — the feed reading cannot attribute it.
+    * a live reading of ``unknown``: ``None`` (nothing was read).
+
+    Motion-only: a step that is not a ``command``, or names a command this module does not
+    publish, RAISES ``LookupError`` — a ledger token nobody can read back is drift, never a
+    skipped row (``printer_incidents.EvidenceLog``'s rule).
+    """
+    if step.kind != STEP_KIND_COMMAND or step.name not in _COMMANDS:
+        raise LookupError(f"ams_command.ran: not a motion command step (kind={step.kind!r}, name={step.name!r})")
+    if live.active.kind == "unknown":
+        return None
+    if step.name == "unload":
+        if step.feeder not in _RECORDED_LOADED_FEEDERS:
+            return None
+        return live.active.kind == "empty"
+    target = valid_feeder(step.target)
+    if target is None:
+        return None
+    return live.active.kind == "fed" and live.active.tray == target
 
 
 # --- the verbs ------------------------------------------------------------------------
@@ -791,11 +948,15 @@ async def observe(
 
 @dataclass(frozen=True)
 class AmsCommandResult:
-    """The operator facade's answer: the closed outcome plus the sentence for it (the
-    refusal's own detail, or the non-UI-client fallback for a wire answer)."""
+    """The operator facade's answer: the closed outcome, the sentence for it (the refusal's
+    own detail, or the non-UI-client fallback for a wire answer), and the posture family the
+    command was sent into (:func:`_posture_family`) — what a client keys its own copy of the
+    answer by, since ``held`` means different things in the two families. ``None`` for a
+    refusal: nothing was sent, so no posture was read."""
 
     outcome: AmsCommandOutcome
     message: str
+    family: PostureFamily | None
 
 
 _REFUSAL_OUTCOME: dict[RefusalReason, AmsCommandOutcome] = {
@@ -803,22 +964,46 @@ _REFUSAL_OUTCOME: dict[RefusalReason, AmsCommandOutcome] = {
     "runout_hold": "refused_runout_hold",
 }
 
-# The non-UI-client fallback sentence per (command, answer); ``{target}`` is the load's
-# tray. No ("load", "undecidable") cell, on purpose: only an unload into a mid-change AMS
-# with nothing loaded is undecidable (``_unload_mid_change_empty``), so that lookup
-# raising is the classifier having changed shape without its copy.
-_ANSWER_COPY: dict[tuple[Command, Answer], str] = {
-    ("load", "complete"): "Loading filament from {target}",
-    ("load", "acted"): "Loading filament from {target}",
-    ("load", "no_movement"): "Load sent. AMS did not move.",
-    ("load", "held"): "Load accepted. Held behind the paused print's filament change.",
-    ("load", "session_changed"): "Printer reconnected during the command. Check the AMS.",
-    ("unload", "complete"): "Unloading filament",
-    ("unload", "acted"): "Unloading filament",
-    ("unload", "no_movement"): "Unload sent. AMS did not move.",
-    ("unload", "held"): "Unload accepted. Held behind the paused print's filament change.",
-    ("unload", "undecidable"): "Unload sent. Nothing was loaded.",
-    ("unload", "session_changed"): "Printer reconnected during the command. Check the AMS.",
+# The non-UI-client fallback sentence per (command, answer, posture family); ``{target}``
+# is the load's tray. Every cell explicit — a missing key RAISES, so a classifier that
+# changed shape without its copy fails loudly. The families differ only in ``held``: inside
+# a change the command waits behind the print's own change; outside one it was accepted and
+# has not run, and an accepted unload can still run later on its own (011-H2S 2026-10-09,
+# 014-H2S 2026-10-10: ~4.5 min after the send). A held load outside a change is stated as
+# fact only — its later run is unmeasured. No ``undecidable`` cell except the mid-change
+# unload: only an unload into a mid-change AMS with nothing loaded is undecidable
+# (``_unload_mid_change_empty`` / ``_unload_nothing_was_loaded``).
+_LOADING = "Loading filament from {target}"
+_UNLOADING = "Unloading filament"
+_LOAD_UNMOVED = "Load sent. AMS did not move."
+_UNLOAD_UNMOVED = "Unload sent. AMS did not move."
+_RECONNECTED = "Printer reconnected during the command. Check the AMS."
+_ANSWER_COPY: dict[tuple[Command, Answer, PostureFamily], str] = {
+    ("load", "complete", "mid_change"): _LOADING,
+    ("load", "acted", "mid_change"): _LOADING,
+    ("load", "no_movement", "mid_change"): _LOAD_UNMOVED,
+    ("load", "held", "mid_change"): "Load accepted. Held behind the paused print's filament change.",
+    ("load", "session_changed", "mid_change"): _RECONNECTED,
+    ("load", "complete", "outside_change"): _LOADING,
+    ("load", "acted", "outside_change"): _LOADING,
+    ("load", "no_movement", "outside_change"): _LOAD_UNMOVED,
+    ("load", "held", "outside_change"): "Load accepted. Not run yet.",
+    ("load", "session_changed", "outside_change"): _RECONNECTED,
+    ("unload", "complete", "mid_change"): _UNLOADING,
+    ("unload", "acted", "mid_change"): _UNLOADING,
+    ("unload", "no_movement", "mid_change"): _UNLOAD_UNMOVED,
+    ("unload", "held", "mid_change"): "Unload accepted. Held behind the paused print's filament change.",
+    ("unload", "undecidable", "mid_change"): "Unload sent. Nothing was loaded.",
+    ("unload", "session_changed", "mid_change"): _RECONNECTED,
+    ("unload", "complete", "outside_change"): _UNLOADING,
+    ("unload", "acted", "outside_change"): _UNLOADING,
+    ("unload", "no_movement", "outside_change"): _UNLOAD_UNMOVED,
+    (
+        "unload",
+        "held",
+        "outside_change",
+    ): "Unload accepted. Not run yet. The AMS can run it later without another command.",
+    ("unload", "session_changed", "outside_change"): _RECONNECTED,
 }
 
 
@@ -830,8 +1015,8 @@ def _target_label(tray_id: int) -> str:
     return f"AMS {tray_id // 4} slot {tray_id % 4 + 1}"
 
 
-def _answer_message(command: Command, tray_id: int | None, answer: Answer) -> str:
-    template = _ANSWER_COPY[(command, answer)]
+def _answer_message(command: Command, tray_id: int | None, answer: Answer, family: PostureFamily) -> str:
+    template = _ANSWER_COPY[(command, answer, family)]
     return template.format(target=_target_label(tray_id)) if tray_id is not None else template
 
 
@@ -847,6 +1032,7 @@ async def command_for_operator(printer_id: int, command: Command, tray_id: int |
     else:
         raise LookupError(f"ams_command.command_for_operator: unknown command {command!r}")
     if isinstance(sent, Refusal):
-        return AmsCommandResult(outcome=_REFUSAL_OUTCOME[sent.reason], message=sent.detail)
+        return AmsCommandResult(outcome=_REFUSAL_OUTCOME[sent.reason], message=sent.detail, family=None)
     answer = await observe(printer_id, command, tray_id, sent, timeout_s=OPERATOR_ACK_S)
-    return AmsCommandResult(outcome=answer, message=_answer_message(command, tray_id, answer))
+    family = _posture_family(sent.entry)
+    return AmsCommandResult(outcome=answer, message=_answer_message(command, tray_id, answer, family), family=family)

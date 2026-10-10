@@ -32,6 +32,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spool_usage_history import SpoolUsageHistory
 from backend.app.services import job_identity
+from backend.app.services.job_extent import JobExtent, payload_int, plate_share
 from backend.app.services.tray_fields import normalized_tag_uid, normalized_tray_uuid
 from backend.app.utils.tag_normalization import tag_matches_row
 
@@ -366,32 +367,22 @@ def _decode_mqtt_mapping(mapping_raw: list | None) -> list[int] | None:
     return result
 
 
-def _int_or(value: object, default: int) -> int:
-    """``value`` when it is a real int (never a bool), else ``default``."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else default
-
-
-def _float_or(value: object, default: float) -> float:
-    """``value`` as a float when it is a real number (never a bool), else ``default``."""
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
-
-
 @dataclass(frozen=True, slots=True)
-class JobEvidence:
+class JobEvidence(JobExtent):
     """The ENDING job's own consumption evidence, read once off its terminal payload.
 
     The charge path's only source for how far the job ran and which trays fed it. The producer is
-    ``bambu_mqtt`` — the peaks (``last_progress`` / ``last_layer_num``) from the client's per-job
-    tracking, the rest through ``bambu_mqtt.job_consumption_evidence`` — snapshotted at the moment
-    the terminal fired, so none of it can describe the job the printer runs by the time the charge
-    is computed. A key the payload lacks (a synthesis that has none, an older client) reads as
-    "not observed": no progress, no layers, no tray switches, no tray (-1), no mapping — never a
-    guess filled in from the live printer.
+    ``bambu_mqtt`` — the peaks and the unfed layer from the client's per-job tracking
+    (``JobPeaks.terminal_fields``), the rest through ``bambu_mqtt.job_consumption_evidence`` —
+    snapshotted at the moment the terminal fired, so none of it can describe the job the printer
+    runs by the time the charge is computed. How far the job got, and how far it FED, is the
+    payload's one extent parse (``job_extent.JobExtent``, which the plate gate's ``DepositEvidence``
+    is built on too); a partial charge runs to its ``charged_extent``. A key the payload lacks (a
+    synthesis that has none, an older client) reads as "not observed": no progress, no layers,
+    nothing unfed, no tray switches, no tray (-1), no mapping — never a guess filled in from the
+    live printer.
     """
 
-    last_progress: float = 0.0
-    last_layer_num: int = 0
-    total_layers: int = 0
     tray_change_log: tuple[tuple[int, int], ...] = ()
     tray_now: int = -1
     last_loaded_tray: int = -1
@@ -403,16 +394,14 @@ class JobEvidence:
         changes: list[tuple[int, int]] = []
         for change in data.get("tray_change_log") or ():
             if isinstance(change, (tuple, list)) and change and isinstance(change[0], int):
-                changes.append((change[0], _int_or(change[1], 0) if len(change) >= 2 else 0))
+                changes.append((change[0], payload_int(change[1], 0) if len(change) >= 2 else 0))
         raw_mapping = data.get("mqtt_mapping")
         decoded = _decode_mqtt_mapping(raw_mapping if isinstance(raw_mapping, list) else None)
         return cls(
-            last_progress=_float_or(data.get("last_progress"), 0.0),
-            last_layer_num=_int_or(data.get("last_layer_num"), 0),
-            total_layers=_int_or(data.get("total_layers"), 0),
+            **JobExtent.payload_fields(data),
             tray_change_log=tuple(changes),
-            tray_now=_int_or(data.get("tray_now"), -1),
-            last_loaded_tray=_int_or(data.get("last_loaded_tray"), -1),
+            tray_now=payload_int(data.get("tray_now"), -1),
+            last_loaded_tray=payload_int(data.get("last_loaded_tray"), -1),
             mqtt_mapping=tuple(decoded) if decoded else None,
         )
 
@@ -1249,12 +1238,13 @@ async def on_print_complete(
     )
     # The job's own evidence, as the terminal captured it — the record a charge is built from.
     logger.info(
-        "[UsageTracker] PRINT COMPLETE printer %d: progress=%s, layer=%s/%s, mapping=%s, tray_now=%s, "
-        "last_loaded_tray=%s, tray_change_log=%s",
+        "[UsageTracker] PRINT COMPLETE printer %d: progress=%s, layer=%s/%s, first_unfed_layer=%s, mapping=%s, "
+        "tray_now=%s, last_loaded_tray=%s, tray_change_log=%s",
         printer_id,
         evidence.last_progress,
         evidence.last_layer_num,
         evidence.total_layers,
+        evidence.first_unfed_layer,
         evidence.mqtt_mapping,
         evidence.tray_now,
         evidence.last_loaded_tray,
@@ -1468,7 +1458,11 @@ async def on_print_complete(
     # mapped slots' share — e.g. $0.01 for a 110g print when 3 of 4 trays had
     # no spool record. The initial cost set by archive.py (total grams *
     # primary cost_per_kg) is fine on its own, but this block overwrites it,
-    # so the overwrite must reconstruct the whole-print cost.
+    # so the overwrite must reconstruct the cost of what the job CHARGED: the
+    # untracked remainder is of the plate's share this terminal is charged
+    # (``job_extent.plate_share``), never of the whole plate — a job stopped
+    # half-way, or one that printed on air from layer 93 (011-H2S 2026-10-09),
+    # never prices the filament it did not feed.
 
     if archive_id and results:
         from sqlalchemy import func
@@ -1481,8 +1475,8 @@ async def on_print_complete(
         if archive:
             total_cost = sum(r.get("cost", 0) or 0 for r in results)
             tracked_grams = sum(r.get("weight_used", 0) or 0 for r in results)
-            archive_grams = archive.filament_used_grams or 0
-            untracked_grams = max(0.0, archive_grams - tracked_grams)
+            charged_estimate_g = (archive.filament_used_grams or 0) * plate_share(charge, evidence.charged_extent)
+            untracked_grams = max(0.0, charged_estimate_g - tracked_grams)
             if untracked_grams > 0 and default_filament_cost > 0:
                 total_cost += (untracked_grams / 1000.0) * default_filament_cost
             if total_cost > 0:
@@ -1966,9 +1960,10 @@ async def _track_from_3mf(
     """Track usage from 3MF per-filament slicer data (primary path).
 
     Uses slicer-estimated filament weight for all spools (BL and non-BL).
-    ``charge`` is the outcome's basis: ``full`` charges the plate's slicer grams; ``partial``
-    tries per-layer gcode data at the payload's ``last_layer_num`` first, then falls back to
-    linear scaling by its ``last_progress``. ``evidence`` is the ending job's own record (its
+    ``charge`` is the outcome's basis: ``full`` charges the plate's slicer grams; ``partial`` runs
+    to the extent the job FED (``evidence.charged_extent`` — its last layer and percent, ending at
+    the first layer it printed with nothing fed): per-layer gcode data at that layer first, then
+    linear scaling by its share of the plate. ``evidence`` is the ending job's own record (its
     terminal payload) and ``hardware`` the live printer's hardware description (``raw_data``) —
     see :func:`on_print_complete` for why each is read where.
 
@@ -2193,8 +2188,18 @@ async def _track_from_3mf(
     nonzero_slot_ids = [u.get("slot_id", 0) for u in nonzero_slots]
     tray_now_override: int | None = None
 
+    # How far the charge runs: the whole plate, or the extent a PARTIAL charge reaches — the job's
+    # last layer and percent, ending at the first layer it printed with nothing fed
+    # (``JobExtent.charged_extent``). A feeder segment that STARTS at or past that layer fed nothing
+    # (014-H2S unit 4289: the refill back onto tray 0 at layer 134 printed on air to the stop at 142),
+    # so it is dropped before the log is split, and the layer-ratio split spans the layers CHARGED:
+    # over the plate's span, the last segment took the share of layers the job never reached.
+    extent = evidence.charged_extent
     tray_changes = list(evidence.tray_change_log)
-    split_total_layers = evidence.total_layers
+    split_layers = evidence.total_layers or evidence.last_layer_num
+    if charge != "full" and extent.layer > 0:
+        tray_changes = [(tray, layer) for tray, layer in tray_changes if layer < extent.layer]
+        split_layers = extent.layer
 
     slot_segments = _assign_segments_to_slots(tray_changes, slot_to_tray, nonzero_slot_ids)
     any_split = any(len({t for t, _ in (slot_segments.get(sid) or [])}) > 1 for sid in nonzero_slot_ids)
@@ -2230,22 +2235,24 @@ async def _track_from_3mf(
                 evidence.last_loaded_tray,
             )
 
-    # Scale factor: the whole plate, or the job's own last progress (the firmware resets the live
-    # percent on a cancel; the payload carries the last valid one it read for THIS job).
-    if charge == "full":
-        scale = 1.0
-    else:
-        scale = max(0.0, min(evidence.last_progress / 100.0, 1.0))
+    # Scale factor: the whole plate, or the share the job fed (the firmware resets the live percent
+    # on a cancel; the payload carries the last valid reading of THIS job, and its unfed layer).
+    scale = plate_share(charge, extent)
+    if charge != "full":
         logger.info(
-            "[UsageTracker] 3MF: partial charge — the terminal's last_progress=%.1f, last_layer_num=%d",
+            "[UsageTracker] 3MF: partial charge — the terminal's last_progress=%.1f, last_layer_num=%d, "
+            "first_unfed_layer=%s -> charged to layer %d (%.3f of the plate)",
             evidence.last_progress,
             evidence.last_layer_num,
+            evidence.first_unfed_layer,
+            extent.layer,
+            scale,
         )
 
-    # Per-layer gcode accuracy for partial prints, at the job's own last layer
+    # Per-layer gcode accuracy for partial prints, at the layer the charge runs to
     layer_grams: dict[int, float] | None = None
     if charge != "full":
-        current_layer = evidence.last_layer_num
+        current_layer = extent.layer
         if current_layer > 0:
             try:
                 from backend.app.utils.threemf_tools import (
@@ -2315,9 +2322,20 @@ async def _track_from_3mf(
             # then resumes on the same tray), so aggregate before writing one
             # history row per spool. The last segment carries the rounding
             # remainder so the parts sum to exactly total_weight.
+            #
+            # With per-layer G-code the segments TILE the filament's cumulative
+            # extrusion: each runs from where the previous one ended, and the
+            # first from 0 mm — so everything this filament extruded before its
+            # first logged switch is the tray it started on. That includes the
+            # start block's prime, which the parser buckets under layer 0 (before
+            # ``M73 L1``): measured from layer 0's cumulative, the prime fell
+            # through to the last segment's remainder and was charged to whichever
+            # tray the job ENDED on (capsule E's replay of 2026-10-09/10: 0.123 g
+            # per plate on the wrong roll, on every T0 -> T1 auto-refill too).
             seg_count = len(this_slot_segments)
             per_tray_grams: dict[int, float] = {}
             sum_previous = 0.0
+            mm_charged = 0.0
             for seg_idx, (tray_global, seg_start_layer) in enumerate(this_slot_segments):
                 is_last = seg_idx + 1 >= seg_count
 
@@ -2326,13 +2344,14 @@ async def _track_from_3mf(
                     segment_grams = total_weight - sum_previous
                 elif split_layer_usage:
                     seg_end_layer = this_slot_segments[seg_idx + 1][1]
-                    mm_at_start = get_cumulative_usage_at_layer(split_layer_usage, seg_start_layer).get(filament_id, 0)
                     mm_at_end = get_cumulative_usage_at_layer(split_layer_usage, seg_end_layer).get(filament_id, 0)
-                    segment_grams = mm_to_grams(mm_at_end - mm_at_start, diameter, density)
+                    segment_grams = mm_to_grams(mm_at_end - mm_charged, diameter, density)
+                    mm_charged = mm_at_end
                 else:
-                    # No per-layer data: linear fallback by layer ratio (#1771).
-                    # Cascade denominators because firmware on some models (P1S
-                    # observed) resets `total_layer_num` to 0 at print end —
+                    # No per-layer data: linear fallback by layer ratio (#1771),
+                    # over the layers charged (``split_layers``). A full charge
+                    # cascades its denominator because firmware on some models
+                    # (P1S observed) resets `total_layer_num` to 0 at print end —
                     # `last_layer_num` is the print's last-valid layer captured
                     # mid-print and survives that reset. Equal-split is the
                     # last-resort fence: still wrong, but bounded — never dumps
@@ -2341,7 +2360,7 @@ async def _track_from_3mf(
                     # fed from spool 1 then spool 2, all 260 g credited to
                     # spool 2 even though spool 1 had given up its 180 g).
                     seg_end_layer = this_slot_segments[seg_idx + 1][1]
-                    denom = split_total_layers or evidence.last_layer_num
+                    denom = split_layers
                     if denom > 0:
                         segment_grams = total_weight * (seg_end_layer - seg_start_layer) / denom
                     else:

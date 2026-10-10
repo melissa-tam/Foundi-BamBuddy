@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor, fireEvent } from '@testing-library/react';
 import { render } from '../utils';
 import { PrintLogModal } from '../../components/PrintLogModal';
+import { FAILURE_REASON_KEYS } from '../../components/EditArchiveModal';
 import { api } from '../../api/client';
+import en from '../../i18n/locales/en';
 
 vi.mock('../../api/client', () => ({
   api: {
@@ -112,6 +114,24 @@ describe('PrintLogModal', () => {
       expect(screen.getByText('Filament runout')).toBeInTheDocument();
     });
     expect(screen.queryByText('filamentRunout')).not.toBeInTheDocument();
+  });
+
+  it('renders the farm-measured printed_without_filament category in words', async () => {
+    // A FINISH the farm records failed because layers printed with nothing fed
+    // (`terminal_outcome.PRINTED_WITHOUT_FILAMENT_CATEGORY`): a key, worded per locale.
+    vi.mocked(api.getArchiveRuns).mockResolvedValue({
+      total: 1,
+      items: [{ ...sampleRuns.items[0], failure_reason: 'printed_without_filament' }],
+    });
+    render(<PrintLogModal archiveId={42} archiveName="Benchy" onClose={vi.fn()} />);
+    await waitFor(() => {
+      expect(screen.getByText(en.editArchive.failureReasons.printed_without_filament)).toBeInTheDocument();
+    });
+    expect(screen.queryByText('printed_without_filament')).not.toBeInTheDocument();
+  });
+
+  it('does not offer the farm-measured category as an operator choice', () => {
+    expect(FAILURE_REASON_KEYS as readonly string[]).not.toContain('printed_without_filament');
   });
 
   it('shows the empty state when there are no runs', async () => {

@@ -2142,6 +2142,85 @@ class TestOpenIncidentProjection:
         }
 
 
+class TestToolheadProjection:
+    """``toolhead`` on the status frame (K10/C3c, 2026-10-10) — what the card's "Toolhead empty" chip
+    reads: the ACTIVE extruder's feed (``tray_fields.toolhead_feed``, K1) and the farm's refill of it
+    (``printer_incidents.refill_state``), DERIVED on every broadcast, JSON primitives."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from backend.app.services import printer_incidents
+
+        printer_incidents._reset_state()
+        yield
+        printer_incidents._reset_state()
+
+    def _state(self, tray_now):
+        from backend.app.services.bambu_mqtt import PrinterState
+
+        state = PrinterState()
+        state.connected = True
+        state.state = "PAUSE"
+        state.tray_now = tray_now
+        return state
+
+    def test_a_fed_toolhead(self):
+        from backend.app.services.printer_manager import toolhead_payload
+
+        assert toolhead_payload(7, self._state(2)) == {"feed": "fed", "tray": 2, "refill": None}
+        assert toolhead_payload(7, self._state(254)) == {"feed": "external", "tray": None, "refill": None}
+
+    def test_an_empty_toolhead_with_nothing_acting(self):
+        from backend.app.services.printer_manager import toolhead_payload
+
+        assert toolhead_payload(7, self._state(255)) == {"feed": "empty", "tray": None, "refill": None}
+
+    def test_no_state_is_unknown(self):
+        from backend.app.services.printer_manager import toolhead_payload
+
+        assert toolhead_payload(7, None) == {"feed": "unknown", "tray": None, "refill": None}
+
+    def test_the_refill_rides_an_empty_toolhead_only(self, monkeypatch):
+        from backend.app.services import printer_incidents
+        from backend.app.services.printer_manager import toolhead_payload
+
+        refill = {"phase": "failed", "command": "unload", "slot": "AMS A slot 1", "answer": "acted"}
+        monkeypatch.setattr(printer_incidents, "refill_state", lambda _pid: refill)
+
+        assert toolhead_payload(7, self._state(255)) == {"feed": "empty", "tray": None, "refill": refill}
+        # Once the toolhead reads fed again a person loaded it: the failed refill is history.
+        assert toolhead_payload(7, self._state(1))["refill"] is None
+
+    def test_it_rides_the_status_frame(self):
+        import json
+
+        payload = printer_state_to_dict(self._state(255), printer_id=7)
+        assert payload["toolhead"] == {"feed": "empty", "tray": None, "refill": None}
+        json.dumps(payload["toolhead"])
+
+    def test_the_wire_feed_vocabulary_is_the_readers_own(self):
+        """The schema cannot import the reader's leaf type, so this pin keeps one spelling."""
+        from typing import get_args
+
+        from backend.app.schemas.printer import ToolheadState
+        from backend.app.services import tray_fields
+
+        assert get_args(ToolheadState.model_fields["feed"].annotation) == get_args(tray_fields.FeedKind)
+
+    def test_the_refill_command_vocabulary_is_the_classifiers_own(self):
+        """``refill.command`` is the motion the chip speaks of: the ledger's command step names, which
+        only ``ams_command`` publishes (``ams_command.Command``). The schema cannot import the service,
+        so this pin keeps one spelling."""
+        from typing import get_args
+
+        from backend.app.schemas.printer import ToolheadRefillState
+        from backend.app.services import ams_command
+
+        field = ToolheadRefillState.model_fields.get("command")
+        assert field is not None, "ToolheadRefillState names no command"
+        assert get_args(field.annotation) == get_args(ams_command.Command)
+
+
 class TestServiceHoldProjection:
     """Maintenance mode on the status frame — its OWN field, from its own kind-scoped read.
 

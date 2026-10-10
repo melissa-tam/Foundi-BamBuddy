@@ -233,6 +233,8 @@ _RESOLUTION_LITERALS = {
     "RESOLUTION_OPERATOR",
     "RESOLUTION_JOB_PAUSE",
     "RESOLUTION_DECLARED",
+    # 2026-10-10 (K10): the empty-toolhead hold's class.
+    "RESOLUTION_TOOLHEAD",
     "RESOLVES_ON",
     # Keyed by the class literals: a read of it outside the family is a second copy of
     # "can Recover end this" — the store's ``closed_by_recover`` is the one reader.
@@ -375,6 +377,124 @@ class TestRawStopOwnership:
         """The liveness half: every allowlisted module still sends one."""
         senders = {_relative_parts(f) for f in get_python_files(BACKEND_DIR) if _scan_raw_stops(f)}
         assert senders == _RAW_STOP_CALLERS
+
+
+# --- The resume of a paused print, and who may send one (2026-10-10, K9) ------------------
+
+# WHO may publish ``print.resume`` (``BambuMQTTClient.resume_print``), by (file, enclosing scope),
+# each with its reason. Operator requirement, verbatim (Raymond 2026-10-10): "when i click resume
+# there MUST be filament loaded. It's not the users job to know whether or not there's filament in
+# there, the fact that it's unloaded is the farms POOR auto recovery mechanics". So EVERY resume of
+# a paused print goes through ONE body — ``spool_recovery.resume_paused_print``, which asks the
+# refill verdict at publish time and refills an empty toolhead first — and the few lanes outside it
+# are named here with the reason each is not a resume onto air:
+_RESUME_CALLERS: dict[tuple[str, ...], dict[str, str]] = {
+    ("services", "spool_recovery.py"): {
+        # THE resume of a paused print (K9): the verb's publisher and the refill driver's resume
+        # once its load reached the toolhead. Every route resume, the HMS dialog's resume buttons,
+        # the refill lane and the repair self-heal publish through it.
+        "_plain_resume": "the K9 body",
+        # The release ladder's verbs (``resume``, ``resume_then_pause``): releases INSIDE the
+        # recovery driver's own segment, each read by THE reader (``_read_after``), which never
+        # reads a print running on nothing as a success; withheld outright over an extruder the
+        # farm emptied (``extruder_emptied_by_farm``).
+        "_LEVERS": "the release ladder, inside the driver's own segment",
+    },
+    ("services", "bambu_mqtt.py"): {
+        # The client's dialog dispatcher: the plain-resume buttons' frame. Reached from the
+        # ``/hms/execute-action`` route only through the K9 verb's ``press``
+        # (``bambu_mqtt.DIALOG_RESUME_ACTIONS``), and from the plate-check lane for its own dialog.
+        "execute_hms_action": "the dialog's plain-resume buttons, pressed through the K9 verb",
+    },
+    ("services", "pause_recovery.py"): {
+        # The firmware's power-loss prompt (``0300_8007``): the plain resume is the prompt's answer
+        # — the firmware's own post-reboot recovery — and K7 excludes the prompt (a ``tray_now``
+        # read across a reboot is the reset, not a measurement).
+        "_resume_after_power_loss": "the power-loss prompt's answer",
+    },
+}
+
+
+class TestResumeOwnership:
+    """The resume of a paused print has ONE body (K9). SOURCE pins, like their neighbours: a second
+    resume publisher is a well-formed resume every behaviour test passes — onto an empty toolhead."""
+
+    @staticmethod
+    def _resume_publishes() -> set[tuple[tuple[str, ...], str]]:
+        found: set[tuple[tuple[str, ...], str]] = set()
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if isinstance(node, ast.Call) and _called(node.func)[1] == "resume_print":
+                    found.add((parts, scope[-1] if scope else "<module>"))
+        return found
+
+    def test_only_the_allowlisted_scopes_publish_a_resume(self):
+        allowed = {(parts, scope) for parts, scopes in _RESUME_CALLERS.items() for scope in scopes}
+        strays = sorted(self._resume_publishes() - allowed)
+        assert not strays, (
+            "print.resume is published outside its owners — a resume of a paused print goes through "
+            f"spool_recovery.resume_paused_print (it refills an empty toolhead first): {strays}"
+        )
+
+    def test_the_allowlisted_resume_lanes_are_still_there(self):
+        """Liveness: every allowlisted scope still publishes one, so the pin cannot pass on nothing."""
+        allowed = {(parts, scope) for parts, scopes in _RESUME_CALLERS.items() for scope in scopes}
+        assert self._resume_publishes() == allowed
+
+    def test_the_routes_never_publish_a_resume_themselves(self):
+        """``api/routes/printers.py`` maps the verb's verdict: it may not call ``resume_print`` (the
+        allowlist already says so) — and its resume-family dialog press is handed to the verb as
+        ``press``, inside ``_resume_button``, the one route function that reads
+        ``DIALOG_RESUME_ACTIONS``' members' answers."""
+        (tree,) = [t for parts, t in _app_trees() if parts == ("api", "routes", "printers.py")]
+        verb_calls = [
+            scope[-1]
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Call) and _called(node.func) == ("spool_recovery", "resume_paused_print")
+        ]
+        assert sorted(verb_calls) == ["_resume_button", "resume_print"]
+        presses_in_the_resume_button = [
+            node
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Call)
+            and _called(node.func)[1] == "execute_hms_action"
+            and scope[-1:] == ("_resume_button",)
+        ]
+        assert len(presses_in_the_resume_button) == 1  # the press handed to the verb
+        uses = [
+            scope[-1]
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Name) and node.id == "DIALOG_RESUME_ACTIONS" and scope
+        ]
+        assert uses == ["execute_hms_action"]  # the route's gate: the family goes to the verb
+
+    def test_the_refill_exclusions_have_one_owner(self):
+        """K7: the predicates a refill decision composes are ``spool_recovery.refill_owed``'s alone.
+        Its exclusion readers — the open-row pending command, maintenance mode, the runout demand,
+        the power-loss prompt, a filament change in flight — appear together nowhere else in the app
+        as a refill decision; the detectors and the verb read the VERDICT. Pinned on the one function
+        that calls ``refill_owed``'s private settle rule outside the driver's own waits."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
+        callers = {
+            scope[-1]
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Call) and _called(node.func)[1] == "refill_owed"
+        }
+        assert callers == {"resume_paused_print", "_refill_then_resume", "_reentered_trigger", "_sample_toolhead"}
+        settle_readers = {
+            scope[-1]
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Call) and _called(node.func)[1] == "_pending_settles"
+        }
+        assert settle_readers == {"refill_owed", "_await_pending_command", "_settle_pending", "_sample_toolhead"}
+        # No other module asks the refill question at all.
+        others = sorted(
+            parts
+            for parts, tree in _app_trees()
+            if parts != _SPOOL_RECOVERY
+            and any(isinstance(n, ast.Call) and _called(n.func)[1] == "refill_owed" for n in ast.walk(tree))
+        )
+        assert not others, others
 
 
 class TestTerminalPolicyHook:
@@ -1352,13 +1472,16 @@ _AMS_COMMAND = ("services", "ams_command.py")
 _PRINTER_INCIDENTS = ("services", "printer_incidents.py")
 
 # The frames a release verb publishes. In ``spool_recovery`` they are published by the
-# lever table's own lambdas, by THE reader's pause arms, and by the runout refill /
-# path-repair auto-resume lane (a different feature: ``_resume_after_evidence``) — and
-# nowhere else, so no second reading of a verb's effect can grow beside the reader. The
-# restart rung's ``stop_print`` is one of them, and its home is narrower still: the table
-# alone (``test_the_restart_stop_is_published_by_its_rung_alone``).
+# lever table's own lambdas, by THE reader's pause arms, and by the K9 resume of a paused
+# print (2026-10-10 — a different feature from the ladder: ``_plain_resume``, the one plain
+# resume of the verb and the refill driver, which replaced the evidence lanes' deleted
+# ``_resume_after_evidence``; and ``_stop_air_print``, the refill's one pause — T4's first
+# act on a print running onto an empty toolhead, and its answer to its own resume reading
+# RUNNING with nothing fed) — and nowhere else, so no second reading of a verb's effect can
+# grow beside the reader. The restart rung's ``stop_print`` is one of them, and its home is
+# narrower still: the table alone (``test_the_restart_stop_is_published_by_its_rung_alone``).
 _RELEASE_FRAMES = {"resume_print", "pause_print", "ams_control", "clean_print_error", "stop_print"}
-_RELEASE_FRAME_SCOPES = {"_LEVERS", "_read_after", "_resume_after_evidence"}
+_RELEASE_FRAME_SCOPES = {"_LEVERS", "_read_after", "_plain_resume", "_stop_air_print"}
 
 
 def _called(func: ast.expr) -> tuple[str | None, str | None]:
@@ -1412,7 +1535,7 @@ class TestRecoveryDriverOwnership:
         """``ams_command.classify`` is THE reading of a command's answer, and the posture is
         its private key: nothing outside ``ams_command`` may read ``posture()`` or re-derive
         a verdict from a mid-change posture set (``MID_CHANGE_POSTURES`` is deleted) — the
-        feeder question is ``spool_recovery._feeder_position``'s."""
+        feeder question is ``spool_recovery._feeding_position``'s."""
         strays: list[str] = []
         for parts, tree in _app_trees():
             if parts == _AMS_COMMAND:
@@ -1493,8 +1616,8 @@ class TestRecoveryDriverOwnership:
     def test_the_release_frames_have_one_publisher_per_role(self):
         """In ``spool_recovery`` a release frame (resume / pause / ams_control /
         clean_print_error) is published by the lever table's lambdas, THE reader's pause
-        arms (``_read_after``) and the refill / repair auto-resume lane
-        (``_resume_after_evidence``) — nowhere else."""
+        arms (``_read_after``) and the K9 resume of a paused print (``_plain_resume``, its
+        refill's pause ``_stop_air_print``) — nowhere else."""
         (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
         seen: set[str] = set()
         strays: list[str] = []
@@ -1625,6 +1748,227 @@ class TestRecoveryDriverOwnership:
         # Liveness: the subclass scan still sees the AMS driver's log, so it cannot pass on an
         # empty set.
         assert "_RecoveryEvidence" in logs
+
+
+# --- "Is the toolhead fed" has ONE reader (K1, 2026-10-10) --------------------------------
+
+_TRAY_FIELDS = ("services", "tray_fields.py")
+
+# The two ``tray_now`` values that are not trays (``tray_fields.TRAY_NOW_EXTERNAL_SPOOL`` = 254,
+# ``TRAY_NOW_NOTHING_FED`` = 255), by value and by every name a module has given them.
+_FEED_SENTINEL_VALUES = frozenset({254, 255})
+_FEED_SENTINEL_NAMES = frozenset({"TRAY_NOW_NOTHING_FED", "TRAY_NOW_EXTERNAL_SPOOL", "_NO_FILAMENT", "_TRAY_UNLOADED"})
+
+# The IDENTITY readers — "WHICH tray is at the feeder", never "is the toolhead fed" — by
+# (file, function), each with why it may read a tray id off ``tray_now``. One still spells the
+# feeder range inline instead of reading it through ``tray_fields`` (the usage attribution),
+# and the entry says why rather than calling the spelling right.
+_FEED_IDENTITY_READERS: dict[tuple[tuple[str, ...], str], str] = {
+    (_SPOOL_RECOVERY, "_resolve_jammed_tray"): (
+        "which tray jammed: the feeder at fault time, then last_loaded_tray — through tray_fields.valid_feeder"
+    ),
+    (_SPOOL_RECOVERY, "_feeder_before_edge"): (
+        "which tray fed just before a presence edge: tray_now is its LAST fallback tier — through valid_feeder"
+    ),
+    (("services", "spool_respool.py"), "sample_status_push"): (
+        "the backup-swap sampler: which tray DEPARTED and which ARRIVED on a tray_now edge — both ends "
+        "real AMS feeders, through valid_feeder"
+    ),
+    (("services", "usage_tracker.py"), "_track_from_3mf"): (
+        "usage attribution: which feeder a 3MF slot is charged to. It spells 0..254 / == 255 / >= 254 inline "
+        "because 255 is a FEEDER there (the H2 Ext-R holder, _has_right_external_holder), which tray_fields' "
+        "vocabulary reads as nothing fed — a read through it would drop that charge"
+    ),
+}
+
+
+def _feeder_read(node: ast.AST, aliases: set[str]) -> bool:
+    """Does this expression READ a feeder value: ``x.tray_now`` / ``x.<…>_snow``,
+    ``getattr(x, "tray_now" | "<…>_snow", …)``, a name bound from one in the same function, a
+    lookup into one (``snow.get(k)``, ``snow[k]``, ``snow.values()``), or ``a or b`` /
+    ``int(…)`` / ``parse_int_field(…)`` over one?"""
+    if isinstance(node, ast.Attribute):
+        return node.attr == "tray_now" or node.attr.endswith("_snow")
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    if isinstance(node, ast.Subscript):
+        return _feeder_read(node.value, aliases)
+    if isinstance(node, ast.BoolOp):
+        return any(_feeder_read(value, aliases) for value in node.values)
+    if isinstance(node, ast.IfExp):
+        return _feeder_read(node.body, aliases) or _feeder_read(node.orelse, aliases)
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name) and func.id == "getattr" and len(node.args) >= 2:
+        key = node.args[1]
+        return (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and (key.value == "tray_now" or key.value.endswith("_snow"))
+        )
+    if isinstance(func, ast.Name) and func.id in ("int", "parse_int_field") and node.args:
+        return _feeder_read(node.args[0], aliases)
+    if isinstance(func, ast.Attribute) and func.attr in ("get", "values", "items"):
+        return _feeder_read(func.value, aliases)
+    return False
+
+
+def _feed_sentinel(node: ast.AST) -> bool:
+    """A feeder sentinel: 254 / 255, one of their names, or a tuple / list / set holding one."""
+    if isinstance(node, ast.Constant):
+        return type(node.value) is int and node.value in _FEED_SENTINEL_VALUES
+    if isinstance(node, ast.Name):
+        return node.id in _FEED_SENTINEL_NAMES
+    if isinstance(node, ast.Attribute):
+        return node.attr in _FEED_SENTINEL_NAMES
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(_feed_sentinel(element) for element in node.elts)
+    return False
+
+
+def _function_scopes(tree: ast.Module):
+    """``(name, own nodes)`` for the module body and for every function, a function's own
+    nodes stopping at the defs nested in it (each is a scope of its own)."""
+
+    def own(root: ast.AST) -> list[ast.AST]:
+        nodes: list[ast.AST] = []
+        stack = list(ast.iter_child_nodes(root))
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend(ast.iter_child_nodes(node))
+        return nodes
+
+    yield "<module>", own(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node.name, own(node)
+
+
+def _feeder_aliases(nodes: list[ast.AST]) -> set[str]:
+    """The names a function binds from a feeder read (assignment, walrus, ``for`` / comprehension
+    target), to a fixed point — ``tn = self.state.tray_now`` makes ``tn`` a feeder value."""
+    aliases: set[str] = set()
+    grew = True
+    while grew:
+        grew = False
+        for node in nodes:
+            if isinstance(node, ast.Assign):
+                targets, value = list(node.targets), node.value
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+                targets, value = [node.target], node.value
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                targets, value = [node.target], node.iter
+            else:
+                continue
+            if not _feeder_read(value, aliases):
+                continue
+            for target in targets:
+                for name in target.elts if isinstance(target, ast.Tuple) else [target]:
+                    if isinstance(name, ast.Name) and name.id not in aliases:
+                        aliases.add(name.id)
+                        grew = True
+    return aliases
+
+
+def _scan_feed_tests(tree: ast.Module) -> list[tuple[str, int, str]]:
+    """Every "is it fed" reading of a raw feeder value: ``(function, line, what)``."""
+    hits: list[tuple[str, int, str]] = []
+    for name, nodes in _function_scopes(tree):
+        aliases = _feeder_aliases(nodes)
+        for node in nodes:
+            if isinstance(node, ast.Compare):
+                operands = [node.left, *node.comparators]
+                if any(
+                    (_feeder_read(a, aliases) and _feed_sentinel(b)) or (_feeder_read(b, aliases) and _feed_sentinel(a))
+                    for a, b in zip(operands[:-1], operands[1:], strict=True)
+                ):
+                    hits.append((name, node.lineno, f"compares a feeder to a sentinel: {ast.unparse(node)}"))
+            elif (
+                isinstance(node, ast.Call)
+                and _called(node.func)[1] == "valid_feeder"
+                and node.args
+                and _feeder_read(node.args[0], aliases)
+            ):
+                hits.append((name, node.lineno, f"reads a tray id off a raw feeder: {ast.unparse(node)}"))
+    return hits
+
+
+class TestToolheadFeedOwnership:
+    """K1 (2026-10-10, the 011/014-H2S review fold): "is the toolhead fed" has ONE reader,
+    ``tray_fields.toolhead_feed`` — the ACTIVE extruder, per extruder on a dual nozzle — and its
+    one-reading classifier ``extruder_feed``. SOURCE pins, like their neighbours: a second reading
+    is a well-formed comparison every behaviour test passes, and on an H2C it answers for the
+    wrong hotend (an empty active nozzle beside a loaded one prints air).
+
+    Flagged anywhere in ``backend/app`` but the owner: a ``tray_now`` or ``*_snow`` value — or a
+    name bound from one in the same function — compared to a feeder sentinel (254 / 255 / their
+    names), and ``valid_feeder(<that value>)``, the shape of an emptiness test. The identity
+    readers ("WHICH tray is at the feeder") are allowlisted by (file, function), each with its
+    reason (:data:`_FEED_IDENTITY_READERS`)."""
+
+    @staticmethod
+    def _hits() -> dict[tuple[tuple[str, ...], str], list[str]]:
+        found: dict[tuple[tuple[str, ...], str], list[str]] = {}
+        for parts, tree in _app_trees():
+            if parts == _TRAY_FIELDS:
+                continue
+            for name, line, what in _scan_feed_tests(tree):
+                found.setdefault((parts, name), []).append(f"  - {'/'.join(parts)}:{line} {name}: {what}")
+        return found
+
+    def test_no_is_it_fed_reading_outside_the_owner(self):
+        strays = [
+            line for key, lines in sorted(self._hits().items()) if key not in _FEED_IDENTITY_READERS for line in lines
+        ]
+        assert not strays, (
+            "An 'is the toolhead fed' reading outside tray_fields — read the ACTIVE extruder through "
+            "toolhead_feed / extruder_feed. A reader of WHICH tray is at the feeder belongs in "
+            "_FEED_IDENTITY_READERS with its reason:\n" + "\n".join(strays)
+        )
+
+    def test_the_identity_readers_are_still_there(self):
+        """Liveness: every allowlisted scope still reads a tray id off a raw feeder, so a stale
+        entry cannot shelter a future stray under its name."""
+        assert set(_FEED_IDENTITY_READERS) <= set(self._hits())
+
+    @pytest.mark.parametrize(
+        ("source", "flagged"),
+        [
+            pytest.param("def f(state):\n    return state.tray_now == 255\n", True, id="bare_255"),
+            pytest.param(
+                "def f(state):\n    return getattr(state, 'tray_now', None) != TRAY_NOW_NOTHING_FED\n",
+                True,
+                id="named_sentinel",
+            ),
+            pytest.param("def f(state):\n    raw = state.tray_now\n    return raw in (254, 255)\n", True, id="alias"),
+            pytest.param("def f(st):\n    tn = st.tray_now\n    return 0 <= tn <= 254\n", True, id="range"),
+            pytest.param(
+                "def f(state):\n"
+                "    snow = getattr(state, 'h2d_extruder_snow', None) or {}\n"
+                "    return any(v != 255 for v in snow.values())\n",
+                True,
+                id="per_extruder_map",
+            ),
+            pytest.param(
+                "def f(state):\n    return tray_fields.valid_feeder(state.tray_now) is None\n", True, id="valid_feeder"
+            ),
+            pytest.param(
+                "def f(state):\n    return toolhead_feed(state).active.kind == 'empty'\n", False, id="the_owner_read"
+            ),
+            pytest.param(
+                "def f(tray_id):\n    return tray_id == TRAY_NOW_EXTERNAL_SPOOL\n", False, id="a_target_not_a_feeder"
+            ),
+            pytest.param(
+                "def f(state, jammed):\n    return state.tray_now == jammed\n", False, id="an_identity_compare"
+            ),
+        ],
+    )
+    def test_the_scan_sees_every_shape(self, source, flagged):
+        """The detector itself: each shape it must flag, and the reads it must not."""
+        assert bool(_scan_feed_tests(ast.parse(source))) is flagged
 
 
 # --- The deposit predicate and the lineage walk keep their one owner each --------------

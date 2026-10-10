@@ -12,6 +12,8 @@ import io
 import zipfile
 
 from backend.app.main import _scope_notification_archive_data_to_plate
+from backend.app.services.job_extent import plate_share
+from backend.app.services.usage_tracker import JobEvidence
 
 
 def _write_multi_plate_3mf(tmp_path, name="multi.3mf") -> "tuple":
@@ -82,8 +84,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             rel,
             plate_id=2,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -102,8 +103,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             rel,
             plate_id=1,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -118,8 +118,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             rel,
             plate_id=3,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -137,8 +136,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             rel,
             plate_id=2,
-            print_status="cancelled",
-            progress=50,
+            share=0.5,
             base_dir=tmp_path,
         )
 
@@ -160,8 +158,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             rel,
             plate_id=None,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -177,8 +174,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             None,
             plate_id=2,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -196,8 +192,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             "missing.3mf",
             plate_id=2,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -216,8 +211,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             "bad.3mf",
             plate_id=2,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -235,8 +229,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             rel,
             plate_id=99,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -274,8 +267,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             "zero.3mf",
             plate_id=1,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -317,8 +309,7 @@ class TestScopeNotificationArchiveDataToPlate:
             archive_data,
             "single.3mf",
             plate_id=1,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
@@ -346,10 +337,29 @@ class TestScopeNotificationArchiveDataToPlate:
             _project_totals_archive_data(),
             rel,
             plate_id=2,
-            print_status="completed",
-            progress=100,
+            share=1.0,
             base_dir=tmp_path,
         )
 
         assert result["actual_filament_grams"] == parsed["filament_used_grams"]
         assert result["print_time_seconds"] == parsed["print_time_seconds"]
+
+    def test_a_finish_that_printed_on_air_notifies_only_what_it_fed(self, tmp_path):
+        """The notification reads the SAME share the spools and the print log are charged: 011-H2S
+        (2026-10-09) fed 93 of its 167 layers and printed the rest on air, so plate 2's 120 g
+        notifies as 120 * 93/167, never the whole plate."""
+        file_path, rel = _write_multi_plate_3mf(tmp_path)
+        evidence = JobEvidence.from_payload(
+            {"last_progress": 100.0, "last_layer_num": 167, "total_layers": 167, "first_unfed_layer": 93}
+        )
+
+        result = _scope_notification_archive_data_to_plate(
+            _project_totals_archive_data(),
+            rel,
+            plate_id=2,
+            share=plate_share("partial", evidence.charged_extent),
+            base_dir=tmp_path,
+        )
+
+        assert result["actual_filament_grams"] == round(120.0 * 93 / 167, 1)
+        assert result["filament_slots"][0]["used_g"] == round(80.0 * 93 / 167, 1)
