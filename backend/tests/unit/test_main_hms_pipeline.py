@@ -671,6 +671,126 @@ class TestRunoutGuidanceRefreshHook:
         assert "0700_4025" in h.sent_bodies[0]
 
 
+@pytest.mark.asyncio
+class TestEveryPushIsSampled:
+    """The status key gates the WebSocket BROADCAST and nothing else (2026-10-10). It omits
+    ``ams_status_main``, HMS and ``sdcard``, so while it RETURNED early every block behind it
+    skipped exactly the pushes a firmware change, a fault edge or a USB unmount lives on — the
+    runout auto-switch's posture and HMS words arrive on pushes the key reads as unchanged. Every
+    block now runs on every push, idempotent through its own cursor or edge; only the broadcast
+    is skipped on an unchanged key."""
+
+    @staticmethod
+    def _broadcasts() -> int:
+        """The WebSocket broadcasts sent so far (the harness's mock, read while it is patched)."""
+        return main_module.ws_manager.send_printer_status.await_count
+
+    async def test_a_code_appearing_on_a_push_the_broadcast_dedup_swallows_still_edges(self):
+        with _Harness() as h:
+            await _warm_up(5)
+            await main_module.on_printer_status_change(5, _state([], layer_num=1))
+            broadcast_key = main_module._last_status_broadcast[5]
+            # Same status key (HMS is not part of it): the broadcast is deduped, the edge is not.
+            await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION], layer_num=1))
+
+            assert main_module._last_status_broadcast[5] == broadcast_key
+        h.guidance_refresh.assert_awaited_once()
+
+    async def test_every_sampler_sees_every_push(self):
+        samplers = {
+            "edges": patch.object(hms_edges, "note_push", MagicMock(return_value=None)),
+            "swap": patch("backend.app.services.spool_respool.sample_status_push", MagicMock(return_value=frozenset())),
+            "demand": patch("backend.app.services.spool_recovery.note_demand_watch", MagicMock()),
+            "pause": patch("backend.app.services.pause_recovery.note_status_push", MagicMock()),
+        }
+        with _Harness():
+            mocks = {name: p.start() for name, p in samplers.items()}
+            try:
+                state = _state([], layer_num=1)
+                for _ in range(3):  # one status key, three pushes
+                    await main_module.on_printer_status_change(5, state)
+            finally:
+                for p in samplers.values():
+                    p.stop()
+
+        assert {name: mock.call_count for name, mock in mocks.items()} == {
+            "edges": 3,
+            "swap": 3,
+            "demand": 3,
+            "pause": 3,
+        }
+
+    async def test_an_unchanged_key_runs_the_hms_lane_and_the_usb_lanes_and_skips_only_the_broadcast(self):
+        """Three pushes, one status key: ONE broadcast — and on every push the re-notify ledger
+        was bumped (``notify_dedup.new_codes``), the AMS-fault machine was spawned (it throttles
+        itself), and the USB-drop edge and the deferred storage retry were asked."""
+        runout = SimpleNamespace(code="0x8011", attr=0x07000000, module=0x07, severity=2, full_code="0700000000008011")
+        new_codes = MagicMock(wraps=notify_dedup.new_codes)
+        usb_drop = MagicMock(return_value=False)
+        storage_retry = MagicMock(return_value=False)
+        with (
+            _Harness() as h,
+            patch("backend.app.services.spool_recovery.owned_full_codes", new=_owned(runout.full_code)),
+            patch("backend.app.services.spool_recovery.on_ams_fault", new=AsyncMock()) as fault,
+            patch.object(notify_dedup, "new_codes", new_codes),
+            patch("backend.app.main.record_sdcard_and_detect_drop", usb_drop),
+            patch("backend.app.main.should_retry_deferred", storage_retry),
+        ):
+            state = _state([_hms(runout)], layer_num=3)
+            for _ in range(3):
+                await main_module.on_printer_status_change(5, state)
+            await _drain_tasks()
+            broadcasts = self._broadcasts()
+
+        assert broadcasts == 1
+        assert new_codes.call_count == 3
+        assert h.spawned.count("ams-fault-p5") == 3, h.spawned  # strong-referenced, by name
+        assert fault.await_count == 3
+        assert (usb_drop.call_count, storage_retry.call_count) == (3, 3)
+
+    async def test_a_usb_unmount_on_a_push_with_an_unchanged_key_still_alerts(self):
+        """``sdcard`` is not part of the key: the unmount push reads as unchanged to the
+        broadcast, and must still reach the True → False edge."""
+        from backend.app.services import usb_storage
+
+        mounted = _state([], layer_num=1)
+        unmounted = _state([], layer_num=1)
+        unmounted.sdcard = False
+        try:
+            with (
+                _Harness() as h,
+                patch("backend.app.main.verify_and_alert_usb_drop", new=AsyncMock()) as verify,
+            ):
+                await main_module.on_printer_status_change(5, mounted)
+                await main_module.on_printer_status_change(5, unmounted)
+                await _drain_tasks()
+                broadcasts = self._broadcasts()
+        finally:
+            usb_storage._last_sdcard.pop(5, None)
+
+        assert broadcasts == 1
+        assert "usb-drop-verify-p5" in h.spawned
+        verify.assert_awaited_once_with(5)
+
+    async def test_a_progress_milestone_notifies_once_however_many_pushes_carry_it(self):
+        """The milestones run on every push, idempotent through their own cursor
+        (``_last_progress_milestone``) — never through the broadcast key."""
+        try:
+            with _Harness() as h:
+                h.notify.on_print_progress = AsyncMock()
+                for progress in (30, 30, 30, 52, 52):
+                    state = _state([], layer_num=7)
+                    state.state = "RUNNING"
+                    state.progress = progress
+                    await main_module.on_printer_status_change(5, state)
+        finally:
+            main_module._last_progress_milestone.pop(5, None)
+            main_module._first_layer_notified.pop(5, None)
+
+        milestones = [call.args[3] for call in h.notify.on_print_progress.await_args_list]
+        assert milestones == [25, 50]
+
+
 # The firmware's "ran out and automatically switched" statement: code word 0x00030002
 # on attr 0x07002200 (AMS0 slot 3 → tray 2). Its short code is "0700_0002", which the
 # pipeline must NEVER match as a bare string — the slot byte and the code-word high
@@ -1108,11 +1228,20 @@ class TestSpentStampingStillHappensEndToEnd:
         yield
         spool_respool._reset_state()
 
-    async def test_lane_a_unrescued_runout_stamps_the_feeding_slot(self, db_session, printer_factory, sessions):
+    async def test_lane_a_unrescued_runout_stamps_the_feeding_slot(
+        self, db_session, printer_factory, sessions, monkeypatch
+    ):
         """The unrescued vocabulary, plain case: the runout appears, the spool feeding
-        the slot gets stamped, and the row is really written."""
+        the slot — the roll the printer's toolhead feed state names, read off a REAL
+        client driven over the wire — gets stamped, and the row is really written."""
+        from backend.app.services.printer_manager import printer_manager
+        from backend.tests._fixtures import feed_wire
+
         printer = await printer_factory()
         spool = await _seat_spool(db_session, printer.id, 0, 0)
+        client = feed_wire.live_client()
+        feed_wire.start_print(client, 0)
+        monkeypatch.setattr(printer_manager, "get_client", lambda pid: client if pid == printer.id else None)
 
         with _Harness(), _runout_lane_on(sessions):
             await _warm_up(printer.id)

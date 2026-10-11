@@ -1619,8 +1619,8 @@ async def _warn_zero_gram_tagless_charge(
     from backend.app.services import notify_dedup
     from backend.app.services.notification_service import notification_service
     from backend.app.services.printer_incidents import runout_slot_desc
-    from backend.app.services.spool_respool import encode_global_tray
     from backend.app.services.spool_tagless import is_tagless_spool
+    from backend.app.services.tray_fields import encode_global_tray
 
     # ``runout_slot_desc`` is the ONE origin for slot wording, so this page names a
     # slot the way every other operator surface does. The roll is named by id +

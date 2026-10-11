@@ -169,6 +169,7 @@ function buildPrinterStatus(opts: {
     }],
     vt_tray: [],
     tray_now: 255,
+    toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null },
     active_extruder: 0,
   };
 }
@@ -443,5 +444,50 @@ describe('SpoolBuddyAmsPage Phase 14 — SlotActionPicker BL-detection in local 
     fireEvent.click(emptySlot);
 
     await screen.findByText('Track a spool from your inventory');
+  });
+});
+
+/**
+ * The active slot ring reads the backend's feed state (`toolhead.active_tray`),
+ * never `tray_now`: during a firmware runout auto-switch `tray_now` pre-flips to
+ * the backup slot minutes before the backup feeds, while the drained roll's tail
+ * still feeds (2026-10-10). The ring has no accessible state of its own, so it
+ * is read off the slot tile's ring class.
+ */
+describe('SpoolBuddyAmsPage — active slot ring', () => {
+  beforeEach(() => {
+    setupDefaultApiResponses();
+    spoolmanStatusValue = { enabled: false, connected: false };
+    vi.clearAllMocks();
+  });
+
+  const backup = { tray_type: 'PLA', tray_color: 'FF0000FF', remain: 100 };
+
+  it('keeps the ring on the draining roll while tray_now has pre-flipped to the backup', async () => {
+    apiResponses.getPrinterStatus = {
+      ...buildPrinterStatus({ slot0: { tray_type: '', tray_uuid: null, tag_uid: null }, slot1: backup }),
+      state: 'RUNNING',
+      tray_now: 1,
+      toolhead: { feed: 'fed', active_tray: 0, was_feeding_tray: null, refill: null },
+    };
+    renderPage();
+
+    expect(await screen.findByTitle('AMS Slot 1')).toHaveClass('ring-bambu-green');
+    expect(screen.getByTitle('AMS Slot 2')).not.toHaveClass('ring-bambu-green');
+  });
+
+  it('rings no slot when the toolhead names no tray, whatever tray_now says', async () => {
+    apiResponses.getPrinterStatus = {
+      ...buildPrinterStatus({ slot1: backup }),
+      state: 'PAUSE',
+      tray_now: 1,
+      toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: 1, refill: null },
+    };
+    renderPage();
+
+    expect(await screen.findByTitle('AMS Slot 1')).not.toHaveClass('ring-bambu-green');
+    for (const n of [2, 3, 4]) {
+      expect(screen.getByTitle(`AMS Slot ${n}`)).not.toHaveClass('ring-bambu-green');
+    }
   });
 });

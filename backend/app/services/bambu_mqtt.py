@@ -22,8 +22,10 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
+from backend.app.services.feed_state import FeedFrame, FeedReading, FeedTracker, JobBoundary
 from backend.app.services.hms_actions import HMSAction, get_actions_for_error_code
 from backend.app.services.hms_errors import hms_severity, print_error_dialog
+from backend.app.services.live_reading import reads_live
 from backend.app.services.tray_fields import (
     TRAY_NOW_EXTERNAL_SPOOL,
     TRAY_PRESENT_STATES,
@@ -759,7 +761,12 @@ class PrinterState:
     # point in `_process_message` and read through `BambuMQTTClient.ack_for`, which
     # services/ams_command uses to correlate the ACK to its own send by sequence id.
     command_acks: deque[CommandAck] = field(default_factory=lambda: deque(maxlen=_COMMAND_ACK_KEEP))
-    # Last valid tray_now (0-253) — survives unload (255) for usage tracking after print completes
+    # The last real feeder (an AMS tray, or the external holder as 254) fed — survives the
+    # end retract's 255 for usage tracking after the print completes; -1 = none, reset at a new
+    # print only (never at an attach). A PROJECTION of the feed state's reading
+    # (``feed_state.FeedReading.last_loaded``), written only by
+    # ``BambuMQTTClient._project_feed``: a ``tray_now`` pre-flip inside a roll's TAIL does not
+    # move it — the draining roll is still the feeder.
     last_loaded_tray: int = -1
     # Pending load target - used to track what tray we're loading for H2D disambiguation
     pending_tray_target: int | None = None
@@ -823,7 +830,10 @@ class PrinterState:
     big_fan2_speed: int | None = None  # Chamber/exhaust fan
     heatbreak_fan_speed: int | None = None  # Hotend heatbreak fan
     # Tray change history during current print: [(global_tray_id, layer_num), ...]
-    # Used by usage tracker to split filament weight on mid-print tray switch
+    # Used by usage tracker to split filament weight on mid-print tray switch. A PROJECTION of
+    # the feed state's reading (``feed_state.FeedReading.tray_change_log``), written only by
+    # ``BambuMQTTClient._project_feed``: a backup's segment starts at the layer its load LANDS,
+    # so a drained roll's tail is charged to that roll.
     tray_change_log: list = field(default_factory=list)
     # Firmware version info (from info.module[name="ota"].sw_ver)
     firmware_version: str | None = None
@@ -865,16 +875,17 @@ class JobPeaks:
     * ``reliable`` — this client watched the job START, so the numbers are a measurement
       (``_peaks_reliable``; an attach mid-job is not).
     * ``first_unfed_layer`` — the lowest layer this job PRINTED WITH NOTHING FED, or ``None``
-      when none was observed (:meth:`BambuMQTTClient._track_unfed_layer`, the one writer). An
-      EVENT, never a time: the layer L at which a run of RUNNING pushes began with the ACTIVE
-      extruder empty (``tray_fields.toolhead_feed``) and no filament change in flight
-      (:func:`ams_mid_filament_change`), stamped only once ``layer_num`` advances past L
-      still empty — so a sub-second pause-and-refill inside one layer never stamps it, and
-      neither does the end-of-print retract (L must be below ``total_layers``). NOT gated
-      on ``reliable``: layer numbers are absolute, so a layer printed empty after an attach
-      is a real measurement of this job. 011-H2S 2026-10-09 is the shape it measures: a
-      resume after an accepted pull-back ran on its own printed from layer 93 to the end
-      with ``tray_now=255``, and the FINISH was recorded completed.
+      when none was observed. Its one writer is the feed state (``feed_state.FeedTracker``,
+      read here off :meth:`BambuMQTTClient.feed`). An EVENT, never a time: the layer L at
+      which an empty episode of the ACTIVE extruder (``tray_fields.toolhead_feed``) began —
+      on entry to EMPTY_UNCONFIRMED, or to a firmware change whose toolhead reads empty —
+      stamped only once ``layer_num`` advances past L still empty and that advance makes the
+      print AIR. A sub-second pause-and-refill inside one layer never stamps it, nor does the
+      end-of-print retract (L must be below ``total_layers``), nor layer 0 (L is never below
+      1). NOT gated on ``reliable``: layer numbers are absolute, so a layer printed empty
+      after an attach is a real measurement of this job. 011-H2S 2026-10-09 is the shape it
+      measures: a resume after an accepted pull-back ran on its own printed from layer 93 to
+      the end with ``tray_now=255``, and the FINISH was recorded completed.
 
     A LIVE job's current reading is part of how far it got — a job paused mid-way through
     its first layer reads ``layer_num == 1`` while nothing has been saved yet — so a live
@@ -929,7 +940,8 @@ def job_consumption_evidence(state: PrinterState) -> dict[str, object]:
     * ``total_layers`` — the job's slicer layer count, the per-tray split's denominator, kept
       across the firmware's end-of-print 0 (#1771);
     * ``tray_change_log`` — every ``(global_tray_id, layer)`` the job switched to, the per-tray
-      split's segments, seeded at an observed print start and cleared at an attach;
+      split's segments, seeded at an observed print start and cleared at an attach (the feed
+      state's record: a backup's segment starts where its load LANDED);
     * ``tray_now`` — the tray fed at the terminal (often 255 by now: unloaded, or Ext-R on H2);
     * ``last_loaded_tray`` — the last real tray this job fed (-1 = none observed);
     * ``mqtt_mapping`` — the printer-reported ``mapping`` field (slicer slot → snow-encoded tray),
@@ -1053,6 +1065,7 @@ class BambuMQTTClient:
         on_drying_complete: Callable[[int], None] | None = None,
         on_print_running_observed: Callable[[dict], None] | None = None,
         on_finish_photo_moment: Callable[[dict], None] | None = None,
+        farm_acting: Callable[[], bool] | None = None,
     ):
         self.ip_address = ip_address
         self.serial_number = serial_number
@@ -1105,6 +1118,12 @@ class BambuMQTTClient:
         # stage 22 never arrives (cancel mid-print, external-spool-
         # only prints, HMS halt before unload, firmware variants).
         self.on_finish_photo_moment = on_finish_photo_moment
+        # Does a FARM motion own this printer right now (a live recovery driver, or a farm
+        # command the step ledger holds pending)? Injected by the registry, which knows the
+        # printer id and the incident store (``printer_manager`` wires it); this client imports
+        # nothing above itself (dependency inversion). Asked once per push, while the feed
+        # frame is built, so a landing is attributed at STEP time. Default: never.
+        self._farm_acting = farm_acting
         # Per-AMS previous dry_time, used to detect the falling edge above.
         # Seeded lazily as we observe each AMS unit.
         self._previous_dry_times: dict[int, int] = {}
@@ -1151,13 +1170,15 @@ class BambuMQTTClient:
         # a print start observed HERE (below) may set it True. Every attach sets it False,
         # so a job adopted after one this client DID watch never inherits that job's True.
         self._peaks_reliable: bool = False
-        # The first layer this job printed with nothing fed (JobPeaks.first_unfed_layer) and
-        # the open run it is measured from: the layer at which the current unbroken run of
-        # RUNNING + active-extruder-empty + no-change-in-flight pushes began, None when the
-        # latest push broke it. Process memory with the peaks' own rehydrate story — reset at
-        # every print start and every attach, re-measured from the wire after a restart.
-        self._unfed_run_layer: int | None = None
-        self._first_unfed_layer: int | None = None
+        # THE toolhead feed state (``feed_state``): stepped once per push by ``_step_feed`` —
+        # its one caller — and read as a frozen snapshot through :meth:`feed`. Process memory
+        # with the peaks' own rehydrate story: its job record resets where the peaks reset (a
+        # print start, an attach), and its phase re-reads from the first live report.
+        self._feed = FeedTracker()
+        # Did THIS push carry ``ams_status`` (the change posture)? Reset at the top of every
+        # message; only a push that carried it may vote toward AIR (invariant 12's
+        # corroboration rule — a merged value is not this push's evidence).
+        self._push_carried_posture: bool = False
         # Stale-predecessor gate for the two "last valid" captures above. The firmware
         # keeps republishing the PREVIOUS job's layer/percent for the seconds a new job
         # spends heating and levelling, so a reading arriving just after a print start
@@ -1754,6 +1775,8 @@ class BambuMQTTClient:
 
     def _process_message(self, payload: dict):
         """Process incoming MQTT message from printer."""
+        # A per-push fact: set below only by a push that carries ``ams_status``.
+        self._push_carried_posture = False
         # Handle top-level AMS data (comes outside of "print" key)
         # Wrap in try/except to prevent breaking the MQTT connection
         if "ams" in payload:
@@ -1902,6 +1925,7 @@ class BambuMQTTClient:
             # Main status: 0=idle, 1=filament_change, 2=rfid_identifying, 3=assist, 4=calibration
             # Sub status (when main=1): 2=heating, 3=AMS feeding, 4=retract, 6=push, 7=purge
             if "ams_status" in print_data:
+                self._push_carried_posture = True
                 raw_ams_status = print_data["ams_status"]
                 if isinstance(raw_ams_status, str):
                     try:
@@ -2817,6 +2841,7 @@ class BambuMQTTClient:
             # IMPORTANT: Parse ams_status FIRST before tray_now, so we have fresh status
             # when checking if we're in filament change mode for tray_now disambiguation
             if "ams_status" in ams_data:
+                self._push_carried_posture = True
                 raw_ams_status = ams_data["ams_status"]
                 if isinstance(raw_ams_status, str):
                     try:
@@ -3042,28 +3067,8 @@ class BambuMQTTClient:
                     # Trust the printer's reported value.
                     self.state.tray_now = parsed_tray_now
 
-                # Track last valid tray for usage tracking (survives retract → 255 at print end).
-                # A physical feeder: an AMS tray or the external spool holder — the one
-                # definition, ``tray_fields.extruder_feed`` (fed / external), never "nothing fed".
-                tn = self.state.tray_now
-                if extruder_feed(tn).kind in ("fed", "external"):
-                    # Log tray change for mid-print usage splitting. Gate on the
-                    # print-lifecycle flags (`_was_running` set on first RUNNING /
-                    # new print, `_completion_triggered` set when on_print_complete
-                    # fires) instead of `state in ("RUNNING", "PAUSE")` — P2S
-                    # firmware briefly transitions out of RUNNING during AMS
-                    # auto-fallback (#957), so a literal-string gate misses the
-                    # switch and the usage tracker double-credits at completion.
-                    if tn != self.state.last_loaded_tray and self._was_running and not self._completion_triggered:
-                        self.state.tray_change_log.append((tn, self.state.layer_num))
-                        logger.info(
-                            "[%s] Tray change during print: tray=%d at layer=%d",
-                            self.serial_number,
-                            tn,
-                            self.state.layer_num,
-                        )
-                    self.state.last_loaded_tray = self.state.tray_now
-
+                # The last feeder and the job's tray-change log are the feed state's record,
+                # projected once per push (``_project_feed``) — never written here.
                 logger.debug("[%s] tray_now updated: %s", self.serial_number, self.state.tray_now)
 
             # tray_tar rides the same dict (and the P1S partial update). Recorded raw —
@@ -3529,42 +3534,93 @@ class BambuMQTTClient:
             progress=self.state.progress if self._job_progress_baseline_seen else 0.0,
             layer_num=self.state.layer_num if self._job_layer_baseline_seen else 0,
             reliable=self._peaks_reliable,
-            first_unfed_layer=self._first_unfed_layer,
+            first_unfed_layer=self._feed.reading.first_unfed_layer,
         )
 
-    def _track_unfed_layer(self) -> None:
-        """Measure :attr:`JobPeaks.first_unfed_layer` from this push — its ONE writer.
+    def feed(self) -> FeedReading:
+        """THE toolhead feed state of this printer — the frozen reading the last push produced
+        (``feed_state.FeedReading``; UNKNOWN before the first). Every reader asks this one
+        snapshot: is filament reaching the nozzle, and if not, is the firmware about to put it
+        back (a change, a runout hold) or is the print on AIR — with the job's feeder record and
+        the last event of each kind under a process-global sequence."""
+        return self._feed.reading
 
-        A run is open while the job is RUNNING with the ACTIVE extruder reading empty
-        (``tray_fields.toolhead_feed``: on a dual-nozzle machine an empty active nozzle beside
-        a loaded one prints air) and no filament change in flight
-        (:func:`ams_mid_filament_change` — mid-change, a 255 is the AMS owning the path, not
-        air). Any other push closes it. The run's layer is where it began, and never below
-        layer 1: layer 0 is the start block, where a 255 is the load still to come, so a run
-        that began there is read from the first printed layer. The stamp is the event "a
-        layer was printed with nothing fed": ``layer_num`` advancing past the run's layer
-        while the run is open, the run's layer below ``total_layers`` (an unknown total, 0,
-        stamps nothing; the end-of-print retract happens AT the last layer). The lowest such
-        layer is kept. The layer is read through :meth:`job_peaks` (the stale-predecessor
-        gate: a predecessor's republished layer is never this job's). Total: it rides the
-        status callback (invariant 10).
-        """
-        empty_and_running = (
-            self.state.state == "RUNNING"
-            and not ams_mid_filament_change(self.state)
-            and toolhead_feed(self.state).active.kind == "empty"
-        )
-        if not empty_and_running:
-            self._unfed_run_layer = None
-            return
-        layer = self.job_peaks().layer_num
-        if self._unfed_run_layer is None:
-            self._unfed_run_layer = max(layer, 1)
-            return
-        run = self._unfed_run_layer
-        if layer > run and run < self.state.total_layers:
-            if self._first_unfed_layer is None or run < self._first_unfed_layer:
-                self._first_unfed_layer = run
+    def _step_feed(self, boundary: JobBoundary) -> None:
+        """Step the feed state with THIS push — its one caller (``test_code_quality``), once per
+        status push, after every field is applied and the job baseline is set — and project the
+        reading onto the state. Total: it rides the status callback (invariant 10)."""
+        try:
+            frame = FeedFrame.of(
+                self.state,
+                live=reads_live(self.state),
+                posture_carried=self._push_carried_posture,
+                posture=ams_mid_filament_change(self.state),
+                # The job-gated layer: a predecessor's republished layer is never this job's.
+                layer=self.job_peaks().layer_num,
+                job_active=self._was_running and not self._completion_triggered,
+                farm_acting=self._farm_acting_now(),
+                boundary=boundary,
+            )
+            before = self._feed.reading
+            after = self._feed.step(frame)
+            self._project_feed(after)
+            self._log_feed(before, after)
+        except Exception:  # noqa: BLE001 — the status callback must never break on the feed state
+            logger.exception("[%s] feed state step failed", self.serial_number)
+
+    def _log_feed(self, before: FeedReading, after: FeedReading) -> None:
+        """One INFO line per feed-state transition, per event and per new tray-change segment —
+        the triage record of a runout sequence (``TAIL → CHANGING → FED``) and the grammar the
+        support-bundle greps read (``Tray change during print``). Transitions are rare per job."""
+        held = (after.phase, after.cause, after.tail, after.departed, after.held_slot)
+        if held != (before.phase, before.cause, before.tail, before.departed, before.held_slot):
+            detail = {
+                "tail": after.tail,
+                "cause": after.cause.value if after.cause is not None else None,
+                "departed": after.departed,
+                "slot": after.held_slot,
+                "feeder": after.feeder,
+            }
+            logger.info(
+                "[%s] Feed state: %s -> %s %s",
+                self.serial_number,
+                before.phase.value,
+                after.phase.value,
+                " ".join(f"{key}={value}" for key, value in detail.items() if value is not None) or "-",
+            )
+        for kind in ("roll_drained", "load_landed", "auto_switched", "air_began"):
+            event = getattr(after, kind)
+            if event is not None and event != getattr(before, kind):
+                logger.info("[%s] Feed event %s: %s", self.serial_number, kind, event)
+        grew = after.feeder_log[: len(before.feeder_log)] == before.feeder_log
+        # A job boundary resets the record: every entry of the new one is new.
+        for extruder, tray, layer in after.feeder_log[len(before.feeder_log) :] if grew else after.feeder_log:
+            logger.info(
+                "[%s] Tray change during print: tray=%d at layer=%d (extruder %d)",
+                self.serial_number,
+                tray,
+                layer,
+                extruder,
+            )
+
+    def _farm_acting_now(self) -> bool:
+        """The injected provider's answer for this push (False with none, or when it fails — a
+        landing then reads as no farm motion's, the direction that keeps it evidence)."""
+        if self._farm_acting is None:
+            return False
+        try:
+            return bool(self._farm_acting())
+        except Exception:  # noqa: BLE001 — a provider failure must not break the status callback
+            logger.debug("[%s] farm-acting provider failed", self.serial_number, exc_info=True)
+            return False
+
+    def _project_feed(self, reading: FeedReading) -> None:
+        """THE one writer of ``PrinterState.tray_change_log`` and ``last_loaded_tray`` — both
+        PROJECTIONS of the feed state's reading, so the terminal payload
+        (:func:`job_consumption_evidence`), the API and the usage charge keep their shape. A fresh
+        list per push: a terminal payload already holds its own copy."""
+        self.state.tray_change_log = list(reading.tray_change_log)
+        self.state.last_loaded_tray = reading.last_loaded
 
     def _update_state(self, data: dict):
         """Update printer state from message data."""
@@ -4777,17 +4833,16 @@ class BambuMQTTClient:
             if not (is_new_print or is_file_change):
                 # This client never saw the job start, so it holds no measurement of it —
                 # and must not pass off a PREVIOUS job's as one. A client attaching on its
-                # first push holds none of these yet (all four writes are no-ops there);
-                # they make an attach after a job this client DID watch (a reconnect gap in
-                # which the next job started) equal to that. The peaks and the tray-change
-                # log are the terminal payload's consumption evidence: a charge built on
-                # the predecessor's would bill this job for that one's filament.
+                # first push holds none of these yet (the writes are no-ops there); they make
+                # an attach after a job this client DID watch (a reconnect gap in which the
+                # next job started) equal to that. The peaks and the feed state's job record
+                # (the tray-change log, the unfed layer — reset by the ATTACH boundary this
+                # push hands ``_step_feed``) are the terminal payload's consumption evidence:
+                # a charge built on the predecessor's would bill this job for that one's
+                # filament.
                 self._peaks_reliable = False
                 self._last_valid_progress = 0.0
                 self._last_valid_layer_num = 0
-                self._unfed_run_layer = None
-                self._first_unfed_layer = None
-                self.state.tray_change_log.clear()
         if self.state.state == "RUNNING" and current_file:
             self._was_running = True
             self._completion_triggered = False
@@ -4831,17 +4886,11 @@ class BambuMQTTClient:
             # Reset completion tracking for new print
             self._was_running = True
             self._completion_triggered = False
-            # last_loaded_tray means "last tray fed THIS job" — reset it so a
-            # runout PAUSE renders the was-feeding ring for the CURRENT job's slot,
-            # not a stale tray leaked from the previous print.
-            self.state.last_loaded_tray = -1
             # #1721: rearm the end-of-print finish-photo trigger for the new print
             self._finish_photo_captured = False
             # Reset last valid progress/layer for usage tracking
             self._last_valid_progress = 0.0
             self._last_valid_layer_num = 0
-            self._unfed_run_layer = None
-            self._first_unfed_layer = None
             # This client watched THIS job start, so from here its peaks measure this
             # job and a zero reading at the terminal is a real zero (see the flag's
             # rationale at __init__). Set only here: the restart-recovery attach above
@@ -4851,11 +4900,10 @@ class BambuMQTTClient:
             # PREVIOUS print. Clear so it can't leak into this print's
             # completion classification.
             self.state.user_cancel_seen_at = None
-            # Clear and seed tray change log for mid-print usage splitting
-            self.state.tray_change_log.clear()
-            tn = self.state.tray_now
-            if extruder_feed(tn).kind in ("fed", "external"):  # a physical feeder (as at the AMS merge)
-                self.state.tray_change_log.append((tn, 0))
+            # The feed state's job record (the tray-change log seeded with the start feeder at
+            # layer 0, last_loaded_tray meaning "last tray fed THIS job" so a runout PAUSE
+            # renders the was-feeding ring for the CURRENT job's slot, the unfed layer) resets
+            # with the NEW_JOB boundary this push hands ``_step_feed``.
             # Initialize timelapse tracking based on current state
             # NOTE: xcam data is parsed BEFORE this code runs in _process_message,
             # so self.state.timelapse may already be set from this message.
@@ -4907,9 +4955,15 @@ class BambuMQTTClient:
             )
 
         # Every field of this push is applied (tray_now and ams_status above _update_state,
-        # the active extruder and its snow inside it) and the job baseline is set, so the
-        # unfed-layer run reads one consistent push.
-        self._track_unfed_layer()
+        # the active extruder and its snow inside it) and the job baseline is set, so the feed
+        # state reads one consistent push — before the terminal below reads its projections.
+        if is_new_print or is_file_change:
+            boundary = JobBoundary.NEW_JOB
+        elif job_first_observed:
+            boundary = JobBoundary.ATTACH
+        else:
+            boundary = JobBoundary.NONE
+        self._step_feed(boundary)
 
         # Detect print completion (FINISH = success, FAILED = error, IDLE = aborted)
         # Use _was_running flag in addition to _previous_gcode_state for more robust detection

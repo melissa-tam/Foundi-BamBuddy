@@ -99,7 +99,6 @@ from backend.app.services.slot_state import (
     resolve,
 )
 from backend.app.services.spool_binding import NEVER_FED_MAX_G, bind_spool_to_slot, release_spool_from_slot
-from backend.app.services.spool_respool import encode_global_tray
 from backend.app.services.spool_tag_matcher import (
     create_spool_from_tray,
     find_matching_untagged_spool,
@@ -107,7 +106,12 @@ from backend.app.services.spool_tag_matcher import (
     link_tag_to_inventory_spool,
 )
 from backend.app.services.spool_tagless import is_tagless_spool
-from backend.app.services.tray_fields import TRAY_PRESENT_STATES, parse_tray_exist_bits, slot_exist_bit
+from backend.app.services.tray_fields import (
+    TRAY_PRESENT_STATES,
+    encode_global_tray,
+    parse_tray_exist_bits,
+    slot_exist_bit,
+)
 from backend.app.services.tray_observation import TrayObservation, observation_tray_dict
 from backend.app.utils.color_utils import colors_similar
 from backend.app.utils.filament_types import canonical_filament_type
@@ -932,10 +936,11 @@ def _runout_suspect(obs: TrayObservation, deps: PipelineDeps, incident: PrinterI
     slot 2 while slot 3 is held for a runout must still de-bounce, and over-suspecting mints
     a part-used roll back to label weight, which is the unsafe direction.
 
-    * **Inside the gap** — the slot was the ACTIVE FEEDER of a live print when its presence
-      was lost (``ams_presence.reseat_under_active_feed``, the gain-side readback of the
-      loss-edge stamp ``spool_recovery.slot_was_feeding`` wrote). A slot that loses presence
-      while it is feeding is running out or being pulled mid-print; neither is a glitch.
+    * **Inside the gap** — the slot was FEEDING a live print, on any extruder, when its
+      presence was lost (``ams_presence.reseat_under_active_feed``, the gain-side readback of
+      the loss-edge stamp ``ams_presence._slot_was_active_feeder`` asked of the toolhead feed
+      state). A slot that loses presence while it is feeding is running out or being pulled
+      mid-print; neither is a glitch.
       Blind when a firmware auto-refill moved the feed to a backup BEFORE the bit cleared,
       and erased entirely by a restart inside the gap.
     * **On the wire, right now** — the firmware is standing on a slot-attributed runout for

@@ -987,78 +987,13 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         f"{ams_dry_key}:{ams_tray_key}:{state.door_open}:{state.ams_filament_backup}"
     )
 
-    # MQTT relay - publish status (before dedup check - always publish to MQTT)
+    # MQTT relay - publish status on every push (the status key gates only the WebSocket)
     try:
         printer_info = printer_manager.get_printer(printer_id)
         if printer_info:
             await mqtt_relay.on_printer_status(printer_id, state, printer_info.name, printer_info.serial_number)
     except Exception:
         pass  # Don't fail status callback if MQTT fails
-
-    if _last_status_broadcast.get(printer_id) == status_key:
-        return  # No change, skip WebSocket broadcast
-
-    _last_status_broadcast[printer_id] = status_key
-
-    # Check for progress milestone notifications (25%, 50%, 75%)
-    progress = state.progress or 0
-    is_printing = state.state in ("RUNNING", "PRINTING")
-
-    if is_printing and progress > 0:
-        # Determine which milestone we've reached
-        current_milestone = 0
-        if progress >= 75:
-            current_milestone = 75
-        elif progress >= 50:
-            current_milestone = 50
-        elif progress >= 25:
-            current_milestone = 25
-
-        last_milestone = _last_progress_milestone.get(printer_id, 0)
-
-        # If we've crossed a new milestone, send notification
-        if current_milestone > last_milestone:
-            _last_progress_milestone[printer_id] = current_milestone
-            try:
-                async with async_session() as db:
-                    from backend.app.models.printer import Printer
-
-                    result = await db.execute(select(Printer).where(Printer.id == printer_id))
-                    printer = result.scalar_one_or_none()
-                    printer_name = printer.name if printer else f"Printer {printer_id}"
-                    filename = state.subtask_name or state.gcode_file or "Unknown"
-                    # remaining_time is in minutes, convert to seconds for notification
-                    remaining_time_seconds = state.remaining_time * 60 if state.remaining_time else None
-
-                    # Capture camera snapshot for notification image attachment
-                    image_data = await _capture_snapshot_for_notification(
-                        printer_id, printer, logging.getLogger(__name__)
-                    )
-
-                    await notification_service.on_print_progress(
-                        printer_id,
-                        printer_name,
-                        filename,
-                        current_milestone,
-                        db,
-                        remaining_time_seconds,
-                        image_data=image_data,
-                    )
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"Progress milestone notification failed: {e}")
-    elif progress < 5:
-        # Reset milestone tracking when print restarts or new print begins
-        _last_progress_milestone[printer_id] = 0
-        _first_layer_notified[printer_id] = False
-
-    # HMS error codes that should not trigger notifications even though they
-    # have known descriptions (e.g. user-initiated actions, not real errors).
-    _HMS_NOTIFICATION_SUPPRESS = {
-        "0500_400E",  # Printing was cancelled (user action, not an error)
-    }
-
-    # Check for new HMS errors and send notifications
-    current_hms_errors = getattr(state, "hms_errors", []) or []
 
     # Wire-HMS APPEARANCE EDGES (services/hms_edges), consumed exactly ONCE per push and
     # fanned out to the edge-triggered STATE consumers below. These five decide farm
@@ -1145,22 +1080,23 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 "[SPOOL-RECOVERY] runout guidance refresh failed for printer %s: %s", printer_id, _ge
             )
 
-    # Re-spool Tier 1, HMS-FREE runout: the seamless AMS backup swap. Sampled HERE, on
-    # every status push, and NOT from the AMS-change callback — that callback is gated
-    # on bambu_mqtt's AMS hash and tray_now is deliberately not hashed, so the tray_now
-    # edge this detector lives on was visible there only by accident (the drained slot's
-    # exist-bit wipe) and the stable-feeder window was starved of samples outright. The
-    # sampler is sync, in-memory and session-free precisely so it can ride this ~1 Hz
-    # cadence; only a CONFIRMED departure pays for a session, fired and forgotten with
-    # the Spoolman gate inside it — strong-referenced (Path B is a spent lane too, and a
-    # collected confirmer is a missing stamp nobody can see).
+    # Re-spool Tier 1, the firmware's AMS backup swap (a runout it RESCUED). Sampled
+    # HERE, on every status push, and NOT from the AMS-change callback, which is gated on
+    # bambu_mqtt's AMS hash. The switch itself is the toolhead feed state's
+    # ``auto_switched`` event (invariant 16); the sampler applies respool's policy to it
+    # once per event, sync, in-memory and session-free so it can ride this ~1 Hz cadence.
+    # Only an admitted switch pays for a session, fired and forgotten with the Spoolman
+    # gate and the per-job dedup inside it, under THIS push's job — strong-referenced
+    # (Path B is a spent lane too, and a collected confirmer is a missing stamp nobody
+    # can see).
     try:
         from backend.app.services.spool_respool import confirm_backup_swaps, sample_status_push
 
         _departed_trays = sample_status_push(printer_id, state)
         if _departed_trays:
             spawn_background_task(
-                confirm_backup_swaps(printer_id, _departed_trays), name=f"backup-swap-confirm-p{printer_id}"
+                confirm_backup_swaps(printer_id, _departed_trays, subtask_id=state.subtask_id),
+                name=f"backup-swap-confirm-p{printer_id}",
             )
     except Exception as _bse:  # noqa: BLE001 — sampling must never crash the status flow
         logging.getLogger(__name__).warning("[RESPOOL] backup-swap sampler failed for printer %s: %s", printer_id, _bse)
@@ -1199,6 +1135,82 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         logging.getLogger(__name__).warning(
             "[PAUSE-RECOVERY] pause-recovery sampler failed for printer %s: %s", printer_id, _ple
         )
+
+    # The status key decides ONE thing: whether this push's WebSocket broadcast goes out (the
+    # ``if broadcast_due:`` at the end of this handler) — it dedups the card's redraws, and
+    # nothing else may hide behind it. The key omits ``ams_status_main``, HMS and ``sdcard``, so
+    # while it RETURNED here every block after it skipped exactly the pushes a firmware change,
+    # a fault edge or a USB unmount lives on (2026-10-10: a runout auto-switch's posture and HMS
+    # words arrive on pushes the key reads as unchanged). EVERY block of this handler runs on
+    # EVERY push — the samplers above, the milestones, the HMS lane and the USB lanes below — in
+    # this one order, each idempotent through its own cursor or edge: the samplers' edges, the
+    # milestone cursor, the re-notify ledger (its last-seen is bumped on every push — behind the
+    # key, a code standing on a printer whose key held still past the window re-notified as
+    # new), the per-code hms_event throttle, the one-shot standing seed, the AMS-fault entry
+    # throttle, the USB-drop edge and the consumed storage deferral.
+    broadcast_due = _last_status_broadcast.get(printer_id) != status_key
+    if broadcast_due:
+        _last_status_broadcast[printer_id] = status_key
+
+    # Check for progress milestone notifications (25%, 50%, 75%)
+    progress = state.progress or 0
+    is_printing = state.state in ("RUNNING", "PRINTING")
+
+    if is_printing and progress > 0:
+        # Determine which milestone we've reached
+        current_milestone = 0
+        if progress >= 75:
+            current_milestone = 75
+        elif progress >= 50:
+            current_milestone = 50
+        elif progress >= 25:
+            current_milestone = 25
+
+        last_milestone = _last_progress_milestone.get(printer_id, 0)
+
+        # If we've crossed a new milestone, send notification
+        if current_milestone > last_milestone:
+            _last_progress_milestone[printer_id] = current_milestone
+            try:
+                async with async_session() as db:
+                    from backend.app.models.printer import Printer
+
+                    result = await db.execute(select(Printer).where(Printer.id == printer_id))
+                    printer = result.scalar_one_or_none()
+                    printer_name = printer.name if printer else f"Printer {printer_id}"
+                    filename = state.subtask_name or state.gcode_file or "Unknown"
+                    # remaining_time is in minutes, convert to seconds for notification
+                    remaining_time_seconds = state.remaining_time * 60 if state.remaining_time else None
+
+                    # Capture camera snapshot for notification image attachment
+                    image_data = await _capture_snapshot_for_notification(
+                        printer_id, printer, logging.getLogger(__name__)
+                    )
+
+                    await notification_service.on_print_progress(
+                        printer_id,
+                        printer_name,
+                        filename,
+                        current_milestone,
+                        db,
+                        remaining_time_seconds,
+                        image_data=image_data,
+                    )
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Progress milestone notification failed: {e}")
+    elif progress < 5:
+        # Reset milestone tracking when print restarts or new print begins
+        _last_progress_milestone[printer_id] = 0
+        _first_layer_notified[printer_id] = False
+
+    # HMS error codes that should not trigger notifications even though they
+    # have known descriptions (e.g. user-initiated actions, not real errors).
+    _HMS_NOTIFICATION_SUPPRESS = {
+        "0500_400E",  # Printing was cancelled (user action, not an error)
+    }
+
+    # Check for new HMS errors and send notifications
+    current_hms_errors = getattr(state, "hms_errors", []) or []
 
     # Restart-replay HMS suppression (Phase D). Same one-shot shape as the runout
     # seed above and gated on the same "real report" rule: on the FIRST status push
@@ -1544,10 +1556,11 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # 9 runout episodes silent (a code standing at restart, or flapping inside the
         # 600 s window, is never "new"). The service's own entry throttle keeps a
         # standing fault from re-querying every second; all other gating lives there
-        # too. Guarded fire-and-forget hook only.
+        # too. Guarded fire-and-forget hook only, strong-referenced through ``core.tasks`` like
+        # the hooks above (a discarded bare task can be collected mid-await).
         if _actionable:
             try:
-                asyncio.create_task(on_ams_fault(printer_id, state))
+                spawn_background_task(on_ams_fault(printer_id, state), name=f"ams-fault-p{printer_id}")
             except Exception as _fe:  # noqa: BLE001 — hook must never crash the status flow
                 logging.getLogger(__name__).warning(
                     "[SPOOL-RECOVERY] AMS fault hook failed for printer %s: %s", printer_id, _fe
@@ -1590,15 +1603,17 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                 "[USB-STORAGE] deferred storage-low retry failed for printer %s: %s", printer_id, _se
             )
 
-    await ws_manager.send_printer_status(
-        printer_id,
-        printer_state_to_dict(
-            state,
+    # The ONE block the status key gates (see ``broadcast_due``).
+    if broadcast_due:
+        await ws_manager.send_printer_status(
             printer_id,
-            printer_manager.get_model(printer_id),
-            printer_manager.get_drying_targets(printer_id),
-        ),
-    )
+            printer_state_to_dict(
+                state,
+                printer_id,
+                printer_manager.get_model(printer_id),
+                printer_manager.get_drying_targets(printer_id),
+            ),
+        )
 
 
 def _is_bambu_uuid(tray_uuid: str) -> bool:
@@ -2313,18 +2328,6 @@ async def on_print_start(printer_id: int, data: dict):
         note_running_edge(printer_id)
     except Exception as _re:  # noqa: BLE001 — edge stamping must never crash the start callback
         logger.warning("[AMS-PRESENCE] running-edge stamp failed for printer %s: %s", printer_id, _re)
-
-    # Backup-swap edge state is per-printer and must not survive a print boundary: a
-    # feeder change chosen by the NEXT job's dispatch mapping would otherwise read as a
-    # mid-job firmware backup switch and falsely stamp the departed spool spent
-    # (2026-07-20). Reset BEFORE the eject short-circuit below — an eject job is a
-    # boundary too. Guarded like the other per-push hooks; the logic lives in the service.
-    try:
-        from backend.app.services.spool_respool import reset_swap_edge_state
-
-        reset_swap_edge_state(printer_id)
-    except Exception as _rse:  # noqa: BLE001 — edge-state reset must never crash the start callback
-        logger.warning("[RESPOOL] backup-swap edge reset failed on print start for printer %s: %s", printer_id, _rse)
 
     # #1721: drop any leftover pre-captured finish frame from a prior print
     # so a never-consumed cache entry can't bleed into the new print's photo.
@@ -3553,23 +3556,12 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
 
     logger.info("[CALLBACK] on_print_complete started for printer %s", printer_id)
 
-    # Symmetric to on_print_start: drop the per-printer backup-swap edge state at every
-    # terminal so it never carries into the next print (2026-07-20 false-spent
-    # incident). Unconditional — runs for every terminal, incl. eject sweeps. Guarded;
-    # the logic lives in the service.
-    try:
-        from backend.app.services.spool_respool import reset_swap_edge_state
-
-        reset_swap_edge_state(printer_id)
-    except Exception as _rse:  # noqa: BLE001 — edge-state reset must never crash the completion callback
-        logger.warning("[RESPOOL] backup-swap edge reset failed on print complete for printer %s: %s", printer_id, _rse)
-
     # Retire any physical cycle a DE-BOUNCE preserved on this printer (2026-08-20). The
     # preservation exists so a runout's spent stamp — which lands ~3 min after the bay
     # clears — can still drive REPLACE_SPENT on the next push; a job boundary is the CAUSE
     # bound on that wait, because a stamp arriving after this print ended belongs to a
-    # different physical story. Unconditional and symmetric to the two resets above; the
-    # decision (a stamped row keeps its cycle) lives in the service.
+    # different physical story. Unconditional — runs for every terminal, incl. eject
+    # sweeps; the decision (a stamped row keeps its cycle) lives in the service.
     try:
         from backend.app.services.spool_tagless import expire_debounce_preserved_cycles
 

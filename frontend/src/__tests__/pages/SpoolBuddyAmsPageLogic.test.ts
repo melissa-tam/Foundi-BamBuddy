@@ -1,6 +1,6 @@
 /**
  * Tests for SpoolBuddy AMS page logic:
- * - External slot active state (tray_now=255 bug fix)
+ * - External slot active state (`toolhead.active_tray`; null = nothing fed)
  * - Fill level override fallback chain (inventory → AMS remain)
  *
  * These mirror inline logic from SpoolBuddyAmsPage.tsx, extracted for testability.
@@ -8,20 +8,20 @@
 import { describe, it, expect } from 'vitest';
 
 /**
- * Mirrors the ext slot isExtActive calculation from SpoolBuddyAmsPage.tsx.
- * tray_now=255 means "no tray loaded" (idle) — should never mark any slot active.
+ * Mirrors the ext slot isExtActive calculation from SpoolBuddyAmsPage.tsx over
+ * `toolhead.active_tray` (254 = the external spool, null = nothing fed). Nothing
+ * fed must never mark a slot active — not even Ext-R, whose vt_tray id is 255.
  */
 function computeExtActive(
-  trayNow: number,
+  activeTray: number | null,
   isDualNozzle: boolean,
   extTrayId: number,
   activeExtruder: number | undefined,
 ): boolean {
-  return trayNow === 255 ? false
-    : isDualNozzle && trayNow === 254
-      ? (extTrayId === 254 && activeExtruder === 1) ||
-        (extTrayId === 255 && activeExtruder === 0)
-      : trayNow === extTrayId;
+  return isDualNozzle && activeTray === 254
+    ? (extTrayId === 254 && activeExtruder === 1) ||
+      (extTrayId === 255 && activeExtruder === 0)
+    : activeTray === extTrayId;
 }
 
 /**
@@ -37,22 +37,21 @@ function computeEffectiveFill(
 }
 
 describe('ext slot active state', () => {
-  describe('tray_now=255 (idle) — no slot should be active', () => {
-    it('single-nozzle: ext (id=254) not active when tray_now=255', () => {
-      expect(computeExtActive(255, false, 254, undefined)).toBe(false);
+  describe('active_tray=null (nothing fed) — no slot should be active', () => {
+    it('single-nozzle: ext (id=254) not active when nothing is fed', () => {
+      expect(computeExtActive(null, false, 254, undefined)).toBe(false);
     });
 
-    it('dual-nozzle: ext-L (id=254) not active when tray_now=255', () => {
-      expect(computeExtActive(255, true, 254, 1)).toBe(false);
+    it('dual-nozzle: ext-L (id=254) not active when nothing is fed', () => {
+      expect(computeExtActive(null, true, 254, 1)).toBe(false);
     });
 
-    it('dual-nozzle: ext-R (id=255) not active when tray_now=255', () => {
-      // This was the bug: trayNow(255) === extTrayId(255) without the guard
-      expect(computeExtActive(255, true, 255, 0)).toBe(false);
+    it('dual-nozzle: ext-R (id=255) not active when nothing is fed', () => {
+      expect(computeExtActive(null, true, 255, 0)).toBe(false);
     });
   });
 
-  describe('tray_now=254 on dual-nozzle — uses active_extruder', () => {
+  describe('active_tray=254 on dual-nozzle — uses active_extruder', () => {
     it('ext-L active when active_extruder=1 (left)', () => {
       expect(computeExtActive(254, true, 254, 1)).toBe(true);
     });
@@ -70,14 +69,14 @@ describe('ext slot active state', () => {
     });
   });
 
-  describe('tray_now=254 on single-nozzle — direct ID match', () => {
-    it('ext (id=254) active when tray_now=254', () => {
+  describe('active_tray=254 on single-nozzle — direct ID match', () => {
+    it('ext (id=254) active when active_tray=254', () => {
       expect(computeExtActive(254, false, 254, undefined)).toBe(true);
     });
   });
 
   describe('AMS tray active — ext slots not active', () => {
-    it('ext not active when AMS slot is active (tray_now=5)', () => {
+    it('ext not active when AMS slot is active (active_tray=5)', () => {
       expect(computeExtActive(5, false, 254, undefined)).toBe(false);
     });
   });

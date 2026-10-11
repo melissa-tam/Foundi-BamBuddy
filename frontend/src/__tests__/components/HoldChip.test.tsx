@@ -25,7 +25,7 @@ describe('HoldChip', () => {
     renderChip({
       state: 'PAUSE',
       open_incident: null,
-      toolhead: { feed: 'empty', tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } },
+      toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } },
     });
     const tooltip = en.printers.toolhead.loading.replace('{{slot}}', 'AMS A slot 1');
 
@@ -42,7 +42,7 @@ describe('HoldChip', () => {
     renderChip({
       state: 'PAUSE',
       open_incident: null,
-      toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'acted' } },
+      toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'acted' } },
     });
 
     const tooltip = [
@@ -59,7 +59,8 @@ describe('HoldChip', () => {
       open_incident: null,
       toolhead: {
         feed: 'empty',
-        tray: null,
+        active_tray: null,
+        was_feeding_tray: null,
         refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'acted', command: 'unload' },
       },
     });
@@ -79,7 +80,7 @@ describe('HoldChip', () => {
     renderChip({
       state: 'PAUSE',
       open_incident: null,
-      toolhead: { feed: 'empty', tray: null, refill: null, refill_reason: 'owed' },
+      toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null, refill_reason: 'owed' },
     });
 
     expect(screen.getByText(en.printers.incident.toolhead_refill)).toBeInTheDocument();

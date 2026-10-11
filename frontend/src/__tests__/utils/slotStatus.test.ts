@@ -1,40 +1,10 @@
 /**
- * Pure derivations behind the PrintersPage slot badges/ring: the was-feeding
- * dimmed-ring tray id and the per-slot ran-out flag.
+ * Pure derivation behind the PrintersPage slot badges: the per-slot ran-out
+ * flag. (The slot rings are the backend's answer; see
+ * `__tests__/pages/PrintersPage.feedRing.test.tsx`.)
  */
 import { describe, it, expect } from 'vitest';
-import { wasFeedingTrayId, slotRanOut, type RunoutSlotBearer } from '../../utils/slotStatus';
-
-describe('wasFeedingTrayId', () => {
-  it('returns the last-loaded tray during a runout PAUSE (no live active tray)', () => {
-    // PAUSE, tray_now cleared (effectiveTrayNow undefined), last_loaded_tray = 3.
-    expect(wasFeedingTrayId('PAUSE', undefined, 3)).toBe(3);
-    expect(wasFeedingTrayId('RUNNING', undefined, 0)).toBe(0);
-  });
-
-  it('returns undefined when a live active tray is present (ring not needed)', () => {
-    // effectiveTrayNow is defined → the real green ring shows; no was-feeding hint.
-    expect(wasFeedingTrayId('PAUSE', 3, 3)).toBeUndefined();
-    expect(wasFeedingTrayId('RUNNING', 1, 3)).toBeUndefined();
-  });
-
-  it('returns undefined when no job is active', () => {
-    expect(wasFeedingTrayId('IDLE', undefined, 3)).toBeUndefined();
-    expect(wasFeedingTrayId('FINISH', undefined, 3)).toBeUndefined();
-    expect(wasFeedingTrayId(null, undefined, 3)).toBeUndefined();
-    expect(wasFeedingTrayId(undefined, undefined, 3)).toBeUndefined();
-  });
-
-  it('returns undefined when last_loaded_tray names no tray (-1 / null)', () => {
-    expect(wasFeedingTrayId('PAUSE', undefined, -1)).toBeUndefined();
-    expect(wasFeedingTrayId('PAUSE', undefined, null)).toBeUndefined();
-    expect(wasFeedingTrayId('PAUSE', undefined, undefined)).toBeUndefined();
-  });
-
-  it('treats tray 0 as a real tray (not falsy)', () => {
-    expect(wasFeedingTrayId('PAUSE', undefined, 0)).toBe(0);
-  });
-});
+import { slotRanOut, type RunoutSlotBearer } from '../../utils/slotStatus';
 
 describe('slotRanOut', () => {
   const errors: RunoutSlotBearer[] = [

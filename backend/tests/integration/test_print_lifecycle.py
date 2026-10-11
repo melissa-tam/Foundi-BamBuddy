@@ -744,6 +744,7 @@ class _LadderWire:
         self.client.execute_hms_action.side_effect = self._press
         self.client.await_ack = AsyncMock(side_effect=lambda sent, budget_s, poll_s: self._ack(sent, ack))
         self.client.job_peaks.side_effect = self._peaks
+        self.client.feed.side_effect = self._feed
         self.client.send_gcode.return_value = True  # the held-bed lift
 
     @staticmethod
@@ -769,6 +770,13 @@ class _LadderWire:
             layer_num=self.layer or 0,
             reliable=self.layer is not None,
         )
+
+    def _feed(self):
+        """The client's toolhead feed state (``BambuMQTTClient.feed()``): a real tracker that has
+        seen the scripted state reported."""
+        from backend.tests._fixtures.feed import ScriptedFeed
+
+        return ScriptedFeed().settle(self.state)
 
     def _press(self, print_error, action, job_id):
         from backend.app.services.bambu_mqtt import SentCommand

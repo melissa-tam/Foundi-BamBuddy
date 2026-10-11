@@ -474,17 +474,21 @@ class TestResumeOwnership:
         pending command, maintenance mode, the runout demand, the power-loss prompt, a filament change
         in flight — appear together nowhere else in the app as a refill decision; every reader reads
         the VERDICT. Its readers, each with its reason: the resume verb (T3), the refill driver at its
-        publish, the restart re-entry and the per-push detectors (T2 / T4), all in ``spool_recovery``;
-        and the status frame's ``toolhead.refill_reason`` (T3 — what a Resume would do, so the card
-        never re-derives K7). The settle rule (``pending_settles``) is read by the verdict and the
-        driver's own waits only."""
+        publish, the give-up (T3 — would a person's Resume print air; it kept a private subset of the
+        exclusions until 2026-10-10), the restart re-entry and the per-push detectors (T2 / T4), all in
+        ``spool_recovery``; and the status frame's ``toolhead.refill_reason`` (T3 — what a Resume would
+        do, so the card never re-derives K7). The settle rule (``pending_settles``) is read by the
+        verdict and the driver's own waits only."""
         found: set[tuple[tuple[str, ...], str]] = set()
         settle_readers: set[tuple[tuple[str, ...], str]] = set()
+        give_up_calls: set[str] = set()
         for parts, tree in _app_trees():
             for node, scope in _scoped_nodes(tree):
                 if not isinstance(node, ast.Call):
                     continue
                 name = _called(node.func)[1]
+                if parts == _SPOOL_RECOVERY and scope[-1:] == ("_give_up",):
+                    give_up_calls.add(name)
                 if name == "refill_owed":
                     found.add((parts, scope[-1] if scope else "<module>"))
                 elif name == "pending_settles":
@@ -494,10 +498,13 @@ class TestResumeOwnership:
         assert found == {
             (_SPOOL_RECOVERY, "resume_paused_print"),
             (_SPOOL_RECOVERY, "_refill_then_resume"),
+            (_SPOOL_RECOVERY, "_give_up"),
             (_SPOOL_RECOVERY, "_reentered_trigger"),
             (_SPOOL_RECOVERY, "_sample_toolhead"),
             (manager, "toolhead_payload"),
         }
+        # The give-up composes none of the exclusions itself: it asks the verdict.
+        assert not give_up_calls & {"ams_mid_filament_change", "toolhead_feed", "reads_live"}, give_up_calls
         assert settle_readers == {
             (verdict, "refill_owed"),
             (_SPOOL_RECOVERY, "_await_pending_command"),
@@ -1228,12 +1235,13 @@ class TestPrintRecordResolution:
         ):
             assert "is_held_job" in _source_of(cell), cell.__name__
         assert not hasattr(incident_resolution, "_same_job")
-        # A NAMED job, never an id-less match: the repair arm and the AMS driver's job tests.
+        # A NAMED job, never an id-less match: the repair arm, the AMS driver's job tests and the
+        # resume-once verdict's held job (``resume_owed``, which its spawner and the resume's own
+        # readiness re-ask both read).
         for site in (
             incident_resolution._repair_job_terminal,  # noqa: SLF001
+            incident_resolution._held_job_paused,  # noqa: SLF001
             spool_recovery._takeover,  # noqa: SLF001
-            spool_recovery._maybe_self_heal_after_repair,  # noqa: SLF001
-            spool_recovery._resume_after_repair,  # noqa: SLF001
         ):
             assert "same_job" in _source_of(site), site.__name__
 
@@ -1773,16 +1781,6 @@ _FEED_SENTINEL_NAMES = frozenset({"TRAY_NOW_NOTHING_FED", "TRAY_NOW_EXTERNAL_SPO
 # feeder range inline instead of reading it through ``tray_fields`` (the usage attribution),
 # and the entry says why rather than calling the spelling right.
 _FEED_IDENTITY_READERS: dict[tuple[tuple[str, ...], str], str] = {
-    (_SPOOL_RECOVERY, "_resolve_jammed_tray"): (
-        "which tray jammed: the feeder at fault time, then last_loaded_tray — through tray_fields.valid_feeder"
-    ),
-    (_SPOOL_RECOVERY, "_feeder_before_edge"): (
-        "which tray fed just before a presence edge: tray_now is its LAST fallback tier — through valid_feeder"
-    ),
-    (("services", "spool_respool.py"), "sample_status_push"): (
-        "the backup-swap sampler: which tray DEPARTED and which ARRIVED on a tray_now edge — both ends "
-        "real AMS feeders, through valid_feeder"
-    ),
     (("services", "usage_tracker.py"), "_track_from_3mf"): (
         "usage attribution: which feeder a 3MF slot is charged to. It spells 0..254 / == 255 / >= 254 inline "
         "because 255 is a FEEDER there (the H2 Ext-R holder, _has_right_external_holder), which tray_fields' "
@@ -1978,6 +1976,219 @@ class TestToolheadFeedOwnership:
     def test_the_scan_sees_every_shape(self, source, flagged):
         """The detector itself: each shape it must flag, and the reads it must not."""
         assert bool(_scan_feed_tests(ast.parse(source))) is flagged
+
+
+# --- The toolhead feed state: one stepper, one projection writer (2026-10-10) -----------------
+
+_FEED_STATE = ("services", "feed_state.py")
+_FEED_CLIENT = ("services", "bambu_mqtt.py")
+# The two PrinterState fields that are PROJECTIONS of the feed state's reading.
+_FEED_PROJECTIONS = frozenset({"tray_change_log", "last_loaded_tray"})
+_FEED_PROJECTION_WRITER = ("BambuMQTTClient", "_project_feed")
+_LIST_MUTATORS = frozenset({"append", "extend", "insert", "clear", "pop", "remove", "sort", "reverse"})
+
+
+def _scan_projection_writes(tree: ast.Module) -> list[tuple[tuple[str, ...], int, str]]:
+    """Every write to a feed projection: ``(scope, line, what)`` — an assignment (or ``del`` /
+    augmented assignment) of ``x.tray_change_log`` / ``x.last_loaded_tray``, an item write into
+    the log, a list mutator called on it, or a ``setattr`` naming either."""
+    hits: list[tuple[tuple[str, ...], int, str]] = []
+    for node, scope in _scoped_nodes(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in _FEED_PROJECTIONS
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        ):
+            hits.append((scope, node.lineno, f"assigns .{node.attr}"))
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr in _FEED_PROJECTIONS
+        ):
+            hits.append((scope, node.lineno, f"writes an item of .{node.value.attr}"))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in _LIST_MUTATORS
+                and isinstance(func.value, ast.Attribute)
+                and func.value.attr in _FEED_PROJECTIONS
+            ):
+                hits.append((scope, node.lineno, f"mutates .{func.value.attr}.{func.attr}()"))
+            elif (
+                isinstance(func, ast.Name)
+                and func.id == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in _FEED_PROJECTIONS
+            ):
+                hits.append((scope, node.lineno, f"setattr({node.args[1].value!r})"))
+    return hits
+
+
+class TestFeedStateOwnership:
+    """The toolhead FEED STATE (``feed_state``) has ONE stepper and its projections ONE writer.
+    SOURCE pins, like their neighbours: a second stepper or a second writer is a well-formed
+    line every behaviour test passes — and it is exactly how the job's tray-change log credited a
+    backup from the PRE-FLIP layer while the old roll's tail still fed (005/001-H2S 2026-10-10).
+
+    * ``FeedTracker`` is built by ``BambuMQTTClient.__init__`` alone, held on the client's private
+      ``_feed``, and stepped by ``BambuMQTTClient._step_feed`` alone (once per status push) — so no
+      other module can reach a tracker to step it;
+    * ``PrinterState.tray_change_log`` / ``last_loaded_tray`` are written by
+      ``BambuMQTTClient._project_feed`` alone, from the reading.
+    """
+
+    def test_only_the_client_builds_and_steps_the_tracker(self):
+        builds: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        steps: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        reaches: list[str] = []
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if isinstance(node, ast.Call):
+                    owner_name = _called(node.func)[1]
+                    if owner_name == "FeedTracker":
+                        builds.add((parts, scope))
+                    func = node.func
+                    if (
+                        isinstance(func, ast.Attribute)
+                        and func.attr == "step"
+                        and isinstance(func.value, ast.Attribute)
+                        and func.value.attr == "_feed"
+                    ):
+                        steps.add((parts, scope))
+                if isinstance(node, ast.Attribute) and node.attr == "_feed":
+                    if parts != _FEED_CLIENT or scope[:1] != ("BambuMQTTClient",):
+                        reaches.append(f"  - {'/'.join(parts)}:{node.lineno} {'.'.join(scope) or '<module>'}")
+        assert builds == {(_FEED_CLIENT, ("BambuMQTTClient", "__init__"))}, builds
+        assert steps == {(_FEED_CLIENT, ("BambuMQTTClient", "_step_feed"))}, steps
+        assert not reaches, "The client's feed tracker is reached outside BambuMQTTClient:\n" + "\n".join(reaches)
+
+    def test_the_projections_have_one_writer(self):
+        strays: list[str] = []
+        owner_writes: list[str] = []
+        for parts, tree in _app_trees():
+            for scope, line, what in _scan_projection_writes(tree):
+                if parts == _FEED_CLIENT and scope == _FEED_PROJECTION_WRITER:
+                    owner_writes.append(what)
+                else:
+                    strays.append(f"  - {'/'.join(parts)}:{line} {'.'.join(scope) or '<module>'}: {what}")
+        assert not strays, (
+            "PrinterState.tray_change_log / last_loaded_tray are PROJECTIONS of the feed state's reading — "
+            "written only by BambuMQTTClient._project_feed:\n" + "\n".join(strays)
+        )
+        # Liveness: the writer still writes both, so the pin cannot pass on nothing.
+        assert sorted(owner_writes) == ["assigns .last_loaded_tray", "assigns .tray_change_log"]
+
+    @pytest.mark.parametrize(
+        ("source", "flagged"),
+        [
+            pytest.param("def f(s):\n    s.state.last_loaded_tray = 3\n", True, id="assign"),
+            pytest.param("def f(s):\n    s.state.tray_change_log.append((1, 2))\n", True, id="append"),
+            pytest.param("def f(s):\n    s.tray_change_log.clear()\n", True, id="clear"),
+            pytest.param("def f(s):\n    s.tray_change_log[0] = (1, 2)\n", True, id="item"),
+            pytest.param("def f(s):\n    s.tray_change_log += [(1, 2)]\n", True, id="augmented"),
+            pytest.param("def f(s):\n    setattr(s, 'last_loaded_tray', 3)\n", True, id="setattr"),
+            pytest.param("def f(s):\n    return list(s.tray_change_log)\n", False, id="a_read"),
+            pytest.param("class E:\n    tray_change_log: tuple = ()\n", False, id="another_classes_field"),
+            pytest.param("def f(e):\n    return E(tray_change_log=e)\n", False, id="a_keyword"),
+        ],
+    )
+    def test_the_scan_sees_every_shape(self, source, flagged):
+        assert bool(_scan_projection_writes(ast.parse(source))) is flagged
+
+    def test_the_feed_state_is_its_own_module(self):
+        """The leaf exists where the pins above expect it (a rename would empty them)."""
+        assert BACKEND_DIR.joinpath(*_FEED_STATE).is_file()
+
+
+# The lanes that ASK the feed state for a fact it composes — the firmware's switch, a roll that
+# drained, the last feeder of an extruder — each with what it asks.
+_FEED_READING_CONSUMERS: dict[tuple[str, ...], str] = {
+    ("services", "spool_respool.py"): (
+        "the backup-swap lane (auto_switched) and the exhausted-roll inference (feeder / last_fed / drained)"
+    ),
+    ("services", "ams_presence.py"): "the loss edge's 'was this slot feeding' (last_fed / drained, any extruder)",
+}
+# The raw fields a reader would compose those facts from: the client's feeder field and the
+# feed state's two projections (``*_snow`` — the per-extruder feeder map — by suffix).
+_RAW_FEEDER_FIELDS = frozenset({"tray_now", "last_loaded_tray", "tray_change_log"})
+
+
+def _raw_feeder_field(name: object) -> bool:
+    return isinstance(name, str) and (name in _RAW_FEEDER_FIELDS or name.endswith("_snow"))
+
+
+def _scan_raw_feeder_reads(tree: ast.Module) -> list[tuple[int, str]]:
+    """Every read of a raw feeder field: ``x.tray_now`` / ``.last_loaded_tray`` /
+    ``.tray_change_log`` / ``.<…>_snow``, or ``getattr`` naming one."""
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _raw_feeder_field(node.attr):
+            hits.append((node.lineno, f".{node.attr}"))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and _raw_feeder_field(node.args[1].value)
+        ):
+            hits.append((node.lineno, f"getattr(…, {node.args[1].value!r})"))
+    return hits
+
+
+class TestTheFeedStateFactsAreAsked:
+    """The firmware's runout switch, a roll draining at the AMS and the last feeder of each
+    extruder are composed by ``feed_state`` alone (invariant 16) and ASKED of its reading
+    (``BambuMQTTClient.feed()``). The respool lane once kept its own ``tray_now`` edge tracker
+    with 60 s stability windows, which confirmed a pre-flip 60 s late and never saw A → 255 → B
+    (2026-10-10), and the presence lane its own ``last_loaded_tray`` / ``tray_now`` tiers —
+    each a minutes-long firmware sequence composed from single frames. SOURCE pins, like their
+    neighbours: a raw feeder field read in one of these lanes is a second composer coming
+    back, and every behaviour test passes it.
+    """
+
+    def test_the_lanes_read_no_raw_feeder_field(self):
+        trees = dict(_app_trees())
+        strays = [
+            f"  - {'/'.join(parts)}:{line} {what}"
+            for parts in _FEED_READING_CONSUMERS
+            for line, what in _scan_raw_feeder_reads(trees[parts])
+        ]
+        assert not strays, (
+            "A lane that asks the toolhead feed state reads a raw feeder field — ask the reading "
+            "(feed_state.FeedReading: feeder / extruders[*].last_fed / drained / auto_switched):\n" + "\n".join(strays)
+        )
+
+    def test_the_lanes_still_ask_the_reading(self):
+        """Liveness: each lane still calls ``.feed()``, so the pin cannot pass on a lane that
+        stopped asking anything."""
+        trees = dict(_app_trees())
+        silent = [
+            "/".join(parts)
+            for parts in _FEED_READING_CONSUMERS
+            if not any(
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "feed"
+                for node in ast.walk(trees[parts])
+            )
+        ]
+        assert not silent, f"These lanes no longer ask the feed state: {silent}"
+
+    @pytest.mark.parametrize(
+        ("source", "flagged"),
+        [
+            pytest.param("def f(s):\n    return s.tray_now\n", True, id="tray_now"),
+            pytest.param("def f(s):\n    return getattr(s, 'last_loaded_tray', -1)\n", True, id="getattr"),
+            pytest.param("def f(s):\n    return s.h2d_extruder_snow.get(1)\n", True, id="snow"),
+            pytest.param("def f(s):\n    return list(s.tray_change_log)\n", True, id="projection"),
+            pytest.param("def f(c):\n    return c.feed().extruders\n", False, id="the_reading"),
+            pytest.param("def f(r):\n    return r.feeder\n", False, id="a_reading_field"),
+        ],
+    )
+    def test_the_scan_sees_every_shape(self, source, flagged):
+        assert bool(_scan_raw_feeder_reads(ast.parse(source))) is flagged
 
 
 # --- The deposit predicate and the lineage walk keep their one owner each --------------

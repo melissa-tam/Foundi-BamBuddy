@@ -1220,6 +1220,20 @@ _RUNOUT_SLOT_SPENT_CODE32: frozenset[int] = frozenset({0x00030001, 0x00030002})
 # (a terminal runout is a print the operator must attend to), so it is not listed here.
 NOTIFY_SUPPRESSED_CODE32: frozenset[int] = frozenset({0x00030002})
 
+# The two SPENT words split by what each REPORTS, for the toolhead feed state
+# (``feed_state``), which reads them as PHASE evidence and never as a stamp source (the
+# spent lane above stays their one stamping consumer). Derived views, never re-spelled: of
+# the two, the auto-switch report is the one whose alert is suppressed BECAUSE it reports
+# work the firmware already finished (the header above), and the pull-back notice is the
+# other — it still pages.
+#
+#   * the AUTO-SWITCH report (0x00030002) — the firmware says it moved the print onto the
+#     backup: a tail that reads the active feed on another tray is over;
+#   * the PULL-BACK notice (0x00030001) — "please wait while old filament is purged": the
+#     firmware's change is in progress, so an empty toolhead beside it is not air yet.
+_RUNOUT_AUTO_SWITCHED_CODE32: frozenset[int] = _RUNOUT_SLOT_SPENT_CODE32 & NOTIFY_SUPPRESSED_CODE32
+_RUNOUT_PULL_BACK_CODE32: frozenset[int] = _RUNOUT_SLOT_SPENT_CODE32 - NOTIFY_SUPPRESSED_CODE32
+
 
 def is_notify_suppressed(attr: int, code: int | str) -> bool:
     """True when this fault's raw operator alert is suppressed (see the set above).
@@ -2392,6 +2406,57 @@ def slot_runout_full_codes(hms_list) -> frozenset[str]:
     return frozenset(found)
 
 
+def runout_demand_standing(hms_list) -> bool:
+    """Is the firmware ASKING for filament right now — any runout demand standing?
+
+    Either word the hold is made of: a slot-attributed DEMAND (:func:`current_runout_demand`)
+    or the slot-agnostic "insert into the SAME slot" family (``RUNOUT_HMS_CODES``, e.g.
+    ``0700_8011`` — 001-H2S 2026-10-10 18:25 held on that word alone, after a backup switch
+    onto an EMPTY slot failed, so a slotted-demand-only reading misses the hold). The one
+    reading behind :func:`runout_hold_active` and the feed state's RUNOUT_HELD phase
+    (``feed_state``). AMS-slot vocabulary only, by design (see :func:`runout_hold_active`).
+
+    Pure over any HMSError-shaped sequence; a malformed entry is skipped, never raised
+    (invariant 10).
+    """
+    if current_runout_demand(hms_list) is not None:
+        return True
+    for e in hms_list or []:
+        try:
+            if hms_short_code(e.attr, e.code) in RUNOUT_HMS_CODES:
+                return True
+        except Exception:  # noqa: BLE001, PERF203 — a malformed HMS entry must not break the predicate
+            continue
+    return False
+
+
+def _slot_runout_word_standing(hms_list, words: frozenset[int]) -> bool:
+    """Is one of ``words`` standing under a TRAY attr — the slot-attributed runout family's
+    own decode (:func:`runout_slot_from_hms`), so the overload sharing a word's short form
+    never reads as it. Skips a malformed entry (invariant 10)."""
+    for e in hms_list or []:
+        try:
+            word = _code_word(getattr(e, "code", 0))
+            if word in words and runout_slot_from_hms(int(getattr(e, "attr", 0) or 0), word) is not None:
+                return True
+        except (TypeError, ValueError):  # noqa: PERF203 — a malformed HMS entry must not break the decode
+            continue
+    return False
+
+
+def pull_back_standing(hms_list) -> bool:
+    """Is the PULL-BACK notice (0x00030001, :data:`_RUNOUT_PULL_BACK_CODE32`) standing — the
+    firmware's runout change in progress? Phase evidence for ``feed_state``."""
+    return _slot_runout_word_standing(hms_list, _RUNOUT_PULL_BACK_CODE32)
+
+
+def auto_switch_standing(hms_list) -> bool:
+    """Is the AUTO-SWITCH report (0x00030002, :data:`_RUNOUT_AUTO_SWITCHED_CODE32`) standing —
+    the firmware moved the print onto a backup slot? Phase evidence for ``feed_state``, never
+    a stamp (the HMS-edge lane stamps on its appearance)."""
+    return _slot_runout_word_standing(hms_list, _RUNOUT_AUTO_SWITCHED_CODE32)
+
+
 def runout_hold_active(state) -> bool:
     """True when the printer is PAUSEd holding for a same-slot filament refill.
 
@@ -2401,8 +2466,8 @@ def runout_hold_active(state) -> bool:
     Two legs, both required:
 
     * live ``gcode_state == "PAUSE"``, and
-    * a runout code standing in ``hms_errors`` — either the slot-agnostic
-      "insert into the SAME slot" family (``RUNOUT_HMS_CODES``) or any
+    * a runout code standing in ``hms_errors`` (:func:`runout_demand_standing`) — either
+      the slot-agnostic "insert into the SAME slot" family (``RUNOUT_HMS_CODES``) or any
       slot-attributed DEMAND (:func:`current_runout_demand`).
 
     Both legs are AMS-SLOT vocabulary by design, so an EXTERNAL-holder runout is
@@ -2422,17 +2487,7 @@ def runout_hold_active(state) -> bool:
     try:
         if (getattr(state, "state", None) or "") != "PAUSE":
             return False
-        hms_list = getattr(state, "hms_errors", None) or []
-        if current_runout_demand(hms_list) is not None:
-            return True
-
-        for e in hms_list:
-            try:
-                if hms_short_code(e.attr, e.code) in RUNOUT_HMS_CODES:
-                    return True
-            except Exception:  # noqa: BLE001 — a malformed HMS entry must not break the predicate
-                continue
-        return False
+        return runout_demand_standing(getattr(state, "hms_errors", None) or [])
     except Exception:  # noqa: BLE001 — a gate predicate must never raise into a callback/route
         return False
 

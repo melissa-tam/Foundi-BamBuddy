@@ -1027,7 +1027,7 @@ describe('PrintersPage', () => {
         state: 'PAUSE',
         hms_errors: [],
         open_incident: heldBy('toolhead_refill', [], { status: 'recovering' }),
-        toolhead: { feed: 'empty', tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } },
+        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } },
       });
       render(<PrintersPage />);
 
@@ -1042,7 +1042,7 @@ describe('PrintersPage', () => {
         state: 'PAUSE',
         hms_errors: [],
         open_incident: heldBy('jam', [], { status: 'escalated', slot_desc: 'AMS A slot 3' }),
-        toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'no_movement' } },
+        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'no_movement' } },
       });
       render(<PrintersPage />);
 
@@ -1060,7 +1060,7 @@ describe('PrintersPage', () => {
       serveStatus({
         state: 'PAUSE',
         hms_errors: [],
-        toolhead: { feed: 'empty', tray: null, refill: null, refill_reason: 'owed' },
+        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null, refill_reason: 'owed' },
       });
       render(<PrintersPage />);
 
@@ -1082,7 +1082,7 @@ describe('PrintersPage', () => {
         state: 'PAUSE',
         layer_num: 0,
         hms_errors: [],
-        toolhead: { feed: 'empty', tray: null, refill: null, ...verdict },
+        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null, ...verdict },
       });
       render(<PrintersPage />);
 

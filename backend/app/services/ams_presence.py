@@ -82,7 +82,7 @@ from backend.app.services import hms_errors
 from backend.app.services.bambu_mqtt import AMS_STATUS_IDENTIFYING, TRAY_PRESENT_STATES, filament_engaged
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.spool_tag_matcher import is_valid_tag
-from backend.app.services.tray_fields import parse_int_field, tray_identity_asserted
+from backend.app.services.tray_fields import encode_global_tray, parse_int_field, tray_identity_asserted
 from backend.app.services.tray_observation import TrayObservation, observation_tray_dict
 
 if TYPE_CHECKING:
@@ -149,9 +149,9 @@ _RESEAT_WINDOW_S = 300.0
 # identify-explained", the same conservative default every edge map here takes.
 _absent_under_identify: dict[tuple[int, int, int], bool] = {}
 
-# (printer_id, ams_id, tray_id) -> whether the slot was the ACTIVE FEEDER of a LIVE
-# print at the PRESENT→ABSENT edge (:func:`_slot_was_active_feeder`, evaluated at that
-# edge while the wire evidence is freshest). The third stamp beside the two above, and
+# (printer_id, ams_id, tray_id) -> whether the slot was FEEDING a LIVE print, on any
+# extruder, at the PRESENT→ABSENT edge (:func:`_slot_was_active_feeder`, asked of the
+# toolhead feed state at that edge). The third stamp beside the two above, and
 # the reason it exists is the ~3-minute gap measured 2026-08-13: **the AMS
 # clears a drained slot's exist bit ~3 min BEFORE it declares the runout**. Inside that
 # gap the departed row is released but not yet ``spent_at``-stamped, so nothing in the
@@ -683,50 +683,58 @@ def open_ambiguity_occasion(printer_id: int, ams_id: int, tray_id: int, spool_id
 # --- Re-seat evidence (the de-bounce lane's two inputs) --------------------
 
 
-def _slot_was_active_feeder(printer_id: int, ams_id: int, tray_id: int, state, running: bool) -> bool:
-    """Was this slot FEEDING a live print at the moment it lost presence?
+def _slot_was_active_feeder(printer_id: int, ams_id: int, tray_id: int, running: bool) -> bool:
+    """Was this slot FEEDING a live print — on any extruder — when it lost presence?
 
     Evaluated at the PRESENT→ABSENT edge and stamped into
     :data:`_absent_under_active_feed`, because this question has an answer only while
-    the evidence is fresh: seconds later the firmware has moved on, and minutes later
-    (the ~3-minute bay-clear→HMS gap) the exhaustion evidence that would have explained
-    the departure has not even arrived yet.
+    the evidence is fresh: minutes later (the ~3-minute bay-clear→HMS gap) the exhaustion
+    evidence that would have explained the departure has not even arrived yet.
 
     A slot that goes empty while it is feeding is running out, or is being pulled
     mid-print. Neither is a spurious release, so its return is a REFILL and must mint a
     fresh row rather than de-bounce onto the row that just drained (scenarios T7/T8).
 
-    **The resolution order is the REVERSE of the jam case's, and getting it backwards
-    would make this condition silently never fire.** ``spool_recovery`` owns the one
-    wire-first feeder resolution and is asked here through its public
-    :func:`spool_recovery.slot_was_feeding`, which orders ``last_loaded_tray`` and the
-    job's mapping AHEAD of ``tray_now``: the question here is which slot was feeding
-    IMMEDIATELY BEFORE this edge, and at that instant ``tray_now`` may already have
-    moved (a firmware auto-refill switches to a backup slot) or read the 255 sentinel,
-    which means "nothing is feeding" and never "the path is clear" (invariant 8).
+    **The answer is the toolhead FEED STATE's** (invariant 16 — ``feed_state``, read as the
+    client's one reading, ``BambuMQTTClient.feed()``), never a single frame of
+    ``tray_now``: at the edge ``tray_now`` may already have PRE-FLIPPED to the backup or
+    read 255, which means "nothing is feeding" and never "the path is clear" (invariant 8).
 
-    ``printer_id`` is passed through deliberately (2026-08-20): without it the resolver
-    could reach neither the job's SLICER mapping (captured on the client, so the
-    contracted mapping tier was absent for this caller) nor the DUAL-NOZZLE per-extruder
-    feeders — on an H2C a slot feeding the non-active hotend answered "not feeding", so a
-    mid-print pull there de-bounced onto the row that was still printing.
+    **The order of one push, and why the answer does not depend on it.** The client
+    handles a push's ``print.ams`` block (``_handle_ams_data``, where the raw hook builds
+    this pass's observations) BEFORE ``_update_state``, whose tail steps the feed state
+    (``_step_feed``); the hook only SCHEDULES this pass onto the event loop
+    (``printer_manager._schedule_async``), so the pass runs on another thread, unordered
+    against the rest of the push. The reading it asks can therefore be the previous
+    push's, this push's, or a later one's — and the answer is the same in each:
 
-    Idle printer ⇒ False: ``last_loaded_tray`` and the mapping are per-JOB state, and
-    reading them between prints would attribute a stale feeder to an operator's
-    ordinary roll change. Never raises — an unresolvable answer is "not suspect", and
-    the pipeline's live-HMS half of the runout-suspect test covers the same ground once
-    the firmware has spoken.
+    * the slot is the LAST feeder of some extruder (:attr:`ExtruderReading.last_fed` — the
+      effective feeder while one feeds; a TAIL keeps the draining roll there, and a
+      toolhead that went empty keeps it too), which holds BEFORE the push that drains it;
+    * or it is a DRAINED tray of some extruder (:attr:`ExtruderReading.drained` — read
+      trusted-absent while it fed, the active extruder's TAIL or an inactive extruder's
+      feeding tray while the print RUNS), which holds AFTER that push, and through the
+      firmware's switch to a backup, until the slot reads present again.
+
+    ANY extruder, by design (2026-08-20): on an H2C a slot feeding the non-active hotend
+    is feeding, and answering "not feeding" there de-bounced a mid-print pull onto the
+    row that was still printing.
+
+    Idle printer ⇒ False: the reading's record is per JOB, and a feeder between prints
+    would attribute a stale feed to an operator's ordinary roll change. Never raises — an
+    unreadable answer is "not suspect", and the pipeline's live-HMS half of the
+    runout-suspect test covers the same ground once the firmware has spoken.
     """
     if not running:
         return False
+    tray = encode_global_tray(ams_id, tray_id)
     try:
-        from backend.app.services.spool_recovery import slot_was_feeding
-
-        return slot_was_feeding(state, ams_id, tray_id, printer_id=printer_id)
-    except Exception:  # noqa: BLE001 — an unresolvable feeder is not evidence of a runout
-        logger.exception(
-            "AMS presence: active-feeder resolution failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id
-        )
+        client = printer_manager.get_client(printer_id)
+        if tray is None or client is None:
+            return False
+        return any(tray == extruder.last_fed or tray in extruder.drained for extruder in client.feed().extruders)
+    except Exception:  # noqa: BLE001 — an unreadable feed is not evidence of a runout
+        logger.exception("AMS presence: feed-state read failed for printer %d AMS%d-T%d", printer_id, ams_id, tray_id)
         return False
 
 
@@ -1746,7 +1754,7 @@ async def on_tray_observations(printer_id: int, observations: list[TrayObservati
                 # gap the firmware has not yet said why the bay went empty. A slot that
                 # empties mid-feed is running out or being pulled, never glitching, so
                 # its return is a refill and the de-bounce lane must refuse it.
-                _absent_under_active_feed[key] = _slot_was_active_feeder(printer_id, ams_id, tray_id, state, running)
+                _absent_under_active_feed[key] = _slot_was_active_feeder(printer_id, ams_id, tray_id, running)
                 # The slot is absent again: whatever its last return measured no longer
                 # describes it.
                 _reseat.pop(key, None)

@@ -48,8 +48,11 @@ AmsMotionCommand = Literal["load", "unload"]
 #: RefillReason``, pinned equal by ``test_printer_manager``): ``owed`` — the farm refills it, then
 #: resumes; the firmware feeds it itself (``before_first_layer`` — the start block's own load;
 #: ``change_in_flight``, ``runout_demand``, ``last_layer``, ``eject_sweep``, ``power_loss_prompt``);
-#: refused (``maintenance``, ``command_pending``, ``physical``, ``unknown``); ``fed`` never reaches a
-#: client (the field rides an empty feed only). :class:`ToolheadState`.
+#: ``unconfirmed`` — a RUNNING print reads empty and the firmware's own sequence has not shown yet
+#: (the first frames of a runout auto-switch read exactly so; the farm acts on nothing until it
+#: does, or the print is on air); refused (``maintenance``, ``command_pending``, ``physical``,
+#: ``unknown``); ``fed`` never reaches a client (the field rides an empty feed only).
+#: :class:`ToolheadState`.
 ToolheadRefillReason = Literal[
     "owed",
     "fed",
@@ -62,6 +65,7 @@ ToolheadRefillReason = Literal[
     "change_in_flight",
     "command_pending",
     "eject_sweep",
+    "unconfirmed",
     "unknown",
 ]
 
@@ -692,14 +696,20 @@ class ToolheadState(BaseModel):
     branches and the WS frame.
 
     ``feed`` — ``fed`` (a real AMS feeder) / ``external`` (the external spool) / ``empty``
-    (nothing fed) / ``unknown`` (nothing read); ``tray`` — the global tray when ``fed``;
-    ``refill`` — set only while the feed reads empty or unknown and the farm is loading it or could
-    not; ``refill_reason`` — set only while the feed reads EMPTY: what a Resume would do about it
+    (nothing fed) / ``unknown`` (nothing read); ``active_tray`` — the feed state's EFFECTIVE feeder
+    (``feed_state.FeedReading.feeder``): the AMS global tray feeding the active extruder, or 254 for
+    the external spool — during a drained roll's tail the DRAINING roll (a ``tray_now`` pre-flip to
+    the backup is not fed yet); ``None`` when nothing is fed or nothing is read;
+    ``was_feeding_tray`` — while a job is RUNNING or PAUSEd and nothing is fed, the job's last real
+    feeder (``FeedReading.last_loaded``; 254 the external spool), else ``None``; ``refill`` — set
+    only while the feed reads empty or unknown and the farm is loading it or could not;
+    ``refill_reason`` — set only while the feed reads EMPTY: what a Resume would do about it
     (:data:`ToolheadRefillReason`, the T3 verdict — a client keys its "Toolhead empty" copy off it and
-    never re-derives the verdict)."""
+    never re-derives the verdict). A client derives no feeder of its own from ``tray_now``."""
 
     feed: Literal["fed", "external", "empty", "unknown"]
-    tray: int | None = None
+    active_tray: int | None = None
+    was_feeding_tray: int | None = None
     refill: ToolheadRefillState | None = None
     refill_reason: ToolheadRefillReason | None = None
 

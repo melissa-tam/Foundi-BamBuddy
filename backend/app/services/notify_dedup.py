@@ -34,7 +34,7 @@ owned code, having never stamped a row, would re-blast at the next deploy via
 
 Module-level in-memory state is process-lifetime, matching the fork's other
 event-edge bookkeeping (``ams_presence._last_presence``,
-``spool_respool._last_tray_now``).
+``spool_respool._switch_seen``).
 """
 
 from __future__ import annotations
