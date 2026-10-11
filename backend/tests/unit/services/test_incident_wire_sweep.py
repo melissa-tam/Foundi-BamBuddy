@@ -21,6 +21,7 @@ path again. So the WIRE-lane cases below are keyed on ``KIND_JAM`` (the wire cla
 #60's own mechanical sibling carried) and the repair lane has its own class.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -36,6 +37,7 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.services import incident_resolution, printer_incidents, spool_recovery
 from backend.app.services.bambu_mqtt import HMSError, PrinterState
+from backend.tests._fixtures.feed import ScriptedFeed
 
 pytestmark = pytest.mark.asyncio
 
@@ -86,8 +88,17 @@ def _state(live: str | None, hms: list | None = None) -> PrinterState | None:
 
 
 def _wire(monkeypatch, state, *, connected: bool = True) -> None:
+    """The printer's live state, its session, and its client — whose toolhead FEED STATE
+    (``feed_state``, invariant 16: what ``Context.feed`` and the motion ledger read) is a real
+    tracker stepped off the scripted state (``ScriptedFeed``), as the client steps it per push."""
+    feed = ScriptedFeed()
+    client = None
+    if state is not None:
+        feed.settle(state)
+        client = SimpleNamespace(feed=lambda: feed.reading)
     monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: state)
     monkeypatch.setattr(spool_recovery.printer_manager, "is_connected", lambda _pid: connected)
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: client)
 
 
 async def _held(
@@ -420,9 +431,13 @@ class TestRepairClassSweep:
 
     @staticmethod
     def _running(tray_now: int):
-        """A RUNNING push whose ACTIVE extruder reads ``tray_now`` (single nozzle)."""
+        """A RUNNING push whose ACTIVE extruder reads ``tray_now`` (single nozzle), on the printer's
+        live session at a printed layer — what the feed state reads FED (or, on 255, not)."""
         state = _state("RUNNING", [])
         state.tray_now = tray_now
+        state.connected = True
+        state.report_epoch = state.connection_epoch
+        state.layer_num = 10
         return state
 
     async def test_a_running_print_with_no_eject_closes_it(self, db_session, printer_factory, monkeypatch):
@@ -540,47 +555,65 @@ class TestLoadCompletedEdge:
     """``MotionLedger.load_completed_at`` is the repair evidence, and it is an EDGE.
 
     A LEVEL cannot serve: 003-H2S read ``tray_now == 1`` continuously through the
-    whole fault. What the sampler stamps is the transition — the AMS finished a
-    filament change onto a real feeder — which is filament demonstrably moving.
+    whole fault. What the sampler hands the ledger is the client's FEED STATE, whose
+    ``load_landed`` event is the transition — a load landing on a real feeder at the
+    active extruder — which is filament demonstrably moving. Each push here is a real
+    tracker step (``ScriptedFeed``), then the per-push sampler, as production runs them.
     """
 
-    def _sample(self, printer_id, *, tray_now, epoch=1, live="IDLE"):
+    @pytest.fixture
+    def feed(self, monkeypatch):
+        feed = ScriptedFeed()
+        client = SimpleNamespace(feed=lambda: feed.reading)
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: client)
+        return feed
+
+    @staticmethod
+    def _sample(feed, printer_id, *, tray_now, epoch=1, live="IDLE"):
         state = _state(live, [])
         state.tray_now = tray_now
+        state.connected = True
         state.connection_epoch = epoch
+        state.report_epoch = epoch
+        feed.push(state)
         spool_recovery.note_demand_watch(printer_id, state)
 
-    async def test_the_first_sample_only_seeds(self, db_session, printer_factory):
+    async def test_the_first_samples_only_seed(self, db_session, printer_factory, feed):
+        """A session's first report re-seeds the feed state, and its first reading is a reading:
+        an edge that happened before we looked is not an edge we witnessed."""
         printer = await printer_factory()
-        self._sample(printer.id, tray_now=1)
+        self._sample(feed, printer.id, tray_now=255)
+        self._sample(feed, printer.id, tray_now=1)
         assert incident_resolution.ledger.load_completed_at(printer.id) is None
 
-    async def test_a_transition_onto_a_real_feeder_stamps(self, db_session, printer_factory):
+    async def test_a_transition_onto_a_real_feeder_stamps(self, db_session, printer_factory, feed):
         printer = await printer_factory()
-        self._sample(printer.id, tray_now=255)
-        self._sample(printer.id, tray_now=1)
+        self._sample(feed, printer.id, tray_now=255)
+        self._sample(feed, printer.id, tray_now=255)
+        self._sample(feed, printer.id, tray_now=1)
         assert incident_resolution.ledger.load_completed_at(printer.id) is not None
 
-    async def test_a_standing_level_never_stamps(self, db_session, printer_factory):
+    async def test_a_standing_level_never_stamps(self, db_session, printer_factory, feed):
         printer = await printer_factory()
-        self._sample(printer.id, tray_now=1)
-        self._sample(printer.id, tray_now=1)
-        self._sample(printer.id, tray_now=1)
+        for _ in range(4):
+            self._sample(feed, printer.id, tray_now=1)
         assert incident_resolution.ledger.load_completed_at(printer.id) is None
 
-    async def test_an_unload_never_stamps(self, db_session, printer_factory):
+    async def test_an_unload_never_stamps(self, db_session, printer_factory, feed):
         """255 is "nothing is feeding" — the opposite of the evidence."""
         printer = await printer_factory()
-        self._sample(printer.id, tray_now=1)
-        self._sample(printer.id, tray_now=255)
+        self._sample(feed, printer.id, tray_now=1)
+        self._sample(feed, printer.id, tray_now=1)
+        self._sample(feed, printer.id, tray_now=255)
         assert incident_resolution.ledger.load_completed_at(printer.id) is None
 
-    async def test_a_reconnect_cannot_fabricate_the_edge(self, db_session, printer_factory):
+    async def test_a_reconnect_cannot_fabricate_the_edge(self, db_session, printer_factory, feed):
         """The same rule the negative edges obey: a new MQTT session re-seeds every
         wire fact at once, so a transition across it is a reading, not an event."""
         printer = await printer_factory()
-        self._sample(printer.id, tray_now=255, epoch=1)
-        self._sample(printer.id, tray_now=1, epoch=2)
+        self._sample(feed, printer.id, tray_now=255, epoch=1)
+        self._sample(feed, printer.id, tray_now=255, epoch=1)
+        self._sample(feed, printer.id, tray_now=1, epoch=2)
         assert incident_resolution.ledger.load_completed_at(printer.id) is None
 
 

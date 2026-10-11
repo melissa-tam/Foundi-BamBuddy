@@ -210,6 +210,37 @@ class TestPrinterManager:
             assert result is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("driver_live", "pending", "acting"),
+        [
+            pytest.param(False, None, False, id="nothing_of_the_farms"),
+            pytest.param(True, None, True, id="a_live_recovery_driver"),
+            pytest.param(False, object(), True, id="a_pending_farm_command"),
+        ],
+    )
+    async def test_the_client_gets_the_farm_acting_provider(
+        self, manager, mock_printer, monkeypatch, driver_live, pending, acting
+    ):
+        """The feed state attributes a landing at STEP time through a provider the registry injects
+        (the client imports nothing above itself): a live recovery driver, or a farm motion command
+        the step ledger holds pending, for THIS printer."""
+        from backend.app.services import printer_incidents
+
+        asked: list[int] = []
+        monkeypatch.setattr(printer_incidents, "driver_live", lambda pid: asked.append(pid) or driver_live)
+        monkeypatch.setattr(printer_incidents, "pending_command", lambda pid: pending)
+        with (
+            patch("backend.app.services.printer_manager.BambuMQTTClient") as MockClient,
+            patch("backend.app.services.printer_manager.asyncio.sleep", new=AsyncMock()),
+        ):
+            MockClient.return_value = MagicMock()
+            await manager.connect_printer(mock_printer)
+
+        provider = MockClient.call_args.kwargs["farm_acting"]
+        assert provider() is acting
+        assert asked == [mock_printer.id]
+
+    @pytest.mark.asyncio
     async def test_connect_printer_disconnects_existing(self, manager, mock_printer, mock_client):
         """Verify connecting disconnects existing client first."""
         manager._clients[mock_printer.id] = mock_client
@@ -2144,10 +2175,12 @@ class TestOpenIncidentProjection:
 
 class TestToolheadProjection:
     """``toolhead`` on the status frame (K10/C3c, 2026-10-10) — what the card's "Toolhead empty" chip
-    reads: the ACTIVE extruder's feed (``tray_fields.toolhead_feed``, K1), the farm's refill of it
-    (``printer_incidents.refill_state``) and, while the feed reads EMPTY, what a Resume would do about
-    it (``refill_reason``: the T3 verdict, ``refill_verdict.refill_owed`` — the card never re-derives
-    K7), DERIVED on every broadcast, JSON primitives."""
+    and slot rings read: the ACTIVE extruder's feed (``tray_fields.toolhead_feed``, K1), the feed
+    state's effective and was-feeding trays (``feed_state``, invariant 16 — the client's ``feed()``),
+    the farm's refill of it (``printer_incidents.refill_state``) and, while the feed reads EMPTY,
+    what a Resume would do about it (``refill_reason``: the T3 verdict, ``refill_verdict.refill_owed``
+    over the feed state — the card never re-derives K7), DERIVED on every broadcast, JSON
+    primitives. The client's feed state here is a real tracker stepped off the scripted pushes."""
 
     @pytest.fixture(autouse=True)
     def _clean(self):
@@ -2157,60 +2190,95 @@ class TestToolheadProjection:
         yield
         printer_incidents._reset_state()
 
-    def _state(self, tray_now):
+    def _state(self, tray_now, *, gcode="PAUSE"):
         from backend.app.services.bambu_mqtt import PrinterState
 
         state = PrinterState()
         state.connected = True
-        state.state = "PAUSE"
+        state.state = gcode
         state.tray_now = tray_now
         return state
 
-    def _live(self, tray_now, *, layer, total=167):
-        """A reading of THIS session (``live_reading.is_fresh``) at ``layer`` of ``total``."""
-        state = self._state(tray_now)
+    def _live(self, tray_now, *, layer, total=167, gcode="PAUSE", trays=None):
+        """A reading of THIS session (``live_reading.is_fresh``) at ``layer`` of ``total``; ``trays``
+        maps AMS 0's tray id to its ``state`` (11 seated, 9 empty)."""
+        state = self._state(tray_now, gcode=gcode)
         state.report_epoch = state.connection_epoch
         state.layer_num = layer
         state.total_layers = total
+        if trays is not None:
+            state.raw_data = {
+                "ams": [
+                    {
+                        "id": 0,
+                        "tray": [
+                            {"id": tid, "state": st, "tray_type": "PETG" if st == 11 else ""}
+                            for tid, st in sorted(trays.items())
+                        ],
+                    }
+                ]
+            }
         return state
 
     @staticmethod
-    def _client(monkeypatch, *, layer):
-        """The registry's client for the printer, reading ``layer`` through its one peaks reader."""
+    def _client(monkeypatch, *pushes):
+        """The registry's client for the printer: its feed state stepped once per scripted push
+        (the first push is the session's re-seed, the reading's own rule)."""
         from types import SimpleNamespace
 
-        from backend.app.services.bambu_mqtt import JobPeaks
         from backend.app.services.printer_manager import printer_manager
+        from backend.tests._fixtures.feed import ScriptedFeed
 
-        peaks = JobPeaks(last_progress=0.0, last_layer_num=0, progress=0.0, layer_num=layer, reliable=True)
-        monkeypatch.setattr(printer_manager, "get_client", lambda _pid: SimpleNamespace(job_peaks=lambda: peaks))
+        feed = ScriptedFeed()
+        feed.push(pushes[0])
+        for push in pushes:
+            feed.push(push)
+        monkeypatch.setattr(printer_manager, "get_client", lambda _pid: SimpleNamespace(feed=lambda: feed.reading))
+        return feed
 
-    def test_a_fed_toolhead(self):
-        from backend.app.services.printer_manager import toolhead_payload
-
-        assert toolhead_payload(7, self._state(2)) == {"feed": "fed", "tray": 2, "refill": None, "refill_reason": None}
-        assert toolhead_payload(7, self._state(254)) == {
-            "feed": "external",
-            "tray": None,
+    @staticmethod
+    def _payload(**fields):
+        return {
+            "feed": "empty",
+            "active_tray": None,
+            "was_feeding_tray": None,
             "refill": None,
             "refill_reason": None,
-        }
+        } | fields
 
-    def test_an_empty_toolhead_with_nothing_acting(self):
-        """A reading that is not of this session (no report applied yet) decides nothing: ``unknown``."""
+    def test_a_fed_toolhead(self, monkeypatch):
         from backend.app.services.printer_manager import toolhead_payload
 
-        assert toolhead_payload(7, self._state(255)) == {
-            "feed": "empty",
-            "tray": None,
-            "refill": None,
-            "refill_reason": "unknown",
-        }
+        fed = self._live(2, layer=40)
+        self._client(monkeypatch, fed)
+        assert toolhead_payload(7, fed) == self._payload(feed="fed", active_tray=2)
+        external = self._live(254, layer=40)
+        self._client(monkeypatch, external)
+        assert toolhead_payload(7, external) == self._payload(feed="external", active_tray=254)
+
+    def test_during_a_drained_rolls_tail_the_active_tray_is_the_draining_roll(self, monkeypatch):
+        """005/001-H2S 2026-10-10: T1 ran dry at the AMS and ``tray_now`` PRE-FLIPPED to the backup
+        slot 0 while the tail of roll 1 still feeds — the ring stays on roll 1; slot 0 is not fed yet."""
+        from backend.app.services.printer_manager import toolhead_payload
+
+        fed = self._live(1, layer=40, gcode="RUNNING", trays={0: 11, 1: 11})
+        drained = self._live(1, layer=40, gcode="RUNNING", trays={0: 11, 1: 9})
+        pre_flip = self._live(0, layer=40, gcode="RUNNING", trays={0: 11, 1: 9})
+        self._client(monkeypatch, fed, drained, pre_flip)
+
+        assert toolhead_payload(7, pre_flip) == self._payload(feed="fed", active_tray=1)
+
+    def test_an_empty_toolhead_with_nothing_acting(self):
+        """A reading that is not of this session (no report applied yet), and no client: nothing is
+        named as fed and nothing is decided — ``unknown``."""
+        from backend.app.services.printer_manager import toolhead_payload
+
+        assert toolhead_payload(7, self._state(255)) == self._payload(refill_reason="unknown")
 
     def test_no_state_is_unknown(self):
         from backend.app.services.printer_manager import toolhead_payload
 
-        assert toolhead_payload(7, None) == {"feed": "unknown", "tray": None, "refill": None, "refill_reason": None}
+        assert toolhead_payload(7, None) == self._payload(feed="unknown")
 
     def test_the_012_plate_marker_pause_before_the_first_layer(self, monkeypatch):
         """012-H2S, 2026-10-10: PAUSEd at layer 0 of 167 at the printer's plate-marker dialog
@@ -2218,19 +2286,35 @@ class TestToolheadProjection:
         a Resume refills nothing and the card must not say "Load a slot"."""
         from backend.app.services.printer_manager import toolhead_payload
 
-        self._client(monkeypatch, layer=0)
-        assert toolhead_payload(7, self._live(255, layer=0)) == {
-            "feed": "empty",
-            "tray": None,
-            "refill": None,
-            "refill_reason": "before_first_layer",
-        }
+        paused = self._live(255, layer=0)
+        self._client(monkeypatch, paused)
+        assert toolhead_payload(7, paused) == self._payload(refill_reason="before_first_layer")
 
-    def test_an_empty_toolhead_past_the_first_layer_is_owed(self, monkeypatch):
+    def test_an_empty_toolhead_past_the_first_layer_is_owed_and_names_what_was_feeding(self, monkeypatch):
         from backend.app.services.printer_manager import toolhead_payload
 
-        self._client(monkeypatch, layer=40)
-        assert toolhead_payload(7, self._live(255, layer=40))["refill_reason"] == "owed"
+        fed = self._live(1, layer=40)
+        emptied = self._live(255, layer=40)
+        self._client(monkeypatch, fed, emptied)
+        assert toolhead_payload(7, emptied) == self._payload(was_feeding_tray=1, refill_reason="owed")
+
+    def test_a_running_print_that_reads_empty_is_unconfirmed_until_the_phase_moves(self, monkeypatch):
+        """The first frames of a runout auto-switch read RUNNING with nothing fed and no posture yet:
+        the card reads ``unconfirmed`` (the farm acts on nothing) with the slot that was feeding."""
+        from backend.app.services.printer_manager import toolhead_payload
+
+        fed = self._live(1, layer=40, gcode="RUNNING")
+        emptied = self._live(255, layer=40, gcode="RUNNING")
+        self._client(monkeypatch, fed, emptied)
+        assert toolhead_payload(7, emptied) == self._payload(was_feeding_tray=1, refill_reason="unconfirmed")
+
+    def test_no_job_names_no_was_feeding_tray(self, monkeypatch):
+        from backend.app.services.printer_manager import toolhead_payload
+
+        fed = self._live(1, layer=0, gcode="IDLE")
+        idle = self._live(255, layer=0, gcode="IDLE")
+        self._client(monkeypatch, fed, idle)
+        assert toolhead_payload(7, idle) == self._payload(refill_reason="unknown")
 
     async def test_maintenance_mode_is_the_verdict(self, db_session, printer_factory, monkeypatch):
         from backend.app.models.printer_incident import KIND_SERVICE_HOLD
@@ -2239,15 +2323,17 @@ class TestToolheadProjection:
 
         printer = await printer_factory()
         await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
-        self._client(monkeypatch, layer=40)
-        assert toolhead_payload(printer.id, self._live(255, layer=40))["refill_reason"] == "maintenance"
+        emptied = self._live(255, layer=40)
+        self._client(monkeypatch, emptied)
+        assert toolhead_payload(printer.id, emptied)["refill_reason"] == "maintenance"
 
     def test_a_fed_toolhead_names_no_reason(self, monkeypatch):
         from backend.app.services.printer_manager import toolhead_payload
 
-        self._client(monkeypatch, layer=40)
-        assert toolhead_payload(7, self._live(1, layer=40))["refill_reason"] is None
-        assert toolhead_payload(7, self._live(254, layer=40))["refill_reason"] is None
+        for tray in (1, 254):
+            fed = self._live(tray, layer=40)
+            self._client(monkeypatch, fed)
+            assert toolhead_payload(7, fed)["refill_reason"] is None
 
     def test_the_refill_rides_an_empty_toolhead_only(self, monkeypatch):
         from backend.app.services import printer_incidents
@@ -2256,21 +2342,25 @@ class TestToolheadProjection:
         refill = {"phase": "failed", "command": "unload", "slot": "AMS A slot 1", "answer": "acted"}
         monkeypatch.setattr(printer_incidents, "refill_state", lambda _pid: refill)
 
-        assert toolhead_payload(7, self._state(255)) == {
-            "feed": "empty",
-            "tray": None,
-            "refill": refill,
-            "refill_reason": "unknown",
-        }
+        assert toolhead_payload(7, self._state(255)) == self._payload(refill=refill, refill_reason="unknown")
         # Once the toolhead reads fed again a person loaded it: the failed refill is history.
         assert toolhead_payload(7, self._state(1))["refill"] is None
 
     def test_it_rides_the_status_frame(self):
-        import json
-
         payload = printer_state_to_dict(self._state(255), printer_id=7)
-        assert payload["toolhead"] == {"feed": "empty", "tray": None, "refill": None, "refill_reason": "unknown"}
+        assert payload["toolhead"] == self._payload(refill_reason="unknown")
         json.dumps(payload["toolhead"])
+
+    def test_the_payload_is_the_dtos_shape(self, monkeypatch):
+        """ONE builder, ONE DTO: every key the builder emits is a ``ToolheadState`` field and back."""
+        from backend.app.schemas.printer import ToolheadState
+        from backend.app.services.printer_manager import toolhead_payload
+
+        emptied = self._live(255, layer=40)
+        self._client(monkeypatch, self._live(1, layer=40), emptied)
+        payload = toolhead_payload(7, emptied)
+        assert set(payload) == set(ToolheadState.model_fields)
+        assert ToolheadState(**payload).model_dump() == payload
 
     def test_the_wire_feed_vocabulary_is_the_readers_own(self):
         """The schema cannot import the reader's leaf type, so this pin keeps one spelling."""

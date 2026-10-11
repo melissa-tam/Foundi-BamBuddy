@@ -1994,8 +1994,15 @@ class TestLastLoadedTrayValidation(_H2DFixtureMixin):
         assert mqtt_client.state.last_loaded_tray == 128
 
     def test_unloaded_not_stored(self, mqtt_client):
-        mqtt_client.state.last_loaded_tray = 5
+        """Fed from AMS 1 slot 1 (global 5), then unloaded: the 255 never overwrites the last
+        feeder. Driven through the pushes — the field is the feed state's projection."""
+        mqtt_client._process_message(
+            _extruder_info_payload([{"id": 0, "snow": 1 << 8 | 1}, {"id": 1, "snow": 0xFF00FF}])
+        )
+        mqtt_client._process_message(_ams_payload(1))
+        assert mqtt_client.state.last_loaded_tray == 5
 
+        mqtt_client._process_message(_extruder_info_payload([{"id": 0, "snow": 0xFF00FF}, {"id": 1, "snow": 0xFF00FF}]))
         mqtt_client._process_message(_ams_payload(255))
 
         assert mqtt_client.state.tray_now == 255
@@ -2196,16 +2203,24 @@ class TestTrayChangeLog:
     ``_completion_triggered``), never ``state in ("RUNNING", "PAUSE")``: P2S firmware
     drops out of RUNNING for a moment during an AMS auto-fallback (#957), and a
     literal-string gate misses exactly the switch it most needs to see.
+
+    Both fields are PROJECTIONS of the feed state's reading (``feed_state``,
+    ``BambuMQTTClient._project_feed``), so every case drives the client's real pushes.
     """
 
     client_kwargs = {"serial": "TRAYLOG1"}
 
     @staticmethod
-    def _start_a_print(mqtt_client, tray):
+    def _start_a_print(mqtt_client, tray, *, gcode_file="test.3mf"):
+        mqtt_client.on_print_start = lambda data: None
+        mqtt_client.on_print_complete = lambda data: None
         mqtt_client.state.tray_now = tray
-        mqtt_client.state.last_loaded_tray = tray
         mqtt_client._previous_gcode_state = "IDLE"
-        mqtt_client._process_message({"print": {"gcode_state": "RUNNING", "gcode_file": "test.3mf"}})
+        mqtt_client._process_message({"print": {"gcode_state": "RUNNING", "gcode_file": gcode_file}})
+
+    @staticmethod
+    def _feed(mqtt_client, tray, layer, **fields):
+        mqtt_client._process_message({"print": {"layer_num": layer, "ams": {"tray_now": str(tray)}, **fields}})
 
     def test_tray_change_log_defaults_empty(self, mqtt_client):
         assert mqtt_client.state.tray_change_log == []
@@ -2215,69 +2230,239 @@ class TestTrayChangeLog:
         self._start_a_print(mqtt_client, 2)
 
         assert mqtt_client.state.tray_change_log == [(2, 0)]
+        assert mqtt_client.state.last_loaded_tray == 2
 
     def test_tray_change_log_cleared_on_new_print(self, mqtt_client):
         """The previous print's segments must not be charged to this one."""
-        mqtt_client.state.tray_change_log = [(5, 0), (3, 100)]
+        self._start_a_print(mqtt_client, 5)
+        self._feed(mqtt_client, 3, 100)
+        assert mqtt_client.state.tray_change_log == [(5, 0), (3, 100)]
+        mqtt_client._process_message({"print": {"gcode_state": "FINISH"}})
 
-        self._start_a_print(mqtt_client, 1)
+        self._start_a_print(mqtt_client, 1, gcode_file="next.3mf")
 
         assert mqtt_client.state.tray_change_log == [(1, 0)]
 
     @pytest.mark.parametrize(
-        "gcode_state, was_running, completion_triggered, logged",
+        "gcode_state",
         [
-            pytest.param("RUNNING", True, False, True, id="running_is_mid_print"),
+            pytest.param("RUNNING", id="running_is_mid_print"),
             # The AMS can swap while the print is paused for a refill.
-            pytest.param("PAUSE", True, False, True, id="pause_is_still_mid_print"),
+            pytest.param("PAUSE", id="pause_is_still_mid_print"),
             # #957: the transient state a P2S passes through during auto-fallback.
-            pytest.param("LOADING", True, False, True, id="a_transient_state_is_still_mid_print"),
-            pytest.param("IDLE", False, False, False, id="between_prints_nothing_is_logged"),
-            # Post-print self-cleaning moves the tray; that is not consumption.
-            pytest.param("FINISH", True, True, False, id="after_the_terminal_nothing_is_logged"),
+            pytest.param("LOADING", id="a_transient_state_is_still_mid_print"),
         ],
     )
-    def test_only_a_change_inside_the_print_lifecycle_is_logged(
-        self, mqtt_client, gcode_state, was_running, completion_triggered, logged
-    ):
-        mqtt_client.state.state = gcode_state
-        mqtt_client._was_running = was_running
-        mqtt_client._completion_triggered = completion_triggered
-        mqtt_client.state.layer_num = 50
-        mqtt_client.state.last_loaded_tray = 0
-        mqtt_client.state.tray_change_log = [(0, 0)]
+    def test_a_change_inside_the_print_lifecycle_is_logged(self, mqtt_client, gcode_state):
+        self._start_a_print(mqtt_client, 0)
+        self._feed(mqtt_client, 0, 50)
 
-        mqtt_client._process_message(_ams_payload(1))
+        self._feed(mqtt_client, 1, 50, gcode_state=gcode_state)
 
-        assert mqtt_client.state.tray_change_log == ([(0, 0), (1, 50)] if logged else [(0, 0)])
-        # Either way the location is tracked — it is what attributes consumption once
-        # the slot has already been released.
+        assert mqtt_client.state.tray_change_log == [(0, 0), (1, 50)]
+        assert mqtt_client.state.last_loaded_tray == 1
+
+    def test_between_prints_nothing_is_logged(self, mqtt_client):
+        """No job: the location is tracked — it is what attributes consumption once the slot
+        has already been released — but nothing is a segment."""
+        self._feed(mqtt_client, 0, 0, gcode_state="IDLE")
+        self._feed(mqtt_client, 1, 0, gcode_state="IDLE")
+
+        assert mqtt_client.state.tray_change_log == []
+        assert mqtt_client.state.last_loaded_tray == 1
+
+    def test_after_the_terminal_nothing_is_logged(self, mqtt_client):
+        """Post-print self-cleaning moves the tray; that is not consumption."""
+        self._start_a_print(mqtt_client, 0)
+        self._feed(mqtt_client, 0, 50)
+        mqtt_client._process_message({"print": {"gcode_state": "FINISH"}})
+
+        self._feed(mqtt_client, 1, 50)
+
+        assert mqtt_client.state.tray_change_log == [(0, 0)]
         assert mqtt_client.state.last_loaded_tray == 1
 
     def test_same_tray_not_logged_twice(self, mqtt_client):
         """A ~1 Hz push repeats the fed tray forever; only a CHANGE is a segment."""
-        mqtt_client._was_running = True
-        mqtt_client._completion_triggered = False
-        mqtt_client.state.layer_num = 30
-        mqtt_client.state.last_loaded_tray = 2
-        mqtt_client.state.tray_change_log = [(2, 0)]
-
-        mqtt_client._process_message(_ams_payload(2))
+        self._start_a_print(mqtt_client, 2)
+        for _ in range(3):
+            self._feed(mqtt_client, 2, 30)
 
         assert mqtt_client.state.tray_change_log == [(2, 0)]
 
     def test_multiple_tray_changes(self, mqtt_client):
         """A multi-colour print's whole history, in order."""
-        mqtt_client._was_running = True
-        mqtt_client._completion_triggered = False
-        mqtt_client.state.last_loaded_tray = 0
-        mqtt_client.state.tray_change_log = [(0, 0)]
+        self._start_a_print(mqtt_client, 0)
 
         for tray, layer in [(1, 50), (3, 120), (0, 200)]:
-            mqtt_client.state.layer_num = layer
-            mqtt_client._process_message(_ams_payload(tray))
+            self._feed(mqtt_client, tray, layer)
 
         assert mqtt_client.state.tray_change_log == [(0, 0), (1, 50), (3, 120), (0, 200)]
+
+
+def _seated_units(*, absent=()) -> list[dict]:
+    """AMS 0's four trays, every one seated (and feeding-shaped) unless named absent — the full
+    list every H2S push carries (the merge keeps what the push lists)."""
+    return [
+        {
+            "id": "0",
+            "tray": [
+                {"id": str(i), "state": 9, "tray_type": ""}
+                if i in absent
+                else {"id": str(i), "state": 11, "tray_type": "PETG"}
+                for i in range(4)
+            ],
+        }
+    ]
+
+
+class TestTheFeedProjections:
+    """``tray_change_log`` and ``last_loaded_tray`` keep their shape as the feed state's
+    projections, and gain exactly TWO corrections (2026-10-10, 005/001-H2S):
+
+    1. a ``tray_now`` PRE-FLIP inside a draining roll's TAIL neither appends nor moves the last
+       feeder — the old roll's tail is still what feeds;
+    2. the backup's segment starts at the layer its load LANDS, so the tail is charged to the
+       drained roll (the old append credited the backup from the pre-flip layer).
+
+    A LIVE session (the phase is evidence and needs one): connected, and the session's first
+    report applied by the start push.
+    """
+
+    client_kwargs = {"serial": "PROJ1", "connected": True}
+
+    @staticmethod
+    def _push(client, *, tray, layer, absent=(), ams_status=None):
+        fields: dict = {"layer_num": layer, "ams": {"ams": _seated_units(absent=absent), "tray_now": str(tray)}}
+        if ams_status is not None:
+            fields["ams_status"] = ams_status
+        client._process_message({"print": fields})
+
+    def _run_the_005_switch(self, client) -> None:
+        client.on_print_start = lambda data: None
+        client._previous_gcode_state = "IDLE"
+        client._process_message(
+            {
+                "print": {
+                    "gcode_state": "RUNNING",
+                    "gcode_file": "unit.3mf",
+                    "total_layer_num": 167,
+                    "ams": {"ams": _seated_units(), "tray_now": "1"},
+                }
+            }
+        )
+        for layer in range(1, 101):
+            self._push(client, tray=1, layer=layer)
+        self._push(client, tray=1, layer=101, absent={1})  # T1 drains at the AMS
+        self._push(client, tray=0, layer=101, absent={1})  # ~1 s later: the pre-flip to the backup
+
+    def test_a_pre_flip_inside_the_tail_neither_appends_nor_moves_the_last_feeder(self, mqtt_client):
+        self._run_the_005_switch(mqtt_client)
+        for layer in range(102, 111):  # the tail feeds on
+            self._push(mqtt_client, tray=0, layer=layer, absent={1})
+
+        assert mqtt_client.state.tray_now == 0
+        assert mqtt_client.state.tray_change_log == [(1, 0)]
+        assert mqtt_client.state.last_loaded_tray == 1
+        assert mqtt_client.feed().tail == 1
+
+    def test_the_backups_segment_starts_where_its_load_lands(self, mqtt_client):
+        self._run_the_005_switch(mqtt_client)
+        for layer in range(102, 111):
+            self._push(mqtt_client, tray=0, layer=layer, absent={1})
+        self._push(mqtt_client, tray=255, layer=110, absent={1}, ams_status=0x0300)  # 255, posture not yet up
+        self._push(mqtt_client, tray=255, layer=110, absent={1}, ams_status=0x0105)  # the change posture
+        self._push(mqtt_client, tray=0, layer=110, absent={1}, ams_status=0x0105)  # the backup load lands
+        self._push(mqtt_client, tray=0, layer=110, absent={1}, ams_status=0x0300)
+        self._push(mqtt_client, tray=0, layer=111, absent={1}, ams_status=0x0300)
+
+        assert mqtt_client.state.tray_change_log == [(1, 0), (0, 110)]
+        assert mqtt_client.state.last_loaded_tray == 0
+        switched = mqtt_client.feed().auto_switched
+        assert (switched.departed, switched.arrived) == (1, 0)
+
+    def test_the_sequence_is_logged_for_triage(self, mqtt_client, caplog):
+        """``TAIL → CHANGING → FED`` and the segment append, one INFO line each — the post-deploy
+        check reads them, and support-bundle greps read ``Tray change during print``."""
+        with caplog.at_level(logging.INFO, logger="backend.app.services.bambu_mqtt"):
+            self._run_the_005_switch(mqtt_client)
+            self._push(mqtt_client, tray=255, layer=110, absent={1}, ams_status=0x0300)
+            self._push(mqtt_client, tray=0, layer=110, absent={1}, ams_status=0x0300)
+        lines = [r.getMessage() for r in caplog.records]
+
+        assert any("Feed state: fed -> tail tail=1" in line for line in lines), lines
+        assert any("Feed state: tail -> changing" in line and "departed=1" in line for line in lines), lines
+        assert any("Feed state: changing -> fed" in line for line in lines), lines
+        assert any("Feed event auto_switched" in line for line in lines), lines
+        assert any("Tray change during print: tray=0 at layer=110" in line for line in lines), lines
+        assert not any("Tray change during print: tray=0 at layer=101" in line for line in lines), lines
+
+    def test_the_terminal_payload_carries_the_projection(self, mqtt_client):
+        payload: dict = {}
+        mqtt_client.on_print_complete = lambda data: payload.update(data)
+        self._run_the_005_switch(mqtt_client)
+        mqtt_client._process_message({"print": {"gcode_state": "FAILED"}})
+
+        assert payload["tray_change_log"] == [(1, 0)]
+        assert payload["last_loaded_tray"] == 1
+
+
+class TestTheFeedState:
+    """The client OWNS one feed state and steps it once per status push (``_step_feed``)."""
+
+    def test_before_the_first_push_the_reading_is_unknown(self):
+        from backend.app.services.feed_state import FeedPhase
+
+        assert _make_client().feed().phase is FeedPhase.UNKNOWN
+
+    def test_a_push_the_client_cannot_read_live_is_unknown(self):
+        """Not connected: no live reading, so no phase — the bookkeeping still follows."""
+        from backend.app.services.feed_state import FeedPhase
+
+        client = _make_client()
+        client._process_message({"print": {"gcode_state": "IDLE", "ams": {"tray_now": "2"}}})
+        client._process_message({"print": {"gcode_state": "IDLE"}})
+
+        assert client.feed().phase is FeedPhase.UNKNOWN
+        assert client.state.last_loaded_tray == 2
+
+    def test_a_live_session_reads_its_phase(self):
+        from backend.app.services.feed_state import FeedPhase
+
+        client = _make_client(connected=True)
+        for _ in range(3):
+            client._process_message({"print": {"gcode_state": "IDLE", "ams": {"tray_now": "2"}}})
+
+        assert client.feed().phase is FeedPhase.IDLE
+        assert client.feed().feeder == 2
+
+    @pytest.mark.parametrize("acting", [False, True])
+    def test_a_landing_carries_the_injected_farm_acting_answer(self, acting):
+        client = _make_client(connected=True, farm_acting=lambda: acting)
+        for tray in ("255", "255", "3"):
+            client._process_message({"print": {"gcode_state": "IDLE", "ams": {"tray_now": tray}}})
+
+        landed = client.feed().load_landed
+        assert (landed.tray, landed.farm_acting) == (3, acting)
+
+    def test_a_failing_provider_reads_as_no_farm_motion(self):
+        def boom() -> bool:
+            raise RuntimeError("store down")
+
+        client = _make_client(connected=True, farm_acting=boom)
+        for tray in ("255", "255", "3"):
+            client._process_message({"print": {"gcode_state": "IDLE", "ams": {"tray_now": tray}}})
+
+        assert client.feed().load_landed.farm_acting is False
+
+    def test_only_a_push_that_carried_the_posture_votes(self, mqtt_client):
+        """``ams_status`` on either wire path marks the push; a push without it does not."""
+        mqtt_client._process_message({"print": {"ams_status": 0x0300}})
+        assert mqtt_client._push_carried_posture is True
+        mqtt_client._process_message({"print": {"ams": {"ams_status": 0x0300}}})
+        assert mqtt_client._push_carried_posture is True
+        mqtt_client._process_message({"print": {"layer_num": 3}})
+        assert mqtt_client._push_carried_posture is False
 
 
 class TestDeveloperModeDetection:
@@ -6179,7 +6364,7 @@ class TestJobAttach:
         started, _, _ = _lifecycle_recorders(mqtt_client)
         mqtt_client._process_message(_job_push("PAUSE", layer_num=12))
         mqtt_client.state.hms_errors = [HMSError(code="8017", attr=0x03000000, module=3, severity=2)]  # 0300_8017
-        mqtt_client.state.tray_change_log.append((2, 12))
+        mqtt_client._process_message(_ams_payload(2))  # a feeder lands during the hold: the job's own log
 
         mqtt_client._process_message(_job_push("RUNNING", layer_num=12))
 

@@ -47,7 +47,7 @@ qualified-physical-cycle signal that releases it
 Module edge state (``_autoconfig_window``, ``_autoconfig_epochs``,
 ``_pending_physical_cycles``, ``_settle_concluded_logged``) mirrors the fork's other
 event-edge bookkeeping
-(``spool_respool._last_tray_now``). It is lost on restart — worst case a bare-tray
+(``spool_respool._switch_seen``). It is lost on restart — worst case a bare-tray
 config re-push waits one AMS push, a spent slot stays latched until a pull/reseat, a
 write epoch starts over with full strikes (one more attempt, never a suppressed one;
 still bounded by the ladder, and the wire re-states its verdict on that attempt), and

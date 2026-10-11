@@ -43,6 +43,7 @@ from backend.app.services.terminal_outcome import (
     PLATE_RECHECK_WINDOW_S,
     PlateCheckFacts,
 )
+from backend.tests._fixtures.feed import ScriptedFeed
 
 pytestmark = pytest.mark.asyncio
 
@@ -1024,6 +1025,11 @@ class PlateWire:
             layer_num=self.layer or 0,
             reliable=self.layer is not None,
         )
+
+    def feed(self):
+        """The client's toolhead feed state (``BambuMQTTClient.feed()``, read by the rule table's
+        callers as ``Context.feed``): a real tracker that has seen the scripted state reported."""
+        return ScriptedFeed().settle(self.state)
 
     def resume_print(self):
         """The power-loss lane's plain resume (the hand-over re-arm test)."""

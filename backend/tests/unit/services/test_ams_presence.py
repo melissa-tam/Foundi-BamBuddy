@@ -24,6 +24,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services import ams_presence
 from backend.app.services.tray_observation import observe_ams_push
+from backend.tests._fixtures import feed_wire
 
 _VALID_TAG = "1234567890ABCDEF"
 
@@ -2958,3 +2959,127 @@ class TestUnboundUnreadDiscoveryArm:
             assert await ams_presence.identify_needed(db_session, 1, 0, 0, _tray(0, state=10), False) is None
         finally:
             filament_deficit._reset_state()
+
+
+# --- the loss edge asks the toolhead feed state (2026-10-10) ------------------------------
+
+
+class TestTheLossEdgeAsksTheFeedState:
+    """ "Was this slot FEEDING when it emptied?" is the toolhead feed state's answer
+    (invariant 16) — the client's one reading, never a frame of ``tray_now``, which at the
+    edge may already have pre-flipped to a backup or read 255. Every case drives a REAL
+    client over the wire (``_fixtures.feed_wire``) and runs the presence pass on the push's
+    observations, built before the client merges the push, exactly as ``printer_manager``'s
+    raw hook builds them.
+
+    The pass runs on the event loop, unordered against the rest of its push on the MQTT
+    thread: the raw hook only SCHEDULES it, and ``_update_state`` steps the feed state after
+    ``_handle_ams_data``. So the reading it asks may be the one from BEFORE the push, AFTER
+    it, or a later one — the firmware's switch already done — and a "feeding" answer must
+    hold in all three."""
+
+    PRINTER = 7
+    ORDERS = ("before_the_push", "after_the_push", "after_the_switch")
+
+    async def _pass(self, db, observations) -> None:
+        await ams_presence.on_tray_observations(self.PRINTER, observations, db)
+
+    async def _seed(self, db, client, **wire) -> None:
+        """A push with every slot seated, and its pass: the first batch only seeds."""
+        payload = feed_wire.status_push(**wire)
+        observations = observe_ams_push(self.PRINTER, payload["print"]["ams"])
+        client._process_message(payload)
+        await self._pass(db, observations)
+
+    async def _loss(self, db, client, order, loss: dict, then: list[dict] = ()) -> None:
+        """The push that clears a bay and its pass, in ``order``; ``then`` are the pushes
+        after it (the rest of the firmware's switch)."""
+        payload = feed_wire.status_push(**loss)
+        observations = observe_ams_push(self.PRINTER, payload["print"]["ams"])
+        if order == "before_the_push":
+            await self._pass(db, observations)
+            client._process_message(payload)
+            return
+        client._process_message(payload)
+        if order == "after_the_switch":
+            for wire in then:
+                feed_wire.push(client, **wire)
+        await self._pass(db, observations)
+
+    def _client(self, monkeypatch, **kw):
+        client = feed_wire.live_client(serial="PRESENCE", **kw)
+        _patch_pm(monkeypatch, status=client.state, client=client)
+        return client
+
+    @pytest.mark.parametrize("order", ORDERS)
+    async def test_a_drained_roll_was_feeding(self, db_session, monkeypatch, order):
+        """Single nozzle: the feeding roll runs dry at the AMS — its bay clears while its tail
+        still feeds — and the firmware switches to the backup minutes later."""
+        client = self._client(monkeypatch)
+        feed_wire.start_print(client, 2)
+        await self._seed(db_session, client, tray=2, layer=2)
+
+        gone = {2}
+        await self._loss(
+            db_session,
+            client,
+            order,
+            {"tray": 2, "layer": 3, "absent": gone},
+            then=[
+                {"tray": 255, "layer": 4, "absent": gone},
+                {"tray": 255, "layer": 4, "absent": gone, "ams_status": feed_wire.CHANGE},
+                {"tray": 3, "layer": 4, "absent": gone, "ams_status": feed_wire.CHANGE},
+                {"tray": 3, "layer": 4, "absent": gone},
+            ],
+        )
+
+        assert ams_presence.absent_under_active_feed(self.PRINTER, 0, 2) is True
+        if order == "after_the_switch":
+            assert client.feed().feeder == 3, "the pass read a reading the switch had already moved on"
+
+    @pytest.mark.parametrize("order", ORDERS)
+    async def test_the_h2c_deputy_roll_was_feeding(self, db_session, monkeypatch, order):
+        """H2C (2026-08-20): the roll in the NON-active hotend is feeding too. Extruder 0
+        prints from AMS 0 slot 0 while the deputy, extruder 1, holds slot 2 — whose bay
+        clears mid-print. Answering "not feeding" there de-bounced a mid-print pull onto the
+        row that was still printing."""
+        client = self._client(monkeypatch, model="H2C")
+        dual = {"extruders": {0: 0, 1: 2}, "active": 0}
+        feed_wire.start_print(client, 0, **dual)
+        await self._seed(db_session, client, tray=0, layer=2, **dual)
+
+        await self._loss(
+            db_session,
+            client,
+            order,
+            {"tray": 0, "layer": 3, "absent": {2}, **dual},
+            then=[{"tray": 0, "layer": layer, "absent": {2}, **dual} for layer in (4, 5)],
+        )
+
+        assert ams_presence.absent_under_active_feed(self.PRINTER, 0, 2) is True
+        assert client.feed().active_extruder == 0, "the deputy was never the active extruder"
+
+    async def test_an_idle_printers_pull_was_not_feeding(self, db_session, monkeypatch):
+        """Between prints a roll change is the operator's, and the last job's feeder is a
+        stale fact: the job that fed slot 2 has ended, so pulling slot 2 is not a runout."""
+        client = self._client(monkeypatch)
+        feed_wire.start_print(client, 2)
+        feed_wire.push(client, tray=2, layer=2)
+        client._process_message({"print": {"gcode_state": "FINISH"}})
+        await self._seed(db_session, client, tray=255, layer=2, gcode_state="IDLE")
+
+        await self._loss(db_session, client, "after_the_push", {"tray": 255, "layer": 2, "absent": {2}})
+
+        assert client.feed().extruder(0).last_fed == 2, "the feed state still remembers the job's feeder…"
+        assert ams_presence.absent_under_active_feed(self.PRINTER, 0, 2) is False  # …and the gate ignores it
+
+    async def test_a_mid_print_pull_of_a_slot_not_feeding_was_not_feeding(self, db_session, monkeypatch):
+        """Mid-print, slot 0 feeds and slot 3 is pulled: a pull of a slot nothing was feeding
+        from stays a candidate for the de-bounce (its cause rule decides)."""
+        client = self._client(monkeypatch)
+        feed_wire.start_print(client, 0)
+        await self._seed(db_session, client, tray=0, layer=2)
+
+        await self._loss(db_session, client, "after_the_push", {"tray": 0, "layer": 3, "absent": {3}})
+
+        assert ams_presence.absent_under_active_feed(self.PRINTER, 0, 3) is False

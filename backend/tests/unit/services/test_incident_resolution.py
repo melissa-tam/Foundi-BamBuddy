@@ -63,6 +63,7 @@ from backend.app.services.incident_resolution import (
     resolve,
 )
 from backend.app.services.plate_occupancy import EscalationOnly, PendingEject, plate_occupancy
+from backend.tests._fixtures.feed import ScriptedFeed
 
 _OCCASIONS = ("running_edge", "job_terminal", "sweep_tick", "startup", "plate_cleared", "new_fault")
 
@@ -114,20 +115,64 @@ def _ptfe_breakage_hms(ams_id: int = 0, tray_id: int = 3) -> HMSError:
 
 
 def _state(
-    live: str = "IDLE", *, hms=None, tray_now=None, epoch=1, ams_status_main=0, snow=None, active=0
+    live: str = "IDLE",
+    *,
+    hms=None,
+    tray_now=None,
+    epoch=1,
+    ams_status_main=0,
+    snow=None,
+    active=0,
+    layer=10,
+    absent=(),
 ) -> PrinterState:
-    """``snow`` is the dual-nozzle per-extruder map (``{extruder_id: global_tray}``) and
-    ``active`` the active extruder — a single-nozzle state when ``snow`` is None."""
+    """A LIVE reading of the printer (its session's report applied) at a printed ``layer``.
+    ``snow`` is the dual-nozzle per-extruder map (``{extruder_id: global_tray}``) and ``active``
+    the active extruder — a single-nozzle state when ``snow`` is None; ``absent`` names the
+    AMS-0 trays that read empty (every other tray of the four reads seated)."""
     st = PrinterState()
+    st.connected = True
     st.state = live
     st.subtask_id = _JOB
     st.hms_errors = hms or []
     st.tray_now = tray_now
     st.connection_epoch = epoch
+    st.report_epoch = epoch
     st.ams_status_main = ams_status_main
     st.h2d_extruder_snow = dict(snow or {})
     st.active_extruder = active
+    st.layer_num = layer
+    st.raw_data = {
+        "ams": [
+            {
+                "id": 0,
+                "tray": [
+                    {"id": i, "state": 9, "tray_type": ""}
+                    if i in absent
+                    else {"id": i, "state": 11, "tray_type": "PETG"}
+                    for i in range(4)
+                ],
+            }
+        ]
+    }
     return st
+
+
+def _feed_of(state: PrinterState | None):
+    """The printer client's toolhead FEED STATE once it has seen ``state`` reported (a real tracker
+    stepped off the scripted pushes: the session's re-seed, then the reading) — what every caller
+    hands the rule table as ``Context.feed`` (invariant 16). ``None`` for no state (no client)."""
+    if state is None:
+        return None
+    return ScriptedFeed().settle(state)
+
+
+def _observe(ledger: MotionLedger, state: PrinterState, feed: ScriptedFeed | None = None, *, printer_id: int = 7):
+    """ONE status push through the ledger's one writer, with the client's feed state for it —
+    ``feed`` is the printer's running tracker (a sequence of pushes), or a fresh one that has seen
+    this state reported."""
+    reading = feed.push(state) if feed is not None else _feed_of(state)
+    ledger.observe(printer_id, state, reading)
 
 
 def _ledger_with(*, load_at=None, ran_at=None, printer_id: int = 7) -> MotionLedger:
@@ -162,12 +207,14 @@ def _permissive(occasion: str) -> Context:
     carries a DIFFERENT actionable fault than the row's own (its occasion's meaning).
     """
     after = _OPENED_AT + timedelta(seconds=30)
+    state = _state("RUNNING", hms=[_jam_hms()] if occasion == "new_fault" else None, tray_now=0)
     return Context(
-        state=_state("RUNNING", hms=[_jam_hms()] if occasion == "new_fault" else None, tray_now=0),
+        state=state,
         ledger=_ledger_with(load_at=after, ran_at=after),
         driver_live=False,
         terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
         cleared=ClearedEvent(recover=True),
+        feed=_feed_of(state),
     )
 
 
@@ -651,11 +698,8 @@ class TestTheWireLane:
 
 class TestTheRepairLaneMotionEvidence:
     def _ctx(self, *, live="IDLE", hms=None, load_at=None, ams_status_main=0, tray_now=None):
-        return Context(
-            state=_state(live, hms=hms, ams_status_main=ams_status_main, tray_now=tray_now),
-            ledger=_ledger_with(load_at=load_at),
-            driver_live=False,
-        )
+        state = _state(live, hms=hms, ams_status_main=ams_status_main, tray_now=tray_now)
+        return Context(state=state, ledger=_ledger_with(load_at=load_at), driver_live=False, feed=_feed_of(state))
 
     def test_an_idle_clean_printer_is_not_evidence(self):
         """THE 003-H2S pin: the firmware wipes its standing HMS list at every terminal,
@@ -861,62 +905,105 @@ class TestTheCompletedArm:
 
 
 class TestMotionLedger:
-    def _sample(self, ledger, printer_id, *, tray_now, epoch=1, live="IDLE"):
-        ledger.observe(printer_id, _state(live, tray_now=tray_now, epoch=epoch), epoch)
+    """The ledger's two facts, read off the client's FEED STATE (invariant 16): the load edge is the
+    feed state's ``load_landed`` event, consumed once per printer by its ``seq``; the sighting is a
+    POSITIVE reading of a print feeding. Every push here is a real tracker step (``ScriptedFeed``)
+    handed to the ledger's one writer, as the per-push sampler hands it."""
 
-    def test_the_first_sample_only_seeds(self):
-        """An edge that happened before we looked is not an edge we witnessed."""
+    @pytest.fixture
+    def feed(self):
+        """Printer 7's client, whose landings carry production's attribution (a live driver)."""
+        return ScriptedFeed(farm_acting=lambda: printer_incidents.driver_live(7))
+
+    @staticmethod
+    def _sample(ledger, feed, *, tray_now, epoch=1, live="IDLE", printer_id=7):
+        _observe(ledger, _state(live, tray_now=tray_now, epoch=epoch), feed, printer_id=printer_id)
+
+    def test_the_first_samples_only_seed(self, feed):
+        """A session's first report re-seeds the feed state and its first reading is a reading: an
+        edge that happened before we looked is not an edge we witnessed."""
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=1)
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=1)
 
         assert ledger.load_completed_at(7) is None
 
-    def test_a_transition_onto_a_real_feeder_stamps(self):
+    def test_a_landing_onto_a_real_feeder_stamps(self, feed):
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=255)
-        self._sample(ledger, 7, tray_now=1)
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=1)
 
         assert ledger.load_completed_at(7) is not None
 
-    def test_a_standing_level_never_stamps(self):
+    def test_a_landing_is_consumed_once(self, feed):
+        """The reading holds the LAST landing until the next: the ledger's cursor consumes it once,
+        so a later stamp is a later landing, never the same one read again."""
+        ledger = MotionLedger()
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=1)
+        first = ledger.load_completed_at(7)
+        self._sample(ledger, feed, tray_now=1)
+
+        assert ledger.load_completed_at(7) == first
+
+    def test_a_standing_level_never_stamps(self, feed):
         """003-H2S read ``tray_now == 1`` before, during and after its fault."""
         ledger = MotionLedger()
-        for _ in range(3):
-            self._sample(ledger, 7, tray_now=1)
+        for _ in range(4):
+            self._sample(ledger, feed, tray_now=1)
 
         assert ledger.load_completed_at(7) is None
 
     @pytest.mark.parametrize("sentinel", [254, 255])
-    def test_a_sentinel_is_not_a_feeder(self, sentinel):
+    def test_a_sentinel_is_not_a_feeder(self, feed, sentinel):
         """254 is the external holder and 255 is "nothing is feeding" — neither is
         something a load can complete ONTO."""
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=1)
-        self._sample(ledger, 7, tray_now=sentinel)
+        self._sample(ledger, feed, tray_now=1)
+        self._sample(ledger, feed, tray_now=1)
+        self._sample(ledger, feed, tray_now=sentinel)
 
         assert ledger.load_completed_at(7) is None
 
-    def test_an_epoch_change_cannot_fabricate_a_load_edge(self):
+    def test_an_epoch_change_cannot_fabricate_a_load_edge(self, feed):
         """A new MQTT session re-seeds every wire fact at once, so a tray "changing"
         across it is a reading, not an event."""
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=255, epoch=1)
-        self._sample(ledger, 7, tray_now=1, epoch=2)
+        self._sample(ledger, feed, tray_now=255, epoch=1)
+        self._sample(ledger, feed, tray_now=255, epoch=1)
+        self._sample(ledger, feed, tray_now=1, epoch=2)
 
         assert ledger.load_completed_at(7) is None
 
-    def test_running_is_stamped_on_the_positive_reading_with_no_edge(self):
-        """No seed, no epoch test: "this printer was demonstrably printing" is a fact a
-        reconnect cannot fabricate, and it must be usable on the FIRST push after one."""
+    def test_a_pre_flip_inside_a_drained_rolls_tail_is_no_landing(self, feed):
+        """005/001-H2S 2026-10-10: the roll ran dry at the AMS and ``tray_now`` pre-flipped to the
+        backup while the tail still fed — no load landed, so no repair evidence. The landing is the
+        backup actually feeding, after the firmware's change."""
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=1, live="RUNNING")
+        for _ in range(2):
+            _observe(ledger, _state("RUNNING", tray_now=1), feed)
+        _observe(ledger, _state("RUNNING", tray_now=1, absent={1}), feed)  # the roll ran dry
+        _observe(ledger, _state("RUNNING", tray_now=0, absent={1}), feed)  # the pre-flip
+        assert ledger.load_completed_at(7) is None
+
+        _observe(ledger, _state("RUNNING", tray_now=255, absent={1}, ams_status_main=1), feed)  # the change
+        _observe(ledger, _state("RUNNING", tray_now=0, absent={1}), feed)  # the backup lands
+        assert ledger.load_completed_at(7) is not None
+
+    def test_running_is_stamped_on_the_positive_reading_with_no_edge(self):
+        """No edge, no epoch test: "this printer was demonstrably printing" is a fact a reconnect
+        cannot fabricate, and it is usable on the feed state's first READING after one."""
+        ledger = MotionLedger()
+        _observe(ledger, _state("RUNNING", tray_now=1))
 
         assert ledger.path_ran_at(7) is not None
 
     @pytest.mark.parametrize("live", ["IDLE", "PAUSE", "FINISH", "PREPARE", ""])
     def test_only_running_stamps_the_sighting(self, live):
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=1, live=live)
+        _observe(ledger, _state(live, tray_now=1))
 
         assert ledger.path_ran_at(7) is None
 
@@ -937,22 +1024,31 @@ class TestMotionLedger:
             ),
         )
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=1, live="RUNNING")
+        _observe(ledger, _state("RUNNING", tray_now=1))
 
         assert ledger.path_ran_at(7) is None
 
-    def test_the_ledger_is_per_printer(self):
+    def test_the_ledger_is_per_printer(self, feed):
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=255)
-        self._sample(ledger, 7, tray_now=1)
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=1)
 
         assert ledger.load_completed_at(8) is None
 
-    def test_reset_drops_everything(self):
+    def test_no_reading_is_no_evidence(self):
+        """No client (no feed state): no landing, nothing fed."""
+        ledger = MotionLedger()
+        ledger.observe(7, _state("RUNNING", tray_now=1), None)
+
+        assert (ledger.load_completed_at(7), ledger.path_ran_at(7)) == (None, None)
+
+    def test_reset_drops_everything(self, feed):
         """``spool_recovery._reset_state`` delegates here — no second test fixture."""
         ledger = MotionLedger()
-        self._sample(ledger, 7, tray_now=255)
-        self._sample(ledger, 7, tray_now=1, live="RUNNING")
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=255)
+        self._sample(ledger, feed, tray_now=1, live="RUNNING")
         assert ledger.load_completed_at(7) is not None
         assert ledger.path_ran_at(7) is not None
 
@@ -960,8 +1056,11 @@ class TestMotionLedger:
 
         assert ledger.load_completed_at(7) is None
         assert ledger.path_ran_at(7) is None
-        # ...including the feeder memory, so the next sample seeds rather than edges.
-        self._sample(ledger, 7, tray_now=2)
+        # ...including the landing cursor: a restart builds a new client, whose feed state emits no
+        # landing until one is seen after its seed.
+        restarted = ScriptedFeed()
+        self._sample(ledger, restarted, tray_now=2)
+        self._sample(ledger, restarted, tray_now=2)
         assert ledger.load_completed_at(7) is None
 
 
@@ -991,7 +1090,7 @@ class TestTheSightingIsQualified:
 
     @staticmethod
     def _sample(ledger, *, hms=None, ams_status_main=0):
-        ledger.observe(7, _state("RUNNING", hms=hms, tray_now=1, ams_status_main=ams_status_main), 1)
+        _observe(ledger, _state("RUNNING", hms=hms, tray_now=1, ams_status_main=ams_status_main))
 
     def test_a_quiet_running_print_with_no_driver_is_a_sighting(self):
         ledger = MotionLedger()
@@ -1087,11 +1186,12 @@ class TestTheNewFaultOccasion:
     @staticmethod
     def _ran(ledger: MotionLedger, *, hms=None) -> None:
         """One RUNNING push through the sampler's call (qualified or not is the ledger's)."""
-        ledger.observe(7, _state("RUNNING", hms=hms, tray_now=1), 1)
+        _observe(ledger, _state("RUNNING", hms=hms, tray_now=1))
 
     @staticmethod
     def _now_on_wire(ledger: MotionLedger, hms, *, live="PAUSE", driver_live=False) -> Context:
-        return Context(state=_state(live, hms=hms, tray_now=1), ledger=ledger, driver_live=driver_live)
+        state = _state(live, hms=hms, tray_now=1)
+        return Context(state=state, ledger=ledger, driver_live=driver_live, feed=_feed_of(state))
 
     @pytest.mark.parametrize(
         "new_fault",
@@ -1235,7 +1335,7 @@ class TestTheCompletedArmReadsTheSharedSighting:
     def test_a_qualified_sighting_lets_the_completion_close_it(self):
         ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        ledger.observe(7, _state("RUNNING", tray_now=1), 1)
+        _observe(ledger, _state("RUNNING", tray_now=1))
 
         verdict = self._completed(ledger, row)
 
@@ -1244,7 +1344,7 @@ class TestTheCompletedArmReadsTheSharedSighting:
     def test_a_drivers_own_resume_does_not_launder_the_completion(self, live_driver):
         ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        ledger.observe(7, _state("RUNNING", tray_now=1), 1)
+        _observe(ledger, _state("RUNNING", tray_now=1))
         printer_incidents.release_driver(7, live_driver)
 
         assert self._completed(ledger, row).close is False
@@ -1253,7 +1353,7 @@ class TestTheCompletedArmReadsTheSharedSighting:
         """The fault-before-PAUSE samples, then the firmware wipes its list at the terminal."""
         ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        ledger.observe(7, _state("RUNNING", hms=_pull_back_hms(), tray_now=1), 1)
+        _observe(ledger, _state("RUNNING", hms=_pull_back_hms(), tray_now=1))
 
         assert self._completed(ledger, row).close is False
 
@@ -1262,13 +1362,14 @@ class TestRepairEvidenceNeedsFilamentFed:
     """K12 / C3b (011-H2S 2026-10-09, 014-H2S 2026-10-09/10): a print resumed onto an EMPTY
     toolhead read RUNNING, and RUNNING was repair evidence — "a print ran through the path" —
     so a physical hold could close on a print laying down air. The ``repair`` class's motion
-    evidence is now ``feeding_through_path``: RUNNING with no eject AND the ACTIVE extruder fed
-    from an AMS feeder (``tray_fields.toolhead_feed``). It decides the (b) cell and the
-    ledger's ``path_ran_at`` stamp, so the completed and new-fault arms inherit it."""
+    evidence is now ``feeding_through_path``: RUNNING with no eject AND the toolhead's feed state
+    FED or TAIL from an AMS feeder (``feed_state``, invariant 16 — the ACTIVE extruder's phase). It
+    decides the (b) cell and the ledger's ``path_ran_at`` stamp, so the completed and new-fault
+    arms inherit it."""
 
     @staticmethod
     def _ctx(state: PrinterState, ledger: MotionLedger | None = None, **kw) -> Context:
-        return Context(state=state, ledger=ledger or MotionLedger(), driver_live=False, **kw)
+        return Context(state=state, ledger=ledger or MotionLedger(), driver_live=False, feed=_feed_of(state), **kw)
 
     @pytest.mark.parametrize("occasion", ["sweep_tick", "startup"])
     def test_a_print_running_on_air_never_closes_a_physical_hold(self, occasion):
@@ -1296,13 +1397,13 @@ class TestRepairEvidenceNeedsFilamentFed:
 
     def test_an_air_running_sample_never_stamps_the_sighting(self):
         ledger = MotionLedger()
-        ledger.observe(7, _state("RUNNING", tray_now=255), 1)
+        _observe(ledger, _state("RUNNING", tray_now=255))
 
         assert ledger.path_ran_at(7) is None
 
     def test_a_fed_running_sample_still_stamps_it(self):
         ledger = MotionLedger()
-        ledger.observe(7, _state("RUNNING", tray_now=1), 1)
+        _observe(ledger, _state("RUNNING", tray_now=1))
 
         assert ledger.path_ran_at(7) is not None
 
@@ -1311,7 +1412,7 @@ class TestRepairEvidenceNeedsFilamentFed:
         sighting, so the next jam is still the same blockage as far as the farm can tell."""
         ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        ledger.observe(7, _state("RUNNING", tray_now=255), 1)
+        _observe(ledger, _state("RUNNING", tray_now=255))
 
         verdict = resolve(row, "new_fault", self._ctx(_state("RUNNING", hms=[_jam_hms()], tray_now=255), ledger))
 
@@ -1323,7 +1424,7 @@ class TestRepairEvidenceNeedsFilamentFed:
         (an older payload, or one whose air run never advanced a layer)."""
         ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        ledger.observe(7, _state("RUNNING", tray_now=255), 1)
+        _observe(ledger, _state("RUNNING", tray_now=255))
         terminal = TerminalEvent(status="completed", eject=False, job_id=_JOB)
 
         assert resolve(row, "job_terminal", self._ctx(_state("FINISH"), ledger, terminal=terminal)).close is False
@@ -1340,7 +1441,7 @@ class TestRepairEvidenceNeedsFilamentFed:
         filament is not feeding the print."""
         running = _state("RUNNING", tray_now=3, snow=snow, active=active)
         ledger = MotionLedger()
-        ledger.observe(7, running, 1)
+        _observe(ledger, running)
 
         assert (ledger.path_ran_at(7) is not None) is feeding
         assert resolve(_row(RESOLUTION_REPAIR), "sweep_tick", self._ctx(running)).close is feeding
@@ -1359,51 +1460,65 @@ class TestRepairEvidenceNeedsFilamentFed:
 
 
 class TestTheLoadEdgeIsAHumanRepair:
-    """K12: the load-completed EDGE is a person's repair ("free the path, load a slot"). The
-    farm's OWN swap and refill loads run under a live recovery driver and are not one, so
-    ``MotionLedger.observe`` — the edge's one writer — does not stamp an edge while a driver is
-    live (``printer_incidents.driver_live``), decided inside the writer. The previous-feeder
-    seed keeps moving meanwhile, so the edge after the driver ends compares against the feeder
-    the driver left, never the one before it."""
+    """K12: the load edge is a load NO FARM MOTION made — a person's repair ("free the path, load a
+    slot"), or the printer's own. The farm's OWN swap and refill loads land under a live recovery
+    driver (or a farm command pending), and the feed state attributes each landing at the STEP it
+    happened on (``LoadLanded.farm_acting``, the provider the registry injects); the ledger's one
+    writer stamps only the others, and logs the farm's own. Each landing is consumed once, so the
+    feeder the driver left is never compared against again."""
+
+    @pytest.fixture
+    def feed(self):
+        return ScriptedFeed(
+            farm_acting=lambda: printer_incidents.driver_live(7) or printer_incidents.pending_command(7) is not None
+        )
 
     @staticmethod
-    def _sample(ledger: MotionLedger, tray_now: int, **kw) -> None:
-        ledger.observe(7, _state("PAUSE", tray_now=tray_now, **kw), 1)
+    def _sample(ledger: MotionLedger, feed, tray_now: int, **kw) -> None:
+        _observe(ledger, _state("PAUSE", tray_now=tray_now, **kw), feed)
 
-    def test_a_load_under_a_live_driver_is_not_stamped(self, live_driver):
+    def test_a_load_under_a_live_driver_is_not_stamped(self, feed, live_driver, caplog):
+        import logging
+
         ledger = MotionLedger()
-        self._sample(ledger, 255)
-        self._sample(ledger, 1)  # the driver's own load
+        self._sample(ledger, feed, 255)
+        self._sample(ledger, feed, 255)
+        with caplog.at_level(logging.INFO, logger="backend.app.services.incident_resolution"):
+            self._sample(ledger, feed, 1)  # the driver's own load
 
         assert ledger.load_completed_at(7) is None
+        assert any("the farm's own load" in r.getMessage() for r in caplog.records)
 
-    def test_the_seed_moves_under_the_driver_and_a_human_load_after_it_stamps(self, live_driver):
+    def test_the_farms_landing_is_consumed_and_a_persons_load_after_it_stamps(self, feed, live_driver):
         ledger = MotionLedger()
-        self._sample(ledger, 255)
-        self._sample(ledger, 1)  # the driver's refill
+        self._sample(ledger, feed, 255)
+        self._sample(ledger, feed, 255)
+        self._sample(ledger, feed, 1)  # the driver's refill
         printer_incidents.release_driver(7, live_driver)
 
-        self._sample(ledger, 1)  # the feeder the driver left: no edge against a stale seed
+        self._sample(ledger, feed, 1)  # the feeder the driver left: its landing is already consumed
         assert ledger.load_completed_at(7) is None
 
-        self._sample(ledger, 255)
-        self._sample(ledger, 2)  # a person unloads and loads slot 3
+        self._sample(ledger, feed, 255)
+        self._sample(ledger, feed, 2)  # a person unloads and loads slot 3
         assert ledger.load_completed_at(7) is not None
 
-    def test_an_active_extruder_switch_is_not_a_load(self):
+    def test_an_active_extruder_switch_is_not_a_load(self, feed):
         """Dual nozzle: the edge is the ACTIVE extruder's feeder changing. A nozzle switch
         changes which feeder the toolhead reads without anything loading."""
         ledger = MotionLedger()
         snow = {0: 2, 1: 6}
-        self._sample(ledger, 2, snow=snow, active=0)
-        self._sample(ledger, 6, snow=snow, active=1)
+        self._sample(ledger, feed, 2, snow=snow, active=0)
+        self._sample(ledger, feed, 2, snow=snow, active=0)
+        self._sample(ledger, feed, 6, snow=snow, active=1)
 
         assert ledger.load_completed_at(7) is None
 
-    def test_a_load_onto_the_active_extruder_stamps(self):
+    def test_a_load_onto_the_active_extruder_stamps(self, feed):
         ledger = MotionLedger()
-        self._sample(ledger, 255, snow={0: 255, 1: 6}, active=0)
-        self._sample(ledger, 2, snow={0: 2, 1: 6}, active=0)
+        self._sample(ledger, feed, 255, snow={0: 255, 1: 6}, active=0)
+        self._sample(ledger, feed, 255, snow={0: 255, 1: 6}, active=0)
+        self._sample(ledger, feed, 2, snow={0: 2, 1: 6}, active=0)
 
         assert ledger.load_completed_at(7) is not None
 
@@ -1463,12 +1578,13 @@ class TestPathQuiet:
 
 class TestTheToolheadLane:
     """K10 (2026-10-10): a ``toolhead_refill`` row — the farm refilling an EMPTY toolhead on a
-    printer no AMS row holds — returns to normal on a print running FED (the ACTIVE extruder,
-    ``tray_fields.toolhead_feed``), on its job's end, or on Recover. A RUNNING print with nothing
-    fed is the hold itself (a screen resume onto air), never its end."""
+    printer no AMS row holds — returns to normal on a print running FED (the toolhead's feed state
+    FED or TAIL — ``Context.feed``, invariant 16), on its job's end, or on Recover. A RUNNING print
+    with nothing fed is the hold itself (a screen resume onto air), never its end."""
 
     def _ctx(self, live="RUNNING", *, tray_now=0, driver_live=False, **kw):
-        return Context(state=_state(live, tray_now=tray_now), ledger=MotionLedger(), driver_live=driver_live, **kw)
+        state = _state(live, tray_now=tray_now)
+        return Context(state=state, ledger=MotionLedger(), driver_live=driver_live, feed=_feed_of(state), **kw)
 
     def test_a_print_running_on_air_is_not_its_end(self):
         verdict = resolve(_row(RESOLUTION_TOOLHEAD), "running_edge", self._ctx(tray_now=255))
@@ -1514,3 +1630,73 @@ class TestTheToolheadLane:
             is False
         )
         assert resolve(_row(RESOLUTION_TOOLHEAD), "job_terminal", self._ctx(terminal=terminal)).close is True
+
+
+class TestTheResumeOwedVerdict:
+    """``resume_owed`` — operator-ratified 2026-10-10 (P2): a row the farm holds over a PAUSEd print
+    whose toolhead the PRINTER or a PERSON put back is resumed ONCE. One total table keyed by the
+    resolution class (``_RESUME_OWED``; a missing class RAISES): ``repair`` — the repair evidence (a
+    load after the fault, the path quiet, the job PAUSEd); ``toolhead`` — fed again after a load no
+    farm motion made, after the row opened; every other class — never (a jam's exit is the printer's
+    Retry; a runout is the refill lane's, invariant 9)."""
+
+    _AFTER = _OPENED_AT + timedelta(seconds=30)
+    _BEFORE = _OPENED_AT - timedelta(seconds=30)
+
+    def _ctx(self, *, live="PAUSE", tray_now=1, load_at=_AFTER, job=_JOB, hms=None, **kw) -> Context:
+        state = _state(live, tray_now=tray_now, hms=hms)
+        state.subtask_id = job
+        return Context(state=state, ledger=_ledger_with(load_at=load_at), driver_live=False, feed=_feed_of(state), **kw)
+
+    def test_the_table_is_total_over_the_resolution_classes(self):
+        assert set(incident_resolution._RESUME_OWED) == set(RESOLVES_ON.values())  # noqa: SLF001
+
+    def test_an_unregistered_class_raises(self, monkeypatch):
+        monkeypatch.setattr(incident_resolution.printer_incidents, "resolution_class", lambda *a, **k: "invented")
+
+        with pytest.raises(KeyError):
+            incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx())
+
+    @pytest.mark.parametrize("resolution", [RESOLUTION_TOOLHEAD, RESOLUTION_REPAIR])
+    def test_a_toolhead_put_back_on_the_paused_job_is_owed(self, resolution):
+        verdict = incident_resolution.resume_owed(_row(resolution), self._ctx())
+
+        assert verdict.owed is True
+        assert verdict.evidence
+
+    @pytest.mark.parametrize(
+        "resolution", [RESOLUTION_WIRE, RESOLUTION_OPERATOR, RESOLUTION_JOB_PAUSE, RESOLUTION_DECLARED]
+    )
+    def test_every_other_class_never_resumes_on_a_load(self, resolution):
+        verdict = incident_resolution.resume_owed(_row(resolution), self._ctx())
+
+        assert verdict.owed is False
+        assert verdict.evidence
+
+    @pytest.mark.parametrize("resolution", [RESOLUTION_TOOLHEAD, RESOLUTION_REPAIR])
+    @pytest.mark.parametrize(
+        "change",
+        [
+            pytest.param({"live": "RUNNING"}, id="not_paused"),
+            pytest.param({"job": "other-job"}, id="another_job"),
+            pytest.param({"job": ""}, id="a_job_naming_nothing"),
+            pytest.param({"load_at": _BEFORE}, id="the_load_before_the_row_opened"),
+            pytest.param({"load_at": None}, id="no_load_the_farm_did_not_make"),
+            pytest.param({"hms": [_jam_hms()]}, id="a_fault_standing"),
+            pytest.param({"command_pending": True}, id="a_farm_command_pending"),
+        ],
+    )
+    def test_never(self, resolution, change):
+        assert incident_resolution.resume_owed(_row(resolution), self._ctx(**change)).owed is False
+
+    def test_the_toolhead_must_read_fed(self):
+        """A person's load that did not reach the nozzle (or the farm's queued pull-back emptying it
+        after) leaves the toolhead empty: no resume onto air."""
+        verdict = incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx(tray_now=255))
+
+        assert verdict.owed is False
+        assert "does not read fed" in verdict.evidence
+
+    def test_the_external_holder_is_fed_for_the_toolhead_class(self):
+        """The toolhead class asks only "is it printing air": a person's external spool is fed."""
+        assert incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx(tray_now=254)).owed is True

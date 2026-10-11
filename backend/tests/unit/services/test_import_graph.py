@@ -63,8 +63,14 @@ class TestTheMovedNamesAreImportable:
 # composed from modules ABOVE the registry moved down with it — ``is_fresh`` (from ``print_reconcile``,
 # which imports ``job_terminal`` → ``printer_manager``) into ``live_reading``, and ``ran`` (from
 # ``ams_command``, which imports ``printer_manager`` to publish) into ``refill_verdict``.
+#
+# The toolhead FEED STATE (``feed_state``, 2026-10-10) joins them: the MQTT client steps it once per
+# push and every reader above the registry reads its frozen snapshot, so it may reach only the two
+# pure wire leaves it reads the frame through — never the client, never the incident store (the
+# client's ``farm_acting`` answer is INJECTED by the registry, so the client imports nothing above
+# itself either).
 
-_LEAVES = ("refill_verdict", "live_reading")
+_LEAVES = ("refill_verdict", "live_reading", "feed_state")
 _ABOVE_THE_REGISTRY = ("printer_manager", "spool_recovery", "ams_command", "print_reconcile", "job_terminal")
 _REPO = Path(__file__).resolve().parents[4]
 
@@ -91,7 +97,7 @@ class TestTheRefillVerdictIsALeaf:
             assert importlib.util.find_spec(f"backend.app.services.{leaf}") is not None, f"no {leaf} module"
         probe = (
             "import sys\n"
-            "import backend.app.services.refill_verdict, backend.app.services.live_reading\n"
+            f"import {', '.join(f'backend.app.services.{leaf}' for leaf in _LEAVES)}\n"
             "loaded = sorted(m for m in ('backend.app.services.printer_manager', 'backend.app.services.spool_recovery')"
             " if m in sys.modules)\n"
             "print(loaded)\n"
@@ -104,3 +110,29 @@ class TestTheRefillVerdictIsALeaf:
         """``printer_manager`` reads the verdict from the leaf — never from ``spool_recovery``."""
         lines = _import_lines("printer_manager")
         assert not [line for line in lines if "spool_recovery" in line]
+
+
+_FEED_STATE_IMPORTS = frozenset({"backend.app.services.tray_fields", "backend.app.services.hms_errors"})
+
+
+class TestTheFeedStateIsALeaf:
+    def test_it_imports_the_two_wire_leaves_and_the_stdlib_only(self):
+        """Pure, sync and total, on the MQTT thread: nothing farm-side but ``tray_fields`` and
+        ``hms_errors`` (source text, so a function-level import is caught too)."""
+        farm_side = set()
+        for line in _import_lines("feed_state"):
+            if "backend." not in line:
+                continue
+            if line.startswith("from backend.app.services import "):
+                names = line.removeprefix("from backend.app.services import ").split(",")
+                farm_side |= {f"backend.app.services.{name.strip()}" for name in names}
+            else:
+                farm_side.add(line.split()[1])
+        assert farm_side == _FEED_STATE_IMPORTS
+
+    def test_the_client_imports_nothing_above_itself(self):
+        """The ``farm_acting`` provider is injected by the registry: ``bambu_mqtt`` never reaches
+        the incident store or anything that imports the registry."""
+        lines = _import_lines("bambu_mqtt")
+        above = (*_ABOVE_THE_REGISTRY, "printer_incidents")
+        assert not [line for line in lines if any(name in line for name in above)]

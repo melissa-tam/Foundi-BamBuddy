@@ -93,6 +93,74 @@ TRAY_NOW_EXTERNAL_SPOOL = 254
 TRAY_NOW_NOTHING_FED = 255
 
 
+# --- the global-tray codec ---------------------------------------------------------------
+#
+# The external spool holder's "unit": a vt_tray slot is addressed ``(255, 0)`` / ``(255, 1)``
+# (the ``tray_id + 254`` convention of the auto-unlink path), its global id 254 / 255. Note the
+# 255 HERE is the holder's Ext-R slot, a different statement from ``tray_now``'s 255 (nothing
+# fed) — which is why the codec, not a reader of ``tray_now``, owns it.
+_EXTERNAL_HOLDER_UNIT = 255
+# The AMS-HT units: a single-tray unit whose global id IS its unit id.
+_AMS_HT_UNITS = range(128, 192)
+# The regular AMS units the flat ``ams_id * 4 + slot`` layout can address (0..127).
+_REGULAR_AMS_UNITS = range(32)
+
+
+def decode_global_tray(global_tray: int | None) -> tuple[int | None, int | None]:
+    """Decode a global tray id to ``(ams_id, tray_id)`` — e.g. for a ``SpoolAssignment`` lookup.
+
+    THE fork's global-tray codec, with :func:`encode_global_tray` as its exact inverse
+    (cross-cutting invariant 1 — one origin per magic value). It lives here, with the tray
+    vocabulary, because the pure leaves need it (``feed_state`` keys the presence map by the
+    feeding tray) and its consumers sit on both sides of the graph. Three conventions, only
+    one of which is the obvious arithmetic:
+
+    * regular AMS — ``global = ams_id * 4 + slot`` (0..127);
+    * AMS-HT (128..191) — a single-tray unit reports ``global == ams_id``, so the ``* 4``
+      arithmetic is simply WRONG for it;
+    * external vt_tray 254/255 → ``ams_id = 255``, slot 0/1 (the ``tray_id + 254``
+      convention from the auto-unlink path).
+
+    A bare ``ams_id * 4 + tray_id`` anywhere in the fork silently drops the last two, which
+    is why the codec is public and the arithmetic is not to be re-spelled at call sites.
+    """
+    if global_tray is None or global_tray < 0:
+        return (None, None)
+    if global_tray in (TRAY_NOW_EXTERNAL_SPOOL, TRAY_NOW_EXTERNAL_SPOOL + 1):
+        return (_EXTERNAL_HOLDER_UNIT, global_tray - TRAY_NOW_EXTERNAL_SPOOL)
+    if global_tray in _AMS_HT_UNITS:
+        return (global_tray, 0)
+    if global_tray < len(_REGULAR_AMS_UNITS) * TRAYS_PER_AMS_UNIT:
+        return (global_tray // TRAYS_PER_AMS_UNIT, global_tray % TRAYS_PER_AMS_UNIT)
+    return (None, None)
+
+
+def encode_global_tray(ams_id: int | None, tray_id: int | None) -> int | None:
+    """Encode ``(ams_id, tray_id)`` to a global tray id — the inverse of :func:`decode_global_tray`.
+
+    Every convention the decoder knows, applied in the same order, so a round trip through
+    the pair is the identity for every slot the fork can name. ``None`` for an unaddressable
+    slot (either half missing, a negative, or an AMS unit outside the layout), because a
+    fabricated global id would compare EQUAL to some real slot and quietly mis-attribute a
+    fault to it — fail closed, exactly as the decoder does.
+    """
+    if ams_id is None or tray_id is None:
+        return None
+    try:
+        unit, slot = int(ams_id), int(tray_id)
+    except (TypeError, ValueError):
+        return None
+    if unit < 0 or slot < 0:
+        return None
+    if unit == _EXTERNAL_HOLDER_UNIT:
+        return TRAY_NOW_EXTERNAL_SPOOL + slot if slot <= 1 else None
+    if unit in _AMS_HT_UNITS:
+        return unit if slot == 0 else None
+    if unit in _REGULAR_AMS_UNITS and slot < TRAYS_PER_AMS_UNIT:
+        return unit * TRAYS_PER_AMS_UNIT + slot
+    return None
+
+
 def valid_feeder(value: object) -> int | None:
     """A ``tray_now``-style value that names a REAL AMS feeder (0..253), else ``None``.
 

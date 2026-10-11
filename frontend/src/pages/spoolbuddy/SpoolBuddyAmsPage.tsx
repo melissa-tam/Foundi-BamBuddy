@@ -180,19 +180,10 @@ export function SpoolBuddyAmsPage() {
     return map;
   }, [linkedSpools, printerSerial, regularAms, getSpoolmanFillForSlot]);
 
-  // Cache tray_now to prevent flickering when undefined values come in
-  // Valid tray IDs: 0-253 for AMS, 254 for external spool
-  // tray_now=255 means "no tray loaded" (Bambu protocol sentinel) — never active
-  const cachedTrayNow = useRef<number | undefined>(undefined);
-  const currentTrayNow = status?.tray_now;
-  if (currentTrayNow !== undefined && currentTrayNow !== 255) {
-    cachedTrayNow.current = currentTrayNow;
-  } else if (currentTrayNow === 255) {
-    cachedTrayNow.current = undefined;
-  }
-  const effectiveTrayNow = (currentTrayNow !== undefined && currentTrayNow !== 255)
-    ? currentTrayNow
-    : cachedTrayNow.current;
+  // The tray feeding the toolhead, as the backend's feed-state owner answers it
+  // (`ToolheadState.active_tray`): it stays on a draining roll through its tail,
+  // never the backup `tray_now` pre-flips to. Null → no active ring.
+  const activeTray = status?.toolhead?.active_tray ?? null;
   const isDualNozzle = printer?.nozzle_count === 2 || status?.temperatures?.nozzle_2 !== undefined;
   const vtTrays = useMemo(() => [...(status?.vt_tray ?? [])].sort((a, b) => (a.id ?? 254) - (b.id ?? 254)), [status?.vt_tray]);
 
@@ -349,17 +340,17 @@ export function SpoolBuddyAmsPage() {
   });
 
   const getActiveSlotForAms = useCallback((amsId: number): number | null => {
-    if (effectiveTrayNow === undefined) return null;
+    if (activeTray === null) return null;
     if (amsId <= 3) {
-      const activeAmsId = Math.floor(effectiveTrayNow / 4);
-      if (activeAmsId === amsId) return effectiveTrayNow % 4;
+      const activeAmsId = Math.floor(activeTray / 4);
+      if (activeAmsId === amsId) return activeTray % 4;
     }
     if (amsId >= 128 && amsId <= 135) {
       // AMS-HT: global tray ID equals the AMS unit ID itself (128, 129, ...)
-      if (effectiveTrayNow === getGlobalTrayId(amsId, 0, false)) return 0;
+      if (activeTray === getGlobalTrayId(amsId, 0, false)) return 0;
     }
     return null;
-  }, [effectiveTrayNow]);
+  }, [activeTray]);
 
   const handleAmsSlotClick = useCallback((amsId: number, trayId: number, tray: AMSTray | null) => {
     const globalTrayId = getGlobalTrayId(amsId, trayId, false);
@@ -527,13 +518,13 @@ export function SpoolBuddyAmsPage() {
 
     for (const extTray of vtTrays) {
       const extTrayId = extTray.id ?? 254;
-      // On dual-nozzle (H2C/H2D), tray_now=254 means "external spool"
+      // On dual-nozzle (H2C/H2D), active_tray=254 means "external spool"
       // generically — use active_extruder to determine L vs R:
       // extruder 1=left → Ext-L (id=254), extruder 0=right → Ext-R (id=255)
-      const isExtActive = isDualNozzle && effectiveTrayNow === 254
+      const isExtActive = isDualNozzle && activeTray === 254
         ? (extTrayId === 254 && status?.active_extruder === 1) ||
           (extTrayId === 255 && status?.active_extruder === 0)
-        : effectiveTrayNow === extTrayId;
+        : activeTray === extTrayId;
       const extSlotTrayId = extTrayId - 254;
       // Fill level fallback chain: Spoolman → Inventory → AMS remain
       const extSpoolmanFill = getSpoolmanFillForSlot(255, extSlotTrayId, isTrayEmpty(extTray) ? null : extTray);
@@ -556,7 +547,7 @@ export function SpoolBuddyAmsPage() {
     }
 
     return items;
-  }, [htAms, vtTrays, isDualNozzle, effectiveTrayNow, status?.active_extruder, t, getActiveSlotForAms, getNozzleSide, handleAmsSlotClick, handleExtSlotClick, fillOverrides, getSpoolmanFillForSlot]);
+  }, [htAms, vtTrays, isDualNozzle, activeTray, status?.active_extruder, t, getActiveSlotForAms, getNozzleSide, handleAmsSlotClick, handleExtSlotClick, fillOverrides, getSpoolmanFillForSlot]);
 
   return (
     <div className="h-full flex flex-col p-4">

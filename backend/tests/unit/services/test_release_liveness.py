@@ -184,6 +184,18 @@ async def _push(wired, passes, payload, *, timeout=15.0):
     """
     before = len(passes)
     wired.client._handle_ams_data(payload)
+    await _until_passed(passes, before, timeout)
+
+
+async def _push_status(wired, passes, fields, *, timeout=15.0):
+    """One whole STATUS push (``print`` block, ``ams`` inside it) as paho delivers it — the
+    feed state steps on it too — awaited to its pipeline pass."""
+    before = len(passes)
+    wired.client._process_message({"print": fields})
+    await _until_passed(passes, before, timeout)
+
+
+async def _until_passed(passes, before, timeout):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while len(passes) == before and loop.time() < deadline:
@@ -329,21 +341,32 @@ async def test_the_release_evidence_names_the_feeder_when_a_feeding_slot_empties
     wrong map by hand; only the production journey can tell the two apart, which is this
     file's whole reason to exist (memory ``liveness-paired-verification``).
 
-    The shape is a mid-print departure: the printer is RUNNING, the wire says this slot is
-    the tray that last actually fed the job, and the bay then empties — a runout or a
-    mid-print pull, never a glitch (operator ruling 15). Nothing here is seeded: the loss
+    The shape is a mid-print departure: the printer is RUNNING, its toolhead feed state
+    says this slot is the tray feeding the job, and the bay then empties — a runout or a
+    mid-print pull, never a glitch (operator ruling 15). Nothing here is seeded: the print
+    is pushed over the wire, so the feed state is the client's own reading, and the loss
     edge is derived by the presence pass from the same push the pipeline then resolves.
     """
     spool = await _bind(db_session, wired.printer.id)
     slot = (wired.printer.id, 0, 0)
 
-    # A live print whose last actual feeder is A0T0 (global tray 0*4+0).
-    wired.client.state.state = "RUNNING"
-    wired.client.state.last_loaded_tray = 0
-    wired.client.state.tray_now = 0
-
+    # A print this client watches start, fed from A0T0 (global tray 0*4+0): its full
+    # reports seat the roll (the first seeds presence; no edge yet) and step the feed state.
+    wired.client._previous_gcode_state = "IDLE"
     with caplog.at_level(logging.INFO, logger=_PIPELINE_LOGGER):
-        await _push(wired, passes, _seated_pushall())  # seeds presence; no edge yet
+        for layer in (0, 1):
+            await _push_status(
+                wired,
+                passes,
+                {
+                    "gcode_state": "RUNNING",
+                    "gcode_file": "job.3mf",
+                    "subtask_id": "job-A",
+                    "layer_num": layer,
+                    "ams": {**_seated_pushall(), "tray_now": "0"},
+                },
+            )
+        assert wired.client.feed().feeder == 0
         await _push(wired, passes, _cleared_pushall())  # the PRESENT→ABSENT edge + the release
 
     assert await _assignment(sessions, *slot) is None, "a mid-print departure still releases the binding"

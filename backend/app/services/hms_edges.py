@@ -34,7 +34,7 @@ class HmsEdgeReport:
 
 # printer_id -> (hms_wire_at of the last CONSUMED frame, that frame's live full_codes).
 # Process-lifetime, matching the fork's other event-edge bookkeeping
-# (``ams_presence._last_presence``, ``spool_respool._last_tray_now``).
+# (``ams_presence._last_presence``, ``spool_respool._switch_seen``).
 _edge_state: dict[int, tuple[float, frozenset[str]]] = {}
 
 

@@ -33,6 +33,7 @@ from backend.app.services import ams_presence, slot_pipeline, spool_binding, spo
 from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
 from backend.app.services.slot_state import Decision, DecisionKind, SlotState
 from backend.app.services.tray_observation import observation_tray_dict, observe_tray
+from backend.tests._fixtures import feed_wire
 
 
 def _seed_reseat(printer_id, ams_id, tray_id, *, absent_for, under_active_feed=False):
@@ -1704,12 +1705,12 @@ async def test_a_debounce_and_a_real_departure_are_told_apart_by_the_record(
     await _bind_row(db_session, glitched, printer.id, 0, 2)
     await _bind_row(db_session, drained, printer.id, 0, 3)
 
-    # A live print whose last actual feeder was T3 (global tray 0*4+3). T2 is idle.
-    monkeypatch.setattr(
-        ams_presence.printer_manager,
-        "get_status",
-        lambda pid: SimpleNamespace(state="RUNNING", last_loaded_tray=3, tray_now=3, raw_data={}),
-    )
+    # A live print feeding T3 (global tray 0*4+3), pushed over the wire to a REAL client
+    # whose toolhead feed state the loss edge asks. T2 is idle.
+    client = feed_wire.live_client()
+    feed_wire.start_print(client, 3)
+    monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: client.state)
+    monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
 
     seated = [
         observe_tray(printer.id, 0, {"id": 2, "state": 11, "tray_type": "PETG", "tray_color": "000000FF"}),

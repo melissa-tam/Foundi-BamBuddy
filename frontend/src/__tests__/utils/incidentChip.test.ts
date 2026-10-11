@@ -35,11 +35,12 @@ function incident(
 }
 
 /** An empty toolhead with NO verdict field — the shape an older backend sends. */
-const EMPTY: ToolheadState = { feed: 'empty', tray: null, refill: null };
+const EMPTY: ToolheadState = { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null };
 /** An empty toolhead carrying the backend's T3 verdict. */
 const emptyWith = (refillReason: ToolheadRefillReason | null): ToolheadState => ({
   feed: 'empty',
-  tray: null,
+  active_tray: null,
+  was_feeding_tray: null,
   refill: null,
   refill_reason: refillReason,
 });
@@ -56,11 +57,12 @@ const SILENT_REASONS = [
   'eject_sweep',
   'unknown',
 ] as const satisfies readonly ToolheadRefillReason[];
-const FED: ToolheadState = { feed: 'fed', tray: 2, refill: null };
-const LOADING: ToolheadState = { feed: 'empty', tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } };
+const FED: ToolheadState = { feed: 'fed', active_tray: 2, was_feeding_tray: null, refill: null };
+const LOADING: ToolheadState = { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'loading', slot: 'AMS A slot 1', answer: null } };
 const FAILED: ToolheadState = {
   feed: 'empty',
-  tray: null,
+  active_tray: null,
+  was_feeding_tray: null,
   refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'no_movement' },
 };
 
@@ -122,7 +124,7 @@ describe('holdChip precedence', () => {
 
   it('shows nothing for a paused print on a fed or unread toolhead', () => {
     expect(holdChip(status({ toolhead: FED }))).toBeNull();
-    expect(holdChip(status({ toolhead: { feed: 'unknown', tray: null, refill: null } }))).toBeNull();
+    expect(holdChip(status({ toolhead: { feed: 'unknown', active_tray: null, was_feeding_tray: null, refill: null } }))).toBeNull();
     expect(holdChip(status({ toolhead: null }))).toBeNull();
   });
 });
@@ -193,19 +195,19 @@ describe('holdChip states', () => {
 
   it('says "a spool" when the load names no slot', () => {
     const chip = holdChip(
-      status({ toolhead: { feed: 'unknown', tray: null, refill: { phase: 'loading', slot: null, answer: null } } }),
+      status({ toolhead: { feed: 'unknown', active_tray: null, was_feeding_tray: null, refill: { phase: 'loading', slot: null, answer: null } } }),
     );
     expect(keysOf(chip)).toEqual(['printers.toolhead.loadingAnySlot']);
   });
 
   it('leaves out the AMS answer when the failed load carries none', () => {
-    const chip = holdChip(status({ toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: null, answer: null } } }));
+    const chip = holdChip(status({ toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: null, answer: null } } }));
     expect(keysOf(chip)).toEqual(['printers.toolhead.loadFailedAnySlot', 'printers.incidentAction.toolhead_refill']);
   });
 
   it('names an AMS that moved without finishing the load', () => {
     const chip = holdChip(
-      status({ toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: 'AMS B slot 2', answer: 'acted' } } }),
+      status({ toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: 'AMS B slot 2', answer: 'acted' } } }),
     );
     expect(keysOf(chip)).toContain('printers.toolhead.answer.loadActed');
   });
@@ -220,7 +222,8 @@ describe('holdChip states', () => {
       status({
         toolhead: {
           feed: 'empty',
-          tray: null,
+          active_tray: null,
+          was_feeding_tray: null,
           refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'no_movement', command: 'unload' },
         },
       }),
@@ -236,7 +239,7 @@ describe('holdChip states', () => {
   it('names an unload that moved without finishing, and one with no slot', () => {
     const chip = holdChip(
       status({
-        toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: null, answer: 'acted', command: 'unload' } },
+        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: null, answer: 'acted', command: 'unload' } },
       }),
     );
     expect(keysOf(chip)).toEqual([
@@ -249,11 +252,11 @@ describe('holdChip states', () => {
   it('reads an explicit load the same as a missing command (an older backend)', () => {
     const explicit = holdChip(
       status({
-        toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'acted', command: 'load' } },
+        toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'acted', command: 'load' } },
       }),
     );
     const missing = holdChip(
-      status({ toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'acted' } } }),
+      status({ toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot: 'AMS A slot 1', answer: 'acted' } } }),
     );
     expect(keysOf(explicit)).toEqual([
       'printers.toolhead.loadFailed',
@@ -274,11 +277,11 @@ describe('holdChip states', () => {
     const slots = ['AMS A slot 1', null] as const;
     const chips = [
       holdChip(status({ toolhead: LOADING })),
-      holdChip(status({ toolhead: { feed: 'empty', tray: null, refill: { phase: 'loading', slot: null, answer: null } } })),
+      holdChip(status({ toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'loading', slot: null, answer: null } } })),
       ...commands.flatMap((command) =>
         slots.flatMap((slot) =>
           answers.map((answer) =>
-            holdChip(status({ toolhead: { feed: 'empty', tray: null, refill: { phase: 'failed', slot, answer, command } } })),
+            holdChip(status({ toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: { phase: 'failed', slot, answer, command } } })),
           ),
         ),
       ),

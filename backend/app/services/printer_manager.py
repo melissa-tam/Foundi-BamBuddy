@@ -749,6 +749,22 @@ class PrinterManager:
             if self._on_drying_complete:
                 self._schedule_async(self._on_drying_complete(printer_id, ams_id))
 
+        def farm_acting() -> bool:
+            """Does a FARM motion own this printer right now — a live recovery driver, or a farm
+            motion command its step ledger still holds pending? The feed state's attribution of a
+            landing (``feed_state.LoadLanded.farm_acting``), asked by the client once per push on
+            the MQTT thread: both reads are the incident store's sync, DB-free projections.
+
+            The printer id lives in this closure, as on the AMS hooks: the client is keyed by
+            serial and imports nothing above itself. Call-time import, like this module's other
+            reaches into ``printer_incidents``.
+            """
+            from backend.app.services import printer_incidents
+
+            return (
+                printer_incidents.driver_live(printer_id) or printer_incidents.pending_command(printer_id) is not None
+            )
+
         client = BambuMQTTClient(
             ip_address=printer.ip_address,
             serial_number=printer.serial_number,
@@ -765,6 +781,7 @@ class PrinterManager:
             on_drying_complete=on_drying_complete,
             on_print_running_observed=on_print_running_observed,
             on_finish_photo_moment=on_finish_photo_moment,
+            farm_acting=farm_acting,
         )
 
         client.connect()
@@ -1318,36 +1335,56 @@ def open_incident_payload(printer_id: int | None) -> dict | None:
 
 def toolhead_payload(printer_id: int | None, state: PrinterState | None) -> dict:
     """The printer's ACTIVE extruder feed and the farm's refill of it, as the card's "Toolhead empty"
-    chip reads it (K10/C3c, 2026-10-10): ``{"feed", "tray", "refill", "refill_reason"}``.
+    chip and its slot rings read it (K10/C3c, 2026-10-10):
+    ``{"feed", "active_tray", "was_feeding_tray", "refill", "refill_reason"}``.
 
-    DERIVED on every broadcast, never stored: ``feed`` / ``tray`` are ``tray_fields.toolhead_feed``'s
-    ACTIVE reading (K1 — the one reader of "is the toolhead fed"; on a dual nozzle an empty active
-    nozzle beside a loaded one is empty), and ``refill`` is ``printer_incidents.refill_state``
-    (``{"phase", "command", "slot", "answer"}`` — the open-row projection and the liveness slot,
-    passed through as is) — carried only while the feed reads empty or unknown,
-    because a toolhead that reads fed again was loaded, and a failed refill under it is history.
-    ``refill_reason`` is what a Resume would do about an EMPTY feed — the T3 verdict
-    (``refill_verdict.refill_owed``'s reason, the client's peaks read here), so the card never
-    re-derives K7 (012-H2S 2026-10-10: paused at layer 0, the start block loads itself —
-    ``before_first_layer``, never "Load a slot"); ``None`` for any other feed. The verdict is a
-    LEAF (``test_import_graph.TestTheRefillVerdictIsALeaf``): this registry never imports the
-    recovery driver.
+    DERIVED on every broadcast, never stored:
+
+    * ``feed`` is ``tray_fields.toolhead_feed``'s ACTIVE reading (K1 — the one reader of "is the
+      toolhead fed"; on a dual nozzle an empty active nozzle beside a loaded one is empty);
+    * ``active_tray`` / ``was_feeding_tray`` are the toolhead's FEED STATE (``feed_state``,
+      invariant 16 — the client's ``feed()``): the effective feeder — the AMS global tray, or 254
+      for the external spool, and during a drained roll's TAIL the DRAINING roll, never the
+      ``tray_now`` pre-flip target that is not fed yet — and, while a job is RUNNING or PAUSEd with
+      nothing fed, the job's last real feeder. ONE answer for every client, so no card keeps a
+      ``tray_now`` cache of its own to remember which slot was feeding;
+    * ``refill`` is ``printer_incidents.refill_state`` (``{"phase", "command", "slot", "answer"}`` —
+      the open-row projection and the liveness slot, passed through as is) — carried only while the
+      feed reads empty or unknown, because a toolhead that reads fed again was loaded, and a failed
+      refill under it is history;
+    * ``refill_reason`` is what a Resume would do about an EMPTY feed — the T3 verdict
+      (``refill_verdict.refill_owed``'s reason, over the feed state read here), so the card never
+      re-derives K7 (012-H2S 2026-10-10: paused at layer 0, the start block loads itself —
+      ``before_first_layer``, never "Load a slot"); ``None`` for any other feed. The verdict and the
+      feed state are LEAVES (``test_import_graph.TestTheRefillVerdictIsALeaf``): this registry never
+      imports the recovery driver.
 
     ONE builder for all three construction sites (the WS serializer below and BOTH REST ``/status``
     branches), like :func:`open_incident_payload`. JSON primitives only. Total: ``state`` may be
-    ``None`` (no session) — the feed is then ``unknown``.
+    ``None`` (no session) — the feed is then ``unknown`` and nothing is named as fed.
     """
     from backend.app.services import printer_incidents, refill_verdict
     from backend.app.services.tray_fields import toolhead_feed
 
     active = toolhead_feed(state).active
+    client = printer_manager.get_client(printer_id) if printer_id else None
+    reading = client.feed() if client is not None and state is not None else None
+    active_tray = reading.feeder if reading is not None else None
+    was_feeding_tray = None
+    job_active = (getattr(state, "state", None) or "").upper() in ("RUNNING", "PAUSE")
+    if reading is not None and active_tray is None and job_active and reading.last_loaded >= 0:
+        was_feeding_tray = reading.last_loaded
     refill = printer_incidents.refill_state(printer_id) if active.kind in ("empty", "unknown") else None
     reason = None
     if active.kind == "empty" and printer_id:
-        client = printer_manager.get_client(printer_id)
-        peaks = client.job_peaks() if client is not None else None
-        reason = refill_verdict.refill_owed(printer_id, state, trigger="T3", peaks=peaks).reason
-    return {"feed": active.kind, "tray": active.tray, "refill": refill, "refill_reason": reason}
+        reason = refill_verdict.refill_owed(printer_id, state, trigger="T3", reading=reading).reason
+    return {
+        "feed": active.kind,
+        "active_tray": active_tray,
+        "was_feeding_tray": was_feeding_tray,
+        "refill": refill,
+        "refill_reason": reason,
+    }
 
 
 def plate_check_exit_payload(printer_id: int | None, state: PrinterState | None) -> dict | None:
@@ -1761,8 +1798,9 @@ def printer_state_to_dict(
         # The plate-check human's turn (2026-10-05): {print_error, job_id, actions,
         # deadline_at} or null — its own field, same builder as BOTH /status branches.
         "plate_check_exit": plate_check_exit,
-        # The ACTIVE extruder's feed and the farm's refill of it (2026-10-10): {feed, tray,
-        # refill} — what the "Toolhead empty" chip reads; same builder as BOTH /status branches.
+        # The ACTIVE extruder's feed and the farm's refill of it (2026-10-10): {feed, active_tray,
+        # was_feeding_tray, refill, refill_reason} — what the "Toolhead empty" chip and the slot
+        # rings read; same builder as BOTH /status branches.
         "toolhead": toolhead_payload(printer_id, state),
     }
     # Add cover URL if there's an active print and printer_id is provided

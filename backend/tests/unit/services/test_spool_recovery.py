@@ -35,6 +35,7 @@ from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.services import ams_command, incident_resolution, printer_incidents, refill_verdict, spool_recovery
 from backend.app.services.bambu_mqtt import CommandAck, HMSError, PrinterState
+from backend.app.services.feed_state import FeedPhase
 from backend.app.services.printer_incidents import (
     WAITING_REASON_FAILED,
     WAITING_REASON_RECOVERING,
@@ -45,7 +46,9 @@ from backend.app.services.spool_recovery import (
     on_ams_fault,
 )
 from backend.app.services.tray_fields import ExtruderFeed, valid_feeder
+from backend.tests._fixtures import feed_wire
 from backend.tests._fixtures.clock import FakeClock
+from backend.tests._fixtures.feed import ScriptedFeed
 
 _NONE_TAG = "0000000000000000"
 _NONE_UUID = "0" * 32
@@ -239,6 +242,14 @@ class FakeClient:
     firmware's ACK by it (:meth:`ack_for`). No ACK arrives unless the case scripts one:
     ``ack_motion`` acknowledges every load/unload at its publish (the 012-H2S 2026-09-23
     wire: six commands, each echoed ``success``), and :meth:`ack` enqueues one by hand.
+
+    The toolhead's FEED STATE (``feed()``) is a REAL tracker stepped off the scripted state
+    (``_fixtures.feed.ScriptedFeed``), one step per push: the client has seen the printer report
+    by the time a case builds it (two pushes at construction — the session's re-seed, then the
+    first reading), every live-state poll of the driver is a push (:func:`_wire`), and a case that
+    plays the per-push sampler pushes explicitly (:meth:`push`, :func:`_push`). Its ``farm_acting``
+    is production's provider (a live driver, or a farm command pending) for the printer
+    :func:`_wire` bound it to.
     """
 
     # The client's nozzle TOPOLOGY flag. Single-nozzle by default, like the H2S fleet the
@@ -339,6 +350,28 @@ class FakeClient:
         self._seq = 0
         self._last_sent: dict[str, str] = {}
         self._acks: dict[tuple[str, str], CommandAck] = {}
+        # The printer :func:`_wire` binds this client to — production's ``farm_acting`` provider
+        # asks the incident store about THAT printer (``printer_manager.connect_printer``).
+        self.printer_id: int | None = None
+        self._feed = ScriptedFeed(farm_acting=self._farm_acting)
+        self._feed.settle(state)
+
+    # --- the toolhead feed state ------------------------------------------------------
+
+    def _farm_acting(self) -> bool:
+        pid = self.printer_id
+        return pid is not None and (
+            printer_incidents.driver_live(pid) or printer_incidents.pending_command(pid) is not None
+        )
+
+    def push(self):
+        """ONE status push of the scripted state: step the feed state, as the real client does
+        after it applies every field of a push."""
+        return self._feed.push(self.state)
+
+    def feed(self):
+        """The feed state's latest reading (``BambuMQTTClient.feed()``)."""
+        return self._feed.reading
 
     # --- the sequenced-publish surface the ams_command verbs correlate by ---------
 
@@ -499,18 +532,37 @@ def _wire(monkeypatch, state, client, *, on_poll=None):
     ``on_poll(n, state)`` (optional) runs on every live-state read, so a test can
     drive AMS telemetry that changes *between* polls (the filament-change cycle) and
     assert what the machine had done by then.
+
+    Every poll is also one status PUSH of a scripted client (``FakeClient.push``): the driver's
+    reads of the wire and the feed state's steps move together, as the real client steps its
+    feed state once per push.
     """
     polls = {"n": 0}
 
-    def _status(_pid):
+    def _bind(pid):
+        if isinstance(client, FakeClient):
+            client.printer_id = pid
+        return client
+
+    def _status(pid):
         polls["n"] += 1
         if on_poll is not None:
             on_poll(polls["n"], state)
+        if isinstance(_bind(pid), FakeClient):
+            client.push()
         return state
 
     monkeypatch.setattr(spool_recovery.printer_manager, "get_status", _status)
-    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: client)
+    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", _bind)
     return polls
+
+
+def _push(printer_id, client, state=None):
+    """ONE status push as production runs it: the client steps its feed state, then the per-push
+    sampler (``note_demand_watch``) reads the push."""
+    client.printer_id = printer_id
+    client.push()
+    spool_recovery.note_demand_watch(printer_id, state if state is not None else client.state)
 
 
 def _repause_after_running(times=1, *, hms=None):
@@ -3415,13 +3467,24 @@ async def test_runout_escalation_names_the_firmware_demanded_slot(
     assert failed.call_args.kwargs["kind"] == "runout"
 
 
-def _resolve_jam(item, state, *, candidates=(), printer_id=None):
-    """The tray resolution the entry gate runs for a MECHANICAL fault."""
+def _resolve_jam(item, state, *, candidates=(), printer_id=7, fed_before=()):
+    """The tray resolution the entry gate runs for a MECHANICAL fault, on a printer whose client's
+    feed state saw ``fed_before`` (one push each, the trays fed in that order) and then ``state``
+    — a real tracker stepped off the scripted pushes (``ScriptedFeed``), the feeder tier's witness."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
     from backend.app.models.printer_incident import KIND_JAM
 
-    return spool_recovery._resolve_fault_tray(
-        item, state, kind=KIND_JAM, external=False, candidates=candidates, printer_id=printer_id
-    )
+    feed = ScriptedFeed()
+    for tray in fed_before:
+        feed.push(SimpleNamespace(**{**vars(state), "tray_now": tray}))
+    feed.push(state)
+    client = SimpleNamespace(feed=lambda: feed.reading, captured_ams_mapping=None)
+    with patch.object(spool_recovery.printer_manager, "get_client", lambda _pid: client):
+        return spool_recovery._resolve_fault_tray(
+            item, state, kind=KIND_JAM, external=False, candidates=candidates, printer_id=printer_id
+        )
 
 
 def _resolve_runout(item, state, *, candidates=(), printer_id=None):
@@ -3505,14 +3568,41 @@ class TestJammedFeederResolution:
         mapping, and the feeding tray identifies the jam on its own."""
         assert _resolve_jam(None, _wire_state(tray_now=2)) == (2, "single")
 
-    def test_last_loaded_tray_answers_when_tray_now_reads_unloaded(self):
-        """After a feed fault tray_now frequently reads 255 "nothing feeding" while
-        the jam is on the tray that fed a second earlier."""
-        assert _resolve_jam(None, _wire_state(tray_now=255, last_loaded_tray=1)) == (1, "single")
+    def test_the_last_feeder_answers_when_the_toolhead_reads_unloaded(self):
+        """After a feed fault the toolhead frequently reads 255 "nothing feeding" while the jam is
+        on the tray that fed a second earlier — the feed state's last feeder of the active
+        extruder (``ExtruderReading.last_fed``)."""
+        assert _resolve_jam(None, _wire_state(tray_now=255), fed_before=(1,)) == (1, "single")
+
+    def test_a_scripted_last_loaded_tray_is_no_witness(self):
+        """The feeder tier reads the FEED STATE, never a ``last_loaded_tray`` frame (invariant 16):
+        a tray the feed state never saw fed names nothing."""
+        assert _resolve_jam(None, _wire_state(tray_now=255, last_loaded_tray=1)) == (None, "none")
 
     def test_external_and_unloaded_sentinels_are_not_feeders(self):
         """254 (external) and 255 (nothing fed) are sentinels, not trays."""
-        assert _resolve_jam(None, _wire_state(tray_now=254, last_loaded_tray=255)) == (None, "none")
+        assert _resolve_jam(None, _wire_state(tray_now=255), fed_before=(254,)) == (None, "none")
+        assert _resolve_jam(None, _wire_state(tray_now=254)) == (None, "none")
+
+    def test_a_pre_flip_inside_a_drained_rolls_tail_is_not_the_jammed_tray(self):
+        """005/001-H2S 2026-10-10: the drained roll's tail still feeds while ``tray_now`` already
+        reads the backup — a jam then is on the DRAINING roll's path, never on the pre-flip target
+        that is not fed yet (the feed state's effective feeder is the tail)."""
+        drained = [_ams_tray(0), {**_ams_tray(1), "state": 9, "tray_type": ""}]
+        fed = _make_state(gcode_state="RUNNING", tray_now=1, hms=[])
+        tail = _make_state(gcode_state="RUNNING", tray_now=1, hms=[], trays=drained)
+        pre_flip = _make_state(gcode_state="RUNNING", tray_now=0, hms=[], trays=drained)
+        feed = ScriptedFeed()
+        for push in (fed, fed, tail, pre_flip):
+            feed.push(push)
+        assert (feed.reading.phase, feed.reading.feeder) == (FeedPhase.TAIL, 1)
+
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        client = SimpleNamespace(feed=lambda: feed.reading, captured_ams_mapping=None)
+        with patch.object(spool_recovery.printer_manager, "get_client", lambda _pid: client):
+            assert spool_recovery._resolve_jammed_tray(pre_flip, printer_id=7) == (1, "single")
 
     def test_conflicting_feeders_escalate_as_multi_feeder(self):
         """A multi-material job: the swap cannot hold (the firmware re-loads the
@@ -7484,11 +7574,14 @@ class TestTheDriverOwnsItsHeldCommand:
 
 class TestTheRefillStep:
     """K8 (2026-10-10): the farm never pages with the toolhead EMPTY when a spool will load. At
-    every give-up whose active extruder reads empty — outside a change, with no farm command
-    pending — the driver refills it first (``_refill_toolhead``): the job's last feeder when it
-    is present and not spent (an out-of-rotation stamp does NOT disqualify it: Raymond
-    2026-09-17, "reload original spool that was faulty raise the gate and let human fix"), else
-    the swap's selection; the unload first unless invariant 8 lets it skip; the load through
+    every give-up where a person's Resume would print air — K7 asked as T3: the feed state empty,
+    outside a change, with no farm command pending — the driver refills it first
+    (``_refill_toolhead``): the job's last feeder when it is present and not spent (an
+    out-of-rotation stamp does NOT disqualify it: Raymond 2026-09-17, "reload original spool that
+    was faulty raise the gate and let human fix" — whose purpose, in his own words 2026-10-10, is
+    "this was said solely to prevent empty tool head resumes for all scenarios": a RELOAD so that
+    no resume prints air, never a rule that a person must fix what the farm can reload), else the
+    swap's selection; the unload first unless invariant 8 lets it skip; the load through
     ``ams_command``; "reached the toolhead" read off the K1 toolhead feed. It REPLACES the
     restore, and reverses the 2026-09 agent design "the restore undoes only the driver's own
     motion" (never an operator ruling): an empty toolhead is refilled whoever emptied it."""
@@ -9378,19 +9471,6 @@ def test_unload_skippable_reads_the_active_extruder(tray_now, snow, active, skip
     assert spool_recovery._unload_skippable(state) is skippable
 
 
-def test_slot_was_feeding_reads_the_deputy_off_the_state(monkeypatch):
-    """The presence lane's question at a loss edge: was this slot feeding EITHER hotend? The
-    per-extruder witness is ``tray_fields.toolhead_feed``'s, off the state — no client topology
-    lookup can hide it."""
-    monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
-    state = _make_state(tray_now=0)
-    state.last_loaded_tray = 0
-    state.h2d_extruder_snow = {0: 0, 1: 2}  # the deputy feeds AMS A slot 3
-
-    assert spool_recovery.slot_was_feeding(state, 0, 2, printer_id=7) is True
-    assert spool_recovery.slot_was_feeding(state, 0, 3, printer_id=7) is False
-
-
 def test_the_page_reads_the_active_extruder_on_a_dual_nozzle(monkeypatch):
     """The PAGE, unlike the reader above, states the ACTIVE extruder (K1,
     ``tray_fields.toolhead_feed``): on an H2C an empty active nozzle beside a loaded deputy
@@ -9839,6 +9919,42 @@ async def test_a_no_candidate_give_up_at_255_reloads_the_jobs_own_spool(
     )
     db_session.expunge_all()
     assert (await db_session.get(Spool, jammed.id)).feed_fault_at is None
+
+
+@pytest.mark.parametrize(
+    ("wire", "hold", "reason"),
+    [
+        # The deliberate consequence: the start block loads the filament itself, as on every resume.
+        pytest.param({"layer": 0}, False, "before_first_layer", id="before_the_first_layer"),
+        pytest.param({"ams_status_main": 1}, False, "change_in_flight", id="inside_a_filament_change"),
+        pytest.param({}, True, "maintenance", id="in_maintenance_mode"),
+    ],
+)
+async def test_the_give_up_refills_only_what_k7_owes(
+    db_session, printer_factory, install_settings, monkeypatch, wire, hold, reason
+):
+    """The give-up's refill asks K7 (T3 — would a person's Resume print air?), never a private
+    subset of its exclusions: where K7 owes nothing, the give-up sends nothing and pages the
+    measured toolhead."""
+    from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+    install_settings()
+    printer = await printer_factory()
+    item = await _farm_item(db_session, printer.id)
+    if hold:
+        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+    failed = _spy(monkeypatch, "on_spool_recovery_failed")
+    state = _make_state(tray_now=255, trays=[_ams_tray(0)], **wire)
+    client = FakeClient(state)
+    _wire(monkeypatch, state, client)
+    incident = await _owned_incident(db_session, printer.id, step_timeout_s=0.05, item_id=item.id)
+    evidence = await _log(db_session, incident.incident_id)
+
+    assert refill_verdict.refill_owed(printer.id, state, trigger="T3", reading=client.feed()).reason == reason
+    await spool_recovery._give_up(incident, "feed_path_blocked", evidence=evidence)
+
+    assert not any(c[0] in ("load", "unload") for c in client.calls)
+    failed.assert_awaited_once()
 
 
 # --- causality and single-origin pins ---------------------------------------
@@ -10356,7 +10472,7 @@ class TestTheUpgradeKeepsTheSlotTheEventNamed:
         )
 
     def test_an_ams_ht_slot_is_encoded_by_the_codec_not_by_hand(self):
-        """Invariant 1: `spool_respool.encode_global_tray` is THE codec, and it knows
+        """Invariant 1: `tray_fields.encode_global_tray` is THE codec, and it knows
         conventions a bare ``ams_id * 4 + tray_id`` silently drops.
 
         An AMS-HT unit is a SINGLE-tray device whose unit id IS its global tray id
@@ -10364,7 +10480,7 @@ class TestTheUpgradeKeepsTheSlotTheEventNamed:
         fleet with enough units a well-formed id belonging to somebody else's tray.
         A wrong tray is worse than none on every surface this answer reaches."""
         from backend.app.services.hms_errors import AmsFaultClass
-        from backend.app.services.spool_respool import encode_global_tray
+        from backend.app.services.tray_fields import encode_global_tray
 
         assert encode_global_tray(128, 0) == 128  # the codec's own statement
         tray, verdict = self._resolve({self._candidate(AmsFaultClass.PHYSICAL_FAULT, "1800_8003", (128, 0))})
@@ -10376,7 +10492,7 @@ class TestTheUpgradeKeepsTheSlotTheEventNamed:
         slot at all. It must read exactly as "no slot" — never as an id the arithmetic
         would happily have produced."""
         from backend.app.services.hms_errors import AmsFaultClass
-        from backend.app.services.spool_respool import encode_global_tray
+        from backend.app.services.tray_fields import encode_global_tray
 
         assert encode_global_tray(128, 2) is None
         assert self._resolve({self._candidate(AmsFaultClass.PHYSICAL_FAULT, "1800_8003", (128, 2))}) == (
@@ -12042,34 +12158,71 @@ def _air_state(*, tray_now=255, layer=50, total=100, gcode_state="PAUSE", hms=No
 
 
 class TestTheRefillVerdict:
-    """``refill_verdict.refill_owed(printer_id, state, *, trigger, peaks)`` — the ONE answer to "may the farm
-    refill this toolhead now", read by the resume verb (T3), the per-push detectors (T2 / T4) and
-    nothing else. Closed reasons; every trigger is an EVENT (Raymond 2026-10-10: "time is not the
-    right signal"); ``physical`` excludes T2 only (T3/T4 still try and report); ``last_layer`` is
-    T4's (the end-of-print retract reads empty at the last layer)."""
+    """``refill_verdict.refill_owed(printer_id, state, *, trigger, reading)`` — the ONE answer to "may
+    the farm refill this toolhead now", read by the resume verb (T3), the give-up (T3), the per-push
+    detectors (T2 / T4) and the status frame. The feed is the toolhead's FEED STATE phase (invariant
+    16 — the reading of a real tracker stepped off the scripted pushes), mapped through ONE total
+    table; K7 keeps only the POLICY. Closed reasons; every trigger is an EVENT (Raymond 2026-10-10:
+    "time is not the right signal"); ``physical`` excludes T2 only (T3/T4 still try and report)."""
 
     _TRIGGERS = ("T2", "T3", "T4")
 
     async def _verdicts(self, monkeypatch, printer_id, state, client=None):
-        client = client if client is not None else FakeClient(state)
+        client = client if client is not None else (FakeClient(state) if state is not None else None)
         _wire(monkeypatch, state, client)
-        # The FakeClient scripts its peaks off the state, so a state-less case hands in none — the
-        # verdict answers ``unknown`` on the state alone before it reads them.
-        peaks = client.job_peaks() if state is not None else None
-        return {t: refill_verdict.refill_owed(printer_id, state, trigger=t, peaks=peaks).reason for t in self._TRIGGERS}
+        reading = client.feed() if client is not None else None
+        return {
+            t: refill_verdict.refill_owed(printer_id, state, trigger=t, reading=reading).reason for t in self._TRIGGERS
+        }
 
     async def test_an_empty_toolhead_mid_print_is_owed_on_every_trigger(self, db_session, printer_factory, monkeypatch):
+        """PAUSEd empty at layer 50 of 100, no demand, no change: ``EMPTY_PAUSED``."""
         printer = await printer_factory()
         verdicts = await self._verdicts(monkeypatch, printer.id, _air_state())
         assert verdicts == {"T2": "owed", "T3": "owed", "T4": "owed"}
         state = _air_state()
-        assert refill_verdict.refill_owed(printer.id, state, trigger="T3", peaks=FakeClient(state).job_peaks()).owed
+        assert refill_verdict.refill_owed(printer.id, state, trigger="T3", reading=FakeClient(state).feed()).owed
 
     @pytest.mark.parametrize("tray_now", [0, 3, 254], ids=["fed_slot_1", "fed_slot_4", "external_spool"])
     async def test_a_fed_toolhead_owes_nothing(self, db_session, printer_factory, monkeypatch, tray_now):
         printer = await printer_factory()
         verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(tray_now=tray_now))
         assert set(verdicts.values()) == {"fed"}
+
+    async def test_a_drained_rolls_tail_is_fed(self, db_session, printer_factory, monkeypatch):
+        """``TAIL``: the roll ran dry at the AMS and its tail still feeds — even with ``tray_now``
+        already PRE-FLIPPED onto an EMPTY backup slot (001-H2S 2026-10-10 18:22)."""
+        printer = await printer_factory()
+        drained = [
+            {**_ams_tray(0), "state": 9, "tray_type": ""},
+            _ams_tray(1),
+            {**_ams_tray(2), "state": 9, "tray_type": ""},
+        ]
+        state = _air_state(tray_now=2, gcode_state="RUNNING")
+        client = FakeClient(state)
+        state.raw_data = {"ams": [{"id": 0, "tray": drained}]}
+        client.push()  # T2 drains at the AMS
+        state.tray_now = 0
+        client.push()  # the pre-flip onto the empty slot 0
+        assert (client.feed().phase, client.feed().feeder) == (FeedPhase.TAIL, 2)
+        assert set((await self._verdicts(monkeypatch, printer.id, state, client)).values()) == {"fed"}
+
+    async def test_the_first_empty_frames_of_a_running_print_are_unconfirmed_and_air_is_owed(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """THE 2026-10-10 change. RUNNING with nothing fed and no firmware sequence YET is the first
+        frame of an auto-switch as much as of a print on air: ``unconfirmed`` on every trigger — the
+        farm acts on nothing. A layer printed on nothing is AIR: ``owed``."""
+        printer = await printer_factory()
+        state = _air_state(gcode_state="RUNNING")
+        client = FakeClient(state)
+        assert client.feed().phase is FeedPhase.EMPTY_UNCONFIRMED
+        assert set((await self._verdicts(monkeypatch, printer.id, state, client)).values()) == {"unconfirmed"}
+
+        state.layer_num += 1
+        client.push()
+        assert client.feed().phase is FeedPhase.AIR
+        assert set((await self._verdicts(monkeypatch, printer.id, state, client)).values()) == {"owed"}
 
     async def test_no_live_reading_is_unknown(self, db_session, printer_factory, monkeypatch):
         printer = await printer_factory()
@@ -12080,15 +12233,20 @@ class TestTheRefillVerdict:
         unparsed = _air_state(tray_now=None)
         assert set((await self._verdicts(monkeypatch, printer.id, unparsed)).values()) == {"unknown"}
 
+    async def test_no_job_decides_nothing(self, db_session, printer_factory, monkeypatch):
+        """``IDLE`` (the job's lifecycle gate shut) decides nothing, fed or not."""
+        printer = await printer_factory()
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(gcode_state="IDLE"))
+        assert set(verdicts.values()) == {"unknown"}
+
     async def test_no_client_is_unknown(self, db_session, printer_factory, monkeypatch):
-        """``before_first_layer`` is read off the client's one peaks reader; with no client (no
-        peaks handed in) the job's layer is not a measurement, so nothing is decided — and the
-        driver's own gather hands in none when the registry holds no client."""
+        """With no client there is no feed state (no ``reading`` handed in): nothing is decided —
+        and the driver's own read hands in none when the registry holds no client."""
         printer = await printer_factory()
         state = _air_state()
-        assert refill_verdict.refill_owed(printer.id, state, trigger="T3", peaks=None).reason == "unknown"
+        assert refill_verdict.refill_owed(printer.id, state, trigger="T3", reading=None).reason == "unknown"
         monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: None)
-        assert spool_recovery._job_peaks(printer.id) is None
+        assert spool_recovery._feed_reading(printer.id) is None
 
     async def test_a_filament_change_in_flight_is_the_amss(self, db_session, printer_factory, monkeypatch):
         printer = await printer_factory()
@@ -12101,8 +12259,9 @@ class TestTheRefillVerdict:
         assert set(verdicts.values()) == {"power_loss_prompt"}
 
     async def test_a_runout_demand_is_the_refill_lanes(self, db_session, printer_factory, monkeypatch):
-        """The firmware asks for the SAME slot (invariant 9): the refill LANE owns it — on the wire,
-        and on the open runout row once the demand has cleared (the refill lane's own evidence)."""
+        """The firmware asks for the SAME slot (invariant 9): the refill LANE owns it — the phase
+        (``RUNOUT_HELD``), and the open runout row once the demand has cleared (the refill lane's own
+        evidence)."""
         printer = await printer_factory()
         on_wire = await self._verdicts(monkeypatch, printer.id, _air_state(hms=[_runout_demand_hms(0, 2)]))
         assert set(on_wire.values()) == {"runout_demand"}
@@ -12123,8 +12282,8 @@ class TestTheRefillVerdict:
 
     async def test_a_physical_hold_excludes_only_t2(self, db_session, printer_factory, monkeypatch):
         """An open PHYSICAL hold: the exit is the operator's load, so the farm's own command running
-        after the hand-over (T2) does not refill — but a person's Resume (T3) and a screen resume onto
-        air (T4) still try the refill and report a failure."""
+        after the hand-over (T2) does not refill — but a person's Resume (T3) and a print on air (T4)
+        still try the refill and report a failure."""
         from backend.app.models.printer_incident import KIND_PHYSICAL
 
         printer = await printer_factory()
@@ -12137,12 +12296,14 @@ class TestTheRefillVerdict:
         verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(layer=0))
         assert set(verdicts.values()) == {"before_first_layer"}
 
-    async def test_the_last_layer_is_t4s_end_of_print_retract(self, db_session, printer_factory, monkeypatch):
-        """The end-of-print retract reads empty AT the last layer of a RUNNING job (JobPeaks'
-        ``first_unfed_layer`` rule): not air. A paused print there still has layer left to print."""
+    async def test_the_last_layer_running_is_the_end_of_print_retract(self, db_session, printer_factory, monkeypatch):
+        """``END_RETRACT``: a RUNNING job AT its last layer reads empty because of the end-of-print
+        retract — never air, on every trigger. A PAUSEd print there still has layer left to print."""
         printer = await printer_factory()
-        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(layer=100, total=100))
-        assert verdicts == {"T2": "owed", "T3": "owed", "T4": "last_layer"}
+        running = await self._verdicts(monkeypatch, printer.id, _air_state(layer=100, total=100, gcode_state="RUNNING"))
+        assert set(running.values()) == {"last_layer"}
+        paused = await self._verdicts(monkeypatch, printer.id, _air_state(layer=100, total=100))
+        assert set(paused.values()) == {"owed"}
 
     async def test_a_farm_command_still_queued_is_never_sent_behind(self, db_session, printer_factory, monkeypatch):
         """A command the AMS accepted and has not run runs when it runs; anything sent behind it runs
@@ -12165,14 +12326,18 @@ class TestTheRefillVerdict:
 
     async def test_the_firmware_feeding_itself_outranks_maintenance(self, db_session, printer_factory, monkeypatch):
         """Precedence is part of the contract: where the FIRMWARE owns the toolhead's next motion (a
-        change in flight, a same-slot demand, the reboot prompt, the start block) that is the answer,
-        whatever else holds — a resume there prints no air."""
+        change in flight, a same-slot demand) that is the answer, whatever else holds — a resume there
+        prints no air. The start block yields to the policy, as before."""
         from backend.app.models.printer_incident import KIND_SERVICE_HOLD
 
         printer = await printer_factory()
         await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
         verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(hms=[_runout_demand_hms(0, 2)]))
         assert set(verdicts.values()) == {"runout_demand"}
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(ams_status_main=1))
+        assert set(verdicts.values()) == {"change_in_flight"}
+        verdicts = await self._verdicts(monkeypatch, printer.id, _air_state(layer=0))
+        assert set(verdicts.values()) == {"maintenance"}
 
     def test_the_reason_vocabulary_is_closed(self):
         assert set(get_args(refill_verdict.RefillReason)) == {
@@ -12187,9 +12352,30 @@ class TestTheRefillVerdict:
             "change_in_flight",
             "command_pending",
             "eject_sweep",
+            "unconfirmed",
             "unknown",
         }
         assert set(get_args(refill_verdict.RefillTrigger)) == {"T2", "T3", "T4"}
+
+    def test_the_phase_table_is_total(self):
+        """ONE total ``(FeedPhase × trigger) → reason`` table: a missing cell RAISES at the lookup,
+        and completeness here keeps that raise off every caller."""
+        missing = [
+            (phase, trigger)
+            for phase in FeedPhase
+            for trigger in self._TRIGGERS
+            if (phase, trigger) not in refill_verdict._PHASE_REASON
+        ]
+        assert missing == []
+        assert len(refill_verdict._PHASE_REASON) == len(FeedPhase) * len(self._TRIGGERS)
+        with pytest.raises(LookupError):
+            refill_verdict._phase_reason(FeedPhase.FED, "T9")  # type: ignore[arg-type]
+
+    def test_the_answers_before_the_policy_are_the_phases_own(self):
+        """The phase settles four answers outright — nothing to decide on, fed, the firmware's change,
+        the firmware's demand; every other phase answer yields to the policy."""
+        assert {"unknown", "fed", "change_in_flight", "runout_demand"} == refill_verdict._BEFORE_POLICY
+        assert set(refill_verdict._PHASE_REASON.values()) >= refill_verdict._BEFORE_POLICY
 
     async def test_an_eject_sweep_is_filament_less_by_design(self, db_session, printer_factory, monkeypatch):
         """The farm's own eject job RUNS with the filament retracted: never air, never a refill."""
@@ -12589,11 +12775,12 @@ class TestTheD1DetectorAfterTheHandOver:
 
 
 class TestTheD2DetectorOfAPrintRunningOnAir:
-    """D2 (RUNNING): the ACTIVE extruder reads empty, no change in flight, 1 <= layer < total, no
-    driver live, and K7(T4) owes a refill: pause on the FIRST push (Raymond 2026-09-17: "If nothing is
-    feedingg after 20secs the print is ruined already"), refill, resume. A LEVEL check — the first
-    sample after a restart included — never twice for one episode (the registered driver guards it
-    while it lives; after it, the wire is fed again)."""
+    """D2 (RUNNING): the toolhead's feed state reads AIR — a layer printed on nothing, or six quiet
+    reports (invariant 16) — no driver live, and K7(T4) owes a refill: pause, refill, resume (Raymond
+    2026-09-17: "If nothing is feedingg after 20secs the print is ruined already"). Never the first
+    empty frame: that is also the first frame of the firmware's runout auto-switch. A LEVEL check on
+    the phase — the first sample after a restart included — never twice for one episode (the
+    registered driver guards it while it lives; after it, the toolhead is fed again)."""
 
     @pytest.fixture(autouse=True)
     def _fast(self, install_settings, monkeypatch):
@@ -12609,9 +12796,12 @@ class TestTheD2DetectorOfAPrintRunningOnAir:
         client = FakeClient(state)
         _wire(monkeypatch, state, client)
 
-        spool_recovery.note_demand_watch(printer.id, state)  # the first push after the screen resume
+        _push(printer.id, client)  # the screen resume's next report: empty, no firmware sequence yet
+        assert _toolhead_spawns(spawned) == []
+        state.layer_num += 1  # a layer prints on nothing: AIR
+        _push(printer.id, client)
         assert printer_incidents.driver_live(printer.id) is True
-        spool_recovery.note_demand_watch(printer.id, state)  # still air: no second spawn
+        _push(printer.id, client)  # still air: no second spawn
         (task,) = _toolhead_spawns(spawned)
         await task
 
@@ -12653,6 +12843,8 @@ class TestTheD2DetectorOfAPrintRunningOnAir:
         printer = await printer_factory()
         state = _empty_toolhead_wire(gcode_state="RUNNING")
         client = FakeClient(state)
+        state.layer_num += 1
+        client.push()  # the client read a layer printed on nothing before this process's sampler looked
         _wire(monkeypatch, state, client)
         assert printer.id not in spool_recovery._wire_sample  # the process just started
 
@@ -12682,8 +12874,8 @@ class TestTheD2DetectorOfAPrintRunningOnAir:
 
         client.pause_print = _pause
         _wire(monkeypatch, state, client)
-
-        spool_recovery.note_demand_watch(printer.id, state)
+        state.layer_num += 1  # a layer prints on nothing: AIR
+        _push(printer.id, client)
         await _drivers_done(spawned)
 
         assert seen_at_pause == [{"toolhead_refill"}]
@@ -12714,7 +12906,10 @@ class TestTheD2DetectorOfAPrintRunningOnAir:
         client = FakeClient(state)
         _wire(monkeypatch, state, client)
 
-        spool_recovery.note_demand_watch(printer.id, state)
+        _push(printer.id, client)  # drained: empty, no posture, no runout word — not air YET
+        assert _toolhead_spawns(spawned) == []
+        state.layer_num += 1  # the next layer prints on nothing (shape 46)
+        _push(printer.id, client)
         (task,) = _toolhead_spawns(spawned)
         await task
 
@@ -12738,10 +12933,372 @@ class TestTheD2DetectorOfAPrintRunningOnAir:
         state = _empty_toolhead_wire(gcode_state="RUNNING")
         client = FakeClient(state)
         _wire(monkeypatch, state, client)
-
-        spool_recovery.note_demand_watch(printer.id, state)
+        state.layer_num += 1  # AIR — and still nothing is sent under the hands in the machine
+        _push(printer.id, client)
+        assert client.feed().phase is FeedPhase.AIR
 
         assert _toolhead_spawns(spawned) == [] and client.calls == []
+
+
+class TestD2IsALevelOnThePhase:
+    """THE 2026-10-10 liveness pair, through a REAL client stepping real pushes (``_fixtures.feed_wire``,
+    the one wire driver), with the per-push sampler run after every push as production runs it. D2
+    (``_sample_toolhead``) fires only when K7(T4) is owed — the feed state reads AIR — so it spawns
+    NOTHING across the firmware's runout auto-switch (005/015/001-H2S: RUNNING, ``tray_now = 255``,
+    the posture not yet up — the frames it broke into that day) and STILL fires on a print on air:
+    after six quiet posture-carrying reports (shape 39), or on the first layer that advances while
+    empty (shape 46)."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, install_settings):
+        install_settings(step_timeout_s=0.05)
+
+    @pytest.fixture
+    def episodes(self, monkeypatch):
+        """D2's spawn, recorded instead of run: the question here is the detector's decision."""
+        from types import SimpleNamespace
+
+        spawned = _schedule_spawns(monkeypatch)
+        started: list[tuple] = []
+
+        async def _episode(printer_id, *, trigger, incident_id=None, settle=None):
+            started.append((trigger, incident_id, settle))
+
+        monkeypatch.setattr(spool_recovery, "_refill_episode", _episode)
+        return SimpleNamespace(spawned=spawned, started=started)
+
+    @staticmethod
+    def _live(monkeypatch, printer_id):
+        """A real client the registry hands out, and the push that also runs the sampler."""
+        client = feed_wire.live_client()
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_client", lambda _pid: client)
+        monkeypatch.setattr(spool_recovery.printer_manager, "get_status", lambda _pid: client.state)
+
+        def push(**wire):
+            feed_wire.push(client, **wire)
+            spool_recovery.note_demand_watch(printer_id, client.state)
+
+        return client, push
+
+    @pytest.mark.parametrize("switch", feed_wire.AUTO_SWITCHES_20261010, ids=lambda switch: switch.printer)
+    async def test_the_firmwares_auto_switch_spawns_nothing(
+        self, db_session, printer_factory, monkeypatch, episodes, switch
+    ):
+        printer = await printer_factory()
+        client, _push_and_sample = self._live(monkeypatch, printer.id)
+        feed_wire.start_print(client, switch.drained)
+        seen: list[tuple[str, FeedPhase]] = []
+
+        def _after(step):
+            spool_recovery.note_demand_watch(printer.id, client.state)
+            seen.append((step, client.feed().phase))
+            assert _toolhead_spawns(episodes.spawned) == [], step
+
+        feed_wire.run_auto_switch(client, switch, after=_after)
+
+        # The frame D2 broke into — RUNNING, 255, the posture not yet up — reads as the firmware's.
+        assert ("empty", FeedPhase.CHANGING) in seen
+        assert client.feed().phase is FeedPhase.FED
+        switched = client.feed().auto_switched
+        assert (switched.departed, switched.arrived) == (switch.drained, switch.landed)
+
+    async def test_shape_39_a_screen_resume_onto_an_empty_toolhead_fires_on_the_sixth_quiet_report(
+        self, db_session, printer_factory, monkeypatch, episodes
+    ):
+        """The print PAUSEd empty, resumed at the screen: RUNNING, nothing fed, the posture carried
+        and never up, no runout word — five reports wait for the firmware, the sixth is AIR."""
+        printer = await printer_factory()
+        client, push = self._live(monkeypatch, printer.id)
+        feed_wire.start_print(client, 2)
+        for layer in range(2, 60):
+            push(tray=2, layer=layer)
+        push(tray=255, layer=60, gcode_state="PAUSE")
+        for report in range(1, 6):
+            push(tray=255, layer=60, gcode_state="RUNNING")
+            assert _toolhead_spawns(episodes.spawned) == [], report
+            assert client.feed().phase is FeedPhase.EMPTY_UNCONFIRMED
+        push(tray=255, layer=60, gcode_state="RUNNING")
+
+        assert client.feed().phase is FeedPhase.AIR
+        assert len(_toolhead_spawns(episodes.spawned)) == 1
+        assert printer_incidents.driver_live(printer.id) is True
+
+    async def test_shape_46_a_held_pull_back_draining_under_running_fires_on_the_first_layer_advance(
+        self, db_session, printer_factory, monkeypatch, episodes
+    ):
+        """011/014-H2S: the farm's accepted pull-back (held, pending on an escalated row) ran on its own
+        under a RUNNING print — no posture, no runout word. The first frame waits; the first layer
+        printed on nothing is AIR, and D2 spawns carrying the settle of the step that ran."""
+        printer = await printer_factory()
+        row = await _held_pull_back_row(db_session, printer.id, slot=2)
+        client, push = self._live(monkeypatch, printer.id)
+        feed_wire.start_print(client, 2)
+        for layer in range(2, 93):
+            push(tray=2, layer=layer)
+        push(tray=255, layer=93)
+        assert _toolhead_spawns(episodes.spawned) == []
+        assert client.feed().phase is FeedPhase.EMPTY_UNCONFIRMED
+        push(tray=255, layer=94)
+
+        assert client.feed().phase is FeedPhase.AIR
+        (task,) = _toolhead_spawns(episodes.spawned)
+        await task
+        ((trigger, incident_id, settle),) = episodes.started
+        assert (trigger, incident_id) == ("T4", row.id)
+        assert (settle.incident_id, settle.name) == (row.id, "unload")  # the step that ran is answered first
+
+
+class TestTheEpisodeReadsItsResumeOffThePhase:
+    """The refill episode's read of its OWN resume (``_await_resumed_feed``): the toolhead's feed
+    state answers it — never one raw frame, which on 2026-10-10 read the firmware's own runout
+    switch as air and stranded 015-H2S and 001-H2S PAUSED. Fed → the row closes; the firmware's
+    change → the row is left open for its closers (no pause, no page); air → paused and escalated
+    ONCE; a quiet pause → another actor's; a wait past the bound pages ONCE and keeps reading."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch, install_settings):
+        install_settings(step_timeout_s=0.05)
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_CONFIRM_S", 0.2)
+
+    async def test_a_resume_into_the_firmwares_own_change_is_never_paused(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _empty_toolhead_wire()
+
+        class _ResumesIntoAChange(FakeClient):
+            def resume_print(self):
+                sent = super().resume_print()
+                self.state.tray_now = 255  # the firmware's own change empties the toolhead ...
+                self.state.ams_status_main = 1  # ... under its change posture
+                return sent
+
+        client = _ResumesIntoAChange(state)
+        _wire(monkeypatch, state, client)
+
+        assert isinstance(
+            await spool_recovery.resume_paused_print(printer.id, actor="operator"), spool_recovery.RefillStarted
+        )
+        await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("load", "resume", "pause")] == [("load", 0), ("resume",)]
+        failed.assert_not_awaited()
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.kind, row.status, row.resolved_at) == ("toolhead_refill", "escalated", None)
+        assert printer_incidents.driver_live(printer.id) is False
+
+        # The firmware lands the load: the row's own closer answers it (a print running fed).
+        monkeypatch.setattr(spool_recovery.printer_manager, "is_connected", lambda _pid: True)
+        state.tray_now, state.ams_status_main = 0, 0
+        assert await spool_recovery.sweep_open_incidents(now=0.0) == 0
+        assert await spool_recovery.sweep_open_incidents(now=spool_recovery._HOLD_OVER_DWELL_S + 1) == 1
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert row.resolve_source == "observed_running"
+
+    async def test_a_resume_onto_air_is_paused_and_escalated_once(self, db_session, printer_factory, monkeypatch):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _empty_toolhead_wire()
+
+        class _Pulled(FakeClient):
+            def resume_print(self):
+                sent = super().resume_print()
+                self.state.tray_now = 255  # nothing at the toolhead, and no firmware sequence
+                return sent
+
+        client = _Pulled(state)
+        _wire(monkeypatch, state, client)
+
+        await spool_recovery.resume_paused_print(printer.id, actor="operator")
+        await _drivers_done(spawned)
+
+        assert client.feed().phase is not FeedPhase.EMPTY_UNCONFIRMED
+        assert [c for c in client.calls if c[0] in ("load", "resume", "pause")] == [
+            ("load", 0),
+            ("resume",),
+            ("pause",),
+        ]
+        failed.assert_awaited_once()
+        assert "not at toolhead" in failed.call_args.kwargs["detail"]
+
+    async def test_a_quiet_pause_after_the_resume_is_another_actors(self, db_session, printer_factory, monkeypatch):
+        """A quiet PAUSE after the farm's resume (no fault, no change): a touchscreen or UI Pause —
+        ``_takeover``'s ``paused_elsewhere``. The episode stands aside; nothing is paused or paged."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _empty_toolhead_wire()
+        client = FakeClient(state)
+        seen = {"running": 0}
+
+        def _pause_after_the_confirm(_n, st):
+            if st.state == "RUNNING":
+                seen["running"] += 1
+                if seen["running"] == 2:
+                    st.state = "PAUSE"
+
+        _wire(monkeypatch, state, client, on_poll=_pause_after_the_confirm)
+
+        await spool_recovery.resume_paused_print(printer.id, actor="operator")
+        await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("load", "resume", "pause")] == [("load", 0), ("resume",)]
+        failed.assert_not_awaited()
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.resolve_source) == ("aborted", "paused_elsewhere")
+
+    async def test_the_bound_pages_once_and_the_wait_goes_on(self, db_session, printer_factory, monkeypatch):
+        """RUNNING, empty, a runout word standing (the firmware's sequence, not air) past the bound:
+        ONE page, and the wait keeps reading — the load lands and the row closes ``refill_resumed``.
+        The bound times the page only (Raymond 2026-10-10: "time is not the right signal")."""
+        monkeypatch.setattr(spool_recovery, "_RESUMED_FEED_PAGE_S", 0.0)
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        failed = _spy(monkeypatch, "on_spool_recovery_failed")
+        state = _empty_toolhead_wire()
+
+        class _ResumesLoud(FakeClient):
+            def resume_print(self):
+                sent = super().resume_print()
+                self.state.tray_now = 255
+                self.state.hms_errors = [_runout_autoswitched_hms(0, 1)]
+                return sent
+
+        client = _ResumesLoud(state)
+        seen = {"running": 0}
+
+        def _lands_later(_n, st):
+            if st.state == "RUNNING":
+                seen["running"] += 1
+                if seen["running"] == 8:
+                    st.tray_now, st.hms_errors = 0, []
+
+        _wire(monkeypatch, state, client, on_poll=_lands_later)
+
+        await spool_recovery.resume_paused_print(printer.id, actor="operator")
+        await _drivers_done(spawned)
+
+        failed.assert_awaited_once()
+        assert failed.call_args.kwargs["detail"] == spool_recovery._RESUMED_FEED_PAGE_DETAIL
+        assert ("pause",) not in client.calls
+        (row,) = await _incident_rows(db_session, printer.id)
+        assert (row.status, row.resolve_source) == ("resolved", "refill_resumed")
+
+    def test_the_resume_read_table_is_total(self):
+        missing = [phase for phase in FeedPhase if phase not in spool_recovery._RESUMED_FEED]
+        assert missing == []
+        with pytest.raises(LookupError):
+            spool_recovery._resumed_feed("not-a-phase")  # type: ignore[arg-type]
+        assert spool_recovery._RESUMED_FEED[FeedPhase.EMPTY_UNCONFIRMED] is None
+        assert spool_recovery._RESUMED_FEED[FeedPhase.CHANGING] == "closers"
+
+
+class TestTheResumeOnceVerdict:
+    """Operator-ratified 2026-10-10 (P2): a row the farm holds over a PAUSEd print whose toolhead the
+    PRINTER or a PERSON put back is resumed ONCE — ``incident_resolution.resume_owed`` (a total
+    per-class table), ONE spawner (the sweep, every visited row) and ONE body (``resume_paused_print``).
+    The ``toolhead`` class: fed again after a load no farm motion made, the row's own job PAUSEd;
+    never after the farm's own refill, never in maintenance mode, at a plate-check pause, on another
+    job, or on a runout row (invariant 9: the refill lane's)."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch, install_settings):
+        install_settings(step_timeout_s=0.05)
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_SETTLE_S", 0.0)
+        monkeypatch.setattr(spool_recovery, "_RUNOUT_RESUME_CONFIRM_S", 0.5)
+        monkeypatch.setattr(spool_recovery.printer_manager, "is_connected", lambda _pid: True)
+
+    async def _held(self, db, printer_id, *, kind="toolhead_refill"):
+        """An ESCALATED hold over a print PAUSEd empty at layer 50 (a refill that failed)."""
+        from backend.app.models.printer_incident import STATUS_ESCALATED
+
+        row = await printer_incidents.open_new(
+            db,
+            printer_id=printer_id,
+            job_id="task-1",
+            item_id=None,
+            kind=kind,
+            code="0700_8011" if kind == "runout" else "",
+            codes="runout:0700_8011" if kind == "runout" else "",
+            slot_global_tray=0,
+            status=STATUS_ESCALATED,
+        )
+        state = _empty_toolhead_wire(hms=[])
+        state.raw_data = {"ams": [{"id": 0, "tray": [_ams_tray(0), _ams_tray(1)]}]}
+        return row, state
+
+    async def _sweep_twice(self, spawned) -> None:
+        for now in (0.0, 1.0):
+            await spool_recovery.sweep_open_incidents(now=now)
+            await _drivers_done(spawned)
+
+    async def test_a_persons_load_resumes_the_print_exactly_once(
+        self, db_session, printer_factory, monkeypatch, caplog
+    ):
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row, state = await self._held(db_session, printer.id)
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+        _push(printer.id, client)  # PAUSEd, empty
+        state.tray_now = 1
+        _push(printer.id, client)  # a person loads slot 2 at the screen: the load lands, no farm motion
+
+        with caplog.at_level(logging.INFO, logger="backend.app.services.spool_recovery"):
+            await self._sweep_twice(spawned)
+
+        assert client.calls == [("resume",)]
+        assert state.state == "RUNNING"
+        assert any("reads fed, the job PAUSEd; resuming it" in r.getMessage() for r in caplog.records)
+        assert row.id in spool_recovery._repair_resume_sent
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "the_farms_own_refill",
+            "maintenance",
+            "plate_check",
+            "another_job",
+            "a_runout_row",
+            "a_runout_hold_beside_it",
+            "still_empty",
+        ],
+    )
+    async def test_never(self, db_session, printer_factory, monkeypatch, case):
+        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
+
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        _row, state = await self._held(
+            db_session, printer.id, kind="runout" if case == "a_runout_row" else "toolhead_refill"
+        )
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+        _push(printer.id, client)
+        if case != "still_empty":
+            state.tray_now = 1
+        if case == "the_farms_own_refill":
+            driver = _FakeRecoveryTask(done=False)
+            printer_incidents.register_driver(printer.id, driver, incident_id=None)  # the load lands under it
+            _push(printer.id, client)
+            printer_incidents.release_driver(printer.id, driver)
+        else:
+            _push(printer.id, client)
+        if case == "maintenance":
+            await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
+        elif case == "plate_check":
+            state.print_error = 0x0500808C  # PAUSEd at the printer's own plate-check dialog
+        elif case == "another_job":
+            state.subtask_id = "task-2"
+        elif case == "a_runout_hold_beside_it":
+            await _seed_incident(db_session, printer.id)  # the runout row the AMS entry opened beside it
+
+        await self._sweep_twice(spawned)
+
+        assert ("resume",) not in client.calls
 
 
 class TestTheEvidenceLanesResumeThroughTheVerb:
@@ -12951,6 +13508,8 @@ class TestARestartReEntersTheRefill:
         await self._refill_row(db_session, printer.id)
         state = _empty_toolhead_wire(gcode_state="RUNNING")
         client = FakeClient(state)
+        state.layer_num += 1
+        client.push()  # the new client read a layer printed on nothing: AIR
         _wire(monkeypatch, state, client)
 
         await spool_recovery.rearm_incidents_on_startup()
@@ -12961,3 +13520,38 @@ class TestARestartReEntersTheRefill:
             ("load", 0),
             ("resume",),
         ]
+
+    async def test_an_unconfirmed_empty_reading_at_the_restart_sends_nothing_and_d2_acts_on_air(
+        self, db_session, printer_factory, monkeypatch
+    ):
+        """The first live reading after a restart is RUNNING with nothing fed and a runout word
+        standing — the firmware's own sequence, not air (K7: ``unconfirmed``). The re-entry sends
+        nothing into it and leaves the row a person's hold; the per-push detector D2 acts on the
+        same row the moment the feed state reads AIR (a layer printed on nothing)."""
+        spawned = _schedule_spawns(monkeypatch)
+        printer = await printer_factory()
+        row = await self._refill_row(db_session, printer.id)
+        state = _empty_toolhead_wire(gcode_state="RUNNING", hms=[_runout_autoswitched_hms(0, 1)])
+        client = FakeClient(state)
+        _wire(monkeypatch, state, client)
+
+        await spool_recovery.rearm_incidents_on_startup()
+        await _drivers_done(spawned)
+
+        assert client.calls == []
+        db_session.expunge_all()
+        held = await db_session.get(PrinterIncident, row.id)
+        assert (held.status, held.resolved_at) == ("escalated", None)
+
+        state.hms_errors = []
+        state.layer_num += 1  # a layer prints on nothing: AIR
+        _push(printer.id, client)
+        await _drivers_done(spawned)
+
+        assert [c for c in client.calls if c[0] in ("pause", "load", "resume")] == [
+            ("pause",),
+            ("load", 0),
+            ("resume",),
+        ]
+        db_session.expunge_all()
+        assert (await db_session.get(PrinterIncident, row.id)).resolve_source == "refill_resumed"

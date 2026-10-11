@@ -177,7 +177,7 @@ import { remainingGrams, remainingFraction } from '../utils/spoolGrams';
 import { getPrinterImage, getWifiStrength, filterCompatibleQueueItems } from '../utils/printer';
 import { coolingLabel, deriveFarmPhase } from '../utils/farmPhase';
 import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
-import { wasFeedingTrayId, slotRanOut } from '../utils/slotStatus';
+import { slotRanOut } from '../utils/slotStatus';
 import { amsCommandToast, type AmsCommand } from '../utils/amsCommand';
 import { OutOfRotationChip } from '../components/OutOfRotationChip';
 import { EjectPhaseChip } from '../components/EjectPhaseChip';
@@ -2128,24 +2128,13 @@ function PrinterCard({
     );
   }, [status?.ams_filament_backup, amsData, amsExtruderMap, isDualNozzle]);
 
-  // Cache tray_now to prevent flickering when undefined values come in
-  // Valid tray IDs: 0-253 for AMS, 254 for external spool
-  // tray_now=255 means "no tray loaded" (Bambu protocol sentinel) — never active
-  const cachedTrayNow = useRef<number | undefined>(undefined);
-  const currentTrayNow = status?.tray_now;
-  // Update cache: 255 means "no tray" so clear cache; valid values get cached
-  if (currentTrayNow !== undefined && currentTrayNow !== 255) {
-    cachedTrayNow.current = currentTrayNow;
-  } else if (currentTrayNow === 255) {
-    cachedTrayNow.current = undefined;
-  }
-  const effectiveTrayNow = (currentTrayNow !== undefined && currentTrayNow !== 255)
-    ? currentTrayNow
-    : cachedTrayNow.current;
-  // Tray that WAS feeding this job while the active green ring has cleared (a
-  // runout PAUSE flips tray_now to 255) — drives the dimmed "was feeding" ring so
-  // the operator can still see which slot to refill. Undefined when no hint.
-  const wasFeedingTray = wasFeedingTrayId(status?.state, effectiveTrayNow, status?.last_loaded_tray);
+  // The slot rings, as the backend's feed-state owner answers them
+  // (`ToolheadState`): the green ring on the tray feeding the toolhead (it stays
+  // on a draining roll through its tail, never the backup `tray_now` pre-flips
+  // to), the dimmed "was feeding" ring on the tray this job last fed while
+  // nothing feeds. Null → no ring.
+  const activeTray = status?.toolhead?.active_tray ?? null;
+  const wasFeedingTray = status?.toolhead?.was_feeding_tray ?? null;
 
   // Fetch smart plug for this printer
   const { data: smartPlug } = useQuery({
@@ -5665,7 +5654,7 @@ function PrinterCard({
                                 // Check if this is the currently loaded tray
                                 // Global tray ID = ams.id * 4 + slot index (for standard AMS)
                                 const globalTrayId = ams.id * 4 + slotIdx;
-                                const isActive = effectiveTrayNow === globalTrayId;
+                                const isActive = activeTray === globalTrayId;
                                 // Get cloud preset info if available
                                 const cloudInfo = tray?.tray_info_idx ? filamentInfo?.[tray.tray_info_idx] : null;
                                 // Get saved slot preset mapping (for user-configured slots)
@@ -5738,7 +5727,7 @@ function PrinterCard({
                                   ? `P${activePrintSlotIdx + 1}`
                                   : null;
                                 // Status badges/ring for this slot.
-                                const wasFeeding = !isActive && wasFeedingTray === globalTrayId;
+                                const wasFeeding = wasFeedingTray === globalTrayId;
                                 const slotRanOutFlag = slotRanOut(status.hms_errors, ams.id, slotIdx);
                                 const spentCoreFlag = !!inventoryAssignment?.spool?.spent_at;
                                 // Slot visual content (goes inside hover card)
@@ -5967,7 +5956,7 @@ function PrinterCard({
                       const emptyKind = getEmptySlotKind(tray);
                       // Check if this is the currently loaded tray
                       const globalTrayId = getGlobalTrayId(ams.id, tray?.id ?? 0, false);
-                      const isActive = effectiveTrayNow === globalTrayId;
+                      const isActive = activeTray === globalTrayId;
                       // Get cloud preset info if available
                       const cloudInfo = tray?.tray_info_idx ? filamentInfo?.[tray.tray_info_idx] : null;
                       // Get saved slot preset mapping (for user-configured slots)
@@ -6031,7 +6020,7 @@ function PrinterCard({
                           ? `P${htActivePrintSlotIdx + 1}`
                           : null;
                         // Status badges/ring for this HT slot.
-                        const htWasFeeding = !isActive && wasFeedingTray === globalTrayId;
+                        const htWasFeeding = wasFeedingTray === globalTrayId;
                         const htSlotRanOut = slotRanOut(status.hms_errors, ams.id, htSlotId);
                         const htSpentCore = !!htInventoryAssignment?.spool?.spent_at;
                         // Slot visual content (goes inside hover card)
@@ -6370,13 +6359,13 @@ function PrinterCard({
                           <div className={`grid w-full ${status.vt_tray.length > 1 ? 'grid-cols-[repeat(2,minmax(3.5rem,1fr))]' : 'grid-cols-[minmax(3.5rem,1fr)]'} gap-1`}>
                             {[...status.vt_tray].sort((a, b) => (a.id ?? 254) - (b.id ?? 254)).map((extTray) => {
                               const extTrayId = extTray.id ?? 254;
-                              // On dual-nozzle (H2C/H2D), tray_now=254 means "external spool"
+                              // On dual-nozzle (H2C/H2D), active_tray=254 means "external spool"
                               // generically — use active_extruder to determine L vs R:
                               // extruder 1=left → Ext-L (id=254), extruder 0=right → Ext-R (id=255)
-                              const isExtActive = isDualNozzle && effectiveTrayNow === 254
+                              const isExtActive = isDualNozzle && activeTray === 254
                                 ? (extTrayId === 254 && status.active_extruder === 1) ||
                                   (extTrayId === 255 && status.active_extruder === 0)
-                                : effectiveTrayNow === extTrayId;
+                                : activeTray === extTrayId;
                               const slotTrayId = extTrayId - 254; // 0 or 1
                               const extLabel = isDualNozzle
                                 ? (extTrayId === 254 ? t('printers.extL') : t('printers.extR'))

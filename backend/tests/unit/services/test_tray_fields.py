@@ -318,3 +318,45 @@ def test_the_reader_is_a_leaf_that_imports_no_client():
     }
 
     assert not any("bambu_mqtt" in name or "printer_manager" in name for name in imported), imported
+
+
+class TestGlobalTrayCodec:
+    """The ONE global-tray encoding (invariant 1), and its exact inverse.
+
+    A bare ``ams_id * 4 + tray_id`` is correct for a regular AMS and silently wrong for the
+    other two conventions the fleet actually runs — which is why the arithmetic is not to be
+    re-spelled at call sites.
+    """
+
+    def _codec(self):
+        return tray_fields.encode_global_tray, tray_fields.decode_global_tray
+
+    def test_regular_ams_round_trips(self):
+        encode, decode = self._codec()
+        for ams_id in range(4):
+            for tray_id in range(4):
+                assert decode(encode(ams_id, tray_id)) == (ams_id, tray_id)
+        assert encode(0, 3) == 3 and encode(1, 0) == 4
+
+    def test_ams_ht_is_its_own_unit_id_not_the_multiplication(self):
+        encode, decode = self._codec()
+        assert encode(128, 0) == 128, "a single-tray AMS-HT reports global == ams_id"
+        assert decode(128) == (128, 0)
+        assert encode(128, 1) is None, "an AMS-HT has no second tray to name"
+
+    def test_the_external_holder_uses_the_254_convention(self):
+        encode, decode = self._codec()
+        assert (encode(255, 0), encode(255, 1)) == (254, 255)
+        assert decode(254) == (255, 0) and decode(255) == (255, 1)
+        assert encode(255, 2) is None
+
+    def test_an_unaddressable_slot_fails_closed(self):
+        encode, _decode = self._codec()
+        # A fabricated global id would compare EQUAL to some real slot and mis-attribute a
+        # fault to it, so every unrepresentable input answers None rather than guessing.
+        assert encode(None, 0) is None
+        assert encode(0, None) is None
+        assert encode(-1, 0) is None
+        assert encode(0, 4) is None
+        assert encode(200, 0) is None
+        assert encode("x", 0) is None

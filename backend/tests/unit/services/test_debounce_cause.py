@@ -28,6 +28,7 @@ from backend.app.services.bambu_mqtt import HMSError
 from backend.app.services.slot_pipeline import PipelineDeps, run_slot_pipeline
 from backend.app.services.slot_state import DecisionKind
 from backend.app.services.tray_observation import observe_tray
+from backend.tests._fixtures import feed_wire
 
 _PETG = {"state": 11, "tray_type": "PETG", "tray_color": "000000FF"}
 
@@ -134,26 +135,36 @@ def _deps(db, client=None):
 # one pass ahead of the pipeline — and lets the stamps be written by the code under test.
 
 
-def _state(*, running=True, last_loaded_tray=-1, tray_now=255, hms=(), snow=None):
+def _state(*, running=True, tray_now=255, hms=()):
     """The printer state the presence pass and the pipeline read at an edge."""
     return SimpleNamespace(
         state="RUNNING" if running else "IDLE",
         ams_status_main=0,
-        last_loaded_tray=last_loaded_tray,
         tray_now=tray_now,
         hms_errors=list(hms),
-        h2d_extruder_snow=dict(snow or {}),
         raw_data={},
     )
 
 
-def _patch_wire(monkeypatch, state, *, dual=False):
-    """Point BOTH wire readers at ``state``; ``dual`` makes the client a Vortek machine."""
+def _feeding(tray, **wire):
+    """A REAL client whose job feeds ``tray`` — driven over the wire, so its toolhead feed
+    state (the one thing the loss edge asks "was this slot feeding" of) is the tracker's own
+    reading. ``wire`` carries a dual-nozzle push's ``extruders`` / ``active`` / ``model``."""
+    client = feed_wire.live_client(model=wire.pop("model", "H2S"))
+    feed_wire.start_print(client, tray, **wire)
+    return client
+
+
+def _patch_wire(monkeypatch, state, *, dual=False, feeding=None):
+    """Point BOTH wire readers at ``state``; ``dual`` makes the client a Vortek machine;
+    ``feeding`` lends the client a REAL client's feed state (:func:`_feeding`) — without one
+    the client has stepped no push, and its reading names nothing."""
     client = SimpleNamespace(
         state=state,
         is_dual_nozzle=dual,
         ams_unit_drying=lambda _ams_id: False,
         ams_write_refusal=lambda _ams_id: None,
+        feed=(feeding or feed_wire.live_client()).feed,
     )
     monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: state)
     monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
@@ -205,14 +216,14 @@ async def test_a_live_feeder_losing_presence_mints_through_the_real_presence_lan
 ):
     """T7 LIVENESS: the feeder arm, with the loss-edge stamp DERIVED rather than stated.
 
-    The printer is RUNNING and the wire says this slot is the tray that last actually fed
+    The printer is RUNNING and its toolhead feed state says this slot is the tray feeding
     the job; the bay empties and the operator refills it seconds later. Nothing seeds
     ``_reseat`` or ``_absent_under_active_feed`` — the presence pass writes them from the
     same pushes the pipeline then resolves, exactly as production orders the two.
     """
     printer = await printer_factory()
     donor = await _departed_roll(db_session, printer.id, 0, 2)
-    _patch_wire(monkeypatch, _state(last_loaded_tray=2, tray_now=2))
+    _patch_wire(monkeypatch, _state(tray_now=2), feeding=_feeding(2))
 
     seated = await _wire_cycle(db_session, printer.id, 0, 2)
     transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session))
@@ -235,7 +246,7 @@ async def test_a_slot_that_was_not_feeding_still_de_bounces_through_the_real_pre
     """
     printer = await printer_factory()
     donor = await _departed_roll(db_session, printer.id, 0, 3)
-    _patch_wire(monkeypatch, _state(last_loaded_tray=0, tray_now=0))  # slot 0 is feeding, not 3
+    _patch_wire(monkeypatch, _state(tray_now=0), feeding=_feeding(0))  # slot 0 is feeding, not 3
 
     seated = await _wire_cycle(db_session, printer.id, 0, 3)
     transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session))
@@ -260,7 +271,7 @@ async def test_a_standing_firmware_demand_for_this_slot_mints(db_session, printe
     """
     printer = await printer_factory()
     donor = await _departed_roll(db_session, printer.id, 0, 1)
-    state = _state(last_loaded_tray=-1, tray_now=255, hms=[_demand(0, 1)])
+    state = _state(tray_now=255, hms=[_demand(0, 1)])
     client = _patch_wire(monkeypatch, state)
 
     seated = await _wire_cycle(db_session, printer.id, 0, 1)
@@ -283,7 +294,7 @@ async def test_a_standing_demand_for_a_DIFFERENT_slot_does_not_disqualify_this_o
     """
     printer = await printer_factory()
     donor = await _departed_roll(db_session, printer.id, 0, 3)
-    state = _state(last_loaded_tray=-1, tray_now=255, hms=[_demand(0, 1)])  # slot 1, not 3
+    state = _state(tray_now=255, hms=[_demand(0, 1)])  # slot 1, not 3
     client = _patch_wire(monkeypatch, state)
 
     seated = await _wire_cycle(db_session, printer.id, 0, 3)
@@ -297,18 +308,17 @@ async def test_a_standing_demand_for_a_DIFFERENT_slot_does_not_disqualify_this_o
 async def test_a_dual_nozzle_slot_feeding_the_OTHER_hotend_counts_as_feeding(db_session, printer_factory, monkeypatch):
     """H2C/H2D: ``tray_now`` describes ONE hotend, so a two-nozzle machine needs both.
 
-    On a Vortek printer the single ``tray_now`` / ``last_loaded_tray`` pair speaks for the
-    ACTIVE extruder only. A slot feeding the deputy nozzle therefore answered "not feeding"
-    for every consumer of the feeder resolution — so a mid-print pull there de-bounced onto
-    the row that was still printing. The firmware's own per-extruder map
-    (``PrinterState.h2d_extruder_snow``, normalized to global tray ids) is the answer, and a
-    slot feeding EITHER nozzle was feeding.
+    On a Vortek printer the single ``tray_now`` speaks for the ACTIVE extruder only. A slot
+    feeding the deputy nozzle therefore answered "not feeding" for every consumer of the
+    feeder resolution — so a mid-print pull there de-bounced onto the row that was still
+    printing. The toolhead feed state keeps every extruder's feeder (off the firmware's
+    per-extruder ``snow``), and a slot feeding EITHER nozzle was feeding.
     """
     printer = await printer_factory()
     donor = await _departed_roll(db_session, printer.id, 0, 2)
     # The active hotend (0) is feeding slot 0; the deputy (1) is feeding slot 2 — ours.
-    state = _state(last_loaded_tray=0, tray_now=0, snow={0: 0, 1: 2})
-    _patch_wire(monkeypatch, state, dual=True)
+    deputy = _feeding(0, model="H2C", extruders={0: 0, 1: 2}, active=0)
+    _patch_wire(monkeypatch, _state(tray_now=0), dual=True, feeding=deputy)
 
     seated = await _wire_cycle(db_session, printer.id, 0, 2)
     transitions = await run_slot_pipeline(printer.id, [seated], _deps(db_session))

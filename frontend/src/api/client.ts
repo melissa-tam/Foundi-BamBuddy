@@ -789,14 +789,29 @@ export type ToolheadRefillReason =
   | 'unknown';
 
 /**
- * `PrinterStatus.toolhead` (`schemas/printer.ToolheadState`): the ACTIVE extruder's feed —
- * `fed` (an AMS feeder, `tray` set) / `external` / `empty` / `unknown` (nothing read) — the
- * farm's refill of it (set only while the feed reads empty or unknown) and, while it reads
- * empty, `refill_reason`. Absent on a backend predating the field: read as no verdict.
+ * `PrinterStatus.toolhead` (`schemas/printer.ToolheadState`): the ACTIVE extruder's feed as the
+ * backend's one feed-state owner reads it — `fed` (an AMS feeder) / `external` / `empty` /
+ * `unknown` (nothing read) — the tray it is fed from, the tray this job last fed while nothing
+ * is, the farm's refill of it (set only while the feed reads empty or unknown) and, while it
+ * reads empty, `refill_reason`. Absent on a backend predating the field: no verdict, no ring.
+ *
+ * The slot rings read `active_tray` / `was_feeding_tray` and nothing else. The wire's
+ * `tray_now` is deliberately not typed on `PrinterStatus`: during a runout auto-switch it
+ * pre-flips to the backup slot minutes before the backup feeds.
  */
 export interface ToolheadState {
   feed: 'fed' | 'external' | 'empty' | 'unknown';
-  tray: number | null;
+  /**
+   * The tray the toolhead is fed from: an AMS global tray id, or 254 for the external spool.
+   * Through a roll's tail (drained at the AMS, still feeding) it stays on the DRAINING roll,
+   * never the pre-flipped backup. `null` when nothing is fed or nothing was read.
+   */
+  active_tray: number | null;
+  /**
+   * While a job is RUNNING or PAUSEd and `active_tray` is null: the last real tray this job
+   * fed. Otherwise `null`.
+   */
+  was_feeding_tray: number | null;
   refill: ToolheadRefillState | null;
   refill_reason?: ToolheadRefillReason | null;
 }
@@ -923,12 +938,6 @@ export interface PrinterStatus {
   // AMS slots aren't tied to a specific extruder; the FTS routes any slot to
   // either extruder, so per-extruder slot filtering must be skipped.
   fila_switch: FilaSwitchState | null;
-  // Currently loaded tray (global tray ID, 255 = no filament loaded, 254 = external spool)
-  tray_now: number;
-  // Last tray the printer loaded for THIS job (global tray ID; -1 = none). Reset
-  // per-job on the backend, so during a runout PAUSE (tray_now flips to 255) the
-  // UI can still show which slot WAS feeding via a dimmed "was feeding" ring.
-  last_loaded_tray: number;
   // AMS status for filament change tracking (0=idle, 1=filament_change, 2=rfid_identifying, 3=assist, 4=calibration)
   ams_status_main: number;
   // AMS sub-status for filament change step (when main=1): 4=retraction, 6=load verification, 7=purge
@@ -1012,10 +1021,10 @@ export interface PrinterStatus {
   // dialog on the held job. Its own field because `open_incident` shows only the
   // top-ranked hold. Never re-derive it from `open_incident` or `hms_errors`.
   plate_check_exit?: PlateCheckExit | null;
-  // The ACTIVE extruder's feed and the farm's refill of it — what the card's
-  // "Toolhead empty" chip reads (`utils/incidentChip.holdChip`). Same backend
-  // builder for both REST branches and the WS frame; never re-derived from
-  // `tray_now` here.
+  // The ACTIVE extruder's feed, the tray feeding it and the farm's refill of it —
+  // what the card's "Toolhead empty" chip (`utils/incidentChip.holdChip`) and the
+  // slot rings read. Same backend builder for both REST branches and the WS
+  // frame; never re-derived from `tray_now` here.
   toolhead?: ToolheadState | null;
   // Operator maintenance hold, mirrored onto the status frame (including the
   // disconnected branch) so a card rendered from a stale fleet list still shows

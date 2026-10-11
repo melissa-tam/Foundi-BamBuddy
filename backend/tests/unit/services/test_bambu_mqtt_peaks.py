@@ -290,12 +290,15 @@ class TestTheOnePeaksReader:
 
 # --- K2: the first layer printed with nothing fed -------------------------------------
 #
-# ``JobPeaks.first_unfed_layer`` — the layer L at which a run of RUNNING pushes began with
-# the ACTIVE extruder empty (``tray_fields.toolhead_feed``) and no filament change in flight
-# (``ams_mid_filament_change``), stamped only once ``layer_num`` ADVANCES past L while still
-# empty: a layer printed with nothing fed, an event and never a time. 011-H2S 2026-10-09: an
-# accepted pull-back ran on its own while the print sat PAUSED, a resume then printed from
-# layer 93 to the end with ``tray_now=255``, and the FINISH was recorded completed.
+# ``JobPeaks.first_unfed_layer`` — read off the feed state (``feed_state``, the one writer),
+# which the client steps once per push: the layer L at which an empty episode of the ACTIVE
+# extruder (``tray_fields.toolhead_feed``) began, stamped only once ``layer_num`` ADVANCES past
+# L while still empty and outside the firmware's own change: a layer printed with nothing fed,
+# an event and never a time. 011-H2S 2026-10-09: an accepted pull-back ran on its own while
+# the print sat PAUSED, a resume then printed from layer 93 to the end with ``tray_now=255``,
+# and the FINISH was recorded completed. Driven through the client on a LIVE session — the
+# feed state reads only live reports (the start push is the session's first report, applied
+# after the step, so it is not yet one).
 
 _TOTAL = 150
 _FED = "2"
@@ -327,6 +330,12 @@ def _unfed(client) -> int | None:
 
 
 class TestFirstUnfedLayer:
+    @pytest.fixture
+    def mqtt_client(self, mqtt_client):
+        """The client on a connected session (the transport's ``_on_connect`` sets this)."""
+        mqtt_client.state.connected = True
+        return mqtt_client
+
     def test_the_011_shape_stamps_the_layer_the_air_began_at(self, mqtt_client):
         """Fed to layer 92, empty from 93 to the end: layer 93 is the first printed with
         nothing fed, and the FINISH payload says so."""
@@ -448,6 +457,10 @@ class TestFirstUnfedLayer:
             layer_num=80,
             ams={"tray_now": _EMPTY},
         )
+        # The attach push is the session's first report (applied after the feed state steps):
+        # layer 80's next ~1 Hz report is the first LIVE reading, and the advance after it the
+        # layer printed empty.
+        _layer(mqtt_client, 80, _EMPTY)
         _layer(mqtt_client, 81, _EMPTY)
 
         assert mqtt_client.job_peaks().reliable is False

@@ -768,7 +768,8 @@ class TestPrintersAPI:
             assert response.status_code == 200, response.text
             assert response.json()["toolhead"] == {
                 "feed": "empty" if connected else "unknown",
-                "tray": None,
+                "active_tray": None,
+                "was_feeding_tray": None,
                 "refill": {"phase": "failed", "command": "unload", "slot": "AMS A slot 1", "answer": "acted"},
                 "refill_reason": "unknown" if connected else None,
             }
@@ -2989,14 +2990,23 @@ async def _plate_check_row(db_session, printer_id, *, status, job_id="771234"):
 def _paused_and_fed(client, *, tray_now=0):
     """The printer PAUSEd, reporting on its live session, with the ACTIVE extruder fed from
     ``tray_now`` — the shape in which a resume goes out at once (K9). Both readers see it: the
-    route's manager and the resume verb's (``spool_recovery`` reads the singleton)."""
+    route's manager and the resume verb's (``spool_recovery`` reads the singleton). Applied as
+    REAL status pushes, so the client steps its own feed state (invariant 16) — the K7 reading the
+    verb asks: the session's first report re-seeds it, the next is read."""
     from backend.app.services.printer_manager import printer_manager
 
-    client.state.state = "PAUSE"
-    client.state.tray_now = tray_now
-    client.state.layer_num = 12
-    client.state.total_layers = 100
-    client.state.report_epoch = client.state.connection_epoch
+    for _ in range(2):
+        client._process_message(
+            {
+                "print": {
+                    "gcode_state": "PAUSE",
+                    "gcode_file": "unit.3mf",
+                    "layer_num": 12,
+                    "total_layer_num": 100,
+                    "ams": {"tray_now": str(tray_now)},
+                }
+            }
+        )
     with (
         patch.object(printer_manager, "get_client", return_value=client),
         patch.object(printer_manager, "get_status", return_value=client.state),

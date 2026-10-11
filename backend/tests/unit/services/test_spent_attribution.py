@@ -7,7 +7,9 @@ while their trays kept reporting LOADED at ``remain = 100 %``. They stayed hard-
 from selection for NINE DAYS. Root cause: ``_resolve_exhausted_tray``'s inference tier
 trusted ``tray_now``, which on a dual-nozzle machine is a bare SLOT number the MQTT
 client has to guess a unit for — a guess whose own fallbacks log "no AMS on extruder N,
-using slot M".
+using slot M". The tier reads the toolhead feed state now (2026-10-10), whose trays come
+off that same wire, so the gate stands in front of it unchanged; the tests drive a REAL
+client over the wire (``_fixtures.feed_wire``) to give the feed state its feeder.
 
 The asymmetry every test here defends: a MISSED spent stamp self-heals forward (the next
 runout re-fires, the fresh-roll prompt is the backstop), while a FALSE one is effectively
@@ -39,6 +41,8 @@ from backend.app.services.spool_respool import (
     mark_spent_on_slot_runout,
 )
 from backend.app.services.spool_tagless import reattribute_early_runout
+from backend.tests._fixtures import feed_wire
+from backend.tests._fixtures.feed_wire import AutoSwitch
 
 # --- wire fixtures -----------------------------------------------------------
 
@@ -74,34 +78,36 @@ def _tray(*, tray_id=0, state=11, remain=100, tag_uid=TAG_UID, tray_uuid=TRAY_UU
     }
 
 
-def _h2c_state(*, tray_now, units=(0, 1, 2), hms=(), gcode_state="PAUSE", subtask_id="job-A"):
-    """A three-AMS H2C-shaped push. ``tray_now`` is what the client resolved it to —
-    on this topology that is a bare slot number the H2D disambiguation had to guess a
-    unit for, which is exactly the value the inference tier used to trust."""
+def _h2c_state(*, units=(0, 1, 2), hms=(), gcode_state="PAUSE", subtask_id="job-A"):
+    """A three-AMS H2C-shaped runout push: its units and its HMS list. Which tray was
+    feeding is the CLIENT's feed state (:func:`_client`'s ``feeds``) — on this topology a
+    bare slot number the H2D disambiguation had to guess a unit for, which is exactly the
+    value the inference tier used to trust."""
     state = MagicMock()
     state.state = gcode_state
-    state.tray_now = tray_now
     state.subtask_id = subtask_id
     state.hms_errors = list(hms)
     state.raw_data = {"ams": [{"id": u, "tray": [_tray(tray_id=t) for t in range(4)]} for u in units]}
     return state
 
 
-def _single_ams_state(*, tray_now, hms=(), gcode_state="PAUSE", subtask_id="job-A"):
+def _single_ams_state(*, hms=(), gcode_state="PAUSE", subtask_id="job-A"):
     state = MagicMock()
     state.state = gcode_state
-    state.tray_now = tray_now
     state.subtask_id = subtask_id
     state.hms_errors = list(hms)
     state.raw_data = {"ams": [{"id": 0, "tray": [_tray(tray_id=t) for t in range(4)]}]}
     return state
 
 
-def _client(*, model: str, dual_runtime: bool = False) -> BambuMQTTClient:
+def _client(*, model: str, dual_runtime: bool = False, feeds: int | None = None, units=(0, 1, 2)) -> BambuMQTTClient:
     """A REAL MQTT client, so the topology gate exercises the real ``is_dual_nozzle``
-    property (runtime flag OR model fallback) rather than a stub of it."""
-    client = BambuMQTTClient(ip_address="192.168.1.50", serial_number="TESTH2C", access_code="12345678")
-    client.model = model
+    property (runtime flag OR model fallback) rather than a stub of it. ``feeds`` drives a
+    job feeding that global tray over the wire, so the inference tier's witness — the
+    client's feed state — names it."""
+    client = feed_wire.live_client(serial="TESTH2C", model=model)
+    if feeds is not None:
+        feed_wire.start_print(client, feeds, units=units)
     client._is_dual_nozzle = dual_runtime
     return client
 
@@ -179,16 +185,16 @@ async def test_h2c_wrong_unit_inference_does_not_stamp_incident_pin(db_session, 
 
     Printer 12's shape: three AMS units, dual nozzle. The firmware raises ``0701_8011``
     (AMS 1 ran dry — the slot-agnostic "refill the same slot" runout, so no slot is
-    named) while the client's ``tray_now`` reads a bare ``2``, which decodes to AMS 0
+    named) while the client's feed reads a bare ``2``, which decodes to AMS 0
     slot 2 — the WRONG UNIT. The old inference tier stamped that spool.
 
     Now: nothing is stamped, the refusal is loud, a fresh report is requested, and the
     hinted unit's seated slots get a read occasion so the next pass can learn the truth.
     """
     printer = await printer_factory(model="H2C")
-    victim = await _bind(db_session, printer.id, 0, 2)  # what tray_now WRONGLY points at
-    wire["state"] = _h2c_state(tray_now=2)
-    wire["client"] = _client(model="H2C")
+    victim = await _bind(db_session, printer.id, 0, 2)  # what the feed WRONGLY points at
+    wire["state"] = _h2c_state()
+    wire["client"] = _client(model="H2C", feeds=2)
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
         marked = await mark_spent_on_runout(db_session, printer.id, {"0701_8011"}, wire["state"])
@@ -208,18 +214,20 @@ async def test_h2c_wrong_unit_inference_does_not_stamp_incident_pin(db_session, 
 
 
 @pytest.mark.asyncio
-async def test_h2c_dual_nozzle_detected_from_runtime_flag_alone(db_session, printer_factory, wire):
+async def test_h2c_dual_nozzle_detected_from_runtime_flag_alone(db_session, printer_factory, wire, caplog):
     """The gate must not depend on the printer being REGISTERED as a dual model: the
     runtime ``device.extruder.info`` flag is the primary signal, and a mis-modelled real
     dual is exactly the machine that would otherwise be mis-attributed."""
     printer = await printer_factory(model="Mislabelled")
     victim = await _bind(db_session, printer.id, 0, 1)
-    wire["state"] = _h2c_state(tray_now=1, units=(0,))  # ONE unit — only the nozzle is ambiguous
-    wire["client"] = _client(model="Mislabelled", dual_runtime=True)
+    wire["state"] = _h2c_state(units=(0,))  # ONE unit — only the nozzle is ambiguous
+    wire["client"] = _client(model="Mislabelled", dual_runtime=True, feeds=1, units=(0,))
 
-    assert await mark_spent_on_runout(db_session, printer.id, {"0701_8011"}, wire["state"]) is None
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
+        assert await mark_spent_on_runout(db_session, printer.id, {"0701_8011"}, wire["state"]) is None
     await db_session.refresh(victim)
     assert victim.spent_at is None
+    assert "runout attribution ambiguous (multi-AMS/dual-nozzle)" in caplog.text, "the GATE declined the feeder"
 
 
 @pytest.mark.asyncio
@@ -231,8 +239,8 @@ async def test_h2c_demand_entry_still_stamps_the_slot_the_firmware_named(db_sess
     named = await _bind(db_session, printer.id, 1, 3)
     decoy = await _bind(db_session, printer.id, 0, 2)
     demand = _hms(1, 3, _DEMAND_CODE)
-    wire["state"] = _h2c_state(tray_now=2, hms=[demand])
-    wire["client"] = _client(model="H2C")
+    wire["state"] = _h2c_state(hms=[demand])
+    wire["client"] = _client(model="H2C", feeds=2)
 
     marked = await mark_spent_on_runout(db_session, printer.id, {"0701_8011"}, wire["state"])
 
@@ -250,7 +258,7 @@ async def test_hint_disagreeing_with_the_attr_decode_warns_but_never_overrides(
     TELEMETRY, not a veto — the firmware naming a slot outranks a module byte."""
     printer = await printer_factory(model="H2C")
     named = await _bind(db_session, printer.id, 0, 1)
-    wire["state"] = _h2c_state(tray_now=255, hms=[_hms(0, 1, _DEMAND_CODE)])
+    wire["state"] = _h2c_state(hms=[_hms(0, 1, _DEMAND_CODE)])
     wire["client"] = _client(model="H2C")
 
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
@@ -261,13 +269,13 @@ async def test_hint_disagreeing_with_the_attr_decode_warns_but_never_overrides(
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_topology_accepts_tray_now_inside_the_hinted_unit(db_session, printer_factory, wire):
+async def test_ambiguous_topology_accepts_an_inferred_tray_inside_the_hinted_unit(db_session, printer_factory, wire):
     """Corroboration, not paralysis: when the inferred tray decodes INTO the unit the
     firmware named, the two independent signals agree and the stamp stands."""
     printer = await printer_factory(model="H2C")
     spool = await _bind(db_session, printer.id, 1, 2)
-    wire["state"] = _h2c_state(tray_now=6)  # global 6 -> AMS 1 slot 2, matching the hint
-    wire["client"] = _client(model="H2C")
+    wire["state"] = _h2c_state()
+    wire["client"] = _client(model="H2C", feeds=6)  # global 6 -> AMS 1 slot 2, matching the hint
 
     marked = await mark_spent_on_runout(db_session, printer.id, {"0701_8011"}, wire["state"])
 
@@ -276,13 +284,13 @@ async def test_ambiguous_topology_accepts_tray_now_inside_the_hinted_unit(db_ses
 
 @pytest.mark.asyncio
 async def test_single_ams_single_nozzle_inference_still_stamps_regression_pin(db_session, printer_factory, wire):
-    """REGRESSION PIN. On one AMS unit behind one nozzle ``tray_now`` IS the global tray
-    — nothing was guessed — so the inference tier keeps working exactly as before. The
-    fix must narrow the ambiguous case only."""
+    """REGRESSION PIN. On one AMS unit behind one nozzle ``tray_now`` — the wire the feed
+    state reads — IS the global tray, nothing was guessed, so the inference tier keeps
+    working exactly as before. The fix must narrow the ambiguous case only."""
     printer = await printer_factory(model="H2S")
     spool = await _bind(db_session, printer.id, 0, 1)
-    wire["state"] = _single_ams_state(tray_now=1)
-    wire["client"] = _client(model="H2S")
+    wire["state"] = _single_ams_state()
+    wire["client"] = _client(model="H2S", feeds=1, units=(0,))
 
     marked = await mark_spent_on_runout(db_session, printer.id, {"0300_8004"}, wire["state"])
 
@@ -293,13 +301,13 @@ async def test_single_ams_single_nozzle_inference_still_stamps_regression_pin(db
 @pytest.mark.asyncio
 async def test_auto_switch_trigger_never_falls_through_to_inference(db_session, printer_factory, wire):
     """``mark_spent_on_slot_runout`` needs no topology gate because it has no inference
-    path: an event whose attr does not decode to a slot is SKIPPED, even with a live
-    ``tray_now`` sitting right there. This pins that property so a future fallback
+    path: an event whose attr does not decode to a slot is SKIPPED, even with the feed
+    state naming a feeding tray right there. This pins that property so a future fallback
     cannot be added without noticing it inherits the 185/205 class."""
     printer = await printer_factory(model="H2C")
     spool = await _bind(db_session, printer.id, 0, 2)
-    wire["state"] = _h2c_state(tray_now=2)
-    wire["client"] = _client(model="H2C")
+    wire["state"] = _h2c_state()
+    wire["client"] = _client(model="H2C", feeds=2)
 
     # attr 0 decodes to no AMS slot at all.
     stamped = await mark_spent_on_slot_runout(
@@ -323,68 +331,61 @@ def fake_clock(monkeypatch):
     return clock
 
 
-def _swap_push(tray_now, *, units=(0, 1, 2), filam_bak=None, device_bak=None, subtask_id="job-A"):
-    """``filam_bak`` / ``device_bak`` carry the wire's own words: each element of either
-    array is one backup group's slot BITMASK (``[3]`` = slots 0+1, ``[9]`` = slots 0+3),
-    confirmed for AMS unit 0 on 2026-08-25 — see ``tray_fields.parse_filam_bak``."""
+def _bak_push(*, units=(0, 1, 2), filam_bak=None):
+    """A push carrying the firmware's backup grouping. Each element of ``filam_bak`` is one
+    backup group's slot BITMASK (``[3]`` = slots 0+1, ``[9]`` = slots 0+3), confirmed for AMS
+    unit 0 on 2026-08-25 — see ``tray_fields.parse_filam_bak``."""
     state = MagicMock()
-    state.state = "RUNNING"
-    state.tray_now = tray_now
-    state.subtask_id = subtask_id
     raw = {"ams": [{"id": u, "tray": [_tray(tray_id=t) for t in range(4)]} for u in units]}
     if filam_bak is not None:
         raw["filam_bak"] = filam_bak
-    if device_bak is not None:
-        raw["device"] = {"extruder": {"info": [{"id": i, "filam_bak": g} for i, g in enumerate(device_bak)]}}
     state.raw_data = raw
     return state
 
 
-def _sample(printer_id, tray, **kw) -> list[int]:
-    """One status push through the REAL sampler — sync and DB-less, exactly as
-    ``main.on_printer_status_change`` drives it ~1 Hz per printer."""
-    return spool_respool.sample_status_push(printer_id, _swap_push(tray, **kw))
+def _switch(printer_id, client, *, drained=0, landed=1, units=(0, 1, 2), **fields) -> list[int]:
+    """A firmware switch ``drained`` → ``landed`` through the REAL client, the sampler run on
+    every push exactly as ``main.on_printer_status_change`` runs it ~1 Hz per printer.
+    ``fields`` ride the job's opening pushes only (``filam_bak``, a per-extruder
+    ``device`` block) — every push after them omits them, as the wire's incrementals do.
+    Returns every departed tray the sampler reported."""
+    departed: list[int] = []
+
+    def sample(_step: str = "") -> None:
+        departed.extend(spool_respool.sample_status_push(printer_id, client.state))
+
+    feed_wire.start_print(client, drained, units=units, **fields)
+    sample()
+    feed_wire.run_auto_switch(
+        client,
+        AutoSwitch("H2C", drained=drained, pre_flip=None, landed=landed, layer=20),
+        after=sample,
+        units=units,
+    )
+    return departed
 
 
-def _stable_feeder(printer_id, tray, clock, **kw):
-    """Confirm ``tray`` as the stable feeder: two same-value samples ≥ _SWAP_CONFIRM_S
-    apart after a seeding push. Nothing confirms, so no session is involved at all."""
-    assert _sample(printer_id, tray, **kw) == []
-    assert _sample(printer_id, tray, **kw) == []
-    clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    assert _sample(printer_id, tray, **kw) == []
-    assert spool_respool._stable_feeder.get(printer_id) == tray
-
-
-async def _drive_swap(session_factory, printer_id, tray, **kw) -> Spool | None:
-    """One status push through BOTH production halves, wired as ``main`` wires them:
-    the sync sampler decides, and — only on a confirmation — the async confirmer stamps
-    on its OWN session. Returns the first spool stamped by this push, else None."""
-    departed = _sample(printer_id, tray, **kw)
-    if not departed:
-        return None
-    stamped = await spool_respool.confirm_backup_swaps(printer_id, departed, session_factory=session_factory)
+async def _stamp(session_factory, printer_id, client, departed) -> Spool | None:
+    """The confirming half, fired as ``main`` fires it — its OWN session, the push's job.
+    Returns the first spool stamped, else None."""
+    stamped = await spool_respool.confirm_backup_swaps(
+        printer_id, departed, subtask_id=client.state.subtask_id, session_factory=session_factory
+    )
     return stamped[0] if stamped else None
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_swap_without_filam_bak_declines_and_warns(
-    db_session, printer_factory, wire, fake_clock, caplog, own_session_factory
-):
-    """No grouping evidence at all → no stamp. On a bare-slot topology a feeder change
-    is not by itself proof a roll ran dry, and the fat-remainder WARNING plus the
-    fresh-roll prompt remain the backstops."""
+async def test_ambiguous_swap_without_filam_bak_declines_and_warns(db_session, printer_factory, wire, caplog):
+    """No grouping evidence at all → no departure. On a bare-slot topology a feeder change
+    is not by itself proof a roll ran dry, and the fat-remainder note plus the fresh-roll
+    prompt remain the backstops."""
     printer = await printer_factory(model="H2C")
-    wire["client"] = _client(model="H2C")
+    wire["client"] = client = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock)
-    assert _sample(printer.id, 1) == []  # open the pending swap
-    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
-        stamped = await _drive_swap(own_session_factory, printer.id, 1)
+        assert _switch(printer.id, client) == []
 
-    assert stamped is None
     await db_session.refresh(departed)
     assert departed.spent_at is None
     assert "backup-swap spent stamp declined" in caplog.text
@@ -392,19 +393,15 @@ async def test_ambiguous_swap_without_filam_bak_declines_and_warns(
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_swap_with_filam_bak_group_stamps(
-    db_session, printer_factory, wire, fake_clock, own_session_factory
-):
+async def test_ambiguous_swap_with_filam_bak_group_stamps(db_session, printer_factory, wire, own_session_factory):
     """The firmware's OWN grouping pairs the two trays → the switch it performed between
     them IS an auto-refill, and the departed roll ran dry. Stamp."""
     printer = await printer_factory(model="H2C")
-    wire["client"] = _client(model="H2C")
+    wire["client"] = client = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[3])  # 0b0011 — slots 0+1
-    assert _sample(printer.id, 1, filam_bak=[3]) == []
-    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[3])
+    assert _switch(printer.id, client, filam_bak=[3]) == [0]  # 0b0011 — slots 0+1
+    stamped = await _stamp(own_session_factory, printer.id, client, [0])
 
     assert stamped is not None and stamped.id == departed.id
     assert stamped.spent_at is not None
@@ -412,43 +409,35 @@ async def test_ambiguous_swap_with_filam_bak_group_stamps(
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_swap_with_group_not_pairing_the_trays_declines(
-    db_session, printer_factory, wire, fake_clock, caplog, own_session_factory
-):
+async def test_ambiguous_swap_with_group_not_pairing_the_trays_declines(db_session, printer_factory, wire, caplog):
     """A group exists but does NOT contain both trays — the feeder change crossed
     groups, so it is a tool change or a remap, never an auto-refill."""
     printer = await printer_factory(model="H2C")
-    wire["client"] = _client(model="H2C")
+    wire["client"] = client = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[9])  # 0b1001 — slots 0+3, not 1
-    assert _sample(printer.id, 1, filam_bak=[9]) == []
-    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
-        stamped = await _drive_swap(own_session_factory, printer.id, 1, filam_bak=[9])
+        assert _switch(printer.id, client, filam_bak=[9]) == []  # 0b1001 — slots 0+3, not 1
 
-    assert stamped is None
     await db_session.refresh(departed)
     assert departed.spent_at is None
     assert "does not pair these trays" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_per_extruder_filam_bak_shape_is_read(db_session, printer_factory, wire, fake_clock, own_session_factory):
+async def test_per_extruder_filam_bak_shape_is_read(db_session, printer_factory, wire, own_session_factory):
     """Shape B: ``print.device.extruder.info[i].filam_bak``. A dual-nozzle machine
     reports groups per EXTRUDER, and each extruder's masks stay their own groups — two
     nozzles do not back each other up."""
     printer = await printer_factory(model="H2C")
-    wire["client"] = _client(model="H2C")
+    wire["client"] = client = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
     # Right nozzle pairs slots 0+1 (0b0011); left nozzle pairs 2+3 (0b1100). Both masks
     # stay inside AMS unit 0, the only unit whose bit index is measured.
-    groups = [[3], [12]]
+    device = {"extruder": {"info": [{"id": 0, "filam_bak": [3]}, {"id": 1, "filam_bak": [12]}]}}
 
-    _stable_feeder(printer.id, 0, fake_clock, device_bak=groups)
-    assert _sample(printer.id, 1, device_bak=groups) == []
-    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await _drive_swap(own_session_factory, printer.id, 1, device_bak=groups)
+    assert _switch(printer.id, client, device=device) == [0]
+    stamped = await _stamp(own_session_factory, printer.id, client, [0])
 
     assert stamped is not None and stamped.id == departed.id
 
@@ -462,8 +451,8 @@ def test_a_group_bit_outside_ams_unit_0_is_logged_once(caplog):
     ~1 Hz is a log nobody reads."""
     printer_id = 4242
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_respool"):
-        _sample(printer_id, 0, filam_bak=[0x30])  # bits 4+5 — past AMS unit 0
-        _sample(printer_id, 0, filam_bak=[0x30])
+        spool_respool.sample_status_push(printer_id, _bak_push(filam_bak=[0x30]))  # bits 4+5 — past AMS unit 0
+        spool_respool.sample_status_push(printer_id, _bak_push(filam_bak=[0x30]))
 
     lines = [r.getMessage() for r in caplog.records if "filam_bak encoding sample" in r.getMessage()]
     assert len(lines) == 1
@@ -475,29 +464,25 @@ def test_a_group_bit_outside_ams_unit_0_is_logged_once(caplog):
 def test_a_group_inside_ams_unit_0_is_not_logged(caplog):
     """The measured case is not a question, and must not narrate itself every push."""
     with caplog.at_level(logging.INFO, logger="backend.app.services.spool_respool"):
-        _sample(4243, 0, filam_bak=[15])
+        spool_respool.sample_status_push(4243, _bak_push(filam_bak=[15]))
     assert not [r for r in caplog.records if "filam_bak encoding sample" in r.getMessage()]
 
 
 @pytest.mark.asyncio
 async def test_a_pair_outside_ams_unit_0_declines_rather_than_guessing_the_encoding(
-    db_session, printer_factory, wire, fake_clock, caplog, own_session_factory
+    db_session, printer_factory, wire, caplog
 ):
     """Bit N is the SLOT for AMS unit 0 and unmeasured beyond it — every multi-AMS
     printer sampled 2026-08-25 reported no groups at all, so nothing discriminates a
     global tray id from a per-unit slot. Trays 8 -> 9 are AMS unit 2, where a match would
     assert that encoding. Decline, and say so."""
     printer = await printer_factory(model="H2C")
-    wire["client"] = _client(model="H2C")
+    wire["client"] = client = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 2, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 8, fake_clock, filam_bak=[15])
-    assert _sample(printer.id, 9, filam_bak=[15]) == []
-    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
     with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_respool"):
-        stamped = await _drive_swap(own_session_factory, printer.id, 9, filam_bak=[15])
+        assert _switch(printer.id, client, drained=8, landed=9, filam_bak=[15]) == []
 
-    assert stamped is None
     await db_session.refresh(departed)
     assert departed.spent_at is None
     assert "backup-swap corroboration declined" in caplog.text
@@ -505,39 +490,32 @@ async def test_a_pair_outside_ams_unit_0_declines_rather_than_guessing_the_encod
 
 
 @pytest.mark.asyncio
-async def test_filam_bak_cache_survives_pushes_that_omit_it(
-    db_session, printer_factory, wire, fake_clock, own_session_factory
-):
+async def test_filam_bak_cache_survives_pushes_that_omit_it(db_session, printer_factory, wire, own_session_factory):
     """``bambu_mqtt`` replaces ``raw_data`` wholesale and preserves only ams / vt_tray /
     ams_extruder_map / mapping, so an incremental push drops ``filam_bak`` entirely. The
-    LAST-SEEN grouping must stand, or corroboration would be a coin flip on push timing."""
+    LAST-SEEN grouping must stand, or corroboration would be a coin flip on push timing:
+    only the job's opening pushes carry it here, and the switch lands minutes later."""
     printer = await printer_factory(model="H2C")
-    wire["client"] = _client(model="H2C")
+    wire["client"] = client = _client(model="H2C")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock, filam_bak=[3])
-    # Every push from here on omits the field.
-    assert _sample(printer.id, 1) == []
-    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await _drive_swap(own_session_factory, printer.id, 1)
+    assert _switch(printer.id, client, filam_bak=[3]) == [0]
+    assert "filam_bak" not in client.state.raw_data
+    stamped = await _stamp(own_session_factory, printer.id, client, [0])
 
     assert stamped is not None and stamped.id == departed.id
 
 
 @pytest.mark.asyncio
-async def test_unambiguous_topology_swap_needs_no_corroboration(
-    db_session, printer_factory, wire, fake_clock, own_session_factory
-):
+async def test_unambiguous_topology_swap_needs_no_corroboration(db_session, printer_factory, wire, own_session_factory):
     """Single AMS, single nozzle: unchanged behavior, no ``filam_bak`` required. The
     corroboration is a narrowing of the ambiguous case ONLY."""
     printer = await printer_factory(model="H2S")
-    wire["client"] = _client(model="H2S")
+    wire["client"] = client = _client(model="H2S")
     departed = await _bind(db_session, printer.id, 0, 0, weight_used=500.0)
 
-    _stable_feeder(printer.id, 0, fake_clock, units=(0,))
-    assert _sample(printer.id, 1, units=(0,)) == []
-    fake_clock["t"] += spool_respool._SWAP_CONFIRM_S + 1
-    stamped = await _drive_swap(own_session_factory, printer.id, 1, units=(0,))
+    assert _switch(printer.id, client, units=(0,)) == [0]
+    stamped = await _stamp(own_session_factory, printer.id, client, [0])
 
     assert stamped is not None and stamped.id == departed.id
 
