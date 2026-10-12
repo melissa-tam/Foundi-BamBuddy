@@ -42,6 +42,7 @@ from backend.app.services.print_scheduler import PrintScheduler
 from backend.app.services.printer_manager import PrinterManager, printer_manager
 from backend.app.services.spool_selection import MatchOutcome
 from backend.app.utils.filename import derive_remote_filename
+from backend.tests._fixtures.printer_action import route_verbs
 
 
 @pytest.fixture(autouse=True)
@@ -481,13 +482,13 @@ def _dispatch_env(scheduler, *, upload=None):
     delete_mock = AsyncMock(return_value=True)
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch.object(printer_manager, "is_connected", return_value=True))
-        # No ``state`` attribute → pre_state is None → no start watchdog task.
+        # No ``state`` attribute: the start's watch shows no phase and decides nothing.
         stack.enter_context(
             patch.object(printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(sdcard=True)))
         )
         stack.enter_context(patch.object(printer_manager, "get_client", MagicMock(return_value=None)))
         stack.enter_context(patch.object(printer_manager, "request_status_update", MagicMock(return_value=True)))
-        stack.enter_context(patch.object(printer_manager, "start_print", start))
+        stack.enter_context(route_verbs(start=start))
         stack.enter_context(
             patch.object(ps_module, "get_ftp_retry_settings", AsyncMock(return_value=(False, 3, 1.0, 30.0)))
         )
@@ -633,127 +634,3 @@ class TestDeclareDuringDispatch:
         assert plate_occupancy.declare_occupied(printer.id, Evidence(live_state="RUNNING")) == "job_active"
         assert lease.revoked is False
         assert plate_occupancy.is_plate_occupied(printer.id) is False
-
-
-# --------------------------------------------------------------------------- #
-# The dead dispatch claim releases BOTH claims (2026-08-29)
-# --------------------------------------------------------------------------- #
-
-
-class _DeadClaimManager:
-    """The minimum ``printer_manager`` surface ``check_dead_dispatch_claims`` reads."""
-
-    def __init__(self, printer_id: int, state: str, subtask_id: str | None = None):
-        self._printer_id = printer_id
-        self._state = SimpleNamespace(state=state, subtask_id=subtask_id)
-
-    def is_connected(self, printer_id: int) -> bool:
-        return printer_id == self._printer_id
-
-    def get_status(self, printer_id: int):
-        return self._state if printer_id == self._printer_id else None
-
-
-@pytest.mark.asyncio
-class TestDeadDispatchClaimReleasesTheLease:
-    """The row claim and the PRINTER claim are two different things with two
-    different writers, and un-making a dispatch means dropping both.
-
-    ``release_unstarted_claim`` releases the queue row; ``release_dispatch`` releases
-    the occupancy lease that would otherwise hold the printer out of the queue for
-    the full ceiling. Releasing only the row was the shape that left 001-H2S taking
-    no work while the row it was waiting on had already been retired.
-    """
-
-    async def test_a_matured_dead_claim_releases_the_row_and_the_lease(self, db_session, printer_factory):
-        from backend.app.services import farm_stall
-
-        printer = await printer_factory(model="H2S")
-        printer_id = printer.id
-        now = 1_800_000_000.0
-        from backend.app.services.dispatch_claim import DISPATCH_START_BUDGET_S
-
-        started = datetime.fromtimestamp(now - DISPATCH_START_BUDGET_S - 60, tz=timezone.utc).replace(tzinfo=None)
-        item = PrintQueueItem(
-            printer_id=printer_id,
-            status="printing",
-            plate_id=1,
-            position=1,
-            started_at=started,
-            dispatch_subtask_id="dispatch-1",
-            ams_mapping="[0, -1, -1, -1]",
-        )
-        db_session.add(item)
-        await db_session.commit()
-        await db_session.refresh(item)
-
-        # The dispatch that never started still holds its printer claim.
-        scheduler = PrintScheduler()
-        with patch.object(
-            printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="IDLE", subtask_id="other"))
-        ):
-            lease = scheduler._claim_dispatch_lease(printer_id, item.id)
-        assert lease is not None
-        plate_occupancy.commit_dispatch(printer_id, lease)
-        assert plate_occupancy.snapshot(printer_id).lease_unit_id == item.id
-        assert printer_id in plate_occupancy.printers_with_lease_or_eject()
-
-        mgr = _DeadClaimManager(printer_id, "IDLE", subtask_id="a-different-job")
-        farm_stall._dead_claim_since.clear()
-        try:
-            await farm_stall.check_dead_dispatch_claims(db_session, manager=mgr, now=now)  # seed the dwell
-            await farm_stall.check_dead_dispatch_claims(
-                db_session, manager=mgr, now=now + farm_stall._DEAD_CLAIM_DWELL_S + 1
-            )
-        finally:
-            farm_stall._dead_claim_since.clear()
-
-        db_session.expunge_all()
-        after = await db_session.get(PrintQueueItem, item.id)
-        assert after.status == "pending"  # the row claim
-        assert plate_occupancy.snapshot(printer_id).lease_unit_id is None  # the printer claim
-        assert printer_id not in plate_occupancy.printers_with_lease_or_eject()
-        # And the plate was never written — the watch un-makes a dispatch, nothing more.
-        assert plate_occupancy.is_plate_occupied(printer_id) is False
-
-    async def test_a_claim_the_watch_leaves_alone_keeps_its_lease(self, db_session, printer_factory):
-        """The guard side: a claim inside the start budget is still the dispatch
-        watchdog's business, and the printer claim must survive with it — releasing the
-        lease under a live dispatch is a double-dispatch onto an occupied plate."""
-        from backend.app.services import farm_stall
-
-        printer = await printer_factory(model="H2S")
-        printer_id = printer.id
-        now = 1_800_000_000.0
-        item = PrintQueueItem(
-            printer_id=printer_id,
-            status="printing",
-            plate_id=1,
-            position=1,
-            started_at=datetime.fromtimestamp(now, tz=timezone.utc).replace(tzinfo=None) - timedelta(seconds=30),
-            dispatch_subtask_id="dispatch-1",
-        )
-        db_session.add(item)
-        await db_session.commit()
-
-        scheduler = PrintScheduler()
-        with patch.object(
-            printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="IDLE", subtask_id="other"))
-        ):
-            lease = scheduler._claim_dispatch_lease(printer_id, item.id)
-        assert lease is not None
-        plate_occupancy.commit_dispatch(printer_id, lease)
-
-        mgr = _DeadClaimManager(printer_id, "IDLE", subtask_id="a-different-job")
-        farm_stall._dead_claim_since.clear()
-        try:
-            await farm_stall.check_dead_dispatch_claims(db_session, manager=mgr, now=now)
-            await farm_stall.check_dead_dispatch_claims(
-                db_session, manager=mgr, now=now + farm_stall._DEAD_CLAIM_DWELL_S + 1
-            )
-        finally:
-            farm_stall._dead_claim_since.clear()
-
-        db_session.expunge_all()
-        assert (await db_session.get(PrintQueueItem, item.id)).status == "printing"
-        assert plate_occupancy.snapshot(printer_id).lease_unit_id == item.id

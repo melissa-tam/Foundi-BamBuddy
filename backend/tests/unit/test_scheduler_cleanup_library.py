@@ -16,6 +16,7 @@ from backend.app.models.printer import Printer
 from backend.app.services.dispatch_file import DispatchFile
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import PrintScheduler
+from backend.tests._fixtures.printer_action import route_verbs
 
 
 @pytest.fixture(autouse=True)
@@ -163,7 +164,7 @@ async def _dispatch_library_item(ctx, *, archive_failure=False, unlink_side_effe
         patch("backend.app.services.archive.ArchiveService.archive_print", new=archive_print),
         patch("backend.app.services.print_scheduler.printer_manager.is_connected", MagicMock(return_value=True)),
         patch("backend.app.services.print_scheduler.printer_manager.get_status", MagicMock(return_value=None)),
-        patch("backend.app.services.print_scheduler.printer_manager.start_print", ctx.start_print),
+        route_verbs(start=ctx.start_print),
         # No plate write to stub: the dispatch path's unconditional
         # ``set_awaiting_plate_clear(False)`` was deleted on 2026-08-30. The only
         # occupancy write a healthy dispatch makes is COMMITTING its printer lease.

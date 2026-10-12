@@ -7,12 +7,14 @@ import json
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from urllib.parse import unquote
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
+
+from backend.tests._fixtures.printer_action import route_verbs
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +46,7 @@ def _ams_command_wire(
     name: str = "P",
     ack_result: str | None = None,
 ) -> Iterator[MagicMock]:
-    """The printer_manager reads ``services/ams_command`` makes, faked — plus its operator
+    """The printer_manager reads ``services/printer_action`` makes, faked — plus its operator
     observe window shortened, so a wire that never moves answers in 50 ms instead of 5 s.
 
     The AMS routes are controller-thin: the SERVICE reads the client, the live state and
@@ -56,6 +58,8 @@ def _ams_command_wire(
     if client is not None:
         from backend.app.services.bambu_mqtt import CommandAck
 
+        client.state = state  # the record reads the entry off the client the frame goes out on
+
         ack = (
             None
             if ack_result is None
@@ -63,13 +67,13 @@ def _ams_command_wire(
                 command="ams_change_filament", sequence_id=_SENT_SEQ, result=ack_result, reason=None, at=0.0
             )
         )
-        client.last_sent_sequence_id.return_value = _SENT_SEQ
-        client.ack_for.side_effect = lambda command, seq: (
-            ack if (command, seq) == ("ams_change_filament", _SENT_SEQ) else None
+        # The send's id is the action's row id: the firmware ACKs whichever id the motion carried.
+        client.ack_for.side_effect = lambda seq: (
+            None if ack is None else CommandAck(ack.command, seq, ack.result, ack.reason, ack.at)
         )
     with (
-        patch("backend.app.services.ams_command.printer_manager") as mock_pm,
-        patch("backend.app.services.ams_command.OPERATOR_ACK_S", 0.05),
+        patch("backend.app.services.printer_action.printer_manager") as mock_pm,
+        patch("backend.app.services.command_outcome.OPERATOR_ACK_S", 0.05),
     ):
         mock_pm.get_client.return_value = client
         mock_pm.get_status.return_value = state
@@ -96,7 +100,7 @@ def _moves_wire(state: SimpleNamespace, **after: object) -> Callable[..., bool]:
     """A client publish that moves the fake wire the way the printer would, then reports
     the command sent."""
 
-    def publish(*_args: object) -> bool:
+    def publish(*_args: object, **_kwargs: object) -> bool:
         for key, value in after.items():
             setattr(state, key, value)
         return True
@@ -729,12 +733,11 @@ class TestPrintersAPI:
     @pytest.mark.integration
     @pytest.mark.parametrize("connected", [False, True])
     async def test_printers_status_toolhead(self, async_client: AsyncClient, printer_factory, db_session, connected):
-        """BOTH ``/status`` branches carry ``toolhead`` (K10/C3c, 2026-10-10), the one builder: the
-        connected branch reads the ACTIVE extruder; with no session the feed is ``unknown`` while the
-        farm's failed refill — the incident store's own projection — still reports, naming its command
-        (a failed UNLOAD is an unload, on the row's slot). ``refill_reason`` (the T3 verdict) rides an
-        EMPTY feed only: here a reading not yet of this session, so ``unknown``; nothing with no
-        session."""
+        """BOTH ``/status`` branches carry ``toolhead`` (K10/C3c, 2026-10-10) and ``hold_chip``
+        (2026-10-11), each from its one builder: the connected branch reads the ACTIVE extruder; with no
+        session the feed is ``unknown`` while the farm's failed refill — the incident store's own
+        projection — still reaches the chip, naming its command (a failed UNLOAD is an unload, on the
+        row's slot): red "Toolhead empty"."""
         from backend.app.models.printer_incident import KIND_TOOLHEAD_REFILL, STATUS_ESCALATED
         from backend.app.services import printer_incidents
         from backend.app.services.bambu_mqtt import PrinterState
@@ -770,8 +773,17 @@ class TestPrintersAPI:
                 "feed": "empty" if connected else "unknown",
                 "active_tray": None,
                 "was_feeding_tray": None,
-                "refill": {"phase": "failed", "command": "unload", "slot": "AMS A slot 1", "answer": "acted"},
-                "refill_reason": "unknown" if connected else None,
+            }
+            assert response.json()["hold_chip"] == {
+                "variant": "toolhead",
+                "tone": "held",
+                "label": {"key": "printers.incident.toolhead_refill", "values": {}},
+                "tooltip": [
+                    {"key": "printers.toolhead.unloadFailed", "values": {"slot": "AMS A slot 1"}},
+                    {"key": "printers.toolhead.answer.unloadActed", "values": {}},
+                    {"key": "printers.incidentAction.toolhead_refill", "values": {}},
+                ],
+                "qualifier": None,
             }
         finally:
             printer_incidents._reset_state()
@@ -1765,7 +1777,7 @@ class TestPrintControlAPI:
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch.object(print_control.printer_manager, "stop_print", MagicMock(return_value=True)) as stop,
+            route_verbs(stop=MagicMock(return_value=True)) as stop,
         ):
             mock_pm.get_client.return_value = MagicMock()  # connected
 
@@ -1788,7 +1800,7 @@ class TestPrintControlAPI:
 
         with (
             patch("backend.app.api.routes.printers.printer_manager") as mock_pm,
-            patch.object(print_control.printer_manager, "stop_print", MagicMock(return_value=False)),
+            route_verbs(stop=MagicMock(return_value=False)),
         ):
             mock_pm.get_client.return_value = MagicMock()
 
@@ -2103,7 +2115,7 @@ class TestAMSLoadUnloadAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
 
         assert response.status_code == 200
-        mock_client.ams_load_filament.assert_called_once_with(5)
+        mock_client.ams_load_filament.assert_called_once_with(5, sequence_id=ANY)
         assert response.json() == {
             "outcome": "complete",
             "message": "Loading filament from AMS 1 slot 2",
@@ -2123,7 +2135,7 @@ class TestAMSLoadUnloadAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=254")
 
         assert response.status_code == 200
-        mock_client.ams_load_filament.assert_called_once_with(254)
+        mock_client.ams_load_filament.assert_called_once_with(254, sequence_id=ANY)
         assert response.json()["outcome"] == "complete"
         assert "external" in response.json()["message"].lower()
 
@@ -2141,7 +2153,7 @@ class TestAMSLoadUnloadAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=255")
 
         assert response.status_code == 200
-        mock_client.ams_load_filament.assert_called_once_with(255)
+        mock_client.ams_load_filament.assert_called_once_with(255, sequence_id=ANY)
         assert response.json() == {
             "outcome": "acted",
             "message": "Loading filament from Ext-R",
@@ -2195,7 +2207,7 @@ class TestAMSLoadUnloadAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/unload")
 
         assert response.status_code == 200
-        mock_client.ams_unload_filament.assert_called_once_with()
+        mock_client.ams_unload_filament.assert_called_once_with(sequence_id=ANY)
         assert response.json() == {"outcome": "acted", "message": "Unloading filament", "family": "outside_change"}
 
     @pytest.mark.asyncio
@@ -2681,7 +2693,7 @@ class TestSkipObjectsAPI:
             result = response.json()
             assert result["success"] is True
             assert 100 in result["skipped_objects"]
-            mock_client.skip_objects.assert_called_once_with([100])
+            mock_client.skip_objects.assert_called_once_with([100], sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2704,7 +2716,7 @@ class TestSkipObjectsAPI:
             assert result["success"] is True
             assert 100 in result["skipped_objects"]
             assert 200 in result["skipped_objects"]
-            mock_client.skip_objects.assert_called_once_with([100, 200])
+            mock_client.skip_objects.assert_called_once_with([100, 200], sequence_id=ANY)
 
 
 class TestChamberLightAPI:
@@ -2749,7 +2761,7 @@ class TestChamberLightAPI:
             result = response.json()
             assert result["success"] is True
             assert "on" in result["message"].lower()
-            mock_client.set_chamber_light.assert_called_once_with(True)
+            mock_client.set_chamber_light.assert_called_once_with(True, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2769,7 +2781,7 @@ class TestChamberLightAPI:
             result = response.json()
             assert result["success"] is True
             assert "off" in result["message"].lower()
-            mock_client.set_chamber_light.assert_called_once_with(False)
+            mock_client.set_chamber_light.assert_called_once_with(False, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2786,7 +2798,7 @@ class TestChamberLightAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/chamber-light?on=true")
 
             # 502, not 500: an undelivered command is the PRINTER's session failing, and
-            # ``send_command`` is fail-loud about that.
+            # the client's publisher answers False for it.
             assert response.status_code == 502
             assert "failed" in response.json()["detail"].lower()
 
@@ -2833,7 +2845,7 @@ class TestAirductModeAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/airduct-mode?mode=cooling")
         assert response.status_code == 200
-        mock_client.set_airduct_mode.assert_called_once_with("cooling")
+        mock_client.set_airduct_mode.assert_called_once_with("cooling", sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -2862,7 +2874,7 @@ class TestAirductModeAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/airduct-mode?mode=cooling")
         assert response.status_code == 200
         assert response.json()["success"] is True
-        mock_client.set_airduct_mode.assert_called_once_with("cooling")
+        mock_client.set_airduct_mode.assert_called_once_with("cooling", sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -3047,8 +3059,8 @@ def _plate_check_paused(client, *, job_id="771234", print_error=0x0500808C):
 class TestExecuteHMSActionAPI:
     """Integration tests for the /hms/execute-action endpoint (#1743).
 
-    The route answers from the firmware's own ACK of the frame it sent
-    (``SentCommand`` → ``BambuMQTTClient.await_ack``): success → 200, a refusing ACK →
+    The route answers from the firmware's own ACK of the frame it sent (the record's
+    ``printer_action.ack_within`` over the action's id): success → 200, a refusing ACK →
     502 naming the answer, no ACK within the budget → 502 (the silent drop #1830 names),
     and a frame whose echo is never recorded (the ``uiop`` close) → 200 "sent".
 
@@ -3141,7 +3153,7 @@ class TestExecuteHMSActionAPI:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/hms/execute-action", json=body)
 
         assert response.status_code == 200
-        dispatch.assert_called_once_with("07008029", "FILAMENT_EXTRUDED", "task-7")
+        dispatch.assert_called_once_with("07008029", "FILAMENT_EXTRUDED", "task-7", sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -3500,11 +3512,21 @@ class TestExecuteHMSActionAPI:
         """Every plate-check code is delegated — ``0500_806E`` has no catalog button, and the turn
         offers Ignore all the same. The press is noted on the episode's ledger, the frame is the
         printer's own "ignore" for the live dialog and the hold's job."""
-        from backend.app.services import pause_recovery
+        import asyncio
+
+        import backend.app.core.tasks as core_tasks
+        from backend.app.services import pause_recovery, printer_action
+        from backend.app.services.printer_events import CommandAcked
 
         printer = await printer_factory(name="Test Printer")
         client = _dialog_client(result="success")
+        # Production's hub: the client's recorded ACK reaches the record (after the publish returned).
+        client._on_command_ack = lambda ack: asyncio.get_running_loop().call_soon(
+            printer_action.on_command_acked, CommandAcked(printer_id=printer.id, ack=ack)
+        )
         row = await _plate_check_row(db_session, printer.id, status="escalated")
+        # Another test's press on this module's loop may still wait for an answer nobody sends it.
+        before = set(core_tasks._background_tasks)
 
         with _plate_check_paused(client, print_error=int(print_error, 16)):
             status = (await async_client.get(f"/api/v1/printers/{printer.id}/status")).json()
@@ -3523,6 +3545,13 @@ class TestExecuteHMSActionAPI:
         assert response.json() == {"success": True, "message": "HMS action executed"}
         (frame,) = _published_print_frames(client)
         assert (frame["command"], frame["err"], frame["job_id"]) == ("ignore", str(int(print_error, 16)), "771234")
+        # The ledger's answer is the RECORD's, written when it lands.
+        pending = [
+            t
+            for t in set(core_tasks._background_tasks) - before
+            if t.get_name() == f"plate-check-press-p{printer.id}" and not t.done()
+        ]
+        await asyncio.wait_for(asyncio.gather(*pending), timeout=5)
         async with own_session_factory() as s:
             log = await pause_recovery._PlateCheckEvidence.from_row(s, row.id)
         assert [(step.kind, step.name, step.outcome) for step in log.steps] == [("dialog", "IGNORE_RESUME", "success")]
@@ -5090,7 +5119,7 @@ class TestSetNozzleTemperatureAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/nozzle?target=220")
         assert response.status_code == 200
-        mock_client.set_nozzle_temperature.assert_called_once_with(220, 0)
+        mock_client.set_nozzle_temperature.assert_called_once_with(220, 0, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5103,7 +5132,7 @@ class TestSetNozzleTemperatureAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/nozzle?target=260&nozzle=1")
         assert response.status_code == 200
-        mock_client.set_nozzle_temperature.assert_called_once_with(260, 1)
+        mock_client.set_nozzle_temperature.assert_called_once_with(260, 1, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5116,7 +5145,7 @@ class TestSetNozzleTemperatureAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/nozzle?target=0")
         assert response.status_code == 200
-        mock_client.set_nozzle_temperature.assert_called_once_with(0, 0)
+        mock_client.set_nozzle_temperature.assert_called_once_with(0, 0, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5172,7 +5201,7 @@ class TestSetBedTemperatureAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/bed?target=60")
         assert response.status_code == 200
-        mock_client.set_bed_temperature.assert_called_once_with(60)
+        mock_client.set_bed_temperature.assert_called_once_with(60, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5185,7 +5214,7 @@ class TestSetBedTemperatureAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/bed?target=0")
         assert response.status_code == 200
-        mock_client.set_bed_temperature.assert_called_once_with(0)
+        mock_client.set_bed_temperature.assert_called_once_with(0, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5256,7 +5285,7 @@ class TestSetChamberTemperatureAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/chamber?target=45")
         assert response.status_code == 200
-        mock_client.set_chamber_temperature.assert_called_once_with(45)
+        mock_client.set_chamber_temperature.assert_called_once_with(45, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5269,7 +5298,7 @@ class TestSetChamberTemperatureAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/temperature/chamber?target=0")
         assert response.status_code == 200
-        mock_client.set_chamber_temperature.assert_called_once_with(0)
+        mock_client.set_chamber_temperature.assert_called_once_with(0, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5392,7 +5421,7 @@ class TestSelectExtruderAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/select-extruder?extruder={extruder}")
         assert response.status_code == 200
-        mock_client.select_extruder.assert_called_once_with(extruder)
+        mock_client.select_extruder.assert_called_once_with(extruder, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5532,7 +5561,7 @@ class TestAMSLoadRunoutHoldGate:
     published an ``ams_change_filament``, moved nothing — and LATCHED in firmware,
     resurfacing at the resume 12 h later as a bogus demand for slot 2. A 200 that
     silently arms a future fault is worse than a refusal, so the load 409s (refused in
-    ``services/ams_command.load``, the only pre-publish refusal kept besides "not
+    ``services/printer_action.prepare``, the only pre-publish refusal kept besides "not
     connected") and names the slot the firmware is actually asking for."""
 
     _BARE_8011 = SimpleNamespace(attr=0x07000000, code="0x8011", full_code="0700000000008011")
@@ -5587,7 +5616,7 @@ class TestAMSLoadRunoutHoldGate:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
 
         assert response.status_code == 200
-        mock_client.ams_load_filament.assert_called_once_with(5)
+        mock_client.ams_load_filament.assert_called_once_with(5, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5602,7 +5631,7 @@ class TestAMSLoadRunoutHoldGate:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
 
         assert response.status_code == 200
-        mock_client.ams_load_filament.assert_called_once_with(5)
+        mock_client.ams_load_filament.assert_called_once_with(5, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5617,7 +5646,7 @@ class TestAMSLoadRunoutHoldGate:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
 
         assert response.status_code == 200
-        mock_client.ams_load_filament.assert_called_once_with(5)
+        mock_client.ams_load_filament.assert_called_once_with(5, sequence_id=ANY)
 
 
 class TestAmsMidFilamentChangeIsMeasured:
@@ -5651,7 +5680,7 @@ class TestAmsMidFilamentChangeIsMeasured:
             "message": "Load sent. AMS did not move.",
             "family": "mid_change",
         }
-        mock_client.ams_load_filament.assert_called_once_with(2)
+        mock_client.ams_load_filament.assert_called_once_with(2, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5671,7 +5700,7 @@ class TestAmsMidFilamentChangeIsMeasured:
             "message": "Unload sent. AMS did not move.",
             "family": "mid_change",
         }
-        mock_client.ams_unload_filament.assert_called_once_with()
+        mock_client.ams_unload_filament.assert_called_once_with(sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5707,7 +5736,10 @@ class TestAmsMidFilamentChangeIsMeasured:
 
         assert response.status_code == 200
         assert response.json() == {"outcome": "held", "message": message, "family": "mid_change"}
-        mock_client.ack_for.assert_called_with("ams_change_filament", _SENT_SEQ)
+        # The ACK is read by the send's own id — the action's row id (``printer_action.ack_of``).
+        (sent_id,) = mock_client.ack_for.call_args.args
+        (motion,) = [m for m in (mock_client.ams_load_filament, mock_client.ams_unload_filament) if m.called]
+        assert motion.call_args.kwargs["sequence_id"] == sent_id
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5751,14 +5783,14 @@ class TestAmsMidFilamentChangeIsMeasured:
 
     def test_the_family_has_one_spelling(self):
         """The wire's ``family`` (``schemas.printer.AmsPostureFamily``) and the classifier's
-        (``ams_command.PostureFamily``) are one vocabulary: the DTO layer cannot import a service, so
+        (``command_outcome.PostureFamily``) are one vocabulary: the DTO layer cannot import a service, so
         this pin is what keeps the two spellings one."""
         from typing import get_args
 
         from backend.app.schemas.printer import AmsPostureFamily
-        from backend.app.services import ams_command
+        from backend.app.services import command_outcome
 
-        assert get_args(AmsPostureFamily) == get_args(ams_command.PostureFamily)
+        assert get_args(AmsPostureFamily) == get_args(command_outcome.PostureFamily)
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -5802,7 +5834,7 @@ class TestAmsMidFilamentChangeIsMeasured:
             response = await async_client.post(f"/api/v1/printers/{printer.id}/ams/load?tray_id=5")
 
         assert response.status_code == 200
-        mock_client.ams_load_filament.assert_called_once_with(5)
+        mock_client.ams_load_filament.assert_called_once_with(5, sequence_id=ANY)
 
     @pytest.mark.asyncio
     @pytest.mark.integration

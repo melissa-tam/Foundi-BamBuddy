@@ -35,6 +35,10 @@ describe('waitingReasonText', () => {
     expect(waitingReasonText('library_file_missing', t)).toBe(
       'productionRuns.detail.waiting.libraryFileMissing',
     );
+    expect(waitingReasonText('upload_stalled', t)).toBe('productionRuns.detail.waiting.uploadStalled');
+    expect(waitingReasonText('printer_not_connected', t)).toBe(
+      'productionRuns.detail.waiting.printerNotConnected',
+    );
     expect(waitingReasonText('stagger_hold', t)).toBe('productionRuns.detail.waiting.staggerHold');
     expect(waitingReasonText('spool_jam_recovering', t)).toBe(
       'productionRuns.detail.waiting.spoolJamRecovering',

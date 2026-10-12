@@ -188,30 +188,15 @@ def reset_plate_occupancy_authority():
     plate_occupancy.reset_for_tests()
 
 
-@pytest.fixture(autouse=True)
-def reset_dispatch_claim_registry():
-    """Start and leave every test with an EMPTY start-watchdog registry.
-
-    ``dispatch_claim._start_watchdogs`` is a process singleton keyed by queue-item id,
-    and queue ids restart at 1 in every file's fresh DB — so a watchdog task registered
-    by one module (and left un-popped, because its done-callback never ran on that
-    file's closed loop) answers "this dispatch is owned" for a LATER module's item 1 and
-    silently vetoes every dead-claim release in it. Same class as the two resets above,
-    and for the same reason it lives here rather than per file.
-    """
-    from backend.app.services import dispatch_claim
-
-    dispatch_claim._reset_state()
-    yield
-    dispatch_claim._reset_state()
-
-
 def _reset_printer_manager(pm):
     """Drop every per-printer-id record the manager singleton carries."""
     pm.disconnect_all(timeout=0)
     pm._quarantined.clear()
     pm._model_mismatch.clear()
     pm._current_print_user.clear()
+    # A terminal whose handler a test's loop never finished must not stand a later test's
+    # incident sweep aside (``terminal_in_flight``).
+    pm._terminals_in_flight.clear()
     pm._loop = None
 
 
@@ -245,11 +230,21 @@ def reset_printer_manager_process_state():
     if a ``wired*`` fixture is ever made module-scoped this will wipe it
     between that module's tests.
     """
+    from backend.app.services import printer_action, spool_recovery
     from backend.app.services.printer_manager import printer_manager
 
+    # The record's per-printer process memory (outstanding actions, the last operator AMS command,
+    # the last uncommanded landing) and the recovery lane's — the incident store's open-row cache and
+    # driver slots, the sampler's edges, the resume tasks (``spool_recovery._reset_state`` resets the
+    # store with it) — are keyed by the same restarting printer ids: an open row one file left for
+    # printer 1 makes ``printer_incidents.hold_blocks_dispatch(1)`` refuse a LATER file's dispatch.
     _reset_printer_manager(printer_manager)
+    printer_action._reset_state()
+    spool_recovery._reset_state()
     yield
     _reset_printer_manager(printer_manager)
+    printer_action._reset_state()
+    spool_recovery._reset_state()
 
 
 @pytest.fixture(autouse=True)

@@ -1,212 +1,155 @@
-"""Who owns a dispatch that has not started yet — and when the answer is "nobody".
+"""What a dispatch claim's evidence means — the START's answer first, production's two bounds behind it
+(owner 9, 2026-10-11; R17/R18 of the 2026-10-12 restoration).
 
-A unit is marked ``printing`` BEFORE the print command goes out (deliberately: a crash
-in between must leave a row wrongly marked printing rather than one that silently
-reprints hours later). Two things can then own that claim while the print is still
-landing, and exactly one of them is a task:
+A unit is marked ``printing`` BEFORE the print command goes out (deliberately: a crash in between
+must leave a row wrongly marked printing rather than one that silently reprints hours later). What
+then decides the claim is the dispatch's ``print_start`` action on the record
+(``services/printer_action`` + ``command_outcome``'s start family), answered by an EVENT:
 
-* the **start watchdog** (``print_scheduler._watchdog_print_start``) — spawned at the
-  dispatch, it polls for the active-state transition and un-claims the row itself if the
-  command never lands. While it lives, the answer is *it owns this*;
-* **nobody** — the watchdog exited on a state that later went away, or the process
-  restarted and took every watchdog with it. That claim is what
-  ``farm_stall.check_dead_dispatch_claims`` exists to release.
+* **reached** — the printer reported the dispatched job's own id in an ACTIVE job word, or that job's
+  terminal (a FAILED with its id, or its terminal event): the job is the printer's, and the claim
+  stands (its terminal does the rest). The same id at IDLE / FINISH is only a LANDING (the non-final
+  ``Reading.LANDED``): the file landed, the job has not begun;
+* **refused** — the printer's fail ACK, or a frame that never left the farm: the printer never took
+  the job, the unit goes back to the queue next in line;
+* **void** — a later session began with the start unacknowledged and its job never reported, or the
+  printer rebooted: the printer may never have received it, the unit goes back;
+* **taken over** — another job took the printer: the unit never printed and goes back (loudly), while
+  the other job is the FOREIGN path's.
 
-**This module is the ownership HANDOFF.** One task must never infer another task's
-liveness from a clock: the watchdog's real budget is 90 s + 180 s, it exits on ANY
-active state, and it dies with every restart, so a fixed age floor (it was 600 s) makes
-precisely the claims with NO watchdog — the ones nothing else can retire — wait ~12
-minutes while the UI says "printing" over a demonstrably idle printer.
+An outstanding start waits for its event, and production's self-heal bounds are the fallback
+(operator ruling 2026-10-12: "if it was self heal, it should stay self heal"), counted by the record in
+the printer's ONLINE seconds — the bounds themselves are ``services/dispatch_start``'s:
 
-So liveness is ASKED rather than assumed (:func:`has_live_start_watchdog`, the same
-shape as ``printer_incidents.driver_live``), and what is left of the clock is one
-honest number: :data:`DISPATCH_START_BUDGET_S`, the measured window in which a printer
-that has ACCEPTED a job may still report a non-active state. It is the watchdog's own
-Phase A timeout — ONE origin, read by the watchdog as its ``timeout`` default — so the
-two lanes can never come to disagree about how long a start is allowed to take.
+* no answer and no landing by ``_START_SELF_HEAL`` (90 s from the send; production
+  ``_watchdog_print_start`` Phase A) → the unit goes back, :data:`UNANSWERED_CAUSE`;
+* landed but never active by ``_START_ACTIVE_SELF_HEAL`` (180 s from the landing; Phase B, #1678) → the
+  unit goes back, :data:`NOT_ACTIVE_CAUSE`.
 
-**Leaf by construction.** It imports no farm service and holds no DB handle, so both
-consumers (``print_scheduler`` for the registry, ``farm_stall`` for the judge) import it
-at MODULE level — no call-time import to dodge a cycle, because there is no cycle. The
-two exceptions are stdlib-only owners of a definition a second spelling would fork:
-``ACTIVE_PRINT_STATES``, taken from the plate-occupancy authority that OWNS "what counts
-as an active job" (a second spelling of the set is how two lanes come to disagree about
-PAUSE — which here is the difference between leaving a native-vision hold alone and
-double-dispatching onto an occupied plate); and ``job_identity.same_job``, the ONE
-comparison of two subtask ids.
+An answer that arrives AFTER its bound returned the unit is **late** (:func:`start_late`): it touches no
+claim and no lease — the lease may already be a new dispatch's — and a print it reached runs as the
+FOREIGN path's (production's #1150 risk).
 
-:func:`judge` is pure, I/O-free and table-testable: every guard is a row it can be asked
-about. The GATHERING (DB reads, wire reads)
-and the APPLYING (the dwell, the release, the broadcast) stay with ``farm_stall``, which
-owns the tick.
+A claim the RECORD cannot answer — no ``print_start`` action exists for it (a claim committed by a
+build before the record, or a crash between the claim and the send) — is judged ONCE, at the printer's
+first fresh report of a session, by :func:`judge` over the printer's own report.
+
+**Leaf by construction.** It imports no farm service and holds no DB handle or process state: the
+applying (the release, the lease, the log) is ``services/dispatch_start``'s. The two imports are
+owners of a definition a second spelling would fork: ``ACTIVE_PRINT_STATES``, taken from the
+plate-occupancy authority that OWNS "what counts as an active job" (a second spelling of the set is
+how two lanes come to disagree about PAUSE — here the difference between leaving a native-vision hold
+alone and double-dispatching onto an occupied plate); and ``job_identity.same_job``, the ONE
+comparison of two subtask ids. ``command_outcome.Answer`` is the record's own answer vocabulary.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
 from dataclasses import dataclass
 from typing import Literal
 
+from backend.app.services.command_outcome import Answer
 from backend.app.services.job_identity import same_job
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES
 
-logger = logging.getLogger(__name__)
+#: What a claim's start answer means. Closed on purpose: a new reading of "did this dispatch start"
+#: is added here, where the table can be asked about it. ``late`` — an answer that came after the start's
+#: self-heal bound already returned the unit (:func:`start_late`): nothing is touched.
+StartVerdict = Literal["started", "waiting", "refused", "void", "taken_over", "late"]
 
-#: How long a printer that has ACCEPTED a job may still report a non-active state.
-#: THE one origin of the start budget: ``print_scheduler._watchdog_print_start`` reads it
-#: as its Phase A ``timeout`` default, and :func:`judge` uses it as the floor under which
-#: an unwatched claim is simply too fresh to call dead.
-#:
-#: 90 s is the watchdog's own measured figure (raised from 45 s for slow transitions that
-#: emit no early ``subtask_id`` tick; an H2D can sit at FINISH ~50 s after accepting a
-#: ``project_file``). It is the RIGHT floor for the unwatched case too, because the
-#: question is identical — "could this printer still be digesting the job?" — and after a
-#: restart it is the ONLY thing standing between a claim and a release.
-DISPATCH_START_BUDGET_S = 90.0
+#: The return cause each un-started verdict hands ``requeue.return_to_queue`` (its ``ReturnCause``).
+RETURN_CAUSES: dict[StartVerdict, str] = {
+    "refused": "start_refused",
+    "void": "start_void",
+    "taken_over": "start_taken_over",
+}
 
-#: What a claim's evidence adds up to. Closed on purpose: a seventh reading of "is this
-#: dispatch alive" has to be added here, where the table can be asked about it, rather
-#: than appearing as a new ``continue`` in the middle of a sweep.
-ClaimVerdict = Literal[
-    "started",  # the print landed — the three double-dispatch guards
-    "offline",  # the wire cannot be read (disconnected, stale, or already flagged)
-    "watchdog_owns",  # a live start watchdog is going to answer this itself
-    "too_fresh",  # inside the start budget, or of unknowable age
-    "recovery_acting",  # somebody is acting on the printer right now
-    "dead",  # nobody owns it and nothing started — release it
-]
+#: The cause of a claim the record cannot answer and the printer's report shows never started.
+UNRECORDED_CAUSE = "start_unrecorded"
 
-# item_id -> the live start-watchdog task for that dispatch. Process-lifetime by
-# nature: the task IS the process, so a restart's empty registry is not a gap in the
-# record, it is the record (no watchdogs exist after a restart, which is exactly the
-# case the dead-claim watch has to answer for).
-_start_watchdogs: dict[int, asyncio.Task] = {}
+#: The causes of a start the printer stayed silent on past its self-heal bound (production
+#: ``_watchdog_print_start``, 337f4954): no answer and no landing by ``_START_SELF_HEAL`` (Phase A, #967) —
+#: or the job landed and never became active by ``_START_ACTIVE_SELF_HEAL`` (Phase B, #1678).
+UNANSWERED_CAUSE = "start_unanswered"
+NOT_ACTIVE_CAUSE = "start_not_active"
+
+_VERDICT_OF: dict[Answer, StartVerdict] = {
+    Answer.REACHED: "started",
+    Answer.REFUSED: "refused",
+    Answer.VOID: "void",
+    Answer.TAKEN_OVER: "taken_over",
+}
 
 
-def register_start_watchdog(item_id: int, task: asyncio.Task) -> None:
-    """Record that ``task`` is watching queue item ``item_id``'s dispatch start.
-
-    Called at the ONE spawn site in ``print_scheduler``. The done-callback pops the
-    entry — and pops only ITS OWN, so a re-dispatch that registered a newer watchdog
-    for the same item cannot be un-registered by the older task finishing.
-
-    A task that is already done is still recorded: :func:`has_live_start_watchdog`
-    asks ``.done()`` rather than trusting membership, exactly as
-    ``printer_incidents.driver_live`` does, so the two answers cannot diverge on a
-    callback that has not run yet.
-    """
-    _start_watchdogs[item_id] = task
-    task.add_done_callback(lambda finished: _forget_start_watchdog(item_id, finished))
+def verdict_of(answer: Answer | None, *, late: bool) -> StartVerdict:
+    """The claim's verdict from its ``print_start`` action's answer — ``None`` (still outstanding) WAITS
+    for its event or its self-heal bound; an answer :func:`start_late` calls late is ``late``, whatever it
+    is. Total over :class:`~backend.app.services.command_outcome.Answer`: a new answer raises ``KeyError``
+    here instead of falling through to a silent requeue."""
+    if answer is None:
+        return "waiting"
+    if late:
+        return "late"
+    return _VERDICT_OF[answer]
 
 
-def _forget_start_watchdog(item_id: int, task: asyncio.Task) -> None:
-    """Drop ``item_id``'s registry slot iff ``task`` is still the one in it."""
-    if _start_watchdogs.get(item_id) is task:
-        del _start_watchdogs[item_id]
+def start_late(*, bound_passed: bool, unit_status: str | None, current_start: int | None, action_id: int) -> bool:
+    """Is an ANSWERED start late — its self-heal bound passed (``printer_action.bound_passed_at``) and its unit
+    has moved on without it: no longer ``printing``, or a newer dispatch's start names it
+    (``printer_action.last_start_of``)? Then the bound's fallback already returned the unit, and the lease on
+    the printer may be a NEW dispatch's: a late answer touches no claim and no lease. A start whose bound
+    passed but whose unit is still ``printing`` on it is not late — the fallback has not acted (or could
+    not), and the answer is applied as any other: whichever comes first wins."""
+    return bound_passed and (unit_status != "printing" or current_start != action_id)
 
 
-def has_live_start_watchdog(item_id: int) -> bool:
-    """True while a start watchdog is actively watching ``item_id``'s dispatch.
-
-    The ownership handoff, in one question. A missing slot OR a task that has already
-    finished (``.done()``) both read as no live watchdog, so a registry entry orphaned
-    by a cancelled loop cannot silence the dead-claim watch forever.
-    """
-    task = _start_watchdogs.get(item_id)
-    return task is not None and not task.done()
+def fallback_cause(*, landed: bool) -> str:
+    """The return cause of a start whose self-heal bound passed with no answer: the printer reported the
+    job's id (landed, never active — Phase B) or nothing at all (Phase A)."""
+    return NOT_ACTIVE_CAUSE if landed else UNANSWERED_CAUSE
 
 
-def _reset_state() -> None:
-    """Test hook: empty the watchdog registry between cases."""
-    _start_watchdogs.clear()
+ClaimVerdict = Literal["started", "dead"]
 
 
 @dataclass(frozen=True)
 class ClaimEvidence:
-    """Everything :func:`judge` is allowed to know about one ``printing`` claim.
+    """What :func:`judge` may know about one ``printing`` claim the RECORD cannot answer, read at the
+    printer's first fresh report of a session (``services/dispatch_start.reevaluate_session``).
+    Frozen so a verdict can be re-derived from the same facts in a test and logged verbatim beside
+    the release it produced."""
 
-    Gathered by ``farm_stall`` from the DB row, the live wire and the two liveness
-    registries; frozen so a verdict can be re-derived from the same facts in a test,
-    and logged verbatim beside the release it produced.
-    """
-
-    #: The printer answers over MQTT (``printer_manager.is_connected``).
-    connected: bool
-    #: ...and that answer is CURRENT (``BambuMQTTClient.is_stale()`` is False). A stale
-    #: state is a cached snapshot, which is no better evidence than no state at all.
-    state_fresh: bool
     #: The printer's live gcode state, upper-cased; ``""`` when it has none yet.
     live_state: str
-    #: The row already carries the offline-stall token — that watch owns this story.
-    offline_stalled: bool
     #: Some ``PrintArchive`` on this printer reads ``printing``.
     archive_printing: bool
     #: The submission id the dispatcher minted for this unit; ``""`` when it has none.
     dispatch_subtask: str
     #: The job id the printer is echoing right now; ``""`` when it names none.
     live_subtask: str
-    #: Seconds since the claim was made, or ``None`` when ``started_at`` is NULL.
-    claim_age_s: float | None
-    #: A start watchdog is alive for this item (:func:`has_live_start_watchdog`).
-    watchdog_live: bool
-    #: A recovery driver is acting on this printer (a ``recovering`` incident row or a
-    #: live ``spool_recovery`` task).
-    recovery_acting: bool
 
 
 def judge(evidence: ClaimEvidence) -> ClaimVerdict:
-    """Read one claim's evidence into a verdict. Pure — no DB, no wire, no clock.
+    """Read an UNRECORDED claim's evidence into a verdict. Pure — no DB, no wire, no clock.
 
-    The rows, in precedence order, and each one's reason for being ahead of the next:
+    ``started``, three ways, all double-dispatch guards (the cost of a wrong release is a print onto
+    an occupied plate):
 
-    1. **offline** — the wire cannot be read: disconnected, STALE (a cached snapshot),
-       or already flagged ``printer_offline_stalled``. That story has its own watch and
-       its own token; a decision made against state nobody is refreshing is a guess.
-    2. **started**, three ways, all of them double-dispatch guards, because the cost of
-       a wrong release is a print onto an occupied plate:
+    * the live state is ACTIVE — **PAUSE included**: a native-vision trip pauses at print start with
+      the plate occupied, and releasing that unit would re-dispatch onto it. An EMPTY state reads as
+      started too: no state is not evidence;
+    * a ``PrintArchive`` on this printer reads ``printing`` — hard disjointness with the downtime
+      reconcile, so the two can never both act on one printer;
+    * the printer is echoing OUR dispatch id, in any job word. Corroboration, never a precondition: an
+      id missing on either side is ``unknown``.
 
-       * the live state is ACTIVE — **PAUSE included**: a native-vision trip pauses at
-         print start with the plate occupied, and releasing that unit would re-dispatch
-         onto it. An EMPTY state reads as started too: no state is not evidence;
-       * a ``PrintArchive`` on this printer reads ``printing`` — hard disjointness with
-         ``main.reconcile_stale_active_prints``, so the two reconcilers can never both
-         act on one printer;
-       * the printer is echoing OUR dispatch id. That test is corroboration, never a
-         precondition: a NULL id proves nothing either way, and requiring one would
-         strand exactly the rows that need this most.
-    3. **watchdog_owns** — a live start watchdog will answer this itself, AT ANY AGE.
-       This is the row that replaced the 600 s guess: ownership asked instead of
-       inferred, so a watchdog that is genuinely still working keeps its full 90/270 s
-       and one that never existed costs nothing.
-    4. **too_fresh** — no watchdog, and the claim is younger than
-       :data:`DISPATCH_START_BUDGET_S` (or of unknowable age, which fails closed the
-       same way: an unknowable age is not evidence). This is the post-restart floor —
-       the case with no watchdog to ask — and it is measured rather than padded.
-    5. **recovery_acting** — a ``recovering`` incident row or a live recovery task. An
-       ESCALATED hold deliberately does NOT appear here: that is a human's, not an
-       actor that can land a print, and under the equipment-fault model it can be
-       permanent (003-H2S item 1988 sat behind one). Ranked last of the non-dead rows
-       because it can only ever DELAY a release, never cause a wrong one.
-    6. **dead** — nobody owns it, nothing started. ``farm_stall`` still holds this for
-       its dwell before acting: one poll is not evidence.
+    Anything else is ``dead``: the printer's first fresh report of a session shows no job of ours and
+    no job at all, and nothing on the record can ever answer the claim — it goes back to the queue.
     """
-    if not evidence.connected or not evidence.state_fresh or evidence.offline_stalled:
-        return "offline"
-
     if not evidence.live_state or evidence.live_state in ACTIVE_PRINT_STATES:
         return "started"
     if evidence.archive_printing:
         return "started"
-    # Only a positive ``same``: an id missing on either side is ``unknown`` — no
-    # corroboration, never a reason to read the claim as started.
     if same_job(evidence.live_subtask, evidence.dispatch_subtask) == "same":
         return "started"
-
-    if evidence.watchdog_live:
-        return "watchdog_owns"
-    if evidence.claim_age_s is None or evidence.claim_age_s < DISPATCH_START_BUDGET_S:
-        return "too_fresh"
-    if evidence.recovery_acting:
-        return "recovery_acting"
     return "dead"

@@ -2,18 +2,20 @@
 
 One owner for a question that used to be answered in six places. Before this module
 each closer (``spool_recovery.on_observed_running`` / ``on_job_terminal`` /
-``sweep_open_incidents`` / ``rearm_incidents_on_startup``, ``_resume_after_repair``'s
+``sweep_open_incidents`` / the session start's ``reevaluate_session``, ``_resume_after_repair``'s
 readiness test and ``pause_recovery.on_plate_cleared``) carried its own
 ``if resolution == …`` chain, and the motion evidence the ``repair`` class turns on
-lived in ``spool_recovery`` module globals. Adding an evidence therefore meant editing
-several closers — which is how 011-H2S 2026-09-17 came to sit escalated with a clean
+lived in ``spool_recovery`` module globals (and, until 2026-10-11, in a process ledger
+here). Adding an evidence therefore meant editing several closers — which is how 011-H2S 2026-09-17 came to sit escalated with a clean
 wire, an idle printer and a completed print through the repaired path, because the
 commonest fleet repair (hand-clear the path, resume, the job runs to ``completed``)
 was not in anybody's vocabulary.
 
-The domain is **one rule table plus three evidence predicates and one per-printer
-ledger** — not a strategy family. The variance is ``(resolution_class × occasion) →
-verdict`` and most cells are "stand"; :data:`_TABLE` spells every cell out and a
+The domain is **one rule table plus its evidence predicates** — not a strategy family. Every
+evidence a cell reads is an EVENT the printer or a person produced, or the durable record of one
+(2026-10-11: "using time as a gate is not the correct way to discern status complete or
+incompleteness") — no dwell, and no process memory a restart empties. The variance is
+``(resolution_class × occasion) → verdict`` and most cells are "stand"; :data:`_TABLE` spells every cell out and a
 missing key RAISES. That is the ``declared``-class lesson made structural: three
 closers once treated "not operator / not repair" as the WIRE lane through a bare
 ``else``, so a fourth class inherited evidence that said nothing about it. There is no
@@ -22,8 +24,8 @@ closers once treated "not operator / not repair" as the WIRE lane through a bare
 **Dependency direction.** This module reads the wire (:mod:`hms_errors`,
 :mod:`bambu_mqtt`, :mod:`plate_occupancy`) and the store's pure rule table
 (:mod:`printer_incidents`). It NEVER imports ``spool_recovery`` or ``printer_manager``
-— the printer's live state, the ledger and "is a driver live" all arrive as a
-:class:`Context`, so the closers depend on the rule and the rule depends on nothing
+— the printer's live state, the job's layer, "is a driver live" and "is a terminal being handled"
+all arrive as a :class:`Context`, so the closers depend on the rule and the rule depends on nothing
 that closes. ``printer_incidents`` must never import this module back.
 
 **One lane ends rows of this family OUTSIDE the table, by declaration:**
@@ -39,13 +41,15 @@ It is named in the AST pin's allowlist (``test_code_quality`` /
 ``test_incident_resolution``), so a second closer appearing anywhere fails the suite
 rather than quietly becoming another owner.
 
-**One verdict beside the close table: is a RESUME owed** (:func:`resume_owed`, operator-ratified
-2026-10-10, P2). A row the farm holds over a PAUSEd print whose toolhead the printer or a person
-put back — a person's load after a physical fault, the printer's own swap or a person's load after
-an empty-toolhead hold — is resumed ONCE by the farm, through the one resume body
-(``spool_recovery.resume_paused_print``). Which classes may, and on what evidence, is a second
-total table keyed by the same resolution class (:data:`_RESUME_OWED`), so the class literals still
-never leave this module.
+**One verdict beside the close table: is a RESUME owed** (:func:`resume_owed`; doctrine rule 1, and
+Raymond 2026-10-11: "will i have to click resume on a filament swap after this is shipped? the answer
+should be no"). A row the farm holds over a PAUSEd print whose toolhead the printer or a person put
+back — a person's load after a physical fault, a toolhead that reads fed again after an empty-toolhead
+hold — is resumed ONCE by the farm, through the one resume body (``spool_recovery.resume_paused_print``).
+Which classes may, and on what evidence, is a second total table keyed by the same resolution class
+(:data:`_RESUME_OWED`), so the class literals still never leave this module; the guards every class
+shares (maintenance mode, the plate check, a runout row, the once) sit over it, so the spawner and the
+hold chip (``hold_chip``) ask ONE question.
 """
 
 from __future__ import annotations
@@ -54,9 +58,12 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Protocol
 
 from backend.app.models.printer_incident import (
+    AMS_FAULT_KINDS,
+    KIND_PLATE_VISION,
+    KIND_RUNOUT,
     RESOLUTION_DECLARED,
     RESOLUTION_JOB_PAUSE,
     RESOLUTION_OPERATOR,
@@ -77,8 +84,15 @@ from backend.app.models.printer_incident import (
 )
 from backend.app.services import printer_incidents
 from backend.app.services.bambu_mqtt import PrinterState, ams_mid_filament_change
+from backend.app.services.command_outcome import Answer
 from backend.app.services.feed_state import FeedPhase, FeedReading
-from backend.app.services.hms_errors import fault_tokens, fingerprint_tokens, live_candidates
+from backend.app.services.hms_errors import (
+    fault_tokens,
+    fingerprint_tokens,
+    live_candidates,
+    plate_check_paused,
+    power_loss_prompt_standing,
+)
 from backend.app.services.job_identity import is_held_job, same_job
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.tray_fields import valid_feeder
@@ -88,8 +102,11 @@ logger = logging.getLogger(__name__)
 
 # Every occasion on which somebody asks the question. They are OCCASIONS, not events:
 # ``sweep_tick`` and ``startup`` are the farm looking, the other four are the farm
-# being told. The distinction is load-bearing — the two "looking" occasions differ
-# only in whether a dwell applies.
+# being told. The distinction is load-bearing: a "looking" occasion reads a LIVE report
+# (the sweep's own gate) and stands while the job's terminal is being handled
+# (:attr:`Context.terminal_in_flight`) — the terminal is the event that decides, and a
+# level read in the moment between the printer's report and its handling must never
+# pre-empt it (the open fault it classifies, the plate it refuses).
 #
 # ``new_fault`` is asked by the AMS entry gate (``spool_recovery.on_ams_fault``) of the
 # open AMS row, BEFORE it decides whether that row swallows the fault now on the wire.
@@ -121,6 +138,11 @@ class TerminalEvent:
     built from): the job printed layers with NOTHING fed — a FINISH over an empty toolhead
     (011-H2S and 014-H2S, 2026-10-09). ``False`` when nothing measured it (an older payload,
     the downtime reconcile's synthesis). Read only by the ``repair`` class's completed arm.
+
+    ``last_layer`` is the payload's own peak (``job_extent.JobExtent.last_layer_num``): how far the
+    job got. The ``repair`` class's completed arm reads it against the row's ``fault_layer`` — a job
+    that completed having printed PAST the layer the fault stopped it at ran filament through the
+    path after the fault. ``0`` when nothing measured it.
     """
 
     status: str
@@ -128,6 +150,7 @@ class TerminalEvent:
     job_id: str | None
     plate_refused: bool = False
     printed_unfed: bool = False
+    last_layer: int = 0
 
 
 @dataclass(frozen=True)
@@ -147,10 +170,9 @@ class Context:
     """Everything a verdict may read, passed IN so this module imports no closer.
 
     ``state`` is the printer's live status (``None`` when it is not speaking to us —
-    a cached read during a disconnect is a memory, not evidence). ``ledger`` is the
-    process's motion memory. ``driver_live`` is ``printer_incidents.driver_live`` for
-    this printer — the ONE liveness store — asked by the caller and passed in, so a
-    verdict is a pure function of what it is handed.
+    a cached read during a disconnect is a memory, not evidence). ``driver_live`` is
+    ``printer_incidents.driver_live`` for this printer — the ONE liveness store — asked by the
+    caller and passed in, so a verdict is a pure function of what it is handed.
 
     ``restart_owed`` is what the row's STEP LEDGER says (``spool_recovery``'s evidence log,
     read by the startup rearm): the recovery driver sent its restart stop on this still-open
@@ -175,33 +197,59 @@ class Context:
     the ``toolhead`` class's cells, :func:`resume_owed`) read it off the phase, never off a frame.
     ``None`` — no client, or a caller whose occasion reads no feed (``pause_recovery``'s
     ``plate_cleared``, whose cells read only the verb) — and nothing then reads as fed.
+
+    ``observed_load_at`` is the RECORD's last load on this printer that NOBODY commanded
+    (``printer_action.observed_load_at``: the feed state's landing that answered no farm or operator
+    load — the printer's own backup switch, a person's hand at the AMS), naive UTC; ``None`` when the
+    record holds none. Durable (2026-10-11): it survives the restart that wiped the motion ledger's
+    copy and stranded 001-H2S incident 574. Read by the ``repair`` class's repair
+    evidence; ``None`` for a caller whose occasion reads none.
+
+    ``job_layer`` is the tracked job's current layer (``BambuMQTTClient.job_peaks().layer_num`` — a
+    predecessor's republished layer is never this job's), ``None`` with no client. The ``repair``
+    class reads it against the row's ``fault_layer``: a layer printed FED past the one the fault
+    stopped the job at is the print running through the path after the fault
+    (:func:`_printed_past_fault`) — the job's own record, which a restart does not empty.
+
+    ``terminal_in_flight`` is ``printer_manager.terminal_in_flight`` for this printer: the printer
+    reported a job's end and that terminal is still being handled (``main.on_print_complete`` has
+    not returned). The terminal decides every row it answers — and it reads the open holds BEFORE it
+    closes them, so the open fault classifies the stop and the plate check's refusal reaches the
+    plate — so a LOOKING occasion stands while one is in flight (:func:`resolve`).
+
+    ``job_ran`` — the row's OWN job was seen RUNNING since the row opened (:func:`own_job_running`,
+    recorded by the caller at the RUNNING edge: ``spool_recovery``'s process memory of an edge, which a
+    restart empties). Read only by the ``wire`` class's new-fault cell, whose durable arms still answer
+    after a restart.
     """
 
     state: PrinterState | None
-    ledger: MotionLedger
     driver_live: bool
     terminal: TerminalEvent | None = None
     cleared: ClearedEvent | None = None
     restart_owed: bool = False
     command_pending: bool = False
     feed: FeedReading | None = None
+    observed_load_at: datetime | None = None
+    job_layer: int | None = None
+    terminal_in_flight: bool = False
+    job_ran: bool = False
 
 
 @dataclass(frozen=True)
 class Verdict:
-    """Close or stand, why, and whether the sweep must hold the reading first.
+    """Close or stand, and why.
 
     ``evidence`` is a SENTENCE in both directions: the closers log it verbatim, so a
-    close line names what decided it and a stand line names what did not. ``dwell``
-    is True only for the per-tick sweep's cells — the two "looking" occasions differ
-    in exactly that, and a restart is itself the fresh derivation a dwell substitutes
-    for.
+    close line names what decided it and a stand line names what did not. No verdict waits
+    out a window (2026-10-11): what used to be the sweep's 120 s dwell is the printer's own
+    report — a LIVE one (the sweep's gate), read only while no terminal is being handled
+    (:attr:`Context.terminal_in_flight`).
     """
 
     close: bool
     source: str | None = None
     evidence: str = ""
-    dwell: bool = False
 
 
 # The two motion evidences the ``repair`` class has always admitted, the completed arm
@@ -216,134 +264,10 @@ _REPAIR_NOT_FEEDING = (
 )
 _REPAIR_EVIDENCE_COMPLETED = "print completed through the path after the fault"
 _REPAIR_EVIDENCE_NEW_FAULT = "a print ran through the path after the fault, and a different fault stands now"
-
-
-class MotionLedger:
-    """Per-printer process memory of filament actually MOVING. One writer.
-
-    The ``repair`` class closes on motion, never on silence: the firmware wipes its
-    standing HMS list at every terminal, so a stuck filament and a repaired one read
-    identically on the wire (003-H2S 2026-09-11 dispatched into that reading three
-    times). This is where the positive readings are kept.
-
-    Both facts read the toolhead's FEED STATE (``feed_state.FeedReading``, the client's
-    ``feed()``, handed in by the one writer — invariant 16): never a frame, and never a
-    ``tray_now`` the ledger compares to a seed of its own.
-
-    * ``load_completed_at`` — a load the FARM did not make: the feed state's ``load_landed``
-      event (the ACTIVE extruder's effective feeder became a real AMS tray other than the
-      previous push's, within one session and one active extruder — the feed state owns that
-      scoping, and the seeding: no event on a re-seed, an attach or the first live frame of a
-      session). The LEVEL "a slot is at the feeder" proves nothing: 003-H2S read
-      ``tray_now == 1`` before, during and after its fault; the landing is the event. Each
-      landing is consumed ONCE per printer by its process-global ``seq`` (a cursor), and
-      stamped only when its ``farm_acting`` is False — a recovery driver live or a farm motion
-      command pending, decided at the STEP that saw it land (K12, 2026-10-10): the farm's own
-      swap and refill loads are its procedure, not a person's repair, and a firmware load
-      under a live driver is attributed at the push it happened on, never at this sample. A
-      ``tray_now`` pre-flip inside a drained roll's TAIL is no landing (the landing fires when
-      the backup actually feeds), so it is no repair evidence either.
-    * ``path_ran_at`` — this process saw a print FEED THROUGH THE PATH:
-      :func:`feeding_through_path` (RUNNING, no eject owning the printer, the feed state FED or
-      TAIL from an AMS feeder), :func:`path_quiet`, and no recovery driver live. Stamped on
-      that POSITIVE reading only, which is what makes it usable as evidence AFTER the fact (no
-      seed, no epoch test — a reconnect cannot fabricate a printer demonstrably feeding on a
-      quiet path).
-
-      QUALIFIED at write time, because the sighting is read back long after the sample
-      and a bare RUNNING reading is three things that are not filament feeding through a
-      repaired path. (1) The fault-before-PAUSE window: a row opens on the HMS push that
-      carries the fault, typically BEFORE the PAUSE lands, and this sampler stamps that
-      push before the entry task even runs — so the next RUNNING samples carry the very
-      fault the row is about. The path is not quiet there. (2) A recovery driver's own
-      lever resume: a RUNNING sample taken during a resume the driver published is an
-      intermediate reading of its procedure — the running-edge cells' own rule
-      (:func:`_wire_running_edge`) — and an UPGRADED row keeps the jam's ``created_at``
-      (``printer_incidents.upgrade``), so a driver's resume after that open would
-      otherwise read as "after the fault" on the physical row it became. (3) A print on
-      AIR: 011-H2S and 014-H2S, 2026-10-09/10, were resumed onto an EMPTY toolhead, read
-      RUNNING, and printed the rest of the plate with nothing fed — RUNNING is not
-      feeding (K12). :func:`_ran_through_path_since` is the ONE reader.
-
-    Process-lifetime by design, and the safe direction: a restart empties it (and builds
-    new clients, whose feed states emit no landing until one is seen after their seed), so
-    the only repair evidence left after one is a print actually running — which is why the
-    startup rearm cannot close a physical hold on an idle printer however clean the wire
-    reads, and why a new fault arriving before this process has sampled a quiet RUNNING
-    leaves a physical row standing (the sweep, Recover, or the next qualified sighting then
-    answers it).
-    """
-
-    def __init__(self) -> None:
-        self._load_completed_at: dict[int, datetime] = {}
-        self._path_ran_at: dict[int, datetime] = {}
-        # printer_id -> the ``seq`` of the last ``load_landed`` event this ledger consumed. The
-        # sequence is process-global (a reconnect builds a new client, never a counter that
-        # restarts under this cursor).
-        self._landed_seq: dict[int, int] = {}
-
-    def observe(self, printer_id: int, state: PrinterState | None, reading: FeedReading | None) -> None:
-        """Sample one status push. Sync, DB-free, never raises for the caller's sake.
-
-        Called from ``spool_recovery.note_demand_watch`` — the ONE writer, riding the
-        ~1 Hz push, with the client's feed state for that push (``None`` with no client: no
-        landing, nothing fed). Whether a recovery driver is live is asked HERE for the
-        sighting, never by a caller: a writer whose exclusions lived at its call sites would
-        grow a second, unqualified one; a landing carries its own attribution.
-        """
-        landed = reading.load_landed if reading is not None else None
-        if landed is not None and landed.seq > self._landed_seq.get(printer_id, 0):
-            self._landed_seq[printer_id] = landed.seq
-            if landed.farm_acting:
-                logger.info(
-                    "incident_resolution: printer %s load landed on tray %s (extruder %s) under a farm motion — "
-                    "the farm's own load, not stamped as repair evidence",
-                    printer_id,
-                    landed.tray,
-                    landed.extruder,
-                )
-            else:
-                self._load_completed_at[printer_id] = datetime.utcnow()
-                logger.info(
-                    "incident_resolution: printer %s load completed edge onto tray %s (extruder %s, from %s)",
-                    printer_id,
-                    landed.tray,
-                    landed.extruder,
-                    landed.from_phase.value,
-                )
-
-        # POSITIVE, QUALIFIED reading only — no edge, no epoch test (class docstring).
-        # Every exclusion is asked HERE, at the sample, because the reading is only
-        # evidence while it is current: a sweep's RUNNING, a print on air, a RUNNING with
-        # the fault still standing and a driver's own resume must never enter the ledger at
-        # all. Cheapest test first — the quiet-path test classifies the HMS list, and this
-        # runs ~1 Hz.
-        if (
-            not printer_incidents.driver_live(printer_id)
-            and feeding_through_path(state, printer_id, reading)
-            and path_quiet(state)
-        ):
-            self._path_ran_at[printer_id] = datetime.utcnow()
-
-    def load_completed_at(self, printer_id: int) -> datetime | None:
-        """When this process last saw a load land at the active extruder with no farm motion
-        acting — a person's load, or the printer's own (class docstring)."""
-        return self._load_completed_at.get(printer_id)
-
-    def path_ran_at(self, printer_id: int) -> datetime | None:
-        """When this process last saw a print feed through the path (class docstring)."""
-        return self._path_ran_at.get(printer_id)
-
-    def reset(self) -> None:
-        """Test hook: drop every motion memory. ``spool_recovery._reset_state`` delegates here."""
-        self._load_completed_at.clear()
-        self._path_ran_at.clear()
-        self._landed_seq.clear()
-
-
-# THE ledger. One per process, living with the rule that reads it rather than with the
-# closers that no longer decide anything (``spool_recovery`` imports this name).
-ledger = MotionLedger()
+# The ``wire`` class's new-fault close (R27): the print ran on past the row's fault, by the job's own layer or
+# by the farm's resume reaching the printer, and a different fault stands now.
+_WIRE_EVIDENCE_NEW_FAULT_PAST = "the print printed a layer past the fault, and a different fault stands now"
+_WIRE_EVIDENCE_NEW_FAULT_RESUMED = "the job resumed past this hold, and a different fault stands now"
 
 
 def path_quiet(state: PrinterState | None) -> bool:
@@ -385,9 +309,9 @@ def feeding_through_path(state: PrinterState | None, printer_id: int, feed: Feed
     """Is a print FEEDING through the AMS path right now — :func:`running_without_eject`, AND
     the toolhead's feed state FED or TAIL (``feed_state``, invariant 16) from an AMS feeder?
 
-    THE ``repair`` class's motion evidence (K12, 2026-10-10): its (b) cell
-    (:func:`_repair_motion`) and the ledger's ``path_ran_at`` stamp (:class:`MotionLedger`),
-    which the completed and new-fault arms read back. 011-H2S and 014-H2S, 2026-10-09/10:
+    THE ``repair`` class's reading of a print feeding right now (K12, 2026-10-10): its (b) cell
+    (:func:`_repair_motion`), paired there with the job's own record of having printed past the fault
+    (:func:`_printed_past_fault`). 011-H2S and 014-H2S, 2026-10-09/10:
     resumed onto an EMPTY toolhead, the print read RUNNING and laid down air — RUNNING alone
     had been "a print ran through the path".
 
@@ -436,7 +360,24 @@ def driver_owns(row: PrinterIncident, *, live: bool) -> bool:
     return row.status == STATUS_RECOVERING or live
 
 
-def _resolution_of(row: PrinterIncident) -> str:
+class HoldRow(Protocol):
+    """The row facts the resolution class and the resume verdict read. A :class:`PrinterIncident`
+    satisfies it, and so does the hold chip's view of the store's cached row (``hold_chip``): the
+    chip asks the spawner's own question, DB-free, on every status broadcast."""
+
+    @property
+    def id(self) -> int: ...
+    @property
+    def printer_id(self) -> int: ...
+    @property
+    def kind(self) -> str: ...
+    @property
+    def code(self) -> str: ...
+    @property
+    def job_id(self) -> str | None: ...
+
+
+def _resolution_of(row: HoldRow) -> str:
     """The row's resolution class, read from the store's pure rule — the one read
     :func:`resolve` and :func:`driver_owns` share."""
     return printer_incidents.resolution_class(row.kind, external=printer_incidents.row_external(row))
@@ -465,13 +406,68 @@ def _stand(reason: str) -> Handler:
 
 
 # --- the ``wire`` class -------------------------------------------------------------
+#
+# R27 (2026-10-12): a wire-class AMS row (a jam, a runout, an external-holder physical prompt) ends over
+# a RUNNING print only once the job has printed a layer past the row's ``fault_layer`` — or at the job's
+# terminal. Production closed it over RUNNING after the sweep's 120 s dwell (``_HOLD_OVER_DWELL_S``, 337f4954;
+# its running edge and its refill resume's confirm closed at once); the rewrite deleted the dwell, so a
+# fault that flapped around the RUNNING edge closed its row, re-opened as a NEW row and was owed a fresh
+# farm resume (the 574 reopen loop). The layer advance is the event that replaces the dwell: a firmware
+# change, a re-pause or a flap never advances a layer, and a print running on past the fault does. The once
+# stays per ROW (``resume_spent``): a genuine new fault after the advance opens a new row with its own.
+
+
+def own_job_running(row: PrinterIncident, ctx: Context) -> bool:
+    """Is the row's OWN job RUNNING right now, as its own (no recovery driver live, no eject owning the
+    printer, the row's job or an id-less one)? THE sighting a RUNNING edge records for the ``wire`` class's
+    new-fault cell (:attr:`Context.job_ran`): the job resumed past the hold, a person's touchscreen resume
+    included, which the record never sees. A driver's own lever resume is its procedure, not the hold
+    answered (the running edge stands aside for it on the same rule)."""
+    return (
+        not ctx.driver_live
+        and running_without_eject(ctx.state, row.printer_id)
+        and same_job(_live_job(ctx.state), row.job_id) != "other"
+    )
+
+
+def _wire_not_past_fault(row: PrinterIncident, ctx: Context) -> str | None:
+    """May a wire-class row close over the printer's report now (R27)? ``None`` when it may, else the
+    sentence why it stands.
+
+    Only an AMS row over a RUNNING PRINT (:func:`running_without_eject`) of its own job waits for the layer
+    advance (:func:`_job_printed_past_fault`; an id-less job is read as the row's own, compared against
+    ``fault_layer`` all the same — a layer past it is past it). Every other reading keeps its cell's own
+    rule: a power-loss row is not an AMS fault (its hold ends on the RUNNING its resume produces), and a
+    printer running ANOTHER job, reporting the job over, idle, or under an eject sweep is not "over RUNNING"
+    of the interrupted job (that job is over, which is the terminal's statement too).
+
+    A row with NO recorded ``fault_layer`` (opened by a build before the column, or with no client to read
+    the layer from) cannot measure the advance on its own job: it closes as production did over RUNNING,
+    with no dwell. The AMS entry records one on every row it opens on a printer with a client (the layer's
+    reader), so a new row takes this branch only when it had nothing to read the layer from."""
+    if row.kind not in AMS_FAULT_KINDS or not running_without_eject(ctx.state, row.printer_id):
+        return None
+    if same_job(_live_job(ctx.state), row.job_id) == "other":
+        return None  # another job runs: the interrupted one is over, which its terminal says too
+    if _job_printed_past_fault(row, ctx, id_less_is_same=True):
+        return None
+    if row.fault_layer is None:
+        return None
+    return (
+        f"the print is RUNNING but has not printed a layer fed past the fault yet (layer {ctx.job_layer}, "
+        f"fault at layer {row.fault_layer}) — a flap or a re-pause never advances one"
+    )
 
 
 def _wire_running_edge(row: PrinterIncident, ctx: Context) -> Verdict:
-    """A PAUSE->RUNNING edge closes a wire hold, whoever produced it.
+    """A PAUSE->RUNNING edge closes a wire hold, whoever produced it — once the print has printed past
+    the fault (:func:`_wire_not_past_fault`, R27).
 
     Screen, UI, auto-resume or the firmware recovering by itself — the breadth is the
     point, because a hold clearable only by the one path that set it strands every other resume.
+    The edge usually lands on the fault's own layer: the row then stands, and the sweep closes it on the
+    first layer printed past the fault (:func:`_wire_sweep_tick`), so a fault that flaps around this edge
+    re-pauses into the SAME row, whose farm resume is already spent.
 
     It stands only while a recovery DRIVER is live: a RUNNING sample taken during a
     resume the driver ITSELF published (a release lever of the wedge ladder, or the
@@ -483,6 +479,9 @@ def _wire_running_edge(row: PrinterIncident, ctx: Context) -> Verdict:
     """
     if ctx.driver_live:
         return Verdict(close=False, evidence="a recovery driver is live and owns the outcome; closer stands aside")
+    not_past = _wire_not_past_fault(row, ctx)
+    if not_past is not None:
+        return Verdict(close=False, evidence=not_past)
     return Verdict(close=True, source=RESOLVE_OBSERVED_RUNNING, evidence="the printer is RUNNING again")
 
 
@@ -522,25 +521,32 @@ def _hold_over(state: PrinterState | None) -> tuple[bool, str]:
     return bool(reported) and reported.upper() not in ("", "UNKNOWN", "PAUSE"), reported
 
 
-def _wire_sweep_tick(_row: PrinterIncident, ctx: Context) -> Verdict:
-    """The wire lane's ladder: a positive non-PAUSE state AND zero actionable faults.
+def _wire_sweep_tick(row: PrinterIncident, ctx: Context) -> Verdict:
+    """The wire lane's ladder: the printer's LIVE report (the sweep reads no other) of a positive
+    non-PAUSE state AND zero actionable faults — the fault cleared on the printer's current session —
+    and, over a RUNNING print, a layer printed past the fault (:func:`_wire_not_past_fault`, R27).
 
-    Both guards, then the caller's dwell — the fault that OPENED #60 was evaluated
-    78 ms after a dispatch, on a printer reading non-PAUSE for an instant, and a
-    level-triggered close with no dwell would make the same mistake in the opposite
-    direction.
+    No dwell (2026-10-11). What the old 120 s guarded against is events now: a reading in the instant
+    a printer passes through a non-PAUSE state is answered by the report being live (a reconnect's
+    cached re-broadcast is not evidence) and, over a running print, by the layer advance (a flap
+    around the RUNNING edge never advances one); and while the printer's terminal is being handled the
+    sweep stands (:func:`resolve`), because that terminal reads this very hold to classify the stop
+    (the 2026-09-11 fault-stop requeue) before it closes it.
     """
     over, reported = _hold_over(ctx.state)
     if not over:
         return Verdict(close=False, evidence=f"state is {reported or 'unreported'}, not a positive non-PAUSE")
     if live_candidates(ctx.state):
         return Verdict(close=False, evidence="an actionable fault is still standing")
-    return Verdict(close=True, source=RESOLVE_WIRE_CLEAR, evidence="no actionable fault", dwell=True)
+    not_past = _wire_not_past_fault(row, ctx)
+    if not_past is not None:
+        return Verdict(close=False, evidence=not_past)
+    return Verdict(close=True, source=RESOLVE_WIRE_CLEAR, evidence="no actionable fault")
 
 
-def _wire_startup(_row: PrinterIncident, ctx: Context) -> Verdict:
-    """The same ladder with no dwell and no fault-liveness guard: a restart re-derives
-    every wire fact from scratch, and a printer already running has answered.
+def _wire_startup(row: PrinterIncident, ctx: Context) -> Verdict:
+    """The same ladder with no fault-liveness guard: a session start re-derives every wire fact
+    from scratch, and a printer already running has answered.
 
     One reading of "not PAUSE" is not the hold ending: a row whose driver STOPPED the job
     to restart it (``ctx.restart_owed``) reads IDLE / FAILED because of that stop, while its
@@ -556,24 +562,124 @@ def _wire_startup(_row: PrinterIncident, ctx: Context) -> Verdict:
     over, reported = _hold_over(ctx.state)
     if not over:
         return Verdict(close=False, evidence=f"state is {reported or 'unreported'}, not a positive non-PAUSE")
+    # Over a RUNNING print the first fresh report answers it only once the job printed past the fault
+    # (R27) — the layer is the job's own record, so it reads the same after a restart as before one.
+    not_past = _wire_not_past_fault(row, ctx)
+    if not_past is not None:
+        return Verdict(close=False, evidence=not_past)
     return Verdict(close=True, source=RESOLVE_REARM, evidence=f"printer is {reported} not PAUSE")
+
+
+def _wire_new_fault(row: PrinterIncident, ctx: Context) -> Verdict:
+    """A DIFFERENT fault after the print ran on past this row's: its own incident (R27).
+
+    Held open past the RUNNING edge until the layer advance, a wire row is still open when a fault arrives
+    that has nothing to do with it — a fault the row's flap protection must not swallow, because a swallowed
+    fault gets no row, no driver and no resume of its own (production closed the row at its resume, so such
+    a fault always opened its own). The row ends here when, and only when:
+
+    * the fault is NEW (:func:`_fault_is_new`) — none of the row's own tokens stands. The row's own fault
+      standing again is the flap the row stays open for, and a code standing beside the row's own is the
+      same hold, better described (the entry gate's outrank test re-classifies the row if it is worse).
+      Asked first: it is the sentence the entry's log needs for the commonest re-evaluation, the row's own
+      fault still standing — a driver's re-pause on its own fault included;
+    * no recovery driver is LIVE (the told-occasion ownership rule, :func:`_wire_running_edge`);
+    * the print RAN after the fault: it printed a layer past ``fault_layer`` (:func:`_job_printed_past_fault`,
+      the R27 event), or the job RESUMED past the hold: the farm's resume on this row REACHED the printer
+      (the record, durable), or the row's own job was seen RUNNING since the row opened
+      (:attr:`Context.job_ran`, a person's touchscreen resume included; process memory of the RUNNING
+      edge, so after a restart the two durable arms answer). Both are the event production closed the row
+      on. Without any, the new fault arrived INSIDE the hold (a jam raised while the operator refills a
+      runout slot) and does not end it.
+    """
+    not_new = _fault_is_new(row, ctx.state)
+    if not_new is not None:
+        return Verdict(close=False, evidence=not_new)
+    if ctx.driver_live:
+        return Verdict(close=False, evidence="a recovery driver is live and owns the outcome; closer stands aside")
+    if _job_printed_past_fault(row, ctx, id_less_is_same=True):
+        return Verdict(close=True, source=RESOLVE_OBSERVED_RUNNING, evidence=_WIRE_EVIDENCE_NEW_FAULT_PAST)
+    if ctx.job_ran or any(
+        action.command == "resume" and action.answer == Answer.REACHED.value
+        for action in printer_incidents.farm_actions(row.printer_id, row.id)
+    ):
+        return Verdict(close=True, source=RESOLVE_OBSERVED_RUNNING, evidence=_WIRE_EVIDENCE_NEW_FAULT_RESUMED)
+    return Verdict(
+        close=False,
+        evidence="the printer has not run since the fault — the new fault arrived inside the hold, and the "
+        "outrank test re-classifies the row if it is worse",
+    )
 
 
 # --- the ``repair`` class -----------------------------------------------------------
 
 
-def _ran_through_path_since(row: PrinterIncident, ctx: Context) -> bool:
-    """Did a print run through the path AFTER this row opened? THE one spelling.
+def _loaded_since(row: PrinterIncident, ctx: Context) -> bool:
+    """Did a load NOBODY commanded land after this row opened (``Context.observed_load_at``, the
+    record's ``observed_load`` — durable)? The operator's commonest repair: free the path by hand,
+    then load a slot. The farm's own loads are farm actions, never evidence."""
+    loaded_at = ctx.observed_load_at
+    return loaded_at is not None and row.created_at is not None and loaded_at > row.created_at
 
-    Read by the two cells that turn on history rather than on the printer's current
-    reading — the completed arm (:func:`_repair_job_terminal`) and the new-fault arm
-    (:func:`_repair_new_fault`) — off the ledger's QUALIFIED sighting
-    (:meth:`MotionLedger.path_ran_at`: :func:`feeding_through_path`, the path quiet, no
-    driver live — every qualification asked at the sample). Strictly after ``created_at``:
-    the print that was running when the fault arrived is the one it interrupted.
+
+def _job_printed_past_fault(row: PrinterIncident, ctx: Context, *, id_less_is_same: bool = False) -> bool:
+    """Has the job printed a layer FED past the one the fault stopped it at? THE one reader of the
+    layer advance after a fault, shared by the ``repair`` class (:func:`_printed_past_fault`, which adds
+    the AMS-path question) and the ``wire`` class's close over a RUNNING print (:func:`_wire_not_past_fault`,
+    R27). The job's OWN record, never a sighting held in memory: the row's ``fault_layer`` (recorded at
+    the open, re-stamped at a re-classification) against the tracked job's layer (``Context.job_layer``),
+    on the toolhead's feed state (invariant 16).
+
+    * the row's own job: its layer is past ``fault_layer`` (a row with no recorded layer — opened
+      before the column existed — proves nothing here);
+    * another job on the printer (the interrupted one is over): it has printed a layer;
+    * an id-less job either side (``job_identity`` ``unknown``): nothing — unless the caller reads it as
+      the row's own job (``id_less_is_same``), comparing its layer against ``fault_layer`` all the same.
+
+    FED: the feed state measured no layer printed with nothing fed in this job (``first_unfed_layer`` —
+    a print resumed onto an empty toolhead advances its layers on air, K12). The printer must be
+    reporting.
     """
-    ran = ctx.ledger.path_ran_at(row.printer_id)
-    return ran is not None and row.created_at is not None and ran > row.created_at
+    feed = ctx.feed
+    layer = ctx.job_layer
+    if feed is None or layer is None or not _reporting(ctx.state):
+        return False
+    if feed.first_unfed_layer is not None:
+        return False
+    identity = same_job(_live_job(ctx.state), row.job_id)
+    if identity == "unknown" and id_less_is_same:
+        identity = "same"
+    match identity:
+        case "same":
+            fault_layer = getattr(row, "fault_layer", None)
+            return fault_layer is not None and layer > fault_layer
+        case "other":
+            return layer >= 1
+        case _:
+            return False
+
+
+def _printed_past_fault(row: PrinterIncident, ctx: Context) -> bool:
+    """Has the print run filament through the AMS PATH since the fault — :func:`_job_printed_past_fault`,
+    AND the toolhead's feeder — the effective one now, else the job's last feeder segment (an attach
+    after a restart starts the segment log empty) — is a real AMS tray (the external holder bypasses the
+    path this class holds)."""
+    if not _job_printed_past_fault(row, ctx):
+        return False
+    feed = ctx.feed
+    assert feed is not None  # _job_printed_past_fault answered True, which needs a feed reading
+    segments = feed.tray_change_log
+    feeder = feed.feeder if feed.feeder is not None else (segments[-1][0] if segments else None)
+    return valid_feeder(feeder) is not None
+
+
+def _ran_through_path_since(row: PrinterIncident, ctx: Context) -> bool:
+    """Did filament run through the path AFTER this row opened? THE one spelling, read by the
+    new-fault arm (:func:`_repair_new_fault`): a load nobody commanded landed (:func:`_loaded_since`),
+    or the print ran a layer FED past the fault (:func:`_printed_past_fault`). Both are durable — the
+    record, and the job's own layer against the row's — so a restart no longer leaves the row
+    standing until this process happens to see the path run (2026-10-11)."""
+    return _loaded_since(row, ctx) or _printed_past_fault(row, ctx)
 
 
 def _repair_motion(row: PrinterIncident, ctx: Context) -> Verdict:
@@ -582,13 +688,15 @@ def _repair_motion(row: PrinterIncident, ctx: Context) -> Verdict:
     Either is sufficient and both sit behind :func:`path_quiet` — whatever moved, the
     fault must not be standing now and the AMS must not be wedged.
 
-    (a) a completed-load EDGE stamped after this row opened: the operator's commonest
-        repair is to free the path by hand and then load a slot (the ledger stamps no
-        edge a live recovery driver made — :class:`MotionLedger`);
+    (a) a load NOBODY commanded landed after this row opened (:func:`_loaded_since`, the
+        record's ``observed_load``): the operator's commonest repair is to free the path by hand
+        and then load a slot — the farm's own loads are farm actions, never evidence;
     (b) a print is FEEDING through the same path (:func:`feeding_through_path`: RUNNING,
-        no eject, the feed state FED or TAIL from an AMS feeder). The eject exclusion is not
-        incidental: a sweep is filament-LESS, so a toolhead crossing the plate says
-        nothing about whether filament moves — and neither does a print on air (K12).
+        no eject, the feed state FED or TAIL from an AMS feeder) AND it has printed a layer past
+        the fault (:func:`_printed_past_fault`) — the layer advance is the event, so no reading
+        waits out a dwell (2026-10-11). The eject exclusion is not incidental: a sweep is
+        filament-LESS, so a toolhead crossing the plate says nothing about whether filament
+        moves — and neither does a print on air (K12).
 
     The printer must also be REPORTING. A hold is not ended on a printer we cannot
     hear, however good the memory of its last load.
@@ -597,32 +705,36 @@ def _repair_motion(row: PrinterIncident, ctx: Context) -> Verdict:
         return Verdict(close=False, evidence="the printer has not reported a state")
     if not path_quiet(ctx.state):
         return Verdict(close=False, evidence="the path is not quiet (a fault stands, or the AMS is mid-change)")
-    loaded_at = ctx.ledger.load_completed_at(row.printer_id)
-    if loaded_at is not None and row.created_at is not None and loaded_at > row.created_at:
+    if _loaded_since(row, ctx):
+        if _held_job_paused(row, ctx) is None:
+            # The row's own job sits PAUSEd on the repaired path: its resume — the farm's once
+            # (:func:`resume_owed`), or a person's — is what answers the hold, and the print running
+            # again closes it here. Closing on the load first would strand the PAUSE with nobody owed
+            # a resume (the row is the resume's own guard), which is what a dwell used to paper over.
+            return Verdict(
+                close=False,
+                evidence="the path was repaired and the job is PAUSEd on it — its resume answers the hold",
+            )
         return Verdict(close=True, source=RESOLVE_REPAIR_OBSERVED, evidence=_REPAIR_EVIDENCE_LOAD)
     if feeding_through_path(ctx.state, row.printer_id, ctx.feed):
-        return Verdict(close=True, source=RESOLVE_REPAIR_OBSERVED, evidence=_REPAIR_EVIDENCE_RUNNING)
+        if _printed_past_fault(row, ctx):
+            return Verdict(close=True, source=RESOLVE_REPAIR_OBSERVED, evidence=_REPAIR_EVIDENCE_RUNNING)
+        return Verdict(close=False, evidence="the print feeds but has not printed a layer past the fault yet")
     if running_without_eject(ctx.state, row.printer_id):
         return Verdict(close=False, evidence=_REPAIR_NOT_FEEDING)
     return Verdict(close=False, evidence="no repair evidence")
 
 
 def _repair_sweep_tick(row: PrinterIncident, ctx: Context) -> Verdict:
-    """Motion evidence, then the sweep's dwell."""
-    verdict = _repair_motion(row, ctx)
-    return (
-        Verdict(close=True, source=verdict.source, evidence=verdict.evidence, dwell=True) if verdict.close else verdict
-    )
+    """The motion evidence, on the sweep's live report."""
+    return _repair_motion(row, ctx)
 
 
 def _repair_startup(row: PrinterIncident, ctx: Context) -> Verdict:
-    """The same evidences with no dwell — the restart IS the fresh derivation the
-    dwell substitutes for elsewhere — and closed under the rearm's own source token,
-    because the edge itself was never witnessed by this process.
-
-    After a restart the ledger is empty by construction, so in practice only a RUNNING
-    print can close one. That is correct: ``tray_now`` naming a slot is a LEVEL a
-    stuck-filament printer reports just as readily.
+    """The same evidences on the session's first fresh report, closed under the rearm's own source
+    token, because the edge itself was never witnessed by this session. ``tray_now`` naming a slot is
+    a LEVEL a stuck-filament printer reports just as readily, so neither a feeder reading nor a
+    RUNNING edge closes one: a load nobody commanded, or a layer printed fed past the fault.
     """
     verdict = _repair_motion(row, ctx)
     return Verdict(close=True, source=RESOLVE_REARM, evidence=verdict.evidence) if verdict.close else verdict
@@ -635,7 +747,7 @@ def _repair_job_terminal(row: PrinterIncident, ctx: Context) -> Verdict:
     resume, and the resumed job then ran to completion (011-H2S 2026-09-17 sat escalated
     for a day with exactly that behind it) — strong positive evidence about the path, and
     until 2026-09-17 nothing counted it, because the completion landed inside the sweep's
-    120 s dwell and the terminal closer had no repair vocabulary at all.
+    (since deleted) 120 s dwell and the terminal closer had no repair vocabulary at all.
 
     ``completed`` alone is NOT "filament fed to the end", and this docstring used to say it
     was. 011-H2S and 014-H2S, 2026-10-09: resumed onto an EMPTY toolhead, both jobs printed
@@ -653,12 +765,12 @@ def _repair_job_terminal(row: PrinterIncident, ctx: Context) -> Verdict:
     * the SAME job (``job_identity.same_job`` answers ``same``: the terminal must name
       one). The row blocks the DISPATCHER, not the touchscreen: a screen-started print
       completing on another slot must not launder a blocked shared path.
-    * a print ran through the path AFTER the row opened (:func:`_ran_through_path_since`
-      — the qualified sighting, the new-fault arm's own evidence). This excludes a
-      pull-back timeout raised at end-of-print unload with no post-fault resume — there
-      the job completes, but nothing ever ran through the path after the fault — and,
-      since the sighting is qualified, the RUNNING samples of the fault-before-PAUSE
-      window, a recovery driver's own lever resumes and a print running on air.
+    * the job printed PAST the fault: the payload's own peak (``TerminalEvent.last_layer``) is beyond
+      the row's ``fault_layer`` — or a load nobody commanded landed after the row opened
+      (:func:`_loaded_since`). This excludes a pull-back timeout raised at end-of-print unload
+      with no post-fault resume — there the job completes, but no layer ran after the fault. Both
+      readings are durable (the payload and the row; the record), so a restart between the fault
+      and the completion no longer costs the evidence (2026-10-11).
     * :func:`path_quiet` now. Evidence is not a latch.
     """
     terminal = ctx.terminal
@@ -677,8 +789,10 @@ def _repair_job_terminal(row: PrinterIncident, ctx: Context) -> Verdict:
     # ``unknown``, and repair evidence needs the terminal to NAME the interrupted job.
     if same_job(terminal.job_id, row.job_id) != "same":
         return Verdict(close=False, evidence="the completed job is not the one the fault interrupted")
-    if not _ran_through_path_since(row, ctx):
-        return Verdict(close=False, evidence="no print was seen RUNNING through the path after the fault")
+    fault_layer = row.fault_layer
+    printed_past = fault_layer is not None and terminal.last_layer > fault_layer
+    if not printed_past and not _loaded_since(row, ctx):
+        return Verdict(close=False, evidence="the job printed no layer past the fault, and nothing loaded since")
     if not path_quiet(ctx.state):
         return Verdict(close=False, evidence="the path is not quiet (a fault stands, or the AMS is mid-change)")
     return Verdict(close=True, source=RESOLVE_REPAIR_COMPLETED, evidence=_REPAIR_EVIDENCE_COMPLETED)
@@ -712,9 +826,7 @@ def _repair_new_fault(row: PrinterIncident, ctx: Context) -> Verdict:
     class, so the row outlived the resume that had in fact repaired the path, and the
     entry gate then refused every new fault on the printer as "already held" — and
     suppressed its raw alert. A print RAN through the path after the fault, which is the
-    motion this class has always closed on; the sweep would have closed the row on the
-    same running print after its dwell, and the new fault simply arrived inside that
-    dwell.
+    motion this class has always closed on.
 
     Three conditions, and nothing else:
 
@@ -727,12 +839,10 @@ def _repair_new_fault(row: PrinterIncident, ctx: Context) -> Verdict:
     * the fault is NEW (:func:`_fault_is_new`) — the row's own tokens no longer stand. A
       new code standing BESIDE the row's own is the same blockage, better described,
       and the entry gate's outrank test re-classifies the row if it is worse;
-    * :func:`_ran_through_path_since` — a QUALIFIED sighting after the row opened. Not
-      the fault-before-PAUSE window (the path was not quiet), not a driver's own lever
-      resume (a driver was live), not a print on air (nothing was fed — K12). After a
-      restart the ledger is empty, so the row
-      STANDS until this process has itself seen the path run — the safe direction: a
-      hold is never ended on motion nobody here witnessed.
+    * :func:`_ran_through_path_since` — a load nobody commanded since the row opened, or a layer
+      printed FED past the row's ``fault_layer`` (a re-classification re-stamps it, so a driver's
+      own lever resumes before an upgrade are not "after the fault"; a print on air is no evidence —
+      K12). Durable, so a restart reads the same answer.
     """
     if ctx.driver_live:
         return Verdict(close=False, evidence="a recovery driver is live and owns the outcome; closer stands aside")
@@ -865,7 +975,6 @@ def _job_pause_ended_unseen(row: PrinterIncident, ctx: Context) -> Verdict | Non
             close=True,
             source=RESOLVE_JOB_ENDED_UNSEEN,
             evidence=f"the printer reports {live} — the paused job is over",
-            dwell=True,
         )
     job = _live_job(ctx.state)
     if _reporting(ctx.state) and job and not is_held_job(job, row.job_id):
@@ -873,31 +982,29 @@ def _job_pause_ended_unseen(row: PrinterIncident, ctx: Context) -> Verdict | Non
             close=True,
             source=RESOLVE_JOB_ENDED_UNSEEN,
             evidence="the printer is on another job — the paused job is over",
-            dwell=True,
         )
     return None
 
 
 def _job_pause_sweep_tick(row: PrinterIncident, ctx: Context) -> Verdict:
-    """The paused job printing again, or the printer's positive report that it is over —
-    either way after the sweep's dwell.
+    """The paused job printing again, or the printer's positive report that it is over.
 
     The edge closer and the terminal closer are the first responders; this catches what
     they missed: a reconnect straight into RUNNING, and a terminal the farm never saw. The
-    dwell is what keeps it second — a stopped job's own terminal lands within a second of
-    the printer reporting FAILED, and that terminal is the one that carries the
-    ``plate_refused`` verdict to the plate authority.
+    terminal stays first by EVENT, never by a dwell: while the printer's terminal is being
+    handled the sweep stands (:attr:`Context.terminal_in_flight`), because that terminal is
+    the one that carries the ``plate_refused`` verdict to the plate authority.
     """
     verdict = _job_pause_running(row, ctx)
     if verdict.close:
-        return Verdict(close=True, source=verdict.source, evidence=verdict.evidence, dwell=True)
+        return verdict
     ended = _job_pause_ended_unseen(row, ctx)
     return ended if ended is not None else verdict
 
 
 def _job_pause_startup(row: PrinterIncident, ctx: Context) -> Verdict:
-    """The same RUNNING evidence with no dwell, under the rearm's own token — the resume
-    itself was never witnessed by this process.
+    """The same RUNNING evidence, under the rearm's own token — the resume itself was never
+    witnessed by this session.
 
     Deliberately NOT the ended-unseen reading: a job stopped while the farm was down is
     answered by the downtime reconcile's synthesised terminal, which classifies it
@@ -954,24 +1061,24 @@ def _toolhead_fed_print(row: PrinterIncident, ctx: Context) -> Verdict:
 
 def _toolhead_sweep_tick(row: PrinterIncident, ctx: Context) -> Verdict:
     """A print running fed, or the printer's POSITIVE report that the job is over (a terminal the
-    farm never saw) — after the sweep's dwell either way. A toolhead hold cannot outlive its job."""
+    farm never saw — the one being handled stands the sweep aside, :func:`resolve`). A toolhead
+    hold cannot outlive its job."""
     verdict = _toolhead_fed_print(row, ctx)
     if verdict.close:
-        return Verdict(close=True, source=verdict.source, evidence=verdict.evidence, dwell=True)
+        return verdict
     live = _live_state(ctx.state).upper()
     if live in _JOB_OVER_STATES:
         return Verdict(
             close=True,
             source=RESOLVE_JOB_ENDED_UNSEEN,
             evidence=f"the printer reports {live} — the job it held is over",
-            dwell=True,
         )
     return verdict
 
 
 def _toolhead_startup(row: PrinterIncident, ctx: Context) -> Verdict:
-    """The same evidence with no dwell, under the rearm's own token: a print running fed, or a job
-    over. A PAUSEd printer is the hold — the row's driver is re-entered (``spool_recovery``)."""
+    """The same evidence, under the rearm's own token: a print running fed, or a job over. A PAUSEd
+    printer is the hold — the row's driver is re-entered (``spool_recovery``)."""
     verdict = _toolhead_fed_print(row, ctx)
     if verdict.close:
         return Verdict(close=True, source=RESOLVE_REARM, evidence=verdict.evidence)
@@ -1001,21 +1108,16 @@ _TABLE: dict[tuple[str, Occasion], Handler] = {
     (RESOLUTION_WIRE, "sweep_tick"): _wire_sweep_tick,
     (RESOLUTION_WIRE, "startup"): _wire_startup,
     (RESOLUTION_WIRE, "plate_cleared"): _stand("a runout hold is not answered by somebody clearing a plate"),
-    # A wire hold (a jam, a runout, an external-holder physical prompt) already closes on
-    # the printer running again or on its job's terminal — so a wire row still OPEN when
-    # a new fault reaches the entry gate means the printer has not run since it opened:
-    # the new fault arrived INSIDE the hold (a jam raised while the operator refills a
-    # runout slot), or a live driver owns the row and the fault is its reading. Neither
-    # ends the hold. What the new fault may do is RE-CLASSIFY the row, and the entry
-    # gate's outrank test (``spool_recovery._outranks``) already owns that — a runout
-    # must never be routed into the swap machine (doctrine invariant 9).
-    (RESOLUTION_WIRE, "new_fault"): _stand(
-        "a wire hold ends when its printer runs again or its job ends — a new fault while it is open "
-        "arrived inside the hold, and the outrank test re-classifies the row if it is worse"
-    ),
+    # A wire hold (a jam, a runout, an external-holder physical prompt) stays open over a RUNNING
+    # print until the layer advance (R27), so a different fault after the print ran on is its own
+    # incident (:func:`_wire_new_fault`); one that arrived INSIDE the hold (a jam raised while the
+    # operator refills a runout slot), or a live driver's reading, ends nothing. What the new fault may
+    # do there is RE-CLASSIFY the row, and the entry gate's outrank test (``spool_recovery._outranks``)
+    # already owns that — a runout must never be routed into the swap machine (doctrine invariant 9).
+    (RESOLUTION_WIRE, "new_fault"): _wire_new_fault,
     (RESOLUTION_REPAIR, "running_edge"): _stand(
         "a RUNNING edge is not repair evidence — an eject sweep makes one and moves no filament; "
-        "the sweep closes it after the dwell"
+        "the sweep closes it once the print has printed a layer fed past the fault"
     ),
     (RESOLUTION_REPAIR, "job_terminal"): _repair_job_terminal,
     (RESOLUTION_REPAIR, "sweep_tick"): _repair_sweep_tick,
@@ -1081,14 +1183,22 @@ _TABLE: dict[tuple[str, Occasion], Handler] = {
 }
 
 
+# The LOOKING occasions — the farm reading levels rather than being told an event. While the
+# printer's terminal is being handled (``Context.terminal_in_flight``) they stand: the terminal is
+# the event that decides every row it answers, and it reads the open holds before it closes them.
+_LOOKING: frozenset[Occasion] = frozenset({"sweep_tick", "startup"})
+
 # The occasions a PENDING farm command does not stand (K11 + 2026-10-10 item 7a):
 #
 # * ``job_terminal`` — a job that is over has no toolhead left to print air with;
 # * ``plate_cleared`` — Recover / Mark plate cleared: a PERSON declared the printer fixed, and the
 #   rows their verb's class ends close on their word. What the queued command can still do is
 #   answered by events, never by holding the row against them: the next Bambuddy resume refills the
-#   toolhead before it publishes (T3), and a print that runs onto an empty toolhead is paused and
-#   refilled on its first push (T4).
+#   toolhead before it publishes (T3), and a print that runs onto an empty toolhead is stopped on the
+#   first layer it prints on air (T4, 2026-10-12).
+#
+# The same two are the only occasions a row carrying the farm's AIR stop the printer did not take is
+# ended on (:func:`resolve`'s third guard): the job's end, or a person's Recover.
 _PENDING_EXEMPT: frozenset[Occasion] = frozenset({"job_terminal", "plate_cleared"})
 
 
@@ -1109,48 +1219,102 @@ def resolve(row: PrinterIncident, occasion: Occasion, ctx: Context) -> Verdict:
     whatever the cell would answer (:class:`Context`). The exemption lives HERE, never with the
     caller: ``pause_recovery.on_plate_cleared`` passes no ``command_pending`` at all, and a
     person's clear must not depend on whether a caller happened to.
+
+    And a second, by EVENT where a dwell used to stand (2026-10-11): a LOOKING occasion stands while
+    the printer's terminal is being handled (``ctx.terminal_in_flight``) — that terminal decides the
+    rows it answers, from the holds it read before closing them.
+
+    And a third (2026-10-12): a row carrying the farm's AIR stop (``printer_incidents.air_stop_on`` — a
+    stop the printer took ends the job and its driver closes the row, so an open row carrying one is a
+    stop the printer did NOT take, escalated to a person) stands on every occasion but the two in
+    :data:`_PENDING_EXEMPT`: the print may still be running on air, and a running edge or a quiet wire is
+    no evidence it stopped. Held open, it also keeps the per-push air detector off the print
+    (``printer_incidents.air_stop_sent``): one escalation, never a page loop.
     """
     handler = _TABLE[(_resolution_of(row), occasion)]
+    if ctx.terminal_in_flight and occasion in _LOOKING:
+        return Verdict(
+            close=False,
+            evidence="the printer's terminal is being handled — it decides the holds it answers",
+        )
     if ctx.command_pending and occasion not in _PENDING_EXEMPT:
         return Verdict(
             close=False,
             evidence="a farm AMS command on this row has not run (held or unanswered) — the row stands "
             "until it runs, a reboot voids it, or the job ends",
         )
+    if occasion not in _PENDING_EXEMPT and printer_incidents.air_stop_on(row.printer_id, row.id):
+        return Verdict(
+            close=False,
+            evidence="the farm stopped this print for printing on air and the printer did not take the stop — "
+            "the row stands until the job ends or a person recovers the printer",
+        )
     return handler(row, ctx)
 
 
-# --- is a RESUME owed (operator-ratified 2026-10-10, P2) ------------------------------------------
+# --- is a RESUME owed (doctrine rule 1; Raymond 2026-10-11: "will i have to click resume on a ------
+# filament swap after this is shipped? the answer should be no") ------------------------------------
 #
 # A row the farm holds over a PAUSEd print whose toolhead was put back by the PRINTER or a PERSON —
 # never by the farm — is resumed ONCE: a print paused on a fixed toolhead is waiting for a button
-# nobody is standing there to press (doctrine rule 1). The resume itself is never this module's: the
-# caller spawns the one resume body (``spool_recovery.resume_paused_print``, which asks K7 again at
-# publish time) once per row, never in maintenance mode and never at a plate-check pause.
+# nobody is standing there to press. The resume itself is never this module's: the caller spawns the
+# one resume body (``spool_recovery.resume_paused_print``, which asks K7 again at publish time).
+#
+# "Once" is the RECORD's (``printer_action``, the row's farm ``resume`` actions — durable across a
+# restart, which the process set it replaced was not): a farm resume on the row that is outstanding,
+# reached, refused by the printer or taken over by a person spends it; one the printer never received
+# (``void``, or a frame that never left the farm) does not — the hold is still owed its resume.
+
+
+#: :func:`resume_owed`'s closed verdict. ``owed`` — the farm resumes it now (the spawner acts on this
+#: alone); ``waiting`` — a guard the farm itself waits out (its own AMS command still pending, the path
+#: not quiet, the AMS mid-change, the plate-check episode not open yet) — once it clears the sweep
+#: resumes it; ``declined`` — the farm never resumes this row (maintenance mode, another row owns the
+#: pause, the once spent, not the row's job, no evidence) — a person's Resume, or another lane's.
+ResumeVerdict = Literal["owed", "waiting", "declined"]
 
 
 @dataclass(frozen=True)
 class ResumeOwed:
-    """:func:`resume_owed`'s answer, and the SENTENCE that decided it (the spawner logs a yes; a
-    no is a level re-asked every sweep tick, so it is read, never logged)."""
+    """:func:`resume_owed`'s answer: the closed :data:`ResumeVerdict`, the SENTENCE that decided it (the
+    spawner logs a yes; a no is a level re-asked every sweep tick, so it is read, never logged), and —
+    for a ``declined`` whose pause another open row owns (the plate check, a runout, an AMS hold) — that
+    row's kind, so the hold chip names that row rather than asking a person to press Resume."""
 
-    owed: bool
+    verdict: ResumeVerdict
     evidence: str
+    owner: str | None = None
+
+    @property
+    def owed(self) -> bool:
+        return self.verdict == "owed"
 
 
-ResumeRule = Callable[[PrinterIncident, Context], ResumeOwed]
+def _owed(evidence: str) -> ResumeOwed:
+    return ResumeOwed("owed", evidence)
+
+
+def _waiting(evidence: str) -> ResumeOwed:
+    return ResumeOwed("waiting", evidence)
+
+
+def _declined(evidence: str, *, owner: str | None = None) -> ResumeOwed:
+    return ResumeOwed("declined", evidence, owner)
+
+
+ResumeRule = Callable[[HoldRow, Context], ResumeOwed]
 
 
 def _never_resumes(reason: str) -> ResumeRule:
     """A class the farm never resumes on a load, carrying why."""
 
-    def _rule(_row: PrinterIncident, _ctx: Context) -> ResumeOwed:
-        return ResumeOwed(owed=False, evidence=reason)
+    def _rule(_row: HoldRow, _ctx: Context) -> ResumeOwed:
+        return _declined(reason)
 
     return _rule
 
 
-def _held_job_paused(row: PrinterIncident, ctx: Context) -> str | None:
+def _held_job_paused(row: HoldRow, ctx: Context) -> str | None:
     """``None`` when the printer holds the row's OWN job PAUSEd — the job the fault interrupted,
     named on both sides (``job_identity.same_job`` answers ``same``: an id-less echo is no job) —
     else the sentence why not."""
@@ -1161,53 +1325,54 @@ def _held_job_paused(row: PrinterIncident, ctx: Context) -> str | None:
     return None
 
 
-def _repair_resume_owed(row: PrinterIncident, ctx: Context) -> ResumeOwed:
-    """``physical`` (the ``repair`` class): today's repair evidence — a load that landed after the
-    row opened with no farm motion acting (``MotionLedger.load_completed_at``, :func:`_repair_motion`'s
+def _repair_resume_owed(row: HoldRow, ctx: Context) -> ResumeOwed:
+    """``physical`` (the ``repair`` class): today's repair evidence — a load NOBODY commanded that
+    landed after the row opened (``Context.observed_load_at``, the record; :func:`_repair_motion`'s
     (a) arm: the printer reporting, the path quiet), the row's own job PAUSEd. Somebody freed the
     path at the printer and loaded a slot; the repair is their "go". (b) — a print feeding — needs
     RUNNING, which a resume never does."""
     not_held = _held_job_paused(row, ctx)
     if not_held is not None:
-        return ResumeOwed(owed=False, evidence=not_held)
-    motion = _repair_motion(row, ctx)
-    if motion.close and motion.evidence == _REPAIR_EVIDENCE_LOAD:
-        return ResumeOwed(
-            owed=True, evidence="the filament path was repaired: a load completed after the fault, the job PAUSEd"
-        )
-    return ResumeOwed(owed=False, evidence=motion.evidence)
+        return _declined(not_held)
+    if not _reporting(ctx.state):
+        return _declined("the printer has not reported a state")
+    if not path_quiet(ctx.state):
+        return _waiting("the path is not quiet (a fault stands, or the AMS is mid-change)")
+    if _loaded_since(row, ctx):
+        return _owed("the filament path was repaired: a load completed after the fault, the job PAUSEd")
+    return _declined("no repair evidence")
 
 
-def _toolhead_resume_owed(row: PrinterIncident, ctx: Context) -> ResumeOwed:
-    """``toolhead``: the toolhead reads fed again (the feed state FED or TAIL — :func:`_toolhead_fed`)
-    after a load that landed with NO farm motion acting after the row opened (the ledger's
-    ``load_completed_at``: the printer's own swap, or a person's load), the row's own job PAUSEd,
-    and the path quiet — a fault standing, or the AMS mid-change, is that fault's lane's pause to
-    answer, not a fixed toolhead's.
+def _toolhead_resume_owed(row: HoldRow, ctx: Context) -> ResumeOwed:
+    """``toolhead``: a LEVEL, readable off the printer's first fresh report after a restart — the row's
+    own job PAUSEd, the path quiet, the toolhead's feed state FED or TAIL NOW (:func:`_toolhead_fed`), no
+    farm load on this hold reached the toolhead, and no AMS hold open beside it.
 
-    The farm's own refill NEVER qualifies: it lands under the refill driver, ``farm_acting`` at
-    its step, so it never reaches the ledger as a load — and the give-up's refill sits on an AMS
-    row, a class that never resumes (a give-up means the release ladder failed; resuming onto the
-    same spool re-runs the jam in a loop)."""
+    No landing EDGE is asked for: the hold's fact was "this job would print air", and a toolhead that
+    reads fed has answered it, whoever fed it — the printer's own backup switch, a person's load, or a
+    load no record saw. 001-H2S incident 574 (2026-10-11): the firmware's switch landed while the
+    build that opened the hold had no record to write it to, so a rule asking for the landing would
+    have stranded it again after the deploy.
+
+    The farm's OWN refill is excluded on the record (a farm ``load`` on this row answered ``reached``):
+    that episode publishes its own resume. An AMS row beside it is that fault's lane's pause to answer
+    (a give-up's refill sits on the AMS row, a class that never resumes)."""
     not_held = _held_job_paused(row, ctx)
     if not_held is not None:
-        return ResumeOwed(owed=False, evidence=not_held)
+        return _declined(not_held)
     if not path_quiet(ctx.state):
-        return ResumeOwed(owed=False, evidence="the path is not quiet (a fault stands, or the AMS is mid-change)")
+        return _waiting("the path is not quiet (a fault stands, or the AMS is mid-change)")
     if not _toolhead_fed(ctx.feed):
-        return ResumeOwed(owed=False, evidence="the toolhead does not read fed")
-    loaded_at = ctx.ledger.load_completed_at(row.printer_id)
-    if loaded_at is None or row.created_at is None or loaded_at <= row.created_at:
-        return ResumeOwed(
-            owed=False,
-            evidence="no load landed after the hold opened with no farm motion acting — the farm's own refill "
-            "never resumes",
-        )
-    return ResumeOwed(
-        owed=True,
-        evidence="the toolhead was loaded after the hold opened (the printer's own swap or a person's load) and "
-        "reads fed, the job PAUSEd",
-    )
+        return _declined("the toolhead does not read fed")
+    ams = sorted(printer_incidents.open_kinds(row.printer_id) & AMS_FAULT_KINDS)
+    if ams:
+        return _declined("an AMS hold stands beside it — that fault's own lane answers the pause", owner=ams[0])
+    if any(
+        action.command == "load" and action.answer == Answer.REACHED.value
+        for action in printer_incidents.farm_actions(row.printer_id, row.id)
+    ):
+        return _declined("the farm's own refill loaded this toolhead — its episode publishes the resume")
+    return _owed("the toolhead reads fed and the job is PAUSEd on a quiet path")
 
 
 # THE resume table — TOTAL over the resolution classes, keyed like :data:`_TABLE` and with no
@@ -1228,16 +1393,114 @@ _RESUME_OWED: dict[str, ResumeRule] = {
 }
 
 
-def resume_owed(row: PrinterIncident, ctx: Context) -> ResumeOwed:
-    """Is a RESUME of the paused print owed on ``row``, and why (not)? THE one answer — asked by the
-    one spawner (``spool_recovery``'s sweep, for every open row it visits) and re-asked by the
-    resume's own readiness check after its settle.
+# How many farm resumes a RUNOUT row's refill may send before the farm gives up and pages (R14, measured
+# 2026-10-12 on production's support/logs over 90 days: 56 refill auto-resume episodes, the farm published 2
+# resumes and both landed RUNNING in 7–11 s; no refusal was ever logged, so no refusal shape exists to
+# measure and the cap only bounds a loop): the first resume plus two re-owes. Every other class: one.
+RUNOUT_RESUME_CAP = 3
 
-    Raises ``KeyError`` for an unregistered class, like :func:`resolve`. ONE guard sits over the
-    table, read after the lookup: while the farm's own motion command on the row has not run
-    (``ctx.command_pending``) nothing is resumed — the AMS can still run it on its own and empty
-    the toolhead under the print (K11)."""
+
+@dataclass(frozen=True)
+class ResumeSpent:
+    """:func:`resume_spent`'s answer when the row is owed no further farm resume: the SENTENCE why, and
+    ``gave_up`` — the row's last farm resume was NOT carried out (the printer refused it, or the record
+    passed its self-heal bound with no answer) and the row's budget is spent, so the farm's give-up is
+    owed: the page (``spool_recovery``'s refused / unanswered resume escalation). ``gave_up`` is False
+    while a resume is still out (awaiting the printer), once one REACHED, or once a person took it over."""
+
+    why: str
+    gave_up: bool = False
+
+
+def resume_spent(printer_id: int, incident_id: int, *, unanswered: frozenset[int] = frozenset()) -> ResumeSpent | None:
+    """The farm's resume budget on ONE row, off the record: ``None`` while the row is still owed a resume,
+    else why not (:class:`ResumeSpent`). THE one decider of it — :func:`resume_owed`'s classes here, and
+    the runout row's refill resume (``spool_recovery``: the level read, the publish under the printer's
+    resume lock, the printer's answer) — never a second spelling.
+
+    The row's farm resumes that SPEND are the ones the printer may have received: a frame that never left
+    the farm, or a resume the record answered ``void`` (never received, a reboot, the job ended), spends
+    nothing and is owed again. Of the rest:
+
+    * one ``reached`` spends the row (the print ran; the row closes on it);
+    * a person's command that took the last one over spends it (theirs now);
+    * the last one still OUTSTANDING spends it — awaiting the printer, nothing is sent behind it — unless
+      the record passed its self-heal bound (``unanswered``: the row's outstanding farm resumes whose bound
+      passed, read off the record by the caller; this module never imports the record's owner);
+    * a last one the printer REFUSED, or one past its bound unanswered: for a RUNOUT row the row is owed
+      again until :data:`RUNOUT_RESUME_CAP` resumes went out (R14, 2026-10-12: a refused or unconfirmed
+      refill resume is resent on the next evidence, then the farm pages); every other class is spent at
+      once (one resume per row — a per-kind-and-job budget was ruled out as a new human gate, AR-H6).
+      Spent there, the give-up is owed (``gave_up``)."""
+    resumes = [
+        action
+        for action in printer_incidents.farm_actions(printer_id, incident_id)
+        if action.command == "resume" and not action.unsent and action.answer != Answer.VOID.value
+    ]
+    if not resumes:
+        return None
+    reached = next((a for a in resumes if a.answer == Answer.REACHED.value), None)
+    if reached is not None:
+        return ResumeSpent(f"the farm's resume reached the printer (action {reached.action_id})")
+    last = resumes[-1]
+    if last.answer == Answer.TAKEN_OVER.value:
+        return ResumeSpent(f"a person's command took the farm's resume over (action {last.action_id})")
+    if last.answer is None and last.action_id not in unanswered:
+        return ResumeSpent(f"the farm's resume is out, awaiting the printer (action {last.action_id})")
+    how = "refused by the printer" if last.answer == Answer.REFUSED.value else "unanswered past its self-heal bound"
+    cap = RUNOUT_RESUME_CAP if printer_incidents.cached_kind(printer_id, incident_id) == KIND_RUNOUT else 1
+    if len(resumes) < cap:
+        return None
+    return ResumeSpent(
+        f"the farm sent {len(resumes)} of {cap} resume(s) on this hold; the last (action {last.action_id}) was {how}",
+        gave_up=True,
+    )
+
+
+def _resume_withheld(row: HoldRow, ctx: Context) -> ResumeOwed | None:
+    """The guards every class shares, ``None`` when none holds: never in maintenance mode (the evidence
+    IS the hands' own work), never at the printer's plate-check pause (a resume would answer the plate
+    question with no re-check — the plate-check row owns the pause; before its episode has opened the
+    row, the farm waits for it), never beside a runout row (a runout-held print is the refill lane's to
+    resume, invariant 9), never at the firmware's post-reboot prompt (``0300_8007``: the power-loss
+    recovery, ``pause_recovery``, answers it and resumes the interrupted print — the farm waits for it),
+    and once (:func:`resume_spent`)."""
+    pid = row.printer_id
+    if printer_incidents.automation_held(pid):
+        return _declined("maintenance mode — the farm resumes nothing under a person's hands")
+    if ctx.state is not None and power_loss_prompt_standing(getattr(ctx.state, "hms_errors", None) or []):
+        return _waiting("the printer's power-loss prompt stands — the power-loss recovery resumes it")
+    plate_row = printer_incidents.snapshot(pid, kind=KIND_PLATE_VISION)
+    if plate_row is not None:
+        return _declined(
+            "the printer paused the job at its plate check — its own ladder or a person answers it",
+            owner=KIND_PLATE_VISION,
+        )
+    if plate_check_paused(ctx.state):
+        return _waiting("the printer paused the job at its plate check — its episode opens on the next report")
+    if KIND_RUNOUT in printer_incidents.open_kinds(pid):
+        return _declined(
+            "a runout row stands — the refill lane resumes a runout-held print (invariant 9)", owner=KIND_RUNOUT
+        )
+    spent = resume_spent(row.printer_id, row.id)
+    return _declined(spent.why) if spent is not None else None
+
+
+def resume_owed(row: HoldRow, ctx: Context) -> ResumeOwed:
+    """Is a RESUME of the paused print owed on ``row``, and why (not)? THE one answer — asked by the
+    one spawner (``spool_recovery``'s sweep and session start, for every open row), re-asked by the
+    resume's own readiness check after its settle, and read by the hold chip (``hold_chip``: amber
+    "Resuming" while it is owed or waiting, the owning row's chip or "Press Resume." once declined).
+    The spawner acts on ``owed`` alone.
+
+    Raises ``KeyError`` for an unregistered class, like :func:`resolve`. Two guards sit over the table,
+    read after the lookup: while the farm's own motion command on the row has not run
+    (``ctx.command_pending``) nothing is resumed — the AMS can still run it on its own and empty the
+    toolhead under the print (K11) — and the shared guards (:func:`_resume_withheld`)."""
     rule = _RESUME_OWED[_resolution_of(row)]
     if ctx.command_pending:
-        return ResumeOwed(owed=False, evidence="a farm AMS command on this row has not run (held or unanswered)")
+        return _waiting("a farm AMS command on this row has not run (held or unanswered)")
+    withheld = _resume_withheld(row, ctx)
+    if withheld is not None:
+        return withheld
     return rule(row, ctx)

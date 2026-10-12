@@ -260,9 +260,7 @@ async def test_plan_dispatch_one_printer_once_guard(pd_scheduler):
     # a lease the printer does not hold. Build it directly so the PLAN guard is what
     # this test exercises.
     assert pd_scheduler._claim_dispatch_lease(5, 11) == "dispatch_in_flight"
-    duplicate_lease = DispatchLease(
-        unit_id=11, pre_state=None, pre_subtask=None, min_hold_s=60.0, max_hold_s=180.0, minted_at_mono=0.0
-    )
+    duplicate_lease = DispatchLease(unit_id=11, minted_at_mono=0.0)
 
     pd_scheduler._plan_dispatch(plan, planned, item_id=10, printer_id=5, lease=lease_five, ams_mapping=[3])
     pd_scheduler._plan_dispatch(
@@ -308,7 +306,6 @@ async def test_the_plan_hands_its_lease_to_the_dispatch_phase(pd_scheduler, db_s
     assert (seen_item_id, seen_printer_id, seen_mapping) == (item_id, p_id, [0])
     assert isinstance(seen_lease, DispatchLease)
     assert seen_lease.unit_id == item_id
-    assert seen_lease.pre_state == "IDLE"
     # And it is the claim the authority actually holds for that printer — a
     # different object there is what ``lease_unknown`` exists to catch.
     assert plate_occupancy.snapshot(p_id).lease_unit_id == item_id

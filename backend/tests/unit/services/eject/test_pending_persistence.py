@@ -10,8 +10,7 @@ every completed transition out through — and rebuilt by ``plate_occupancy_stor
 These tests therefore drive real TRANSITIONS (``claim_for_eject`` / ``resolve_eject``,
 and the full dispatcher) with the persist callable wired, and assert on the DB. That is
 the seam they own: ``test_plate_occupancy_store.py`` covers ``persist_occupancy`` and
-``hydrate`` called DIRECTLY (including the 24 h TTL, one-pending-per-printer and the
-NULLed losers), while what is pinned here is that the eject lane's own transitions
+``hydrate`` called DIRECTLY (including one-pending-per-printer and the NULLed losers), while what is pinned here is that the eject lane's own transitions
 actually reach that callable — the wiring between the record and its durable half.
 """
 
@@ -39,6 +38,7 @@ from backend.app.services.plate_occupancy import (
     plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
+from backend.tests._fixtures.printer_action import route_verbs
 
 pytestmark = pytest.mark.asyncio
 
@@ -48,7 +48,7 @@ def _reset_occupancy():
     """Every test starts on an empty fleet and leaves no eject timer armed."""
     plate_occupancy.reset_for_tests()
     yield
-    for printer_id in list(remote._start_deadlines) + list(remote._runtime_watchdogs):
+    for printer_id in list(remote._runtime_watchdogs):
         remote.cancel_eject_timers(printer_id)
     plate_occupancy.reset_for_tests()
 
@@ -259,7 +259,7 @@ class TestDispatchStampsOnDispatch:
             patch.object(printer_manager, "is_connected", return_value=True),
             patch("backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))),
             patch("backend.app.services.bambu_ftp.upload_file_async", AsyncMock(return_value=True)),
-            patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+            route_verbs(start=MagicMock(return_value=True)),
         )
 
     async def test_dispatch_stamps_eject_dispatched_at(self, db_session, monkeypatch, scheduled, seed_geometry):
@@ -405,7 +405,7 @@ class TestDispatchStampsOnDispatch:
 class TestRestartRoundTrip:
     """The mirror's whole purpose: what a live claim WRITES is what a restart REBUILDS.
 
-    The TTL / newest-wins / NULLed-losers decision table is pinned against ``hydrate()``
+    The newest-wins / NULLed-losers decision table is pinned against ``hydrate()``
     directly in ``test_plate_occupancy_store.py``; what is pinned here is the round trip
     itself — a stamp written by the eject lane's own transition, read back by the loader,
     with the provenance the rebuilt record must carry."""
@@ -433,9 +433,7 @@ class TestRestartRoundTrip:
         )
         await _drain(scheduled)
         dispatched = plate_occupancy.eject_identity(printer.id).dispatched_at
-        assert store._as_utc(dispatched) > datetime.now(timezone.utc) - timedelta(
-            hours=store._PENDING_EJECT_STALE_TTL_H
-        )
+        assert dispatched is not None
 
         # The process dies and comes back: only the DB survives.
         plate_occupancy.reset_for_tests()

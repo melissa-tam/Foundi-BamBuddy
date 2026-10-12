@@ -11,7 +11,8 @@ Three shapes of "back in the queue", one module:
   refused). It carries the lineage (``retry_of_id`` / ``retry_count``) and is its own
   unit of work.
 * :func:`return_to_queue` — the SAME row, un-claimed: a dispatch that never started
-  (a refused commit, the start watchdog, a dead claim). ``queue_transitions
+  (a refused commit, or the START's answer — refused, void, taken over, or no start on
+  the record — ``services/dispatch_start``). ``queue_transitions
   .release_unstarted_claim`` stays the storage writer of ``printing → pending``; this
   verb is its only caller and adds the position and the run gate the transition
   deliberately knows nothing about.
@@ -68,11 +69,26 @@ logger = logging.getLogger(__name__)
 #   plate_check — the operator stopped a plate-check-paused print (refused plate).
 RequeueCause = Literal["failed", "fault_stop", "plate_check"]
 
-# Why a claimed row is being RETURNED — the log vocabulary of :func:`return_to_queue`.
-#   refused_commit — the plate gate rose between the claim and the print command;
-#   start_watchdog — the printer never started the job it was sent;
-#   dead_claim     — a claim nothing will ever retire (``dispatch_claim.judge`` → dead).
-ReturnCause = Literal["refused_commit", "start_watchdog", "dead_claim"]
+# Why an un-started claim goes back — the log vocabulary of :func:`return_to_queue`. The START's answer
+# decides first (2026-10-11); production's two start bounds are the fallback when the printer stays
+# silent (2026-10-12, "if it was self heal, it should stay self heal" — ``services/dispatch_start``):
+#   refused_commit   — the plate gate rose between the upload and the start (the scheduler's unwind);
+#   start_refused    — the printer's fail ACK, or a start frame that never left the farm;
+#   start_void       — a later session began with the start unacknowledged, or the printer rebooted;
+#   start_taken_over — another job took the printer (that job is the FOREIGN path's);
+#   start_unrecorded — no start on the record, and the session's first report shows no job of ours;
+#   start_unanswered — no answer and the job never reported within the start bound (production Phase A);
+#   start_not_active — the job landed (its id reported at IDLE/FINISH) and never became active within the
+#                      landing bound (production Phase B, #1678).
+ReturnCause = Literal[
+    "refused_commit",
+    "start_refused",
+    "start_void",
+    "start_taken_over",
+    "start_unrecorded",
+    "start_unanswered",
+    "start_not_active",
+]
 
 # What :func:`return_to_queue` did with the row.
 #   returned  — pending again, at the head of its scope, dispatchable;
@@ -350,6 +366,31 @@ async def failed_ancestor_count(db: AsyncSession, item: PrintQueueItem) -> int:
     attempt has 0 failed ancestors and gets its retry; that retry has 1).
     """
     return len([ancestor async for ancestor in _ancestors(db, item) if ancestor.status == "failed"])
+
+
+async def retries_a_plate_check_retry(db: AsyncSession, item: PrintQueueItem) -> bool:
+    """Is ``item`` the RETRY of a plate the farm already stopped and retried at its plate check?
+
+    The plate-check ladder's ONE decision (``pause_recovery._decide``; operator ruling 2026-09-29: "If
+    that re-check fails, stop and retry the same print. If the retry's re-check fails too, escalate"):
+    the attempt ``item`` replaces — its NEAREST ancestor — had a plate-check episode the farm ended with
+    its retry rung's stop (``printer_incidents.unit_stopped_with`` over
+    ``terminal_outcome.PLATE_CHECK_RETRY_STOP_NAMES``). Lineage, never a clock (2026-10-11: the "first
+    farm stop in 60 min" window it replaced counted another job's stop and missed a retry dispatched an
+    hour later). Only the nearest ancestor speaks: an older plate-check retry further up the chain was
+    followed by an attempt that passed its own check (it was replaced for another cause), so this
+    unit's failure is a first one. No ancestor: an original attempt, never a retry.
+    """
+    from backend.app.models.printer_incident import KIND_PLATE_VISION
+    from backend.app.models.printer_incident_step import STEP_KIND_STOP
+    from backend.app.services import printer_incidents
+    from backend.app.services.terminal_outcome import PLATE_CHECK_RETRY_STOP_NAMES
+
+    async for parent in _ancestors(db, item):
+        return await printer_incidents.unit_stopped_with(
+            db, parent.id, kind=KIND_PLATE_VISION, step_kind=STEP_KIND_STOP, names=PLATE_CHECK_RETRY_STOP_NAMES
+        )
+    return False
 
 
 async def fault_restart_spent(db: AsyncSession, item: PrintQueueItem) -> bool:

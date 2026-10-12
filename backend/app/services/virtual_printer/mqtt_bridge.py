@@ -18,6 +18,15 @@ Architecture (cached-as-base, not a separate fan-out stream):
     xcam responses, …) are fanned out raw to the slicer — they carry
     sequence_ids the slicer is waiting on; the slicer matches and ignores
     unrelated ones.
+  - **Slicer commands** the VP cannot answer itself go to the real printer
+    THROUGH THE RECORD (``services/printer_action.slicer_forward``, the
+    operator's action): the wire carries the action's id, never the
+    slicer's own ``sequence_id``, so a reply can only ever answer the row
+    that sent it (2026-10-11 — a slicer id colliding with an outstanding
+    farm action's id used to answer the farm's action). The reply naming
+    the action answers it on the record and is handed to the slicer with
+    the slicer's own id restored (:data:`_FORWARDED_MAX_ENTRIES` bounds
+    the map; a reply drops its entry, a new printer session clears it).
 
 Identity rewriting at cache time:
 
@@ -35,12 +44,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import ipaddress
 import json
 import logging
 import socket
 from typing import TYPE_CHECKING
 
+from backend.app.services import printer_action
 from backend.app.services.bambu_mqtt import apply_tray_exist_bits
 from backend.app.services.virtual_printer._debug import append_event, dump_wire
 
@@ -52,6 +63,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REFRESH_INTERVAL_SECONDS = 30.0
+
+# How many forwarded slicer frames may await their reply at once (the action id → the slicer's own id
+# map). FIFO: a frame the printer never answers ages out instead of growing the map; its action is
+# the record's to answer (a later session voids it).
+_FORWARDED_MAX_ENTRIES = 256
 
 # Bambuddy's internal printer state in bambu_mqtt.py (around line 2686+) is
 # updated per-field — each `if "X" in data: self.state.X = ...` block leaves
@@ -274,6 +290,14 @@ class MQTTBridge:
         self._stopping = False
         self._latest_print_state: dict | None = None
         self._latest_version_modules: list | None = None
+        # A forwarded slicer frame awaiting its reply: its action id → the slicer's own sequence_id (None when
+        # the slicer sent none). Process memory with nothing to rehydrate: a restart drops the slicer
+        # sessions it would hand a reply to. Written on the event loop, popped on paho's thread (atomic
+        # dict operations under the GIL).
+        self._forwarded: dict[int, str | None] = {}
+        # The printer session the map's entries were sent on: a new session clears the map (a reply never
+        # crosses a session; the record voids what it left unanswered).
+        self._forwarded_epoch: int | None = None
 
     @property
     def is_active(self) -> bool:
@@ -415,6 +439,7 @@ class MQTTBridge:
         logger.info("[%s] MQTT bridge unbound from printer %s", self.vp_name, self.target_printer_id)
         self._target_client = None
         self._target_serial = None
+        self._forwarded.clear()
 
     def _refresh_ip_encoding(self) -> None:
         """(Re-)encode `_target_ip_uint32_le` / `_vp_ip_uint32_le` from current values.
@@ -702,6 +727,7 @@ class MQTTBridge:
         target_bytes = target_serial.encode("ascii")
         if target_bytes in payload:
             payload = payload.replace(target_bytes, self.vp_serial.encode("ascii"))
+        payload = self._answer_forwarded(payload, loop)
         vp_topic = f"device/{self.vp_serial}/{suffix}"
         # Env-flagged command trace (#1622): every printer-originated response
         # that gets fanned to the slicer (extrusion_cali_get / ams write acks /
@@ -726,14 +752,15 @@ class MQTTBridge:
         """Return the most recent real printer get_version `module` list, or None."""
         return self._latest_version_modules
 
-    def forward_to_printer(self, payload: dict) -> bool:
-        """Publish a slicer-originated command to the real printer's request topic.
-
-        Returns False if no printer client is currently bound.
+    async def forward_to_printer(self, payload: dict) -> bool:
+        """Send a slicer-originated command to the real printer THROUGH THE RECORD — the operator's
+        ``slicer_forward`` action, published under the action's id (``printer_action.prepare`` +
+        ``publish``). The action id → the slicer's own id entry is written BETWEEN the two, so a reply
+        can never arrive before the bridge can hand it back. Returns False when no printer client is
+        bound or the frame did not go out.
         """
         client = self._target_client
-        target_serial = self._target_serial
-        if client is None or target_serial is None:
+        if client is None or self._target_serial is None:
             logger.debug(
                 "[%s] forward_to_printer dropped (printer %s not bound): %s",
                 self.vp_name,
@@ -741,9 +768,69 @@ class MQTTBridge:
                 list(payload.keys()),
             )
             return False
-        topic = f"device/{target_serial}/request"
         try:
-            return client.publish_raw(topic, json.dumps(payload), qos=1)
+            epoch = int(getattr(client.state, "connection_epoch", 0) or 0)
+            if epoch != self._forwarded_epoch:
+                self._forwarded.clear()
+                self._forwarded_epoch = epoch
+            prepared = await printer_action.prepare(
+                self.target_printer_id,
+                printer_action.slicer_forward(payload),
+                actor=printer_action.ACTOR_OPERATOR,
+                client=client,
+            )
+            while len(self._forwarded) >= _FORWARDED_MAX_ENTRIES:
+                self._forwarded.pop(next(iter(self._forwarded)), None)
+            self._forwarded[prepared.action_id] = _slicer_sequence_id(payload)
+            sent = await printer_action.publish(prepared, client=client)
         except Exception:
-            logger.exception("[%s] forward_to_printer publish failed", self.vp_name)
+            logger.exception("[%s] forward_to_printer failed", self.vp_name)
             return False
+        if not sent.published:
+            self._forwarded.pop(prepared.action_id, None)
+        return sent.published
+
+    def _answer_forwarded(self, payload: bytes, loop: asyncio.AbstractEventLoop) -> bytes:
+        """A printer reply naming a forwarded frame's action id: hand the slicer its own ``sequence_id`` back,
+        and — for a reply carrying no ``result``, which the client's ACK lane never records — answer the action
+        on the record (on the event loop — this runs on paho's thread). A reply carrying a ``result`` is
+        answered by the ACK lane alone. Any other reply (a farm command's ACK, a push) is returned untouched.
+        """
+        if not self._forwarded:
+            return payload
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            return payload
+        if not isinstance(data, dict):
+            return payload
+        for block in data.values():
+            if not isinstance(block, dict) or "sequence_id" not in block:
+                continue
+            try:
+                action_id = int(str(block["sequence_id"]))
+            except ValueError:
+                return payload
+            if action_id not in self._forwarded:
+                return payload
+            slicer_seq = self._forwarded.pop(action_id, None)
+            if "result" not in block:
+                # A data reply carrying no ``result`` never reaches the ACK log: the relay answers it. A
+                # reply carrying one is the client's ACK lane's (every block), so it is answered once.
+                loop.call_soon_threadsafe(
+                    functools.partial(printer_action.on_forward_answered, self.target_printer_id, action_id)
+                )
+            if slicer_seq is None:
+                block.pop("sequence_id", None)
+            else:
+                block["sequence_id"] = slicer_seq
+            return json.dumps(data).encode("utf-8")
+        return payload
+
+
+def _slicer_sequence_id(payload: dict) -> str | None:
+    """The slicer's own ``sequence_id`` on a frame it published (the first block carrying one), or None."""
+    for block in payload.values():
+        if isinstance(block, dict) and block.get("sequence_id") is not None:
+            return str(block["sequence_id"])
+    return None

@@ -1,4 +1,4 @@
-"""Startup reconcile of pending ejects missed during downtime.
+"""The reconcile of a pending eject whose terminal the farm never saw.
 
 Since the 2026-08-30 cut-over every verdict acts through the plate-occupancy
 authority: the reconciler decides only what became of the EJECT, and the PLATE
@@ -8,16 +8,14 @@ shape is seeded with ``hydrate_eject`` + ``hydrate_plate`` — no registry, no
 manager gate flag — and each row is asserted against ``eject_identity`` /
 ``is_plate_occupied``.
 
-The sweep itself changed shape too: it SPAWNS one task per printer and returns
-the number of printers it STARTED, so a single unreachable printer can no longer
-hold every other plate behind its 900 s reconnect cap.
-
-**Since 2026-09-12 there is ONE reconciler with THREE triggers and ONE enrolment
-predicate** (``plate_occupancy.unowned_eject``): startup, the printer's connected
-edge, and the scheduler tick's dwell-gated sweep. Enrolment is no longer "hydrated"
-but "no watchdog is going to act on this" — hydrated OR runtime-verdict-stamped —
-because 001/009-H2S sat with a stamped, undeliverable kill for hours without ever
-restarting, and a restart was the only thing that could enrol them.
+**ONE reconciler, TWO triggers, ONE enrolment predicate** (``plate_occupancy.unowned_eject``):
+the printer's session start (``session_start``, on its first fresh report of every MQTT
+session — a restart's first included, so a hydrated eject is reconciled the moment its
+printer has said what it is doing) and the scheduler tick's dwell-gated sweep. Enrolment
+is "no watchdog is going to act on this" — hydrated OR runtime-verdict-stamped — because
+001/009-H2S sat with a stamped, undeliverable kill for hours without ever restarting
+(2026-09-12). Since 2026-10-11 there is no startup sweep polling for a reconnect and no
+900 s give-up: a disconnected printer's eject waits for that printer's next session.
 """
 
 from __future__ import annotations
@@ -30,12 +28,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from backend.app.core import tasks as core_tasks
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services import farm_policy
 from backend.app.services.eject import monitor as monitor_mod
-from backend.app.services.eject.monitor import EjectCooldownMonitor, reconcile_pending_ejects_on_startup
+from backend.app.services.eject.monitor import EjectCooldownMonitor
 from backend.app.services.plate_occupancy import (
     CooldownEject,
     EscalationOnly,
@@ -53,10 +50,6 @@ def _clean_occupancy():
     plate_occupancy.reset_for_tests()
     yield
     plate_occupancy.reset_for_tests()
-
-
-async def _noop_sleep(_s):
-    return None
 
 
 def _patch_session(monkeypatch, db_session):
@@ -162,20 +155,6 @@ class _RecMgr:
         return script[i] if i < len(script) else script[-1]
 
 
-@pytest.fixture()
-def spawned(monkeypatch):
-    """Capture the REAL tasks the sweep spawns, so a test can await them."""
-    tasks: list[asyncio.Task] = []
-
-    def _spy(coro, *, name=None):
-        task = core_tasks.spawn_background_task(coro, name=name)
-        tasks.append(task)
-        return task
-
-    monkeypatch.setattr(monitor_mod, "spawn_background_task", _spy)
-    return tasks
-
-
 class _FakeTask:
     """Inert stand-in for a watch task (see test_monitor's twin)."""
 
@@ -222,7 +201,7 @@ class TestReconcileDecisionTable:
         _hydrate_gated_eject(printer.id, item.id)
 
         mgr = _RecMgr([_status(live, subtask_name=f"eject_production_item{item.id}")])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=100, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         identity = plate_occupancy.eject_identity(printer.id)
         assert identity is not None  # kept
@@ -238,7 +217,7 @@ class TestReconcileDecisionTable:
         _hydrate_gated_eject(printer.id, item.id)
 
         mgr = _RecMgr([_status("RUNNING", subtask_name="OperatorLocalPrint")])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=100, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert plate_occupancy.eject_identity(printer.id) is None  # dropped
         assert plate_occupancy.is_plate_occupied(printer.id) is True  # gate KEPT for a human
@@ -253,7 +232,7 @@ class TestReconcileDecisionTable:
         _hydrate_gated_eject(printer.id, item.id)
 
         mgr = _RecMgr([_status("FINISH", subtask_name=f"eject_production_item{item.id}")])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=100, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert plate_occupancy.is_plate_occupied(printer.id) is False  # gate released
         assert plate_occupancy.eject_identity(printer.id) is None
@@ -270,7 +249,7 @@ class TestReconcileDecisionTable:
             patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock),
         ):
             mgr = _RecMgr([_status("FAILED", subtask_name=f"eject_production_item{item.id}")])
-            await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=100, sleep=_noop_sleep)
+            await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert plate_occupancy.is_plate_occupied(printer.id) is True  # gate KEPT
         assert plate_occupancy.eject_identity(printer.id) is None
@@ -296,7 +275,7 @@ class TestReconcileDecisionTable:
         name = f"eject_production_item{item.id}"
         mgr = _RecMgr([_status(live, subtask_name=name)])
 
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=100, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert calls == [(printer.id, None, replayed, name)]
 
@@ -309,12 +288,14 @@ class TestReconcileDecisionTable:
         _hydrate_gated_eject(printer.id, item.id)
 
         mgr = _RecMgr([_status("IDLE", subtask_name=f"eject_production_item{item.id}")])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=100, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert plate_occupancy.eject_identity(printer.id) is None
         assert plate_occupancy.is_plate_occupied(printer.id) is True
 
-    async def test_never_connects_drops_pending_keeps_gate(self, db_session, monkeypatch):
+    async def test_a_disconnected_printer_keeps_its_eject_for_its_next_session(self, db_session, monkeypatch):
+        """No reconnect wait and no give-up: a printer that is not reporting has said nothing, so
+        nothing is decided — the record and the gate stand until its next first fresh report."""
         _patch_session(monkeypatch, db_session)
         printer = await _mk_printer(db_session, "OFF")
         item = await _mk_eject_item(db_session, printer_id=printer.id)
@@ -322,45 +303,45 @@ class TestReconcileDecisionTable:
         _hydrate_gated_eject(printer.id, item.id)
 
         mgr = _RecMgr([_status("IDLE", connected=False)])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=40, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
-        assert plate_occupancy.eject_identity(printer.id) is None  # eject gone
-        assert plate_occupancy.is_plate_occupied(printer.id) is True  # plate KEPT
+        assert plate_occupancy.eject_identity(printer.id) is not None  # eject kept
+        assert plate_occupancy.is_plate_occupied(printer.id) is True  # plate kept
 
     async def test_already_resolved_is_noop(self, db_session, monkeypatch):
         # A live terminal already retired the eject before the reconciler ran.
         _patch_session(monkeypatch, db_session)
         mgr = _RecMgr([_status("FINISH", subtask_name="eject_production_item1")])
         # No eject registered for printer 777 → immediate return, no crash.
-        await monitor_mod._reconcile_one(777, manager=mgr, poll_s=20, max_wait_s=40, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(777, manager=mgr)
         assert plate_occupancy.eject_identity(777) is None
 
 
-class TestReconcileSweep:
-    async def test_starts_one_task_per_hydrated_printer_and_returns_the_count(self, db_session, monkeypatch, spawned):
+class TestAHydratedEjectAtItsSessionStart:
+    """A restart's hydrated eject is the session start's to reconcile, per printer: each printer
+    answers on its own first fresh report, so one that never comes back holds nobody else."""
+
+    async def test_each_printer_is_reconciled_from_its_own_report(self, db_session, monkeypatch):
         _patch_session(monkeypatch, db_session)
         p1 = await _mk_printer(db_session, "SW1")
         i1 = await _mk_eject_item(db_session, printer_id=p1.id)
         await db_session.commit()
         _hydrate_gated_eject(p1.id, i1.id)
-        _hydrate_gated_eject(999, 424242)  # will resolve as no-connect
+        _hydrate_gated_eject(999, 424242)  # its printer has not reported
 
         mgr = _RecMgr(
             per_printer={
-                p1.id: [_status("RUNNING", subtask_name=f"eject_production_item{i1.id}")],
+                p1.id: [_status("FINISH", subtask_name=f"eject_production_item{i1.id}")],
                 999: [_status("IDLE", connected=False)],
             }
         )
-        started = await reconcile_pending_ejects_on_startup(manager=mgr, poll_s=20, max_wait_s=0, sleep=_noop_sleep)
+        await monitor_mod.reconcile_pending_eject(p1.id, manager=mgr)
 
-        assert started == 2  # the count of printers STARTED, not finished
-        assert len(spawned) == 2
-        await asyncio.gather(*spawned)
-        assert plate_occupancy.eject_identity(p1.id) is not None  # RUNNING+match kept
-        assert plate_occupancy.eject_identity(999) is None  # never reconnected → dropped
+        assert plate_occupancy.eject_identity(p1.id) is None  # FINISH+match resolved
+        assert plate_occupancy.eject_identity(999) is not None  # untouched: no report, no decision
 
-    async def test_a_live_eject_is_not_reconciled(self, db_session, monkeypatch, spawned):
-        """Only HYDRATED ejects are the reconciler's business — a live dispatch owns itself."""
+    async def test_a_live_eject_is_not_reconciled(self, db_session, monkeypatch):
+        """Only an UNOWNED eject is the reconciler's business — a live dispatch owns itself."""
         _patch_session(monkeypatch, db_session)
         assert plate_occupancy.declare_occupied(5, Evidence()) is None
         assert (
@@ -370,76 +351,9 @@ class TestReconcileSweep:
             is None
         )
 
-        started = await reconcile_pending_ejects_on_startup(
-            manager=_RecMgr(), poll_s=20, max_wait_s=0, sleep=_noop_sleep
-        )
+        await monitor_mod.reconcile_pending_eject(5, manager=_RecMgr([_status("IDLE")]))
 
-        assert started == 0
-        assert spawned == []
         assert plate_occupancy.eject_identity(5) is not None  # untouched
-
-    async def test_one_printers_failure_cannot_abort_the_others(self, db_session, monkeypatch, spawned):
-        _patch_session(monkeypatch, db_session)
-        p1 = await _mk_printer(db_session, "SWOK")
-        i1 = await _mk_eject_item(db_session, printer_id=p1.id)
-        await db_session.commit()
-        _hydrate_gated_eject(p1.id, i1.id)
-        _hydrate_gated_eject(998, 424243)
-
-        mgr = _RecMgr(
-            per_printer={p1.id: [_status("IDLE", subtask_name="OperatorLocalPrint")]},
-            raises_for=998,
-        )
-        started = await reconcile_pending_ejects_on_startup(manager=mgr, poll_s=20, max_wait_s=0, sleep=_noop_sleep)
-
-        assert started == 2
-        await asyncio.gather(*spawned)  # the guard swallowed the failure — nothing escaped
-        assert plate_occupancy.eject_identity(p1.id) is None  # the healthy printer still resolved
-        assert plate_occupancy.eject_identity(998) is not None  # the failed one kept its record
-
-    async def test_the_sweep_is_concurrent(self, db_session, monkeypatch, spawned):
-        """A printer that never reconnects must not hold the others behind its cap.
-
-        Serially, one disconnected printer parked every other plate for the full
-        900 s reconnect wait — on the night of 2026-08-30 three printers were in
-        that state at once and the operator's only way out of the third was to wait
-        out the first two. The blocking sleep here belongs to the disconnected
-        printer alone, so the other one finishing PROVES it never waited."""
-        _patch_session(monkeypatch, db_session)
-        fast = await _mk_printer(db_session, "FAST")
-        slow = await _mk_printer(db_session, "SLOW")
-        item = await _mk_eject_item(db_session, printer_id=fast.id)
-        await db_session.commit()
-        _hydrate_gated_eject(fast.id, item.id)
-        _hydrate_gated_eject(slow.id, 424244)
-
-        fast_done = asyncio.Event()
-
-        async def blocking_sleep(_s):
-            # Only the disconnected printer ever polls; hold it until the other one
-            # has finished so a pass below cannot be a scheduling accident.
-            await fast_done.wait()
-
-        mgr = _RecMgr(
-            per_printer={
-                fast.id: [_status("IDLE", subtask_name="OperatorLocalPrint")],
-                slow.id: [_status("IDLE", connected=False)],
-            }
-        )
-        started = await reconcile_pending_ejects_on_startup(
-            manager=mgr, poll_s=20, max_wait_s=900, sleep=blocking_sleep
-        )
-        assert started == 2
-
-        for _ in range(10):
-            await asyncio.sleep(0)  # let both tasks reach their first suspension
-
-        assert plate_occupancy.eject_identity(fast.id) is None  # resolved while the other waits
-        assert plate_occupancy.eject_identity(slow.id) is not None  # still on its reconnect poll
-
-        fast_done.set()
-        await asyncio.gather(*spawned)
-        assert plate_occupancy.eject_identity(slow.id) is None  # dropped once its cap elapsed
 
 
 class TestAStoppedSweepIsAlwaysRecoverable:
@@ -454,19 +368,14 @@ class TestAStoppedSweepIsAlwaysRecoverable:
     verdict-stamped — because both mean "nothing is coming to retire this record".
     """
 
-    async def test_a_verdict_stamped_live_eject_is_enrolled(self, db_session, monkeypatch, spawned):
+    async def test_a_verdict_stamped_live_eject_is_enrolled(self, db_session, monkeypatch):
         _patch_session(monkeypatch, db_session)
         _live_gated_eject_with_verdict(11, 4242)
 
-        started = await reconcile_pending_ejects_on_startup(
-            manager=_RecMgr([_status("IDLE", subtask_name="OperatorLocalPrint")]),
-            poll_s=20,
-            max_wait_s=0,
-            sleep=_noop_sleep,
+        await monitor_mod.reconcile_pending_eject(
+            11, manager=_RecMgr([_status("IDLE", subtask_name="OperatorLocalPrint")])
         )
 
-        assert started == 1
-        await asyncio.gather(*spawned)
         assert plate_occupancy.eject_identity(11) is None  # disposed of
         assert plate_occupancy.is_plate_occupied(11) is True  # gate KEPT for a human
 
@@ -481,7 +390,7 @@ class TestAStoppedSweepIsAlwaysRecoverable:
         _live_gated_eject_with_verdict(printer.id, item.id, policy=CooldownEject(unit_id=item.id, run_id=None))
 
         mgr = _RecMgr([_status("FINISH", subtask_name=f"eject_production_item{item.id}")])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=0, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert plate_occupancy.eject_identity(printer.id) is None  # the terminal retired it
         assert plate_occupancy.is_plate_occupied(printer.id) is True  # ...unverified: gate kept
@@ -506,7 +415,7 @@ class TestAStoppedSweepIsAlwaysRecoverable:
         monkeypatch.setattr(monitor_mod.eject_remote, "redrive_eject_stop", _fake_redrive)
         mgr = _RecMgr([_status(live, subtask_name=f"eject_production_item{item.id}")])
 
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=0, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert calls == [{"printer_id": printer.id, "stage": "reconnect"}]
         # The record is NOT dropped: the stopped sweep's own terminal resolves it
@@ -531,7 +440,7 @@ class TestAStoppedSweepIsAlwaysRecoverable:
         monkeypatch.setattr(monitor_mod.eject_remote, "redrive_eject_stop", _fake_redrive)
         mgr = _RecMgr([_status("RUNNING", subtask_name=f"eject_production_item{item.id}")])
 
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=0, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert calls == []
         identity = plate_occupancy.eject_identity(printer.id)
@@ -545,12 +454,12 @@ class TestAStoppedSweepIsAlwaysRecoverable:
         _live_gated_eject_with_verdict(printer.id, item.id)
 
         mgr = _RecMgr([_status("RUNNING", subtask_name="OperatorLocalPrint")])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=0, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert plate_occupancy.eject_identity(printer.id) is None
         assert plate_occupancy.is_plate_occupied(printer.id) is True
 
-    async def test_a_live_eject_with_no_verdict_is_never_enrolled(self, db_session, monkeypatch, spawned):
+    async def test_a_live_eject_with_no_verdict_is_never_enrolled(self, db_session, monkeypatch):
         """Its watchdog is running and owns the outcome — the reconciler must not race it."""
         _patch_session(monkeypatch, db_session)
         assert plate_occupancy.declare_occupied(12, Evidence()) is None
@@ -561,19 +470,14 @@ class TestAStoppedSweepIsAlwaysRecoverable:
             is None
         )
 
-        started = await reconcile_pending_ejects_on_startup(
-            manager=_RecMgr(), poll_s=20, max_wait_s=0, sleep=_noop_sleep
-        )
         await monitor_mod.reconcile_pending_eject(12, manager=_RecMgr())
 
-        assert started == 0
-        assert spawned == []
         assert plate_occupancy.eject_identity(12) is not None  # untouched
 
 
 class TestReconcilePendingEjectEntryPoint:
-    """The two non-startup triggers share the startup body — no reconnect poll, because
-    the caller already knows the printer is connected."""
+    """Both triggers share one body, answered from the state already there: each caller knows
+    the printer is connected."""
 
     async def test_it_is_a_no_op_without_an_unowned_eject(self, db_session, monkeypatch):
         _patch_session(monkeypatch, db_session)
@@ -583,30 +487,23 @@ class TestReconcilePendingEjectEntryPoint:
 
         assert plate_occupancy.eject_identity(99) is None
 
-    async def test_it_answers_from_the_live_state_without_waiting(self, db_session, monkeypatch):
-        """``max_wait_s=0``: a caller on the connected edge must not sit in a 900 s
-        reconnect poll — that cap exists for a restart, not for a printer that just
-        said hello."""
+    async def test_it_answers_from_the_live_state(self, db_session, monkeypatch):
+        """A printer that just said hello is answered from what it reports — there is no poll."""
         _patch_session(monkeypatch, db_session)
         printer = await _mk_printer(db_session, "EDGE")
         item = await _mk_eject_item(db_session, printer_id=printer.id)
         await db_session.commit()
         _live_gated_eject_with_verdict(printer.id, item.id)
-        slept: list[float] = []
-
-        async def _recording_sleep(seconds):
-            slept.append(seconds)
 
         mgr = _RecMgr([_status("IDLE", subtask_name="OperatorLocalPrint")])
-        await monitor_mod.reconcile_pending_eject(printer.id, manager=mgr, sleep=_recording_sleep)
+        await monitor_mod.reconcile_pending_eject(printer.id, manager=mgr)
 
-        assert slept == []
         assert plate_occupancy.eject_identity(printer.id) is None
         assert plate_occupancy.is_plate_occupied(printer.id) is True
 
     async def test_one_printers_failure_cannot_escape_the_trigger(self, db_session, monkeypatch):
-        """Guarded like the startup sweep: both callers spawn it beside work that must
-        not be aborted by one printer's reconcile failing."""
+        """Guarded: both callers run it beside work that must not be aborted by one printer's
+        reconcile failing (the session start's other lanes, the tick's other printers)."""
         _patch_session(monkeypatch, db_session)
         _live_gated_eject_with_verdict(13, 424245)
 
@@ -615,38 +512,29 @@ class TestReconcilePendingEjectEntryPoint:
         assert plate_occupancy.eject_identity(13) is not None  # kept, and nothing raised
 
 
-class TestTheConnectedEdgeTrigger:
-    """Trigger (b): the printer's connected edge, under the SAME ``connection_epoch``
-    latch as ``reconcile_stale_active_prints``.
+class TestTheSessionStartTrigger:
+    """Trigger (a): the printer's first fresh report of every MQTT session
+    (``printer_events.FirstFreshReport`` → ``session_start``).
 
-    This is what heals the 001/009-H2S shape without a restart — the printers came back
-    at 03:17:55 reporting FINISH and nothing reconciled, because the only enrolment was
-    at startup. Once per connection, never per push.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _main_state(self):
-        from backend.app import main as main_module
-
-        main_module._printer_reconciled_epoch.clear()
-        main_module._last_status_broadcast.clear()
-        yield
-        main_module._printer_reconciled_epoch.clear()
-        main_module._last_status_broadcast.clear()
+    This is what heals the 001/009-H2S shape without a restart — the printers came back at
+    03:17:55 reporting FINISH and nothing reconciled, because the only enrolment was at startup.
+    Once per session, never per push."""
 
     @staticmethod
-    def _edge_state(epoch: int, layer: int):
-        from backend.tests.unit.test_main_hms_pipeline import _state
+    async def _session(printer_id: int, epoch: int) -> None:
+        from backend.app.services.printer_events import FirstFreshReport
+        from backend.app.services.session_start import SessionStart
 
-        state = _state([], layer_num=layer)
-        state.connection_epoch = epoch
-        state.report_epoch = epoch  # the epoch's first fresh report
-        return state
+        session = SessionStart(downtime_reconcile=AsyncMock(return_value=0))
+        with (
+            patch("backend.app.services.spool_recovery.reevaluate_session", new=AsyncMock(return_value=0)),
+            patch("backend.app.services.pause_recovery.rearm_decision_deadlines", new=AsyncMock(return_value=0)),
+            patch("backend.app.services.pause_recovery.note_session_start"),
+        ):
+            session.on_first_fresh_report(FirstFreshReport(printer_id=printer_id, connection_epoch=epoch))
+            await session._sessions[printer_id]  # noqa: SLF001 — the session's own task, to await it
 
-    async def test_it_fires_once_per_connection_epoch(self, monkeypatch):
-        from backend.app import main as main_module
-        from backend.tests.unit.test_main_hms_pipeline import _Harness
-
+    async def test_it_fires_once_per_session(self, monkeypatch):
         calls: list[int] = []
 
         async def _fake_reconcile(printer_id, **kwargs):
@@ -655,31 +543,17 @@ class TestTheConnectedEdgeTrigger:
         monkeypatch.setattr(monitor_mod, "reconcile_pending_eject", _fake_reconcile)
         _live_gated_eject_with_verdict(21, 424250)
 
-        with _Harness() as h:
-            await main_module.on_printer_status_change(21, self._edge_state(1, 1))
-            await main_module.on_printer_status_change(21, self._edge_state(1, 2))
-            await asyncio.sleep(0)  # let the spawned task reach its first line
-            assert calls == [21]  # one per CONNECTION, not per push
-            assert h.spawned.count("eject-pending-reconcile-21") == 1
+        await self._session(21, 1)
+        assert calls == [21]
 
-            # A new session (a reconnect) is a new occasion.
-            await main_module.on_printer_status_change(21, self._edge_state(2, 3))
-            await asyncio.sleep(0)
-
+        # A new session (a reconnect) is a new occasion.
+        await self._session(21, 2)
         assert calls == [21, 21]
 
-    async def test_it_does_not_fire_for_a_live_eject_with_no_verdict(self, monkeypatch):
-        """The predicate is the authority's, so a sweep under a running watchdog is not
-        touched by a trigger that merely noticed the printer."""
-        from backend.app import main as main_module
-        from backend.tests.unit.test_main_hms_pipeline import _Harness
-
-        calls: list[int] = []
-
-        async def _fake_reconcile(printer_id, **kwargs):
-            calls.append(printer_id)
-
-        monkeypatch.setattr(monitor_mod, "reconcile_pending_eject", _fake_reconcile)
+    async def test_it_does_not_reach_a_live_eject_with_no_verdict(self, db_session, monkeypatch):
+        """The predicate is the authority's, so a sweep under a running watchdog is not touched by
+        a session start that merely noticed the printer."""
+        _patch_session(monkeypatch, db_session)
         assert plate_occupancy.declare_occupied(22, Evidence()) is None
         assert (
             plate_occupancy.claim_for_eject(
@@ -688,17 +562,14 @@ class TestTheConnectedEdgeTrigger:
             is None
         )
 
-        with _Harness():
-            await main_module.on_printer_status_change(22, self._edge_state(1, 1))
-            await asyncio.sleep(0)
+        await self._session(22, 1)
 
-        assert calls == []
-        assert plate_occupancy.eject_identity(22) is not None  # and the record is untouched
+        assert plate_occupancy.eject_identity(22) is not None  # the record is untouched
 
 
 class TestTheTickTrigger:
-    """``farm_stall`` answers the shape neither other trigger can see: the printer never
-    dropped its session, so there is no connected edge and no restart — the terminal
+    """``farm_stall`` answers the shape the session start cannot see: the printer never
+    dropped its session, so there is no first fresh report and no restart — the terminal
     echo simply never arrived."""
 
     @pytest.fixture(autouse=True)
@@ -771,7 +642,7 @@ class TestTheTickTrigger:
         assert names == []
 
     async def test_a_record_with_no_verdict_is_not_a_tick_trigger(self, monkeypatch):
-        """A hydrated sweep the startup reconciler left in flight has been judged by
+        """A hydrated sweep its session start left in flight has been judged by
         nobody — there is nothing to conclude from a tick."""
         from backend.app.services import farm_stall
 
@@ -824,7 +695,7 @@ class TestReconcileAndThePolicyDriver:
         self._wire(mon)
 
         mgr = _RecMgr([_status("IDLE", subtask_name="OperatorLocalPrint")])
-        await monitor_mod._reconcile_one(printer.id, manager=mgr, poll_s=20, max_wait_s=40, sleep=_noop_sleep)
+        await monitor_mod._reconcile_one(printer.id, manager=mgr)
 
         assert plate_occupancy.eject_identity(printer.id) is None
         assert plate_occupancy.is_plate_occupied(printer.id) is True

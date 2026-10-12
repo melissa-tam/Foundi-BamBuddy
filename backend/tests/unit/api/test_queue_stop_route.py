@@ -23,6 +23,7 @@ import pytest
 from backend.app.api.routes.print_queue import stop_queue_item
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.services.printer_manager import printer_manager
+from backend.tests._fixtures.printer_action import route_verbs
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,7 +53,7 @@ async def _add_printing(db, *, printer_id=7, reason=None):
 
 async def test_stop_stamps_operator_ui_and_clears_waiting_reason(db_session):
     item = await _add_printing(db_session, printer_id=7, reason="spool_jam_recovery_failed")
-    with patch.object(printer_manager, "stop_print", MagicMock(return_value=True)):
+    with route_verbs(stop=MagicMock(return_value=True)):
         await stop_queue_item(item.id, db=db_session, auth_result=(None, True))
 
     await db_session.refresh(item)
@@ -67,7 +68,7 @@ async def test_stop_when_printer_offline_still_stamps(db_session):
     # Even when the stop command couldn't be sent, the route force-cancels — so it
     # must still stamp operator_ui + clear the reason.
     item = await _add_printing(db_session, printer_id=8, reason="print_paused_stalled")
-    with patch.object(printer_manager, "stop_print", MagicMock(return_value=False)):
+    with route_verbs(stop=MagicMock(return_value=False)):
         await stop_queue_item(item.id, db=db_session, auth_result=(None, True))
 
     await db_session.refresh(item)
@@ -117,3 +118,42 @@ async def test_stop_routes_through_the_one_operator_stop(db_session):
     assert item.status == "cancelled"
     assert item.stop_source == "operator_ui"
     assert item.error_message == "Stopped by user"
+
+
+async def test_auto_off_after_routes_to_the_one_temperature_gated_cut(db_session, monkeypatch):
+    """S1: the stop route's auto-off delegates to ``smart_plug_manager.schedule_temp_based_off``
+    with the plug's own threshold. It no longer waits 10 minutes for 50 °C and cuts whatever
+    that wait answered (and no longer calls the Tasmota service whatever the plug type)."""
+    from backend.app.models.smart_plug import SmartPlug
+    from backend.app.services.smart_plug_manager import smart_plug_manager
+
+    plug = SmartPlug(name="P11", plug_type="tasmota", ip_address="192.168.1.50", printer_id=11, off_temp_threshold=45)
+    db_session.add(plug)
+    item = PrintQueueItem(printer_id=11, status="printing", plate_id=1, position=1, auto_off_after=True)
+    db_session.add(item)
+    await db_session.commit()
+    await db_session.refresh(item)
+
+    scheduled = MagicMock()
+    monkeypatch.setattr(smart_plug_manager, "schedule_temp_based_off", scheduled)
+    with route_verbs(stop=MagicMock(return_value=True)):
+        await stop_queue_item(item.id, db=db_session, auth_result=(None, True))
+
+    scheduled.assert_called_once()
+    routed_plug, printer_id, threshold = scheduled.call_args.args
+    assert (routed_plug.id, printer_id, threshold) == (plug.id, 11, 45)
+
+
+async def test_no_auto_off_after_routes_nothing(db_session, monkeypatch):
+    from backend.app.models.smart_plug import SmartPlug
+    from backend.app.services.smart_plug_manager import smart_plug_manager
+
+    db_session.add(SmartPlug(name="P12", plug_type="tasmota", ip_address="192.168.1.51", printer_id=12))
+    item = await _add_printing(db_session, printer_id=12)
+
+    scheduled = MagicMock()
+    monkeypatch.setattr(smart_plug_manager, "schedule_temp_based_off", scheduled)
+    with route_verbs(stop=MagicMock(return_value=True)):
+        await stop_queue_item(item.id, db=db_session, auth_result=(None, True))
+
+    scheduled.assert_not_called()

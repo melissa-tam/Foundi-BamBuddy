@@ -22,7 +22,7 @@ import pytest
 
 from backend.app import main as main_module
 from backend.app.core.tasks import spawn_background_task
-from backend.app.services import hms_edges, notify_dedup
+from backend.app.services import hms_edges, notify_dedup, printer_event_wiring, printer_events
 
 # Two REAL production faults that share one attr — the collision the old key had.
 _ATTR = 0x07002000
@@ -116,13 +116,11 @@ def _reset_state():
     notify_dedup._reset_state()
     hms_edges._reset_state()  # the edge-triggered state consumers ride this ledger
     main_module._printer_offline_edge_at.clear()
-    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
     yield
     notify_dedup._reset_state()
     hms_edges._reset_state()
     main_module._printer_offline_edge_at.clear()
-    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
 
 
@@ -150,7 +148,8 @@ class _Harness:
         # that carries new codes and opens its OWN session, so it is stubbed here
         # for the whole file; its behavior is pinned in test_spool_recovery.py.
         self.guidance_refresh = AsyncMock(return_value=False)
-        # Names of the background tasks main spawned during the block, in order.
+        # Names of the background tasks main — and the hub subscribers it publishes to — spawned
+        # during the block, in order.
         self.spawned: list[str] = []
 
     def _spawn(self, coro, *, name=None):
@@ -205,10 +204,9 @@ class _Harness:
             patch("backend.app.main.mqtt_relay", relay),
             patch("backend.app.main.printer_manager", pm),
             patch("backend.app.main.spawn_background_task", new=self._spawn),
-            # The one unrelated lane the old blanket stub was suppressing: the
-            # once-per-reconnect archive reconcile. It has nothing to do with HMS and
-            # would query through main's mocked session, so it is stood down by name.
-            patch("backend.app.main.reconcile_stale_active_prints", new=AsyncMock(return_value=0)),
+            # The farm lanes a push reaches are the printer-event hub's subscribers
+            # (``printer_event_wiring``): their spawns are recorded by name the same way.
+            patch("backend.app.services.printer_event_wiring.spawn_background_task", new=self._spawn),
             patch("backend.app.main.printer_state_to_dict", return_value={}),
             session_patch,
             patch("backend.app.main.notification_service", self.notify),
@@ -233,9 +231,14 @@ class _Harness:
         ]
         for p in self._patches:
             p.start()
+        # The production wiring, as the lifespan makes it (no lifespan runs under a unit test). The
+        # session start is stood down: it never runs from a push, and these pushes are not a
+        # session's first fresh report.
+        printer_event_wiring.wire(downtime_reconcile=AsyncMock(return_value=0))
         return self
 
     def __exit__(self, *exc):
+        printer_event_wiring.unwire()
         for p in reversed(self._patches):
             p.stop()
         return False
@@ -678,7 +681,44 @@ class TestEveryPushIsSampled:
     skipped exactly the pushes a firmware change, a fault edge or a USB unmount lives on — the
     runout auto-switch's posture and HMS words arrive on pushes the key reads as unchanged. Every
     block now runs on every push, idempotent through its own cursor or edge; only the broadcast
-    is skipped on an unchanged key."""
+    is skipped on an unchanged key.
+
+    The samplers are the printer-event hub's subscribers since 2026-10-11: main PUBLISHES one
+    ``StatusReported`` per push (and one ``HmsEdgesAppeared`` per edge), and every subscriber of the
+    production wiring runs on every one of them."""
+
+    async def test_every_push_publishes_exactly_one_status_report(self):
+        reports: list[printer_events.StatusReported] = []
+        with _Harness():
+            unsubscribe = printer_events.subscribe(printer_events.StatusReported, reports.append)
+            try:
+                state = _state([], layer_num=1)
+                for _ in range(3):  # one status key, three pushes
+                    await main_module.on_printer_status_change(5, state)
+            finally:
+                unsubscribe()
+
+        assert [(r.printer_id, r.state) for r in reports] == [(5, state)] * 3
+
+    async def test_an_edge_is_published_once_before_the_status_report(self):
+        seen: list[str] = []
+        with _Harness():
+            unsubscribe_edges = printer_events.subscribe(
+                printer_events.HmsEdgesAppeared, lambda e: seen.append(f"edges:{sorted(e.edges.appeared_full)}")
+            )
+            unsubscribe_reports = printer_events.subscribe(
+                printer_events.StatusReported, lambda e: seen.append("report")
+            )
+            try:
+                await _warm_up(5)
+                seen.clear()
+                await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION], layer_num=1))
+                await main_module.on_printer_status_change(5, _state([_RUNOUT_COMPANION], layer_num=2))
+            finally:
+                unsubscribe_edges()
+                unsubscribe_reports()
+
+        assert seen == [f"edges:{[_RUNOUT_COMPANION.full_code]}", "report", "report"]
 
     @staticmethod
     def _broadcasts() -> int:
@@ -699,6 +739,7 @@ class TestEveryPushIsSampled:
     async def test_every_sampler_sees_every_push(self):
         samplers = {
             "edges": patch.object(hms_edges, "note_push", MagicMock(return_value=None)),
+            "stagger": patch("backend.app.services.stagger.stagger_policy.on_status_push", MagicMock()),
             "swap": patch("backend.app.services.spool_respool.sample_status_push", MagicMock(return_value=frozenset())),
             "demand": patch("backend.app.services.spool_recovery.note_demand_watch", MagicMock()),
             "pause": patch("backend.app.services.pause_recovery.note_status_push", MagicMock()),
@@ -715,6 +756,7 @@ class TestEveryPushIsSampled:
 
         assert {name: mock.call_count for name, mock in mocks.items()} == {
             "edges": 3,
+            "stagger": 3,
             "swap": 3,
             "demand": 3,
             "pause": 3,
@@ -1108,7 +1150,7 @@ class TestMovedConsumersRideTheAppearanceEdge:
     async def test_storage_low_fires_on_an_edge_notify_dedup_calls_stale(self):
         with (
             _Harness() as h,
-            patch("backend.app.main.on_storage_low", new=AsyncMock()) as storage_hook,
+            patch("backend.app.services.usb_storage.on_storage_low", new=AsyncMock()) as storage_hook,
         ):
             await _stale_then_reappear(5, _STORAGE_LOW)
             await asyncio.sleep(0)  # let the fire-and-forget task run
@@ -1154,7 +1196,7 @@ class TestStatusHooksHoldAStrongTaskReference:
     async def test_the_storage_low_hook_is_spawned_by_name(self):
         with (
             _Harness() as h,
-            patch("backend.app.main.on_storage_low", new=AsyncMock()) as storage_hook,
+            patch("backend.app.services.usb_storage.on_storage_low", new=AsyncMock()) as storage_hook,
         ):
             await _warm_up(5)
             await main_module.on_printer_status_change(5, _state([_hms(_STORAGE_LOW)]))

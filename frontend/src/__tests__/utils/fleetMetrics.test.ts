@@ -276,9 +276,9 @@ describe('label keys', () => {
     // rule is that only `incidentKindLabelKey` and `causeLabelKey` assemble it.
     const ALLOWED = new Set([
       // THE owner: `causeLabelKey` builds it and `incidentKindLabelKey` guards
-      // the declared kind away from it. The printer card's hold chip
-      // (`utils/incidentChip`) asks `incidentKindLabelKey` too, so no second
-      // builder is allowed.
+      // the declared kind away from it (the printer card's hold chip takes its
+      // key from the backend's `hold_chip` verdict), so no second builder is
+      // allowed.
       path.join('utils', 'fleetMetrics.ts'),
     ]);
     const builder = /printers\.incident\.(?:\$\{|['"`]\s*\+)|['"`]printers\.incident\.['"`]\s*\+/;

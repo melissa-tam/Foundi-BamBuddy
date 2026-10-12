@@ -1311,7 +1311,7 @@ class SimpleMQTTServer:
                 # printer's response goes back only to them (not fanned
                 # out to every connected slicer).
                 self._record_pending_request(data, client_id)
-                self._bridge.forward_to_printer(data)
+                await self._bridge.forward_to_printer(data)
 
         except (IndexError, ValueError, OSError) as e:
             logger.debug("MQTT PUBLISH error: %s", e)

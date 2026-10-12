@@ -169,7 +169,7 @@ function buildPrinterStatus(opts: {
     }],
     vt_tray: [],
     tray_now: 255,
-    toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null, refill: null },
+    toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: null },
     active_extruder: 0,
   };
 }
@@ -468,7 +468,7 @@ describe('SpoolBuddyAmsPage — active slot ring', () => {
       ...buildPrinterStatus({ slot0: { tray_type: '', tray_uuid: null, tag_uid: null }, slot1: backup }),
       state: 'RUNNING',
       tray_now: 1,
-      toolhead: { feed: 'fed', active_tray: 0, was_feeding_tray: null, refill: null },
+      toolhead: { feed: 'fed', active_tray: 0, was_feeding_tray: null },
     };
     renderPage();
 
@@ -481,7 +481,7 @@ describe('SpoolBuddyAmsPage — active slot ring', () => {
       ...buildPrinterStatus({ slot1: backup }),
       state: 'PAUSE',
       tray_now: 1,
-      toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: 1, refill: null },
+      toolhead: { feed: 'empty', active_tray: null, was_feeding_tray: 1 },
     };
     renderPage();
 

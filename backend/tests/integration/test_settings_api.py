@@ -1172,6 +1172,38 @@ class TestSpoolSelectionSettings:
         assert response.status_code == 422
 
 
+class TestSpoolRecoveryStepTimeout:
+    """The jam-recovery step bound: how long a step waits for the printer before the
+    driver takes its next self-heal step. Same key production stored, so a stored
+    value reads back unchanged. Full PUT→GET round-trip through the route whitelist."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_default_is_90(self, async_client: AsyncClient):
+        response = await async_client.get("/api/v1/settings/")
+        assert response.status_code == 200
+        assert response.json()["spool_recovery_step_timeout_s"] == 90
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_round_trips(self, async_client: AsyncClient):
+        response = await async_client.put("/api/v1/settings/", json={"spool_recovery_step_timeout_s": 120})
+        assert response.status_code == 200
+        assert response.json()["spool_recovery_step_timeout_s"] == 120
+        get_resp = await async_client.get("/api/v1/settings/")
+        # Read back as an int through the int whitelist.
+        assert get_resp.json()["spool_recovery_step_timeout_s"] == 120
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_rejects_out_of_range(self, async_client: AsyncClient):
+        for refused in (10, 700):
+            response = await async_client.put("/api/v1/settings/", json={"spool_recovery_step_timeout_s": refused})
+            assert response.status_code == 422, refused
+        get_resp = await async_client.get("/api/v1/settings/")
+        assert get_resp.json()["spool_recovery_step_timeout_s"] == 90
+
+
 class TestOpenInSlicerOverride:
     """Per #1329, the desktop 'Open in Slicer' target can diverge from the API
     sidecar slicer. The new `open_in_slicer` setting is None by default (frontend

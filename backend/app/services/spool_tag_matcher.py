@@ -829,12 +829,19 @@ async def auto_assign_spool(
                 # (the preset assigned in inventory), falling back to tray's RFID value.
                 cali_filament_id = spool.slicer_filament or tray_info_idx or ""
                 if _cali_sel_window.allow((printer_id, ams_id, tray_id, matching_kp.cali_idx)):
-                    client.extrusion_cali_sel(
-                        ams_id=ams_id,
-                        tray_id=tray_id,
-                        cali_idx=matching_kp.cali_idx,
-                        filament_id=cali_filament_id,
-                        nozzle_diameter=nozzle_diameter,
+                    from backend.app.services import printer_action
+
+                    await printer_action.send(
+                        printer_id,
+                        printer_action.cali_sel(
+                            ams_id,
+                            tray_id,
+                            cali_idx=matching_kp.cali_idx,
+                            filament_id=cali_filament_id,
+                            nozzle_diameter=nozzle_diameter,
+                        ),
+                        actor=printer_action.ACTOR_FARM,
+                        client=client,
                     )
 
                     # NOTE: Do NOT send extrusion_cali_set here. extrusion_cali_sel already
@@ -868,12 +875,19 @@ async def auto_assign_spool(
                 if live_cali_idx is not None and live_cali_idx >= 0:
                     cali_filament_id = spool.slicer_filament or tray_info_idx or ""
                     if _cali_sel_window.allow((printer_id, ams_id, tray_id, live_cali_idx)):
-                        client.extrusion_cali_sel(
-                            ams_id=ams_id,
-                            tray_id=tray_id,
-                            cali_idx=live_cali_idx,
-                            filament_id=cali_filament_id,
-                            nozzle_diameter=nozzle_diameter,
+                        from backend.app.services import printer_action
+
+                        await printer_action.send(
+                            printer_id,
+                            printer_action.cali_sel(
+                                ams_id,
+                                tray_id,
+                                cali_idx=live_cali_idx,
+                                filament_id=cali_filament_id,
+                                nozzle_diameter=nozzle_diameter,
+                            ),
+                            actor=printer_action.ACTOR_FARM,
+                            client=client,
                         )
                         logger.info(
                             "No stored K-profile for spool %d on printer %d AMS%d-T%d — preserved live cali_idx=%d",
@@ -1007,12 +1021,19 @@ async def reapply_k_profile_if_drifted(
         return False  # a re-apply for this slot is still inside its retry window
 
     cali_filament_id = spool.slicer_filament or tray.get("tray_info_idx", "") or ""
-    client.extrusion_cali_sel(
-        ams_id=ams_id,
-        tray_id=tray_id,
-        cali_idx=chosen_kp.cali_idx,
-        filament_id=cali_filament_id,
-        nozzle_diameter=nozzle_diameter,
+    from backend.app.services import printer_action
+
+    await printer_action.send(
+        printer_id,
+        printer_action.cali_sel(
+            ams_id,
+            tray_id,
+            cali_idx=chosen_kp.cali_idx,
+            filament_id=cali_filament_id,
+            nozzle_diameter=nozzle_diameter,
+        ),
+        actor=printer_action.ACTOR_FARM,
+        client=client,
     )
     logger.info(
         "Re-applied K-profile cali_idx=%d for spool %d on printer %d AMS%d-T%d (live=%s drift detected)",

@@ -358,11 +358,11 @@ export interface LongLivedCameraToken {
 // Printer types
 
 /**
- * Every `printer_incident` kind the backend can report. The chip on the printer
- * card looks its label up dynamically by this exact string, so a kind added here
- * needs its locale leaf in the same change (pinned by
- * `__tests__/i18n/incidentKinds.test.ts`) UNLESS it is listed in
- * `OWN_SURFACE_INCIDENT_KINDS` below.
+ * Every `printer_incident` kind the backend can report. The backend's hold chip
+ * (`services/hold_chip`) names a kind by the locale keys `printers.incident.<kind>`
+ * and `printers.incidentAction.<kind>`, so a kind added here needs those leaves in
+ * the same change (pinned by `__tests__/i18n/incidentKinds.test.ts`) unless it has
+ * a surface of its own (maintenance mode).
  */
 export type PrinterIncidentKind =
   | 'jam'
@@ -375,13 +375,6 @@ export type PrinterIncidentKind =
   // The farm refills an EMPTY toolhead on a printer no AMS row holds; failing,
   // a person's hold (`models/printer_incident.KIND_TOOLHEAD_REFILL`).
   | 'toolhead_refill';
-
-/**
- * Incident kinds that carry their OWN surface, so the generic incident chip must
- * skip them: an operator's service hold is rendered by the maintenance banner,
- * and a second chip saying the same thing is a duplicate surface for one fact.
- */
-export const OWN_SURFACE_INCIDENT_KINDS: readonly PrinterIncidentKind[] = ['service_hold'];
 
 /**
  * The operator's maintenance hold ("maintenance mode"): the printer keeps its
@@ -661,7 +654,7 @@ export interface SlotRecheckResult {
 
 /**
  * What the wire answered to an operator AMS load/unload — mirrors the backend
- * `AmsCommandOutcome` owned by `services/ams_command.py`, minus the two refusals
+ * `AmsCommandOutcome` (`schemas/printer.py`, answered by `services/printer_action.py`), minus the two refusals
  * (`refused_not_connected` 400, `refused_runout_hold` 409), which arrive as
  * `ApiError`s instead of a 200 body:
  *   - `complete`        the commanded end state was observed
@@ -744,60 +737,16 @@ export type HmsActionResult =
   | { success: boolean; message: string; status?: undefined }
   | { success: boolean; status: 'refilling'; slot: string | null; message: string };
 
-/** What the AMS answered a farm motion command that did not reach its end. */
-export type ToolheadRefillAnswer = 'no_movement' | 'acted';
-
-/** The farm motion step a refill state names: the load in flight, or the step that failed. */
-export type ToolheadRefillCommand = 'load' | 'unload';
-
-/**
- * The farm's refill of an empty toolhead (`schemas/printer.ToolheadRefillState`):
- * `loading` while a refill (or a recovery driver's load) is in flight, `failed` once the
- * open row's last command did not reach its end. `command` is that step — always `load`
- * while loading; for `failed`, the load or the unload before it. Absent on a backend
- * predating the field, which only ever reported a load: read it as `load`.
- */
-export type ToolheadRefillState =
-  | { phase: 'loading'; slot: string | null; answer: null; command?: 'load' }
-  | {
-      phase: 'failed';
-      slot: string | null;
-      answer: ToolheadRefillAnswer | null;
-      command?: ToolheadRefillCommand;
-    };
-
-/**
- * What a Bambuddy Resume would do about an EMPTY toolhead right now
- * (`schemas/printer.ToolheadRefillReason`) — the resume route's own T3 verdict, served so
- * the card never re-derives it: `owed` (the resume loads a spool first), `fed`, the
- * exclusions (`maintenance`, `physical`, `runout_demand`, `power_loss_prompt`,
- * `before_first_layer`, `last_layer`, `change_in_flight`, `command_pending`,
- * `eject_sweep`) and `unknown` (nothing readable).
- */
-export type ToolheadRefillReason =
-  | 'owed'
-  | 'fed'
-  | 'maintenance'
-  | 'physical'
-  | 'runout_demand'
-  | 'power_loss_prompt'
-  | 'before_first_layer'
-  | 'last_layer'
-  | 'change_in_flight'
-  | 'command_pending'
-  | 'eject_sweep'
-  | 'unknown';
-
 /**
  * `PrinterStatus.toolhead` (`schemas/printer.ToolheadState`): the ACTIVE extruder's feed as the
  * backend's one feed-state owner reads it — `fed` (an AMS feeder) / `external` / `empty` /
- * `unknown` (nothing read) — the tray it is fed from, the tray this job last fed while nothing
- * is, the farm's refill of it (set only while the feed reads empty or unknown) and, while it
- * reads empty, `refill_reason`. Absent on a backend predating the field: no verdict, no ring.
+ * `unknown` (nothing read) — the tray it is fed from and the tray this job last fed while nothing
+ * is. Absent on a backend predating the field: no ring.
  *
  * The slot rings read `active_tray` / `was_feeding_tray` and nothing else. The wire's
  * `tray_now` is deliberately not typed on `PrinterStatus`: during a runout auto-switch it
- * pre-flips to the backup slot minutes before the backup feeds.
+ * pre-flips to the backup slot minutes before the backup feeds. The hold chip is not read off
+ * this field: it is the backend's own verdict, `PrinterStatus.hold_chip`.
  */
 export interface ToolheadState {
   feed: 'fed' | 'external' | 'empty' | 'unknown';
@@ -812,8 +761,27 @@ export interface ToolheadState {
    * fed. Otherwise `null`.
    */
   was_feeding_tray: number | null;
-  refill: ToolheadRefillState | null;
-  refill_reason?: ToolheadRefillReason | null;
+}
+
+/** One translatable sentence of the hold chip: an i18n key and its interpolation values. */
+export interface HoldChipCopy {
+  key: string;
+  values: Record<string, string>;
+}
+
+/**
+ * `PrinterStatus.hold_chip` (`schemas/printer.HoldChipState`): the printer card's ONE hold pill
+ * as the backend decided it (`services/hold_chip`) — which hold it names (`variant`), its tone
+ * (`acting`: amber, the farm still acts; `held`: red, a person's turn), the pill's noun, the
+ * tooltip's sentences in reading order and a raw qualifier the tooltip ends with (the hold's
+ * slot). The card renders it and decides nothing: no precedence, tone or reason table lives here.
+ */
+export interface HoldChipState {
+  variant: 'incident' | 'toolhead';
+  tone: 'acting' | 'held';
+  label: HoldChipCopy;
+  tooltip: HoldChipCopy[];
+  qualifier: string | null;
 }
 
 export interface NozzleInfo {
@@ -1021,11 +989,13 @@ export interface PrinterStatus {
   // dialog on the held job. Its own field because `open_incident` shows only the
   // top-ranked hold. Never re-derive it from `open_incident` or `hms_errors`.
   plate_check_exit?: PlateCheckExit | null;
-  // The ACTIVE extruder's feed, the tray feeding it and the farm's refill of it —
-  // what the card's "Toolhead empty" chip (`utils/incidentChip.holdChip`) and the
-  // slot rings read. Same backend builder for both REST branches and the WS
-  // frame; never re-derived from `tray_now` here.
+  // The ACTIVE extruder's feed and the tray feeding it — what the slot rings read.
+  // Same backend builder for both REST branches and the WS frame; never
+  // re-derived from `tray_now` here.
   toolhead?: ToolheadState | null;
+  // The hold chip: the backend's ONE verdict of which hold the card names, in
+  // which tone, with which words. Rendered as is (`components/HoldChip`).
+  hold_chip?: HoldChipState | null;
   // Operator maintenance hold, mirrored onto the status frame (including the
   // disconnected branch) so a card rendered from a stale fleet list still shows
   // it. `Printer.service_hold` is the primary origin; this is the fallback.
@@ -1656,7 +1626,7 @@ export interface AppSettings {
   // resumes; the jammed spool is flagged out-of-rotation until re-inserted.
   spool_recovery_enabled: boolean;            // Master toggle (default true)
   spool_recovery_max_attempts: number;        // Auto-swap attempts before escalating (1-5, default 2)
-  spool_recovery_step_timeout_s: number;      // Per-step timeout while recovering (15-600s, default 90)
+  spool_recovery_step_timeout_s: number;      // Wait per recovery step before the next self-heal step (15-600s, default 90)
   spool_recovery_protect_layers: number;      // Skip auto-recovery within the first N layers (0-1000, default 7)
   // Resume a runout-PAUSEd print automatically when the AMS slot the firmware is
   // demanding gets refilled (006-H2S 2026-07-26). Default true.
@@ -1761,17 +1731,18 @@ export interface AppSettings {
   // Ignore and resume or Stop; then the farm stops it and gates the plate.
   // A different concern from `farm_pause_stall_minutes` (an alert threshold).
   farm_plate_check_decision_minutes: number;
+  // The attention owner's page bound (1–120 min, default 10): a printer that has not carried out a
+  // command, or sits in a state the farm waits on, this long is paged (then hourly). Decides nothing.
+  farm_attention_page_minutes: number;
   // Eject-cooldown stall detection (server-dispatched eject): during the
   // post-print cooldown the bed must keep cooling. Over each stall window
   // (minutes) it must drop at least the epsilon (°C); two consecutive windows
-  // without that progress quarantine the printer (window 0 disables the watch).
-  // After max-hold minutes above the release threshold the eject dispatches
-  // anyway (0 = wait for the threshold indefinitely).
+  // without that progress hold the plate for a person (window 0 disables the watch).
+  // There is no time cap: a bed still cooling is waited for, never ejected onto hot.
   farm_cooldown_stall_window_minutes: number;
   farm_cooldown_stall_epsilon_c: number;
-  farm_cooldown_max_hold_minutes: number;
   // When cooling plateaus within this many °C of the printer's OWN chamber air,
-  // eject (bed equilibrated) instead of quarantining the printer.
+  // eject (bed equilibrated); a plateau hotter than that holds the plate for a person.
   farm_cooldown_plateau_eject_margin_c: number;
   // THE one eject-line input: the eject line and the chamber-fan step-down sit
   // this far (°C, 0.5–10) above measured shop air (`GET /shop-air`). Replaced
@@ -2920,6 +2891,7 @@ export interface NotificationProvider {
   on_print_stalled: boolean;
   on_storage_low: boolean;
   on_cooldown_escalation: boolean;
+  on_printer_waiting: boolean;
   // Quiet hours
   quiet_hours_enabled: boolean;
   quiet_hours_start: string | null;
@@ -2993,6 +2965,7 @@ export interface NotificationProviderCreate {
   on_print_stalled?: boolean;
   on_storage_low?: boolean;
   on_cooldown_escalation?: boolean;
+  on_printer_waiting?: boolean;
   // Quiet hours
   quiet_hours_enabled?: boolean;
   quiet_hours_start?: string | null;
@@ -3059,6 +3032,7 @@ export interface NotificationProviderUpdate {
   on_print_stalled?: boolean;
   on_storage_low?: boolean;
   on_cooldown_escalation?: boolean;
+  on_printer_waiting?: boolean;
   // Quiet hours
   quiet_hours_enabled?: boolean;
   quiet_hours_start?: string | null;

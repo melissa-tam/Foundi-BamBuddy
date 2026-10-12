@@ -210,25 +210,9 @@ class TestPrinterManager:
             assert result is True
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("driver_live", "pending", "acting"),
-        [
-            pytest.param(False, None, False, id="nothing_of_the_farms"),
-            pytest.param(True, None, True, id="a_live_recovery_driver"),
-            pytest.param(False, object(), True, id="a_pending_farm_command"),
-        ],
-    )
-    async def test_the_client_gets_the_farm_acting_provider(
-        self, manager, mock_printer, monkeypatch, driver_live, pending, acting
-    ):
-        """The feed state attributes a landing at STEP time through a provider the registry injects
-        (the client imports nothing above itself): a live recovery driver, or a farm motion command
-        the step ledger holds pending, for THIS printer."""
-        from backend.app.services import printer_incidents
-
-        asked: list[int] = []
-        monkeypatch.setattr(printer_incidents, "driver_live", lambda pid: asked.append(pid) or driver_live)
-        monkeypatch.setattr(printer_incidents, "pending_command", lambda pid: pending)
+    async def test_the_client_gets_no_farm_acting_provider(self, manager, mock_printer):
+        """Whose load landed is the RECORD's (``printer_action``), never an attribution injected
+        into the client at step time: the registry builds the client with no such provider."""
         with (
             patch("backend.app.services.printer_manager.BambuMQTTClient") as MockClient,
             patch("backend.app.services.printer_manager.asyncio.sleep", new=AsyncMock()),
@@ -236,9 +220,7 @@ class TestPrinterManager:
             MockClient.return_value = MagicMock()
             await manager.connect_printer(mock_printer)
 
-        provider = MockClient.call_args.kwargs["farm_acting"]
-        assert provider() is acting
-        assert asked == [mock_printer.id]
+        assert "farm_acting" not in MockClient.call_args.kwargs
 
     @pytest.mark.asyncio
     async def test_connect_printer_disconnects_existing(self, manager, mock_printer, mock_client):
@@ -435,120 +417,9 @@ class TestPrinterManager:
     # Tests for start_print
     # ========================================================================
 
-    def test_start_print_calls_client(self, manager, mock_client):
-        """Verify start_print calls client method."""
-        mock_client.start_print.return_value = True
-        manager._clients[1] = mock_client
-
-        result = manager.start_print(1, "test.gcode")
-
-        mock_client.start_print.assert_called_once_with(
-            "test.gcode",
-            1,
-            ams_mapping=None,
-            timelapse=False,
-            bed_levelling=True,
-            flow_cali=False,
-            vibration_cali=True,
-            layer_inspect=False,
-            use_ams=True,
-            nozzle_offset_cali=False,
-            nozzle_mapping=None,
-        )
-        assert result is True
-
-    def test_start_print_returns_false_for_unknown(self, manager):
-        """Verify start_print returns False for unknown printer."""
-        result = manager.start_print(999, "test.gcode")
-        assert result is False
-
-    def test_start_print_logs_print_command_with_caller(self, manager, mock_client, caplog):
-        """Verify start_print logs PRINT COMMAND with caller info (#374)."""
-        mock_client.start_print.return_value = True
-        manager._clients[1] = mock_client
-
-        with caplog.at_level(logging.INFO, logger="backend.app.services.printer_manager"):
-            manager.start_print(1, "benchy.3mf")
-
-        print_cmd_logs = [r for r in caplog.records if "PRINT COMMAND" in r.message]
-        assert len(print_cmd_logs) == 1
-        log_msg = print_cmd_logs[0].message
-        assert "printer=1" in log_msg
-        assert "file=benchy.3mf" in log_msg
-        assert "caller=" in log_msg
-
-    def test_start_print_logs_even_when_printer_unknown(self, manager, caplog):
-        """Verify PRINT COMMAND is logged even for unknown printers (#374)."""
-        with caplog.at_level(logging.INFO, logger="backend.app.services.printer_manager"):
-            result = manager.start_print(999, "ghost.3mf")
-
-        assert result is False
-        print_cmd_logs = [r for r in caplog.records if "PRINT COMMAND" in r.message]
-        assert len(print_cmd_logs) == 1
-
     # ========================================================================
     # Tests for stop_print
     # ========================================================================
-
-    def test_stop_print_calls_client(self, manager, mock_client):
-        """Verify stop_print calls client method."""
-        mock_client.stop_print.return_value = True
-        manager._clients[1] = mock_client
-
-        result = manager.stop_print(1)
-
-        mock_client.stop_print.assert_called_once()
-        assert result is True
-
-    def test_stop_print_returns_false_for_unknown(self, manager):
-        """Verify stop_print returns False for unknown printer."""
-        result = manager.stop_print(999)
-        assert result is False
-
-    # ========================================================================
-    # Tests for wait_for_cooldown
-    # ========================================================================
-
-    @pytest.mark.asyncio
-    async def test_wait_for_cooldown_returns_true_when_cool(self, manager, mock_client):
-        """Verify wait_for_cooldown returns True when printer is cool."""
-        mock_client.state.connected = True
-        mock_client.state.temperatures = {"nozzle": 40, "bed": 30}
-        mock_client.check_staleness.return_value = True
-        manager._clients[1] = mock_client
-
-        result = await manager.wait_for_cooldown(1, target_temp=50)
-
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_wait_for_cooldown_returns_false_on_disconnect(self, manager, mock_client):
-        """Verify wait_for_cooldown returns False when printer disconnects."""
-        mock_client.state.connected = False
-        mock_client.check_staleness.return_value = False
-        manager._clients[1] = mock_client
-
-        result = await manager.wait_for_cooldown(1, target_temp=50, timeout=1)
-
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_wait_for_cooldown_returns_false_for_unknown(self, manager):
-        """Verify wait_for_cooldown returns False for unknown printer."""
-        result = await manager.wait_for_cooldown(999, target_temp=50, timeout=1)
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_wait_for_cooldown_checks_both_nozzles(self, manager, mock_client):
-        """Verify wait_for_cooldown checks both nozzles for dual extruders."""
-        mock_client.state.connected = True
-        mock_client.state.temperatures = {"nozzle": 40, "nozzle_2": 45, "bed": 30}
-        mock_client.check_staleness.return_value = True
-        manager._clients[1] = mock_client
-
-        result = await manager.wait_for_cooldown(1, target_temp=50)
-
-        assert result is True
 
     # ========================================================================
     # Tests for logging methods
@@ -2174,13 +2045,11 @@ class TestOpenIncidentProjection:
 
 
 class TestToolheadProjection:
-    """``toolhead`` on the status frame (K10/C3c, 2026-10-10) — what the card's "Toolhead empty" chip
-    and slot rings read: the ACTIVE extruder's feed (``tray_fields.toolhead_feed``, K1), the feed
-    state's effective and was-feeding trays (``feed_state``, invariant 16 — the client's ``feed()``),
-    the farm's refill of it (``printer_incidents.refill_state``) and, while the feed reads EMPTY,
-    what a Resume would do about it (``refill_reason``: the T3 verdict, ``refill_verdict.refill_owed``
-    over the feed state — the card never re-derives K7), DERIVED on every broadcast, JSON
-    primitives. The client's feed state here is a real tracker stepped off the scripted pushes."""
+    """``toolhead`` on the status frame (K10/C3c, 2026-10-10) — what the card's slot rings read: the
+    ACTIVE extruder's feed (``tray_fields.toolhead_feed``, K1) and the feed state's effective and
+    was-feeding trays (``feed_state``, invariant 16 — the client's ``feed()``), DERIVED on every
+    broadcast, JSON primitives. The hold chip is its own builder (``test_hold_chip``). The client's feed
+    state here is a real tracker stepped off the scripted pushes."""
 
     @pytest.fixture(autouse=True)
     def _clean(self):
@@ -2238,13 +2107,7 @@ class TestToolheadProjection:
 
     @staticmethod
     def _payload(**fields):
-        return {
-            "feed": "empty",
-            "active_tray": None,
-            "was_feeding_tray": None,
-            "refill": None,
-            "refill_reason": None,
-        } | fields
+        return {"feed": "empty", "active_tray": None, "was_feeding_tray": None} | fields
 
     def test_a_fed_toolhead(self, monkeypatch):
         from backend.app.services.printer_manager import toolhead_payload
@@ -2268,45 +2131,18 @@ class TestToolheadProjection:
 
         assert toolhead_payload(7, pre_flip) == self._payload(feed="fed", active_tray=1)
 
-    def test_an_empty_toolhead_with_nothing_acting(self):
-        """A reading that is not of this session (no report applied yet), and no client: nothing is
-        named as fed and nothing is decided — ``unknown``."""
-        from backend.app.services.printer_manager import toolhead_payload
-
-        assert toolhead_payload(7, self._state(255)) == self._payload(refill_reason="unknown")
-
     def test_no_state_is_unknown(self):
         from backend.app.services.printer_manager import toolhead_payload
 
         assert toolhead_payload(7, None) == self._payload(feed="unknown")
 
-    def test_the_012_plate_marker_pause_before_the_first_layer(self, monkeypatch):
-        """012-H2S, 2026-10-10: PAUSEd at layer 0 of 167 at the printer's plate-marker dialog
-        (``0500_8062``), ``tray_now`` 255, no open row — the start block loads the filament itself, so
-        a Resume refills nothing and the card must not say "Load a slot"."""
-        from backend.app.services.printer_manager import toolhead_payload
-
-        paused = self._live(255, layer=0)
-        self._client(monkeypatch, paused)
-        assert toolhead_payload(7, paused) == self._payload(refill_reason="before_first_layer")
-
-    def test_an_empty_toolhead_past_the_first_layer_is_owed_and_names_what_was_feeding(self, monkeypatch):
+    def test_an_empty_toolhead_past_the_first_layer_names_what_was_feeding(self, monkeypatch):
         from backend.app.services.printer_manager import toolhead_payload
 
         fed = self._live(1, layer=40)
         emptied = self._live(255, layer=40)
         self._client(monkeypatch, fed, emptied)
-        assert toolhead_payload(7, emptied) == self._payload(was_feeding_tray=1, refill_reason="owed")
-
-    def test_a_running_print_that_reads_empty_is_unconfirmed_until_the_phase_moves(self, monkeypatch):
-        """The first frames of a runout auto-switch read RUNNING with nothing fed and no posture yet:
-        the card reads ``unconfirmed`` (the farm acts on nothing) with the slot that was feeding."""
-        from backend.app.services.printer_manager import toolhead_payload
-
-        fed = self._live(1, layer=40, gcode="RUNNING")
-        emptied = self._live(255, layer=40, gcode="RUNNING")
-        self._client(monkeypatch, fed, emptied)
-        assert toolhead_payload(7, emptied) == self._payload(was_feeding_tray=1, refill_reason="unconfirmed")
+        assert toolhead_payload(7, emptied) == self._payload(was_feeding_tray=1)
 
     def test_no_job_names_no_was_feeding_tray(self, monkeypatch):
         from backend.app.services.printer_manager import toolhead_payload
@@ -2314,42 +2150,14 @@ class TestToolheadProjection:
         fed = self._live(1, layer=0, gcode="IDLE")
         idle = self._live(255, layer=0, gcode="IDLE")
         self._client(monkeypatch, fed, idle)
-        assert toolhead_payload(7, idle) == self._payload(refill_reason="unknown")
-
-    async def test_maintenance_mode_is_the_verdict(self, db_session, printer_factory, monkeypatch):
-        from backend.app.models.printer_incident import KIND_SERVICE_HOLD
-        from backend.app.services import printer_incidents
-        from backend.app.services.printer_manager import toolhead_payload
-
-        printer = await printer_factory()
-        await printer_incidents.open_declared(db_session, printer.id, kind=KIND_SERVICE_HOLD)
-        emptied = self._live(255, layer=40)
-        self._client(monkeypatch, emptied)
-        assert toolhead_payload(printer.id, emptied)["refill_reason"] == "maintenance"
-
-    def test_a_fed_toolhead_names_no_reason(self, monkeypatch):
-        from backend.app.services.printer_manager import toolhead_payload
-
-        for tray in (1, 254):
-            fed = self._live(tray, layer=40)
-            self._client(monkeypatch, fed)
-            assert toolhead_payload(7, fed)["refill_reason"] is None
-
-    def test_the_refill_rides_an_empty_toolhead_only(self, monkeypatch):
-        from backend.app.services import printer_incidents
-        from backend.app.services.printer_manager import toolhead_payload
-
-        refill = {"phase": "failed", "command": "unload", "slot": "AMS A slot 1", "answer": "acted"}
-        monkeypatch.setattr(printer_incidents, "refill_state", lambda _pid: refill)
-
-        assert toolhead_payload(7, self._state(255)) == self._payload(refill=refill, refill_reason="unknown")
-        # Once the toolhead reads fed again a person loaded it: the failed refill is history.
-        assert toolhead_payload(7, self._state(1))["refill"] is None
+        assert toolhead_payload(7, idle) == self._payload()
 
     def test_it_rides_the_status_frame(self):
         payload = printer_state_to_dict(self._state(255), printer_id=7)
-        assert payload["toolhead"] == self._payload(refill_reason="unknown")
+        assert payload["toolhead"] == self._payload()
         json.dumps(payload["toolhead"])
+        # The hold chip rides the same frame, from its own builder (``test_hold_chip``).
+        assert "hold_chip" in payload
 
     def test_the_payload_is_the_dtos_shape(self, monkeypatch):
         """ONE builder, ONE DTO: every key the builder emits is a ``ToolheadState`` field and back."""
@@ -2370,35 +2178,6 @@ class TestToolheadProjection:
         from backend.app.services import tray_fields
 
         assert get_args(ToolheadState.model_fields["feed"].annotation) == get_args(tray_fields.FeedKind)
-
-    def test_the_refill_command_vocabulary_is_the_classifiers_own(self):
-        """``refill.command`` is the motion the chip speaks of: the ledger's command step names, which
-        only ``ams_command`` publishes (``ams_command.Command``). The schema cannot import the service,
-        so this pin keeps one spelling."""
-        from typing import get_args
-
-        from backend.app.schemas.printer import ToolheadRefillState
-        from backend.app.services import ams_command
-
-        field = ToolheadRefillState.model_fields.get("command")
-        assert field is not None, "ToolheadRefillState names no command"
-        assert get_args(field.annotation) == get_args(ams_command.Command)
-
-    def test_the_refill_reason_vocabulary_is_the_verdicts_own(self):
-        """``refill_reason`` is K7's closed reason (``refill_verdict.RefillReason``). The schema cannot
-        import the service, so this pin keeps one spelling — and the field is that Literal or null."""
-        import importlib
-        from typing import get_args
-
-        from backend.app.schemas import printer as schemas
-
-        reason = getattr(schemas, "ToolheadRefillReason", None)
-        assert reason is not None, "schemas.printer names no ToolheadRefillReason"
-        assert importlib.util.find_spec("backend.app.services.refill_verdict") is not None, "no refill_verdict leaf"
-        from backend.app.services import refill_verdict
-
-        assert get_args(reason) == get_args(refill_verdict.RefillReason)
-        assert schemas.ToolheadState.model_fields["refill_reason"].annotation == (reason | None)
 
 
 class TestServiceHoldProjection:
@@ -2672,10 +2451,6 @@ class TestOccupancyProjection:
         lease = plate_occupancy.claim_for_dispatch(
             4242,
             unit_id=11,
-            pre_state="IDLE",
-            pre_subtask="",
-            min_hold_s=60.0,
-            max_hold_s=180.0,
             ev=Evidence(live_state="IDLE"),
         )
 

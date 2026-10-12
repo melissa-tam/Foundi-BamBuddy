@@ -24,6 +24,7 @@ from backend.app.models.orca_base_cache import OrcaBaseProfile
 from backend.app.models.pending_upload import PendingUpload
 from backend.app.models.print_batch import PrintBatch
 from backend.app.models.printer import Printer
+from backend.app.models.printer_action import PrinterAction
 from backend.app.models.printer_incident import PrinterIncident
 from backend.app.models.printer_incident_step import PrinterIncidentStep
 from backend.app.models.printer_model_geometry import PrinterModelGeometry

@@ -132,6 +132,9 @@ async def wired(printer_factory, db_session, sessions, monkeypatch):
     client = printer_manager.get_client(printer.id)
     client._client = MagicMock()
     client.state.connected = True
+    # The session's first report has been applied (``live_reading.is_fresh``): only frames of the LIVE
+    # session count toward the exist-bit corroboration streaks.
+    client.state.report_epoch = client.state.connection_epoch
 
     yield SimpleNamespace(printer=printer, client=client)
 

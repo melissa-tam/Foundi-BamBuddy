@@ -14,6 +14,11 @@ a printer whose AMS keeps faulting, surviving the restarts the process-memory
 latch cannot. Rows older than 30 days are pruned at startup (core/database.py,
 beside the table's DDL): a row older than the quarantine window can never
 influence a decision, so dropping it is behaviour-preserving and bounds the table.
+
+Since 2026-10-12 (R19) a dispatch's stalled FTPS upload writes a row too (reason
+``upload_stalled``, naming its unit), through the same quarantine decider
+(``services.farm_policy``): two with no completed print between them quarantine
+the printer, counted apart from the AMS give-ups.
 """
 
 from datetime import datetime
@@ -45,3 +50,9 @@ class RecoveryEscalation(Base):
     reason: Mapped[str] = mapped_column(String(64), nullable=False)
     # The incident's primary HMS short code (e.g. "0700_8010"), or NULL when none.
     code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The queue unit the escalation names — an upload stall's unit (reason "upload_stalled",
+    # ``farm_policy.record_upload_stall``, 2026-10-12 R19), so a POOLED unit skips the printer that
+    # stalled it until that printer completes a print. NULL for the AMS recovery driver's give-ups.
+    queue_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("print_queue.id", ondelete="SET NULL"), nullable=True, index=True
+    )

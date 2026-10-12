@@ -5,7 +5,7 @@ Tests:
   POST /api/v1/printers/{printer_id}/home-axes?axes=<z|xy|all>
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -166,7 +166,7 @@ class TestHomeAxesAPI:
             mock_pm.get_client.return_value = mock_client
             response = await async_client.post(f"/api/v1/printers/{printer.id}/home-axes?axes={axes}")
             assert response.status_code == 200
-            mock_client.home_axes.assert_called_once_with()
+            mock_client.home_axes.assert_called_once_with(sequence_id=ANY)
             mock_client.send_gcode.assert_not_called()
 
     @pytest.mark.asyncio

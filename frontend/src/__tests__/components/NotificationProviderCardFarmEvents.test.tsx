@@ -71,6 +71,7 @@ function buildProvider(overrides: Partial<NotificationProvider> = {}): Notificat
     on_print_stalled: true,
     on_storage_low: true,
     on_cooldown_escalation: true,
+    on_printer_waiting: true,
     quiet_hours_enabled: false,
     quiet_hours_start: null,
     quiet_hours_end: null,
@@ -122,13 +123,14 @@ describe('NotificationProviderCard — Farm production section', () => {
       'Print stalled',
       'USB storage low',
       'Cooldown running long',
+      'Printer waiting on a command or state',
     ];
     for (const label of labels) {
       expect(within(section).getByText(label)).toBeInTheDocument();
     }
-    // 14 farm toggles: moved plate-not-empty + 8 Phase-3 + 3 Phase-6 + USB storage
-    // low + cooldown escalation.
-    expect(within(section).getAllByRole('switch')).toHaveLength(14);
+    // 15 farm toggles: moved plate-not-empty + 8 Phase-3 + 3 Phase-6 + USB storage
+    // low + cooldown escalation + the attention owner's waiting page (2026-10-11).
+    expect(within(section).getAllByRole('switch')).toHaveLength(15);
   });
 
   it('renders on_plate_not_empty exactly once (single home in the farm section)', async () => {

@@ -62,16 +62,24 @@ class TestTheMovedNamesAreImportable:
 # above the client registry: the client's peaks come in as an argument, and the two pure readers it
 # composed from modules ABOVE the registry moved down with it — ``is_fresh`` (from ``print_reconcile``,
 # which imports ``job_terminal`` → ``printer_manager``) into ``live_reading``, and ``ran`` (from
-# ``ams_command``, which imports ``printer_manager`` to publish) into ``refill_verdict``.
+# ``ams_command``, which imported ``printer_manager`` to publish) into ``refill_verdict`` — and on
+# 2026-10-11 from there into the ``command_outcome`` leaf.
 #
 # The toolhead FEED STATE (``feed_state``, 2026-10-10) joins them: the MQTT client steps it once per
 # push and every reader above the registry reads its frozen snapshot, so it may reach only the two
-# pure wire leaves it reads the frame through — never the client, never the incident store (the
-# client's ``farm_acting`` answer is INJECTED by the registry, so the client imports nothing above
-# itself either).
+# pure wire leaves it reads the frame through — never the client, never the incident store (and the
+# client imports nothing above itself either: whose load landed is the record's, ``printer_action``).
+#
+# The printer-event hub (``printer_events``, 2026-10-11) joins them: the registry publishes the
+# client's facts on it and every lane subscribes through the composition root, so the hub itself
+# imports the stdlib alone at runtime — its event fields name the producers' types under
+# ``TYPE_CHECKING`` only.
 
-_LEAVES = ("refill_verdict", "live_reading", "feed_state")
-_ABOVE_THE_REGISTRY = ("printer_manager", "spool_recovery", "ams_command", "print_reconcile", "job_terminal")
+# The record's outcome tables (``command_outcome``, 2026-10-11) join them: every command family's
+# answer is a pure reading of the action's facts and one event, so the record above the registry
+# (``printer_action``) and the leaves below it read ONE table.
+_LEAVES = ("refill_verdict", "live_reading", "feed_state", "printer_events", "command_outcome")
+_ABOVE_THE_REGISTRY = ("printer_manager", "spool_recovery", "printer_action", "print_reconcile", "job_terminal")
 _REPO = Path(__file__).resolve().parents[4]
 
 
@@ -112,6 +120,29 @@ class TestTheRefillVerdictIsALeaf:
         assert not [line for line in lines if "spool_recovery" in line]
 
 
+class TestTheHoldChipSitsBelowTheRegistry:
+    """``services/hold_chip`` (2026-10-11) builds the card's hold chip on every status broadcast, called
+    from INSIDE the registry (``printer_manager.printer_state_to_dict`` and both ``/status`` branches).
+    It reads the store, the rule table and the verdict leaves — never the registry or the recovery driver,
+    so the edge ``printer_manager`` → ``hold_chip`` closes no cycle."""
+
+    def test_it_imports_nothing_above_the_registry(self):
+        lines = _import_lines("hold_chip")
+        assert not [line for line in lines if any(name in line for name in _ABOVE_THE_REGISTRY)]
+
+    def test_importing_it_never_loads_the_registry(self):
+        probe = (
+            "import sys\n"
+            "import backend.app.services.hold_chip\n"
+            "loaded = sorted(m for m in ('backend.app.services.printer_manager', 'backend.app.services.spool_recovery',"
+            " 'backend.app.services.printer_action') if m in sys.modules)\n"
+            "print(loaded)\n"
+        )
+        result = subprocess.run([sys.executable, "-c", probe], cwd=_REPO, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "[]", result.stdout
+
+
 _FEED_STATE_IMPORTS = frozenset({"backend.app.services.tray_fields", "backend.app.services.hms_errors"})
 
 
@@ -131,8 +162,30 @@ class TestTheFeedStateIsALeaf:
         assert farm_side == _FEED_STATE_IMPORTS
 
     def test_the_client_imports_nothing_above_itself(self):
-        """The ``farm_acting`` provider is injected by the registry: ``bambu_mqtt`` never reaches
-        the incident store or anything that imports the registry."""
+        """``bambu_mqtt`` never reaches the incident store or anything that imports the registry (its
+        transport facts reach the farm through the registry's injected hand-over callbacks)."""
         lines = _import_lines("bambu_mqtt")
         above = (*_ABOVE_THE_REGISTRY, "printer_incidents")
         assert not [line for line in lines if any(name in line for name in above)]
+
+
+class TestThePrinterEventHubIsALeaf:
+    def test_it_imports_the_stdlib_alone_at_runtime(self):
+        """Every farm-side import sits under ``if TYPE_CHECKING:`` (AST, so a function-level import
+        is caught too): importing the hub loads no producer and no subscriber."""
+        import ast
+
+        module = importlib.import_module("backend.app.services.printer_events")
+        tree = ast.parse(inspect.getsource(module))
+        guarded: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+                guarded |= {id(child) for child in ast.walk(node)}
+        runtime = [
+            ast.unparse(node)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            and id(node) not in guarded
+            and "backend" in ast.unparse(node)
+        ]
+        assert runtime == []

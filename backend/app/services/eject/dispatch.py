@@ -55,10 +55,8 @@ class BuiltEject:
     is left DISARMED for such profiles anyway: no SKU runs an assist-off
     profile, so the lane would gain no coverage today, and arming it cannot make an
     existing eject safer while it can make a healthy one killable. The alternative,
-    when it is wanted, is to arm on the SPAN rather than on the profile flag —
-    the ``_EDGE_LANE_MIN_LEAD_S`` test in ``remote.py`` already refuses a span too close
-    to the whole-job deadline to be worth timing, which is the same question asked
-    honestly.
+    when it is wanted, is to arm on the SPAN rather than on the profile flag (the drop
+    guard arms on any block that carries a ``drop_span_s``).
 
     ``sweep_span_s`` and ``tail_s`` are the two post-drop budgets, and unlike the drop
     they are unconditional: every generated block sweeps and every generated block ends

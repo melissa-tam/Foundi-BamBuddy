@@ -20,7 +20,7 @@ keeps a *single* hook call (``on_terminal``) and no farm logic leaks into the
 The eject GENERATION for a remote eject is a pure, tested helper
 (``build_part_present_eject_file`` in ``services.eject.dispatch``); the FTPS
 upload + MQTT ``project_file`` dispatch reuse the existing
-``upload_file_async`` + ``printer_manager.start_print`` primitives — no
+``upload_file_async`` + ``printer_action`` (the record of every printer command) — no
 hand-rolled MQTT.
 """
 
@@ -43,7 +43,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.models.sku import SkuFile
 from backend.app.schemas.settings import AppSettings
-from backend.app.services import farm_correlation, pause_recovery, requeue
+from backend.app.services import farm_correlation, pause_recovery, printer_action, requeue
 from backend.app.services.cycle_episodes import record_episode
 from backend.app.services.dispatch_target import DispatchTarget
 from backend.app.services.eject import geometry as eject_geometry, remote as eject_remote
@@ -430,10 +430,13 @@ async def on_terminal(
                     )
                     plate_occupancy.resolve_eject(printer_id, "unverified")
                     try:
-                        from backend.app.services.eject.monitor import notify_plate_not_empty
-
-                        await notify_plate_not_empty(
+                        # The event's own page, through its owner (``notification_service``) — this module
+                        # imports no eject watch (owner 6: the ``farm_policy`` ↔ ``eject.monitor`` cycle is gone).
+                        rejected_on = await db.get(Printer, printer_id)
+                        await notification_service.on_plate_not_empty(
                             printer_id,
+                            rejected_on.name if rejected_on is not None else f"printer {printer_id}",
+                            db,
                             source_detail=(
                                 f"the printer rejected the eject file before starting it ({codes}) — nothing was "
                                 "swept; remove the part by hand and Mark plate cleared, or eject again once the "
@@ -705,7 +708,14 @@ async def _maybe_idle_deep_park(db: AsyncSession, printer_id: int) -> None:
         # M400 BEFORE M18 is deliberate: drain the motion queue so the steppers are
         # only released once the descent has actually finished. Cutting them
         # mid-descent drops the bed the rest of the way under its own weight.
-        ok = client.send_gcode(f"M17\nG90\nG1 Z{park_z:.1f} F900\nM400\nM18")
+        ok = (
+            await printer_action.send(
+                printer_id,
+                printer_action.gcode(f"M17\nG90\nG1 Z{park_z:.1f} F900\nM400\nM18"),
+                actor=printer_action.ACTOR_FARM,
+                client=client,
+            )
+        ).published
         if ok:
             logger.info(
                 "farm_policy: idle deep-park sent on printer %s (Z%.1f = %d%% of z_travel %.0f)",
@@ -1009,9 +1019,16 @@ async def _maybe_lift_held_bed(db: AsyncSession, printer_id: int) -> None:
                 refusal,
             )
             return
-        ok = client.send_gcode(
-            f"M17\nG91\nG380 S2 Z{VISION_HOLD_PROBE_MM:.1f} F{feed}\nG380 S2 Z-{lift:.1f} F{feed}\nG90\nM400\nM18"
-        )
+        ok = (
+            await printer_action.send(
+                printer_id,
+                printer_action.gcode(
+                    f"M17\nG91\nG380 S2 Z{VISION_HOLD_PROBE_MM:.1f} F{feed}\nG380 S2 Z-{lift:.1f} F{feed}\nG90\nM400\nM18"
+                ),
+                actor=printer_action.ACTOR_FARM,
+                client=client,
+            )
+        ).published
         if not ok:
             plate_occupancy.release_bed_motion(printer_id)
             logger.warning("farm_policy: held-bed lift command refused on printer %s", printer_id)
@@ -1062,6 +1079,192 @@ async def recent_terminal_farm_items(db: AsyncSession, printer_id: int, limit: i
     return list(result.scalars().all())
 
 
+# The quarantine rule for the escalations this module records (owner 6, 2026-10-11): this many
+# counting escalations on one printer with NO completed print between them — the ``completed_since``
+# precedent, never a clock window (the 2-in-24 h count it replaced read a printer that jammed at 23:59 and
+# 00:01 differently from one that jammed twice in one shift, and counted two jams with a day's good
+# printing between them as "repeated"). The AMS recovery driver's hardware-suspect give-ups and the
+# dispatch's upload stalls (R19) are counted apart, each against its own kind.
+_ESCALATION_QUARANTINE_THRESHOLD = 2
+
+_JAM_QUARANTINE_SENTENCE = (
+    f"Repeated AMS jam escalations ({_ESCALATION_QUARANTINE_THRESHOLD} with no completed print between them) "
+    "— AMS hardware suspected (buffer/feeder). Inspect the filament path, then Recover & resume."
+)
+
+#: The escalation reason of a dispatch whose FTPS upload STALLED on the transport (``bambu_ftp.upload_stalled``,
+#: R19 of the 2026-10-12 restoration): a strike against the PRINTER, never the unit's failure — the unit's
+#: retry is not spent. Its row names the unit (``queue_item_id``), so a pooled unit skips the printer that
+#: stalled it until that printer completes a print (:func:`upload_stalled_printers`).
+UPLOAD_STALLED_REASON = "upload_stalled"
+_UPLOAD_STALL_COUNTING: frozenset[str] = frozenset({UPLOAD_STALLED_REASON})
+_UPLOAD_STALL_QUARANTINE_SENTENCE = (
+    f"Repeated upload stalls ({_ESCALATION_QUARANTINE_THRESHOLD} with no completed print between them). "
+    "Check the printer's network and USB drive, then Recover & resume."
+)
+
+
+async def record_upload_stall(db: AsyncSession, *, printer_id: int, queue_item_id: int) -> bool:
+    """A dispatch's FTPS upload to ``printer_id`` stalled on the transport (R19): record the
+    ``recovery_escalation`` row naming the unit, and quarantine the printer at the second stall with no
+    completed print between (:func:`_record_escalation`). Returns True when it quarantined the printer.
+
+    Production (``337f4954``) failed the unit instead (``_fail_queue_item``: the retry spent, the unit's
+    failure counted toward the printer's consecutive-failure quarantine); the unit is no longer failed —
+    the printer is what stalled."""
+    return await _record_escalation(
+        db,
+        printer_id=printer_id,
+        reason=UPLOAD_STALLED_REASON,
+        code=None,
+        opened_at=None,
+        queue_item_id=queue_item_id,
+        counting_reasons=_UPLOAD_STALL_COUNTING,
+        quarantine_reason=_UPLOAD_STALL_QUARANTINE_SENTENCE,
+    )
+
+
+async def upload_stalled_printers(db: AsyncSession) -> dict[int, frozenset[int]]:
+    """Pending unit id → the printers that stalled ITS upload since each printer's last completed print —
+    the printers a POOLED unit skips (``print_scheduler``'s pool search). ONE query per scheduler tick,
+    never one per unit × printer: an upload-stall escalation row naming a pending unit, on a printer with no
+    ``completed`` archive closed after it (``print_binding.completed_after``, correlated per row) and none
+    of it at or before the printer's last quarantine clear (an operator who cleared the printer inspected
+    it — as :func:`_record_escalation` counts)."""
+    from sqlalchemy import or_
+
+    from backend.app.models.recovery_escalation import RecoveryEscalation
+    from backend.app.services import print_binding
+
+    completed_after = print_binding.completed_after(RecoveryEscalation.printer_id, RecoveryEscalation.created_at)
+    rows = await db.execute(
+        select(RecoveryEscalation.queue_item_id, RecoveryEscalation.printer_id)
+        .join(Printer, Printer.id == RecoveryEscalation.printer_id)
+        .join(PrintQueueItem, PrintQueueItem.id == RecoveryEscalation.queue_item_id)
+        .where(RecoveryEscalation.reason == UPLOAD_STALLED_REASON)
+        .where(PrintQueueItem.status == "pending")
+        .where(
+            or_(Printer.quarantine_cleared_at.is_(None), RecoveryEscalation.created_at > Printer.quarantine_cleared_at)
+        )
+        .where(~completed_after)
+    )
+    stalled: dict[int, set[int]] = {}
+    for item_id, printer_id in rows.all():
+        stalled.setdefault(item_id, set()).add(printer_id)
+    return {item_id: frozenset(printers) for item_id, printers in stalled.items()}
+
+
+async def record_recovery_escalation(
+    db: AsyncSession,
+    *,
+    printer_id: int,
+    reason: str,
+    code: str | None,
+    opened_at: datetime | None,
+    counting_reasons: frozenset[str],
+) -> bool:
+    """The AMS recovery driver's give-up: its ``recovery_escalation`` row, and the quarantine decision it feeds
+    (:func:`_record_escalation`, with the AMS-hardware quarantine sentence). Returns True when it quarantined
+    the printer."""
+    return await _record_escalation(
+        db,
+        printer_id=printer_id,
+        reason=reason,
+        code=code,
+        opened_at=opened_at,
+        queue_item_id=None,
+        counting_reasons=counting_reasons,
+        quarantine_reason=_JAM_QUARANTINE_SENTENCE,
+    )
+
+
+async def _record_escalation(
+    db: AsyncSession,
+    *,
+    printer_id: int,
+    reason: str,
+    code: str | None,
+    opened_at: datetime | None,
+    queue_item_id: int | None,
+    counting_reasons: frozenset[str],
+    quarantine_reason: str,
+) -> bool:
+    """THE writer of a ``recovery_escalation`` row, and the quarantine decision it feeds (owner 6: this
+    module is the ONE quarantine decider). Returns True when it quarantined the printer.
+
+    Every escalation records its row — the ledger is the forensic record of every give-up. ``opened_at``
+    (the incident's open) makes it one row per INCIDENT: a row for this printer stamped at or after it IS
+    this incident's (the AMS kinds are mutually exclusive per printer), so an upgrade's re-escalation
+    neither writes a second row nor counts twice (006-H2S, shape 36).
+
+    The decision is on EVENTS: ``counting_reasons`` (the caller's own vocabulary — for the recovery driver,
+    which of its reasons are evidence of AMS hardware, ``spool_recovery._JAM_QUARANTINE_REASONS``; for the
+    dispatch, :data:`UPLOAD_STALLED_REASON` alone) escalations, the
+    last :data:`_ESCALATION_QUARANTINE_THRESHOLD` of them since the printer's quarantine was last cleared,
+    with no completed print after the oldest of them (``print_binding.completed_since``: a print that ran
+    through the path to its end between two jams says the path works). The trigger also requires THIS
+    escalation to count, so unrelated history can never tip a printer over (003-H2S 2026-08-11).
+    """
+    from backend.app.models.recovery_escalation import RecoveryEscalation
+    from backend.app.services import print_binding
+
+    if opened_at is not None:
+        # An upload stall is no incident's escalation: it never stands for the incident's own row.
+        prior = await db.scalar(
+            select(RecoveryEscalation.id)
+            .where(RecoveryEscalation.printer_id == printer_id)
+            .where(RecoveryEscalation.created_at >= opened_at)
+            .where(RecoveryEscalation.reason != UPLOAD_STALLED_REASON)
+            .limit(1)
+        )
+        if prior is not None:
+            logger.info(
+                "farm_policy: printer %s re-escalated (%s) — escalation row %s already records this incident; "
+                "the row and the quarantine count are not repeated",
+                printer_id,
+                reason,
+                prior,
+            )
+            return False
+    db.add(
+        RecoveryEscalation(
+            printer_id=printer_id,
+            created_at=datetime.utcnow(),
+            reason=reason,
+            code=code,
+            queue_item_id=queue_item_id,
+        )
+    )
+    await db.commit()
+    if reason not in counting_reasons:
+        return False
+
+    printer = await db.get(Printer, printer_id)
+    cleared_at = printer.quarantine_cleared_at if printer is not None else None
+    stmt = (
+        select(RecoveryEscalation.created_at)
+        .where(RecoveryEscalation.printer_id == printer_id)
+        .where(RecoveryEscalation.reason.in_(sorted(counting_reasons)))
+    )
+    if cleared_at is not None:
+        stmt = stmt.where(RecoveryEscalation.created_at > cleared_at)
+    recent = list(
+        (await db.execute(stmt.order_by(RecoveryEscalation.created_at.desc()).limit(_ESCALATION_QUARANTINE_THRESHOLD)))
+        .scalars()
+        .all()
+    )
+    if len(recent) < _ESCALATION_QUARANTINE_THRESHOLD:
+        return False
+    if await print_binding.completed_since(db, printer_id, recent[-1]):
+        logger.info(
+            "farm_policy: printer %s escalated (%s) — a print completed since the previous one, no quarantine",
+            printer_id,
+            reason,
+        )
+        return False
+    return await quarantine_printer(db, printer_id, quarantine_reason, failure_count=_ESCALATION_QUARANTINE_THRESHOLD)
+
+
 async def quarantine_printer(db: AsyncSession, printer_id: int, reason: str, *, failure_count: int) -> bool:
     """Idempotently quarantine ``printer_id`` with ``reason``.
 
@@ -1070,8 +1273,9 @@ async def quarantine_printer(db: AsyncSession, printer_id: int, reason: str, *, 
     (``failure_count`` = how many failures drove it — the consecutive-failure
     count, or 1 for an immediate cause like an unverified eject). Returns False —
     doing nothing — when the printer is missing or already quarantined. The one
-    canonical quarantine mutator shared by the consecutive-failure policy below
-    and the eject-verification / cooldown-stall paths.
+    canonical quarantine mutator, called only from this module (owner 6,
+    ``TestQuarantineOwnership``): the consecutive-failure policy below, the recovery
+    escalations above and the eject-verification terminal.
     """
     printer = await db.get(Printer, printer_id)
     if printer is None or printer.quarantined:
@@ -1540,7 +1744,6 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
     An unfinished eject is simply re-approvable, never a half state.
     """
     from backend.app.services.eject import shop_air
-    from backend.app.services.eject.monitor import _unit_releasable
 
     if fa_item is None or fa_item.printer_id is None:
         raise HTTPException(status_code=409, detail="First-article printer is unknown; cannot eject remotely")
@@ -1549,7 +1752,7 @@ async def _dispatch_remote_eject(db: AsyncSession, run: PrintBatch, fa_item: Pri
         # just exit "stale" with the operator none the wiser.
         raise HTTPException(status_code=409, detail="Printer is not connected; cannot eject remotely")
 
-    releasable = await _unit_releasable(fa_item.id, for_first_article=True)
+    releasable = await eject_remote.unit_releasable(fa_item.id, for_first_article=True)
     line = await shop_air.current_line(db)
     state = printer_manager.get_status(fa_item.printer_id)
     readable = state is not None and getattr(state, "connected", False)

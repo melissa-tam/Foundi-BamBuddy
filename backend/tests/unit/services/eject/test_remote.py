@@ -6,9 +6,12 @@ therefore SEEDS through the authority's transitions — ``hydrate_plate`` + ``cl
 for a LIVE record (the shape a dispatch leaves behind), ``hydrate_eject`` for one rebuilt
 at startup — and ASSERTS through its queries (``pending_eject_view`` / ``eject_identity``).
 
-What stays here are the two DISPATCHERS and the two TIMERS that bound a dispatched sweep:
-the START deadline (did the printer ever begin it?) and the RUNTIME watchdog (is it still
-running long past its estimate?).
+What stays here are the two DISPATCHERS and what bounds a dispatched sweep: the RECORD's answer
+to its ``eject_start`` (did the printer ever begin it?) with production's START bound as the
+fallback, and the runtime watch — the bed-drop guard and production's WHOLE-JOB bound (restored
+2026-10-12, operator ruling: "if it was self heal, it should stay self heal"). Both bounds count
+the printer's ONLINE seconds on the record's clock (``printer_action._now``), which every test here
+ties to its own fake clock (:func:`_record_clock`).
 """
 
 import asyncio
@@ -28,6 +31,7 @@ from backend.app.models.eject_profile import EjectProfile
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services import printer_action
 from backend.app.services.eject import remote
 from backend.app.services.plate_occupancy import (
     CooldownEject,
@@ -38,6 +42,7 @@ from backend.app.services.plate_occupancy import (
     plate_occupancy,
 )
 from backend.app.services.printer_manager import printer_manager
+from backend.tests._fixtures.printer_action import route_verbs
 
 pytestmark = pytest.mark.asyncio
 
@@ -50,9 +55,30 @@ def _reset_occupancy():
     from a test fans out into no persist, no broadcast, no kick and no watch."""
     plate_occupancy.reset_for_tests()
     yield
-    for printer_id in list(remote._start_deadlines) + list(remote._runtime_watchdogs):
+    for printer_id in list(remote._runtime_watchdogs):
         remote.cancel_eject_timers(printer_id)
     plate_occupancy.reset_for_tests()
+
+
+# The fake clock the record's clock (``printer_action._now``) follows in this test, if any.
+_RECORD_CLOCK: dict[str, "_FakeClock | None"] = {"clock": None}
+
+
+@pytest.fixture(autouse=True)
+def _record_clock(monkeypatch):
+    """The record's clock — what the self-heal bounds count ONLINE seconds on — follows the test's
+    :class:`_FakeClock` (the newest one built), so a bound passes exactly when the polling watch's own
+    sleeps say it should; with no fake clock it is the wall clock."""
+    _RECORD_CLOCK["clock"] = None
+    wall = printer_action._now
+
+    def now() -> datetime:
+        clock = _RECORD_CLOCK["clock"]
+        return wall() if clock is None else clock.wall()
+
+    monkeypatch.setattr(printer_action, "_now", now)
+    yield
+    _RECORD_CLOCK["clock"] = None
 
 
 @pytest.fixture(autouse=True)
@@ -162,7 +188,7 @@ class TestDispatchPartPresentEject:
             _gate(printer.id)
             start = MagicMock(return_value=True)
             c1, c2, c3 = _ftp_patches()
-            with c1, c2, c3, patch.object(printer_manager, "start_print", start):
+            with c1, c2, c3, route_verbs(start=start):
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=555
                 )
@@ -190,17 +216,17 @@ class TestDispatchPartPresentEject:
         finally:
             source.unlink(missing_ok=True)
 
-    async def test_success_leaves_an_identity_and_an_armed_start_deadline(self, db_session):
-        """The firmware silently ignores a ``project_file`` sent while it is busy, so a
-        dispatched eject that nothing bounds can never be observed to have failed — the
-        2026-08-30 "8 consecutive eject 409s" shape. Every accepted dispatch therefore
-        ends with BOTH the authority's identity and the deadline that retires it."""
+    async def test_success_leaves_an_identity_linked_to_its_start_action(self, db_session):
+        """The firmware silently ignores a ``project_file`` sent while it is busy — the 2026-08-30
+        "8 consecutive eject 409s" shape. Every accepted dispatch therefore ends with the authority's
+        identity carrying its start's RECORD id, which is what the record's answer to that start is
+        matched against (``on_action_answered``) — never a deadline."""
         source = _make_source_3mf()
         try:
             printer, item = await _seed(db_session, source)
             _gate(printer.id)
             c1, c2, c3 = _ftp_patches()
-            with c1, c2, c3, patch.object(printer_manager, "start_print", MagicMock(return_value=True)):
+            with c1, c2, c3, route_verbs(start=MagicMock(return_value=True)):
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=None
                 )
@@ -208,8 +234,8 @@ class TestDispatchPartPresentEject:
             assert identity is not None
             assert (identity.purpose, identity.queue_item_id) == ("production", item.id)
             assert identity.started_at is None
-            assert printer.id in remote._start_deadlines
-            assert not remote._start_deadlines[printer.id].done()
+            assert plate_occupancy.pending_eject_view(printer.id).start_action_id is not None
+            assert not hasattr(remote, "_start_deadlines")
         finally:
             source.unlink(missing_ok=True)
 
@@ -223,7 +249,7 @@ class TestDispatchPartPresentEject:
                 c1,
                 c2,
                 c3,
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                route_verbs(start=MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -247,7 +273,7 @@ class TestDispatchPartPresentEject:
                 c2,
                 c3,
                 patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                route_verbs(start=MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -255,7 +281,6 @@ class TestDispatchPartPresentEject:
                 )
             assert exc.value.status_code == 502
             assert plate_occupancy.pending_eject_view(printer.id) is None
-            assert printer.id not in remote._start_deadlines
             # A failed or partial upload may still have left bytes: the lane removes its own file.
             _assert_removed(remove, printer.id, f"/eject_fa_item{item.id}.3mf", "the upload failed")
         finally:
@@ -273,7 +298,7 @@ class TestDispatchPartPresentEject:
                 c2,
                 c3,
                 patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=False)),
+                route_verbs(start=MagicMock(return_value=False)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -282,7 +307,6 @@ class TestDispatchPartPresentEject:
             assert exc.value.status_code == 502
             # Nothing is claimed unless start_print was accepted.
             assert plate_occupancy.pending_eject_view(printer.id) is None
-            assert printer.id not in remote._start_deadlines
             _assert_removed(remove, printer.id, f"/eject_production_item{item.id}.3mf", "the start command was refused")
         finally:
             source.unlink(missing_ok=True)
@@ -302,8 +326,8 @@ class TestDispatchPartPresentEject:
                 c2,
                 c3,
                 patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
-                patch.object(printer_manager, "stop_print", stop),
+                route_verbs(start=MagicMock(return_value=True)),
+                route_verbs(stop=stop),
                 patch.object(plate_occupancy, "claim_for_eject", MagicMock(return_value="dispatch_in_flight")),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
@@ -312,7 +336,6 @@ class TestDispatchPartPresentEject:
                 )
             assert exc.value.code == "dispatch_in_flight"
             stop.assert_called_once_with(printer.id)
-            assert printer.id not in remote._start_deadlines
             _assert_removed(
                 remove,
                 printer.id,
@@ -345,7 +368,7 @@ class TestDispatchRefusesBeforeItBuilds:
                 patch.object(printer_manager, "get_status", MagicMock(return_value=SimpleNamespace(state="RUNNING"))),
                 patch.object(remote, "build_part_present_eject_file", build),
                 patch("backend.app.services.bambu_ftp.upload_file_async", upload),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                route_verbs(start=MagicMock(return_value=True)) as start,
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -372,7 +395,7 @@ class TestDispatchRefusesBeforeItBuilds:
                 c2,
                 c3,
                 patch.object(remote, "build_part_present_eject_file", build),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                route_verbs(start=MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -396,7 +419,7 @@ class TestDispatchRefusesBeforeItBuilds:
                 c2,
                 c3,
                 patch.object(remote, "build_part_present_eject_file", build),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                route_verbs(start=MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -463,7 +486,7 @@ class TestGeometryFailsClosedOnBothAutoLanes:
                 c2,
                 c3,
                 patch.object(remote, "build_part_present_eject_file", build),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                route_verbs(start=MagicMock(return_value=True)) as start,
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -490,7 +513,7 @@ class TestGeometryFailsClosedOnBothAutoLanes:
                 c2,
                 c3,
                 patch.object(remote, "build_part_present_eject_file", build),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                route_verbs(start=MagicMock(return_value=True)) as start,
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_foreign_eject(
@@ -516,7 +539,7 @@ class TestGeometryFailsClosedOnBothAutoLanes:
             printer, item = await _seed(db_session, source)
             _gate(printer.id)
             c1, c2, c3 = _ftp_patches()
-            with c1, c2, c3, patch.object(printer_manager, "start_print", MagicMock(return_value=True)):
+            with c1, c2, c3, route_verbs(start=MagicMock(return_value=True)):
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
                 )
@@ -565,7 +588,7 @@ class TestStandingFaultDoesNotGateEjects:
             _gate(printer.id)
             start = MagicMock(return_value=True)
             c1, c2, c3 = _ftp_patches()
-            with c1, c2, c3, patch.object(printer_manager, "start_print", start):
+            with c1, c2, c3, route_verbs(start=start):
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=None
                 )
@@ -784,7 +807,7 @@ class TestDispatchForeignEject:
             _gate(printer.id)
             start = MagicMock(return_value=True)
             c1, c2, c3 = _ftp_patches()
-            with c1, c2, c3, patch.object(printer_manager, "start_print", start):
+            with c1, c2, c3, route_verbs(start=start):
                 await remote.dispatch_foreign_eject(
                     db_session, printer_id=printer.id, profile_id=prof.id, source_path=source, plate_id=1
                 )
@@ -823,7 +846,7 @@ class TestDispatchForeignEject:
                 c2,
                 c3,
                 patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                route_verbs(start=MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_foreign_eject(
@@ -880,7 +903,7 @@ class TestEjectUploadBareName:
                     "backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))
                 ),
                 patch("backend.app.services.bambu_ftp.upload_file_async", upload),
-                patch.object(printer_manager, "start_print", start),
+                route_verbs(start=start),
             ):
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=1
@@ -910,7 +933,7 @@ class TestDispatchPartPresentEjectProfileGuard:
                 c1,
                 c2,
                 c3,
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)),
+                route_verbs(start=MagicMock(return_value=True)),
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(
@@ -920,19 +943,6 @@ class TestDispatchPartPresentEjectProfileGuard:
             assert "eject profile" in str(exc.value).lower()
         finally:
             source.unlink(missing_ok=True)
-
-
-class _FakeSleep:
-    """A ``sleep`` stand-in that records each requested delay and returns at once.
-
-    Lets a watchdog test drive the full deadline → stop → retry sequence without any
-    wall-clock wait, while still asserting WHAT was waited on."""
-
-    def __init__(self) -> None:
-        self.delays: list[float] = []
-
-    async def __call__(self, delay: float) -> None:
-        self.delays.append(delay)
 
 
 class _DriverLog:
@@ -953,64 +963,170 @@ class _DriverLog:
 
 
 def _armed(pid_item: int = 5, **kw) -> remote.PendingEject:
-    """A started production pending — what the watchdog is armed with."""
+    """A started production pending (no phase budgets)."""
     kw.setdefault("expected_runtime_s", 83.0)
     kw.setdefault("started_at", datetime.now(timezone.utc) - timedelta(seconds=104))
     return remote.PendingEject("production", 1, pid_item, **kw)
 
 
-class TestEjectAbortDeadline:
-    """The abort deadline in all three regimes (2026-07-31 gouged-plate incident).
+class _FakeClock:
+    """The ONE time source a polling-guard test drives.
 
-    A stalled bed-drop leaves NO trace in MQTT — no Z telemetry, no HMS — and the job
-    still reports ``completed``. Elapsed execution time is the only signature, so the
-    watchdog turns the build's estimate into a deadline and stops the job at it."""
+    The guard's sleeps and its clock must come from the same source, so this supplies
+    both: ``sleep`` records the delay, advances ``now`` by it and yields to the event
+    loop so the test can interleave (cancelling mid-run, for one). No wall-clock time
+    passes, so a whole drop sequence runs in microseconds."""
 
-    async def test_short_profile_gets_the_twenty_second_floor(self):
-        # 25% of 40 s is 10 s — below the floor. The floor protects against TELEMETRY
-        # (the FINISH echo is what cancels the watchdog), not against motion.
-        assert remote.eject_abort_deadline_s(40.0) == 60.0
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self.start = start
+        self.delays: list[float] = []
+        # The record's naive-UTC instant at ``start`` — real time, so a pending's tz-aware
+        # ``started_at`` stamped just before or after lands on the same timeline.
+        self.base_wall = datetime.now(timezone.utc).replace(tzinfo=None)
+        _RECORD_CLOCK["clock"] = self
 
-    async def test_mid_range_profile_gets_the_fraction(self):
-        assert remote.eject_abort_deadline_s(160.0) == 200.0
+    def __call__(self) -> float:
+        return self.now
 
-    async def test_long_profile_is_capped_at_sixty_seconds(self):
-        # A ~7 min multi-pass eject must not inherit minutes of scraping margin, which
-        # a pure ×1.5 factor (600 s → 900 s) would hand it.
-        assert remote.eject_abort_deadline_s(400.0) == 460.0
+    def wall(self) -> datetime:
+        """The record's clock (naive UTC) at this fake clock's ``now``."""
+        return self.base_wall + timedelta(seconds=self.now - self.start)
 
-    async def test_production_calibration(self):
-        # 11 measured production ejects ran 80-83 s against this 83 s estimate; the
-        # sweep phase starts ~45 s in, so 103.75 s pre-empts any pre-sweep stall
-        # longer than 59 s (the incident's was ~97 s).
-        assert remote.eject_abort_deadline_s(83.0) == 103.75
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.now += delay
+        await asyncio.sleep(0)
+
+
+class _ProgressFeed:
+    """Scripted ``mc_percent`` samples, one consumed per telemetry read.
+
+    Each entry is ``(percent, wire_age_s)``: what the live session reports and how old
+    that push is when read. ``wire_age_s=None`` means the stamp PREDATES the arming — a
+    value held over from before this eject, which the guard must treat as no evidence
+    at all. The last entry repeats once exhausted, so a test scripts only the interesting
+    part of the timeline. ``line_number`` is the breadcrumb the kill line carries."""
+
+    def __init__(
+        self, clock: _FakeClock, samples: list[tuple[float, float | None]], *, line_number: int | None = None
+    ) -> None:
+        self._clock = clock
+        self._samples = list(samples)
+        self._line_number = line_number
+        self.reads = 0
+
+    def __call__(self, printer_id: int) -> SimpleNamespace:
+        percent, age = self._samples[min(self.reads, len(self._samples) - 1)]
+        self.reads += 1
+        wire_at = 0.0 if age is None else self._clock.now - age
+        return SimpleNamespace(
+            state=SimpleNamespace(mc_print_line_number=self._line_number, progress=percent, progress_wire_at=wire_at)
+        )
+
+
+def _armed_with_drop(pid_item: int = 5, *, drop_span_s: float = 30.0, **kw) -> remote.PendingEject:
+    """A started production pending carrying a bed-drop budget (arms the drop guard).
+
+    A 30 s drop span → an 8 s margin (the floor) → the drop deadline lands 38 s after the
+    observed P5 edge."""
+    kw.setdefault("expected_runtime_s", 83.0)
+    kw.setdefault("started_at", datetime.now(timezone.utc))
+    return remote.PendingEject("production", 1, pid_item, drop_span_s=drop_span_s, **kw)
+
+
+def _armed_with_phases(
+    pid_item: int = 5,
+    *,
+    drop_span_s: float = 30.0,
+    sweep_span_s: float | None = 20.0,
+    tail_s: float | None = 15.0,
+    **kw,
+) -> remote.PendingEject:
+    """A started production pending carrying ALL the build's phase budgets.
+
+    30 s drop → an 8 s margin (the floor) → the drop deadline lands 38 s after the observed
+    P5 edge; 20 s sweep → the same 8 s floor → the sweep BUDGET line lands 28 s after the
+    observed P50 edge (a line that only warns)."""
+    kw.setdefault("expected_runtime_s", 83.0)
+    kw.setdefault("started_at", datetime.now(timezone.utc))
+    return remote.PendingEject(
+        "production", 1, pid_item, drop_span_s=drop_span_s, sweep_span_s=sweep_span_s, tail_s=tail_s, **kw
+    )
+
+
+@contextlib.contextmanager
+def _watchdog_env(feed: _ProgressFeed, *, stop_delivered: bool = True):
+    """Patch every collaborator the fire path touches; yields the mocks."""
+    from backend.app.services.eject import monitor as monitor_mod
+
+    with (
+        patch.object(printer_manager, "get_client", MagicMock(side_effect=feed)),
+        route_verbs(stop=MagicMock(return_value=stop_delivered)) as stop,
+        patch.object(printer_manager, "request_evidence_pushall", MagicMock(return_value=True)) as pushall,
+        patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+    ):
+        yield SimpleNamespace(stop=stop, pushall=pushall, notify=notify)
+
+
+def _spawn_watchdog(pid: int, armed: remote.PendingEject, clock: _FakeClock) -> asyncio.Task:
+    """Spawn the watch exactly as the arming path does (real registry lifecycle), on a printer whose
+    session began at the clock's start (the record's online clock runs from its first fresh report)."""
+    from backend.app.core.tasks import spawn_background_task
+
+    assert clock.wall() == clock.base_wall, "spawn the watch before advancing the clock"
+    printer_action._session_began(pid)
+
+    task = spawn_background_task(
+        remote._runtime_watchdog(pid, armed, sleep=clock.sleep, clock=clock), name=f"wd-edge-{pid}"
+    )
+    remote._runtime_watchdogs[pid] = task
+    return task
+
+
+async def _poll_then_cancel(pid: int, armed: remote.PendingEject, clock: _FakeClock, feed: _ProgressFeed, polls: int):
+    """Run a guard that has nothing to decide for ``polls`` reads, then cancel it the way the eject's
+    terminal does (``cancel_eject_timers``). Returns the task, cancelled — proof the guard was still
+    WAITING, never deciding, when the terminal arrived."""
+    task = _spawn_watchdog(pid, armed, clock)
+    for _ in range(polls * 20):
+        if feed.reads >= polls or task.done():
+            break
+        await asyncio.sleep(0)
+    assert not task.done(), "the guard decided something where it should only have waited"
+    remote.cancel_eject_timers(pid)
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    return task
+
+
+def _kill_line(caplog) -> str:
+    return next(r.getMessage() for r in caplog.records if "still running at" in r.getMessage())
+
+
+def _records(caplog, needle: str) -> list:
+    return [r for r in caplog.records if needle in r.getMessage()]
 
 
 class TestEjectStartEcho:
-    """The START echo is the only moment a deadline can be measured from — and it is
-    also what proves the firmware did not silently ignore our ``project_file``."""
+    """The START echo is the first moment a deadline can be measured from — it stamps the whole-job
+    bound's anchor and arms the runtime watch (production's arming gate: a verifiable sweep, one that
+    carries its build's expected runtime)."""
 
-    async def test_start_echo_stamps_once_cancels_the_deadline_and_arms_one_watchdog(self):
+    async def test_start_echo_stamps_once_and_arms_one_guard(self):
         pid = 90001
-        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
-        remote._arm_start_deadline(pid)
-        deadline = remote._start_deadlines[pid]
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0, drop_span_s=30.0))
         assert plate_occupancy.eject_identity(pid).started_at is None
 
         remote.on_eject_start_echo(pid)
 
         first = plate_occupancy.eject_identity(pid).started_at
         assert first is not None
-        # The sweep demonstrably started: the never-started timer has nothing to catch.
-        assert pid not in remote._start_deadlines
-        with contextlib.suppress(asyncio.CancelledError):
-            await deadline
-        assert deadline.cancelled()
         assert pid in remote._runtime_watchdogs
         armed_task = remote._runtime_watchdogs[pid]
 
         # A duplicate/replayed start echo must NOT restart the clock — that would
-        # shorten a measured runtime back under the deadline — nor double-arm.
+        # shorten a measured runtime — nor double-arm.
         remote.on_eject_start_echo(pid)
         assert plate_occupancy.eject_identity(pid).started_at == first
         assert remote._runtime_watchdogs[pid] is armed_task
@@ -1026,39 +1142,60 @@ class TestEjectStartEcho:
         assert plate_occupancy.eject_identity(90002) is None
         assert 90002 not in remote._runtime_watchdogs
 
-    async def test_a_pending_without_an_estimate_never_arms_a_watchdog(self):
-        # A rehydrated post-restart pending carries no estimate: there is nothing to
-        # judge against, and the startup reconciler already owns those gates.
-        pid = 90003
-        plate_occupancy.hydrate_eject(pid, PendingEject("production", 1, 5))
+    async def test_a_rehydrated_pending_never_arms_a_watch_but_a_drop_less_sweep_does(self):
+        # A rehydrated post-restart pending carries no build figures: nothing to judge against, so no
+        # watch (the session start's reconcile owns it). A drop-less LIVE sweep has no drop to guard
+        # but still carries its estimate: its whole-job bound is watched (production's single-deadline
+        # form).
+        hydrated, live = 90003, 90004
+        plate_occupancy.hydrate_eject(hydrated, PendingEject("production", 1, 5))
+        _claim(live, PendingEject("production", 1, 6, expected_runtime_s=82.0))
 
-        remote.on_eject_start_echo(pid)
+        remote.on_eject_start_echo(hydrated)
+        remote.on_eject_start_echo(live)
 
-        assert plate_occupancy.eject_identity(pid).started_at is not None  # still stamped
-        assert pid not in remote._runtime_watchdogs
+        assert plate_occupancy.eject_identity(hydrated).started_at is not None  # still stamped
+        assert plate_occupancy.eject_identity(live).started_at is not None
+        assert hydrated not in remote._runtime_watchdogs
+        assert live in remote._runtime_watchdogs
 
 
-class TestEjectStartDeadline:
-    """The 2026-08-30 "8 consecutive eject 409s" class (printer 4, 01:46-01:49).
+def _answered(pid: int, action_id: int, answer: str, *, command: str = "eject_start", reason: str | None = None):
+    from backend.app.services.printer_events import ActionAnswered
 
-    The firmware silently IGNORES a ``project_file`` sent while it is busy — no error,
-    no terminal, nothing — so an eject dispatched into a print that had just started
-    simply never happens. Before this deadline existed such a pending stayed registered
-    forever, every later eject 409'd ``eject_in_flight``, and the operator ended up
-    hand-jogging the toolhead. The deadline is the ONLY signal that shape produces."""
+    return ActionAnswered(
+        printer_id=pid,
+        action_id=action_id,
+        command=command,
+        actor="farm",
+        incident_id=None,
+        answer=answer,
+        reason=reason,
+    )
 
-    async def test_an_eject_the_printer_never_started_expires_and_frees_the_printer(self):
+
+class TestEjectStartAnswer:
+    """The 2026-08-30 "8 consecutive eject 409s" class (printer 4, 01:46-01:49), answered by the
+    RECORD, never a deadline (2026-10-11).
+
+    The firmware silently IGNORES a ``project_file`` sent while it is busy — so an eject dispatched
+    into a print that had just started simply never happens. The record answers that shape (the busy
+    job's end with the sweep's own id never reported is VOID), and a refused or never-received start
+    likewise; that answer — however late — retires the claim. A start nobody has answered WAITS (the
+    attention owner pages it)."""
+
+    async def test_a_void_start_retires_the_claim_and_frees_the_printer(self):
         from backend.app.services.eject import monitor as monitor_mod
 
         pid = 90060
         _gate(pid, source="SUB-DEAD", policy=CooldownEject(unit_id=5, run_id=1))
-        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0))
-        sleep = _FakeSleep()
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0, start_action_id=501))
 
         with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
-            await remote._start_deadline(pid, sleep=sleep, timeout_s=remote.EJECT_START_TIMEOUT_S)
+            await remote.on_action_answered(
+                _answered(pid, 501, "void", reason="the printer was busy with another job and never started it")
+            )
 
-        assert sleep.delays == [remote.EJECT_START_TIMEOUT_S]
         # The dead pending is GONE — that is what unblocks every later eject...
         assert plate_occupancy.eject_identity(pid) is None
         # ...while the plate stays OCCUPIED, demoted to escalation-only: the sweep never
@@ -1068,20 +1205,25 @@ class TestEjectStartDeadline:
         assert isinstance(view.plate_policy, EscalationOnly)
         assert view.plate_source_subtask_id == "SUB-DEAD"
         notify.assert_awaited_once()
-        assert "never started" in notify.await_args.kwargs["source_detail"]
+        detail = notify.await_args.kwargs["source_detail"]
+        assert "never started" in detail and "busy with another job" in detail
         # The printer is ejectable again — the operator can simply eject now.
         assert plate_occupancy.ejectable(pid, Evidence()) is None
 
+    @pytest.mark.parametrize("answer", ["refused", "void"])
     @pytest.mark.parametrize(
         "pending,stem",
-        [(PendingEject("production", 1, 5, expected_runtime_s=83.0), "eject_production_item5"), (None, None)],
+        [
+            (PendingEject("production", 1, 5, expected_runtime_s=83.0, start_action_id=502), "eject_production_item5"),
+            (None, None),
+        ],
     )
-    async def test_an_expired_sweep_removes_its_file_named_by_the_one_builder(
-        self, db_session, own_session_factory, pending, stem
+    async def test_a_start_that_never_ran_removes_its_file_named_by_the_one_builder(
+        self, db_session, own_session_factory, pending, stem, answer
     ):
-        """The expired record names the file through ``expected_eject_stem`` — the unit-bound
-        stem, or the printer-keyed manual one (``pending=None`` here stands for the manual
-        record, whose stem needs the printer row's id)."""
+        """The retired record names the file through ``expected_eject_stem`` — the unit-bound stem, or
+        the printer-keyed manual one (``pending=None`` stands for the manual record, whose stem needs
+        the printer row's id). REFUSED and VOID both prove the file never ran."""
         from backend.app.services.eject import monitor as monitor_mod
 
         printer = Printer(name="SD", serial_number="SD1", ip_address="1.2.3.4", access_code="x", model="H2S")
@@ -1089,7 +1231,8 @@ class TestEjectStartDeadline:
         await db_session.commit()
         await db_session.refresh(printer)
         if pending is None:
-            pending, stem = PendingEject("manual", None, None, expected_runtime_s=60.0), f"eject_manual_p{printer.id}"
+            pending = PendingEject("manual", None, None, expected_runtime_s=60.0, start_action_id=502)
+            stem = f"eject_manual_p{printer.id}"
         _claim(printer.id, pending)
         remove = AsyncMock(return_value=True)
 
@@ -1098,17 +1241,56 @@ class TestEjectStartDeadline:
             patch("backend.app.core.database.async_session", own_session_factory),
             patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
         ):
-            await remote._start_deadline(printer.id, sleep=_FakeSleep(), timeout_s=1.0)
+            await remote.on_action_answered(_answered(printer.id, 502, answer))
 
         assert plate_occupancy.eject_identity(printer.id) is None
         _assert_removed(remove, printer.id, f"/{stem}.3mf", "the printer never started the sweep")
 
-    async def test_a_started_eject_is_never_expired_by_a_late_deadline(self):
-        # The task can wake late or spuriously: the authority, not the timer, decides.
+    async def test_a_taken_over_start_keeps_its_file(self):
+        """Another job took the printer: the claim is retired and paged, but the file stays — the job
+        now running may BE that file, started from the screen under a firmware-minted id."""
         from backend.app.services.eject import monitor as monitor_mod
 
-        pid = 90061
-        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0))
+        pid = 90063
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0, start_action_id=503))
+        remove = AsyncMock(return_value=True)
+        with (
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+            patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
+        ):
+            await remote.on_action_answered(_answered(pid, 503, "taken_over"))
+
+        assert plate_occupancy.eject_identity(pid) is None
+        notify.assert_awaited_once()
+        assert "another job took the printer" in notify.await_args.kwargs["source_detail"]
+        remove.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "event",
+        [
+            _answered(90064, 504, "reached"),  # the sweep began: its echo armed the guard
+            _answered(90064, 999, "void"),  # another action's answer
+            _answered(90064, 504, "void", command="print_start"),  # another command family
+        ],
+        ids=["reached", "another_action", "another_command"],
+    )
+    async def test_an_answer_that_is_not_this_sweeps_never_retires_anything(self, event):
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90064
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0, start_action_id=504))
+        with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
+            await remote.on_action_answered(event)
+        assert plate_occupancy.eject_identity(pid) is not None
+        notify.assert_not_awaited()
+
+    async def test_a_started_eject_is_never_retired_by_a_late_answer(self):
+        # The authority, not the answer's arrival, decides: a sweep the printer started is the guard's
+        # and its terminal's.
+        from backend.app.services.eject import monitor as monitor_mod
+
+        pid = 90065
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0, start_action_id=505))
         plate_occupancy.note_eject_started(pid)
 
         remove = AsyncMock(return_value=True)
@@ -1116,60 +1298,90 @@ class TestEjectStartDeadline:
             patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
             patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
         ):
-            await remote._start_deadline(pid, sleep=_FakeSleep(), timeout_s=1.0)
+            await remote.on_action_answered(_answered(pid, 505, "void"))
 
         assert plate_occupancy.eject_identity(pid) is not None
         notify.assert_not_awaited()
         remove.assert_not_awaited()  # a sweep that started keeps its file
 
-    async def test_a_hydrated_eject_never_expires_on_the_start_deadline(self):
-        """Its ``started_at`` is None BY CONSTRUCTION, so an expiry keyed on that would
-        fire on every restart and discard a record the startup reconciler still owns."""
+    async def test_a_hydrated_eject_is_never_retired_by_an_answer(self):
+        """A record rebuilt at startup carries no start action — the session start's reconcile owns
+        it, decided against the printer's own report."""
         from backend.app.services.eject import monitor as monitor_mod
 
-        pid = 90062
+        pid = 90066
         _gate(pid)
         plate_occupancy.hydrate_eject(pid, PendingEject("production", 1, 5))
 
         with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
-            await remote._start_deadline(pid, sleep=_FakeSleep(), timeout_s=1.0)
+            await remote.on_action_answered(_answered(pid, 506, "void"))
 
         identity = plate_occupancy.eject_identity(pid)
         assert identity is not None and identity.hydrated is True
         notify.assert_not_awaited()
+
+    async def test_an_answer_that_beat_the_claim_is_applied_at_the_claim(self, db_session, own_session_factory):
+        """A fail ACK can land inside the publish's own round trip — before the claim exists for the
+        subscriber to retire. The dispatcher asks the record once more after claiming, so that answer
+        is never lost and the claim never strands."""
+        from backend.app.services import printer_action
+        from backend.app.services.command_outcome import Answer
+        from backend.app.services.eject import monitor as monitor_mod
+
+        source = _make_source_3mf()
+        try:
+            printer, item = await _seed(db_session, source)
+            _gate(printer.id)
+            c1, c2, c3 = _ftp_patches()
+            remove = AsyncMock(return_value=True)
+            with (
+                c1,
+                c2,
+                c3,
+                route_verbs(start=MagicMock(return_value=True)),
+                patch.object(printer_action, "settled", AsyncMock(return_value=Answer.REFUSED)),
+                patch.object(printer_action, "reason_of", AsyncMock(return_value="the printer is busy")),
+                patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+                patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
+                patch("backend.app.core.database.async_session", own_session_factory),
+            ):
+                await remote.dispatch_part_present_eject(
+                    db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=None
+                )
+            assert plate_occupancy.eject_identity(printer.id) is None
+            assert isinstance(plate_occupancy.snapshot(printer.id).plate_policy, EscalationOnly)
+            notify.assert_awaited_once()
+            assert "the printer is busy" in notify.await_args.kwargs["source_detail"]
+            remove.assert_awaited_once()
+        finally:
+            source.unlink(missing_ok=True)
 
 
 class TestCancelEjectTimers:
     """THE one deregistration point, called by the occupancy policy driver on every
     transition that leaves the printer with no eject."""
 
-    async def test_cancels_both_timers_and_is_idempotent(self):
+    async def test_cancels_the_guard_and_is_idempotent(self):
         pid = 90070
-        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0, drop_span_s=30.0))
         remote.on_eject_start_echo(pid)
-        # The echo cancels the deadline it replaces, so arm a fresh one to prove BOTH
-        # lanes are dropped by one call.
-        remote._arm_start_deadline(pid)
-        deadline = remote._start_deadlines[pid]
         watchdog = remote._runtime_watchdogs[pid]
 
         remote.cancel_eject_timers(pid)
         remote.cancel_eject_timers(pid)  # idempotent — never raises, never resurrects
 
-        assert pid not in remote._start_deadlines
         assert pid not in remote._runtime_watchdogs
-        for task in (deadline, watchdog):
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            assert task.cancelled()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog
+        assert watchdog.cancelled()
 
     async def test_cancelling_when_nothing_is_armed_is_a_noop(self):
         remote.cancel_eject_timers(90071)  # must not raise
 
     async def test_retiring_the_eject_hands_the_driver_the_no_eject_view(self):
-        """The level-trigger the monitor's driver cancels both timers on: whatever
-        retires the eject (a matched terminal, an unverified resolve, a start expiry,
-        the reconciler's disposal, an operator recover), the view it sees carries
+        """The level-trigger the monitor's driver cancels the guard on: whatever retires the eject (a
+        matched terminal, an unverified resolve, a start the record answered never-started, the
+        reconciler's disposal, an operator recover), the view it sees carries
         ``eject_present is False``."""
         pid = 90072
         _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
@@ -1183,48 +1395,37 @@ class TestCancelEjectTimers:
         assert view.eject_present is False
         assert view.plate_occupied is False
 
-    async def test_a_successor_sweep_gets_its_own_watchdog(self):
-        """A stale watchdog must never judge the NEXT sweep against the OLD deadline —
-        and the successor must not be left unwatched by a leftover registry entry."""
+    async def test_a_successor_sweep_gets_its_own_guard(self):
+        """A stale guard must never judge the NEXT sweep — and the successor must not be left
+        unguarded by a leftover registry entry."""
         pid = 90073
-        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0))
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=82.0, drop_span_s=30.0))
         remote.on_eject_start_echo(pid)
         stale = remote._runtime_watchdogs[pid]
 
-        # The eject's terminal retires it, and the driver drops both timers.
         assert plate_occupancy.resolve_eject(pid, "completed") is None
         remote.cancel_eject_timers(pid)
         with contextlib.suppress(asyncio.CancelledError):
             await stale
         assert stale.cancelled()
 
-        _claim(pid, PendingEject("production", 1, 6, expected_runtime_s=82.0))
+        _claim(pid, PendingEject("production", 1, 6, expected_runtime_s=82.0, drop_span_s=30.0))
         remote.on_eject_start_echo(pid)
         assert remote._runtime_watchdogs[pid] is not stale
 
 
-class TestRuntimeWatchdogFires:
-    """Past the deadline the watchdog stops the machine MID-JOB — the whole point of
-    replacing the terminal-time judgement: the stall accrues in the drop/return phase,
-    so stopping now happens before the sweep can scrape the plate."""
-
-    @staticmethod
-    def _run(pid: int, armed: remote.PendingEject, sleep: _FakeSleep):
-        """Spawn the watchdog exactly as the arming path does, so the test exercises
-        the real registry lifecycle (including the ``finally`` deregistration)."""
-        from backend.app.core.tasks import spawn_background_task
-
-        task = spawn_background_task(remote._runtime_watchdog(pid, armed, sleep=sleep), name=f"wd-test-{pid}")
-        remote._runtime_watchdogs[pid] = task
-        return task
+class TestDropGuardFires:
+    """Past the drop deadline the guard stops the machine MID-JOB — before the sweep can scrape the
+    plate. The named exception's whole behaviour, unchanged since 2026-08-31."""
 
     async def test_marks_before_stopping_then_notifies_and_deregisters(self):
         from backend.app.services.eject import monitor as monitor_mod
 
         pid = 90010
-        armed = _armed()
+        armed = _armed_with_drop()
         _claim(pid, armed)
-        sleep = _FakeSleep()
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0)])
         mark_at_stop: list[object] = []
 
         def _stop(printer_id: int) -> bool:
@@ -1234,49 +1435,41 @@ class TestRuntimeWatchdogFires:
             return True
 
         with (
-            patch.object(printer_manager, "stop_print", MagicMock(side_effect=_stop)) as stop,
+            patch.object(printer_manager, "get_client", MagicMock(side_effect=feed)),
+            route_verbs(stop=MagicMock(side_effect=_stop)) as stop,
             patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
         ):
-            await self._run(pid, armed, sleep)
-        assert sleep.delays == [103.75]  # the 83 s estimate's deadline
+            await _spawn_watchdog(pid, armed, clock)
         stop.assert_called_once_with(pid)
         assert mark_at_stop and mark_at_stop[0] is not None
         assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
         notify.assert_awaited_once()
         detail = notify.await_args.kwargs["source_detail"]
-        assert "STOPPED" in detail and "104" in detail and "83" in detail
+        assert "STOPPED DURING the bed-drop" in detail and "30s" in detail
         assert pid not in remote._runtime_watchdogs  # deregistered on exit
 
     async def test_the_stop_arms_no_hold_of_its_own(self):
-        """The escalation hold moved OUT of the kill path: while an eject owns the
-        printer the plate carries no watch BY CONSTRUCTION (an armed cooldown over a
-        plate a sweep is crossing is the double dispatch the authority forbids). The
-        hold arrives one step later, from the stopped sweep's ``unverified`` resolve."""
+        """The escalation hold moved OUT of the kill path: while an eject owns the printer the plate
+        carries no watch BY CONSTRUCTION. The hold arrives one step later, from the stopped sweep's
+        ``unverified`` resolve."""
         from backend.app.services.eject import monitor as monitor_mod
 
-        # The old kill-path entry point is gone; the driver is the one arming site.
         assert not hasattr(monitor_mod.eject_cooldown_monitor, "start_escalation_only_watch")
 
         pid = 90015
-        armed = _armed()
-        # The production shape: a cooldown plate, swept by the eject that plate armed.
+        armed = _armed_with_drop()
         _gate(pid, policy=CooldownEject(unit_id=5, run_id=1))
         _claim(pid, armed)
         driver = _DriverLog()
         plate_occupancy.configure(policy_driver=driver)
+        clock = _FakeClock()
 
-        with (
-            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
-        ):
-            await self._run(pid, armed, _FakeSleep())
+        with _watchdog_env(_ProgressFeed(clock, [(5.0, 0.0)])):
+            await _spawn_watchdog(pid, armed, clock)
 
-        # The kill stamps the verdict and NOTHING else: every view the driver saw still
-        # has an eject on the printer, which is exactly "no watch may be armed here".
         assert driver.causes == ["eject_runtime_exceeded"]
         assert all(view.eject_present and view.plate_occupied for _pid, _c, view in driver.calls)
 
-        # ...and the hold appears only once the stopped sweep's terminal resolves it.
         assert plate_occupancy.resolve_eject(pid, "unverified") is None
         _pid, cause, view = driver.calls[-1]
         assert cause == "eject_unverified"
@@ -1284,69 +1477,60 @@ class TestRuntimeWatchdogFires:
         assert view.plate_occupied is True
         assert isinstance(view.plate_policy, EscalationOnly)
 
-    async def test_undelivered_stop_is_retried_exactly_once(self):
-        # stop_print returning False means the command was NOT delivered (no live MQTT
-        # session). One retry, then proceed regardless — the mark alone already keeps
-        # the gate closed, and the operator is paged either way.
-        from backend.app.services.eject import monitor as monitor_mod
-
+    async def test_an_undelivered_stop_is_never_retried_on_a_clock(self):
+        """A stop that found no live session is NOT retried after a delay (2026-10-11): the page says
+        the truth, and the stamped pending is UNOWNED (``unowned_eject``) — exactly what the session
+        start's reconcile re-drives the stop on, the moment the printer reports again."""
         pid = 90011
-        armed = _armed()
+        armed = _armed_with_drop()
         _claim(pid, armed)
-        sleep = _FakeSleep()
-        with (
-            patch.object(printer_manager, "stop_print", MagicMock(return_value=False)) as stop,
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
-        ):
-            await self._run(pid, armed, sleep)
-        assert stop.call_count == 2
-        assert sleep.delays == [103.75, remote._STOP_RETRY_DELAY_S]
+        clock = _FakeClock()
+        with _watchdog_env(_ProgressFeed(clock, [(5.0, 0.0)]), stop_delivered=False) as env:
+            await _spawn_watchdog(pid, armed, clock)
+        assert env.stop.call_count == 1
         assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
-        notify.assert_awaited_once()
+        env.notify.assert_awaited_once()
+        assert env.notify.await_args.kwargs["source_detail"] == remote._UNDELIVERED_STOP_DETAIL
+        assert plate_occupancy.unowned_eject(pid) is True
 
-    async def test_notify_failure_never_kills_the_watchdog(self):
+    async def test_notify_failure_never_kills_the_guard(self):
         from backend.app.services.eject import monitor as monitor_mod
 
         pid = 90012
-        armed = _armed()
+        armed = _armed_with_drop()
         _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0)])
         with (
-            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
+            patch.object(printer_manager, "get_client", MagicMock(side_effect=feed)),
+            route_verbs(stop=MagicMock(return_value=True)),
             patch.object(
-                monitor_mod,
-                "notify_plate_not_empty",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("smtp down"),
+                monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock, side_effect=RuntimeError("smtp down")
             ),
         ):
-            await self._run(pid, armed, _FakeSleep())
-        # The verdict still stands and the task still deregisters cleanly.
+            await _spawn_watchdog(pid, armed, clock)
         assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
         assert pid not in remote._runtime_watchdogs
 
-    async def test_superseded_pending_stands_the_watchdog_down(self):
-        # The eject this task was armed for resolved while it slept and a NEW one was
-        # dispatched onto the same printer. Stopping now would abort a healthy job.
-        from backend.app.services.eject import monitor as monitor_mod
-
+    async def test_superseded_pending_stands_the_guard_down(self):
+        # The eject this task was armed for resolved and a NEW one took the printer.
         pid = 90013
-        armed = _armed(5)
-        _claim(pid, _armed(6))
-        with (
-            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)) as stop,
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
-        ):
-            await self._run(pid, armed, _FakeSleep())
-        stop.assert_not_called()
-        notify.assert_not_awaited()
+        armed = _armed_with_drop(5)
+        _claim(pid, _armed_with_drop(6))
+        clock = _FakeClock()
+        with _watchdog_env(_ProgressFeed(clock, [(5.0, 0.0)])) as env:
+            await _spawn_watchdog(pid, armed, clock)
+        env.stop.assert_not_called()
+        env.notify.assert_not_awaited()
         assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is None  # successor unmarked
         assert pid not in remote._runtime_watchdogs
 
-    async def test_resolved_pending_stands_the_watchdog_down(self):
+    async def test_resolved_pending_stands_the_guard_down(self):
         pid = 90014
-        with patch.object(printer_manager, "stop_print", MagicMock(return_value=True)) as stop:
-            await self._run(pid, _armed(), _FakeSleep())
-        stop.assert_not_called()
+        clock = _FakeClock()
+        with _watchdog_env(_ProgressFeed(clock, [(5.0, 0.0)])) as env:
+            await _spawn_watchdog(pid, _armed_with_drop(), clock)
+        env.stop.assert_not_called()
         assert pid not in remote._runtime_watchdogs
 
     async def test_the_identity_check_reads_the_authority_not_a_captured_copy(self):
@@ -1367,156 +1551,74 @@ class TestRuntimeWatchdogFires:
 
 
 class TestKillDecisionTelemetry:
-    """The kill line must say WHERE the eject was when it was stopped.
+    """The kill line must say WHERE the eject was when it was stopped (the 2026-08-14 009-H2S lesson).
+    Log-only: no assertion here may become a stop condition."""
 
-    The 2026-08-14 009-H2S eject ran 106 s against an expected 84 s and was stopped
-    with nothing in the record to attribute the +21 s to the bed-drop or the sweep.
-    The executing G-code line number falls inside exactly one of those phases, so
-    sampling it at the kill instant is what makes the next one diagnosable. Log-only:
-    no assertion here may become a stop condition."""
-
-    @staticmethod
-    def _client(line_number, percent):
-        return SimpleNamespace(state=SimpleNamespace(mc_print_line_number=line_number, progress=percent))
-
-    async def _fire(self, pid: int, caplog, client) -> str:
-        """Drive the fire path with ``client`` as the live session; return the kill line."""
-        from backend.app.services.eject import monitor as monitor_mod
-
-        armed = _armed()
+    async def _fire(self, pid: int, caplog, *, line_number, percent: float) -> str:
+        armed = _armed_with_drop()
         _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(percent, 0.0)], line_number=line_number)
         with (
-            patch.object(printer_manager, "get_client", MagicMock(return_value=client)),
-            patch.object(printer_manager, "stop_print", MagicMock(return_value=True)),
-            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
+            _watchdog_env(feed),
             caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
         ):
-            await TestRuntimeWatchdogFires._run(pid, armed, _FakeSleep())
-        return next(r.getMessage() for r in caplog.records if "still running at" in r.getMessage())
+            await _spawn_watchdog(pid, armed, clock)
+        return _kill_line(caplog)
 
     async def test_kill_line_carries_the_line_number_and_percent(self, caplog):
-        message = await self._fire(90030, caplog, self._client(41207, 57.0))
+        message = await self._fire(90030, caplog, line_number=41207, percent=7.0)
         assert "gcode line 41207" in message
-        assert "57.0% done" in message
-        # The runtimes it has always carried must survive the added fields.
-        assert "still running at 104s" in message and "expected 83s" in message
-
-    async def test_kill_line_tolerates_a_printer_with_no_live_session(self, caplog):
-        # A disconnected printer is exactly when a stop goes undelivered — the kill
-        # line still has to render rather than blow up inside the watchdog.
-        message = await self._fire(90031, caplog, None)
-        assert "gcode line None" in message and "None% done" in message
+        assert "7.0% done" in message
+        assert "expected 83s" in message and "stage=drop" in message and "deadline 40s" in message
 
     async def test_kill_line_tolerates_firmware_that_never_publishes_the_line_number(self, caplog):
-        # mc_print_line_number is UNVERIFIED on the H2S wire: absent field, not absent
-        # printer. Percent must still land so the breadcrumb is not all-or-nothing.
-        message = await self._fire(90032, caplog, self._client(None, 12.0))
+        # mc_print_line_number is absent on the H2S wire: absent field, not absent printer. Percent
+        # must still land so the breadcrumb is not all-or-nothing.
+        message = await self._fire(90032, caplog, line_number=None, percent=12.0)
         assert "gcode line None" in message and "12.0% done" in message
+
+    async def test_a_printer_with_no_live_session_is_never_stopped_by_the_drop_guard(self):
+        # No session, no evidence: the guard cannot arm its drop window, so it never stops a sweep it
+        # cannot see. (Only the whole-job bound, which needs no evidence, could — not inside 60 s.)
+        pid = 90031
+        armed = _armed_with_drop()
+        _claim(pid, armed)
+        clock = _FakeClock()
+        reads = {"n": 0}
+
+        def no_session(printer_id):
+            reads["n"] += 1
+            return None
+
+        with (
+            patch.object(printer_manager, "get_client", MagicMock(side_effect=no_session)),
+            route_verbs(stop=MagicMock(return_value=True)) as stop,
+        ):
+            task = _spawn_watchdog(pid, armed, clock)
+            for _ in range(400):
+                if reads["n"] >= 30:
+                    break
+                await asyncio.sleep(0)
+            assert not task.done()
+            remote.cancel_eject_timers(pid)
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        stop.assert_not_called()
 
     async def test_telemetry_reader_tolerates_a_stateless_client(self):
         with patch.object(printer_manager, "get_client", MagicMock(return_value=SimpleNamespace())):
             assert remote._live_phase_telemetry(90033) == (None, None, None)
 
     async def test_telemetry_reader_carries_the_progress_recency_stamp(self):
-        # The percent field always holds SOME value; only its wire stamp says whether
-        # that value describes the phase running now (see PrinterState.progress_wire_at).
         state = SimpleNamespace(mc_print_line_number=7, progress=42.0, progress_wire_at=1234.5)
         with patch.object(printer_manager, "get_client", MagicMock(return_value=SimpleNamespace(state=state))):
             assert remote._live_phase_telemetry(90034) == (7, 42.0, 1234.5)
 
 
-class _FakeClock:
-    """The ONE time source a polling-watchdog test drives.
-
-    The watchdog's sleeps and its clock must come from the same source, so this supplies
-    both: ``sleep`` records the delay, advances ``now`` by it and yields to the event
-    loop so the test can interleave (cancelling mid-run, for one). No wall-clock time
-    passes, so a 104 s deadline sequence runs in microseconds."""
-
-    def __init__(self, start: float = 1000.0) -> None:
-        self.now = start
-        self.delays: list[float] = []
-
-    def __call__(self) -> float:
-        return self.now
-
-    async def sleep(self, delay: float) -> None:
-        self.delays.append(delay)
-        self.now += delay
-        await asyncio.sleep(0)
-
-
-class _ProgressFeed:
-    """Scripted ``mc_percent`` samples, one consumed per telemetry read.
-
-    Each entry is ``(percent, wire_age_s)``: what the live session reports and how old
-    that push is when read. ``wire_age_s=None`` means the stamp PREDATES the arming — a
-    value held over from before this eject, which the watchdog must treat as no evidence
-    at all. The last entry repeats once exhausted, so a test scripts only the interesting
-    part of the timeline."""
-
-    def __init__(self, clock: _FakeClock, samples: list[tuple[float, float | None]]) -> None:
-        self._clock = clock
-        self._samples = list(samples)
-        self.reads = 0
-
-    def __call__(self, printer_id: int) -> SimpleNamespace:
-        percent, age = self._samples[min(self.reads, len(self._samples) - 1)]
-        self.reads += 1
-        wire_at = 0.0 if age is None else self._clock.now - age
-        return SimpleNamespace(
-            state=SimpleNamespace(mc_print_line_number=None, progress=percent, progress_wire_at=wire_at)
-        )
-
-
-def _armed_with_drop(pid_item: int = 5, *, drop_span_s: float = 30.0, **kw) -> remote.PendingEject:
-    """A started production pending carrying a bed-drop budget (arms the edge lane).
-
-    83 s expected → a 103.75 s whole-job deadline; a 30 s drop span → an 8 s margin (the
-    floor) → the drop deadline lands 38 s after the observed P5 edge."""
-    kw.setdefault("expected_runtime_s", 83.0)
-    kw.setdefault("started_at", datetime.now(timezone.utc))
-    return remote.PendingEject("production", 1, pid_item, drop_span_s=drop_span_s, **kw)
-
-
-@contextlib.contextmanager
-def _watchdog_env(feed: _ProgressFeed, *, stop_delivered: bool = True):
-    """Patch every collaborator the fire path touches; yields the mocks."""
-    from backend.app.services.eject import monitor as monitor_mod
-
-    with (
-        patch.object(printer_manager, "get_client", MagicMock(side_effect=feed)),
-        patch.object(printer_manager, "stop_print", MagicMock(return_value=stop_delivered)) as stop,
-        patch.object(printer_manager, "request_evidence_pushall", MagicMock(return_value=True)) as pushall,
-        patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
-    ):
-        yield SimpleNamespace(stop=stop, pushall=pushall, notify=notify)
-
-
-def _spawn_watchdog(pid: int, armed: remote.PendingEject, clock: _FakeClock) -> asyncio.Task:
-    """Spawn the watchdog exactly as the arming path does (real registry lifecycle)."""
-    from backend.app.core.tasks import spawn_background_task
-
-    task = spawn_background_task(
-        remote._runtime_watchdog(pid, armed, sleep=clock.sleep, clock=clock), name=f"wd-edge-{pid}"
-    )
-    remote._runtime_watchdogs[pid] = task
-    return task
-
-
-def _kill_line(caplog) -> str:
-    return next(r.getMessage() for r in caplog.records if "still running at" in r.getMessage())
-
-
 class TestEjectMarginMath:
-    """Two margins, one clamp. The drop margin is tighter on both ends because it is
-    measured from an OBSERVED beacon edge, so it pays for none of the upload / spin-up /
-    start-echo variance the whole-job margin has to absorb."""
-
-    async def test_abort_margin_keeps_the_twenty_and_sixty_second_clamps(self):
-        assert remote._abort_margin_s(40.0) == 20.0  # floor
-        assert remote._abort_margin_s(160.0) == 40.0  # fraction
-        assert remote._abort_margin_s(400.0) == 60.0  # cap
+    """One clamp. The drop margin is measured from an OBSERVED beacon edge, so it pays for none of the
+    upload / spin-up / start-echo variance."""
 
     async def test_drop_margin_floors_at_eight_and_caps_at_twenty(self):
         # The 8 s floor covers the estimator's ~±3 s, the ~1 Hz push cadence and the 2 s
@@ -1526,18 +1628,11 @@ class TestEjectMarginMath:
         assert remote._drop_margin_s(48.0) == 12.0
         assert remote._drop_margin_s(200.0) == 20.0
 
-    async def test_deadline_is_the_estimate_plus_its_margin(self):
-        assert remote.eject_abort_deadline_s(83.0) == 83.0 + remote._abort_margin_s(83.0)
-
 
 class TestRuntimeWatchdogPhaseEdges:
-    """The pre-sweep guarantee (2026-08-15 009-H2S bed-drop stalls).
-
-    The whole-job deadline can only catch a stall that overruns the ENTIRE eject (~59 s
-    on the production profile); a shorter one lets the sweep run on a bed that lost Z
-    steps. mc_percent is M73-driven, so the block's phase beacons make the bed-drop phase
-    boundable on its own — and a percent below the sweep beacon PROVES the sweep has not
-    started, which is what makes stopping there safe."""
+    """The pre-sweep guarantee (2026-08-15 009-H2S bed-drop stalls): a percent below the sweep beacon
+    PROVES the sweep has not started, which is what makes stopping there safe. The whole-job bound
+    (83 s → 103.75 s here, caught on the 104 s poll) is the evidence-free backstop behind it."""
 
     async def test_drop_overrun_with_the_sweep_unreached_stops_the_job(self, caplog):
         # Percent parked at the lifted beacon: the printer is still executing drop-phase
@@ -1559,12 +1654,9 @@ class TestRuntimeWatchdogPhaseEdges:
         detail = env.notify.await_args.kwargs["source_detail"]
         assert "bed-drop" in detail and "under the heatbed" in detail
         assert pid not in remote._runtime_watchdogs
-        # Killed on the DROP deadline (t5 + 38 s), far short of the 103.75 s whole-job one.
         assert clock.now - 1000.0 == pytest.approx(42.0)
 
     async def test_sweep_beacon_arriving_after_the_drop_deadline_still_stops(self, caplog):
-        # The drop verifiably ran long. The sweep opens with rear positioning at lift
-        # height, so the stop still lands before the toolhead can reach the plate.
         pid = 90041
         armed = _armed_with_drop()
         _claim(pid, armed)
@@ -1580,11 +1672,12 @@ class TestRuntimeWatchdogPhaseEdges:
         assert "bed-drop" in env.notify.await_args.kwargs["source_detail"]
         assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
 
-    async def test_healthy_phase_sequence_never_kills_and_cancels_on_resolution(self, caplog):
-        # 0 → 5 → 50 → 75: the drop cleared inside its budget, so no phase rule may fire.
-        # The eject's terminal then cancels the task, which is the NORMAL exit.
+    async def test_healthy_phase_sequence_never_kills_and_ends_at_the_park_beacon(self, caplog):
+        # 0 → 5 → 50 → 75: the drop cleared inside its budget, so no phase rule may fire, and past the
+        # park beacon there is nothing left to guard — the guard ENDS on its own; the eject's terminal
+        # answers the rest.
         pid = 90042
-        armed = _armed_with_drop()
+        armed = _armed_with_phases()
         _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(0.0, 0.0), (5.0, 0.0), (50.0, 0.0), (75.0, 0.0)])
@@ -1593,30 +1686,22 @@ class TestRuntimeWatchdogPhaseEdges:
             caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
         ):
             task = _spawn_watchdog(pid, armed, clock)
-            for _ in range(200):
-                if feed.reads >= 4:
-                    break
-                await asyncio.sleep(0)
-            # The matched terminal retires the eject; the policy driver's level-triggered
-            # timer hygiene then drops both timers.
-            assert plate_occupancy.resolve_eject(pid, "completed") is None
-            remote.cancel_eject_timers(pid)
-            env.stop.assert_not_called()
-            env.notify.assert_not_awaited()
-        # LIVENESS: the lane really ran the sequence — a silent watchdog would satisfy
-        # every "did not fire" assertion above without ever observing a phase edge.
-        assert feed.reads >= 4
-        assert [r for r in caplog.records if "bed-drop phase cleared" in r.getMessage()]
-        with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert task.cancelled()
+        env.stop.assert_not_called()
+        env.notify.assert_not_awaited()
+        # LIVENESS: the lane really ran the sequence.
+        assert feed.reads >= 4
+        assert _records(caplog, "bed-drop phase cleared")
+        assert _records(caplog, "sweep phase cleared")
+        assert not task.cancelled()
         assert pid not in remote._runtime_watchdogs
-        assert plate_occupancy.pending_eject_view(pid) is None
+        assert plate_occupancy.pending_eject_view(pid) is not None  # the terminal ends the eject
 
-    async def test_beacons_never_reflected_falls_back_to_the_whole_job_deadline(self, caplog):
-        # mc_percent stuck at 0 while fresh: the firmware is publishing, but the beacons
-        # are not landing in it. The lane must degrade to the original rule, exactly once,
-        # and the whole-job deadline must still fire.
+    async def test_beacons_never_reflected_warn_once_then_the_whole_job_bound_stops_the_sweep(self, caplog):
+        # mc_percent stuck at 0 while fresh: the firmware is publishing, but the beacons are not
+        # landing in it. The drop guard cannot arm without P5: ONE warning at production's line (job
+        # spin-up 25 s + the 20.75 s whole-job grace) — and the whole-job bound, which needs no
+        # evidence, still stops the sweep at expected + margin (production's beacon-dead fallback).
         pid = 90043
         armed = _armed_with_drop()
         _claim(pid, armed)
@@ -1627,50 +1712,40 @@ class TestRuntimeWatchdogPhaseEdges:
             caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
         ):
             await _spawn_watchdog(pid, armed, clock)
-        fallbacks = [r for r in caplog.records if "phase beacons not reflected" in r.getMessage()]
-        assert len(fallbacks) == 1
+        silent = _records(caplog, "phase beacons not reflected")
+        assert len(silent) == 1
+        assert "at 46s after the start echo" in silent[0].getMessage()
         env.stop.assert_called_once_with(pid)
+        assert clock.now - clock.start == pytest.approx(104.0)
         assert "stage=total" in _kill_line(caplog)
-        assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
+        assert "STOPPED mid-job after" in env.notify.await_args.kwargs["source_detail"]
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
 
     async def test_stale_evidence_never_kills_and_asks_once_for_a_fresh_report(self, caplog):
-        # One fresh sample opens the drop window, then the link goes quiet: every later
-        # sample is stamped before this eject even armed. Stale evidence advances nothing
-        # and justifies no stop — the lane asks for ONE pushall and leaves the whole-job
-        # deadline as the backstop.
+        # One fresh sample opens the drop window, then the link goes quiet: every later sample is
+        # stamped before this eject even armed. Stale evidence advances nothing and justifies no
+        # stop — the guard asks for ONE pushall and keeps waiting.
         pid = 90044
         armed = _armed_with_drop()
         _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0), (5.0, None)])
-        with (
-            _watchdog_env(feed) as env,
-            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-        ):
-            await _spawn_watchdog(pid, armed, clock)
+        with _watchdog_env(feed) as env:
+            await _poll_then_cancel(pid, armed, clock, feed, polls=50)  # 100 s: inside the whole-job bound
         env.pushall.assert_called_once_with(pid, remote._EVIDENCE_REASON)
-        env.stop.assert_called_once_with(pid)
-        assert "stage=total" in _kill_line(caplog)  # NOT a drop kill
-        assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
+        env.stop.assert_not_called()
 
-    async def test_aged_out_sample_is_not_evidence_either(self, caplog):
-        # Stamped after arming but far older than the freshness window: a link that went
-        # silent mid-eject is not a phase report, so the drop rule must not fire on it.
+    async def test_aged_out_sample_is_not_evidence_either(self):
         pid = 90045
         armed = _armed_with_drop()
         _claim(pid, armed)
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0), (5.0, remote._PROGRESS_FRESH_S + 30.0)])
-        with (
-            _watchdog_env(feed) as env,
-            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
-        ):
-            await _spawn_watchdog(pid, armed, clock)
-        assert "stage=total" in _kill_line(caplog)
-        env.stop.assert_called_once_with(pid)
+        with _watchdog_env(feed) as env:
+            await _poll_then_cancel(pid, armed, clock, feed, polls=50)
+        env.stop.assert_not_called()
 
     async def test_superseded_pending_stands_the_edge_lane_down(self):
-        # The eject this task was armed for resolved and a NEW one took the printer.
         pid = 90046
         armed = _armed_with_drop(5)
         _claim(pid, _armed_with_drop(6))
@@ -1684,260 +1759,216 @@ class TestRuntimeWatchdogPhaseEdges:
         assert pid not in remote._runtime_watchdogs
 
 
-class TestRuntimeWatchdogDeadlineOnlyFallback:
-    """Without a drop budget the watchdog is EXACTLY what it was before the edge lane:
-    one sleep to the whole-job deadline, then the same stop. A rehydrated post-restart
-    pending and every drop-less profile land here."""
+class TestNoDropPhase:
+    """Without a drop budget there is nothing for the drop guard to bound, and no beacon lane: a
+    drop-less sweep is watched in production's SINGLE-DEADLINE form — the whole-job bound until the
+    terminal, with no beacon loosening it. A rehydrated pending (no build figures) is not watched."""
 
-    async def test_no_drop_span_sleeps_straight_to_the_total_deadline(self, caplog):
+    async def test_a_rehydrated_pending_returns_without_polling_or_stopping(self):
         pid = 90050
-        armed = _armed()  # drop_span_s defaults to None
+        armed = remote.PendingEject("production", 1, 5, started_at=datetime.now(timezone.utc))
         _claim(pid, armed)
         clock = _FakeClock()
-        feed = _ProgressFeed(clock, [(5.0, 0.0)])
+        with _watchdog_env(_ProgressFeed(clock, [(5.0, 0.0)])) as env:
+            await _spawn_watchdog(pid, armed, clock)
+        assert clock.delays == []
+        env.stop.assert_not_called()
+        assert pid not in remote._runtime_watchdogs
+
+    async def test_a_drop_less_sweep_is_stopped_at_its_whole_job_bound_whatever_the_beacons_say(self, caplog):
+        # Even a FRESH park-beacon sample does not end the single-deadline form (production: no edge
+        # lane, no patience) — the bound passes at 103.75 s online and the 104 s poll stops the sweep.
+        pid = 90052
+        armed = _armed(started_at=datetime.now(timezone.utc))  # drop_span_s None, 83 s estimate
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(75.0, 0.0)])
         with (
             _watchdog_env(feed) as env,
             caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
         ):
             await _spawn_watchdog(pid, armed, clock)
-        assert clock.delays == [103.75]  # one sleep, no polling
         env.stop.assert_called_once_with(pid)
+        assert clock.now - clock.start == pytest.approx(104.0)
         assert "stage=total" in _kill_line(caplog)
-        # The pre-edge-lane operator wording is untouched for this stage.
-        detail = env.notify.await_args.kwargs["source_detail"]
-        assert "STOPPED mid-job" in detail and "104" in detail and "83" in detail
+        assert "against an expected 83s" in env.notify.await_args.kwargs["source_detail"]
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is not None
+        assert len(_records(caplog, "[self-heal]")) == 1
+        assert "lane=eject whole-job" in _records(caplog, "[self-heal]")[0].getMessage()
 
-    async def test_a_drop_budget_that_cannot_beat_the_total_deadline_polls_nothing(self):
-        # 100 s span + 20 s margin = 120 s, past the 103.75 s whole-job deadline: the
-        # phase rule could never fire first, so arming it would only add failure modes.
-        pid = 90051
-        armed = _armed_with_drop(drop_span_s=100.0)
+    async def test_a_drop_less_sweep_that_finishes_inside_its_bound_is_never_stopped(self):
+        # The terminal arrives at 100 s (the 2026-07-31 band: 80-83 s against 83 s): the occupancy
+        # driver cancels the watch, which was still WAITING.
+        pid = 90053
+        armed = _armed(started_at=datetime.now(timezone.utc))
         _claim(pid, armed)
         clock = _FakeClock()
-        feed = _ProgressFeed(clock, [(5.0, 0.0)])
+        feed = _ProgressFeed(clock, [(75.0, 0.0)])
         with _watchdog_env(feed) as env:
+            task = _spawn_watchdog(pid, armed, clock)
+            for _ in range(2000):
+                if clock.now - clock.start >= 100.0:
+                    break
+                await asyncio.sleep(0)
+            assert not task.done()
+            remote.cancel_eject_timers(pid)
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        env.stop.assert_not_called()
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is None
+
+
+class TestALongDropBudget:
+    async def test_a_long_drop_budget_is_still_guarded(self):
+        # 100 s span + 20 s margin = 120 s, inside a 250 s whole-job bound (a 200 s estimate): the drop
+        # guard arms on any span the build states, with no lead it must hold over the whole-job bound.
+        pid = 90051
+        armed = _armed_with_drop(drop_span_s=100.0, expected_runtime_s=200.0)
+        _claim(pid, armed)
+        clock = _FakeClock()
+        with _watchdog_env(_ProgressFeed(clock, [(5.0, 0.0)])) as env:
             await _spawn_watchdog(pid, armed, clock)
-        assert clock.delays == [103.75]
         env.stop.assert_called_once_with(pid)
-
-
-def _armed_with_phases(
-    pid_item: int = 5,
-    *,
-    drop_span_s: float = 30.0,
-    sweep_span_s: float | None = 20.0,
-    tail_s: float | None = 15.0,
-    **kw,
-) -> remote.PendingEject:
-    """A started production pending carrying ALL the build's phase budgets.
-
-    83 s expected → a 103.75 s whole-job deadline; 30 s drop → an 8 s margin (the floor)
-    → the drop deadline lands 38 s after the observed P5 edge; 20 s sweep → the same 8 s
-    floor → the sweep BUDGET line lands 28 s after the observed P50 edge (a line that
-    only warns); 15 s tail → the epilogue deadline lands 215 s after the observed P75."""
-    kw.setdefault("expected_runtime_s", 83.0)
-    kw.setdefault("started_at", datetime.now(timezone.utc))
-    return remote.PendingEject(
-        "production", 1, pid_item, drop_span_s=drop_span_s, sweep_span_s=sweep_span_s, tail_s=tail_s, **kw
-    )
-
-
-def _records(caplog, needle: str) -> list:
-    return [r for r in caplog.records if needle in r.getMessage()]
-
-
-class TestBindingDeadline:
-    """The ONE deadline-selection point. Whichever phase the poller is in, exactly one
-    deadline is in force, and the whole-job figure it is derived from is never mutated."""
-
-    async def test_every_phase_but_the_epilogue_holds_the_whole_job_deadline(self):
-        for phase in ("await_p5", "await_p50", "await_p75", "deadline_only"):
-            assert remote._binding_deadline(
-                phase, armed_at=1000.0, total_deadline_s=103.75, t75=1050.0, tail_s=15.0
-            ) == (1103.75, "total")
-
-    async def test_the_epilogue_deadline_is_anchored_on_the_observed_park_edge(self):
-        deadline, stage = remote._binding_deadline(
-            "epilogue", armed_at=1000.0, total_deadline_s=103.75, t75=1060.0, tail_s=15.0
-        )
-        assert (deadline, stage) == (1060.0 + 15.0 + remote.UNMODELLED_EPILOGUE_ALLOWANCE_S, "epilogue")
-
-    async def test_the_epilogue_deadline_can_only_ever_loosen(self):
-        # The invariant behind the `max`: at a smaller future allowance the epilogue rule
-        # must silently revert to the whole-job deadline rather than become TIGHTER than
-        # the rule it replaces — a patient window that kills sooner is the one outcome
-        # this change may never produce.
-        deadline, stage = remote._binding_deadline(
-            "epilogue", armed_at=1000.0, total_deadline_s=900.0, t75=1005.0, tail_s=1.0
-        )
-        assert (deadline, stage) == (1900.0, "epilogue")
-        assert deadline >= 1000.0 + 900.0
-
-    async def test_missing_build_figures_fail_closed_onto_the_whole_job_deadline(self):
-        assert remote._binding_deadline(
-            "epilogue", armed_at=1000.0, total_deadline_s=103.75, t75=1060.0, tail_s=None
-        ) == (1103.75, "total")
-        assert remote._binding_deadline(
-            "epilogue", armed_at=1000.0, total_deadline_s=103.75, t75=None, tail_s=15.0
-        ) == (1103.75, "total")
+        assert clock.now - 1000.0 == pytest.approx(124.0)  # t5 (2 s) + 100 s + 20 s, caught on the next poll
 
 
 class TestStopReasonCopy:
-    """One origin for kill copy, two renderings. Before it, every stage was paged as an
-    'under-bed obstruction' — already wrong for `drop_late`/`total`, and unusable for a
-    stage that fires after the wire says the sweep completed."""
+    """One origin for kill copy, two renderings. Only the timed stops (the whole-job bound and the drop
+    guard) carry runtime figures."""
 
-    def _reason(self, stage, **kw):
-        kw.setdefault("fired_deadline_s", 104.0)
-        kw.setdefault("phase_elapsed_s", 42.0)
-        kw.setdefault("expected_s", 83.0)
-        kw.setdefault("drop_span_s", None)
-        kw.setdefault("sweep_span_s", None)
-        return remote._stop_reason(stage, **kw)
+    async def test_a_whole_job_kill_mid_sweep_suspects_a_part_that_did_not_release(self):
+        # A sweep budget in force means an on-time P50 cleared the drop: blaming the heatbed would be
+        # a guess the wire contradicts (production's copy).
+        diagnostic, detail = remote._stop_reason(
+            "total", phase_elapsed_s=100.0, drop_span_s=30.0, deadline_s=103.75, expected_s=83.0, sweep_span_s=20.0
+        )
+        assert "whole-job deadline (104s)" in diagnostic and "did not release" in diagnostic
+        assert "STOPPED at its whole-job deadline after 100s of sweeping" in detail
+        assert "under the heatbed" not in detail
+
+    async def test_a_whole_job_kill_with_no_phase_observed_keeps_the_obstruction_wording(self):
+        diagnostic, detail = remote._stop_reason(
+            "total", phase_elapsed_s=104.0, drop_span_s=None, deadline_s=103.75, expected_s=83.0
+        )
+        assert "under-bed obstruction" in diagnostic
+        assert "STOPPED mid-job after 104s against an expected 83s" in detail and "under the heatbed" in detail
 
     async def test_a_drop_kill_names_the_bed_drop_budget_and_the_heatbed(self):
-        diagnostic, detail = self._reason("drop", drop_span_s=30.0)
+        diagnostic, detail = remote._stop_reason("drop", phase_elapsed_s=42.0, drop_span_s=30.0)
         assert "bed-drop" in diagnostic and "30s" in diagnostic
         assert "bed-drop" in detail and "under the heatbed" in detail
 
     async def test_a_drop_late_kill_says_the_sweep_started_after_the_overrun(self):
-        diagnostic, detail = self._reason("drop_late", drop_span_s=30.0)
+        diagnostic, detail = remote._stop_reason("drop_late", phase_elapsed_s=42.0, drop_span_s=30.0)
         assert "sweep beacon arrived only after" in diagnostic
         assert "overran" in detail and "under the heatbed" in detail
 
-    async def test_a_beacon_blind_total_keeps_the_obstruction_wording(self):
-        # No phase was ever observed, so an obstruction is still the honest suspicion.
-        diagnostic, detail = self._reason("total", phase_elapsed_s=104.0)
-        assert "under-bed obstruction" in diagnostic
-        assert "STOPPED mid-job" in detail and "104" in detail and "83" in detail
-
-    async def test_a_total_that_fired_past_an_in_time_p50_blames_the_sweep_not_the_bed(self):
-        # The sweep budget can only have been armed by an on-time P50 edge, so the drop
-        # demonstrably cleared: pointing the operator under the heatbed would send them
-        # to a place the wire has already ruled out.
-        diagnostic, detail = self._reason("total", phase_elapsed_s=100.0, drop_span_s=30.0, sweep_span_s=20.0)
-        assert "cleared on budget" in diagnostic and "20s" in diagnostic
-        assert "did not release" in diagnostic
-        assert "under the heatbed" not in detail
-        assert "may not have released" in detail
-
-    async def test_an_epilogue_kill_says_both_phases_cleared_and_the_job_never_finished(self):
-        diagnostic, detail = self._reason("epilogue", phase_elapsed_s=215.0, fired_deadline_s=280.0)
-        assert "both cleared" in diagnostic and "firmware tail" in diagnostic
-        assert "280" in diagnostic
-        assert "sweep COMPLETED" in detail and "under the heatbed" not in detail
+    @pytest.mark.parametrize("stage", ["service_hold", "reconnect"])
+    async def test_the_untimed_stages_invent_no_runtime_evidence(self, stage):
+        diagnostic, detail = remote._stop_reason(stage, phase_elapsed_s=0.0, drop_span_s=None)
+        assert "budget" not in diagnostic and "deadline" not in detail
+        assert "plate" in detail
 
 
 class TestRuntimeWatchdogSweepLane:
-    """The sweep phase MEASURES and never kills (2026-08-31, principle 4).
+    """The sweep phase MEASURES and never kills on its own budget (2026-08-31): a part that fails to
+    release presents as a sweep overrun, which the WHOLE-JOB bound stops — production's stuck-part
+    timing, restored 2026-10-12."""
 
-    A part that fails to release presents as a sweep overrun, so this phase is never
-    given patience: the whole-job deadline keeps today's exact stuck-part timing through
-    it, and the budget line only produces the P50→P75 distribution a calibrated sweep
-    kill will be armed from."""
-
-    @staticmethod
-    async def _run(pid: int, armed, samples, caplog) -> tuple:
-        clock = _FakeClock()
-        feed = _ProgressFeed(clock, samples)
+    async def test_a_sweep_running_past_its_budget_warns_once_and_is_never_killed_by_that_budget(self, caplog):
+        pid = 90060
+        armed = _armed_with_phases()
         _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0)])
         with (
             _watchdog_env(feed) as env,
             caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
         ):
-            await _spawn_watchdog(pid, armed, clock)
-        return env, clock
-
-    async def test_a_sweep_running_past_its_budget_warns_once_and_never_kills_there(self, caplog):
-        # Percent parked at the sweep beacon: the sweep budget line (t50 + 28 s) passes
-        # at ~34 s, and nothing may fire there.
-        env, clock = await self._run(90060, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0)], caplog)
+            await _poll_then_cancel(pid, armed, clock, feed, polls=50)  # 100 s: inside the whole-job bound
         warnings = _records(caplog, "sweep phase running")
         assert len(warnings) == 1
         assert "20s budget" in warnings[0].getMessage()
         assert warnings[0].levelno == logging.WARNING
-        # The kill that DID happen is the whole-job backstop, not a sweep rule.
-        assert "stage=total" in _kill_line(caplog)
-        assert not _records(caplog, "stage=drop")
-        env.stop.assert_called_once_with(90060)
+        env.stop.assert_not_called()
 
-    async def test_the_whole_job_deadline_is_still_enforced_inside_the_sweep_phase(self, caplog):
-        # The complement of the epilogue's patience: while the plate may still be under
-        # the toolhead, the stuck-part timing is EXACTLY the whole-job deadline.
-        env, clock = await self._run(90061, _armed_with_phases(), [(5.0, 0.0), (50.0, 0.0)], caplog)
-        assert clock.now - 1000.0 == pytest.approx(104.0)
-        assert clock.now - 1000.0 >= remote.eject_abort_deadline_s(83.0)
-        detail = env.notify.await_args.kwargs["source_detail"]
-        assert "may not have released" in detail and "under the heatbed" not in detail
-
-    async def test_a_park_beacon_after_the_budget_line_advances_with_a_warning(self, caplog):
-        # A 5 s sweep budget (+8 s floor) with the park beacon arriving at ~18 s: the
-        # overrun is recorded for the distribution and the job is NOT killed for it —
-        # deliberately asymmetric with drop_late, whose stop still precedes plate
-        # contact, while past the park beacon there is no contact left to pre-empt.
+    async def test_a_park_beacon_after_the_budget_line_ends_the_guard_with_a_warning(self, caplog):
+        pid = 90062
         armed = _armed_with_phases(sweep_span_s=5.0)
-        samples = [(5.0, 0.0), (50.0, 0.0)] + [(50.0, 0.0)] * 8 + [(75.0, 0.0)]
-        env, clock = await self._run(90062, armed, samples, caplog)
-        cleared = _records(caplog, "sweep phase cleared")
-        assert len(cleared) == 1
-        assert cleared[0].levelno == logging.WARNING
-        assert "OVERRAN" in cleared[0].getMessage()
-        # It advanced rather than died: the only kill is the epilogue's own deadline.
-        assert "stage=epilogue" in _kill_line(caplog)
-        env.stop.assert_called_once_with(90062)
-
-    async def test_a_stale_park_beacon_never_opens_the_epilogue(self, caplog):
-        # Patience is bought by FRESH wire evidence only. A held-over percent proves
-        # nothing about the phase running now, so the job keeps the tight deadline.
-        armed = _armed_with_phases()
-        env, clock = await self._run(90063, armed, [(5.0, 0.0), (50.0, 0.0), (75.0, None)], caplog)
-        assert not _records(caplog, "sweep phase cleared")
-        assert not _records(caplog, "sweep phase running")  # the WARN is fresh-gated too
-        assert "stage=total" in _kill_line(caplog)
-        assert clock.now - 1000.0 == pytest.approx(104.0)
-
-    async def test_without_a_sweep_budget_both_new_lanes_stay_silent(self, caplog):
-        # A rehydrated pending carries no build figures. The drop lane still runs to
-        # completion (liveness) and the job then keeps exactly today's behaviour.
-        armed = _armed_with_phases(sweep_span_s=None, tail_s=None)
-        env, clock = await self._run(90064, armed, [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)], caplog)
-        assert _records(caplog, "bed-drop phase cleared")
-        assert not _records(caplog, "sweep phase")
-        assert "stage=total" in _kill_line(caplog)
-        assert clock.now - 1000.0 == pytest.approx(104.0)
-        detail = env.notify.await_args.kwargs["source_detail"]
-        assert "STOPPED mid-job" in detail and "under the heatbed" in detail
-
-
-class TestRuntimeWatchdogEpilogue:
-    """The one patient window, and the trap it must not fall into.
-
-    23 of the 24 kills in the beacon era fired AFTER the bed-drop phase had cleared, on
-    jobs whose parts were physically ejected: the whole-job deadline was expiring during
-    a firmware tail the estimator does not model. Past the park beacon no motion over the
-    plate remains, so the only thing a longer deadline exposes is downtime."""
-
-    @staticmethod
-    async def _run_to_park(pid: int, caplog, armed=None) -> tuple:
-        clock = _FakeClock()
-        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)])
-        armed = armed or _armed_with_phases()
         _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0)] + [(50.0, 0.0)] * 8 + [(75.0, 0.0)])
         with (
             _watchdog_env(feed) as env,
             caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
         ):
             await _spawn_watchdog(pid, armed, clock)
-        return env, clock
+        cleared = _records(caplog, "sweep phase cleared")
+        assert len(cleared) == 1
+        assert cleared[0].levelno == logging.WARNING
+        assert "OVERRAN" in cleared[0].getMessage()
+        env.stop.assert_not_called()
+
+    async def test_a_stale_park_beacon_never_ends_the_sweep_lane(self, caplog):
+        pid = 90063
+        armed = _armed_with_phases()
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (75.0, None)])
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _poll_then_cancel(pid, armed, clock, feed, polls=45)
+        assert not _records(caplog, "sweep phase cleared")
+        assert not _records(caplog, "sweep phase running")  # the WARN is fresh-gated too
+        env.stop.assert_not_called()
+
+    async def test_without_a_sweep_budget_the_watch_still_waits_for_the_park_beacon(self, caplog):
+        # No budget line to warn on, but the whole-job bound keeps binding until a fresh P75.
+        pid = 90064
+        armed = _armed_with_phases(sweep_span_s=None, tail_s=None)
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (60.0, 0.0), (75.0, 0.0)])
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        assert _records(caplog, "bed-drop phase cleared")
+        cleared = _records(caplog, "sweep phase cleared")
+        assert len(cleared) == 1 and "budget none" in cleared[0].getMessage()
+        assert not _records(caplog, "sweep phase running")
+        assert clock.now - clock.start == pytest.approx(8.0)
+        env.stop.assert_not_called()
+
+    async def test_without_a_sweep_budget_a_stuck_sweep_is_still_stopped_at_the_bound(self, caplog):
+        pid = 90065
+        armed = _armed_with_phases(sweep_span_s=None, tail_s=None)
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (60.0, 0.0)])
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        env.stop.assert_called_once_with(pid)
+        assert clock.now - clock.start == pytest.approx(104.0)
+        assert "stage=total" in _kill_line(caplog)
+
+
+class TestThePostSweepIsTheTerminals:
+    """Past a FRESH park beacon no motion over the plate remains: the watch ends — the whole-job bound
+    with it, production's rule — and the job's terminal, however long its firmware tail runs, is what
+    ends the eject. 23 of the 24 beacon-era kills fired there, on jobs whose parts had physically been
+    ejected; the epilogue deadline that made them stays deleted."""
 
     async def test_a_park_beacon_sample_never_produces_a_drop_late_kill(self, caplog):
-        # PINS THE FALLTHROUGH TRAP: the predecessor skipped the phase rules for a TUPLE
-        # of states and let everything else fall into the bed-drop branch — where a
-        # percent at/above the SWEEP beacon arriving past the drop deadline is a
-        # drop_late kill. This is that exact shape: a 0.5 s drop budget (deadline t5 +
-        # 8.5 s), the link blind through the sweep, and the first sample back is the PARK
-        # beacon at ~12 s. Read by the drop lane it is a drop_late kill; read by the
-        # phase that actually owns it, it is proof the sweep is over.
+        # PINS THE FALLTHROUGH TRAP: a 0.5 s drop budget (deadline t5 + 8.5 s), the link blind through
+        # the sweep, and the first sample back is the PARK beacon at ~12 s. Read by the drop lane it
+        # would be a drop_late kill; read by the phase that owns it, it is proof the sweep is over.
         pid = 90070
         clock = _FakeClock()
         feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (50.0, None), (50.0, None), (50.0, None), (75.0, 0.0)])
@@ -1951,36 +1982,462 @@ class TestRuntimeWatchdogEpilogue:
         assert not _records(caplog, "stage=drop_late")
         assert not _records(caplog, "stage=drop")
         assert _records(caplog, "sweep phase cleared")
-        assert "stage=epilogue" in _kill_line(caplog)
-        env.stop.assert_called_once_with(pid)
+        env.stop.assert_not_called()
 
-    async def test_the_epilogue_is_entered_on_the_first_fresh_park_sample(self, caplog):
-        await self._run_to_park(90071, caplog)
+    async def test_the_guard_ends_on_the_first_fresh_park_sample(self, caplog):
+        pid = 90071
+        armed = _armed_with_phases()
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)])
+        with (
+            _watchdog_env(feed),
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
         cleared = _records(caplog, "sweep phase cleared")
         assert len(cleared) == 1
         assert cleared[0].levelno == logging.INFO
         assert "in <=2.0s" in cleared[0].getMessage() and "budget 20s" in cleared[0].getMessage()
 
-    async def test_the_whole_job_deadline_is_not_enforced_once_the_sweep_is_proven_done(self, caplog):
-        # The change itself: this job ran 118 s past the rule that used to kill it.
-        env, clock = await self._run_to_park(90072, caplog)
-        assert clock.now - 1000.0 > remote.eject_abort_deadline_s(83.0)
-        # Killed at the epilogue deadline instead: park edge (t=6 s) + 15 s tail + the
-        # 200 s allowance, caught on the following 2 s poll.
-        assert clock.now - 1000.0 == pytest.approx(222.0)
+    async def test_a_job_slow_to_finish_after_the_sweep_is_never_stopped(self, caplog):
+        # The old epilogue kill's shape: the sweep proven done, the firmware tail running long. The
+        # watch has ended (a fresh P75 releases the whole-job bound); nothing stops the job; the plate
+        # stays gated until its terminal.
+        pid = 90073
+        armed = _armed_with_phases()
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (75.0, 0.0)])
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        env.stop.assert_not_called()
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is None
+        assert plate_occupancy.is_plate_occupied(pid)
+        assert pid not in remote._runtime_watchdogs
 
-    async def test_a_job_wedged_after_the_sweep_is_still_stopped_and_escalated(self, caplog):
-        # LIVENESS for the patient window: patience is bounded, the printer is freed, and
-        # the plate stays gated exactly as every other kill leaves it (the mark is what
-        # resolves the eject `unverified` → EscalationOnly).
-        env, clock = await self._run_to_park(90073, caplog)
-        env.stop.assert_called_once_with(90073)
-        assert plate_occupancy.pending_eject_view(90073).runtime_exceeded_at is not None
-        kill = _kill_line(caplog)
-        assert "stage=epilogue" in kill and "deadline 221s" in kill
-        detail = env.notify.await_args.kwargs["source_detail"]
-        assert "sweep COMPLETED" in detail and "under the heatbed" not in detail
-        assert 90073 not in remote._runtime_watchdogs
+
+class _ScriptedClock(_FakeClock):
+    """A fake clock that runs scripted acts (``(seconds since start, async act)``) once its own
+    sleeps carry it past each one — how a test drops and restores the printer's session mid-sweep."""
+
+    def __init__(self, script) -> None:
+        super().__init__()
+        self._script = sorted(script, key=lambda step: step[0])
+
+    async def sleep(self, delay: float) -> None:
+        await super().sleep(delay)
+        while self._script and self.now - self.start >= self._script[0][0]:
+            _at, act = self._script.pop(0)
+            await act()
+
+
+async def _eject_terminal(db, printer_id: int, final_status: str):
+    """Drive the eject's matched terminal through ``farm_policy.on_terminal`` — the ONE resolver —
+    and return its ``_finalize_remote_eject`` spy."""
+    from backend.app.services import farm_policy
+    from backend.app.services.eject import monitor as monitor_mod
+
+    with (
+        patch.object(
+            farm_policy.printer_manager, "get_client", return_value=SimpleNamespace(last_dispatch_subtask_id="SUB-E")
+        ),
+        patch.object(farm_policy, "quarantine_printer", new_callable=AsyncMock),
+        patch.object(farm_policy, "_finalize_remote_eject", new_callable=AsyncMock) as finalize,
+        patch.object(farm_policy, "_maybe_idle_deep_park", new_callable=AsyncMock),
+        patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock),
+    ):
+        await farm_policy.on_terminal(db, printer_id, None, final_status, completed_subtask_id="SUB-E")
+    return finalize
+
+
+class TestWholeJobBound:
+    """R20 — production's WHOLE-JOB deadline, restored (2026-10-12, operator ruling: "The behaviour
+    should stay the same for the most part … so if it was self heal, it should stay self heal").
+
+    The 2026-07-31 gouged plate (012-H2S): a stalled bed-drop ran 179 s against the 80-83 s band of
+    11 measured ejects (83 s estimate), still echoed ``completed`` and released the gate onto the
+    damaged plate. The bound is expected + clamp(25 %, 20 s, 60 s) of the printer's ONLINE seconds
+    from the PRINT START echo; past it the sweep is STOPPED under ``"total"``, the plate stays gated,
+    and a FINISH that lands after the stop clears nothing. Here: 83 s → 103.75 s, caught on the
+    104 s poll."""
+
+    async def test_the_bound_is_productions_figure_with_its_witness(self):
+        assert (remote.EJECT_ABORT_MARGIN_FRAC, remote.EJECT_ABORT_MARGIN_MIN_S, remote.EJECT_ABORT_MARGIN_MAX_S) == (
+            0.25,
+            20.0,
+            60.0,
+        )
+        assert remote.eject_abort_deadline_s(83.0) == pytest.approx(103.75)
+        assert remote.eject_abort_deadline_s(40.0) == pytest.approx(60.0)  # the 20 s floor
+        assert remote.eject_abort_deadline_s(600.0) == pytest.approx(660.0)  # the 60 s cap
+        bound = remote._whole_job_bound(83.0)
+        assert isinstance(bound, printer_action.SelfHealBound)
+        assert (bound.name, bound.seconds) == ("_EJECT_WHOLE_JOB_SELF_HEAL", pytest.approx(103.75))
+        assert "2026-07-31" in bound.witness and "80-83 s" in bound.witness
+
+    async def test_slow_firmware_a_sweep_finishing_just_inside_the_deadline_is_never_stopped(self, caplog):
+        # The sweep crawls (P75 only at 102 s, past the old 83 s estimate): one poll inside the bound,
+        # the fresh park beacon ends the watch and nothing is stopped.
+        pid = 90300
+        armed = _armed_with_phases()
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0)] + [(60.0, 0.0)] * 48 + [(75.0, 0.0)])
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.INFO, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        assert clock.now - clock.start == pytest.approx(102.0)
+        env.stop.assert_not_called()
+        env.notify.assert_not_awaited()
+        assert _records(caplog, "sweep phase cleared")
+        assert not _records(caplog, "[self-heal]")
+        assert plate_occupancy.pending_eject_view(pid).runtime_exceeded_at is None
+
+    async def test_an_overrun_is_stopped_at_the_bound_with_the_plate_gated_and_a_late_finish_clears_nothing(
+        self, db_session, caplog
+    ):
+        # The stuck-part shape: the drop cleared on budget, the sweep never reaches the park beacon.
+        pid = 90301
+        armed = _armed_with_phases()
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (60.0, 0.0)])
+        mark_at_stop: list[object] = []
+
+        def _stop(printer_id: int) -> bool:
+            mark_at_stop.append(plate_occupancy.pending_eject_view(printer_id).runtime_exceeded_at)
+            return True
+
+        from backend.app.services.eject import monitor as monitor_mod
+
+        with (
+            patch.object(printer_manager, "get_client", MagicMock(side_effect=feed)),
+            route_verbs(stop=MagicMock(side_effect=_stop)) as stop,
+            patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        stop.assert_called_once_with(pid)
+        assert clock.now - clock.start == pytest.approx(104.0)
+        assert mark_at_stop and mark_at_stop[0] is not None  # stamped BEFORE the stop went out
+        assert "stage=total" in _kill_line(caplog)
+        detail = notify.await_args.kwargs["source_detail"]
+        assert "STOPPED at its whole-job deadline after 100s of sweeping" in detail
+        healed = _records(caplog, "[self-heal]")
+        assert len(healed) == 1
+        assert "lane=eject whole-job" in healed[0].getMessage()
+        assert "_EJECT_WHOLE_JOB_SELF_HEAL" in healed[0].getMessage()
+        assert pid not in remote._runtime_watchdogs
+
+        # The printer then reports FINISH for the stopped sweep: the mark keeps the plate gated.
+        finalize = await _eject_terminal(db_session, pid, "completed")
+        view = plate_occupancy.snapshot(pid)
+        assert view.eject_present is False
+        assert view.plate_occupied is True
+        assert isinstance(view.plate_policy, EscalationOnly)
+        finalize.assert_not_awaited()
+
+    async def test_time_offline_does_not_count_toward_the_bound(self, caplog):
+        # The printer drops off the wire 50 s into the sweep and is back at 110 s: those 60 s are not
+        # online, so the bound passes at 163.75 s of wall time — the 164 s poll — not at 104 s.
+        from backend.app.services.printer_events import SessionLost
+
+        pid = 90302
+        armed = _armed_with_phases()
+        _claim(pid, armed)
+
+        async def lose() -> None:
+            printer_action.on_session_lost(SessionLost(printer_id=pid))
+
+        async def back() -> None:
+            await printer_action.reread_session(pid, 2)
+
+        clock = _ScriptedClock([(50.0, lose), (110.0, back)])
+        feed = _ProgressFeed(clock, [(5.0, 0.0), (50.0, 0.0), (60.0, 0.0)])
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(logging.WARNING, logger="backend.app.services.eject.remote"),
+        ):
+            await _spawn_watchdog(pid, armed, clock)
+        env.stop.assert_called_once_with(pid)
+        assert clock.now - clock.start == pytest.approx(164.0)
+        assert "stage=total" in _kill_line(caplog)
+
+    async def test_liveness_a_normal_eject_completes_and_clears_the_gate(self, db_session):
+        # The base journey: drop and sweep inside their budgets (80 s, the 2026-07-31 band), a fresh
+        # park beacon ends the watch, and the matched FINISH clears the plate for the next unit.
+        pid = 90303
+        armed = _armed_with_phases()
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(
+            clock,
+            [(0.0, 0.0)] * 5 + [(5.0, 0.0)] + [(20.0, 0.0)] * 12 + [(50.0, 0.0)] + [(60.0, 0.0)] * 9 + [(75.0, 0.0)],
+        )
+        with _watchdog_env(feed) as env:
+            task = _spawn_watchdog(pid, armed, clock)
+            await task
+        assert not task.cancelled()
+        env.stop.assert_not_called()
+        assert clock.now - clock.start == pytest.approx(58.0)
+
+        await _eject_terminal(db_session, pid, "completed")
+        view = plate_occupancy.snapshot(pid)
+        assert view.eject_present is False
+        assert view.plate_occupied is False
+
+
+class TestEjectStartBound:
+    """R30 — production's START deadline, restored as the record's self-heal bound (2026-10-12).
+
+    The 2026-08-30 shape: a busy printer silently ignores the ``project_file``, so the sweep never
+    starts and its claim wedges every later eject behind ``eject_in_flight``. The record's answer
+    decides first (a VOID / REFUSED / TAKEN_OVER start retires at once — :class:`TestEjectStartAnswer`);
+    the fallback is ``_EJECT_START_SELF_HEAL``, 180 s of the printer's ONLINE time from the send (the
+    fleet's start echo is ~45 s: 44/43 s measured 2026-08-30). Driven through the real dispatcher, the
+    record's own bound evaluation (``printer_action.check_bounds``) and the hub's ``SelfHealDue``."""
+
+    @pytest.fixture
+    def hub(self):
+        from backend.app.services import printer_events
+        from backend.app.services.printer_events import SelfHealDue
+
+        unsubscribe = printer_events.subscribe(SelfHealDue, remote.on_self_heal_due)
+        yield
+        unsubscribe()
+
+    @staticmethod
+    async def _drain() -> None:
+        for _ in range(5):
+            pending = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task() and (task.get_name() or "").startswith("printer-action")
+            ]
+            if not pending:
+                await asyncio.sleep(0)
+                continue
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _dispatch(self, db_session, own_session_factory, source: Path):
+        """A dispatched, claimed, NOT started sweep on a printer whose session began at the clock's start."""
+        printer, item = await _seed(db_session, source)
+        _gate(printer.id, source="SUB-GATE", policy=CooldownEject(unit_id=item.id, run_id=None))
+        clock = _FakeClock()
+        printer_action._session_began(printer.id)
+        c1, c2, c3 = _ftp_patches()
+        with (
+            c1,
+            c2,
+            c3,
+            route_verbs(start=MagicMock(return_value=True)),
+            patch("backend.app.core.database.async_session", own_session_factory),
+        ):
+            await remote.dispatch_part_present_eject(
+                db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=None
+            )
+        pending = plate_occupancy.pending_eject_view(printer.id)
+        assert pending is not None and pending.started_at is None
+        assert printer_action.outstanding(pending.start_action_id)
+        self.item_id = item.id
+        return printer, clock, pending.start_action_id
+
+    def _expiry_patches(self, own_session_factory):
+        from backend.app.services.eject import monitor as monitor_mod
+
+        notify = AsyncMock()
+        remove = AsyncMock(return_value=True)
+        return (
+            notify,
+            remove,
+            (
+                patch.object(monitor_mod, "notify_plate_not_empty", notify),
+                patch("backend.app.services.bambu_ftp.remove_abandoned_upload", remove),
+                patch("backend.app.core.database.async_session", own_session_factory),
+            ),
+        )
+
+    async def test_the_bound_is_productions_figure_with_its_witness(self):
+        bound = remote._EJECT_START_SELF_HEAL
+        assert (bound.name, bound.seconds) == ("_EJECT_START_SELF_HEAL", 180.0)
+        assert "44/43 s measured 2026-08-30" in bound.witness and "EJECT_START_TIMEOUT_S" in bound.witness
+
+    async def test_no_echo_by_180s_online_expires_pages_and_removes_the_file(
+        self, db_session, own_session_factory, hub, caplog
+    ):
+        source = _make_source_3mf()
+        try:
+            printer, clock, action_id = await self._dispatch(db_session, own_session_factory, source)
+            notify, remove, patches = self._expiry_patches(own_session_factory)
+            with patches[0], patches[1], patches[2], caplog.at_level(logging.WARNING):
+                clock.now += 179.0
+                printer_action.check_bounds()
+                await self._drain()
+                assert plate_occupancy.eject_identity(printer.id) is not None  # not yet
+                notify.assert_not_awaited()
+
+                clock.now += 1.0
+                printer_action.check_bounds()
+                await self._drain()
+
+            # The claim is gone (every later eject is free again) and the plate stays a person's.
+            assert plate_occupancy.eject_identity(printer.id) is None
+            view = plate_occupancy.snapshot(printer.id)
+            assert view.plate_occupied is True
+            assert isinstance(view.plate_policy, EscalationOnly)
+            assert plate_occupancy.ejectable(printer.id, Evidence()) is None
+            notify.assert_awaited_once()
+            assert notify.await_args.kwargs["source_detail"].startswith(
+                "the eject sweep was dispatched but the printer never started it within 180s — the plate has "
+                "NOT been swept."
+            )
+            _assert_removed(
+                remove,
+                printer.id,
+                remote._eject_remote_path(f"eject_production_item{self.item_id}"),
+                "the printer never started the sweep",
+            )
+            assert any("never echoed a PRINT START for its eject within 180s" in r.getMessage() for r in caplog.records)
+            assert any(
+                r.getMessage().startswith("[self-heal]") and "_EJECT_START_SELF_HEAL" in r.getMessage()
+                for r in caplog.records
+            )
+            # The action is NOT answered by the clock: a late answer still lands on the record.
+            assert printer_action.outstanding(action_id)
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_slow_firmware_a_start_echo_at_150s_is_honoured(self, db_session, own_session_factory, hub):
+        source = _make_source_3mf()
+        try:
+            printer, clock, _action_id = await self._dispatch(db_session, own_session_factory, source)
+            notify, remove, patches = self._expiry_patches(own_session_factory)
+            with patches[0], patches[1], patches[2]:
+                clock.now += 150.0
+                remote.on_eject_start_echo(printer.id)  # the sweep began, late
+                clock.now += 30.0
+                printer_action.check_bounds()  # the bound passes over a STARTED sweep
+                await self._drain()
+            identity = plate_occupancy.eject_identity(printer.id)
+            assert identity is not None and identity.started_at is not None  # the authority refused
+            notify.assert_not_awaited()
+            remove.assert_not_awaited()
+            assert printer.id in remote._runtime_watchdogs  # the started sweep is watched
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_time_offline_does_not_count_toward_the_start_bound(self, db_session, own_session_factory, hub):
+        from backend.app.services.bambu_mqtt import CommandAck
+        from backend.app.services.printer_events import CommandAcked, SessionLost
+
+        source = _make_source_3mf()
+        try:
+            printer, clock, action_id = await self._dispatch(db_session, own_session_factory, source)
+            # The printer accepted the frame (a busy printer ACKs it and then ignores it), so the new
+            # session's re-read does not void the start.
+            printer_action.on_command_acked(
+                CommandAcked(
+                    printer_id=printer.id,
+                    ack=CommandAck(
+                        command="project_file", sequence_id=str(action_id), result="success", reason=None, at=0.0
+                    ),
+                )
+            )
+            notify, remove, patches = self._expiry_patches(own_session_factory)
+            with patches[0], patches[1], patches[2]:
+                clock.now += 100.0
+                printer_action.on_session_lost(SessionLost(printer_id=printer.id))
+                clock.now += 100.0  # offline
+                await printer_action.reread_session(printer.id, 2)
+                clock.now += 79.0  # 179 s online, 279 s of wall time
+                printer_action.check_bounds()
+                await self._drain()
+                assert plate_occupancy.eject_identity(printer.id) is not None
+                notify.assert_not_awaited()
+
+                clock.now += 1.0
+                printer_action.check_bounds()
+                await self._drain()
+            assert plate_occupancy.eject_identity(printer.id) is None
+            notify.assert_awaited_once()
+        finally:
+            source.unlink(missing_ok=True)
+
+    async def test_a_late_echo_after_the_expiry_takes_productions_path(self, db_session, own_session_factory, hub):
+        # The sweep starts after all: no record is left to stamp, so nothing is armed and the plate
+        # stays gated for the person the expiry paged.
+        source = _make_source_3mf()
+        try:
+            printer, clock, _action_id = await self._dispatch(db_session, own_session_factory, source)
+            _notify, _remove, patches = self._expiry_patches(own_session_factory)
+            with patches[0], patches[1], patches[2]:
+                clock.now += 180.0
+                printer_action.check_bounds()
+                await self._drain()
+            assert plate_occupancy.eject_identity(printer.id) is None
+
+            remote.on_eject_start_echo(printer.id)
+
+            assert plate_occupancy.eject_identity(printer.id) is None
+            assert printer.id not in remote._runtime_watchdogs
+            view = plate_occupancy.snapshot(printer.id)
+            assert view.plate_occupied is True and isinstance(view.plate_policy, EscalationOnly)
+        finally:
+            source.unlink(missing_ok=True)
+
+    @pytest.mark.parametrize(
+        ("command", "action_id", "bound_name"),
+        [
+            ("print_start", 701, "_EJECT_START_SELF_HEAL"),  # another family
+            ("eject_start", 999, "_EJECT_START_SELF_HEAL"),  # another action
+            ("eject_start", 701, "_SOME_OTHER_SELF_HEAL"),  # another bound
+        ],
+        ids=["another_command", "another_action", "another_bound"],
+    )
+    async def test_a_self_heal_that_is_not_this_sweeps_start_retires_nothing(self, command, action_id, bound_name):
+        from backend.app.services.eject import monitor as monitor_mod
+        from backend.app.services.printer_events import SelfHealDue
+
+        pid = 90310
+        _claim(pid, PendingEject("production", 1, 5, expected_runtime_s=83.0, start_action_id=701))
+        with patch.object(monitor_mod, "notify_plate_not_empty", new_callable=AsyncMock) as notify:
+            await remote.on_self_heal_due(
+                SelfHealDue(
+                    printer_id=pid,
+                    action_id=action_id,
+                    command=command,
+                    bound_name=bound_name,
+                    incident_id=None,
+                    queue_item_id=5,
+                )
+            )
+        assert plate_occupancy.eject_identity(pid) is not None
+        notify.assert_not_awaited()
+
+    async def test_liveness_a_start_echoed_in_45s_runs_its_sweep(self, db_session, own_session_factory, hub):
+        # The fleet's measured shape: the echo at ~45 s stamps the start and arms the watch; the
+        # bound has nothing to retire.
+        source = _make_source_3mf()
+        try:
+            printer, clock, _action_id = await self._dispatch(db_session, own_session_factory, source)
+            notify, _remove, patches = self._expiry_patches(own_session_factory)
+            with patches[0], patches[1], patches[2]:
+                clock.now += 45.0
+                remote.on_eject_start_echo(printer.id)
+                clock.now += 135.0
+                printer_action.check_bounds()
+                await self._drain()
+            assert plate_occupancy.eject_identity(printer.id).started_at is not None
+            assert printer.id in remote._runtime_watchdogs
+            notify.assert_not_awaited()
+        finally:
+            source.unlink(missing_ok=True)
 
 
 class TestZReferenceEvidence:
@@ -2092,7 +2549,7 @@ class TestRedriveEjectStop:
 
     @staticmethod
     def _stop_patch(*, delivered: bool = True):
-        return patch.object(printer_manager, "stop_print", MagicMock(return_value=delivered))
+        return route_verbs(stop=MagicMock(return_value=delivered))
 
     @staticmethod
     def _notify_patch():
@@ -2110,7 +2567,7 @@ class TestRedriveEjectStop:
             return True
 
         with (
-            patch.object(printer_manager, "stop_print", MagicMock(side_effect=_stop)) as stop,
+            route_verbs(stop=MagicMock(side_effect=_stop)) as stop,
             self._notify_patch() as notify,
         ):
             assert await remote.redrive_eject_stop(pid, stage="power_loss") is True
@@ -2119,14 +2576,16 @@ class TestRedriveEjectStop:
         notify.assert_awaited_once()
         assert notify.await_args.kwargs["source_detail"] == "power_loss_eject_interrupted"
 
-    async def test_an_undelivered_stop_is_retried_exactly_once(self):
+    async def test_an_undelivered_stop_is_not_retried_on_a_clock(self):
+        # Sent once; the page says the truth, and the stamped pending stays unowned — the session
+        # start's reconcile re-drives it on the printer's next report (2026-10-11).
         pid = 90201
         _claim(pid, _armed())
-        sleep = _FakeSleep()
-        with self._stop_patch(delivered=False) as stop, self._notify_patch():
-            assert await remote.redrive_eject_stop(pid, stage="power_loss", sleep=sleep) is True
-        assert stop.call_count == 2
-        assert sleep.delays == [remote._STOP_RETRY_DELAY_S]
+        with self._stop_patch(delivered=False) as stop, self._notify_patch() as notify:
+            assert await remote.redrive_eject_stop(pid, stage="power_loss") is True
+        assert stop.call_count == 1
+        assert notify.await_args.kwargs["source_detail"] == remote._UNDELIVERED_STOP_DETAIL
+        assert plate_occupancy.unowned_eject(pid) is True
 
     async def test_it_is_idempotent_over_an_already_stamped_pending(self):
         # The outage shape exactly: the watchdog stamped, the stop could not be
@@ -2135,7 +2594,7 @@ class TestRedriveEjectStop:
         pid = 90202
         _claim(pid, _armed())
         stamped_at = datetime.now(timezone.utc) - timedelta(minutes=40)
-        plate_occupancy.note_eject_runtime_exceeded(pid, stamped_at, "total")
+        plate_occupancy.note_eject_runtime_exceeded(pid, stamped_at, "drop")
 
         with self._stop_patch() as stop, self._notify_patch() as notify:
             assert await remote.redrive_eject_stop(pid, stage="power_loss") is True
@@ -2165,14 +2624,7 @@ class TestRedriveEjectStop:
     async def test_the_power_loss_stage_invents_no_runtime_evidence(self):
         # Every other stage renders spans and deadlines. Here the machine was off the
         # wire, so any span would describe a job nobody was watching.
-        diagnostic, detail = remote._stop_reason(
-            "power_loss",
-            fired_deadline_s=0.0,
-            phase_elapsed_s=0.0,
-            expected_s=0.0,
-            drop_span_s=None,
-            sweep_span_s=None,
-        )
+        diagnostic, detail = remote._stop_reason("power_loss", phase_elapsed_s=0.0, drop_span_s=None)
         assert diagnostic == "eject interrupted by a power loss; sweep unverified"
         assert detail == "power_loss_eject_interrupted"
         assert "budget" not in diagnostic and "deadline" not in diagnostic
@@ -2181,9 +2633,9 @@ class TestRedriveEjectStop:
 def _armed_with_reference(pid_item: int = 5, *, reference_s: float = 19.5, **kw) -> remote.PendingEject:
     """A started pending whose block carries the Z re-reference phase.
 
-    83 s expected → a 103.75 s whole-job deadline; a 19.5 s drive → the 8 s margin floor
-    → its own budget line lands at overhead(25) + 19.5 + 8 = 52.5 s after the start echo,
-    and P5 is no longer expected before overhead + 19.5 + abort margin(20.75) = 65.25 s."""
+    A 19.5 s drive → the 8 s margin floor → its own budget line lands at overhead + 19.5 + 8
+    after the start echo, and the beacon-silence warning not before overhead + 19.5 + the
+    20.75 s whole-job grace of the 83 s estimate."""
     kw.setdefault("expected_runtime_s", 83.0)
     kw.setdefault("started_at", datetime.now(timezone.utc))
     kw.setdefault("drop_span_s", 30.0)
@@ -2232,48 +2684,62 @@ class TestRuntimeWatchdogReferencePhase:
         # ...and the phases after it run exactly as they do without the prologue.
         assert _records(caplog, "bed-drop phase cleared")
 
+    async def _run_waiting(self, pid: int, armed, samples, caplog, *, polls: int, level=logging.WARNING):
+        _claim(pid, armed)
+        clock = _FakeClock()
+        feed = _ProgressFeed(clock, samples)
+        with (
+            _watchdog_env(feed) as env,
+            caplog.at_level(level, logger="backend.app.services.eject.remote"),
+        ):
+            await _poll_then_cancel(pid, armed, clock, feed, polls=polls)
+        return env, clock
+
     async def test_a_drive_past_its_budget_warns_once_and_never_kills_there(self, caplog):
-        # Percent parked at 0: the drive's budget line (52.5 s) passes and NOTHING may
-        # fire there. The job is stopped later, by the whole-job backstop.
-        env, clock = await self._run(90082, _armed_with_reference(), [(0.0, 0.0)], caplog, level=logging.WARNING)
+        # Percent parked at 0: the drive's budget line passes and NOTHING may fire there — the
+        # whole-job bound (103.75 s) is the only backstop, and it has not passed at 100 s.
+        env, _clock = await self._run_waiting(90082, _armed_with_reference(), [(0.0, 0.0)], caplog, polls=50)
         warnings = _records(caplog, "Z re-reference running")
         assert len(warnings) == 1
         assert "19s budget" in warnings[0].getMessage() or "20s budget" in warnings[0].getMessage()
         assert "no phase kill fires here" in warnings[0].getMessage()
-        # The kill that DID happen is the whole-job backstop — never a reference stage.
-        kill = _kill_line(caplog)
-        assert "stage=total" in kill
-        assert clock.now - 1000.0 == pytest.approx(remote.eject_abort_deadline_s(83.0), abs=2.0)
+        env.stop.assert_not_called()
 
-    async def test_dead_beacons_fall_back_exactly_as_they_do_today(self, caplog):
-        # Never a kill at the first beacon: a stuck percent there is indistinguishable
-        # from firmware that does not reflect M73, so the printer degrades to the
-        # deadline-only watchdog it would have had before this recipe existed.
-        env, _clock = await self._run(90083, _armed_with_reference(), [(0.0, 0.0)], caplog, level=logging.WARNING)
+    async def test_dead_beacons_warn_once_and_leave_the_stop_to_the_whole_job_bound(self, caplog):
+        # Never a kill at the first beacon: a stuck percent there is indistinguishable from firmware
+        # that does not reflect M73. ONE warning — and the whole-job bound, which needs no evidence,
+        # stops the sweep at expected + margin (production's beacon-dead fallback).
+        armed = _armed_with_reference()
+        env, clock = await self._run(90083, armed, [(0.0, 0.0)], caplog, level=logging.WARNING)
         fallback = _records(caplog, "not reflected in mc_percent")
         assert len(fallback) == 1
-        assert "Z re-reference budget" in fallback[0].getMessage()
+        assert "cannot arm without the P5 beacon" in fallback[0].getMessage()
+        env.stop.assert_called_once_with(90083)
+        assert clock.now - clock.start == pytest.approx(104.0)
         assert "stage=total" in _kill_line(caplog)
 
-    async def test_the_p5_deadline_is_pushed_out_by_the_drive(self):
-        # Without this, enabling the prologue would look like beacon-death on EVERY job:
-        # the drive genuinely delays P5, so its budget must move the beacon-death line.
-        drive_s = 19.5
-        without = remote.EJECT_RUNTIME_OVERHEAD_S + remote._abort_margin_s(83.0)
-        with_drive = remote.EJECT_RUNTIME_OVERHEAD_S + drive_s + remote._abort_margin_s(83.0)
-        assert with_drive == pytest.approx(without + drive_s)
+    async def test_the_beacon_silence_warning_is_pushed_out_by_the_drive(self, caplog):
+        # Without this, enabling the prologue would look like beacon-death on EVERY job: the drive
+        # genuinely delays P5, so its budget moves the warning line out by exactly the drive.
+        armed = _armed_with_reference()
+        env, _clock = await self._run_waiting(90087, armed, [(2.0, 0.0)], caplog, polls=40)
+        fallback = _records(caplog, "not reflected in mc_percent")
+        assert len(fallback) == 1
+        at_s = float(fallback[0].getMessage().split(" at ")[1].split("s after")[0])
+        assert at_s >= remote.EJECT_RUNTIME_OVERHEAD_S + 19.5 + remote._abort_margin_s(83.0)
+        env.stop.assert_not_called()
 
     async def test_a_stale_sample_never_advances_the_phase(self, caplog):
         # FRESH-only, like every other lane: a percent published before this eject
         # started is not evidence that its drive completed.
-        env, _clock = await self._run(90084, _armed_with_reference(), [(2.0, None)], caplog, level=logging.WARNING)
+        env, _clock = await self._run_waiting(90084, _armed_with_reference(), [(2.0, None)], caplog, polls=45)
         assert _records(caplog, "Z re-reference cleared") == []
 
     async def test_going_blind_asks_for_evidence_once_rather_than_judging_on_silence(self, caplog):
-        env, _clock = await self._run(90085, _armed_with_reference(), [(0.0, None)], caplog, level=logging.WARNING)
+        env, _clock = await self._run_waiting(90085, _armed_with_reference(), [(0.0, None)], caplog, polls=45)
         env.pushall.assert_called_once_with(90085, remote._EVIDENCE_REASON)
 
-    async def test_the_healthy_sequence_still_reaches_the_epilogue(self, caplog):
+    async def test_the_healthy_sequence_still_reaches_the_park_beacon(self, caplog):
         # LIVENESS: the added phase must not strand the poller short of the lanes that
         # come after it (the 2026-08-08 lesson — a cured storm and a starved deadlock
         # look identical on absence metrics).
@@ -2283,7 +2749,7 @@ class TestRuntimeWatchdogReferencePhase:
         assert _records(caplog, "Z re-reference cleared")
         assert _records(caplog, "bed-drop phase cleared")
         assert _records(caplog, "sweep phase cleared")
-        assert "stage=epilogue" in _kill_line(caplog)
+        env.stop.assert_not_called()
 
 
 class TestTheCommandedPlateIsTheBuiltPlate:
@@ -2332,7 +2798,7 @@ class TestTheCommandedPlateIsTheBuiltPlate:
                     "backend.app.services.bambu_ftp.get_ftp_retry_settings", AsyncMock(return_value=(False, 0, 0, 30))
                 ),
                 patch("backend.app.services.bambu_ftp.upload_file_async", AsyncMock(side_effect=_capture)),
-                patch.object(printer_manager, "start_print", start),
+                route_verbs(start=start),
             ):
                 await remote.dispatch_part_present_eject(
                     db_session, printer_id=printer.id, queue_item_id=item.id, purpose="production", run_id=7
@@ -2359,7 +2825,7 @@ class TestTheCommandedPlateIsTheBuiltPlate:
                 c1,
                 c2,
                 c3,
-                patch.object(printer_manager, "start_print", MagicMock(return_value=True)) as start,
+                route_verbs(start=MagicMock(return_value=True)) as start,
                 pytest.raises(remote.EjectDispatchError) as exc,
             ):
                 await remote.dispatch_part_present_eject(

@@ -22,6 +22,7 @@ from backend.app.services.dispatch_target import encode_printer_ids
 from backend.app.services.farm_correlation import (
     OPERATOR_STOP_VERDICTS,
     REQUEUE_VERDICTS,
+    STOP_VERDICT_AIR_STOP,
     STOP_VERDICT_FAULT_RESTART,
     STOP_VERDICT_PLATE_REFUSED,
     StopVerdict,
@@ -45,7 +46,7 @@ from backend.app.services.plate_occupancy import (
     PlateRefusal,
     plate_occupancy,
 )
-from backend.app.services.printer_incidents import PAYLOAD_FAULT_RESTART_STOP
+from backend.app.services.printer_incidents import PAYLOAD_AIR_STOP, PAYLOAD_FAULT_RESTART_STOP
 from backend.app.services.printer_manager import printer_manager
 
 # The per-file occupancy reset that used to live here is GONE: the plate-vision
@@ -766,6 +767,66 @@ class TestClassifyStopFaultRestart:
         assert STOP_VERDICT_FAULT_RESTART in get_args(StopVerdict)
         assert STOP_VERDICT_FAULT_RESTART in REQUEUE_VERDICTS
         assert STOP_VERDICT_FAULT_RESTART not in OPERATOR_STOP_VERDICTS
+
+
+class TestClassifyStopAirStop:
+    """``air_stop``: a non-completed terminal of the job an open row carries the farm's AIR stop for
+    (operator ruling 2026-10-12: on proof a layer printed with nothing fed, the farm stops the ruined
+    print and the unit is retried). The LEDGER decides, never the echo: the H2S echoes the farm's own
+    remote stop as a screen-stop cancel echo, which without this rank would cancel the unit with no
+    retry and hold its run."""
+
+    _AIR = {"kind": "toolhead_refill", "job_id": "JOB-7", "printer_messages": [], PAYLOAD_AIR_STOP: True}
+
+    @pytest.mark.parametrize("status", ["failed", "aborted", "cancelled"])
+    def test_an_h2s_air_stop_terminal_carrying_a_cancel_echo_classifies_air_stop(self, status):
+        payload = {"status": status, "subtask_id": "JOB-7", "user_cancel_observed": True}
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._AIR]) == STOP_VERDICT_AIR_STOP
+        )
+
+    def test_an_h2c_air_stop_with_no_echo_classifies_air_stop(self):
+        payload = {"status": "failed", "subtask_id": "JOB-7"}
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._AIR]) == STOP_VERDICT_AIR_STOP
+        )
+
+    def test_it_outranks_the_operators_ui_stop_and_the_reconciles_unknown(self):
+        payload = {"status": "failed", "subtask_id": "JOB-7", "user_cancel_observed": True, "outcome_unknown": True}
+        assert classify_stop(payload, operator_stop_requested=True, open_incidents=[self._AIR]) == STOP_VERDICT_AIR_STOP
+
+    def test_it_ranks_after_a_refused_plate_and_a_restart_stop(self):
+        """A refused plate printed nothing and a restart stop names a job that deposited nothing: neither
+        carries a layer printed on air, and both keep their place above it."""
+        payload = {"status": "failed", "subtask_id": "JOB-7"}
+        vision = {"kind": "plate_vision", "job_id": "JOB-7", "printer_messages": []}
+        restart = {"kind": "jam", "job_id": "JOB-7", "printer_messages": [], PAYLOAD_FAULT_RESTART_STOP: True}
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._AIR, vision])
+            == STOP_VERDICT_PLATE_REFUSED
+        )
+        assert (
+            classify_stop(payload, operator_stop_requested=False, open_incidents=[self._AIR, restart])
+            == STOP_VERDICT_FAULT_RESTART
+        )
+
+    def test_another_jobs_terminal_and_a_completed_terminal_are_not_the_air_stop(self):
+        other = {"status": "failed", "subtask_id": "JOB-8", "user_cancel_observed": True}
+        assert classify_stop(other, operator_stop_requested=False, open_incidents=[self._AIR]) == "operator_screen"
+        finished = {"status": "completed", "subtask_id": "JOB-7"}
+        assert classify_stop(finished, operator_stop_requested=False, open_incidents=[self._AIR]) is None
+
+    @pytest.mark.parametrize("flag", [False, None])
+    def test_a_row_without_the_ledgered_air_stop_keeps_the_operators_verdict(self, flag):
+        row = {**self._AIR, PAYLOAD_AIR_STOP: flag}
+        payload = {"status": "failed", "subtask_id": "JOB-7", "user_cancel_observed": True}
+        assert classify_stop(payload, operator_stop_requested=False, open_incidents=[row]) == "operator_screen"
+
+    def test_the_token_is_a_member_of_the_closed_set_and_no_requeue(self):
+        """It is the ORDINARY failed disposition: never a requeue verdict, never an operator stop."""
+        assert STOP_VERDICT_AIR_STOP in get_args(StopVerdict)
+        assert STOP_VERDICT_AIR_STOP not in REQUEUE_VERDICTS
+        assert STOP_VERDICT_AIR_STOP not in OPERATOR_STOP_VERDICTS
 
 
 class TestResolvePrintingFarmItem:

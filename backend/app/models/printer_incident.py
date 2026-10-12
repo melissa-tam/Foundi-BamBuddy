@@ -276,12 +276,15 @@ STATUS_ABORTED = "aborted"
 # How an incident closed. ``None`` on a transient close (the fault never held the
 # printer — the firmware handled it before we could act), which is an outcome no
 # actor can claim.
+# ``auto_resume`` — the refill lane closed a runout row on its resume's confirm. No closer writes it since
+# R27 (2026-10-12: the row ends on the layer advance or the terminal, through the rule table); it stays a
+# token so the outcome ledger still reads the rows that carry it.
 RESOLVE_AUTO_RESUME = "auto_resume"
 RESOLVE_OBSERVED_RUNNING = "observed_running"
 RESOLVE_TERMINAL = "terminal"
 RESOLVE_OPERATOR = "operator"
 # Another actor PAUSED the print after the recovery driver's own swap resume ran
-# (``spool_recovery._takeover``'s ``paused_elsewhere``): the PAUSE read on a quiet path —
+# (``command_outcome.takeover``'s ``paused_elsewhere``): the PAUSE read on a quiet path —
 # no actionable fault on either wire lane and the AMS out of a change — so it is not the
 # re-jam the driver retries, and the driver stands aside (no resume, no park). Its own
 # token beside ``operator`` because the pause's actor is not known: a touchscreen or UI
@@ -409,6 +412,19 @@ class PrinterIncident(Base):
     # incident is still open, so this column alone answers "is this printer held".
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     resolve_source: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    # The tracked job's layer when the fault opened (or re-classified) the row
+    # (``BambuMQTTClient.job_peaks().layer_num``), recorded by the AMS entry: the ``repair`` class's
+    # "a print ran through the path AFTER the fault" is a layer printed FED past this one — the job's
+    # own record, read back off the terminal payload or the live job, durable across the restart that
+    # emptied the motion ledger it replaced (2026-10-11). NULL on rows opened before the column
+    # existed and on every opener with no fault layer to state.
+    fault_layer: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # An ABORTED close bars re-entry for its exact standing fault until the wire RE-ARMS it — the
+    # fault's codes no longer all standing, or the printer witnessed pausing again
+    # (``spool_recovery._rearm_blocked``). When that was witnessed, naive UTC; NULL while the bar
+    # stands (and on every row not closed ABORTED). Durable since 2026-10-11, so a restart no longer
+    # lifts every bar at once.
+    rearmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (
         # ONE open incident per printer PER KIND — the durable successor of the

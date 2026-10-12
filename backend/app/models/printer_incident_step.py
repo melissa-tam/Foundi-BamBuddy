@@ -32,6 +32,14 @@ produces it, so they are stored as tokens.
 
 A driver is any lane that SENDS against an incident: the AMS recovery driver
 (``spool_recovery``) and the plate-check episode driver (``pause_recovery``).
+
+``action_id`` (2026-10-11) references the ``printer_action`` row the step's send was — the
+durable record of the command, its wire sequence id and the printer's ANSWER. The step keeps the
+driver's own vocabulary and reading (``kind``, ``name``, ``seq``, ``feeder``, ``outcome``,
+``read_at``); the send itself is the action's. ``sent_at`` and ``target`` are the ROLLBACK MIRROR
+of the action's own columns: still written at the send so the previous build (which reads them)
+stays a working rollback target, and READ BY NOTHING in this build
+(``test_code_quality.TestPrinterActionOwnership``). Their contracting drop is an open item.
 """
 
 from datetime import datetime
@@ -85,15 +93,24 @@ class PrinterIncidentStep(Base):
     kind: Mapped[str] = mapped_column(String(8), nullable=False)
     # The lever name or the command name.
     name: Mapped[str] = mapped_column(String(32), nullable=False)
-    # The AMS global tray a command named; NULL for a lever (a lever names no tray).
+    # ROLLBACK MIRROR of the action's ``target`` (the module docstring): written, never read.
     target: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # The feeder-position kind the driver read at the send; NULL when it read none.
     feeder: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Filled at the READ. NULL = sent and never read (a crash between the two).
     outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # Naive UTC, matching ``printer_incident``'s timestamp columns.
-    sent_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # The plate a plate-check press was sent over, as the farm read it AT the send
+    # (``plate_occupancy.DepositEvidence.ledger_token``: ``deposited`` / ``clear``) — recorded so the
+    # ladder's ONE decision reads the trip's own measurement even after a restart left the new client
+    # unable to vouch for the job's peaks (2026-10-11). NULL on every other step, and on a press
+    # written before the column existed (the decision then reads the live job, failing closed).
+    deposit: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # ROLLBACK MIRROR of the action's ``sent_at`` (naive UTC): written, never read.
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The ``printer_action`` this step's send was; NULL for a step that sent nothing (a lever whose
+    # publish never left) or one written before the record existed and not yet backfilled.
+    action_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # One step per (incident, seq). Declared as a unique INDEX rather than a
@@ -104,4 +121,6 @@ class PrinterIncidentStep(Base):
         Index("ux_printer_incident_step_seq", "incident_id", "seq", unique=True),
         # The re-entry read: every step of one incident.
         Index("ix_printer_incident_step_incident", "incident_id"),
+        # The step of one action (the projection's join, the backfill's re-run guard).
+        Index("ix_printer_incident_step_action", "action_id"),
     )

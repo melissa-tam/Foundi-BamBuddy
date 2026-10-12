@@ -17,7 +17,9 @@ What that investigation established, and what these tests defend:
 
 The consequence chain the mask closes, and the one it opens, are both destructive in one
 direction only — which is why a SET bit is believed at once and an all-zero mask must
-repeat first.
+repeat first. Only FRESH frames count toward either streak (``live_reading.is_fresh``: the
+current session's first report already applied), so a reconnect breaks a run rather than
+extending it (``TestOnlyFreshFramesCount``; restored with the streaks 2026-10-12).
 """
 
 import copy
@@ -105,8 +107,22 @@ def client():
     c.on_ams_push_raw = captured.append
     c._client = MagicMock()
     c.state.connected = True
+    # The session's first report has been applied (``live_reading.is_fresh``): every push below is
+    # a frame of the LIVE session unless a test simulates a reconnect (``_reconnect``).
+    c.state.report_epoch = c.state.connection_epoch
     c.captured = captured  # type: ignore[attr-defined]
     return c
+
+
+def _reconnect(client):
+    """A new MQTT session whose first report has not landed yet (``_on_connect``'s two writes)."""
+    client.state.connection_epoch += 1
+    client.state.report_epoch = None
+
+
+def _first_report_applied(client):
+    """The session's first report stamped (``_update_state``'s ``report_epoch`` write)."""
+    client.state.report_epoch = client.state.connection_epoch
 
 
 def _observed(client, ams_id=0, tray_id=0):
@@ -496,3 +512,68 @@ class TestPersistentBitStateContradiction:
                 _push_latched(client)
         lines = [r for r in caplog.records if "the mask wins" in r.getMessage() and "tray 0" in r.getMessage()]
         assert len(lines) == 1
+
+
+class TestOnlyFreshFramesCount:
+    """Both streaks count frames of the LIVE session only (``live_reading.is_fresh``, read before the
+    push applies). A frame of a session whose first report has not landed — a reconnect — breaks the run
+    instead of extending it, so two frames before a reconnect plus one after can never make three."""
+
+    def test_a_reconnect_breaks_the_zero_mask_streak(self, client):
+        empty = _ams_push(copy.deepcopy(PRINTER_1_KEYLESS), bits="0")
+        for _ in range(_ZERO_EXIST_BITS_TRUST_PUSHES - 1):
+            client._handle_ams_data(copy.deepcopy(empty))
+        _reconnect(client)
+        client._handle_ams_data(copy.deepcopy(empty))  # the new session's frame, not yet fresh
+        assert _observed(client).exist_bit is None, "a stale frame never completes the streak"
+        assert client._zero_exist_bits_streak == 0
+        _first_report_applied(client)
+        for push_n in range(1, _ZERO_EXIST_BITS_TRUST_PUSHES):
+            client._handle_ams_data(copy.deepcopy(empty))
+            assert _observed(client).exist_bit is None, f"fresh frame {push_n} of the new run"
+        client._handle_ams_data(copy.deepcopy(empty))
+        assert _observed(client).exist_bit is False
+        assert _observed(client).present is False
+
+    def test_a_disconnected_client_never_counts_a_zero_frame(self, client):
+        client.state.connected = False
+        empty = _ams_push(copy.deepcopy(PRINTER_1_KEYLESS), bits="0")
+        for _ in range(_ZERO_EXIST_BITS_TRUST_PUSHES + 2):
+            client._handle_ams_data(copy.deepcopy(empty))
+            assert _observed(client).exist_bit is None
+
+    def test_a_set_bit_needs_no_freshness(self, client):
+        """Believing a spool is there destroys nothing, so a set bit stays trusted at once — even on a
+        new session's first frame."""
+        _reconnect(client)
+        client._handle_ams_data(_ams_push([{"id": "0", "state": 9}], bits="1"))
+        assert _observed(client).exist_bit is True
+        assert _observed(client).present is True
+
+    def test_a_reconnect_empties_the_contradiction_bank(self, client):
+        # The zero mask itself must be trusted for the latched frames to be trusted frames at all, so the
+        # contradiction is driven with ANOTHER slot's bit set (mask 0b0010: slot 1 present, slot 0 clear).
+        _push_latched(client, bits="f")  # every bit set: no contradiction (seeds the merged copy)
+        _push_latched(client, bits="2")
+        _push_latched(client, bits="2")  # bank = 2 on slot 0
+        assert _observed(client).present is None
+        _reconnect(client)
+        _push_latched(client, bits="2")  # a trusted mask, but no frame of the live session's run
+        assert _observed(client).present is None, "a stale frame never completes the bank"
+        assert client._bit_state_contradiction_streak == {}
+        _first_report_applied(client)
+        for push_n in (1, 2):
+            _push_latched(client, bits="2")
+            assert _observed(client).present is None, f"fresh frame {push_n} after the reconnect"
+        _push_latched(client, bits="2")
+        assert _observed(client).present is False
+
+    def test_three_fresh_contradicting_frames_resolve_to_the_mask(self, client):
+        """The liveness half: the base journey still completes on the live session."""
+        _push_latched(client, bits="f")  # every bit set: no contradiction (seeds the merged copy)
+        for push_n in (1, 2):
+            _push_latched(client, bits="2")
+            assert _observed(client).present is None, f"contradicted frame {push_n} stays fail-open"
+        _push_latched(client, bits="2")
+        assert _observed(client).present is False
+        assert _observed(client, tray_id=1).present is not False

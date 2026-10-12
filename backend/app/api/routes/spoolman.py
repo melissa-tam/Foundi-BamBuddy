@@ -21,6 +21,7 @@ from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spoolman_k_profile import SpoolmanKProfile
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.models.user import User
+from backend.app.services import printer_action
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.slot_identity import compose_sub_brands, resolve_slot_identity
 from backend.app.services.spoolman import (
@@ -999,28 +1000,40 @@ async def link_spool(
                         "printer" if printer_kp else "stored",
                     )
 
-                mqtt_client.ams_set_filament_setting(
-                    ams_id=a_id,
-                    tray_id=t_id,
-                    tray_info_idx=effective_tray_info_idx,
-                    tray_type=tray_type,
-                    tray_sub_brands=tray_sub_brands,
-                    tray_color=tray_color,
-                    nozzle_temp_min=temp_min,
-                    nozzle_temp_max=temp_max,
-                    setting_id=effective_setting_id,
+                await printer_action.operator_verb(
+                    p_id,
+                    "ams_filament_setting",
+                    lambda live, seq: live.ams_set_filament_setting(
+                        ams_id=a_id,
+                        tray_id=t_id,
+                        tray_info_idx=effective_tray_info_idx,
+                        tray_type=tray_type,
+                        tray_sub_brands=tray_sub_brands,
+                        tray_color=tray_color,
+                        nozzle_temp_min=temp_min,
+                        nozzle_temp_max=temp_max,
+                        setting_id=effective_setting_id,
+                        sequence_id=seq,
+                    ),
+                    client=mqtt_client,
                 )
 
                 if matching_kp and matching_kp.cali_idx is not None:
                     cali_filament_id = (
                         printer_kp.filament_id if printer_kp and printer_kp.filament_id else None
                     ) or effective_tray_info_idx
-                    mqtt_client.extrusion_cali_sel(
-                        ams_id=a_id,
-                        tray_id=t_id,
-                        cali_idx=matching_kp.cali_idx,
-                        filament_id=cali_filament_id,
-                        nozzle_diameter=nozzle_diameter,
+                    await printer_action.operator_verb(
+                        p_id,
+                        "extrusion_cali_sel",
+                        lambda live, seq: live.extrusion_cali_sel(
+                            ams_id=a_id,
+                            tray_id=t_id,
+                            cali_idx=matching_kp.cali_idx,
+                            filament_id=cali_filament_id,
+                            nozzle_diameter=nozzle_diameter,
+                            sequence_id=seq,
+                        ),
+                        client=mqtt_client,
                     )
                     logger.info(
                         "Spoolman link: applied K-profile cali_idx=%d "
@@ -1044,12 +1057,18 @@ async def link_spool(
                         live_tray = _find_tray_in_ams_data(ams_raw, a_id, t_id)
                     live_cali_idx = (live_tray or {}).get("cali_idx")
                     if live_cali_idx is not None and live_cali_idx >= 0:
-                        mqtt_client.extrusion_cali_sel(
-                            ams_id=a_id,
-                            tray_id=t_id,
-                            cali_idx=live_cali_idx,
-                            filament_id=effective_tray_info_idx,
-                            nozzle_diameter=nozzle_diameter,
+                        await printer_action.operator_verb(
+                            p_id,
+                            "extrusion_cali_sel",
+                            lambda live, seq: live.extrusion_cali_sel(
+                                ams_id=a_id,
+                                tray_id=t_id,
+                                cali_idx=live_cali_idx,
+                                filament_id=effective_tray_info_idx,
+                                nozzle_diameter=nozzle_diameter,
+                                sequence_id=seq,
+                            ),
+                            client=mqtt_client,
                         )
 
                 logger.info(

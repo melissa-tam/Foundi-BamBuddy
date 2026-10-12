@@ -517,7 +517,7 @@ class _IdentifyClient:
     def ams_unit_drying(self, ams_id):
         return self.drying
 
-    def ams_refresh_tray(self, ams_id, tray_id):
+    def ams_refresh_tray(self, ams_id, tray_id, *, sequence_id=None):
         self.reads.append((ams_id, tray_id))
         return (True, "ok")
 

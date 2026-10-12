@@ -30,7 +30,7 @@ independent reasons, both load-bearing:
   dangerous direction — the plate ends HIGHER than the firmware believes — and every
   absolute Z after it is read in that corrupted frame. That is the 012-H2S 2026-07-31
   gouged-plate incident, recorded verbatim beside
-  :data:`~backend.app.services.eject.remote.EJECT_ABORT_MARGIN_FRAC`. ``G28 X`` /
+  :data:`~backend.app.services.eject.remote.EJECT_DROP_MARGIN_FRAC`. ``G28 X`` /
   ``G28 Y`` are sensorless-stall moves, so a home run in that corrupted frame can read
   contact with the part as its endstop and corrupt X/Y on top of Z, after which the
   sweep runs in a frame the envelope guard never validated. Homing BEFORE the drop
@@ -53,20 +53,18 @@ The module also owns :func:`estimate_runtime_segments` (and its total-only faça
 :func:`estimate_runtime_s`), the EXPECTED execution time of a generated block. There
 is no Z telemetry in the MQTT feed, so an eject whose bed-drop stalls against an
 obstruction (lost steps, bed returning too high) still reports ``completed`` — job
-RUNTIME is the only observable signature of that failure. The estimate is what the
-in-flight runtime watchdog turns into an abort deadline
-(``eject.remote.eject_abort_deadline_s``), so an eject still executing at that
-deadline is STOPPED mid-job instead of judged after the fact.
-
-A whole-job deadline can only catch a stall long enough to push the WHOLE eject past
-its margin (~59 s on the production profile), so the block also emits M73 PHASE
-BEACONS (:data:`PHASE_BEACON_LIFTED` / :data:`PHASE_BEACON_SWEEP` /
-:data:`PHASE_BEACON_PARK`). ``mc_percent`` is entirely M73-driven and resets to 0 at
-job start, so those three commands are the ONLY in-band phase signal the wire carries
-(``mc_print_line_number`` is absent on the H2S). The watchdog times the EDGES between
-them against the per-phase spans of :class:`EjectRuntimeSegments`, so each phase is
-bounded on its own: the sweep is provably unreached while ``mc_percent`` sits below the
-sweep beacon, and provably OVER once it reaches the park beacon.
+RUNTIME of the bed-drop phase is the only pre-sweep signature of that failure. The
+block therefore emits M73 PHASE BEACONS (:data:`PHASE_BEACON_LIFTED` /
+:data:`PHASE_BEACON_SWEEP` / :data:`PHASE_BEACON_PARK`). ``mc_percent`` is entirely
+M73-driven and resets to 0 at job start, so those three commands are the ONLY in-band
+phase signal the wire carries (``mc_print_line_number`` is absent on the H2S). The
+drop guard (``eject.remote._runtime_watchdog``, a named exception to the farm's
+event-only rule) times the EDGE that opens the drop against the drop span of
+:class:`EjectRuntimeSegments` and stops a drop that overruns it: the sweep is provably
+unreached while ``mc_percent`` sits below the sweep beacon, and provably OVER once it
+reaches the park beacon. Nothing stops a sweep on its whole-job estimate any more
+(2026-10-11): the estimate is a measurement — logged beside the measured ``ran Ns`` —
+and the page bound the attention owner reads it against.
 
 Two optional tunings narrow the sweep: an X sub-band (``sweep_x_min_mm`` /
 ``sweep_x_max_mm``) confines the lanes to part of the bed width instead of the
@@ -189,9 +187,9 @@ HOMING_ALLOWANCE_S = 10.0
 # calibration population above is entirely blocks WITHOUT that prologue, and it stays
 # valid for them: the constant is unchanged and every existing golden is byte-identical.
 # For a block WITH it, the drive's own commanded time is scored into ``reference_s`` and
-# flows into ``total_s``, so the whole-job deadline grows by the drive and by nothing
-# else — this constant is NOT re-fitted to cover it, because job spin-up and the finish
-# chime did not get longer.
+# flows into ``total_s``, so the estimate grows by the drive and by nothing else — this
+# constant is NOT re-fitted to cover it, because job spin-up and the finish chime did not
+# get longer.
 #
 # The residue that is honestly UNMEASURED: whatever fixed cost the firmware adds for
 # ``M211`` / ``G92`` / the ``G380`` guard's own settle, plus however early the guarded
@@ -323,12 +321,11 @@ M18
 
 M73 P100 R0"""
 
-# Seconds of job-completion tail the estimator deliberately does NOT count, and which a
-# post-sweep deadline must therefore tolerate before it may call a job wedged.
-#
-# It lives here, beside :data:`COMPLETION_EPILOGUE` (which holds the two ``M400 S180``
-# dwells) and the ``M622``/``M623`` skip rule in :func:`estimate_runtime_segments`, so the
-# fact and its numeric compensation can only ever change together.
+# The job-completion tail the estimator deliberately does NOT count (the ``M622``/``M623`` skip
+# rule in :func:`estimate_runtime_segments` over the two ``M400 S180`` dwells of
+# :data:`COMPLETION_EPILOGUE`). Nothing compensates for it in code any more: the post-sweep
+# deadline that had to tolerate it is gone (2026-10-11), and the attention owner's page bound
+# sits far above it. The measurement stays the record of what the tail costs:
 #
 # EVIDENCE (30 days of rotated prod logs, read 2026-08-31):
 #
@@ -342,13 +339,11 @@ M73 P100 R0"""
 #   is why the allowance is flat rather than derived per profile: it models firmware
 #   behaviour, not geometry.
 #
-# THE MEASUREMENT ABOVE IS THE AUTHORITY. The SIZING hypothesis is one firing of the
+# THE MEASUREMENT ABOVE IS THE AUTHORITY. The sizing hypothesis is one firing of the
 # conditional air-purification purge (``M400 S180`` = 180 s) plus chime/publish slop
-# (~20 s) — a hypothesis this constant does not depend on and cannot confirm. The
-# instrument that settles it is the ``ran Ns (expected Ns)`` terminal INFO once
-# post-sweep ejects are allowed to run to FINISH: a mode at +25-35 s refutes the purge,
-# a mode near +180 s confirms it.
-UNMODELLED_EPILOGUE_ALLOWANCE_S = 200.0
+# (~20 s). The instrument that settles it is the ``ran Ns (expected Ns)`` terminal INFO now
+# that every post-sweep eject runs to FINISH: a mode at +25-35 s refutes the purge, a mode
+# near +180 s confirms it.
 
 
 class EjectGenerationError(ValueError):
@@ -702,10 +697,10 @@ def cooldown_hold_lines(
 class EjectRuntimeSegments:
     """One eject block's commanded time, split at all three M73 phase beacons.
 
-    The split exists because the whole-job deadline can only catch a stall big enough
-    to overrun the ENTIRE eject's margin. ``drop_span_s`` bounds the bed-drop phase by
-    itself, which is the phase that stalls (2026-07-31 gouged plate, 2026-08-15 009-H2S)
-    and the one that must be caught BEFORE the sweep touches the plate. Since the block
+    The split exists because the bed-drop phase is the one that stalls (2026-07-31 gouged
+    plate, 2026-08-15 009-H2S) and the one that must be caught BEFORE the sweep touches the
+    plate: ``drop_span_s`` is what the drop guard (``eject.remote._runtime_watchdog``, the
+    named exception) bounds that phase by. Since the block
     became ONE Z flow that span also holds the block's FIRST Z move and the X/Y home:
     both now sit between the P5 and P50 beacons.
 
@@ -786,10 +781,9 @@ def estimate_runtime_segments(
       tail's air-purification blocks each hold an ``M400 S180``, and whether either
       fires is decided by ``print_finish_air_filt_flag`` — firmware state this process
       cannot read, on the wire or anywhere else. Counting both would add 360 s to every
-      estimate and make the guard structurally unable to fire, so the estimate is the
-      floor: what the machine was told to do MINUS whatever the firmware may add here.
-      :data:`UNMODELLED_EPILOGUE_ALLOWANCE_S` is that omission's numeric compensation and
-      carries the measurement behind its size.
+      estimate, so the estimate is the floor: what the machine was told to do MINUS
+      whatever the firmware may add here (the measurement of that tail sits beside
+      :data:`COMPLETION_EPILOGUE`).
     * **``G28`` (any dialect — ``G28 X Y``, the dual-nozzle torque forms
       ``G28 X T300`` / ``G28 Y T300``) zeroes X and Y and books
       :data:`HOMING_ALLOWANCE_S`** into whichever segment it sits in — the drop span, in
@@ -1250,7 +1244,7 @@ def generate_eject_gcode(
     #   toward a possible obstruction (debris under the plate). A stall there loses
     #   steps with the plate ending HIGHER than the firmware believes, and every
     #   absolute Z after it runs in that corrupted frame (012-H2S 2026-07-31,
-    #   gouged plate; see ``remote.EJECT_ABORT_MARGIN_FRAC``). ``G28 X``/``G28 Y`` are
+    #   gouged plate; see ``remote.EJECT_DROP_MARGIN_FRAC``). ``G28 X``/``G28 Y`` are
     #   sensorless-stall homes, so a home run in that frame can read contact with the
     #   part as its endstop and corrupt X/Y too. Homing here keeps the home in the
     #   frame the print left — the only frame the block has evidence for.

@@ -98,7 +98,7 @@ from backend.app.services.plate_occupancy import (
     TerminalDisposition,
     plate_occupancy,
 )
-from backend.app.services.printer_incidents import PAYLOAD_FAULT_RESTART_STOP
+from backend.app.services.printer_incidents import PAYLOAD_AIR_STOP, PAYLOAD_FAULT_RESTART_STOP
 from backend.app.utils.filename import print_identity_key
 from backend.app.utils.threemf_tools import list_gcode_plate_ids, resolve_plate_id
 
@@ -136,6 +136,18 @@ STOP_VERDICT_PLATE_REFUSED = "plate_refused"
 # 13 characters — inside ``print_queue.stop_source``'s VARCHAR(20).
 STOP_VERDICT_FAULT_RESTART = "fault_restart"
 
+# "The farm stopped this print because it printed on AIR." A terminal of the job an OPEN row's
+# ledger records the farm's air stop on (``printer_incidents.PAYLOAD_AIR_STOP``): on PROOF that a
+# layer printed with nothing fed — the feed state's AIR — the farm stops the ruined print and the unit
+# is retried (operator ruling 2026-10-12: "printing on air = ruined print already"). Read off the
+# projection, never off the printer's cancel echo: the H2S echoes the farm's own remote stop as a
+# screen-stop cancel echo, which would otherwise make it an operator stop (cancelled, no retry, the
+# run held). NOT a requeue verdict: ``terminal_outcome`` records it ``failed`` (``printed_without_
+# filament``) and it takes the ORDINARY failed disposition — the unit's one retry, the consecutive-
+# failure count, the plate gate of a deposit. 8 characters — inside ``print_queue.stop_source``'s
+# VARCHAR(20), though a ``failed`` terminal writes no stop source.
+STOP_VERDICT_AIR_STOP = "air_stop"
+
 # "The farm never learned how this print ended." Stamped when the DOWNTIME reconcile
 # synthesises a terminal for a print whose outcome the wire cannot supply — the printer
 # came back IDLE, or echoing a different job, so there is no FINISH/FAILED to believe.
@@ -156,7 +168,9 @@ PAYLOAD_KEY_OUTCOME_UNKNOWN = "outcome_unknown"
 # Why a terminal happened, as a CLOSED set. The disposition is selected from this
 # verdict once, ahead of the ``final_status`` fork, so a new reason for a print to end
 # has to be added here rather than sniffed out of a status string downstream.
-StopVerdict = Literal["plate_refused", "fault_restart", "operator_ui", "operator_screen", "reconcile_unknown"]
+StopVerdict = Literal[
+    "plate_refused", "fault_restart", "air_stop", "operator_ui", "operator_screen", "reconcile_unknown"
+]
 
 # The two verdicts a HUMAN produced by pressing Stop — the UI button (the unit's durable
 # stop request) or the printer's own screen (the cancel echo). One origin for "was this stop an
@@ -772,6 +786,16 @@ def classify_stop(
       echo, H2C echoes nothing, and an operator Stop pressed while the driver's stop was
       already out ends the same job the same way. Below ``plate_refused``: a refused plate
       is the printer's statement about the plate, and it holds the plate for a human.
+    - ``air_stop``          — the terminal is NOT ``completed`` and names the job an open row
+      carries the farm's AIR stop for (``printer_incidents.PAYLOAD_AIR_STOP``: the step ledger
+      holds an ``AIR_STOP_STEP``), the SAME job by ``job_identity.same_job``. Operator ruling
+      2026-10-12: on proof the print laid down a layer with nothing fed, the farm stops the
+      ruined print and the unit is retried. Ranked after ``plate_refused`` / ``fault_restart``
+      (a refused plate printed nothing, and a restart stop names a job that deposited nothing;
+      neither can carry a layer printed on air) and ABOVE both operator signals for the same
+      reason as ``fault_restart``: the H2S echoes the farm's own remote stop as a screen-stop
+      cancel echo, H2C echoes nothing, and the LEDGER says who ended the job. Without this
+      rank the unit would be cancelled with no retry and its run held.
     - ``operator_ui``       — ``operator_stop_requested``: Stop was pressed in the Bambuddy
       UI (the printer card, the queue page, the printer's HMS dialog, the API) for THIS
       job's unit. A FOREIGN job has no unit and no request; a UI stop of one falls through
@@ -792,7 +816,8 @@ def classify_stop(
     wire-capture session hunting an alternative echo code on this firmware line,
     prefer stopping H2C farm units from the Bambuddy UI (the request wins). A screen
     stop of a PAUSED plate check is unaffected: ``plate_refused`` needs no echo, and
-    neither does the farm's own restart stop — ``fault_restart`` reads the ledger.
+    neither do the farm's own restart and air stops — ``fault_restart`` and ``air_stop``
+    read the ledger.
 
     Pure — no DB, no I/O — so it is directly unit-testable; the caller captures its
     inputs once, before any consumer of the terminal mutates state.
@@ -809,6 +834,11 @@ def classify_stop(
         for incident in open_incidents
     ):
         return STOP_VERDICT_FAULT_RESTART
+    if status != "completed" and any(
+        incident.get(PAYLOAD_AIR_STOP) and same_job(job, str(incident.get("job_id") or "")) == "same"
+        for incident in open_incidents
+    ):
+        return STOP_VERDICT_AIR_STOP
     if operator_stop_requested:
         return "operator_ui"
     if payload.get("user_cancel_observed"):

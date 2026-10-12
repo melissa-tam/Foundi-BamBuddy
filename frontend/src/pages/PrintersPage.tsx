@@ -147,7 +147,6 @@ import { unshownPrinterMessages } from '../utils/printerMessages';
 import { FarmUnitChip } from '../components/FarmUnitChip';
 import { hmsTone } from '../utils/hmsTone';
 import { showNoUsbChip } from '../utils/noUsbChip';
-import { holdChip } from '../utils/incidentChip';
 import { HoldChip } from '../components/HoldChip';
 import { bulkResumeToast, refillingToast, refusalToast, resumeRefusalOf, tallyResumes } from '../utils/printResume';
 import { PrinterQueueWidget } from '../components/PrinterQueueWidget';
@@ -2208,8 +2207,8 @@ function PrinterCard({
   // A refused plate: the operator stopped a print the printer's own plate check
   // had paused. The stop wiped the printer's words, so the gate carries them.
   const plateRefusal = status?.occupancy?.plate.refusal;
-  // The hold chip: the open incident row, or the empty toolhead (`utils/incidentChip`).
-  const cardHoldChip = status ? holdChip(status) : null;
+  // The hold chip: the backend's one verdict (`PrinterStatus.hold_chip`), rendered as is.
+  const cardHoldChip = status?.hold_chip ?? null;
   // While a cooldown eject watch is armed, marking the plate cleared cancels
   // the pending auto-eject (the watch exits without sweeping). Surface that as a
   // hint on the mark-cleared button so the operator isn't surprised.
@@ -4329,8 +4328,9 @@ function PrinterCard({
                   foreign print's hold has no queue row, so without this chip it is
                   invisible in the UI entirely (12 foreign runouts held printers
                   with nothing on screen to say so). Which hold, its tone and its
-                  tooltip are `utils/incidentChip.holdChip`'s; kinds that own a
-                  surface of their own (the maintenance banner) never reach it. */}
+                  tooltip are the backend's verdict (`services/hold_chip`); kinds
+                  that own a surface of their own (the maintenance banner) never
+                  reach it. */}
               {cardHoldChip && <HoldChip chip={cardHoldChip} />}
               </div>
               {/* One-line HMS summary under the badge row — names the fault (incl.

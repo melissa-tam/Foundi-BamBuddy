@@ -383,8 +383,8 @@ def release_ok(bed_c: float | None, chamber_c: float | None, line_c: float | Non
     air further waiting buys nothing — and because the bed out-lags the exhausted chamber air
     all through a cooldown (production: chamber 26-27 °C within ~15-20 min, bed still ~35 °C),
     the own-air term only fires near equilibrium. A missing term is absent. No bed, or no term
-    at all, is False: the predicate cannot judge, and the cooldown watch's plateau and max-hold
-    cap are what end such a wait.
+    at all, is False: the predicate cannot judge, and the cooldown watch's plateau is what ends
+    such a wait.
     """
     limit = release_limit(line_c, chamber_c, margin_c)
     return bed_c is not None and limit is not None and bed_c <= limit.value_c
@@ -463,8 +463,8 @@ async def arm_line() -> EjectLine:
     """:func:`current_line` in its own session, for the cooldown watch's arm. Never raises.
 
     A watch that fails to arm strands the plate gate (2026-07-18/07-21), so a read failure
-    arms with shop air UNKNOWN and the schema's margin: the own-air term, the plateau and the
-    max-hold cap still end the wait.
+    arms with shop air UNKNOWN and the schema's margin: the own-air term and the plateau still
+    end the wait.
     """
     from backend.app.core.database import async_session
 

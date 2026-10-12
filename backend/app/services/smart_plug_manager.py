@@ -1,4 +1,25 @@
-"""Manager for smart plug automation and delayed turn-off."""
+"""Manager for smart plug automation and delayed turn-off.
+
+This module is the ONE owner of cutting a printer's smart plug after a print.
+Every "power the printer off afterwards" path delegates here: the plug's own
+auto-off (:meth:`SmartPlugManager.on_print_complete`, in the plug's time or
+temperature mode) and a queue unit's ``auto_off_after`` flag (the scheduler's
+dispatch-failure path, the print terminal in ``main`` and the queue page's stop
+route). The queue flag always takes the temperature path,
+:meth:`SmartPlugManager.schedule_temp_based_off`, with the plug's configured
+``off_temp_threshold``.
+
+The temperature-based cut fires only once every nozzle reads below the plug's
+threshold. It is never taken at a fixed timeout regardless of temperature: a
+printer still hot when the watch gives up keeps its power, and the watch logs
+a warning instead. (The queue paths used to wait at most 10 minutes for 50 °C
+and cut the plug whatever that wait answered.) A pending cut resumed after a
+restart is temperature-gated in every mode, the plug's time mode included.
+
+Background work is spawned through ``core.tasks.spawn_background_task``; the
+tasks the manager cancels (the scheduler loops and each plug's pending off)
+stay stored on the manager.
+"""
 
 import asyncio
 import logging
@@ -69,10 +90,10 @@ class SmartPlugManager:
     def start_scheduler(self):
         """Start the background scheduler for time-based plug control."""
         if self._scheduler_task is None:
-            self._scheduler_task = asyncio.create_task(self._schedule_loop())
+            self._scheduler_task = spawn_background_task(self._schedule_loop(), name="smart-plug-scheduler")
             logger.info("Smart plug scheduler started")
         if self._snapshot_task is None:
-            self._snapshot_task = asyncio.create_task(self._snapshot_loop())
+            self._snapshot_task = spawn_background_task(self._snapshot_loop(), name="smart-plug-energy-snapshot")
             logger.info("Smart plug energy snapshot loop started")
 
     def stop_scheduler(self):
@@ -292,7 +313,7 @@ class SmartPlugManager:
             if plug.off_delay_mode == "time":
                 self._schedule_delayed_off(plug, printer_id, plug.off_delay_minutes * 60)
             elif plug.off_delay_mode == "temperature":
-                self._schedule_temp_based_off(plug, printer_id, plug.off_temp_threshold)
+                self.schedule_temp_based_off(plug, printer_id, plug.off_temp_threshold)
 
     async def on_drying_complete(self, printer_id: int, db: AsyncSession):
         """Schedule turn-off for plugs flagged ``auto_off_after_drying`` when
@@ -343,7 +364,7 @@ class SmartPlugManager:
         # Mark as pending in database (survives restarts)
         spawn_background_task(self._mark_auto_off_pending(plug.id, True), name=f"plug-auto-off-pending-{plug.id}")
 
-        task = asyncio.create_task(
+        task = spawn_background_task(
             self._delayed_off(
                 plug.id,
                 plug.plug_type,
@@ -357,7 +378,8 @@ class SmartPlugManager:
                 rest_off_body=plug.rest_off_body if plug.plug_type == "rest" else None,
                 rest_method=plug.rest_method if plug.plug_type == "rest" else None,
                 rest_headers=plug.rest_headers if plug.plug_type == "rest" else None,
-            )
+            ),
+            name=f"plug-delayed-off-{plug.id}",
         )
         self._pending_off[plug.id] = task
 
@@ -412,8 +434,13 @@ class SmartPlugManager:
         finally:
             self._pending_off.pop(plug_id, None)
 
-    def _schedule_temp_based_off(self, plug: "SmartPlug", printer_id: int, temp_threshold: int):
-        """Monitor temperature and turn off when below threshold."""
+    def schedule_temp_based_off(self, plug: "SmartPlug", printer_id: int, temp_threshold: int):
+        """Cut ``plug`` once every nozzle of ``printer_id`` reads below ``temp_threshold``.
+
+        The one power-off-after-a-print path (see the module docstring). Callers pass
+        the plug's own ``off_temp_threshold``. It replaces any off already pending for
+        this plug, and it never cuts on a timeout.
+        """
         # Cancel any existing task for this plug
         self._cancel_pending_off(plug.id)
 
@@ -422,7 +449,7 @@ class SmartPlugManager:
         # Mark as pending in database (survives restarts)
         spawn_background_task(self._mark_auto_off_pending(plug.id, True), name=f"plug-auto-off-pending-{plug.id}")
 
-        task = asyncio.create_task(
+        task = spawn_background_task(
             self._temp_based_off(
                 plug.id,
                 plug.plug_type,
@@ -436,7 +463,8 @@ class SmartPlugManager:
                 rest_off_body=plug.rest_off_body if plug.plug_type == "rest" else None,
                 rest_method=plug.rest_method if plug.plug_type == "rest" else None,
                 rest_headers=plug.rest_headers if plug.plug_type == "rest" else None,
-            )
+            ),
+            name=f"plug-temp-off-{plug.id}",
         )
         self._pending_off[plug.id] = task
 
@@ -626,18 +654,10 @@ class SmartPlugManager:
 
                     logger.info("Resuming pending auto-off for plug '%s' (printer %s)", plug.name, plug.printer_id)
 
-                    # Resume the appropriate off mode
-                    if plug.off_delay_mode == "temperature":
-                        self._schedule_temp_based_off(plug, plug.printer_id, plug.off_temp_threshold)
-                    else:
-                        # For time mode, just turn off immediately since delay already passed
-                        logger.info("Time-based auto-off was pending, turning off plug '%s' now", plug.name)
-
-                        service = await self.get_service_for_plug(plug, db)
-                        success = await service.turn_off(plug)
-                        if success:
-                            await self._mark_auto_off_executed(plug.id)
-                            printer_manager.mark_printer_offline(plug.printer_id)
+                    # Temperature-gated in EVERY mode: how far a time-mode delay ran before the
+                    # restart is unknowable, and a cut while the printer is hot is the one outcome
+                    # to rule out.
+                    self.schedule_temp_based_off(plug, plug.printer_id, plug.off_temp_threshold)
 
                 if pending_plugs:
                     logger.info("Resumed %s pending auto-off(s)", len(pending_plugs))

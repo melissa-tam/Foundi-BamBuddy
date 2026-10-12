@@ -20,6 +20,7 @@ from httpx import AsyncClient
 from backend.app.models.printer_incident import KIND_SERVICE_HOLD, STATUS_ESCALATED, PrinterIncident
 from backend.app.services import printer_incidents, service_hold
 from backend.app.services.printer_manager import printer_manager
+from backend.tests._fixtures.printer_action import route_verbs_mp
 
 pytestmark = pytest.mark.asyncio
 
@@ -345,7 +346,7 @@ class TestDeactivateQuiescesFirst:
             return True
 
         monkeypatch.setattr(printer_manager, "get_status", lambda pid: SimpleNamespace(state="RUNNING"))
-        monkeypatch.setattr(print_control.printer_manager, "stop_print", lambda pid: stopped.append(pid) or True)
+        route_verbs_mp(monkeypatch, stop=lambda pid: stopped.append(pid) or True)
         monkeypatch.setattr(print_control, "stamp_operator_stop", _stamp)
         monkeypatch.setattr(printer_manager, "disconnect_printer", lambda pid: None)
 

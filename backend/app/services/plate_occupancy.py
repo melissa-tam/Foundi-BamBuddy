@@ -60,18 +60,21 @@ nested fan-out until the outer one drains, so ``kick`` can never read a record t
 changed under it. The record itself is already consistent when the nested call runs
 — only the notification is deferred, never the mutation.
 
-**Lease settlement is a read-time function, never a transition.** A committed lease
-counts as in-flight until the wire moves past its pre-dispatch snapshot and
-``min_hold_s`` has elapsed, or ``max_hold_s`` has elapsed outright — exactly the
-self-expiring shape of the scheduler's old ``_printer_in_dispatch_hold``. Making a
-settle a transition would fan persist/broadcast/kick out for a non-event, on a tick
-that returns early on an empty queue, so an idle queue could strand a lease past its
-own ceiling.
+**A lease ends on the START's answer, by transition (2026-10-11).** A committed lease holds the
+printer until the dispatch's ``print_start`` action is ANSWERED by the record
+(``services/dispatch_start``: reached → the job owns the printer; refused / void / taken over →
+the unit goes back to the queue), which calls :meth:`PlateOccupancy.release_dispatch`. Until then
+it holds, however long the printer takes — no minimum cooldown, no ceiling: the old read-time
+settlement ("the wire moved off its pre-dispatch state and 60 s passed, or 180 s passed") guessed
+the outcome from a clock, and a lease that lapsed under a start still digesting let a second
+dispatch onto the printer. A lease is process-local (never hydrated): after a restart the durable
+witness is the ``printing`` queue row (``Evidence.db_claim``), answered at the printer's first
+fresh report.
 
-**A bed-motion window ends the same way.** The held-bed lift is a CLAIMED motion
-(:meth:`PlateOccupancy.claim_bed_motion`): it holds the printer for exactly its own
-motion time, and the end of that window is read, never notified — the same shape, for the
-same reason, as a lease that settles.
+**A bed-motion window ends at READ time.** The held-bed lift is a CLAIMED motion
+(:meth:`PlateOccupancy.claim_bed_motion`): it holds the printer for exactly its own motion time,
+and the end of that window is read, never notified (a named exception: no end-of-motion report
+exists on the wire).
 """
 
 from __future__ import annotations
@@ -116,6 +119,11 @@ ACTIVE_PRINT_STATES: frozenset[str] = frozenset({"PREPARE", "SLICING", "RUNNING"
 # :attr:`DepositEvidence.final_status` of a job that has NOT ended (:meth:`DepositEvidence.live`):
 # never ``completed``, so only the peaks can say the plate is empty.
 _LIVE_JOB = "live"
+# The plate a plate-check press was sent over, as its ledger step records it
+# (``DepositEvidence.ledger_token`` / ``DepositEvidence.recorded``).
+DEPOSIT_DEPOSITED = "deposited"
+DEPOSIT_CLEAR = "clear"
+DEPOSIT_TOKENS: frozenset[str] = frozenset({DEPOSIT_DEPOSITED, DEPOSIT_CLEAR})
 
 
 TransitionRefusal = Literal[
@@ -196,12 +204,11 @@ class Evidence:
     witness that a unit is already on its way. The eject-side checks
     (:meth:`PlateOccupancy.ejectable`, :meth:`PlateOccupancy.claim_for_eject`)
     derive ``dispatch_in_flight`` from the unrevoked LEASE alone, because a
-    ``printing`` row on an IDLE printer is the 2026-08-29 dead-claim class — item
-    1010 on 001-H2S sat ``printing`` for 15 h behind a print that never started, and
-    the watchdog releases such a row only after 600 s of age plus a 120 s dwell.
-    Deriving an eject refusal from it would lock the operator out of a provably idle
-    plate for ≥12 minutes, which is strictly worse than the behaviour it replaces
-    (the manual eject lane never read the queue row at all).
+    ``printing`` row on an IDLE printer can be a start nobody answered — item 1010 on
+    001-H2S sat ``printing`` for 15 h behind a print that never started (2026-08-29).
+    Deriving an eject refusal from the row would lock the operator out of a provably
+    idle plate, which is strictly worse than the behaviour it replaces (the manual
+    eject lane never read the queue row at all).
 
     ``z_reference`` is "does the firmware's Z frame still describe the machine?", and
     it is TRI-STATE on purpose: ``None`` = nothing is known (every caller that has not
@@ -309,6 +316,27 @@ class DepositEvidence(JobExtent):
             last_layer_num=peaks.peak_layer_num,
             last_progress=peaks.peak_progress,
         )
+
+    @property
+    def ledger_token(self) -> str:
+        """This evidence as a plate-check press records it on its ledger step (``DEPOSIT_TOKENS``):
+        ``deposited`` when the plate must be assumed to carry a part, ``clear`` for the measured zero.
+        :meth:`recorded` reads it back."""
+        return DEPOSIT_DEPOSITED if self.deposited else DEPOSIT_CLEAR
+
+    @classmethod
+    def recorded(cls, token: str | None) -> DepositEvidence:
+        """The evidence a plate-check episode RECORDED at its trip (``printer_incident_step.deposit``,
+        written from :attr:`ledger_token` over :meth:`live`), read back — so the ladder's one decision reads
+        the trip's own measurement even after a restart left the new client unable to vouch for the job's
+        peaks (2026-10-11). ``clear`` is the measured zero; ``deposited``, a token this build cannot name,
+        and no record at all (``None``: a press written before the column existed) all fail CLOSED — the
+        plate carries a part."""
+        if token == DEPOSIT_CLEAR:
+            return cls(
+                final_status=_LIVE_JOB, is_dry_run=False, peaks_reliable=True, last_layer_num=0, last_progress=0.0
+            )
+        return cls(final_status=_LIVE_JOB, is_dry_run=False)
 
 
 @dataclass(frozen=True)
@@ -429,6 +457,10 @@ class PendingEject:
     start_z: float | None = None
     dispatched_at: datetime | None = None
     hydrated: bool = False
+    # The ``printer_action`` row of the sweep's ``project_file`` (its ``eject_start`` action): what the
+    # record's answer to the start is matched against (``eject.remote.on_action_answered``). None on a
+    # hydrated record (the durable mirror is one timestamp; the session start's reconcile owns those).
+    start_action_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -468,10 +500,6 @@ class DispatchLease:
     """
 
     unit_id: int
-    pre_state: str | None
-    pre_subtask: str | None
-    min_hold_s: float
-    max_hold_s: float
     minted_at_mono: float
     committed_at_mono: float | None = None
     revoked: bool = False
@@ -615,41 +643,18 @@ def _now_mono() -> float:
     return time.monotonic()
 
 
-def _lease_active(lease: DispatchLease, ev: Evidence, now_mono: float) -> bool:
-    """Is this lease still in flight, as of *now_mono* and the caller's evidence?
-
-    Pure, and evaluated on READ — never written back as a "settled" state. Three
-    cases:
+def _lease_active(lease: DispatchLease) -> bool:
+    """Is this lease still in flight? Two cases, no clock:
 
     * **revoked** — not active. An operator declared the plate occupied under it, so
       it no longer holds the printer; :meth:`PlateOccupancy.commit_dispatch` still
       finds it and refuses ``lease_revoked``, which is how the scheduler learns to
       unwind its row instead of printing onto a declared plate.
-    * **uncommitted** — always active. The upload is in progress; there is nothing
-      on the wire to transition yet, and the printer is unambiguously spoken for.
-    * **committed** — active until the wire moved past the pre-dispatch snapshot AND
-      ``min_hold_s`` elapsed, or ``max_hold_s`` elapsed outright.
-
-    The transition test is ``ev.live_state`` differing from ``pre_state``. The core
-    has no subtask evidence beyond the live state, so the old scheduler's second
-    limb (a subtask id advance) folds into the same test; an empty or absent
-    ``live_state`` is silence, not a transition. With a falsy ``pre_state`` no
-    transition is detectable at all and ``min_hold_s`` alone decides — the same
-    fallback the scheduler's sentinel empty string encoded.
+    * otherwise — active: an uncommitted lease is an upload in progress, a committed one a start
+      the record has not answered yet. It ends by :meth:`PlateOccupancy.release_dispatch`, on the
+      start's answer (``services/dispatch_start``) or on an unwind.
     """
-    if lease.revoked:
-        return False
-    if lease.committed_at_mono is None:
-        return True
-
-    elapsed = now_mono - lease.committed_at_mono
-    if elapsed >= lease.max_hold_s:
-        return False
-    if not lease.pre_state:
-        return elapsed < lease.min_hold_s
-
-    transitioned = ev.live_state not in (None, "", lease.pre_state)
-    return not (transitioned and elapsed >= lease.min_hold_s)
+    return not lease.revoked
 
 
 # ---------------------------------------------------------------------------
@@ -662,8 +667,8 @@ class PlateOccupancy:
 
     Transitions return :data:`TransitionRefusal` or ``None``; queries return views
     or refusals and never mutate anything an observer can see (they DO prune a
-    settled lease lazily, which is the expiry itself, not a state change — see
-    :meth:`_lease_in_flight`).
+    lapsed bed-motion window lazily, which is the expiry itself, not a state change — see
+    :meth:`_bed_motion_in_flight`).
 
     **The fan-out** runs after every state change, in a fixed order, through the
     five callables injected by :meth:`configure`:
@@ -779,10 +784,6 @@ class PlateOccupancy:
         printer_id: int,
         unit_id: int,
         *,
-        pre_state: str | None,
-        pre_subtask: str | None,
-        min_hold_s: float,
-        max_hold_s: float,
         ev: Evidence,
     ) -> DispatchLease | TransitionRefusal:
         """Claim a printer for a unit dispatch at PLAN time, before the upload.
@@ -792,9 +793,9 @@ class PlateOccupancy:
         apart. Returns the lease on success; a :data:`TransitionRefusal` string
         otherwise (test with ``isinstance(result, DispatchLease)``).
 
-        ``pre_state`` / ``pre_subtask`` are the wire snapshot taken NOW: settlement
-        later asks whether the printer moved off them, which is the only evidence
-        available that a print command actually landed.
+        The lease holds the printer until the dispatch's start is ANSWERED (the record's
+        ``print_start`` action, applied by ``services/dispatch_start``) or the dispatch unwinds —
+        :meth:`release_dispatch` either way.
         """
         refusal = self.dispatchable(printer_id, ev)
         if refusal is not None:
@@ -803,10 +804,6 @@ class PlateOccupancy:
         before = self._view(printer_id, None)
         lease = DispatchLease(
             unit_id=unit_id,
-            pre_state=pre_state,
-            pre_subtask=pre_subtask,
-            min_hold_s=min_hold_s,
-            max_hold_s=max_hold_s,
             minted_at_mono=_now_mono(),
         )
         self._record(printer_id).lease = lease
@@ -839,9 +836,9 @@ class PlateOccupancy:
         """Drop the lease. Idempotent, never refuses — a release must always be reachable.
 
         Purely in-memory. ``queue_transitions.release_unstarted_claim`` remains the
-        one writer of the queue row's status, and the two callers that un-make a
-        dispatch (the scheduler's start watchdog, the dead-claim watch) call BOTH:
-        this drops the printer claim, that drops the row claim.
+        one writer of the queue row's status, and the lane that un-makes a dispatch on its
+        start's answer (``services/dispatch_start``) calls BOTH: this drops the printer claim,
+        ``requeue.return_to_queue`` drops the row claim. A REACHED start drops only this.
         """
         record = self._records.get(printer_id)
         if record is None or record.lease is None:
@@ -1143,7 +1140,14 @@ class PlateOccupancy:
         The firmware silently ignores a ``project_file`` sent while it is busy, so a
         dispatched eject can simply never happen — no error, no terminal, nothing.
         That is how the 2026-08-30 pendings stayed registered forever and every later
-        eject 409'd. The start deadline is the only signal that shape produces.
+        eject 409'd. Two callers decide it, the event first: the record's answer to the
+        sweep's ``eject_start`` (refused, never received, or the busy job ending with ours
+        never reported — ``eject.remote.on_action_answered``), and production's self-heal
+        fallback when the printer says nothing — the start bound
+        (``eject.remote._EJECT_START_SELF_HEAL``, 180 s of the printer's online time from the
+        send, restored 2026-10-12: "if it was self heal, it should stay self heal") passing with
+        no PRINT START echo (``eject.remote.on_self_heal_due``). Either may arrive late or twice:
+        the refusals below make that harmless.
 
         A HYDRATED eject never expires here: its ``started_at`` is None by
         construction, so an expiry rule keyed on it would fire on every restart and
@@ -1226,7 +1230,7 @@ class PlateOccupancy:
           its way, and its own start block drives the bed off the stop, so the lift is not
           owed;
         * ``eject_in_flight`` — any registered eject, live or hydrated (as for
-          :meth:`dispatchable`: a hydrated one means the startup reconciler owns the printer);
+          :meth:`dispatchable`: a hydrated one means the session-start reconciler owns the printer);
         * ``bed_motion_in_flight`` — a motion is already claimed.
 
         NOT refused on an occupied plate: the lift exists for exactly the plate a human must
@@ -1235,13 +1239,13 @@ class PlateOccupancy:
 
         On grant the window is recorded as a monotonic deadline, ``now + hold_s``;
         :meth:`dispatchable` refuses ``bed_motion_in_flight`` until it passes. Its end is a
-        READ-TIME expiry (:meth:`_bed_motion_in_flight`), never a transition — like a lease's
-        settlement — so nothing is notified when it lapses. A caller whose motion never went
+        READ-TIME expiry (:meth:`_bed_motion_in_flight`), never a transition, so nothing is
+        notified when it lapses. A caller whose motion never went
         out ends it early with :meth:`release_bed_motion`.
         """
         if ev.live_state in ACTIVE_PRINT_STATES:
             return "job_active"
-        if self._lease_in_flight(printer_id, ev) or ev.db_claim:
+        if self._lease_in_flight(printer_id) or ev.db_claim:
             return "dispatch_in_flight"
         record = self._records.get(printer_id)
         if record is not None and record.eject is not None:
@@ -1320,7 +1324,7 @@ class PlateOccupancy:
         It is the 001/009-H2S shape of 2026-09-12: the whole-job deadline fired while
         the printer was off the wire, both stops went undelivered, the task exited, and
         the pending sat registered for hours refusing every later eject with
-        ``eject_in_flight`` — a state the startup reconciler would have cured, except
+        ``eject_in_flight`` — a state the session-start reconciler would have cured, except
         that nothing had restarted. Live records with no verdict are deliberately NOT
         unowned: their watchdog is running and owns them.
         """
@@ -1346,7 +1350,7 @@ class PlateOccupancy:
             return "plate_occupied"
         if record is not None and record.eject is not None:
             return "eject_in_flight"
-        if self._lease_in_flight(printer_id, ev) or ev.db_claim:
+        if self._lease_in_flight(printer_id) or ev.db_claim:
             return "dispatch_in_flight"
         if self._bed_motion_in_flight(printer_id):
             return "bed_motion_in_flight"
@@ -1378,7 +1382,7 @@ class PlateOccupancy:
             return "job_active"
         if ev.z_reference is False:
             return "z_unreferenced"
-        if self._lease_in_flight(printer_id, ev):
+        if self._lease_in_flight(printer_id):
             return "dispatch_in_flight"
         if self._live_eject(printer_id) is not None:
             return "eject_in_flight"
@@ -1432,15 +1436,13 @@ class PlateOccupancy:
     def printers_with_lease_or_eject(self) -> set[int]:
         """Printers this module claims, to augment the scheduler's DB-derived busy set.
 
-        Evaluated with no evidence, so a committed lease counts as in flight until
-        its ``max_hold_s`` ceiling — the safe direction for a busy set, since
-        over-reporting delays a dispatch by seconds while under-reporting sends one
-        onto a printer that is already taking a job.
+        A lease counts as in flight until its start is answered (:meth:`release_dispatch`) —
+        the safe direction for a busy set, since over-reporting delays a dispatch while
+        under-reporting sends one onto a printer that is already taking a job.
         """
-        ev = Evidence()
         claimed: set[int] = set()
         for printer_id, record in list(self._records.items()):
-            if record.eject is not None or self._lease_in_flight(printer_id, ev):
+            if record.eject is not None or self._lease_in_flight(printer_id):
                 claimed.add(printer_id)
         return claimed
 
@@ -1461,30 +1463,17 @@ class PlateOccupancy:
             return None
         return record.eject
 
-    def _lease_in_flight(self, printer_id: int, ev: Evidence) -> bool:
-        """Settle the lease on READ, pruning it once it is spent.
-
-        The prune is the expiry itself, not a state change, so it deliberately does
-        NOT notify: fanning persist/broadcast/kick out for a lease that simply timed
-        out would write on a tick that may not even have work to do. Only a
-        COMMITTED lease is pruned — an uncommitted one is always in flight, and a
-        revoked-but-uncommitted one must survive to be found by
-        :meth:`commit_dispatch` so it can refuse ``lease_revoked``.
-        """
+    def _lease_in_flight(self, printer_id: int) -> bool:
+        """Is a dispatch lease holding this printer (:func:`_lease_active`)? A pure read: a lease ends
+        only by :meth:`release_dispatch` (a revoked one survives, unpruned, so :meth:`commit_dispatch`
+        can still find it and refuse ``lease_revoked``)."""
         record = self._records.get(printer_id)
-        if record is None or record.lease is None:
-            return False
-
-        active = _lease_active(record.lease, ev, _now_mono())
-        if not active and record.lease.committed_at_mono is not None:
-            record.lease = None
-        return active
+        return record is not None and record.lease is not None and _lease_active(record.lease)
 
     def _bed_motion_in_flight(self, printer_id: int) -> bool:
         """Is a claimed bed motion still in its window? Pruned on READ once it lapses.
 
-        Like :meth:`_lease_in_flight`, the prune is the expiry itself, not a state change,
-        so it notifies nothing: the window is the motion's own time, and fanning a kick out
+        The prune is the expiry itself, not a state change, so it notifies nothing: the window is the motion's own time, and fanning a kick out
         for a motion that simply finished would write on a tick that may have no work.
         """
         record = self._records.get(printer_id)
@@ -1511,9 +1500,8 @@ class PlateOccupancy:
     def _view(self, printer_id: int, ev: Evidence | None) -> OccupancyView:
         """Project the record (settled against *ev*) into an immutable snapshot."""
         effective = ev if ev is not None else Evidence()
-        # Settle FIRST: a spent lease (or a lapsed bed motion) must not appear in the view
-        # it was pruned from.
-        lease_in_flight = self._lease_in_flight(printer_id, effective)
+        # Settle FIRST: a lapsed bed motion must not appear in the view it was pruned from.
+        lease_in_flight = self._lease_in_flight(printer_id)
         bed_motion_active = self._bed_motion_in_flight(printer_id)
         record = self._records.get(printer_id)
         plate = record.plate if record is not None else None

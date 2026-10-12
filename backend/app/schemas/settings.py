@@ -137,7 +137,7 @@ class AppSettings(BaseModel):
         default=90,
         ge=15,
         le=600,
-        description="Seconds to wait for each recovery step to confirm",
+        description="How long a recovery step waits for the printer before the farm takes the next step (15–600 s)",
     )
     spool_recovery_protect_layers: int = Field(
         default=7,
@@ -617,6 +617,17 @@ class AppSettings(BaseModel):
         le=720,
         description="Flag a farm unit still 'printing' whose CONNECTED printer has sat unattended-PAUSEd this many minutes (5–720)",
     )
+    # THE page bound of the attention owner (``farm_stall.check_waiting_on_printers``, 2026-10-11): how
+    # long a printer may leave a command uncarried-out, or sit in a state the farm waits on, before a
+    # person is paged (then hourly). It decides only when a person hears — never an outcome. Not
+    # ``spool_recovery_step_timeout_s``: that bound decides when the jam-recovery driver, with the
+    # printer still silent, takes its next self-heal step; this one decides when a person is paged.
+    farm_attention_page_minutes: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="Page a person when a printer has not carried out a command, or sits in a state the farm waits on, this many minutes (1–120)",
+    )
     # Operator ruling 2026-10-05: when the plate-check ladder's stop would be an escalation, the
     # print waits PAUSED at the dialog this long for Ignore and resume or Stop; then the farm stops
     # it and holds the plate. Not the pause-stall threshold above (when an unattended pause pages).
@@ -632,7 +643,8 @@ class AppSettings(BaseModel):
         ge=0,
         le=180,
         description="Cooldown-plateau watchdog window (minutes): the bed must cool by at least the stall epsilon "
-        "within each window; two consecutive windows below it quarantine the printer instead of ejecting. 0 disables.",
+        "within each window; two consecutive windows below it hold the plate for a person instead of ejecting. 0 "
+        "disables.",
     )
     farm_cooldown_stall_epsilon_c: float = Field(
         default=1.0,
@@ -640,20 +652,13 @@ class AppSettings(BaseModel):
         le=20.0,
         description="Minimum bed cooling (°C) expected across a plateau window before it counts as a stall strike",
     )
-    farm_cooldown_max_hold_minutes: int = Field(
-        default=180,
-        ge=0,
-        le=720,
-        description="Cap (minutes) the cooldown watch holds a hot bed above threshold before dispatching the eject "
-        "anyway. 0 = no cap (hold until the bed reaches threshold or the plateau watchdog trips).",
-    )
     farm_cooldown_plateau_eject_margin_c: float = Field(
         default=3.0,
         ge=0.0,
         le=50.0,
-        description="When cooling plateaus, eject instead of quarantining if the bed has settled within this many "
-        "°C of its OWN chamber air (bed equilibrated). A plateaued bed still hotter than its own air by more than "
-        "this is genuinely stuck hot and the printer is quarantined with NO eject.",
+        description="When cooling plateaus, eject if the bed has settled within this many °C of its OWN chamber "
+        "air (bed equilibrated). A plateaued bed still hotter than its own air by more than this is genuinely stuck "
+        "hot: NO eject, the plate is held for a person and paged.",
     )
     # THE one eject-line input (user ruling 2026-09-25): the line is MEASURED shop air plus
     # this margin (``services/eject/shop_air``). It replaced the per-profile
@@ -933,9 +938,9 @@ class AppSettingsUpdate(BaseModel):
     farm_offline_stall_minutes: int | None = Field(default=None, ge=5, le=720)
     farm_pause_stall_minutes: int | None = Field(default=None, ge=5, le=720)
     farm_plate_check_decision_minutes: int | None = Field(default=None, ge=1, le=120)
+    farm_attention_page_minutes: int | None = Field(default=None, ge=1, le=120)
     farm_cooldown_stall_window_minutes: int | None = Field(default=None, ge=0, le=180)
     farm_cooldown_stall_epsilon_c: float | None = Field(default=None, ge=0.1, le=20.0)
-    farm_cooldown_max_hold_minutes: int | None = Field(default=None, ge=0, le=720)
     farm_cooldown_plateau_eject_margin_c: float | None = Field(default=None, ge=0.0, le=50.0)
     farm_cooldown_margin_c: float | None = Field(default=None, ge=0.5, le=10.0)
     farm_cooldown_aux_fan_enabled: bool | None = None

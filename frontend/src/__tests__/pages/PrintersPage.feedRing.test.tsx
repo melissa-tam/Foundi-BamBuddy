@@ -136,7 +136,7 @@ describe('PrintersPage — slot rings read the backend feed state', () => {
     serveStatus({
       tray_now: 1,
       last_loaded_tray: 1,
-      toolhead: { feed: 'fed', active_tray: 0, was_feeding_tray: null, refill: null },
+      toolhead: { feed: 'fed', active_tray: 0, was_feeding_tray: null },
     });
     render(<PrintersPage />);
 
@@ -153,8 +153,6 @@ describe('PrintersPage — slot rings read the backend feed state', () => {
         feed: 'empty',
         active_tray: null,
         was_feeding_tray: 1,
-        refill: null,
-        refill_reason: 'runout_demand',
       },
     });
     render(<PrintersPage />);
@@ -165,7 +163,7 @@ describe('PrintersPage — slot rings read the backend feed state', () => {
   });
 
   it.each([
-    ['the toolhead names no tray', { toolhead: { feed: 'unknown', active_tray: null, was_feeding_tray: null, refill: null } }],
+    ['the toolhead names no tray', { toolhead: { feed: 'unknown', active_tray: null, was_feeding_tray: null } }],
     ['the frame carries no toolhead', {}],
   ])('draws no ring when %s, whatever tray_now says', async (_label, toolhead) => {
     serveStatus({ tray_now: 1, last_loaded_tray: 1, ...toolhead });
@@ -179,7 +177,7 @@ describe('PrintersPage — slot rings read the backend feed state', () => {
     serveStatus({
       tray_now: 254,
       vt_tray: [{ id: 254, tray_type: 'PLA', tray_color: 'FFFFFFFF', tray_sub_brands: 'PLA Basic' }],
-      toolhead: { feed: 'external', active_tray: 254, was_feeding_tray: null, refill: null },
+      toolhead: { feed: 'external', active_tray: 254, was_feeding_tray: null },
     });
     render(<PrintersPage />);
 

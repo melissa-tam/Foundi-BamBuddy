@@ -1,14 +1,16 @@
 import asyncio
 import logging
 import re
-import traceback
+import threading
 from collections.abc import Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.printer import Printer
-from backend.app.services.bambu_mqtt import BambuMQTTClient, MQTTLogEntry, PrinterState, get_stage_name
+from backend.app.services import printer_events
+from backend.app.services.bambu_mqtt import BambuMQTTClient, CommandAck, MQTTLogEntry, PrinterState, get_stage_name
+from backend.app.services.feed_state import FeedEvent, FeedReading
 from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, hms_error_payload
 from backend.app.services.tray_observation import TrayObservation, observe_ams_push
 from backend.app.utils.printer_models import A1_FAMILY_MODELS, canon_model
@@ -400,6 +402,12 @@ class PrinterManager:
         self._printer_info: dict[int, PrinterInfo] = {}  # Cache printer name/serial for callbacks
         self._on_print_start: Callable[[int, dict], None] | None = None
         self._on_print_complete: Callable[[int, dict], None] | None = None
+        # printer_id -> terminals the client has reported whose handler has not returned
+        # (:meth:`terminal_in_flight`). Counted up on the client's MQTT thread at the push that
+        # reported the job's end, down on the loop when the handler returns. Process memory of
+        # coroutines in flight: a restart has none, so there is nothing to rehydrate.
+        self._terminals_in_flight: dict[int, int] = {}
+        self._terminals_lock = threading.Lock()
         self._on_print_running_observed: Callable[[int, dict], None] | None = None
         self._on_finish_photo_moment: Callable[[int, dict], None] | None = None
         self._on_status_change: Callable[[int, PrinterState], None] | None = None
@@ -654,6 +662,53 @@ class PrinterManager:
 
             future.add_done_callback(handle_exception)
 
+    def _schedule_terminal(self, printer_id: int, coro) -> None:
+        """Schedule a reported job end's handler, marking it IN FLIGHT from this push until it returns
+        (:meth:`terminal_in_flight`). Called on the client's MQTT thread, so the mark is up before any
+        coroutine on the loop can read the printer's job-over state. No running loop drops it, exactly as
+        :meth:`_schedule_async` does — and marks nothing."""
+        if not (self._loop and self._loop.is_running()):
+            self._schedule_async(coro)
+            return
+        with self._terminals_lock:
+            self._terminals_in_flight[printer_id] = self._terminals_in_flight.get(printer_id, 0) + 1
+        self._schedule_async(self._run_terminal(printer_id, coro))
+
+    async def _run_terminal(self, printer_id: int, coro) -> None:
+        try:
+            await coro
+        finally:
+            with self._terminals_lock:
+                left = self._terminals_in_flight.get(printer_id, 0) - 1
+                if left > 0:
+                    self._terminals_in_flight[printer_id] = left
+                else:
+                    self._terminals_in_flight.pop(printer_id, None)
+
+    def terminal_in_flight(self, printer_id: int) -> bool:
+        """Is a job end this printer reported still being handled (``main.on_print_complete`` has not
+        returned)? The terminal is the EVENT that decides the holds it answers — it reads them before it
+        closes them, so the open fault classifies the stop and the plate check's refusal reaches the plate
+        — and the farm's level readers (the incident sweep, the session start's re-evaluation) stand aside
+        while one is in flight (``incident_resolution.Context.terminal_in_flight``): a liveness read, like a
+        recovery driver's, never a window. Up from BEFORE the job-over state is visible (the client's
+        ``terminal_pending``, raised as the push writes it) until the handler returns (the counter)."""
+        # The client's push-scoped mark FIRST, then the counter: the client clears its mark only after
+        # the completion detection raised the counter, so this order never misses both.
+        client = self._clients.get(printer_id)
+        if client is not None and client.terminal_pending():
+            return True
+        with self._terminals_lock:
+            return self._terminals_in_flight.get(printer_id, 0) > 0
+
+    def _emit(self, event: printer_events.PrinterEvent) -> None:
+        """Publish a client-side printer event on the event loop, from whichever thread the
+        client handed it over on (its MQTT network thread). No running loop (a test with no
+        lifespan) drops it, as :meth:`_schedule_async` drops a callback — building the coroutine
+        only once it can run."""
+        if self._loop and self._loop.is_running():
+            self._schedule_async(printer_events.publish(event))
+
     async def connect_printer(self, printer: Printer) -> bool:
         """Connect to a printer."""
         if printer.id in self._clients:
@@ -671,7 +726,7 @@ class PrinterManager:
 
         def on_print_complete(data: dict):
             if self._on_print_complete:
-                self._schedule_async(self._on_print_complete(printer_id, data))
+                self._schedule_terminal(printer_id, self._on_print_complete(printer_id, data))
 
         def on_print_running_observed(data: dict):
             if self._on_print_running_observed:
@@ -749,21 +804,21 @@ class PrinterManager:
             if self._on_drying_complete:
                 self._schedule_async(self._on_drying_complete(printer_id, ams_id))
 
-        def farm_acting() -> bool:
-            """Does a FARM motion own this printer right now — a live recovery driver, or a farm
-            motion command its step ledger still holds pending? The feed state's attribution of a
-            landing (``feed_state.LoadLanded.farm_acting``), asked by the client once per push on
-            the MQTT thread: both reads are the incident store's sync, DB-free projections.
+        # The client's four printer-event facts, each built into its event HERE — the closure
+        # knows the printer id the serial-keyed client does not — and published on the event loop
+        # (``printer_events``; the client hands them over on its MQTT network thread, or on the
+        # caller's thread for a teardown or a forced reconnect).
+        def on_command_ack(ack: CommandAck) -> None:
+            self._emit(printer_events.CommandAcked(printer_id=printer_id, ack=ack))
 
-            The printer id lives in this closure, as on the AMS hooks: the client is keyed by
-            serial and imports nothing above itself. Call-time import, like this module's other
-            reaches into ``printer_incidents``.
-            """
-            from backend.app.services import printer_incidents
+        def on_feed_event(event: FeedEvent, reading: FeedReading) -> None:
+            self._emit(printer_events.FeedEventReported(printer_id=printer_id, event=event, reading=reading))
 
-            return (
-                printer_incidents.driver_live(printer_id) or printer_incidents.pending_command(printer_id) is not None
-            )
+        def on_session_report(connection_epoch: int) -> None:
+            self._emit(printer_events.FirstFreshReport(printer_id=printer_id, connection_epoch=connection_epoch))
+
+        def on_session_lost() -> None:
+            self._emit(printer_events.SessionLost(printer_id=printer_id))
 
         client = BambuMQTTClient(
             ip_address=printer.ip_address,
@@ -781,7 +836,10 @@ class PrinterManager:
             on_drying_complete=on_drying_complete,
             on_print_running_observed=on_print_running_observed,
             on_finish_photo_moment=on_finish_photo_moment,
-            farm_acting=farm_acting,
+            on_command_ack=on_command_ack,
+            on_feed_event=on_feed_event,
+            on_session_report=on_session_report,
+            on_session_lost=on_session_lost,
         )
 
         client.connect()
@@ -852,40 +910,6 @@ class PrinterManager:
         """Get the MQTT client for a printer."""
         return self._clients.get(printer_id)
 
-    async def await_state(
-        self,
-        printer_id: int,
-        states: set[str],
-        timeout_s: float,
-        *,
-        poll_interval_s: float = 1.0,
-    ) -> bool:
-        """Poll live ``gcode_state`` until it is one of ``states``, or ``timeout_s`` elapses.
-
-        The shared "did the printer actually do what I just told it to?" confirm wait.
-        Promoted here from ``spool_recovery._await_state`` when a second lane needed the
-        same wait: a command's ACK proves only that it was accepted, so every lane that
-        sends ``resume``/``pause``/``stop`` must confirm against the wire, and two copies
-        of that loop would drift on the one decision that matters — whether an absent
-        state (a disconnected printer) reads as failure. It does: ``get_status`` returns
-        None and the final re-check answers False.
-
-        ``poll_interval_s`` is the CALLER's latency budget, not this method's — the
-        recovery lanes each name their own constant so the AMS skill's latency-budget
-        table keeps one owner per wait.
-
-        Re-checks once after the deadline so a state that arrived during the last sleep
-        is not lost to an off-by-one poll.
-        """
-        deadline = asyncio.get_running_loop().time() + timeout_s
-        while asyncio.get_running_loop().time() < deadline:
-            st = self.get_status(printer_id)
-            if st is not None and getattr(st, "state", None) in states:
-                return True
-            await asyncio.sleep(poll_interval_s)
-        st = self.get_status(printer_id)
-        return st is not None and getattr(st, "state", None) in states
-
     def mark_printer_offline(self, printer_id: int):
         """Mark a printer as offline and trigger status callback.
 
@@ -908,104 +932,6 @@ class PrinterManager:
                 # Trigger the status change callback to broadcast via WebSocket
                 if self._on_status_change:
                     self._schedule_async(self._on_status_change(printer_id, client.state))
-
-    def start_print(
-        self,
-        printer_id: int,
-        filename: str,
-        plate_id: int = 1,
-        ams_mapping: list[int] | None = None,
-        bed_levelling: bool = True,
-        flow_cali: bool = False,
-        vibration_cali: bool = True,
-        layer_inspect: bool = False,
-        timelapse: bool = False,
-        use_ams: bool = True,
-        nozzle_offset_cali: bool = False,
-        nozzle_mapping: str | None = None,
-    ) -> bool:
-        """Start a print on a connected printer.
-
-        ``nozzle_mapping`` is an opaque JSON string captured from BambuStudio's
-        project_file MQTT command (H2C rack-swap slicer pick preservation,
-        #1780). It rides through to the MQTT client untouched; the dispatch
-        builder there parses + injects it only on dual-nozzle models.
-        """
-        caller = traceback.extract_stack(limit=3)[0]
-        logger.info(
-            "PRINT COMMAND: printer=%s, file=%s, caller=%s:%s:%s",
-            printer_id,
-            filename,
-            caller.filename.split("/")[-1],
-            caller.lineno,
-            caller.name,
-        )
-        if printer_id in self._clients:
-            return self._clients[printer_id].start_print(
-                filename,
-                plate_id,
-                ams_mapping=ams_mapping,
-                timelapse=timelapse,
-                bed_levelling=bed_levelling,
-                flow_cali=flow_cali,
-                vibration_cali=vibration_cali,
-                layer_inspect=layer_inspect,
-                use_ams=use_ams,
-                nozzle_offset_cali=nozzle_offset_cali,
-                nozzle_mapping=nozzle_mapping,
-            )
-        return False
-
-    def stop_print(self, printer_id: int) -> bool:
-        """Stop the current print on a connected printer."""
-        if printer_id in self._clients:
-            return self._clients[printer_id].stop_print()
-        return False
-
-    async def wait_for_cooldown(
-        self,
-        printer_id: int,
-        target_temp: float = 50.0,
-        timeout: int = 600,
-        check_interval: int = 10,
-    ) -> bool:
-        """Wait for the nozzle to cool down to a safe temperature.
-
-        Args:
-            printer_id: The printer to monitor
-            target_temp: Target temperature to wait for (default 50°C)
-            timeout: Maximum seconds to wait (default 600s = 10 min)
-            check_interval: Seconds between temperature checks (default 10s)
-
-        Returns:
-            True if cooled down, False if timeout or not connected
-        """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        elapsed = 0
-        while elapsed < timeout:
-            state = self.get_status(printer_id)
-            if not state or not state.connected:
-                logger.warning("Printer %s disconnected during cooldown wait", printer_id)
-                return False
-
-            # Check nozzle temperature (and nozzle_2 for dual extruders)
-            nozzle_temp = state.temperatures.get("nozzle", 0)
-            nozzle_2_temp = state.temperatures.get("nozzle_2", 0)
-            max_temp = max(nozzle_temp, nozzle_2_temp)
-
-            if max_temp <= target_temp:
-                logger.info("Printer %s cooled down to %s°C", printer_id, max_temp)
-                return True
-
-            logger.debug("Printer %s nozzle at %s°C, waiting for %s°C...", printer_id, max_temp, target_temp)
-            await asyncio.sleep(check_interval)
-            elapsed += check_interval
-
-        logger.warning("Printer %s cooldown timeout after %ss", printer_id, timeout)
-        return False
 
     def enable_logging(self, printer_id: int, enabled: bool = True) -> bool:
         """Enable or disable MQTT logging for a printer."""
@@ -1032,21 +958,6 @@ class PrinterManager:
         if printer_id in self._clients:
             return self._clients[printer_id].logging_enabled
         return False
-
-    def send_drying_command(
-        self,
-        printer_id: int,
-        ams_id: int,
-        temp: int,
-        duration: int,
-        mode: int = 1,
-        filament: str = "",
-        rotate_tray: bool = False,
-    ) -> bool:
-        """Send AMS drying command to printer."""
-        if printer_id not in self._clients:
-            return False
-        return self._clients[printer_id].send_drying_command(ams_id, temp, duration, mode, filament, rotate_tray)
 
     def request_status_update(self, printer_id: int) -> bool:
         """Request a full status update from the printer.
@@ -1334,9 +1245,9 @@ def open_incident_payload(printer_id: int | None) -> dict | None:
 
 
 def toolhead_payload(printer_id: int | None, state: PrinterState | None) -> dict:
-    """The printer's ACTIVE extruder feed and the farm's refill of it, as the card's "Toolhead empty"
-    chip and its slot rings read it (K10/C3c, 2026-10-10):
-    ``{"feed", "active_tray", "was_feeding_tray", "refill", "refill_reason"}``.
+    """The printer's ACTIVE extruder feed, as the card's slot rings read it (K10/C3c, 2026-10-10):
+    ``{"feed", "active_tray", "was_feeding_tray"}``. The hold chip is its own builder
+    (``hold_chip.hold_chip_payload``, :func:`hold_chip_payload`).
 
     DERIVED on every broadcast, never stored:
 
@@ -1347,44 +1258,43 @@ def toolhead_payload(printer_id: int | None, state: PrinterState | None) -> dict
       for the external spool, and during a drained roll's TAIL the DRAINING roll, never the
       ``tray_now`` pre-flip target that is not fed yet — and, while a job is RUNNING or PAUSEd with
       nothing fed, the job's last real feeder. ONE answer for every client, so no card keeps a
-      ``tray_now`` cache of its own to remember which slot was feeding;
-    * ``refill`` is ``printer_incidents.refill_state`` (``{"phase", "command", "slot", "answer"}`` —
-      the open-row projection and the liveness slot, passed through as is) — carried only while the
-      feed reads empty or unknown, because a toolhead that reads fed again was loaded, and a failed
-      refill under it is history;
-    * ``refill_reason`` is what a Resume would do about an EMPTY feed — the T3 verdict
-      (``refill_verdict.refill_owed``'s reason, over the feed state read here), so the card never
-      re-derives K7 (012-H2S 2026-10-10: paused at layer 0, the start block loads itself —
-      ``before_first_layer``, never "Load a slot"); ``None`` for any other feed. The verdict and the
-      feed state are LEAVES (``test_import_graph.TestTheRefillVerdictIsALeaf``): this registry never
-      imports the recovery driver.
+      ``tray_now`` cache of its own to remember which slot was feeding.
 
     ONE builder for all three construction sites (the WS serializer below and BOTH REST ``/status``
     branches), like :func:`open_incident_payload`. JSON primitives only. Total: ``state`` may be
     ``None`` (no session) — the feed is then ``unknown`` and nothing is named as fed.
     """
-    from backend.app.services import printer_incidents, refill_verdict
     from backend.app.services.tray_fields import toolhead_feed
 
     active = toolhead_feed(state).active
-    client = printer_manager.get_client(printer_id) if printer_id else None
-    reading = client.feed() if client is not None and state is not None else None
+    reading = _feed_reading(printer_id, state)
     active_tray = reading.feeder if reading is not None else None
     was_feeding_tray = None
     job_active = (getattr(state, "state", None) or "").upper() in ("RUNNING", "PAUSE")
     if reading is not None and active_tray is None and job_active and reading.last_loaded >= 0:
         was_feeding_tray = reading.last_loaded
-    refill = printer_incidents.refill_state(printer_id) if active.kind in ("empty", "unknown") else None
-    reason = None
-    if active.kind == "empty" and printer_id:
-        reason = refill_verdict.refill_owed(printer_id, state, trigger="T3", reading=reading).reason
     return {
         "feed": active.kind,
         "active_tray": active_tray,
         "was_feeding_tray": was_feeding_tray,
-        "refill": refill,
-        "refill_reason": reason,
     }
+
+
+def _feed_reading(printer_id: int | None, state: PrinterState | None):
+    """The client's toolhead FEED STATE (``BambuMQTTClient.feed()``) for a status projection, or
+    ``None`` with no client or no session state."""
+    client = printer_manager.get_client(printer_id) if printer_id else None
+    return client.feed() if client is not None and state is not None else None
+
+
+def hold_chip_payload(printer_id: int | None, state: PrinterState | None) -> dict | None:
+    """The printer card's hold chip — ``services/hold_chip``'s ONE verdict (which hold, tone, label and
+    tooltip keys), read with this printer's feed state. ONE call for all three construction sites (the
+    WS serializer below and BOTH REST ``/status`` branches), like :func:`open_incident_payload`.
+    JSON primitives only."""
+    from backend.app.services import hold_chip
+
+    return hold_chip.hold_chip_payload(printer_id, state, _feed_reading(printer_id, state))
 
 
 def plate_check_exit_payload(printer_id: int | None, state: PrinterState | None) -> dict | None:
@@ -1699,7 +1609,7 @@ def printer_state_to_dict(
         "ams_status_sub": state.ams_status_sub,
         "tray_now": state.tray_now,
         # The AMS's own target tray, raw (never a feeder id) — the wire's answer to a
-        # motion command, read by services/ams_command as movement evidence.
+        # motion command, read by services/command_outcome as movement evidence.
         "tray_tar": state.tray_tar,
         # Last tray fed THIS job (reset to -1 at print start; survives the
         # end-of-print retract → 255). Drives the "was feeding" dimmed AMS ring
@@ -1798,10 +1708,12 @@ def printer_state_to_dict(
         # The plate-check human's turn (2026-10-05): {print_error, job_id, actions,
         # deadline_at} or null — its own field, same builder as BOTH /status branches.
         "plate_check_exit": plate_check_exit,
-        # The ACTIVE extruder's feed and the farm's refill of it (2026-10-10): {feed, active_tray,
-        # was_feeding_tray, refill, refill_reason} — what the "Toolhead empty" chip and the slot
-        # rings read; same builder as BOTH /status branches.
+        # The ACTIVE extruder's feed (2026-10-10): {feed, active_tray, was_feeding_tray} — what the
+        # slot rings read; same builder as BOTH /status branches.
         "toolhead": toolhead_payload(printer_id, state),
+        # The hold chip (2026-10-11): THE verdict of which hold the card names — same builder as BOTH
+        # /status branches.
+        "hold_chip": hold_chip_payload(printer_id, state),
     }
     # Add cover URL if there's an active print and printer_id is provided
     # Include PAUSE state so skip objects modal can show cover

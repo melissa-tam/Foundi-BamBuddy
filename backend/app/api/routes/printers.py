@@ -50,7 +50,7 @@ from backend.app.schemas.printer import (
     SlotRecheckResponse,
     ToolheadState,
 )
-from backend.app.services import ams_command, service_hold
+from backend.app.services import printer_action, service_hold
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     cleanup_downloaded_3mf,
@@ -61,7 +61,7 @@ from backend.app.services.bambu_ftp import (
     get_storage_info_async,
     list_files_async,
 )
-from backend.app.services.bambu_mqtt import DIALOG_RESUME_ACTIONS
+from backend.app.services.bambu_mqtt import DIALOG_RESUME_ACTIONS, DIALOG_UNANSWERED_ACTIONS
 from backend.app.services.eject.monitor import eject_cooldown_monitor
 from backend.app.services.hms_actions import HMSAction
 from backend.app.services.hms_errors import PLATE_CHECK_HMS_CODES, printer_message_from_full_code
@@ -74,6 +74,7 @@ from backend.app.services.printer_manager import (
     get_derived_status_name,
     has_chamber_fan,
     hms_errors_payload,
+    hold_chip_payload,
     occupancy_payload,
     open_incident_payload,
     plate_check_exit_payload,
@@ -92,7 +93,7 @@ from backend.app.services.tray_fields import tray_presence_map
 from backend.app.utils.http import build_content_disposition
 
 if TYPE_CHECKING:
-    from backend.app.services.bambu_mqtt import BambuMQTTClient, CommandAck, SentCommand
+    from backend.app.services.bambu_mqtt import BambuMQTTClient, CommandAck
 
     # Type-only: the AMS services stay out of this module's runtime import graph (see the
     # local imports below — ``slot_recheck`` pulls the slot pipeline's model graph in with it).
@@ -103,10 +104,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["printers"])
 
 # Seconds the /hms/execute-action route waits for the firmware's ACK of the frame it
-# sent before reporting 502 to the UI, and how often it re-reads the ACK log inside that
-# budget. Module-level so tests can monkeypatch a near-zero value.
+# sent before reporting 502 to the UI (``printer_action.ack_within``: it decides only what the
+# click says; the press's answer is the record's). Module-level so tests can monkeypatch it.
 HMS_ACTION_ACK_WAIT_SECONDS = 2.5
-HMS_ACTION_ACK_POLL_SECONDS = 0.1
 
 
 async def _caller_can_view_printer_secrets(user: User | None, db: AsyncSession) -> bool:
@@ -559,9 +559,11 @@ async def get_printer_status(
             # The plate-check human's turn — the one builder; with no session there is no
             # paused dialog to answer, so it reads null here.
             plate_check_exit=plate_check_exit_payload(printer_id, None),
-            # The toolhead — the one builder; with no session nothing is read (``unknown``), and the
-            # farm's refill state still reports (it is the incident store's own projection).
+            # The toolhead — the one builder; with no session nothing is read (``unknown``).
             toolhead=ToolheadState(**toolhead_payload(printer_id, None)),
+            # The hold chip — the one builder; with no session the open rows still report (the
+            # incident store's own projection), and nothing is read as fed.
+            hold_chip=hold_chip_payload(printer_id, None),
             # Hardware capabilities are facts about the MODEL, not about the MQTT
             # session, so they are reportable with no session — same as the sticky
             # flags above. Load-bearing: the printer card's chamber-fan and airduct
@@ -899,6 +901,8 @@ async def get_printer_status(
         plate_check_exit=plate_check_exit,
         # Same builder as the WS frame and the disconnected branch above.
         toolhead=ToolheadState(**toolhead_payload(printer_id, state)),
+        # Same builder as the WS frame and the disconnected branch above.
+        hold_chip=hold_chip_payload(printer_id, state),
         quarantined=printer.quarantined,
         quarantine_reason=printer.quarantine_reason,
         model_mismatch=printer_manager.is_model_mismatch(printer_id),
@@ -1950,9 +1954,13 @@ async def start_drying(
     if not filament:
         filament = "PLA"
 
-    success = printer_manager.send_drying_command(
-        printer_id, ams_id, temp, duration, mode=1, filament=filament, rotate_tray=rotate_tray
-    )
+    success = (
+        await printer_action.send(
+            printer_id,
+            printer_action.drying(ams_id, temp, duration, mode=1, filament=filament, rotate_tray=rotate_tray),
+            actor=printer_action.ACTOR_OPERATOR,
+        )
+    ).published
     if not success:
         raise HTTPException(400, "Printer not connected")
     return {"status": "drying_started", "ams_id": ams_id, "temp": temp, "duration": duration}
@@ -1971,7 +1979,11 @@ async def stop_drying(
     if not printer:
         raise HTTPException(404, "Printer not found")
 
-    success = printer_manager.send_drying_command(printer_id, ams_id, temp=0, duration=0, mode=0)
+    success = (
+        await printer_action.send(
+            printer_id, printer_action.drying(ams_id, 0, 0, mode=0), actor=printer_action.ACTOR_OPERATOR
+        )
+    ).published
     if not success:
         raise HTTPException(400, "Printer not connected")
     return {"status": "drying_stopped", "ams_id": ams_id}
@@ -2030,11 +2042,13 @@ async def set_print_option(
     if sensitivity not in valid_sensitivities:
         raise HTTPException(400, f"Invalid sensitivity. Must be one of: {valid_sensitivities}")
 
-    success = client.set_xcam_option(
-        module_name=module_name,
-        enabled=enabled,
-        print_halt=print_halt,
-        sensitivity=sensitivity,
+    success = await printer_action.operator_verb(
+        printer_id,
+        "xcam_control_set",
+        lambda live, seq: live.set_xcam_option(
+            module_name=module_name, enabled=enabled, print_halt=print_halt, sensitivity=sensitivity, sequence_id=seq
+        ),
+        client=client,
     )
 
     if not success:
@@ -2066,7 +2080,12 @@ async def set_ams_backup(
     if not client or not client.state.connected:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_ams_filament_backup(enabled)
+    success = await printer_action.operator_verb(
+        printer_id,
+        "print_option",
+        lambda live, seq: live.set_ams_filament_backup(enabled, sequence_id=seq),
+        client=client,
+    )
     if not success:
         raise HTTPException(500, "Failed to send command to printer")
 
@@ -2155,12 +2174,18 @@ async def start_calibration(
     if not any([bed_leveling, vibration, motor_noise, nozzle_offset, high_temp_heatbed]):
         raise HTTPException(400, "At least one calibration option must be selected")
 
-    success = client.start_calibration(
-        bed_leveling=bed_leveling,
-        vibration=vibration,
-        motor_noise=motor_noise,
-        nozzle_offset=nozzle_offset,
-        high_temp_heatbed=high_temp_heatbed,
+    success = await printer_action.operator_verb(
+        printer_id,
+        "calibration",
+        lambda live, seq: live.start_calibration(
+            bed_leveling=bed_leveling,
+            vibration=vibration,
+            motor_noise=motor_noise,
+            nozzle_offset=nozzle_offset,
+            high_temp_heatbed=high_temp_heatbed,
+            sequence_id=seq,
+        ),
+        client=client,
     )
 
     if not success:
@@ -2467,16 +2492,22 @@ async def configure_ams_slot(
     # RFID-tagged slots to preserve the slicer eye icon, but printers cache
     # stale tag_uid/tray_uuid after a BL spool is removed, causing the check
     # to false-positive on non-RFID slots and silently drop the command.
-    success = client.ams_set_filament_setting(
-        ams_id=ams_id,
-        tray_id=tray_id,
-        tray_info_idx=effective_tray_info_idx,
-        tray_type=identity.tray_type,
-        tray_sub_brands=tray_sub_brands,
-        tray_color=identity.tray_color,
-        nozzle_temp_min=identity.nozzle_temp_min,
-        nozzle_temp_max=identity.nozzle_temp_max,
-        setting_id=effective_setting_id,
+    success = await printer_action.operator_verb(
+        printer_id,
+        "ams_filament_setting",
+        lambda live, seq: live.ams_set_filament_setting(
+            ams_id=ams_id,
+            tray_id=tray_id,
+            tray_info_idx=effective_tray_info_idx,
+            tray_type=identity.tray_type,
+            tray_sub_brands=tray_sub_brands,
+            tray_color=identity.tray_color,
+            nozzle_temp_min=identity.nozzle_temp_min,
+            nozzle_temp_max=identity.nozzle_temp_max,
+            setting_id=effective_setting_id,
+            sequence_id=seq,
+        ),
+        client=client,
     )
 
     if not success:
@@ -2485,12 +2516,18 @@ async def configure_ams_slot(
     # Method 1: Select existing calibration profile by cali_idx
     # Do NOT include setting_id — BambuStudio never sends it in extrusion_cali_sel,
     # and including it causes the firmware to mislink the profile on X1C/P1S.
-    cali_ok = client.extrusion_cali_sel(
-        ams_id=ams_id,
-        tray_id=tray_id,
-        cali_idx=cali_idx,
-        filament_id=filament_id_for_kprofile,
-        nozzle_diameter=nozzle_diameter,
+    cali_ok = await printer_action.operator_verb(
+        printer_id,
+        "extrusion_cali_sel",
+        lambda live, seq: live.extrusion_cali_sel(
+            ams_id=ams_id,
+            tray_id=tray_id,
+            cali_idx=cali_idx,
+            filament_id=filament_id_for_kprofile,
+            nozzle_diameter=nozzle_diameter,
+            sequence_id=seq,
+        ),
+        client=client,
     )
 
     # Method 2: Only send extrusion_cali_set when NO existing profile was selected
@@ -2508,15 +2545,21 @@ async def configure_ams_slot(
         else:
             global_tray_id = tray_id
 
-        client.extrusion_cali_set(
-            tray_id=global_tray_id,
-            k_value=k_value,
-            nozzle_diameter=nozzle_diameter,
-            nozzle_temp=identity.nozzle_temp_max,
-            filament_id=filament_id_for_kprofile,
-            setting_id=kprofile_setting_id or "",
-            name=tray_sub_brands or "",
-            cali_idx=cali_idx,
+        await printer_action.operator_verb(
+            printer_id,
+            "extrusion_cali_set",
+            lambda live, seq: live.extrusion_cali_set(
+                tray_id=global_tray_id,
+                k_value=k_value,
+                nozzle_diameter=nozzle_diameter,
+                nozzle_temp=identity.nozzle_temp_max,
+                filament_id=filament_id_for_kprofile,
+                setting_id=kprofile_setting_id or "",
+                name=tray_sub_brands or "",
+                cali_idx=cali_idx,
+                sequence_id=seq,
+            ),
+            client=client,
         )
 
     # Persist the user's K-profile choice so it survives RFID re-reads and
@@ -2718,7 +2761,12 @@ async def reset_ams_slot(
         raise HTTPException(status_code=400, detail="Printer not connected")
 
     # Reset the slot
-    success = client.reset_ams_slot(ams_id=ams_id, tray_id=tray_id)
+    success = await printer_action.operator_verb(
+        printer_id,
+        "ams_filament_setting",
+        lambda live, seq: live.reset_ams_slot(ams_id=ams_id, tray_id=tray_id, sequence_id=seq),
+        client=client,
+    )
 
     if not success:
         raise HTTPException(status_code=500, detail="Failed to send reset command")
@@ -3136,7 +3184,9 @@ async def pause_print(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.pause_print()
+    success = await printer_action.operator_verb(
+        printer_id, "pause", lambda live, seq: live.pause_print(sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(502, "Failed to pause print — printer MQTT session not connected, command not delivered")
 
@@ -3213,7 +3263,9 @@ async def set_print_speed(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_print_speed(mode)
+    success = await printer_action.operator_verb(
+        printer_id, "print_speed", lambda live, seq: live.set_print_speed(mode, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(
             502, "Failed to set print speed — printer MQTT session not connected, command not delivered"
@@ -3241,7 +3293,12 @@ async def set_nozzle_temperature(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_nozzle_temperature(target, nozzle)
+    success = await printer_action.operator_verb(
+        printer_id,
+        "gcode_line",
+        lambda live, seq: live.set_nozzle_temperature(target, nozzle, sequence_id=seq),
+        client=client,
+    )
     if not success:
         raise HTTPException(500, "Failed to set nozzle temperature")
 
@@ -3265,7 +3322,9 @@ async def set_bed_temperature(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_bed_temperature(target)
+    success = await printer_action.operator_verb(
+        printer_id, "gcode_line", lambda live, seq: live.set_bed_temperature(target, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(500, "Failed to set bed temperature")
 
@@ -3298,7 +3357,9 @@ async def set_chamber_temperature(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_chamber_temperature(target)
+    success = await printer_action.operator_verb(
+        printer_id, "gcode_line", lambda live, seq: live.set_chamber_temperature(target, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(500, "Failed to set chamber temperature")
 
@@ -3328,7 +3389,9 @@ async def set_fan_speed(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_fan_percent(fan_id, speed)
+    success = await printer_action.operator_verb(
+        printer_id, "gcode_line", lambda live, seq: live.set_fan_percent(fan_id, speed, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(502, "Failed to set fan speed — printer MQTT session not connected, command not delivered")
 
@@ -3353,7 +3416,9 @@ async def select_extruder(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.select_extruder(extruder)
+    success = await printer_action.operator_verb(
+        printer_id, "select_extruder", lambda live, seq: live.select_extruder(extruder, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(500, "Failed to select nozzle")
 
@@ -3389,7 +3454,9 @@ async def set_airduct_mode(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_airduct_mode(mode)
+    success = await printer_action.operator_verb(
+        printer_id, "set_airduct", lambda live, seq: live.set_airduct_mode(mode, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(500, "Failed to set airduct mode")
 
@@ -3413,7 +3480,9 @@ async def set_chamber_light(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.set_chamber_light(on)
+    success = await printer_action.operator_verb(
+        printer_id, "ledctrl", lambda live, seq: live.set_chamber_light(on, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(
             502, "Failed to control chamber light — printer MQTT session not connected, command not delivered"
@@ -3477,7 +3546,9 @@ async def bed_jog(
     if force:
         lines.append("M211 S1")
 
-    if not client.send_gcode("\n".join(lines)):
+    if not await printer_action.operator_verb(
+        printer_id, "gcode_line", lambda live, seq: live.send_gcode("\n".join(lines), sequence_id=seq), client=client
+    ):
         raise HTTPException(
             502, "Failed to send bed-jog command — printer MQTT session not connected, command not delivered"
         )
@@ -3512,7 +3583,12 @@ async def xy_jog(
     if y:
         axes.append(f"Y{y:.2f}")
 
-    if not client.send_gcode("\n".join(["G91", f"G1 {' '.join(axes)} F6000", "G90"])):
+    if not await printer_action.operator_verb(
+        printer_id,
+        "gcode_line",
+        lambda live, seq: live.send_gcode("\n".join(["G91", f"G1 {' '.join(axes)} F6000", "G90"]), sequence_id=seq),
+        client=client,
+    ):
         raise HTTPException(
             502, "Failed to send XY jog command — printer MQTT session not connected, command not delivered"
         )
@@ -3547,7 +3623,12 @@ async def extruder_jog(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    if not client.send_gcode("\n".join(["M83", f"G1 E{distance:.2f} F300", "M82"])):
+    if not await printer_action.operator_verb(
+        printer_id,
+        "gcode_line",
+        lambda live, seq: live.send_gcode("\n".join(["M83", f"G1 E{distance:.2f} F300", "M82"]), sequence_id=seq),
+        client=client,
+    ):
         raise HTTPException(
             502, "Failed to send extruder jog command — printer MQTT session not connected, command not delivered"
         )
@@ -3596,7 +3677,9 @@ async def home_axes(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    if not client.home_axes():
+    if not await printer_action.operator_verb(
+        printer_id, "gcode_line", lambda live, seq: live.home_axes(sequence_id=seq), client=client
+    ):
         raise HTTPException(
             502, "Failed to send home command — printer MQTT session not connected, command not delivered"
         )
@@ -3620,7 +3703,9 @@ async def clear_hms_errors(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.clear_hms_errors()
+    success = await printer_action.operator_verb(
+        printer_id, "clean_print_error", lambda live, seq: live.clear_hms_errors(sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(500, "Failed to clear HMS errors")
 
@@ -3766,7 +3851,9 @@ async def skip_objects(
     if invalid_ids:
         raise HTTPException(400, f"Invalid object IDs: {invalid_ids}")
 
-    success = client.skip_objects(object_ids)
+    success = await printer_action.operator_verb(
+        printer_id, "skip_objects", lambda live, seq: live.skip_objects(object_ids, sequence_id=seq), client=client
+    )
     if not success:
         raise HTTPException(500, "Failed to skip objects")
 
@@ -4133,12 +4220,18 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
         # NOTE: Do NOT send ams_set_filament_setting here — it tells the firmware
         # "this is a manual config" which destroys the RFID-detected spool state
         # (changes eye icon to pen icon in slicer).
-        cali_ok = client.extrusion_cali_sel(
-            ams_id=ams_id,
-            tray_id=slot_id,
-            cali_idx=matching_cali_idx,
-            filament_id=matching_filament_id,
-            nozzle_diameter=nozzle_diameter,
+        cali_ok = await printer_action.operator_verb(
+            printer_id,
+            "extrusion_cali_sel",
+            lambda live, seq: live.extrusion_cali_sel(
+                ams_id=ams_id,
+                tray_id=slot_id,
+                cali_idx=matching_cali_idx,
+                filament_id=matching_filament_id,
+                nozzle_diameter=nozzle_diameter,
+                sequence_id=seq,
+            ),
+            client=client,
         )
         if not cali_ok:
             # Refused (AMS identifying/drying). This is a fire-and-forget background
@@ -4184,7 +4277,7 @@ async def ams_load(
     - 254: external spool (single-external printers, or Ext-L on dual-nozzle H2D)
     - 255: Ext-R on dual-nozzle H2D
 
-    ``services/ams_command`` sends the load in every AMS posture, reads the wire for its
+    ``services/printer_action`` sends the load in every AMS posture, reads the wire for its
     operator window and answers 200 ``{outcome, message, family}`` with the measured outcome.
     400 when the printer has no client or the publish did not go out; 409 while the
     printer is PAUSEd holding for a same-slot refill (the load would latch in firmware —
@@ -4197,7 +4290,7 @@ async def ams_load(
     if result.scalar_one_or_none() is None:
         raise HTTPException(404, "Printer not found")
 
-    return _ams_command_response(await ams_command.command_for_operator(printer_id, "load", tray_id))
+    return _ams_command_response(await printer_action.command_for_operator(printer_id, "load", tray_id))
 
 
 @router.post("/{printer_id}/ams/unload", response_model=AmsCommandResponse)
@@ -4208,7 +4301,7 @@ async def ams_unload(
 ) -> AmsCommandResponse:
     """Unload the currently loaded filament — publish, observe, report.
 
-    ``services/ams_command`` sends the unload in every AMS posture, reads the wire for
+    ``services/printer_action`` sends the unload in every AMS posture, reads the wire for
     its operator window and answers 200 ``{outcome, message, family}`` with the measured
     outcome. 400 when the printer has no client or the publish did not go out.
     """
@@ -4216,10 +4309,10 @@ async def ams_unload(
     if result.scalar_one_or_none() is None:
         raise HTTPException(404, "Printer not found")
 
-    return _ams_command_response(await ams_command.command_for_operator(printer_id, "unload"))
+    return _ams_command_response(await printer_action.command_for_operator(printer_id, "unload"))
 
 
-def _ams_command_response(result: ams_command.AmsCommandResult) -> AmsCommandResponse:
+def _ams_command_response(result: printer_action.AmsCommandResult) -> AmsCommandResponse:
     """Outcome → HTTP. The service decides and composes the sentence; this only maps — the posture
     family the command was sent into included, which a client keys its posture-specific copy off."""
     if result.outcome == "refused_not_connected":
@@ -4272,12 +4365,12 @@ async def execute_hms_action(
 ):
     """Press an HMS dialog button on the printer and answer from the firmware's own ACK.
 
-    ``BambuMQTTClient.execute_hms_action`` publishes the button's frame and names it
-    (``SentCommand``); ``await_ack`` reads the firmware's echo of THAT send by sequence id
-    (invariant 14). 200 on a success ACK; 502 on a refusing ACK (naming the firmware's
-    answer) or on no ACK within the budget — publish success is not printer acceptance,
-    the firmware drops a frame it does not accept (#1830). A frame whose echo is never
-    recorded (the system-topic ``uiop`` close) answers 200 "sent". This replaces a
+    The press is the operator's action on the record (``printer_action``: the frame carries its
+    row id as the sequence id, and the firmware's ACK of THAT send answers it — invariant 14);
+    ``printer_action.ack_within`` reads the ACK for :data:`HMS_ACTION_ACK_WAIT_SECONDS`. 200 on a
+    success ACK; 502 on a refusing ACK (naming the firmware's answer) or on no ACK within the
+    budget — publish success is not printer acceptance, the firmware drops a frame it does not
+    accept (#1830). This replaces a
     before/after diff of ``gcode_state`` + the HMS-list length, which read a printer that
     accepted, resumed and re-paused inside the window as a refusal (upstream #1869).
 
@@ -4315,7 +4408,9 @@ async def execute_hms_action(
             raise HTTPException(409, "Plate check: the farm is still working on it")
         if verdict.refusal is not None:
             raise HTTPException(409, "No paused plate check on this printer")
-        return _hms_action_answer(verdict.sent, verdict.ack)
+        # The ACK read here shapes only this reply; the press's answer is the record's, on the ledger.
+        ack = await printer_action.ack_within(verdict.sent, HMS_ACTION_ACK_WAIT_SECONDS) if verdict.sent else None
+        return _hms_action_answer(verdict.sent, ack)
 
     if body.action in DIALOG_RESUME_ACTIONS:
         # A button whose frame RESUMES the paused print is the resume of a paused print (K9): the
@@ -4324,11 +4419,18 @@ async def execute_hms_action(
         return await _resume_button(printer_id, body, client)
 
     # The dialog frames echo the pressed job's subtask id; a fault with no job sends "".
-    sent = client.execute_hms_action(body.print_error, body.action, body.job_id or "")
-    ack = None
-    if sent is not None and sent.sequence_id is not None:
-        ack = await client.await_ack(sent, HMS_ACTION_ACK_WAIT_SECONDS, HMS_ACTION_ACK_POLL_SECONDS)
-    return _hms_action_answer(sent, ack)
+    sent = await printer_action.send(
+        printer_id,
+        printer_action.dialog_press(body.print_error, body.action, body.job_id or ""),
+        actor=printer_action.ACTOR_OPERATOR,
+        client=client,
+    )
+    if body.action in DIALOG_UNANSWERED_ACTIONS:
+        # The double-check OK ends on the system-topic close, whose echo is never an ACK: "sent".
+        if not sent.published:
+            raise HTTPException(400, "Failed to execute HMS action")
+        return {"success": True, "message": "HMS action sent"}
+    return _hms_action_answer(sent, await printer_action.ack_within(sent, HMS_ACTION_ACK_WAIT_SECONDS))
 
 
 async def _resume_button(printer_id: int, body: HmsActionBody, client: "BambuMQTTClient") -> dict:
@@ -4342,14 +4444,11 @@ async def _resume_button(printer_id: int, body: HmsActionBody, client: "BambuMQT
         printer_id,
         actor="operator",
         # The dialog frames echo the pressed job's subtask id; a fault with no job sends "".
-        press=lambda live: live.execute_hms_action(body.print_error, body.action, body.job_id or ""),
+        press=printer_action.dialog_press(body.print_error, body.action, body.job_id or ""),
     )
     match verdict:
         case spool_recovery.ResumeSent(sent=sent):
-            ack = None
-            if sent.sequence_id is not None:
-                ack = await client.await_ack(sent, HMS_ACTION_ACK_WAIT_SECONDS, HMS_ACTION_ACK_POLL_SECONDS)
-            return _hms_action_answer(sent, ack)
+            return _hms_action_answer(sent, await printer_action.ack_within(sent, HMS_ACTION_ACK_WAIT_SECONDS))
         case spool_recovery.RefillStarted(slot=slot):
             return {"success": True, "status": "refilling", "slot": slot, "message": _refilling_message(slot)}
         case spool_recovery.ResumeRefused():
@@ -4362,17 +4461,15 @@ async def _resume_button(printer_id: int, body: HmsActionBody, client: "BambuMQT
             assert_never(verdict)
 
 
-def _hms_action_answer(sent: "SentCommand | None", ack: "CommandAck | None") -> dict:
+def _hms_action_answer(sent: "printer_action.Sent | None", ack: "CommandAck | None") -> dict:
     """A dialog press and its ACK → the HTTP answer, for both lanes (a plate-check press the
-    ladder's service sent, any other the client sent here): nothing sent → 400; a frame whose
-    echo is never recorded → 200 "sent"; no ACK → 502; a refusing ACK → 502 naming it."""
-    if sent is None:
+    ladder's service sent, any other sent here through the record): nothing sent → 400; no ACK
+    → 502; a refusing ACK → 502 naming it."""
+    if sent is None or not sent.published:
         raise HTTPException(400, "Failed to execute HMS action")
-    if sent.sequence_id is None:
-        return {"success": True, "message": "HMS action sent"}
     if ack is None:
         raise HTTPException(502, f"Printer did not acknowledge HMS action within {HMS_ACTION_ACK_WAIT_SECONDS}s")
     if not ack.succeeded:
         answer = f"result={ack.result}" + (f", reason={ack.reason}" if ack.reason else "")
-        raise HTTPException(502, f"Printer rejected HMS action {sent.command}: {answer}")
+        raise HTTPException(502, f"Printer rejected HMS action {ack.command}: {answer}")
     return {"success": True, "message": "HMS action executed"}

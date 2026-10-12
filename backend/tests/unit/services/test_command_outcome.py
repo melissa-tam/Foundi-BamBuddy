@@ -1,8 +1,10 @@
-"""``services/ams_command`` — ONE owner for "an AMS motion command and what the wire answered".
+"""``services/command_outcome`` — the AMS motion reading, absorbed from ``ams_command`` (2026-10-11).
 
 The 2026-09-11 premise ("the firmware drops every load and unload while the AMS is mid
 filament-change") was asserted, not measured per posture, and two refusals were built on
-it. This suite pins the measurement that replaces it:
+it. This suite pins the measurement that replaces it — now the recovery driver's per-step
+reading in the outcome leaf (``command_outcome.classify``; the record's own answer is
+``command_outcome.read``, pinned in ``test_command_outcome_record``):
 
 * the classifier table — every ``(command, posture)`` row against every answer it can
   give, the ``session_changed`` precedence, the grace-held completions, the
@@ -10,58 +12,37 @@ it. This suite pins the measurement that replaces it:
   012-H2S 2026-09-23 measurement) in exactly the mid-change rows that can move,
   ``acted`` vs ``no_movement`` at the deadline, and a missing row RAISING (the
   ``incident_resolution`` pattern);
-* the ACK correlation — the firmware's ACK is read for the send's OWN sequence id;
-* the verbs — the only two refusals kept, the pre-send mark and snapshot ordering, the
-  send's sequence id, the operator attribution stamp and its session-epoch scope, a
-  publish that did not go out;
-* the operator facade's outcome mapping and its log lines;
-* the single-caller pin: only ``ams_command`` calls the client's motion publishers.
+* :func:`command_outcome.ran` — did a RECORDED motion command run.
 """
 
 from __future__ import annotations
 
-import ast
 import itertools
-import logging
-from collections.abc import Callable, Iterator
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from typing import get_args
 
 import pytest
 
-from backend.app.models.printer_incident_step import STEP_KIND_COMMAND, STEP_KIND_LEVER
 from backend.app.schemas.printer import AmsCommandOutcome
-from backend.app.services import ams_command, spool_respool
-from backend.app.services.ams_command import (
+from backend.app.services import command_outcome
+from backend.app.services.bambu_mqtt import CommandAck, PrinterState, ams_mid_filament_change
+from backend.app.services.command_outcome import (
     OPERATOR_ACK_S,
     UNLOAD_GRACE_S,
-    AmsCommandResult,
     AmsWireSnapshot,
-    Answer,
-    Command,
+    MotionCommand as Command,
+    MotionReading as Answer,
     Observation,
     Posture,
     PostureFamily,
-    Refusal,
-    Sent,
-    ack_of,
     classify,
-    command_for_operator,
-    observe,
-    operator_commanded_since,
     posture,
+    ran,
     snapshot,
 )
-from backend.app.services.bambu_mqtt import CommandAck, PrinterState, ams_mid_filament_change
-from backend.app.services.printer_incidents import StepEntry
-from backend.app.services.refill_verdict import ran
-from backend.app.services.tray_fields import ExtruderFeed, ToolheadFeed, extruder_feed, toolhead_feed
-from backend.tests._fixtures.ast_tree import ParsedModule, ParsedTree
-from backend.tests._fixtures.clock import FakeClock
+from backend.app.services.tray_fields import ExtruderFeed, extruder_feed, toolhead_feed
 
-_LOGGER = "backend.app.services.ams_command"
 _PID = 12
 _DRIVER_DEADLINE_S = 90.0
 
@@ -69,13 +50,6 @@ _DRIVER_DEADLINE_S = 90.0
 # 0700_2200_0002_0001 — "AMS A Slot 3 filament has run out" (a slot-attributed DEMAND).
 _BARE_8011 = SimpleNamespace(attr=0x07000000, code="0x8011", full_code="0700000000008011")
 _SLOT3_DEMAND = SimpleNamespace(attr=0x07002200, code="0x20001", full_code="0700220000020001")
-
-
-@pytest.fixture(autouse=True)
-def _fresh_operator_stamps() -> Iterator[None]:
-    ams_command._reset_state()
-    yield
-    ams_command._reset_state()
 
 
 def _snap(
@@ -126,7 +100,7 @@ def _run(
     first answer and the elapsed time it landed at."""
     observation = Observation()
     for elapsed_s, now in polls:
-        observation.fold_ack(ack if elapsed_s >= ack_from_s else None)
+        observation.fold_ack(ack.succeeded if ack is not None and elapsed_s >= ack_from_s else None)
         answer = classify(
             command, target, entry, now, observation=observation, elapsed_s=elapsed_s, deadline_s=deadline_s
         )
@@ -243,16 +217,16 @@ class TestSnapshot:
 
 class TestClassifierTable:
     def test_the_table_spells_out_every_command_posture_pair(self) -> None:
-        assert set(ams_command._ROWS) == set(itertools.product(get_args(Command), get_args(Posture)))
+        assert set(command_outcome._MOTION_ROWS) == set(itertools.product(get_args(Command), get_args(Posture)))
 
     def test_a_missing_row_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delitem(ams_command._ROWS, ("unload", "idle_loaded"))
+        monkeypatch.delitem(command_outcome._MOTION_ROWS, ("unload", "idle_loaded"))
 
-        with pytest.raises(LookupError, match=r"no classifier row for \(command='unload', posture='idle_loaded'\)"):
+        with pytest.raises(LookupError, match=r"no motion row for \(command='unload', posture='idle_loaded'\)"):
             _run("unload", None, _snap(main=0, tray_now=3), [(1.0, _snap(main=0, tray_now=3))])
 
     def test_an_unknown_command_raises_rather_than_borrowing_a_row(self) -> None:
-        with pytest.raises(LookupError, match="no classifier row"):
+        with pytest.raises(LookupError, match="no motion row"):
             classify(
                 "purge",  # type: ignore[arg-type]
                 None,
@@ -303,19 +277,19 @@ class TestSessionChanged:
     ``session_changed`` at once in every row — so a load that completed across a reconnect
     read as unknowable, and the recovery driver aborted on it. Now the new session is
     waited out to its first FRESH report and the command is answered by its motion
-    (:data:`ams_command._ACROSS_ROWS`)."""
+    (:data:`command_outcome._ACROSS_ROWS`)."""
 
     def test_the_cross_session_table_spells_out_every_command_posture_pair(self) -> None:
-        assert set(ams_command._ACROSS_ROWS) == set(itertools.product(get_args(Command), get_args(Posture)))
+        assert set(command_outcome._ACROSS_ROWS) == set(itertools.product(get_args(Command), get_args(Posture)))
 
     def test_a_missing_cross_session_row_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delitem(ams_command._ACROSS_ROWS, ("load", "idle_loaded"))
+        monkeypatch.delitem(command_outcome._ACROSS_ROWS, ("load", "idle_loaded"))
         entry = _ENTRY["idle_loaded"]
 
         with pytest.raises(LookupError, match=r"no cross-session row for \(command='load', posture='idle_loaded'\)"):
             _run("load", 5, entry, [(1.0, _new_session(entry, fresh=True))])
 
-    @pytest.mark.parametrize("command, entry_posture", sorted(ams_command._ROWS))
+    @pytest.mark.parametrize("command, entry_posture", sorted(command_outcome._MOTION_ROWS))
     def test_a_new_session_that_is_not_fresh_is_waited_out_then_session_changed_at_the_deadline(
         self, command: Command, entry_posture: Posture
     ) -> None:
@@ -637,7 +611,7 @@ class TestFoldAck:
         (the ``ams_control resume`` echo), 012-H2S 2026-09-23."""
         observation = Observation()
 
-        observation.fold_ack(_ack(result))
+        observation.fold_ack(_ack(result).succeeded)
 
         assert observation.acked is True
 
@@ -645,27 +619,25 @@ class TestFoldAck:
     def test_anything_else_is_a_failure(self, result: str | None) -> None:
         observation = Observation()
 
-        observation.fold_ack(_ack(result))
+        observation.fold_ack(_ack(result).succeeded)
 
         assert observation.acked is False
 
     def test_the_reading_is_the_ack_records_own(self) -> None:
-        """ONE reading of ``result``: ``CommandAck.succeeded``. ``ams_command`` keeps no
+        """ONE reading of ``result``: ``CommandAck.succeeded``. The outcome leaf keeps no
         spelling set of its own, so the motion lane and the dialog-button lane can never
         disagree about what the firmware said."""
-        from backend.app.services import ams_command
-
-        assert not hasattr(ams_command, "_ACK_SUCCESS_RESULTS")
+        assert not hasattr(command_outcome, "_ACK_SUCCESS_RESULTS")
         for result in ("success", "SUCCESS", "ok", "fail", None):
             observation = Observation()
-            observation.fold_ack(_ack(result))
+            observation.fold_ack(_ack(result).succeeded)
             assert observation.acked is _ack(result).succeeded
 
     def test_an_ack_once_seen_stays_seen(self) -> None:
         """A later ``None`` (the ACK rolled out of the client's bounded log) changes nothing."""
         observation = Observation()
 
-        observation.fold_ack(_ack("success"))
+        observation.fold_ack(_ack("success").succeeded)
         observation.fold_ack(None)
 
         assert observation.acked is True
@@ -792,7 +764,7 @@ class TestHeldBehindTheChange:
         into an empty path (:class:`TestHeldOutsideAChange`)."""
         held_rows = {
             (command, entry_posture)
-            for command, entry_posture in ams_command._ROWS
+            for command, entry_posture in command_outcome._MOTION_ROWS
             if _run(
                 command,
                 5,
@@ -920,23 +892,17 @@ class TestHeldOutsideAChange:
 # --- did a recorded motion command run ----------------------------------------------------
 
 
-def _command_step(command: str, *, target: int | None = None, feeder: str | None = None) -> StepEntry:
-    """A ``command`` step as the step ledger records it (``printer_incident_step``)."""
-    return StepEntry(kind=STEP_KIND_COMMAND, name=command, target=target, feeder=feeder)
-
-
-def _live(tray_now: object) -> ToolheadFeed:
-    return toolhead_feed(SimpleNamespace(tray_now=tray_now, h2d_extruder_snow={}, active_extruder=0))
+def _live(tray_now: object) -> ExtruderFeed:
+    return toolhead_feed(SimpleNamespace(tray_now=tray_now, h2d_extruder_snow={}, active_extruder=0)).active
 
 
 class TestRan:
-    """``refill_verdict.ran(step, live)`` — did a RECORDED motion command run, read off the step's own
-    recorded columns and the live K1 reading. Pure and DB-free: its readers are the driver's
-    round top after a restart (never send behind a command that may still run) and the
-    per-push detector of a farm command that ran after the hand-over (011/014-H2S: an
-    accepted pull-back ran on its own ~4.5 min after the send)."""
+    """``command_outcome.ran(command, target, loaded_at_send, live)`` — did a RECORDED motion command
+    run, read off what was recorded at the send and the live ACTIVE extruder. Pure and DB-free: its
+    readers are the record's AMS-motion cells, the driver's round top after a restart and the refill
+    verdict's pending-command settle (011/014-H2S: an accepted pull-back ran on its own ~4.5 min after
+    the send)."""
 
-    @pytest.mark.parametrize("recorded", ["jammed", "other"])
     @pytest.mark.parametrize(
         "tray_now, expected",
         [
@@ -947,16 +913,16 @@ class TestRan:
         ],
     )
     def test_an_unload_sent_loaded_ran_when_the_active_extruder_reads_empty(
-        self, recorded: str, tray_now: object, expected: bool | None
+        self, tray_now: object, expected: bool | None
     ) -> None:
-        assert ran(_command_step("unload", feeder=recorded), _live(tray_now)) is expected
+        assert ran("unload", None, True, _live(tray_now)) is expected
 
-    @pytest.mark.parametrize("recorded", ["empty", "external", "unknown", None])
+    @pytest.mark.parametrize("loaded", [False, None])
     @pytest.mark.parametrize("tray_now", [255, 3, 254])
-    def test_an_unload_sent_with_no_feeder_loaded_is_undecidable(self, recorded: str | None, tray_now: int) -> None:
+    def test_an_unload_sent_with_no_feeder_loaded_is_undecidable(self, loaded: bool | None, tray_now: int) -> None:
         """Nothing was at the feeder for it to pull back (or nobody read what was): no live
         reading is its answer."""
-        assert ran(_command_step("unload", feeder=recorded), _live(tray_now)) is None
+        assert ran("unload", None, loaded, _live(tray_now)) is None
 
     @pytest.mark.parametrize(
         "tray_now, expected",
@@ -969,746 +935,46 @@ class TestRan:
         ],
     )
     def test_a_load_ran_when_the_active_feeder_is_its_target(self, tray_now: object, expected: bool | None) -> None:
-        assert ran(_command_step("load", target=2, feeder="empty"), _live(tray_now)) is expected
+        assert ran("load", 2, False, _live(tray_now)) is expected
 
     @pytest.mark.parametrize("target", [None, 254, 255])
     def test_a_load_whose_target_is_no_ams_feeder_is_undecidable(self, target: int | None) -> None:
-        assert ran(_command_step("load", target=target), _live(254)) is None
+        assert ran("load", target, None, _live(254)) is None
 
     def test_a_dual_nozzle_reads_the_active_extruder(self) -> None:
         """The right nozzle still holds slot 5; the left, active one is empty — the pull-back
         from the active nozzle ran."""
-        live = toolhead_feed(SimpleNamespace(tray_now=5, h2d_extruder_snow={0: 5, 1: 255}, active_extruder=1))
+        live = toolhead_feed(SimpleNamespace(tray_now=5, h2d_extruder_snow={0: 5, 1: 255}, active_extruder=1)).active
 
-        assert ran(_command_step("unload", feeder="jammed"), live) is True
-        assert ran(_command_step("load", target=5), live) is False
+        assert ran("unload", None, True, live) is True
+        assert ran("load", 5, None, live) is False
 
-    @pytest.mark.parametrize(
-        "step",
-        [
-            pytest.param(StepEntry(kind=STEP_KIND_LEVER, name="resume"), id="a_lever"),
-            pytest.param(StepEntry(kind=STEP_KIND_COMMAND, name="purge"), id="an_unknown_command"),
-        ],
-    )
-    def test_only_a_motion_command_can_be_asked(self, step: StepEntry) -> None:
-        """Motion-only: a lever's effect is the release reader's, and a token the module
-        cannot name is ledger drift, never a skipped row."""
+    @pytest.mark.parametrize("command", ["resume", "purge"])
+    def test_only_a_motion_command_can_be_asked(self, command: str) -> None:
+        """Motion-only: a lever's effect is the release reader's, and a token the leaf cannot name
+        is drift, never a skipped row."""
         with pytest.raises(LookupError):
-            ran(step, _live(255))
+            ran(command, None, True, _live(255))
 
-    def test_the_loaded_kinds_are_the_drivers_own_feeder_vocabulary(self) -> None:
-        """``ran`` reads the feeder-position kind the recovery driver RECORDS at the send
-        (``spool_recovery.FeederKind``): both kinds that name a real feeder at the extruder
-        count as loaded, and every kind it reads is one the driver can write."""
-        from backend.app.services import refill_verdict
+    def test_the_drivers_loaded_feeder_kinds_are_its_own_vocabulary(self) -> None:
+        """The recovery driver turns its recorded feeder kind into ``loaded_at_send``: both kinds
+        that name a real feeder at the extruder count as loaded, and both are kinds it writes."""
+        from backend.app.services import spool_recovery
         from backend.app.services.spool_recovery import FeederKind
 
-        assert {"jammed", "other"} == refill_verdict._RECORDED_LOADED_FEEDERS
-        assert set(get_args(FeederKind)) >= refill_verdict._RECORDED_LOADED_FEEDERS
+        assert {"jammed", "other"} == spool_recovery._LOADED_FEEDERS
+        assert set(get_args(FeederKind)) >= spool_recovery._LOADED_FEEDERS
 
 
-# --- the verbs -----------------------------------------------------------------------------
+class TestPendingSettles:
+    """``command_outcome.pending_settles`` — has the pending command stopped being a queue."""
 
+    def test_a_run_command_is_complete(self) -> None:
+        assert command_outcome.pending_settles("load", 2, False, _live(2)) == "complete"
 
-class _FakeClient:
-    """The two motion publishers plus the ACK lane's two reads, recording call order into
-    a shared log.
+    def test_an_unload_sent_with_nothing_loaded_is_undecidable_once_the_toolhead_reads_empty(self) -> None:
+        assert command_outcome.pending_settles("unload", None, False, _live(255)) == "undecidable"
 
-    Every publish that goes out is numbered like the real client's (``"1"``, ``"2"``, …,
-    read back through ``last_sent_sequence_id``); ``echo`` makes the fake firmware ACK
-    each send with that ``result`` under the send's own id, as the report-topic echo does.
-    """
-
-    def __init__(
-        self,
-        log: list[str],
-        *,
-        sent: bool = True,
-        on_publish: Callable[[int | None], None] | None = None,
-        echo: str | None = None,
-    ) -> None:
-        self.log = log
-        self.sent = sent
-        self.on_publish = on_publish
-        self.echo = echo
-        self.loads: list[int] = []
-        self.unloads = 0
-        self.acks: list[CommandAck] = []
-        self._seq = 0
-        self._last_sent: str | None = None
-
-    def _went_out(self, tray: int | None) -> None:
-        self._seq += 1
-        self._last_sent = str(self._seq)
-        if self.echo is not None:
-            self.acks.append(_ack(self.echo, seq=self._last_sent))
-        if self.on_publish is not None:
-            self.on_publish(tray)
-
-    def ams_load_filament(self, tray_id: int) -> bool:
-        self.log.append(f"publish_load:{tray_id}")
-        self.loads.append(tray_id)
-        if self.sent:
-            self._went_out(tray_id)
-        return self.sent
-
-    def ams_unload_filament(self) -> bool:
-        self.log.append("publish_unload")
-        self.unloads += 1
-        if self.sent:
-            self._went_out(None)
-        return self.sent
-
-    def last_sent_sequence_id(self, command: str) -> str | None:
-        return self._last_sent if command == "ams_change_filament" else None
-
-    def ack_for(self, command: str, sequence_id: str) -> CommandAck | None:
-        return next((a for a in reversed(self.acks) if (a.command, a.sequence_id) == (command, sequence_id)), None)
-
-
-class _FakeManager:
-    """The three ``printer_manager`` reads ``ams_command`` makes."""
-
-    def __init__(
-        self,
-        *,
-        client: _FakeClient | None,
-        state: PrinterState | None,
-        name: str | None = "012-H2S",
-        on_status: Callable[[], None] | None = None,
-    ) -> None:
-        self.client = client
-        self.state = state
-        self.info = SimpleNamespace(name=name) if name is not None else None
-        self.on_status = on_status
-
-    def get_client(self, printer_id: int) -> _FakeClient | None:
-        return self.client
-
-    def get_status(self, printer_id: int) -> PrinterState | None:
-        if self.on_status is not None:
-            self.on_status()
-        return self.state
-
-    def get_printer(self, printer_id: int) -> SimpleNamespace | None:
-        return self.info
-
-
-@pytest.fixture
-def call_log(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Order of the pre-send mark and the publish, one shared log."""
-    log: list[str] = []
-    monkeypatch.setattr(
-        spool_respool, "note_commanded_load", lambda printer_id, tray: log.append(f"mark:{printer_id}:{tray}")
-    )
-    return log
-
-
-def _install(monkeypatch: pytest.MonkeyPatch, manager: _FakeManager) -> _FakeManager:
-    monkeypatch.setattr(ams_command, "printer_manager", manager)
-    return manager
-
-
-def _state(**fields: object) -> PrinterState:
-    base: dict[str, object] = {"connected": True, "connection_epoch": 1, "state": "IDLE"}
-    base.update(fields)
-    return PrinterState(**base)  # type: ignore[arg-type]
-
-
-class TestVerbRefusals:
-    @pytest.mark.parametrize("verb", ["load", "unload"])
-    def test_no_client_is_not_connected(self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], verb: str) -> None:
-        _install(monkeypatch, _FakeManager(client=None, state=None))
-
-        sent = (
-            ams_command.load(_PID, 5, actor="operator")
-            if verb == "load"
-            else ams_command.unload(_PID, actor="operator")
-        )
-
-        assert sent == Refusal("not_connected", "Printer not connected")
-        assert call_log == []
-
-    @pytest.mark.parametrize(
-        "hms, where",
-        [
-            pytest.param([_SLOT3_DEMAND, _BARE_8011], "AMS A slot 3", id="slot_attributed_demand"),
-            pytest.param([_BARE_8011], "the slot that ran out", id="slot_agnostic_runout"),
-        ],
-    )
-    def test_a_runout_hold_refuses_a_load_with_todays_copy(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], hms: list[SimpleNamespace], where: str
-    ) -> None:
-        client = _FakeClient(call_log)
-        _install(monkeypatch, _FakeManager(client=client, state=_state(state="PAUSE", hms_errors=hms), name="006-H2S"))
-
-        sent = ams_command.load(_PID, 1, actor="operator")
-
-        assert sent == Refusal(
-            "runout_hold",
-            f"006-H2S is PAUSEd waiting for a filament refill in {where}. The AMS executes no load in this "
-            "state — the request would latch in the firmware and resurface at the resume as a bogus demand "
-            f"for this slot (006-H2S 2026-07-26). Insert filament into {where} and the print resumes from there.",
-        )
-        assert call_log == []  # no mark, no publish — the latch is never armed
-
-    def test_a_runout_hold_does_not_refuse_an_unload(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]
-    ) -> None:
-        client = _FakeClient(call_log)
-        _install(monkeypatch, _FakeManager(client=client, state=_state(state="PAUSE", hms_errors=[_BARE_8011])))
-
-        assert isinstance(ams_command.unload(_PID, actor="operator"), Sent)
-        assert client.unloads == 1
-
-    @pytest.mark.parametrize("verb", ["load", "unload"])
-    def test_a_mid_change_ams_is_not_refused(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], verb: str
-    ) -> None:
-        """The retracted premise: no posture refuses a command any more."""
-        client = _FakeClient(call_log)
-        _install(
-            monkeypatch,
-            _FakeManager(client=client, state=_state(state="PAUSE", ams_status_main=1, ams_status_sub=5, tray_now=3)),
-        )
-
-        sent = (
-            ams_command.load(_PID, 2, actor="operator")
-            if verb == "load"
-            else ams_command.unload(_PID, actor="operator")
-        )
-
-        assert isinstance(sent, Sent)
-        assert posture(sent.entry) == "mid_change_loaded"
-        assert len(client.loads) + client.unloads == 1
-
-    @pytest.mark.parametrize("verb", ["load", "unload"])
-    def test_a_publish_that_did_not_go_out_is_not_connected(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], caplog: pytest.LogCaptureFixture, verb: str
-    ) -> None:
-        caplog.set_level(logging.INFO, logger=_LOGGER)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, sent=False), state=_state()))
-
-        sent = (
-            ams_command.load(_PID, 5, actor="operator")
-            if verb == "load"
-            else ams_command.unload(_PID, actor="operator")
-        )
-
-        assert isinstance(sent, Refusal) and sent.reason == "not_connected"
-        assert "not connected" in sent.detail.lower()
-        assert operator_commanded_since(_PID, 0.0) is False  # an unsent click attributes nothing
-        assert [r.levelno for r in caplog.records if "[ams-command]" in r.getMessage()] == [logging.WARNING]
-
-
-class TestVerbSend:
-    def test_the_mark_and_the_snapshot_precede_the_publish(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]
-    ) -> None:
-        state = _state(tray_now=255, ams_status_main=0)
-
-        def lands(tray: int | None) -> None:
-            state.tray_now = tray if tray is not None else 255
-            state.ams_status_main = 1
-
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=lands), state=state))
-
-        sent = ams_command.load(_PID, 5, actor="driver")
-
-        assert call_log == [f"mark:{_PID}:5", "publish_load:5"]
-        assert isinstance(sent, Sent)
-        assert (sent.entry.tray_now, sent.entry.ams_status_main) == (255, 0)  # read BEFORE the publish moved it
-
-    def test_an_unload_snapshot_precedes_the_publish(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]
-    ) -> None:
-        state = _state(tray_now=3, ams_status_main=0)
-
-        def lands(tray: int | None) -> None:
-            state.tray_now = 255
-
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=lands), state=state))
-
-        sent = ams_command.unload(_PID, actor="driver")
-
-        assert call_log == ["publish_unload"]  # an unload carries no load mark
-        assert isinstance(sent, Sent) and sent.entry.tray_now == 3
-
-    def test_each_send_carries_its_own_sequence_id(self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]) -> None:
-        """The id the client published under, read right after the publish — the key the
-        firmware's ACK is correlated by."""
-        state = _state(tray_now=3, ams_status_main=0)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=state))
-
-        first = ams_command.load(_PID, 2, actor="driver")
-        second = ams_command.unload(_PID, actor="driver")
-
-        assert first == Sent(entry=first.entry, sequence_id="1")
-        assert second == Sent(entry=second.entry, sequence_id="2")
-
-    def test_the_send_line_carries_the_entry_snapshot(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], caplog: pytest.LogCaptureFixture
-    ) -> None:
-        caplog.set_level(logging.INFO, logger=_LOGGER)
-        state = _state(tray_now=3, ams_status_main=1, ams_status_sub=5, tray_tar=3, connection_epoch=7)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=state))
-
-        ams_command.load(_PID, 2, actor="driver")
-
-        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ams-command]")]
-        assert lines == [
-            f"[ams-command] actor=driver command=load printer={_PID} target=2 seq=1 posture=mid_change_loaded "
-            "entry tray_now=3 ams_status=1/5 tray_tar=3 epoch=7"
-        ]
-
-
-class TestAckOf:
-    """``ack_of`` — the ONE correlation of a send to the firmware's ACK for it."""
-
-    def _sent(self, seq: str | None) -> Sent:
-        return Sent(entry=_ENTRY["mid_change_loaded"], sequence_id=seq)
-
-    def test_reads_the_ack_for_the_send_s_own_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = _FakeClient([])
-        client.acks = [_ack("fail", seq="6"), _ack("success", seq="7"), _ack("fail", seq="8")]
-        _install(monkeypatch, _FakeManager(client=client, state=None))
-
-        assert ack_of(_PID, self._sent("7")) == _ack("success", seq="7")
-
-    def test_an_ack_for_another_command_is_not_this_send_s(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The ACK is keyed by ``(command, id)``: an ACK another command carries under the
-        same id is not this send's."""
-        client = _FakeClient([])
-        client.acks = [_ack("success", seq="7", command="ams_control")]
-        _install(monkeypatch, _FakeManager(client=client, state=None))
-
-        assert ack_of(_PID, self._sent("7")) is None
-
-    def test_no_client_or_no_id_is_no_ack(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = _FakeClient([])
-        client.acks = [_ack("success", seq="7")]
-        _install(monkeypatch, _FakeManager(client=None, state=None))
-        assert ack_of(_PID, self._sent("7")) is None
-
-        _install(monkeypatch, _FakeManager(client=client, state=None))
-        assert ack_of(_PID, self._sent(None)) is None
-
-
-class TestOperatorAttribution:
-    @pytest.mark.parametrize("verb", ["load", "unload"])
-    def test_only_an_operator_command_is_stamped(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], verb: str
-    ) -> None:
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=_state()))
-
-        if verb == "load":
-            ams_command.load(_PID, 5, actor="driver")
-        else:
-            ams_command.unload(_PID, actor="driver")
-        assert operator_commanded_since(_PID, 0.0) is False
-
-        if verb == "load":
-            ams_command.load(_PID, 5, actor="operator")
-        else:
-            ams_command.unload(_PID, actor="operator")
-        assert operator_commanded_since(_PID, 0.0) is True
-
-    def test_since_is_a_time_bound(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], clock: FakeClock
-    ) -> None:
-        monkeypatch.setattr(ams_command, "_monotonic", clock)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=_state()))
-
-        ams_command.unload(_PID, actor="operator")  # stamped at t=1000
-
-        assert operator_commanded_since(_PID, clock.t) is True
-        assert operator_commanded_since(_PID, clock.t + 0.001) is False
-        assert operator_commanded_since(_PID + 1, 0.0) is False  # per printer
-
-    def test_a_stamp_from_an_older_session_is_not_since_anything(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]
-    ) -> None:
-        state = _state(connection_epoch=1)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=state))
-        ams_command.unload(_PID, actor="operator")
-        assert operator_commanded_since(_PID, 0.0) is True
-
-        state.connection_epoch = 2  # the printer reconnected
-
-        assert operator_commanded_since(_PID, 0.0) is False
-
-
-# --- the operator facade -------------------------------------------------------------------
-
-
-@pytest.fixture
-def short_ack(monkeypatch: pytest.MonkeyPatch) -> float:
-    """The operator window, shortened so a "nothing happened" case does not wait 5 s."""
-    monkeypatch.setattr(ams_command, "OPERATOR_ACK_S", 0.05)
-    return 0.05
-
-
-class TestCommandForOperator:
-    async def test_no_client_maps_to_refused_not_connected(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]
-    ) -> None:
-        _install(monkeypatch, _FakeManager(client=None, state=None))
-
-        assert await command_for_operator(_PID, "unload") == AmsCommandResult(
-            "refused_not_connected", "Printer not connected", None
-        )
-
-    async def test_a_runout_hold_maps_to_refused_runout_hold_with_its_sentence(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str]
-    ) -> None:
-        _install(
-            monkeypatch,
-            _FakeManager(client=_FakeClient(call_log), state=_state(state="PAUSE", hms_errors=[_SLOT3_DEMAND])),
-        )
-
-        result = await command_for_operator(_PID, "load", 1)
-
-        assert result.outcome == "refused_runout_hold"
-        assert "AMS A slot 3" in result.message and "latch" in result.message
-        assert result.family is None  # nothing was sent, so no posture was read
-
-    async def test_a_load_that_reaches_its_tray_is_complete(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float
-    ) -> None:
-        state = _state(tray_now=255)
-
-        def lands(tray: int | None) -> None:
-            state.tray_now = tray if tray is not None else 255
-
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=lands), state=state))
-
-        assert await command_for_operator(_PID, "load", 5) == AmsCommandResult(
-            "complete", "Loading filament from AMS 1 slot 2", "outside_change"
-        )
-
-    @pytest.mark.parametrize(
-        "tray_id, label", [(254, "external spool"), (255, "Ext-R"), (0, "AMS 0 slot 1")], ids=["ext_l", "ext_r", "slot"]
-    )
-    async def test_a_load_that_moved_is_acted_with_todays_sentence(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float, tray_id: int, label: str
-    ) -> None:
-        state = _state(tray_now=255, ams_status_main=0)
-
-        def stirs(tray: int | None) -> None:
-            state.ams_status_main = 1
-
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=stirs), state=state))
-
-        assert await command_for_operator(_PID, "load", tray_id) == AmsCommandResult(
-            "acted", f"Loading filament from {label}", "outside_change"
-        )
-
-    @pytest.mark.parametrize(
-        "command, tray_id, message",
-        [("load", 3, "Load sent. AMS did not move."), ("unload", None, "Unload sent. AMS did not move.")],
-    )
-    async def test_a_wire_that_never_moves_is_no_movement(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        call_log: list[str],
-        short_ack: float,
-        command: Command,
-        tray_id: int | None,
-        message: str,
-    ) -> None:
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=_state(tray_now=1, ams_status_main=0)))
-
-        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult(
-            "no_movement", message, "outside_change"
-        )
-
-    @pytest.mark.parametrize(
-        "command, tray_id, message",
-        [
-            ("load", 2, "Load accepted. Held behind the paused print's filament change."),
-            ("unload", None, "Unload accepted. Held behind the paused print's filament change."),
-        ],
-    )
-    async def test_an_acknowledged_click_into_a_wedge_is_held(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        call_log: list[str],
-        short_ack: float,
-        command: Command,
-        tray_id: int | None,
-        message: str,
-    ) -> None:
-        """012-H2S 2026-09-23: the operator's clicks into the loaded wedge were each echoed
-        ``success`` and moved nothing — the click is told so, not "did not move"."""
-        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, echo="success"), state=state))
-
-        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("held", message, "mid_change")
-
-    @pytest.mark.parametrize(
-        "command, tray_id, tray_now, message",
-        [
-            ("load", 2, 255, "Load accepted. Not run yet."),
-            ("unload", None, 3, "Unload accepted. Not run yet. The AMS can run it later without another command."),
-        ],
-    )
-    async def test_an_acknowledged_click_outside_a_change_is_held_with_its_own_sentence(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        call_log: list[str],
-        short_ack: float,
-        command: Command,
-        tray_id: int | None,
-        tray_now: int,
-        message: str,
-    ) -> None:
-        """Outside a change there is no paused change to be held behind, so the in-change
-        sentence would be false: the outside-change family carries its own (011/014-H2S: an
-        accepted pull-back ran on its own ~4.5 min later)."""
-        state = _state(tray_now=tray_now, ams_status_main=0)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, echo="success"), state=state))
-
-        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult("held", message, "outside_change")
-
-    @pytest.mark.parametrize("command, tray_id", [("load", 2), ("unload", None)])
-    async def test_a_failure_ack_into_a_wedge_is_no_movement(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        call_log: list[str],
-        short_ack: float,
-        command: Command,
-        tray_id: int | None,
-    ) -> None:
-        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, echo="fail"), state=state))
-
-        assert (await command_for_operator(_PID, command, tray_id)).outcome == "no_movement"
-
-    async def test_an_unload_with_nothing_loaded_mid_change_is_undecidable(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float
-    ) -> None:
-        state = _state(state="PAUSE", tray_now=255, ams_status_main=1, ams_status_sub=5)
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log), state=state))
-
-        assert await command_for_operator(_PID, "unload") == AmsCommandResult(
-            "undecidable", "Unload sent. Nothing was loaded.", "mid_change"
-        )
-
-    async def test_an_unload_that_empties_a_mid_change_feeder_is_acted(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float
-    ) -> None:
-        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
-
-        def empties(tray: int | None) -> None:
-            state.tray_now = 255
-
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=empties), state=state))
-
-        assert await command_for_operator(_PID, "unload") == AmsCommandResult(
-            "acted", "Unloading filament", "mid_change"
-        )
-
-    @pytest.mark.parametrize("command, tray_id", [("load", 5), ("unload", None)])
-    async def test_a_reconnect_during_the_command_is_session_changed(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        call_log: list[str],
-        short_ack: float,
-        command: Command,
-        tray_id: int | None,
-    ) -> None:
-        """The operator's window is short (:data:`OPERATOR_ACK_S`): a new session whose
-        first report has not landed by its end reads ``session_changed`` — the toast copy
-        stands. (Since F4 the classifier waits the cache out instead of answering at once,
-        so the window is shortened here like every "nothing happened" case.)"""
-        state = _state(connection_epoch=3)
-
-        def reconnects(tray: int | None) -> None:
-            state.connection_epoch = 4
-            state.report_epoch = None  # _on_connect: the new session's report has not landed
-
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=reconnects), state=state))
-
-        assert await command_for_operator(_PID, command, tray_id) == AmsCommandResult(
-            "session_changed", "Printer reconnected during the command. Check the AMS.", "outside_change"
-        )
-
-    def test_the_operator_window_is_five_seconds(self) -> None:
-        assert ams_command.OPERATOR_ACK_S == 5.0
-
-    async def test_a_reconnect_whose_first_report_lands_inside_the_window_answers_from_motion(
-        self, monkeypatch: pytest.MonkeyPatch, call_log: list[str], short_ack: float
-    ) -> None:
-        """The session changed under the click, and the new session's first FRESH report —
-        inside the window — shows the load on its tray: ``complete``, not a reconnect toast."""
-        state = _state(connection_epoch=3)
-
-        def reconnects_loaded(tray: int | None) -> None:
-            state.connection_epoch = 4
-            state.tray_now = tray
-            state.report_epoch = 4  # the new session's first report, applied
-
-        _install(monkeypatch, _FakeManager(client=_FakeClient(call_log, on_publish=reconnects_loaded), state=state))
-
-        assert await command_for_operator(_PID, "load", 5) == AmsCommandResult(
-            "complete", "Loading filament from AMS 1 slot 2", "outside_change"
-        )
-
-    async def test_a_load_without_a_tray_is_a_programming_error(self) -> None:
-        with pytest.raises(ValueError, match="needs a tray_id"):
-            await command_for_operator(_PID, "load")
-
-    def test_the_copy_covers_exactly_the_answers_each_command_can_get_in_each_family(self) -> None:
-        """Keyed by posture family: only an unload into a mid-change AMS with nothing loaded
-        is ``undecidable``, so that cell exists in the mid-change family alone."""
-        reachable = {
-            (command, answer, family)
-            for command in get_args(Command)
-            for answer in get_args(Answer)
-            for family in get_args(PostureFamily)
-            if answer != "undecidable" or (command, family) == ("unload", "mid_change")
-        }
-        assert set(ams_command._ANSWER_COPY) == reachable
-
-    def test_held_has_a_sentence_of_its_own_in_each_family(self) -> None:
-        for command in get_args(Command):
-            assert (
-                ams_command._ANSWER_COPY[(command, "held", "mid_change")]
-                != ams_command._ANSWER_COPY[(command, "held", "outside_change")]
-            )
-
-    def test_the_operator_window_is_the_documented_five_seconds(self) -> None:
-        assert OPERATOR_ACK_S == 5.0
-
-
-class TestObserve:
-    async def test_polls_until_the_grace_held_completion_and_logs_the_answer(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, clock: FakeClock
-    ) -> None:
-        """The 012-H2S posture over the driver's window: the feeder empties 1 s after
-        the send and stays empty while the AMS stays in state 1 — complete once the
-        empty reading has held for the grace."""
-        caplog.set_level(logging.INFO, logger=_LOGGER)
-        monkeypatch.setattr(ams_command, "_monotonic", clock)
-        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
-        entry = snapshot(state)
-
-        def one_second_per_poll() -> None:
-            clock.advance(1.0)
-            state.tray_now = 255
-
-        _install(monkeypatch, _FakeManager(client=None, state=state, on_status=one_second_per_poll))
-
-        answer = await observe(
-            _PID, "unload", None, Sent(entry=entry, sequence_id=None), timeout_s=_DRIVER_DEADLINE_S, poll_s=0.0
-        )
-
-        assert answer == "complete"
-        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[ams-command]")]
-        assert lines == [
-            f"[ams-command] actor=operator printer={_PID} command=unload target=None posture=mid_change_loaded "
-            "answer=complete after 16.0s (tray_now 3→255 ams_status 1/5→1/5 tray_tar None→None)"
-        ]
-
-    async def test_answers_at_the_deadline_when_nothing_decides(
-        self, monkeypatch: pytest.MonkeyPatch, clock: FakeClock
-    ) -> None:
-        monkeypatch.setattr(ams_command, "_monotonic", clock)
-        state = _state(tray_now=2, ams_status_main=0)
-        entry = snapshot(state)
-        _install(monkeypatch, _FakeManager(client=None, state=state, on_status=lambda: clock.advance(1.0)))
-
-        assert await observe(_PID, "load", 5, Sent(entry=entry, sequence_id=None), timeout_s=3.0, poll_s=0.0) == (
-            "no_movement"
-        )
-        assert clock.t == entry.taken_at + 3.0
-
-    async def test_folds_the_ack_for_its_own_send_and_answers_held_at_the_grace(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, clock: FakeClock
-    ) -> None:
-        """The 012-H2S 2026-09-23 posture over the driver's window: the unload is echoed
-        ``success`` and nothing moves — ``held`` at the grace, not a 90 s wait."""
-        caplog.set_level(logging.INFO, logger=_LOGGER)
-        monkeypatch.setattr(ams_command, "_monotonic", clock)
-        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
-        client = _FakeClient([])
-        client.acks = [_ack("fail", seq="6"), _ack("success", seq="7")]
-        entry = snapshot(state)
-        _install(monkeypatch, _FakeManager(client=client, state=state, on_status=lambda: clock.advance(1.0)))
-
-        answer = await observe(
-            _PID, "unload", None, Sent(entry=entry, sequence_id="7"), timeout_s=_DRIVER_DEADLINE_S, poll_s=0.0
-        )
-
-        assert answer == "held"
-        assert clock.t == entry.taken_at + UNLOAD_GRACE_S
-        assert [r.getMessage() for r in caplog.records if "answer=" in r.getMessage()] == [
-            f"[ams-command] actor=operator printer={_PID} command=unload target=None posture=mid_change_loaded "
-            "answer=held after 15.0s (tray_now 3→3 ams_status 1/5→1/5 tray_tar None→None)"
-        ]
-
-    async def test_an_ack_for_an_older_send_is_not_this_one_s(
-        self, monkeypatch: pytest.MonkeyPatch, clock: FakeClock
-    ) -> None:
-        monkeypatch.setattr(ams_command, "_monotonic", clock)
-        state = _state(state="PAUSE", tray_now=3, ams_status_main=1, ams_status_sub=5)
-        client = _FakeClient([])
-        client.acks = [_ack("success", seq="6")]
-        entry = snapshot(state)
-        _install(monkeypatch, _FakeManager(client=client, state=state, on_status=lambda: clock.advance(1.0)))
-
-        assert await observe(_PID, "unload", None, Sent(entry=entry, sequence_id="7"), timeout_s=30.0, poll_s=0.0) == (
-            "no_movement"
-        )
-
-
-# --- the single-caller pin -----------------------------------------------------------------
-
-_MOTION_PUBLISHERS = frozenset({"ams_load_filament", "ams_unload_filament"})
-_OWNER = Path("services") / "ams_command.py"
-
-
-def _scan_motion_publishes(module: ParsedModule) -> list[tuple[str, int]]:
-    """Every CALL of a client motion publisher, however the client was reached.
-
-    AST, not grep, for the ``TestOperatorStopOwnership`` reason: the publishers are
-    named in prose (and DEFINED in ``bambu_mqtt``) — only a ``Call`` counts.
-    """
-    hits: list[tuple[str, int]] = []
-    for node in ast.walk(module.tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-        if name in _MOTION_PUBLISHERS:
-            hits.append((name, node.lineno))
-    return hits
-
-
-class TestAmsMotionPublishOwnership:
-    """Only ``ams_command`` publishes an AMS load or unload.
-
-    A second caller would send a motion command nobody snapshots, classifies,
-    attributes or marks — the measured answer this module exists for would silently
-    stop covering it.
-    """
-
-    def test_only_ams_command_calls_the_client_motion_publishers(self, app_sources: ParsedTree) -> None:
-        strays = [
-            f"  - {module.rel_to_root.as_posix()}:{line} calls {name}()"
-            for module in app_sources.modules()
-            if module.rel_to_root != _OWNER
-            for name, line in _scan_motion_publishes(module)
-        ]
-        if strays:
-            pytest.fail(
-                "Something outside services/ams_command.py publishes an AMS load/unload:\n"
-                + "\n".join(strays)
-                + "\n\nRoute it through ams_command.load / ams_command.unload — the verbs own the "
-                "pre-send mark, the entry snapshot, the attribution stamp and the send line."
-            )
-
-    def test_the_owner_still_calls_both(self, app_sources: ParsedTree) -> None:
-        """The liveness half: a pin whose owner stopped calling the publishers would pass
-        on an empty set."""
-        assert {name for name, _ in _scan_motion_publishes(app_sources.get(_OWNER))} == _MOTION_PUBLISHERS
+    def test_a_queued_command_is_still_a_queue(self) -> None:
+        assert command_outcome.pending_settles("unload", None, True, _live(3)) is None
+        assert command_outcome.pending_settles("load", 2, False, _live(255)) is None

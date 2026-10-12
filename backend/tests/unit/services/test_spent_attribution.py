@@ -1140,6 +1140,25 @@ async def test_overshoot_without_a_rebind_is_left_completely_alone(db_session, p
 
 
 @pytest.mark.asyncio
+async def test_a_bind_long_after_the_mint_with_no_print_between_is_the_original(db_session, printer_factory, caplog):
+    """The re-bind proof is an EVENT, never a gap (2026-10-11): a row minted and bound two hours apart
+    with NO print charged to it in between entered service with that binding — however slowly the
+    mint and the bind happened to land — so its overshoot is overfill, left alone. (The 120 s
+    epsilon this replaced read the gap alone and would have "reconciled" the row's own first roll.)"""
+    from backend.app.services import spool_tagless
+
+    printer = await printer_factory(model="H2S")
+    old = await _overcharged(db_session, printer.id, 0, 1, pre=(), post=(1100.0,), bound_at=_T0 + timedelta(hours=2))
+
+    with caplog.at_level(logging.WARNING, logger="backend.app.services.spool_tagless"):
+        assert await spool_tagless.reconcile_ledger_overcharges(db_session) == 0
+
+    await db_session.refresh(old)
+    assert old.archived_at is None and old.weight_used == pytest.approx(1100.0)
+    assert caplog.text == ""
+
+
+@pytest.mark.asyncio
 async def test_c5_an_operator_assigning_an_old_row_over_a_new_roll_is_reconciled(
     db_session, printer_factory, silent_surfaces, caplog
 ):

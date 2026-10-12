@@ -90,10 +90,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
-from sqlalchemy import exists, func as sa_func, or_, select
+from sqlalchemy import func as sa_func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.models.printer import Printer
+from backend.app.models.printer_action import PrinterAction
 from backend.app.models.printer_incident import (
     AMS_FAULT_KINDS,
     DECLARED_KINDS,
@@ -132,6 +133,10 @@ from backend.app.models.printer_incident_step import (
     PrinterIncidentStep,
     StepKind,
 )
+
+# ``command_outcome`` is a LEAF (``test_import_graph._LEAVES``): the record's command vocabulary — here,
+# whether a command is ever answered by an echo (``FarmAction.outstanding``).
+from backend.app.services.command_outcome import echoes
 
 # ``hms_actions`` is a LEAF (the vendored action catalog), the one spelling of a dialog button.
 from backend.app.services.hms_actions import HMSAction
@@ -186,12 +191,30 @@ FAULT_RESTART_STEP = "print_stop"
 # driver sent.
 PAYLOAD_FAULT_RESTART_STOP = "fault_restart_stop"
 
+# The step-ledger NAME of the farm's stop of a print running on AIR (operator ruling 2026-10-12: "printing
+# on air = ruined print already" — on PROOF of air the farm stops the ruined print and the unit is
+# retried). A ``stop``-kind step on an AMS or toolhead row, written by ``spool_recovery._stop_printing_on_air``
+# BEFORE it publishes ``print.stop``. ONE origin for the spelling, because the terminal classifier reads the
+# farm's air stop off the projection it derives (:data:`PAYLOAD_AIR_STOP`) — the same reason as
+# :data:`FAULT_RESTART_STEP`. Never a plate-check stop: that ladder's stops are its own row kind's, and the
+# projection keeps this one out of ``last_stop``. 8 characters — inside the step name's VARCHAR(32).
+AIR_STOP_STEP = "air_stop"
+
+# The open-row projection key that says "the farm has SENT its air stop on this row" (a step named
+# :data:`AIR_STOP_STEP` is on the row's ledger). Derived from the ledger by the ledger's one writer, at
+# rehydrate and at every re-projection of the row (:func:`_ledger_projections`), never stored on the row —
+# :data:`PAYLOAD_FAULT_RESTART_STOP`'s idiom. Read by the terminal classifier (``farm_correlation
+# .classify_stop``'s ``air_stop`` verdict: the H2S echoes the farm's own remote stop as a screen-stop cancel
+# echo, so without the ledger the unit would be cancelled with no retry) and by the per-push air detector
+# (:func:`air_stop_sent` — a row whose farm stop was not taken is never stopped again by the detector).
+PAYLOAD_AIR_STOP = "air_stop"
+
 # The classifier's answer for a motion command the firmware ACKNOWLEDGED and has not run
-# (``ams_command.Answer``'s ``held`` — behind the print's own filament change, or, outside one,
+# (``command_outcome.MotionReading``'s ``held`` — behind the print's own filament change, or, outside one,
 # at the step bound: 011-H2S 2026-10-09 04:31:27 and 014-H2S 2026-10-10 02:45:58, both run by
-# the AMS on its own ~4.5 min later). Spelled here because this store may not import
-# ``ams_command`` (that module imports this one); ``test_printer_incidents`` pins the token into
-# the classifier's answer vocabulary, so the two spellings cannot drift.
+# the AMS on its own ~4.5 min later). Spelled here, beside the store's other ledger tokens;
+# ``test_printer_incidents`` pins the token into the classifier's answer vocabulary, so the two
+# spellings cannot drift.
 COMMAND_HELD = "held"
 
 # The dialog buttons a HUMAN may press on the printer's plate-check dialog through the farm, on
@@ -494,6 +517,7 @@ def _reset_state() -> None:
     """
     _open_cache.clear()
     _drivers.clear()
+    _projected_answers.clear()
 
 
 def is_known_kind(kind: str) -> bool:
@@ -534,40 +558,48 @@ def command_pends(outcome: str | None) -> bool:
     (``no_movement``), cannot be answered (``undecidable``), or its answer was lost with its MQTT
     session (``session_changed`` — also how a firmware reboot voids one, ``spool_recovery``).
 
-    ONE rule for both readings of the ledger: the open-row projection's (:func:`_ledger_projections`,
-    over the table) and the recovery driver's evidence log (over its in-memory steps)."""
+    The recovery driver's step-level reading of its own log (its evidence log, over its in-memory
+    steps). The open-row projection's pending command is the RECORD's (2026-10-11): the row's last farm
+    AMS motion ACTION while it is outstanding (``printer_action``, answered only by an event) —
+    :func:`_ledger_projections`."""
     return outcome is None or outcome == COMMAND_HELD
 
 
 @dataclass(frozen=True, slots=True)
 class PendingCommand:
-    """A motion command the farm SENT on a row that has not run as far as anybody measured — the
-    row's LAST command step, while :func:`command_pends` (K11, 011/014-H2S 2026-10-09/10).
+    """A farm AMS motion command on a row that the printer has not answered — the row's LAST farm
+    ``load`` / ``unload`` ACTION while it PENDS (``printer_action`` outstanding, and accepted by the
+    printer or not yet read — :func:`_pends`; K11, 011/014-H2S 2026-10-09/10, the record since
+    2026-10-11).
 
-    It is the farm's command until it runs, even after a hand-over: the AMS ran an accepted
-    pull-back ON ITS OWN ~4.5 min after the send, with the print still paused (011-H2S 04:31:27 →
-    04:36:01, 014-H2S 02:45:58 → 02:50:38), emptying the toolhead under a page that said "slot N is
-    loaded". The step's own ledger columns: ``seq`` (the step to answer once it settles), ``name``
-    (``load`` / ``unload``), ``target`` (a load's tray), ``feeder`` (the feeder kind read AT the
-    send — what ``refill_verdict.ran`` reads back), ``sent_at`` (naive UTC). ``incident_id`` names the
+    It is the farm's command until an EVENT answers it, even after a hand-over: the AMS ran an
+    accepted pull-back ON ITS OWN ~4.5 min after the send, with the print still paused (011-H2S
+    04:31:27 → 04:36:01, 014-H2S 02:45:58 → 02:50:38), emptying the toolhead under a page that said
+    "slot N is loaded". The action's own columns: ``action_id`` (the row — and the wire sequence id),
+    ``name`` (``load`` / ``unload``), ``target`` (a load's tray), ``loaded_at_send`` (was the active
+    extruder fed from a real AMS feeder when it went out — the entry posture,
+    ``command_outcome.entry_loaded``; what ``command_outcome.ran`` reads back), ``sent_at`` (naive UTC);
+    ``seq`` the driver's step that sent it (``None`` when no step names it). ``incident_id`` names the
     row, because the printer-scoped reader (:func:`pending_command`) answers about one row.
     """
 
     incident_id: int
-    seq: int
+    action_id: int
+    seq: int | None
     name: str
     target: int | None
-    feeder: str | None
+    loaded_at_send: bool | None
     sent_at: datetime | None
 
     def as_payload(self) -> dict:
         """The projection's form — JSON primitives only (the WS lane dumps it bare)."""
         return {
             "incident_id": self.incident_id,
+            "action_id": self.action_id,
             "seq": self.seq,
             "name": self.name,
             "target": self.target,
-            "feeder": self.feeder,
+            "loaded_at_send": self.loaded_at_send,
             "sent_at": self.sent_at.isoformat() if self.sent_at is not None else None,
         }
 
@@ -576,21 +608,90 @@ class PendingCommand:
         """The value back from :meth:`as_payload`'s form."""
         sent_at = payload.get("sent_at")
         target = payload.get("target")
-        feeder = payload.get("feeder")
+        seq = payload.get("seq")
+        loaded = payload.get("loaded_at_send")
         return cls(
             incident_id=int(payload["incident_id"]),  # type: ignore[call-overload]
-            seq=int(payload["seq"]),  # type: ignore[call-overload]
+            action_id=int(payload["action_id"]),  # type: ignore[call-overload]
+            seq=seq if isinstance(seq, int) else None,
             name=str(payload["name"]),
             target=target if isinstance(target, int) else None,
-            feeder=feeder if isinstance(feeder, str) else None,
+            loaded_at_send=loaded if isinstance(loaded, bool) else None,
             sent_at=datetime.fromisoformat(sent_at) if isinstance(sent_at, str) else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FarmAction:
+    """One action the FARM sent on a row (``printer_action``, actor ``farm``) — the "what has the farm
+    already done on this hold" read (a farm resume exists, a farm load reached, …). ``answer`` is the
+    record's final answer (``command_outcome.Answer``'s token), ``None`` while outstanding; ``reason``
+    the record's reason (a refusal's printer words); ``unsent`` — the frame never left the farm (the
+    record's ``refusal``: no client, a publish that did not go out), which the printer never saw."""
+
+    action_id: int
+    command: str
+    target: int | None
+    answer: str | None
+    sent_at: datetime | None
+    answered_at: datetime | None
+    #: The driver's reading of the step that sent it (``None`` — no reading yet, or no step names it).
+    step_reading: str | None = None
+    reason: str | None = None
+    unsent: bool = False
+
+    @property
+    def outstanding(self) -> bool:
+        """No event has answered it yet, and one WILL: a command with no echo by design
+        (``command_outcome.echoes`` False — ``set_airduct``, ``gcode_line``, ``print_speed``) keeps a NULL
+        answer forever, which means "nothing will ever answer it", never "awaiting the printer"."""
+        return self.answer is None and echoes(self.command)
+
+    @property
+    def printer_refused(self) -> bool:
+        """The PRINTER answered it ``refused`` — never a frame that did not leave the farm."""
+        return self.answer == _REFUSED and not self.unsent
+
+    def as_payload(self) -> dict:
+        """The projection's form — JSON primitives only."""
+        return {
+            "action_id": self.action_id,
+            "command": self.command,
+            "target": self.target,
+            "answer": self.answer,
+            "sent_at": self.sent_at.isoformat() if self.sent_at is not None else None,
+            "answered_at": self.answered_at.isoformat() if self.answered_at is not None else None,
+            "step_reading": self.step_reading,
+            "reason": self.reason,
+            "unsent": self.unsent,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> FarmAction:
+        """The value back from :meth:`as_payload`'s form."""
+        target = payload.get("target")
+        answer = payload.get("answer")
+        sent_at = payload.get("sent_at")
+        answered_at = payload.get("answered_at")
+        reading = payload.get("step_reading")
+        reason = payload.get("reason")
+        return cls(
+            action_id=int(payload["action_id"]),  # type: ignore[call-overload]
+            command=str(payload["command"]),
+            target=target if isinstance(target, int) else None,
+            answer=answer if isinstance(answer, str) else None,
+            sent_at=datetime.fromisoformat(sent_at) if isinstance(sent_at, str) else None,
+            answered_at=datetime.fromisoformat(answered_at) if isinstance(answered_at, str) else None,
+            step_reading=reading if isinstance(reading, str) else None,
+            reason=reason if isinstance(reason, str) else None,
+            unsent=payload.get("unsent") is True,
         )
 
 
 # The classifier's answers for a motion command that went out and did NOT reach its end — moved
 # and stopped (``acted``) or never moved (``no_movement``): what the "Toolhead empty" chip's
-# ``failed`` phase reads off a row's LAST command (``ams_command.Answer``'s tokens, spelled here
-# because this store may not import ``ams_command``; ``test_printer_incidents`` pins them into the
+# ``failed`` phase reads off a row's LAST command (``command_outcome.MotionReading``'s tokens, spelled
+# here beside the store's other ledger tokens; ``test_printer_incidents`` pins them into the
 # classifier's vocabulary). ``session_changed`` is not one: its answer was LOST (a reconnect, or a
 # reboot voiding a queued command), which says nothing about the toolhead.
 COMMAND_FAILED_ANSWERS: frozenset[str] = frozenset({"acted", "no_movement"})
@@ -627,6 +728,10 @@ class _LedgerProjection:
     ``fault_restart_stop`` — the AMS recovery driver has SENT its restart stop on the row (a
     lever step named :data:`FAULT_RESTART_STEP`), read by the terminal classifier.
 
+    ``air_stop`` — the farm has SENT its stop of a print running on AIR on the row (a ``stop`` step
+    named :data:`AIR_STOP_STEP`), read by the terminal classifier and the per-push air detector
+    (:func:`air_stop_sent`). Never a ``last_stop``: that is the plate-check episode's.
+
     ``last_stop`` — a plate-check episode's LAST farm stop step as ``{"name", "outcome"}`` (the
     outcome ``None`` while unanswered), or ``None`` when the farm sent none. Read by the episode's
     sampler (an unanswered decision-hold stop re-enters; a standing hold is not the sampler's) and
@@ -634,8 +739,8 @@ class _LedgerProjection:
     is the ledger's as written: the ladder's own hydration reads a pre-2026-10-05 ``stop`` as the
     retry rung's (``pause_recovery``), and no DB-free reader branches on it.
 
-    ``pending_command`` — the row's last motion command step while it pends
-    (:class:`PendingCommand`, :func:`command_pends`), else ``None``. Read DB-free through
+    ``pending_command`` — the row's last farm AMS motion ACTION while it is outstanding
+    (:class:`PendingCommand`, the record ``printer_action``), else ``None``. Read DB-free through
     :func:`pending_command`: by the closers' ``incident_resolution.Context.command_pending`` (every
     cell but the job terminal stands while it holds), by the recovery driver's stand-aside (a row
     whose command still pends stays open), and by the per-push detector that refills the toolhead
@@ -644,12 +749,17 @@ class _LedgerProjection:
     ``failed_command`` — the row's last motion command step when it did not reach its end
     (:class:`FailedCommand`), else ``None``. Read DB-free through :func:`refill_state`, the "Toolhead
     empty" chip's ``failed`` phase (K10/C3c, 2026-10-10).
+
+    ``farm_actions`` — every action the FARM sent on the row, in send order, with the record's answer
+    (:class:`FarmAction`). Read DB-free through :func:`farm_actions`.
     """
 
     fault_restart_stop: bool = False
+    air_stop: bool = False
     last_stop: dict | None = None
     pending_command: PendingCommand | None = None
     failed_command: FailedCommand | None = None
+    farm_actions: tuple[FarmAction, ...] = ()
 
 
 def _payload(
@@ -684,7 +794,9 @@ def _payload(
     The STEP-LEDGER facts (:class:`_LedgerProjection`) ride along for the DB-free readers:
     :data:`PAYLOAD_FAULT_RESTART_STOP` (True once the recovery driver has SENT its restart
     stop on this row, so the terminal of that stop classifies as the farm's restart rather
-    than the cancel echo H2S sends for any remote stop — H2C sends none), ``last_stop`` (a
+    than the cancel echo H2S sends for any remote stop — H2C sends none),
+    :data:`PAYLOAD_AIR_STOP` (True once the farm has SENT its stop of a print on air on this row —
+    the same reason, the ``air_stop`` verdict), ``last_stop`` (a
     plate-check episode's last farm stop) and ``pending_command`` (the farm's motion command
     that has not run, :meth:`PendingCommand.as_payload`, read back through
     :func:`pending_command`). Projections of the ledger, never columns: the
@@ -703,6 +815,7 @@ def _payload(
     return {
         "id": incident.id,
         "kind": incident.kind,
+        "code": incident.code or "",
         "status": incident.status,
         "job_id": incident.job_id or "",
         "slot_desc": slot_desc(incident),
@@ -711,21 +824,24 @@ def _payload(
         "operator_exits": closed_by_recover(incident.kind, external=row_external(incident)),
         "printer_messages": [message.as_payload() for message in printer_messages_of(incident)],
         PAYLOAD_FAULT_RESTART_STOP: ledger.fault_restart_stop,
+        PAYLOAD_AIR_STOP: ledger.air_stop,
         "last_stop": dict(ledger.last_stop) if ledger.last_stop is not None else None,
         "pending_command": ledger.pending_command.as_payload() if ledger.pending_command is not None else None,
         "failed_command": ledger.failed_command.as_payload() if ledger.failed_command is not None else None,
+        "farm_actions": [action.as_payload() for action in ledger.farm_actions],
         "deadline_at": deadline_at,
     }
 
 
 async def _ledger_projections(db: AsyncSession, incident_ids: Iterable[int]) -> dict[int, _LedgerProjection]:
-    """THE derivation of the projection's ledger facts from the table, for every projection that
-    is rebuilt from a row (:func:`rehydrate`, the re-projections after an escalation or an
-    upgrade) and for the one writer's own re-derivation at the send and the read. ONE query over
-    the rows' restart-stop levers, stop steps and motion command steps, in send order; a row with
-    none reads the defaults. A command step's place is the LAST one's: only it can still pend
-    (:func:`command_pends`) — the driver never sends behind a pending command. The ledger only
-    ever grows, so a fact the send set is never lost by a rebuild."""
+    """THE derivation of the projection's ledger facts, for every projection that is rebuilt from a
+    row (:func:`rehydrate`, the re-projections after an escalation or an upgrade) and for the
+    re-derivation at a step's send and read and an action's send and answer
+    (:func:`rederive_actions`). TWO queries: the rows' restart-stop levers, stop steps (the plate-check
+    ladder's and the air stop) and motion command steps from the step ledger, and the rows' FARM actions from the record
+    (``printer_action``), each in send order; a row with none reads the defaults. The pending command
+    is the LAST farm motion action while it is outstanding — the record's, answered only by an event
+    (2026-10-11). Both tables only ever grow, so a fact the send set is never lost by a rebuild."""
     ids = list(incident_ids)
     if not ids:
         return {}
@@ -736,10 +852,10 @@ async def _ledger_projections(db: AsyncSession, incident_ids: Iterable[int]) -> 
             PrinterIncidentStep.name,
             PrinterIncidentStep.outcome,
             PrinterIncidentStep.seq,
-            PrinterIncidentStep.target,
-            PrinterIncidentStep.feeder,
-            PrinterIncidentStep.sent_at,
+            PrinterAction.target,
+            PrinterIncidentStep.action_id,
         )
+        .outerjoin(PrinterAction, PrinterAction.id == PrinterIncidentStep.action_id)
         .where(PrinterIncidentStep.incident_id.in_(ids))
         .where(
             or_(
@@ -751,36 +867,159 @@ async def _ledger_projections(db: AsyncSession, incident_ids: Iterable[int]) -> 
         .order_by(PrinterIncidentStep.incident_id, PrinterIncidentStep.seq)
     )
     restart: set[int] = set()
+    air_stop: set[int] = set()
     last_stop: dict[int, dict] = {}
-    last_command: dict[int, PendingCommand | None] = {}
     last_failed: dict[int, FailedCommand | None] = {}
-    for incident_id, kind, name, outcome, seq, target, feeder, sent_at in result.all():
+    step_of_action: dict[int, tuple[int, str | None]] = {}
+    for incident_id, kind, name, outcome, seq, target, action_id in result.all():
+        if action_id is not None:
+            step_of_action[action_id] = (seq, outcome)
         if kind == STEP_KIND_LEVER:
             restart.add(incident_id)
+        elif kind == STEP_KIND_STOP and name == AIR_STOP_STEP:
+            air_stop.add(incident_id)
         elif kind == STEP_KIND_STOP:
             last_stop[incident_id] = {"name": name, "outcome": outcome}
         else:
-            last_command[incident_id] = (
-                PendingCommand(
-                    incident_id=incident_id, seq=seq, name=name, target=target, feeder=feeder, sent_at=sent_at
-                )
-                if command_pends(outcome)
-                else None
-            )
             last_failed[incident_id] = (
                 FailedCommand(incident_id=incident_id, seq=seq, name=name, target=target, answer=outcome)
                 if outcome in COMMAND_FAILED_ANSWERS
                 else None
             )
+    actions = await db.execute(
+        select(
+            PrinterAction.incident_id,
+            PrinterAction.id,
+            PrinterAction.command,
+            PrinterAction.target,
+            PrinterAction.entry,
+            PrinterAction.answer,
+            PrinterAction.sent_at,
+            PrinterAction.answered_at,
+            PrinterAction.acked_at,
+            PrinterAction.reason,
+            PrinterAction.refusal,
+        )
+        .where(PrinterAction.incident_id.in_(ids))
+        .where(PrinterAction.actor == _FARM_ACTOR)
+        .order_by(PrinterAction.incident_id, PrinterAction.id)
+    )
+    farm: dict[int, list[FarmAction]] = {}
+    last_command: dict[int, PendingCommand | None] = {}
+    for (
+        incident_id,
+        action_id,
+        command,
+        target,
+        entry,
+        answer,
+        sent_at,
+        answered_at,
+        acked_at,
+        reason,
+        refusal,
+    ) in actions.all():
+        seq, step_reading = step_of_action.get(action_id, (None, None))
+        farm.setdefault(incident_id, []).append(
+            FarmAction(
+                action_id=action_id,
+                command=command,
+                target=target,
+                answer=answer,
+                sent_at=sent_at,
+                answered_at=answered_at,
+                step_reading=step_reading,
+                reason=reason,
+                unsent=refusal is not None,
+            )
+        )
+        if command in _MOTION_COMMANDS:
+            last_command[incident_id] = (
+                PendingCommand(
+                    incident_id=incident_id,
+                    action_id=action_id,
+                    seq=seq,
+                    name=command,
+                    target=target,
+                    loaded_at_send=_loaded_at_send(entry),
+                    sent_at=sent_at,
+                )
+                if _pends(answered_at, acked_at, step_reading)
+                else None
+            )
     return {
         incident_id: _LedgerProjection(
             fault_restart_stop=incident_id in restart,
+            air_stop=incident_id in air_stop,
             last_stop=last_stop.get(incident_id),
             pending_command=last_command.get(incident_id),
             failed_command=last_failed.get(incident_id),
+            farm_actions=tuple(farm.get(incident_id, ())),
         )
-        for incident_id in restart | set(last_stop) | set(last_command)
+        for incident_id in restart | air_stop | set(last_stop) | set(last_failed) | set(farm)
     }
+
+
+#: The record's actor token for the farm's own lanes, its two AMS motion commands and its ``refused``
+#: answer (``command_outcome.ACTOR_FARM`` / ``COMMANDS`` / ``Answer.REFUSED``; spelled here because this
+#: store sits below the record's owner, and ``test_printer_incidents`` pins them equal).
+_FARM_ACTOR = "farm"
+_MOTION_COMMANDS: frozenset[str] = frozenset({"load", "unload"})
+_REFUSED = "refused"
+
+
+def _pends(answered_at: datetime | None, acked_at: datetime | None, step_reading: str | None) -> bool:
+    """Does a farm AMS motion action PEND — the projection's ``pending_command``? Outstanding on the
+    record (no event has answered it) AND either the printer ACCEPTED it (``acked_at``: it sits in the
+    AMS queue and can run on its own — 011/014-H2S) or nobody has read it yet (its step pends:
+    sent and never read, or ``held``). An outstanding command the printer never acknowledged and the
+    driver read unmoved is not in anybody's queue as far as the wire says: it does not pend (the
+    record still holds it outstanding, and an event — a later session, a reboot, a person's command —
+    answers it)."""
+    if answered_at is not None:
+        return False
+    return acked_at is not None or command_pends(step_reading)
+
+
+def _loaded_at_send(entry: str | None) -> bool | None:
+    """Was the active extruder fed from a real AMS feeder at the send — read off the action's recorded
+    posture (``command_outcome.posture``'s ``*_loaded`` / ``*_empty``); ``None`` when none was recorded."""
+    if entry is None:
+        return None
+    return entry.endswith("_loaded")
+
+
+# The record's FINAL answers already reflected in the projection (:func:`project_action_answer`): action
+# id → (answer, reason). A re-derivation reads the DB, where the record's write of such an answer may not
+# have landed (it is a spawned task) — and one whose read ran a moment before that write would RESURRECT
+# the answered command as pending (an operator's command taking over the farm's between the farm's send
+# and its step note: the abort then kept the row open on a command nobody holds). So every re-derivation
+# overlays these answers (:func:`_overlay_projected_answers`); an entry goes once a re-derivation reads
+# its answer persisted. Process memory by design: the write makes it durable, a restart re-reads the
+# persisted answer, and the overlay never adds a fact the record did not give.
+_projected_answers: dict[int, tuple[str, str | None]] = {}
+_PROJECTED_ANSWERS_KEEP = 512
+
+
+def _overlay_projected_answers(payload: dict) -> dict:
+    """``payload`` with the record's in-memory final answers laid over what the DB still reads as
+    unanswered: the pending command they answered is no longer pending, the farm action carries its
+    answer. An action the DB already reads answered drops out of the overlay."""
+    pending = payload.get("pending_command")
+    if isinstance(pending, dict) and pending.get("action_id") in _projected_answers:
+        payload["pending_command"] = None
+    actions = []
+    for action in payload.get("farm_actions") or ():
+        projected = _projected_answers.get(action.get("action_id"))
+        if projected is not None:
+            if action.get("answer") is not None:
+                _projected_answers.pop(action["action_id"], None)  # persisted: the overlay is done
+            else:
+                action = {**action, "answer": projected[0], "reason": projected[1]}
+        actions.append(action)
+    if "farm_actions" in payload:
+        payload["farm_actions"] = actions
+    return payload
 
 
 async def _reproject(db: AsyncSession, incident: PrinterIncident) -> None:
@@ -790,25 +1029,61 @@ async def _reproject(db: AsyncSession, incident: PrinterIncident) -> None:
     ledger = (await _ledger_projections(db, [incident.id])).get(incident.id)
     rows = _open_cache.setdefault(incident.printer_id, {})
     deadline_at = rows.get(incident.id, {}).get("deadline_at")
-    rows[incident.id] = _payload(incident, ledger=ledger, deadline_at=deadline_at)
+    rows[incident.id] = _overlay_projected_answers(_payload(incident, ledger=ledger, deadline_at=deadline_at))
 
 
 async def _rederive_ledger(db: AsyncSession, incident_id: int) -> None:
-    """Re-derive ONE cached row's ledger facts after a step write — the projection follows the
-    ledger at the send and at the read. A row not in the cache (closed) is left alone."""
+    """Re-derive ONE cached row's ledger facts after a step write or an action's send or answer — the
+    projection follows the ledger and the record. A row not in the cache (closed) is left alone."""
     for rows in _open_cache.values():
         if incident_id in rows:
             ledger = (await _ledger_projections(db, [incident_id])).get(incident_id, _LedgerProjection())
-            rows[incident_id] = {
-                **rows[incident_id],
-                PAYLOAD_FAULT_RESTART_STOP: ledger.fault_restart_stop,
-                "last_stop": dict(ledger.last_stop) if ledger.last_stop is not None else None,
-                "pending_command": (
-                    ledger.pending_command.as_payload() if ledger.pending_command is not None else None
-                ),
-                "failed_command": (ledger.failed_command.as_payload() if ledger.failed_command is not None else None),
-            }
+            rows[incident_id] = _overlay_projected_answers(
+                {
+                    **rows[incident_id],
+                    PAYLOAD_FAULT_RESTART_STOP: ledger.fault_restart_stop,
+                    PAYLOAD_AIR_STOP: ledger.air_stop,
+                    "last_stop": dict(ledger.last_stop) if ledger.last_stop is not None else None,
+                    "pending_command": (
+                        ledger.pending_command.as_payload() if ledger.pending_command is not None else None
+                    ),
+                    "failed_command": (
+                        ledger.failed_command.as_payload() if ledger.failed_command is not None else None
+                    ),
+                    "farm_actions": [action.as_payload() for action in ledger.farm_actions],
+                }
+            )
             return
+
+
+def project_action_answer(
+    printer_id: int, incident_id: int, action_id: int, answer: str, reason: str | None = None
+) -> None:
+    """The record answered action ``action_id`` of open row ``incident_id`` FINALLY: reflect it in the
+    cached projection in the same synchronous stretch (the pending command it names is no longer
+    pending; the farm action carries its answer), so no reader sees an answered command as pending
+    while the record's write and the full re-derivation (:func:`rederive_actions`) land — and every
+    re-derivation that read the rows before that write overlays it (:data:`_projected_answers`). Sync,
+    DB-free; a row the cache does not hold is left alone."""
+    _projected_answers[action_id] = (answer, reason)
+    while len(_projected_answers) > _PROJECTED_ANSWERS_KEEP:
+        _projected_answers.pop(next(iter(_projected_answers)))
+    payload = (_open_cache.get(printer_id) or {}).get(incident_id)
+    if payload is None:
+        return
+    pending = payload.get("pending_command")
+    if isinstance(pending, dict) and pending.get("action_id") == action_id:
+        payload["pending_command"] = None
+    for action in payload.get("farm_actions") or ():
+        if action.get("action_id") == action_id:
+            action["answer"] = answer
+            action["reason"] = reason
+
+
+async def rederive_actions(db: AsyncSession, incident_id: int) -> None:
+    """Re-derive ONE open row's projection after the RECORD wrote an action of it (its send, its
+    answer) — ``printer_action``'s hook into the projection it feeds."""
+    await _rederive_ledger(db, incident_id)
 
 
 def note_deadline(printer_id: int, incident_id: int, at: datetime | None) -> None:
@@ -1082,6 +1357,31 @@ def refill_in_progress(printer_id: int | None) -> bool:
     )
 
 
+def air_stop_sent(printer_id: int | None) -> bool:
+    """Does an OPEN row on this printer carry the farm's stop of a print running on air
+    (:data:`PAYLOAD_AIR_STOP`)? Pure, DB-free, sync — the :func:`refill_in_progress` idiom, for the
+    per-push air detector (``spool_recovery._sample_toolhead``): a row whose farm stop the printer did
+    not take (refused, or unanswered past the stop bound — the air stop resent it once and escalated) is
+    a person's now, and the detector never stops that print again (no page loop). A taken stop ends the
+    job and its driver closes the row, so an open row carrying one is never the stop that worked."""
+    return (
+        any(payload.get(PAYLOAD_AIR_STOP) for payload in (_open_cache.get(printer_id) or {}).values())
+        if printer_id
+        else False
+    )
+
+
+def air_stop_on(printer_id: int | None, incident_id: int) -> bool:
+    """Does OPEN row ``incident_id`` carry the farm's stop of a print running on air
+    (:data:`PAYLOAD_AIR_STOP`)? Pure, DB-free, sync — the row-scoped half of :func:`air_stop_sent`, read
+    by the rule table (``incident_resolution.resolve``: such a row is a person's until the job ends or
+    they recover the printer — the print may still be running on air). ``False`` for a row the cache
+    does not hold."""
+    if not printer_id:
+        return False
+    return bool(((_open_cache.get(printer_id) or {}).get(incident_id) or {}).get(PAYLOAD_AIR_STOP))
+
+
 def cached_kind(printer_id: int, incident_id: int) -> str | None:
     """The KIND the open-incident cache holds for ``incident_id``, or ``None``.
 
@@ -1116,7 +1416,7 @@ def refill_state(printer_id: int | None) -> dict | None:
       ``None``;
     * ``failed`` — an open row's LAST command did not reach its end (``failed_command``, the ledger's
       own derivation): ``command`` is that step's own name (``load`` / ``unload`` — the ledger's
-      command steps are ``ams_command``'s alone), the slot it named (an unload names none — the
+      command steps are the AMS recovery driver's alone), the slot it named (an unload names none — the
       row's slot), and the answer;
     * ``None`` — neither.
 
@@ -1148,14 +1448,15 @@ def refill_state(printer_id: int | None) -> dict | None:
 
 
 def pending_command(printer_id: int | None, *, incident_id: int | None = None) -> PendingCommand | None:
-    """The farm's motion command that has not run on this printer's open row, or ``None``.
-    Pure, DB-free, sync — the projection the ledger's one derivation keeps
-    (:func:`_ledger_projections`, re-derived at every send and read and at :func:`rehydrate`).
+    """The farm's AMS motion command the printer has not answered on this printer's open row, or
+    ``None``. Pure, DB-free, sync — the projection :func:`_ledger_projections` keeps over the record
+    (re-derived at every action's send and answer and at :func:`rehydrate`).
 
     ``incident_id`` scopes the question to ONE row (the driver asking about its own); without it,
-    any open row of the printer that holds one — only the AMS recovery driver writes motion command
-    steps, and a printer holds at most one open AMS row, so there is at most one. ``None`` for a
-    printer with no open row, a row the cache does not hold, or a row whose last command settled.
+    any open row of the printer that holds one — only the AMS recovery driver sends farm motion
+    commands on a row, and a printer holds at most one open AMS row, so there is at most one. ``None``
+    for a printer with no open row, a row the cache does not hold, or a row whose last command an
+    event answered.
     """
     if not printer_id:
         return None
@@ -1165,6 +1466,26 @@ def pending_command(printer_id: int | None, *, incident_id: int | None = None) -
         pending = (payload or {}).get("pending_command")
         if pending:
             return PendingCommand.from_payload(pending)
+    return None
+
+
+def farm_actions(printer_id: int | None, incident_id: int) -> tuple[FarmAction, ...]:
+    """Every action the FARM sent on open row ``incident_id``, in send order, with the record's answer
+    — "what has the farm already done on this hold". Pure, DB-free, sync (the projection); empty for a
+    row the cache does not hold."""
+    if not printer_id:
+        return ()
+    payload = (_open_cache.get(printer_id) or {}).get(incident_id) or {}
+    return tuple(FarmAction.from_payload(action) for action in payload.get("farm_actions") or ())
+
+
+def last_farm_action(printer_id: int | None, incident_id: int, command: str) -> FarmAction | None:
+    """The FARM's last ``command`` action on open row ``incident_id`` (:func:`farm_actions`), or ``None``.
+    "Has the farm resumed this hold" — the resume-once read (``incident_resolution.resume_owed``), the
+    hold chip's "Resuming" / "Resume refused" (``hold_chip``) and the refill episode's own resume."""
+    for action in reversed(farm_actions(printer_id, incident_id)):
+        if action.command == command:
+            return action
     return None
 
 
@@ -1300,6 +1621,26 @@ async def find_closed(db: AsyncSession, printer_id: int, job_id: str, codes: str
     return result.scalar_one_or_none()
 
 
+async def rearm_aborted(db: AsyncSession, incident_ids: Iterable[int]) -> int:
+    """Lift the re-entry bar of these ABORTED closes: the wire RE-ARMED them — the fault's codes stopped
+    all standing, or the printer was witnessed pausing again (``spool_recovery._rearm_blocked``, the one
+    caller). Stamps ``rearmed_at`` on the closed rows still barring (NULL); returns how many it lifted.
+    The bar is the closed row itself — durable — so a restart lifts nothing on its own."""
+    ids = sorted(set(incident_ids))
+    if not ids:
+        return 0
+    result = await db.execute(
+        update(PrinterIncident)
+        .where(PrinterIncident.id.in_(ids))
+        .where(PrinterIncident.status == STATUS_ABORTED)
+        .where(PrinterIncident.resolved_at.is_not(None))
+        .where(PrinterIncident.rearmed_at.is_(None))
+        .values(rearmed_at=datetime.utcnow())
+    )
+    await db.commit()
+    return int(result.rowcount or 0)
+
+
 async def last_closed_by(db: AsyncSession, printer_id: int, source: str) -> PrinterIncident | None:
     """This printer's most recently CLOSED row whose close was ``source``, or None.
 
@@ -1353,6 +1694,7 @@ async def open_new(
     slot_global_tray: int | None,
     hms_full_codes: Iterable[str] = (),
     status: str = STATUS_RECOVERING,
+    fault_layer: int | None = None,
 ) -> PrinterIncident | None:
     """Create an open FAULT incident for this printer, or ``None`` when one owns it.
 
@@ -1365,6 +1707,10 @@ async def open_new(
     wire by the opener at the moment the hold opens (``hms_errors.full_codes_of``) — the
     printer's own words, recorded because the printer will stop showing them long before
     the hold ends. Every fault opener passes them; empty stores NULL.
+
+    ``fault_layer`` is the tracked job's layer at the fault (the AMS entry passes it): the
+    ``repair`` class's "a print ran through the path after the fault" is a layer printed past it
+    (``incident_resolution._printed_past_fault``). ``None`` stores NULL.
 
     Two guards, deliberately both: a pre-check (the ordinary case, so the common path
     logs a reason instead of raising) and the partial unique indexes (the race). A
@@ -1381,6 +1727,7 @@ async def open_new(
         slot_global_tray=slot_global_tray,
         hms_full_codes=join_full_codes(hms_full_codes),
         status=status,
+        fault_layer=fault_layer,
     )
 
 
@@ -1422,6 +1769,7 @@ async def open_declared(
         slot_global_tray=None,
         hms_full_codes=None,
         status=status,
+        fault_layer=None,
     )
 
 
@@ -1437,6 +1785,7 @@ async def _open_row(
     slot_global_tray: int | None,
     hms_full_codes: str | None,
     status: str,
+    fault_layer: int | None,
 ) -> PrinterIncident | None:
     """The ONE open transition behind :func:`open_new` and :func:`open_declared`.
 
@@ -1466,6 +1815,7 @@ async def _open_row(
         status=status,
         created_at=now,
         escalated_at=now if status == STATUS_ESCALATED else None,
+        fault_layer=fault_layer,
     )
     db.add(incident)
     try:
@@ -1528,6 +1878,7 @@ async def upgrade(
     codes: str,
     slot_global_tray: int | None,
     hms_full_codes: Iterable[str] = (),
+    fault_layer: int | None = None,
 ) -> PrinterIncident | None:
     """Re-classify an OPEN row onto a worse fault. ``None`` when it is gone or closed.
 
@@ -1547,6 +1898,10 @@ async def upgrade(
     same reason: a row re-classified onto a physical fault must not keep showing the
     milder fault's text under the new chip.
 
+    ``fault_layer`` — the tracked job's layer at the WORSE fault — re-stamps the row's when given
+    (``None`` keeps it): "a print ran through the path after the fault" means after the fault the
+    row now names, so a recovery driver's own resumes before the re-classification are not that.
+
     The row keeps its ID, its ``created_at`` and its ``escalated_at``: it is the same
     equipment fault, better understood. A live recovery driver learns of the change
     through :func:`cached_kind` (the ``reclassified`` takeover token) and hands over
@@ -1561,6 +1916,8 @@ async def upgrade(
     incident.codes = codes[:256]
     incident.slot_global_tray = slot_global_tray
     incident.hms_full_codes = join_full_codes(hms_full_codes)
+    if fault_layer is not None:
+        incident.fault_layer = fault_layer
     await db.commit()
     await _reproject(db, incident)
     logger.info(
@@ -1667,8 +2024,15 @@ async def note_step(
     name: str,
     target: int | None = None,
     feeder: str | None = None,
+    action_id: int | None = None,
+    sent_at: datetime | None = None,
+    deposit: str | None = None,
 ) -> PrinterIncidentStep:
     """Persist one step AT THE SEND and commit. Returns the row.
+
+    ``action_id`` is the ``printer_action`` the step's send was (the record of the command and its
+    answer). ``target`` and ``sent_at`` are written as the ROLLBACK MIRROR the previous build reads
+    (``models/printer_incident_step``) — nothing in this build reads them back.
 
     ``seq`` is the driver's own send order within the incident; a duplicate
     ``(incident_id, seq)`` is a driver that lost count of its own log, and the unique
@@ -1677,10 +2041,11 @@ async def note_step(
 
     The open row's cached ledger facts are re-derived here (:func:`_rederive_ledger`), at
     the one writer, once the step is durable and BEFORE the driver publishes: a lever step
-    named :data:`FAULT_RESTART_STEP` sets :data:`PAYLOAD_FAULT_RESTART_STOP`, so the terminal
-    that stop produces is always classified against a projection that already says the farm
-    sent it; a plate-check ``stop`` step becomes the row's unanswered ``last_stop``, so the
-    sampler re-enters a stop a crash left unanswered.
+    named :data:`FAULT_RESTART_STEP` sets :data:`PAYLOAD_FAULT_RESTART_STOP` and a ``stop`` step
+    named :data:`AIR_STOP_STEP` sets :data:`PAYLOAD_AIR_STOP`, so the terminal that stop produces
+    is always classified against a projection that already says the farm sent it; a plate-check
+    ``stop`` step becomes the row's unanswered ``last_stop``, so the sampler re-enters a stop a
+    crash left unanswered.
     """
     step = PrinterIncidentStep(
         incident_id=incident_id,
@@ -1689,7 +2054,9 @@ async def note_step(
         name=name,
         target=target,
         feeder=feeder,
-        sent_at=datetime.utcnow(),
+        sent_at=sent_at or datetime.utcnow(),
+        action_id=action_id,
+        deposit=deposit,
     )
     db.add(step)
     try:
@@ -1727,56 +2094,105 @@ async def answer_step(db: AsyncSession, incident_id: int, seq: int, *, outcome: 
     return step
 
 
-async def steps_of(db: AsyncSession, incident_id: int) -> list[PrinterIncidentStep]:
-    """Every step of this incident, in send order (``seq`` ascending)."""
+@dataclass(frozen=True, slots=True)
+class LedgerRow:
+    """One step as a driver hydrates it (``EvidenceLog._step_of``): the step's own columns — the
+    driver's vocabulary and its reading — and the SEND's facts read off the step's ACTION
+    (``printer_action``: when it went out, the tray it named). The step's ``sent_at`` / ``target``
+    are the rollback build's mirror and are never read back (``_RETIRED_COLUMNS``). A step with no
+    action — one the backfill could not map — carries neither."""
+
+    incident_id: int
+    seq: int
+    kind: str
+    name: str
+    feeder: str | None
+    outcome: str | None
+    read_at: datetime | None
+    action_id: int | None
+    sent_at: datetime | None
+    target: int | None
+    deposit: str | None = None
+
+
+async def steps_of(db: AsyncSession, incident_id: int) -> list[LedgerRow]:
+    """Every step of this incident, in send order (``seq`` ascending), each with its action's send
+    facts (an outer join: a step with no action keeps its own columns and no send facts)."""
     result = await db.execute(
-        select(PrinterIncidentStep)
+        select(
+            PrinterIncidentStep.incident_id,
+            PrinterIncidentStep.seq,
+            PrinterIncidentStep.kind,
+            PrinterIncidentStep.name,
+            PrinterIncidentStep.feeder,
+            PrinterIncidentStep.outcome,
+            PrinterIncidentStep.read_at,
+            PrinterIncidentStep.action_id,
+            PrinterAction.sent_at,
+            PrinterAction.target,
+            PrinterIncidentStep.deposit,
+        )
+        .outerjoin(PrinterAction, PrinterAction.id == PrinterIncidentStep.action_id)
         .where(PrinterIncidentStep.incident_id == incident_id)
         .order_by(PrinterIncidentStep.seq)
     )
-    return list(result.scalars().all())
+    return [LedgerRow(*row) for row in result.all()]
 
 
-async def count_rows_with_step(
+async def unit_stopped_with(
     db: AsyncSession,
+    item_id: int,
     *,
-    printer_id: int,
     kind: str,
     step_kind: StepKind,
-    since: datetime,
-    exclude_job_id: str | None,
-) -> int:
-    """How many rows of ``kind`` on this printer, opened at or after ``since``, hold at
-    least one step of ``step_kind`` on the ledger — leaving out the row(s) of the job
-    ``exclude_job_id``.
+    names: Iterable[str],
+) -> bool:
+    """Did the farm send a ``step_kind`` step named one of ``names`` on any row of ``kind`` bound to the
+    unit ``item_id``? Open and closed rows alike: an episode is read by what the farm SENT in it, not by
+    how it ended.
 
-    The store read behind "how many OTHER plate-check episodes on this printer did the farm
-    already stop in the window" (``pause_recovery``'s second rung, where the retry-or-escalate
-    decision is made once): it counts the farm's own ``stop`` steps, so an operator's stop or
-    a foreign terminal — neither of which writes one — never counts. Open and closed rows
-    alike: an episode is counted by what the farm SENT in it, not by how it ended.
-
-    The excluded job is decided by :func:`~backend.app.services.job_identity.is_held_job`,
-    in Python — the held-job rule has one spelling, and SQL cannot spell its ``unknown``
-    arm. So ``None`` / ``""`` / ``"0"`` all name the id-less job, and exclude the rows that
-    recorded none. The step test is an ``EXISTS`` over the ledger, so a row with several
-    steps of that kind is counted once.
+    The store read behind the plate-check ladder's lineage question (``requeue.retries_a_plate_check_retry``,
+    its one caller): was the attempt a unit replaces stopped and retried at ITS plate check — the farm's
+    retry-rung stop on that unit's episode. A person's stop and a job the printer ended by itself write no
+    farm stop step, so neither ever counts. An ``EXISTS`` over the ledger joined to its row.
     """
-    has_step = (
-        exists()
-        .where(PrinterIncidentStep.incident_id == PrinterIncident.id)
+    wanted = sorted(set(names))
+    if not wanted:
+        return False
+    found = await db.scalar(
+        select(PrinterIncidentStep.id)
+        .join(PrinterIncident, PrinterIncident.id == PrinterIncidentStep.incident_id)
+        .where(PrinterIncident.item_id == item_id)
+        .where(PrinterIncident.kind == kind)
         .where(PrinterIncidentStep.kind == step_kind)
+        .where(PrinterIncidentStep.name.in_(wanted))
+        .limit(1)
     )
-    rows = (
-        await db.execute(
-            select(PrinterIncident.job_id)
-            .where(PrinterIncident.printer_id == printer_id)
-            .where(PrinterIncident.kind == kind)
-            .where(PrinterIncident.created_at >= since)
-            .where(has_step)
-        )
-    ).scalars()
-    return sum(1 for job in rows if not is_held_job(job, exclude_job_id))
+    return found is not None
+
+
+async def last_plate_check_stop_at(db: AsyncSession, printer_id: int, *, exclude_incident_id: int) -> datetime | None:
+    """When the farm last sent a plate-check stop on this printer, on any ``plate_vision`` row but
+    ``exclude_incident_id`` (the episode deciding now) — open and closed rows alike — or ``None`` when it
+    never did.
+
+    The printer half of the plate-check ladder's one decision (``pause_recovery._decide``; the operator's
+    "2 failures between a successful print", which replaced production's 60-minute window): a refused plate
+    on a printer whose last plate-check stop has no completed print after it is a REPEAT, and is held for
+    a person. A stop step on a ``plate_vision`` row is only ever the farm's (``retry_stop`` /
+    ``deadline_stop``, or the pre-2026-10-05 ``stop``): a person's Stop writes none. The time is the step's
+    ACTION's send (``printer_action.sent_at``, joined on ``action_id``) — never the step's mirror column; a
+    step no action records (one the backfill could not map) is not read. ONE query, an aggregate."""
+    return await db.scalar(
+        select(sa_func.max(PrinterAction.sent_at))
+        .select_from(PrinterIncidentStep)
+        .join(PrinterIncident, PrinterIncident.id == PrinterIncidentStep.incident_id)
+        .join(PrinterAction, PrinterAction.id == PrinterIncidentStep.action_id)
+        .where(PrinterIncident.printer_id == printer_id)
+        .where(PrinterIncident.kind == KIND_PLATE_VISION)
+        .where(PrinterIncident.id != exclude_incident_id)
+        .where(PrinterIncidentStep.kind == STEP_KIND_STOP)
+    )
 
 
 # --- the evidence log: the step ledger's ONE writer --------------------------------
@@ -1784,12 +2200,15 @@ async def count_rows_with_step(
 
 @dataclass(frozen=True, slots=True)
 class StepEntry:
-    """The ledger columns a step is WRITTEN with at the send (``note_step``'s arguments)."""
+    """The ledger columns a step is WRITTEN with at the send (``note_step``'s arguments). ``action_id``
+    names the ``printer_action`` the send was (``None`` for a step that sent nothing)."""
 
     kind: StepKind
     name: str
     target: int | None = None
     feeder: str | None = None
+    action_id: int | None = None
+    deposit: str | None = None
 
 
 class LoggedStep(Protocol):
@@ -1806,7 +2225,7 @@ class LoggedStep(Protocol):
 
     def entry(self) -> StepEntry: ...
 
-    def sent(self, seq: int, at: datetime) -> Self: ...
+    def sent(self, seq: int, at: datetime | None) -> Self: ...
 
     def answered(self, outcome: str) -> Self: ...
 
@@ -1854,7 +2273,7 @@ class EvidenceLog(ABC, Generic[S]):
 
     @classmethod
     @abstractmethod
-    def _step_of(cls, row: PrinterIncidentStep) -> S:
+    def _step_of(cls, row: LedgerRow) -> S:
         """Hydrate ONE ledger row into the driver's step type. A token the driver's
         vocabulary cannot name RAISES ``LookupError`` — a ledger that says something the
         driver cannot read is drift, never a skipped row."""
@@ -1870,11 +2289,15 @@ class EvidenceLog(ABC, Generic[S]):
         from backend.app.core.database import async_session
 
         seq = max((s.seq for s in self.steps), default=0) + 1
-        at = datetime.utcnow()
         entry = step.entry()
+        # The send's time is its ACTION's (``printer_action``) — the one hydration reads back, so a
+        # live log and a re-entered one agree; a step that names no action has none.
+        at: datetime | None = None
         try:
             async with async_session() as db:
-                row = await note_step(
+                if entry.action_id is not None:
+                    at = await db.scalar(select(PrinterAction.sent_at).where(PrinterAction.id == entry.action_id))
+                await note_step(
                     db,
                     self.incident_id,
                     seq=seq,
@@ -1882,8 +2305,10 @@ class EvidenceLog(ABC, Generic[S]):
                     name=entry.name,
                     target=entry.target,
                     feeder=entry.feeder,
+                    action_id=entry.action_id,
+                    sent_at=at,
+                    deposit=entry.deposit,
                 )
-                at = row.sent_at
         except Exception:  # noqa: BLE001 — a ledger write must never crash the driver
             logger.exception("printer_incidents: incident %s step %s could not be persisted", self.incident_id, seq)
         self.steps.append(step.sent(seq, at))
@@ -1907,8 +2332,7 @@ class EvidenceLog(ABC, Generic[S]):
             )
 
     def has_step(self, kind: StepKind) -> bool:
-        """Does this log hold a step of ``kind`` — sent, answered or not? The per-episode
-        reading of :func:`count_rows_with_step`'s ledger test."""
+        """Does this log hold a step of ``kind`` — sent, answered or not?"""
         return any(step.entry().kind == kind for step in self.steps)
 
 

@@ -107,23 +107,13 @@ RESPOOL_TAG_TYPE = "bambulab_reused"
 # event (``feed_state.AutoSwitched``) this lane has decided on. The feed state keeps only
 # the LAST event of each kind and every reader sees it on every push after it, so the
 # cursor is what makes the lane act ONCE per switch — and it advances before the policy
-# runs, because the policy CONSUMES (a commanded-load marker): re-deciding the same event
-# on a later push would find the marker gone and stamp the farm's own load.
+# runs, so a later push re-reading the same event decides nothing twice.
 #
 # Process memory, and that is the whole rehydrate story: ``seq`` is process-global and
 # monotonic, a restart (or a reconnect, which builds a new client) starts a tracker that
 # carries no event until it WITNESSES a switch — none on an attach, none on the first live
 # frame of a session — so an empty cursor can only ever meet a switch this process saw.
 _switch_seen: dict[int, int] = {}
-
-# ``_commanded_loads[pid] = (target_tray, monotonic)`` — a load WE issued (every farm load
-# goes through ``ams_command.load``, which marks it here BEFORE the publish). A switch
-# whose ARRIVED tray matches an unexpired marker is our own swap or refill, never a
-# firmware runout, and never stamps the departed spool (the 006 false-stamp mode,
-# 2026-07-19). Process-lifetime: a restart loses a marker, and a held farm load that runs
-# after it would read as a firmware switch — the commanded-load TTL bounds that window,
-# and the fat-remainder note plus the "Same spool" un-spend are the backstops.
-_commanded_loads: dict[int, tuple[int, float]] = {}
 
 # How far a roll's DELIVERED grams may fall short of its assumed label before the spent
 # stamp bothers to record the gap. This used to be a WARNING floor, on the reading that a
@@ -136,17 +126,24 @@ _commanded_loads: dict[int, tuple[int, float]] = {}
 # "remaining" at their stamp were every one of them a part-used roll minted as full.
 _SPENT_DELIVERY_GAP_NOTE_G = 150.0
 
-# How long after a slot's bay cleared the exhaustion evidence FOR THAT CLEAR may still
-# arrive — the scope of one runout episode, used by :func:`_bound_after_the_bay_cleared`
-# and nowhere else.
+# WHICH bay clear a runout explains — the scope of one runout episode, used by
+# :func:`_bound_after_the_bay_cleared` and nowhere else. Two situations, one rule each:
+#
+# * **A live job** (the printer's live print archive, ``print_binding.live_print_archive``): the
+#   clear happened inside the job the runout word arrives in — the archive began before it. Both
+#   halves of one runout episode fall inside one job; a clear from before the job began is another
+#   episode. Durable on both sides (the archive, the residue's ``last_location_at``), so a deploy
+#   landing inside the drain→runout gap reads the same answer (T8c).
+# * **No live job** (an idle printer's held runout, a job whose archive already closed): the window
+#   below, production's measured gap, restored 2026-10-12 (operator ruling "the behaviour should
+#   stay the same for the most part"). With no job there is no event to pair the clear with, and
+#   "nothing pairs" would keep tier 1 and stamp a roll seated after the bay emptied.
 #
 # The AMS clears a drained slot's exist bit ~3 MINUTES BEFORE it declares the runout (the
 # tail is still traversing the feed path; three timed pairs on 2026-08-13 — 03:55:46 →
 # 03:58:20, 06:41:47 → 06:44:44, 07:02:52 → 07:05:33). A release and the HMS that explains
 # it are therefore two halves of ONE physical episode, separated by a firmware delay, and a
-# slot accumulates many such clears over its life. Deciding whether the roll bound RIGHT NOW
-# could be the roll that drained needs to know WHICH clear the arriving evidence is about,
-# and the gap is the only thing that says so.
+# slot accumulates many such clears over its life.
 #
 # This is not identity evidence and it concludes nothing on its own (doctrine rules 6/7 —
 # duration never decides identity POSITIVELY). It decides one NEGATIVE: outside the window
@@ -162,11 +159,6 @@ _SPENT_DELIVERY_GAP_NOTE_G = 150.0
 # roll's runout. The measured physics is the only defensible anchor, so the value is tied to
 # it rather than to a round number that felt safe.
 _BAY_CLEAR_TO_RUNOUT_GAP_S = 600.0
-
-# A commanded-load marker older than this is stale (the load never took / a much later
-# unrelated switch); it stops suppressing. Wide enough for a load the AMS acknowledged and
-# ran on its own minutes later (274-280 s, 011/014-H2S — invariant 15).
-_COMMANDED_LOAD_TTL_S = 600
 
 # Per-printer dedup for `respool_prompt` WS broadcasts, keyed
 # (ams_id, tray_id) -> (tag_uid, tray_uuid). Mirrors slot_pipeline's unknown-tag dedup:
@@ -189,7 +181,12 @@ _respool_observation_logged: dict[int, dict[tuple[int, int], tuple[str, str]]] =
 # ``_JUMP_MIN_PUSHES`` observations spanning ``_JUMP_STABLE_S``. The entry is
 # dropped the moment the jump stops reading (the condition must hold, not merely
 # have occurred) and on the slot-empty edge (:func:`clear_respool_prompt_dedup`).
-# Process-lifetime like the edge dicts above: a restart simply re-corroborates.
+# Process-lifetime like the edge dicts above: a restart simply re-corroborates (the
+# safe direction — doctrine rule 10: every respool prompt this farm has raised was a
+# false positive, so the filter errs toward no prompt). Its observations arrive only
+# through ``main.on_ams_change``, which the client fires from a LIVE push's AMS change
+# (``bambu_mqtt._handle_ams_data``), never from a reconnect's cached re-broadcast.
+# Restored 2026-10-12 (operator ruling "the behaviour should stay the same for the most part").
 _jump_seen: dict[tuple[int, int, int], tuple[float, int]] = {}
 
 # Per-incident spent-stamp dedup, keyed (printer_id, subtask_id, global_tray): one
@@ -208,7 +205,6 @@ def _reset_state() -> None:
     global _last_contradiction_scan_at
 
     _switch_seen.clear()
-    _commanded_loads.clear()
     _respool_prompt_dedup.clear()
     _respool_observation_logged.clear()
     _jump_seen.clear()
@@ -219,20 +215,9 @@ def _reset_state() -> None:
 
 
 def _monotonic() -> float:
-    """Monotonic clock indirection so tests can drive the commanded-load TTL and the
-    remain-jump window without wall-clock waits (mirrors spool_recovery._now)."""
+    """Monotonic clock indirection so tests can drive the remain-jump window and the contradiction
+    scan's pass throttle without wall-clock waits (mirrors spool_recovery._now)."""
     return time.monotonic()
-
-
-def note_commanded_load(printer_id: int, target_tray: int) -> None:
-    """Record that WE just issued an AMS load of ``target_tray`` on ``printer_id``.
-
-    Called by ``ams_command.load`` — every farm load, the recovery driver's and the
-    operator's ``/ams/load`` alike — BEFORE the MQTT publish. The backup-swap lane
-    consumes a marker whose target matches a switch's ARRIVED tray, so our own recovery
-    / operator swaps can never be mistaken for a firmware runout and spend the departed
-    spool (the 006 false-stamp mode)."""
-    _commanded_loads[printer_id] = (target_tray, _monotonic())
 
 
 class RespoolError(Exception):
@@ -373,8 +358,14 @@ def _bound_after_the_bay_cleared(
     printer_id: int,
     ams_id: int,
     tray_id: int,
-) -> bool:
+    live_job_started_at: datetime | None,
+) -> bool | None:
     """Did the roll bound to this slot arrive AFTER the bay-clear this runout explains?
+
+    True — tier 1 stands aside for tier 2; False — tier 1 keeps its incumbent; None — the
+    residue's clear moment is UNKNOWN, so which clear this runout explains is unknowable and
+    the caller stamps nothing (invariant 11: a missed stamp self-heals forward, a false stamp
+    is permanent).
 
     Tier 1's ELIGIBILITY test, and a physical impossibility rather than a heuristic: a roll
     that was bound to the slot only after the bay emptied cannot be the roll that emptied it.
@@ -407,9 +398,13 @@ def _bound_after_the_bay_cleared(
     Ordering alone cannot decide this, and that is the whole subtlety. In the ordinary case
     (T6) the incumbent ALSO bound after the slot's previous occupant left — every roll does.
     What separates "bound after the clear this runout is about" from "bound after some clear
-    weeks of prod ago" is :data:`_BAY_CLEAR_TO_RUNOUT_GAP_S`, the measured firmware delay
-    between the two halves of one runout episode. So both conditions are required: the
-    ordering states the impossibility, the window says which clear is being talked about.
+    weeks of prod ago" is the scope of one runout episode, in two situations: with a LIVE job
+    the clear happened inside the job the runout word arrives in (``live_job_started_at`` — the
+    printer's live print archive began before it; both halves of one runout fall inside one job);
+    with NO live job, the clear lies inside :data:`_BAY_CLEAR_TO_RUNOUT_GAP_S`, the measured
+    firmware delay between the two halves of one runout episode. So both conditions are
+    required: the ordering states the impossibility, the scope says which clear is being talked
+    about.
 
     Three exits keep tier 1, and each is a distinct reason, not a defensive default:
 
@@ -427,19 +422,23 @@ def _bound_after_the_bay_cleared(
       a bay that never emptied.
 
     **Accepted residual, stated rather than hidden:** two departures from one slot inside
-    the window, where the more recent departure's row has since re-bound with a FRESH moment
+    one job, where the more recent departure's row has since re-bound with a FRESH moment
     (a tagged roll re-read after a glitch release, which does not preserve a bind moment),
     resolves the clear to that row's own departure and keeps tier 1 — correct — but the
     mirror shape, where the returning row's breadcrumb has been overwritten elsewhere, would
-    attribute to the older residue. It needs two roll departures from one slot inside ten
-    minutes, and the alternative (no window at all) is the shipped regression.
+    attribute to the older residue. It needs two roll departures from one slot inside one
+    episode scope (one job, or the window with no job). So does the other residual: an idle roll
+    pulled from the slot mid-job and the roll seated in its place then running out in that same
+    job (a whole roll consumed after the swap) would stand tier 1 aside onto the pulled roll.
     """
     if assignment is None or residue is None:
         return False
     bound_at = getattr(assignment, "created_at", None)
-    cleared_at = getattr(residue, "last_location_at", None)
-    if bound_at is None or cleared_at is None:
+    if bound_at is None:
         return False
+    cleared_at = getattr(residue, "last_location_at", None)
+    if cleared_at is None:
+        return None
     own_clear = _last_clear_of(
         getattr(assignment, "spool", None), printer_id=printer_id, ams_id=ams_id, tray_id=tray_id
     )
@@ -447,6 +446,8 @@ def _bound_after_the_bay_cleared(
         return False
     if bound_at <= cleared_at:
         return False
+    if live_job_started_at is not None:
+        return cleared_at >= live_job_started_at
     return (datetime.utcnow() - cleared_at).total_seconds() <= _BAY_CLEAR_TO_RUNOUT_GAP_S
 
 
@@ -569,10 +570,35 @@ async def _mark_tray_spent(db: AsyncSession, printer_id: int, global_tray: int) 
     # Read once, used by both tiers: the eligibility test below needs the same row tier 2
     # would adjudicate, so resolving it twice could only let them disagree.
     residue = await _newest_released_from_slot(db, printer_id, ams_id, tray_id)
+    from backend.app.services.print_binding import live_print_archive
 
-    if spool is not None and _bound_after_the_bay_cleared(
-        assignment, residue, printer_id=printer_id, ams_id=ams_id, tray_id=tray_id
-    ):
+    live_job = await live_print_archive(db, printer_id)
+
+    stands_aside = (
+        _bound_after_the_bay_cleared(
+            assignment,
+            residue,
+            printer_id=printer_id,
+            ams_id=ams_id,
+            tray_id=tray_id,
+            live_job_started_at=live_job.started_at if live_job is not None else None,
+        )
+        if spool is not None
+        else False
+    )
+    if stands_aside is None:
+        logger.warning(
+            "[RESPOOL] spent stamp withheld on printer %d AMS%d-T%d: spool %d is bound and spool %d last "
+            "left this bay at an UNKNOWN moment, so which roll this runout drained is unknowable — "
+            "a missed stamp self-heals forward, a false one is permanent (invariant 11)",
+            printer_id,
+            ams_id,
+            tray_id,
+            spool.id,
+            residue.id,
+        )
+        return None
+    if stands_aside:
         logger.info(
             "[RESPOOL] tier 1 stands aside on printer %d AMS%d-T%d: spool %d was bound at %s, "
             "AFTER this bay cleared at %s (%.0fs ago) — a roll seated after the bay emptied cannot "
@@ -1346,23 +1372,6 @@ async def mark_spent_on_runout_hold(printer_id: int, state, *, subtask_id, sessi
         logger.warning("Runout-hold spent stamp failed for printer %s: %s", printer_id, e)
 
 
-def _consume_commanded_load(printer_id: int, arrived: int) -> bool:
-    """True (consuming the marker) when a switch's ``arrived`` tray matches an unexpired
-    load WE issued — our own recovery/UI swap or refill, never a firmware runout. A stale
-    marker is dropped so it can't suppress a later genuine switch."""
-    marker = _commanded_loads.get(printer_id)
-    if marker is None:
-        return False
-    target, ts = marker
-    if _monotonic() - ts > _COMMANDED_LOAD_TTL_S:
-        _commanded_loads.pop(printer_id, None)
-        return False
-    if target == arrived:
-        _commanded_loads.pop(printer_id, None)
-        return True
-    return False
-
-
 # Last-seen firmware auto-refill BACKUP GROUPS per printer, one slot-index SET per
 # group (`tray_fields.filam_bak_groups` owns the mask expansion). Refreshed by the
 # per-push sampler whenever a push carries the field and left standing when it does not:
@@ -1569,8 +1578,10 @@ def sample_status_push(printer_id: int, state) -> list[int]:
     What stays HERE is the POLICY on the event, decided once per event — the per-printer
     :data:`_switch_seen` cursor advances BEFORE it, because the policy consumes:
 
-    * the farm's own load is never a firmware runout — a switch whose ARRIVED tray matches
-      an unexpired commanded load (:func:`_consume_commanded_load`) stamps nothing;
+    * the farm's (or an operator's) own load is never a firmware runout — a switch whose
+      ARRIVED tray a commanded load explains (``printer_action.landed_by_command``: the RECORD's
+      outstanding load of it, or the landing it already attributed to one — durable across a
+      restart, where the old TTL marker was not) stamps nothing;
     * on an ambiguous topology the firmware's own backup grouping has to pair the two trays
       (:func:`_swap_stamp_permitted`);
     * one stamp per job per tray — the HMS-edge lane stamps the same switch off its
@@ -1598,7 +1609,9 @@ def sample_status_push(printer_id: int, state) -> list[int]:
         return []
     _switch_seen[printer_id] = switched.seq
     departed, arrived = switched.departed, switched.arrived
-    if _consume_commanded_load(printer_id, arrived):
+    from backend.app.services import printer_action
+
+    if printer_action.landed_by_command(printer_id, arrived):
         logger.info(
             "[RESPOOL] backup swap on printer %d (tray %d -> %d) landed the farm's own commanded load — "
             "not a firmware runout, no spent stamp",
@@ -2243,7 +2256,9 @@ _RESPOOL_REMAIN_JUMP_PCT = 30.0
 #   repair is the offline tool (``tools/repair/repair_spool_ledger.py``).
 # * ``_JUMP_MIN_PUSHES`` / ``_JUMP_STABLE_S`` — a remain jump must hold across at
 #   least this many observations spanning this long before it counts, so a single
-#   in-flux reading can never prompt.
+#   in-flux reading can never prompt. Restored 2026-10-12 (operator ruling "the
+#   behaviour should stay the same for the most part"), replacing the completed-read
+#   substitute.
 _RESPOOL_SWAP_EVIDENCE_S = 600.0
 _LEDGER_CORRUPT_TOL_G = 50.0
 _JUMP_STABLE_S = 10.0

@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 def is_fresh(state: PrinterState | None) -> bool:
     """Does ``state`` describe the printer's CURRENT MQTT session? ONE spelling, for the
     connected-edge hook in ``main``, for the downtime reconcile's evidence
-    (``print_reconcile.evidence_of``), for the AMS command snapshot (``ams_command.snapshot``), for
+    (``print_reconcile.evidence_of``), for the AMS command snapshot (``command_outcome.snapshot``), for
     the plate-check episode (``pause_recovery``) and for :func:`reads_live`.
 
     Total: no state (no client registered), or an object without the session fields, is
@@ -39,7 +39,7 @@ def is_fresh(state: PrinterState | None) -> bool:
     )
 
 
-def reads_live(state: PrinterState | None) -> bool:
+def reads_live(state: PrinterState | None, *, applying_report: bool = False) -> bool:
     """Is ``state`` evidence about the printer RIGHT NOW? THE recovery driver's one freshness
     question, and the refill verdict's first gate (``refill_verdict.refill_owed``).
 
@@ -48,5 +48,12 @@ def reads_live(state: PrinterState | None) -> bool:
     not positively reported (``""`` / ``UNKNOWN``) is not a reading either. No state at all (no
     client registered — a startup before the printer connects, a re-registration) is not fresh by
     the same test.
+
+    ``applying_report`` is the CLIENT's own read while it applies a push that IS its session's report
+    (it carries ``gcode_state``) and has not stamped ``report_epoch`` yet — the stamp lands last, so
+    a reader that sees it sees the whole report. That push is the session's first fresh reading, so
+    a connected state is fresh for it: the feed state reads its level off the session's FIRST
+    report (``BambuMQTTClient._step_feed``), never one report later.
     """
-    return is_fresh(state) and (getattr(state, "state", None) or "").upper() not in ("", "UNKNOWN")
+    fresh = is_fresh(state) or (applying_report and bool(getattr(state, "connected", False)))
+    return fresh and (getattr(state, "state", None) or "").upper() not in ("", "UNKNOWN")

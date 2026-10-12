@@ -14,8 +14,9 @@ Three properties are pinned here and nowhere else:
   ``else`` (the ``declared``-class lesson, made structural);
 * **the completed arm is QUALIFIED** — five separate ways the "the job completed"
   reading could be wrong, each pinned by its own case;
-* **the ledger records EDGES and POSITIVE readings**, never levels, and a session
-  boundary can fabricate neither.
+* **the repair evidence is the JOB'S OWN RECORD and the record's** — a load nobody commanded, a
+  layer printed fed past the row's ``fault_layer`` — never process memory a restart empties, and no
+  cell waits out a window (2026-10-11).
 """
 
 from dataclasses import replace
@@ -27,6 +28,8 @@ from backend.app.models.printer_incident import (
     KIND_JAM,
     KIND_PHYSICAL,
     KIND_PLATE_VISION,
+    KIND_POWER_LOSS,
+    KIND_RUNOUT,
     KIND_SERVICE_HOLD,
     KIND_TOOLHEAD_REFILL,
     KIND_Z_REFERENCE_LOST,
@@ -56,7 +59,6 @@ from backend.app.services.hms_errors import candidate_fingerprint, live_candidat
 from backend.app.services.incident_resolution import (
     ClearedEvent,
     Context,
-    MotionLedger,
     TerminalEvent,
     driver_owns,
     path_quiet,
@@ -91,7 +93,13 @@ def _clean_authority():
     plate_occupancy.reset_for_tests()
 
 
-def _row(resolution: str, *, status: str = STATUS_ESCALATED, printer_id: int = 7) -> PrinterIncident:
+# The job layer the fault opened a row at (``PrinterIncident.fault_layer``); ``_state`` reports layer 10.
+_FAULT_LAYER = 5
+
+
+def _row(
+    resolution: str, *, status: str = STATUS_ESCALATED, printer_id: int = 7, fault_layer: int | None = _FAULT_LAYER
+) -> PrinterIncident:
     """An open row of the given resolution class. Unattached — ``resolve`` is DB-free."""
     kind, code = _KIND_BY_CLASS[resolution]
     return PrinterIncident(
@@ -105,6 +113,7 @@ def _row(resolution: str, *, status: str = STATUS_ESCALATED, printer_id: int = 7
         slot_global_tray=None,
         status=status,
         created_at=_OPENED_AT,
+        fault_layer=fault_layer,
     )
 
 
@@ -167,26 +176,34 @@ def _feed_of(state: PrinterState | None):
     return ScriptedFeed().settle(state)
 
 
-def _observe(ledger: MotionLedger, state: PrinterState, feed: ScriptedFeed | None = None, *, printer_id: int = 7):
-    """ONE status push through the ledger's one writer, with the client's feed state for it —
-    ``feed`` is the printer's running tracker (a sequence of pushes), or a fresh one that has seen
-    this state reported."""
-    reading = feed.push(state) if feed is not None else _feed_of(state)
-    ledger.observe(printer_id, state, reading)
+def _ctx_of(state: PrinterState | None, **kw) -> Context:
+    """A verdict's context over a live reading: the client's feed state for it and the tracked job's
+    layer (``Context.job_layer`` — the state's own), as every closer hands them."""
+    return Context(
+        state=state,
+        feed=_feed_of(state),
+        job_layer=None if state is None else state.layer_num,
+        **{"driver_live": False, **kw},
+    )
 
 
-def _ledger_with(*, load_at=None, ran_at=None, printer_id: int = 7) -> MotionLedger:
-    """A ledger pre-loaded with the motion this case means to have happened.
+def _air_feed(*, layer: int = 10):
+    """A printer's feed state after its job printed a layer with NOTHING fed (``first_unfed_layer``
+    stamped — invariant 16's AIR): RUNNING, ``tray_now`` 255, the layer advancing once."""
+    from backend.app.services.feed_state import JobBoundary
 
-    ``ran_at`` is the QUALIFIED "a print ran through the path" sighting. The cases that
-    are ABOUT what qualifies a sighting drive ``MotionLedger.observe`` instead
-    (``TestTheSightingIsQualified``, ``TestTheNewFaultOccasion``)."""
-    ledger = MotionLedger()
-    if load_at is not None:
-        ledger._load_completed_at[printer_id] = load_at  # noqa: SLF001
-    if ran_at is not None:
-        ledger._path_ran_at[printer_id] = ran_at  # noqa: SLF001
-    return ledger
+    def _push(tray_now: int, at: int) -> PrinterState:
+        state = _state("RUNNING", tray_now=tray_now, layer=at)
+        state.total_layers = 100
+        return state
+
+    feed = ScriptedFeed()
+    feed.push(_push(1, 1), boundary=JobBoundary.NEW_JOB)  # the job this client watched start
+    feed.push(_push(255, layer))
+    feed.push(_push(255, layer + 1))  # a layer advanced with nothing fed: AIR
+    reading = feed.push(_push(1, layer + 2))  # refilled, fed again
+    assert reading.first_unfed_layer is not None
+    return reading
 
 
 def _jam_hms() -> HMSError:
@@ -210,11 +227,12 @@ def _permissive(occasion: str) -> Context:
     state = _state("RUNNING", hms=[_jam_hms()] if occasion == "new_fault" else None, tray_now=0)
     return Context(
         state=state,
-        ledger=_ledger_with(load_at=after, ran_at=after),
+        observed_load_at=after,
         driver_live=False,
-        terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
+        terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB, last_layer=20),
         cleared=ClearedEvent(recover=True),
         feed=_feed_of(state),
+        job_layer=state.layer_num,
     )
 
 
@@ -225,9 +243,9 @@ _EXPECTED: dict[tuple[str, str], str | None] = {
     (RESOLUTION_WIRE, "sweep_tick"): RESOLVE_WIRE_CLEAR,
     (RESOLUTION_WIRE, "startup"): RESOLVE_REARM,
     (RESOLUTION_WIRE, "plate_cleared"): None,
-    # Open while a new fault arrives = the fault arrived INSIDE the hold (the wire row
-    # closes on its own resume); the outrank test re-classifies, nothing here closes.
-    (RESOLUTION_WIRE, "new_fault"): None,
+    # R27: a wire row stays open over a RUNNING print until the layer advance, so a DIFFERENT fault
+    # after the print ran on past it (layer 10 past the fault's 5 here) is its own incident.
+    (RESOLUTION_WIRE, "new_fault"): RESOLVE_OBSERVED_RUNNING,
     (RESOLUTION_REPAIR, "running_edge"): None,
     (RESOLUTION_REPAIR, "job_terminal"): RESOLVE_REPAIR_COMPLETED,
     (RESOLUTION_REPAIR, "sweep_tick"): RESOLVE_REPAIR_OBSERVED,
@@ -294,13 +312,27 @@ class TestEveryCell:
         # a silent stand is a hold nobody can explain from the log.
         assert verdict.evidence
 
-    @pytest.mark.parametrize("resolution", sorted(_KIND_BY_CLASS))
-    def test_only_the_sweep_ever_asks_for_a_dwell(self, resolution):
-        """The dwell belongs to the per-tick sweep alone: a restart IS the fresh
-        derivation it substitutes for, and the three told-occasions are events."""
-        for occasion in _OCCASIONS:
-            verdict = resolve(_row(resolution), occasion, _permissive(occasion))
-            assert verdict.dwell is (occasion == "sweep_tick" and verdict.close), (resolution, occasion)
+    def test_no_verdict_carries_a_window(self):
+        """2026-10-11: no cell waits out a dwell — the verdict is close or stand, on an event."""
+        assert not hasattr(incident_resolution.Verdict(close=True), "dwell")
+
+
+class TestATerminalInFlightStandsTheLookingCells:
+    """The printer reported its job's end and ``main.on_print_complete`` is still handling it: that
+    terminal reads the open holds to classify the stop and the plate BEFORE it closes them, so the farm's
+    LOOKING occasions (the sweep, the session start) stand until it returns — the event decides, where a
+    120 s dwell used to keep it first. The told occasions are untouched."""
+
+    @pytest.mark.parametrize(("resolution", "occasion"), sorted(_EXPECTED))
+    def test_cell(self, resolution, occasion):
+        verdict = resolve(_row(resolution), occasion, replace(_permissive(occasion), terminal_in_flight=True))
+        looking = occasion in ("sweep_tick", "startup")
+        expected_source = None if looking else _EXPECTED[(resolution, occasion)]
+
+        assert verdict.close is (expected_source is not None), verdict.evidence
+        assert verdict.source == expected_source
+        if looking:
+            assert "terminal is being handled" in verdict.evidence
 
 
 class TestAPendingCommandStandsEveryCellButTheJobTerminalAndAPersonsClear:
@@ -394,7 +426,7 @@ class TestTheJobPauseLane:
     def _ctx(self, *, live="RUNNING", job=_JOB, driver_live=False, terminal=None) -> Context:
         state = _state(live)
         state.subtask_id = job
-        return Context(state=state, ledger=MotionLedger(), driver_live=driver_live, terminal=terminal)
+        return Context(state=state, driver_live=driver_live, terminal=terminal)
 
     def test_the_paused_job_running_again_closes_it(self):
         verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "running_edge", self._ctx())
@@ -462,7 +494,7 @@ class TestTheJobPauseLane:
         assert resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live=live, job="other-job")).close is False
 
     def test_a_disconnected_printer_is_not_evidence(self):
-        ctx = Context(state=None, ledger=MotionLedger(), driver_live=False)
+        ctx = Context(state=None, driver_live=False)
         assert resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", ctx).close is False
 
     @pytest.mark.parametrize("occasion", ["sweep_tick", "startup"])
@@ -471,16 +503,17 @@ class TestTheJobPauseLane:
         plate_occupancy.hydrate_eject(7, PendingEject(purpose="production", run_id=None, queue_item_id=1))
         assert resolve(_row(RESOLUTION_JOB_PAUSE), occasion, self._ctx()).close is False
 
-    def test_the_sweep_waits_out_its_dwell_and_the_restart_does_not(self):
+    def test_the_sweep_and_the_session_start_close_on_the_job_running_again(self):
+        """Both read the printer's report, neither waits out a window — only the source differs."""
         sweep = resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx())
         startup = resolve(_row(RESOLUTION_JOB_PAUSE), "startup", self._ctx())
-        assert (sweep.close, sweep.dwell) == (True, True)
-        assert (startup.close, startup.dwell, startup.source) == (True, False, RESOLVE_REARM)
+        assert (sweep.close, sweep.source) == (True, RESOLVE_OBSERVED_RUNNING)
+        assert (startup.close, startup.source) == (True, RESOLVE_REARM)
 
     @pytest.mark.parametrize("recover", [True, False])
     def test_neither_plate_verb_answers_a_paused_job(self, recover):
         """ "The plate is clear" is not "resume the print"."""
-        ctx = Context(state=_state("PAUSE"), ledger=MotionLedger(), driver_live=False, cleared=ClearedEvent(recover))
+        ctx = Context(state=_state("PAUSE"), driver_live=False, cleared=ClearedEvent(recover))
         assert resolve(_row(RESOLUTION_JOB_PAUSE), "plate_cleared", ctx).close is False
 
 
@@ -495,7 +528,7 @@ class TestTheJobPauseIdentityCells:
         row.job_id = row_job
         state = _state(live)
         state.subtask_id = echo
-        return resolve(row, occasion, Context(state=state, ledger=MotionLedger(), driver_live=False))
+        return resolve(row, occasion, Context(state=state, driver_live=False))
 
     @pytest.mark.parametrize(
         ("row_job", "echo", "closes"),
@@ -545,29 +578,29 @@ class TestTheJobPauseIdentityCells:
 class TestAJobPauseCannotOutliveItsJob:
     """A job-pause row whose job ended without the farm seeing its terminal has no other
     exit (no plate verb answers a job pause), so it would block dispatch and stand every
-    resume lane aside on its printer for good. The per-tick SWEEP closes it — after its
-    dwell, under its own token — on the printer's POSITIVE report that the job is over.
-    The startup rearm does not: the downtime reconcile needs the row open to classify a
+    resume lane aside on its printer for good. The per-tick SWEEP closes it — under its own
+    token — on the printer's POSITIVE report that the job is over (a terminal still being handled
+    stands it aside, :class:`TestATerminalInFlightStandsTheLookingCells`). The startup rearm does not: the downtime reconcile needs the row open to classify a
     job stopped during the outage as a refused plate."""
 
     def _ctx(self, *, live, job=_JOB) -> Context:
         state = _state(live)
         state.subtask_id = job
-        return Context(state=state, ledger=MotionLedger(), driver_live=False)
+        return Context(state=state, driver_live=False)
 
     @pytest.mark.parametrize("live", ["IDLE", "FINISH", "FAILED"])
-    def test_a_terminal_or_idle_printer_ends_it_after_the_dwell(self, live):
+    def test_a_terminal_or_idle_printer_ends_it(self, live):
         verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live=live))
 
-        assert (verdict.close, verdict.dwell, verdict.source) == (True, True, RESOLVE_JOB_ENDED_UNSEEN)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_JOB_ENDED_UNSEEN)
         assert live in verdict.evidence
 
     @pytest.mark.parametrize("live", ["RUNNING", "PAUSE", "PREPARE", "IDLE"])
-    def test_another_job_on_the_printer_ends_it_after_the_dwell(self, live):
+    def test_another_job_on_the_printer_ends_it(self, live):
         """A printer runs one job; another one means this one ended."""
         verdict = resolve(_row(RESOLUTION_JOB_PAUSE), "sweep_tick", self._ctx(live=live, job="other-job"))
 
-        assert (verdict.close, verdict.dwell, verdict.source) == (True, True, RESOLVE_JOB_ENDED_UNSEEN)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_JOB_ENDED_UNSEEN)
 
     def test_the_paused_job_running_again_keeps_its_own_token(self):
         """The RUNNING-of-that-job close is unchanged: it is an ANSWER, not an unseen end."""
@@ -587,7 +620,7 @@ class TestTheWireLane:
         intermediate reading of its procedure, not the hold being over (006-H2S
         2026-09-04: the row closed at the resume, the re-PAUSE found no open incident,
         and a second driver ran the swap round on the same AMS)."""
-        ctx = Context(state=_state("RUNNING"), ledger=MotionLedger(), driver_live=True)
+        ctx = Context(state=_state("RUNNING"), driver_live=True)
 
         verdict = resolve(_row(RESOLUTION_WIRE), "running_edge", ctx)
 
@@ -597,8 +630,9 @@ class TestTheWireLane:
     def test_an_orphaned_recovering_row_still_closes_on_the_running_edge(self):
         """The R1 orphan: a driver that crashed mid-recovery leaves ``recovering`` on
         a row nothing is acting on. The handover in ``_run_recovery``'s ``finally``
-        re-reads the level once its slot is free, and that close must still land."""
-        ctx = Context(state=_state("RUNNING"), ledger=MotionLedger(), driver_live=False)
+        re-reads the level once its slot is free, and that close must still land (on a print that has
+        printed past the fault — R27)."""
+        ctx = _ctx_of(_state("RUNNING", tray_now=1))
 
         verdict = resolve(_row(RESOLUTION_WIRE, status=STATUS_RECOVERING), "running_edge", ctx)
 
@@ -612,7 +646,6 @@ class TestTheWireLane:
         its own source; the terminal closer must not free the row from under it."""
         ctx = Context(
             state=_state("IDLE"),
-            ledger=MotionLedger(),
             driver_live=True,
             terminal=TerminalEvent(status="failed", eject=False, job_id=_JOB),
         )
@@ -628,7 +661,6 @@ class TestTheWireLane:
         died (the R1 orphan) has no owner left, and its job's terminal still closes it."""
         ctx = Context(
             state=_state("IDLE"),
-            ledger=MotionLedger(),
             driver_live=False,
             terminal=TerminalEvent(status="failed", eject=False, job_id=_JOB),
         )
@@ -642,7 +674,6 @@ class TestTheWireLane:
         the closers' two log lines read the same reason."""
         ctx = Context(
             state=_state("RUNNING"),
-            ledger=MotionLedger(),
             driver_live=True,
             terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
         )
@@ -656,7 +687,7 @@ class TestTheWireLane:
     @pytest.mark.parametrize("live", ["", "UNKNOWN", "PAUSE"])
     def test_a_non_positive_state_never_closes_a_wire_hold(self, live):
         """``""``/``UNKNOWN`` are absence of evidence; ``PAUSE`` IS the hold."""
-        ctx = Context(state=_state(live), ledger=MotionLedger(), driver_live=False)
+        ctx = Context(state=_state(live), driver_live=False)
 
         assert resolve(_row(RESOLUTION_WIRE), "sweep_tick", ctx).close is False
         assert resolve(_row(RESOLUTION_WIRE), "startup", ctx).close is False
@@ -665,18 +696,19 @@ class TestTheWireLane:
         """Whole-printer, never per-code: #60 carried the pair ``0700_8006`` +
         ``0700_0006``, so a close keyed on the row's own code would have ended the hold
         with its sibling still standing."""
-        ctx = Context(state=_state("IDLE", hms=[_ptfe_breakage_hms()]), ledger=MotionLedger(), driver_live=False)
+        ctx = Context(state=_state("IDLE", hms=[_ptfe_breakage_hms()]), driver_live=False)
 
         assert resolve(_row(RESOLUTION_WIRE), "sweep_tick", ctx).close is False
 
     def test_the_startup_cell_needs_no_fault_liveness_guard(self):
         """Deliberate asymmetry: a restart re-derives every wire fact from scratch, and
-        a printer already positive has answered the question."""
-        ctx = Context(state=_state("RUNNING", hms=[_ptfe_breakage_hms()]), ledger=MotionLedger(), driver_live=False)
+        a printer already positive has answered the question (over a RUNNING print, once it printed past
+        the fault — R27)."""
+        ctx = _ctx_of(_state("RUNNING", hms=[_ptfe_breakage_hms()], tray_now=1))
 
         verdict = resolve(_row(RESOLUTION_WIRE), "startup", ctx)
 
-        assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_REARM, False)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_REARM)
 
     @pytest.mark.parametrize("live", ["IDLE", "FAILED"])
     def test_a_restart_the_driver_owes_an_unload_stands_at_startup(self, live):
@@ -687,7 +719,7 @@ class TestTheWireLane:
         the continuation re-enters to finish (the unload, or the park and the close), instead
         of handing the dispatcher a tube that may still hold the stalled filament. Only the
         startup occasion reads it; without it the same reading closes as before."""
-        owed = Context(state=_state(live), ledger=MotionLedger(), driver_live=False, restart_owed=True)
+        owed = Context(state=_state(live), driver_live=False, restart_owed=True)
         verdict = resolve(_row(RESOLUTION_WIRE, status=STATUS_RECOVERING), "startup", owed)
         assert verdict.close is False
         assert "restart continuation re-enters" in verdict.evidence
@@ -696,10 +728,237 @@ class TestTheWireLane:
         assert resolve(_row(RESOLUTION_WIRE, status=STATUS_RECOVERING), "startup", not_owed).close is True
 
 
+def _runout_same_slot_hms() -> HMSError:
+    """``0700_8011`` — the slot-agnostic runout that opens a runout row."""
+    return HMSError(code="8011", attr=0x07000000, module=7, severity=2, full_code="0700000000008011")
+
+
+def _wire_row(kind: str = KIND_RUNOUT, *, fault_layer: int | None = 50, job_id: str = _JOB) -> PrinterIncident:
+    """An open WIRE-class row the AMS entry opened at job layer ``fault_layer``, its ``codes`` the entry's
+    own fingerprint of the runout (or, for a jam, the feed fault) it opened on."""
+    opened_on = [_runout_same_slot_hms()] if kind == KIND_RUNOUT else [_jam_hms()]
+    return PrinterIncident(
+        id=1,
+        printer_id=7,
+        job_id=job_id,
+        item_id=None,
+        kind=kind,
+        code="0700_8011" if kind == KIND_RUNOUT else "0700_8010",
+        codes=candidate_fingerprint(live_candidates(_state(hms=opened_on))),
+        slot_global_tray=2,
+        status=STATUS_ESCALATED,
+        created_at=_OPENED_AT,
+        fault_layer=fault_layer,
+    )
+
+
+class TestTheWireCloseWaitsForTheLayerAdvance:
+    """R27 (2026-10-12). Production closed a wire-class AMS row over RUNNING only after the sweep's 120 s
+    dwell; the rewrite deleted the dwell, so a fault flapping around the RUNNING edge closed its row,
+    re-opened as a NEW row and was owed a fresh farm resume (the 574 reopen loop). The event that replaces
+    the dwell: over a RUNNING print the row closes only once the job printed a layer FED past its
+    ``fault_layer`` — or at the job's terminal. A flap, a re-pause or a firmware change never advances one."""
+
+    @staticmethod
+    def _running(*, layer: int, job: str = _JOB, hms=None, live: str = "RUNNING", feed=None) -> Context:
+        state = _state(live, hms=hms, tray_now=1, layer=layer)
+        state.subtask_id = job
+        return _ctx_of(state) if feed is None else replace(_ctx_of(state), feed=feed)
+
+    @pytest.mark.parametrize("kind", [KIND_RUNOUT, KIND_JAM])
+    @pytest.mark.parametrize("occasion", ["running_edge", "sweep_tick", "startup"])
+    def test_the_print_at_the_faults_layer_keeps_it_and_the_next_layer_closes_it(self, kind, occasion):
+        row = _wire_row(kind, fault_layer=50)
+
+        held = resolve(row, occasion, self._running(layer=50))
+        assert held.close is False
+        assert "has not printed a layer fed past the fault" in held.evidence
+
+        assert resolve(row, occasion, self._running(layer=51)).close is True
+
+    def test_slow_firmware_the_advance_comes_late_and_still_closes(self):
+        """However long the printer sits RUNNING on the fault's layer (a slow first layer after the resume,
+        a long layer), nothing closes the row on a window — and the advance, whenever it lands, does."""
+        row = _wire_row(fault_layer=50)
+        for _ in range(20):
+            assert resolve(row, "sweep_tick", self._running(layer=50)).close is False
+
+        verdict = resolve(row, "sweep_tick", self._running(layer=51))
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_WIRE_CLEAR)
+
+    def test_a_layer_advanced_on_air_is_not_printed_past_the_fault(self):
+        """FED: a layer the feed state measured printed with nothing fed (``first_unfed_layer``) is the air
+        lane's, never the print running on past the fault."""
+        row = _wire_row(fault_layer=5)
+
+        assert resolve(row, "sweep_tick", self._running(layer=12, feed=_air_feed())).close is False
+
+    def test_the_jobs_terminal_still_closes_it_at_the_faults_layer(self):
+        """The other event: a job hold cannot outlive its job."""
+        ctx = replace(
+            self._running(layer=50, live="FAILED"), terminal=TerminalEvent(status="failed", eject=False, job_id=_JOB)
+        )
+
+        verdict = resolve(_wire_row(fault_layer=50), "job_terminal", ctx)
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_TERMINAL)
+
+    @pytest.mark.parametrize("live", ["IDLE", "FINISH", "FAILED"])
+    def test_a_printer_reporting_the_job_over_is_not_over_running(self, live):
+        """The rule is for a close over a RUNNING print: a printer reporting the job over or idle closes it on
+        a quiet wire, as before (the terminal said so too)."""
+        assert resolve(_wire_row(fault_layer=50), "sweep_tick", self._running(layer=50, live=live)).close is True
+
+    @pytest.mark.parametrize("layer", [0, 1])
+    def test_another_job_running_closes_it(self, layer):
+        """The interrupted job is over and another one runs — the statement its terminal makes too, so it is
+        not a RUNNING of the job the row holds, whatever its layer."""
+        row = _wire_row(fault_layer=120)
+
+        assert resolve(row, "sweep_tick", self._running(layer=layer, job="other-job")).close is True
+
+    def test_an_id_less_job_is_read_against_the_fault_layer(self):
+        """A job naming no id (``job_identity`` ``unknown``) is compared like the row's own: a layer past the
+        fault is past it, the fault's own layer is not."""
+        row = _wire_row(fault_layer=50, job_id="")
+
+        assert resolve(row, "sweep_tick", self._running(layer=50, job="")).close is False
+        assert resolve(row, "sweep_tick", self._running(layer=51, job="")).close is True
+
+    def test_a_row_with_no_recorded_fault_layer_closes_as_production_did(self):
+        """A row opened before the column (or with no client to read the layer) cannot measure the advance
+        on its own job: it closes over RUNNING as production did, with no dwell. Every row the AMS entry
+        opens now records one."""
+        row = _wire_row(fault_layer=None)
+
+        verdict = resolve(row, "running_edge", self._running(layer=50))
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_OBSERVED_RUNNING)
+
+    def test_a_power_loss_row_is_not_an_ams_row(self):
+        """The power-loss hold is wire-class but not an AMS fault: its farm resume's RUNNING ends it at once
+        (``pause_recovery``), at whatever layer — R27 does not reach it."""
+        row = _replace_row(_wire_row(fault_layer=50), kind=KIND_POWER_LOSS, code="0300_8007", codes="")
+
+        assert resolve(row, "running_edge", self._running(layer=0)).close is True
+
+    def test_a_live_driver_still_owns_the_edge(self):
+        verdict = resolve(_wire_row(fault_layer=50), "running_edge", replace(self._running(layer=51), driver_live=True))
+
+        assert verdict.close is False
+        assert "closer stands aside" in verdict.evidence
+
+    # --- the new-fault occasion: the flap stays absorbed, a different fault is its own incident ---------
+
+    def test_the_rows_own_fault_standing_again_is_the_flap_it_stays_open_for(self):
+        """The 574 shape: the runout flaps back on at the fault's layer, or on a later one — the row's own
+        fault is the hold it holds; it is never closed to make room for itself."""
+        row = _wire_row(fault_layer=50)
+        for layer in (50, 51):
+            verdict = resolve(row, "new_fault", self._running(layer=layer, hms=[_runout_same_slot_hms()]))
+            assert verdict.close is False
+            assert "own fault still stands" in verdict.evidence
+
+    def test_a_different_fault_before_the_print_ran_arrived_inside_the_hold(self):
+        """A jam raised while the operator refills the runout slot, the printer never resumed: the hold
+        stands, and the entry's outrank test re-classifies it if the jam is worse."""
+        verdict = resolve(
+            _wire_row(fault_layer=50), "new_fault", self._running(layer=50, live="PAUSE", hms=[_jam_hms()])
+        )
+
+        assert verdict.close is False
+        assert "inside the hold" in verdict.evidence
+
+    def test_a_different_fault_after_the_layer_advance_is_its_own_incident(self):
+        verdict = resolve(_wire_row(fault_layer=50), "new_fault", self._running(layer=51, hms=[_jam_hms()]))
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_OBSERVED_RUNNING)
+        assert verdict.evidence == incident_resolution._WIRE_EVIDENCE_NEW_FAULT_PAST  # noqa: SLF001
+
+    def test_a_different_fault_after_the_job_was_seen_running_is_its_own_incident(self):
+        """A person's touchscreen resume (no farm resume on the row): the RUNNING edge recorded the row's own job
+        running since the row opened (``Context.job_ran``), so a jam inside the fault's layer is its own
+        incident — while the row's own fault flapping back stays held."""
+        row = _wire_row(fault_layer=50)
+
+        jam = resolve(row, "new_fault", replace(self._running(layer=50, live="PAUSE", hms=[_jam_hms()]), job_ran=True))
+        flap = resolve(
+            row,
+            "new_fault",
+            replace(self._running(layer=50, live="PAUSE", hms=[_runout_same_slot_hms()]), job_ran=True),
+        )
+
+        assert (jam.close, jam.source) == (True, RESOLVE_OBSERVED_RUNNING)
+        assert jam.evidence == incident_resolution._WIRE_EVIDENCE_NEW_FAULT_RESUMED  # noqa: SLF001
+        assert flap.close is False
+
+    def test_the_sighting_is_the_rows_own_job_running_with_no_driver(self):
+        """What the RUNNING edge records (``own_job_running``): the row's job (or an id-less one) RUNNING, no
+        driver live (a driver's lever resume is its procedure), no eject."""
+        row = _wire_row(fault_layer=50)
+
+        assert incident_resolution.own_job_running(row, self._running(layer=50)) is True
+        assert incident_resolution.own_job_running(row, replace(self._running(layer=50), driver_live=True)) is False
+        assert incident_resolution.own_job_running(row, self._running(layer=50, job="other-job")) is False
+        assert incident_resolution.own_job_running(row, self._running(layer=50, live="PAUSE")) is False
+
+    def test_a_different_fault_after_the_farms_resume_reached_is_its_own_incident(self):
+        """Inside the fault's own layer, the farm's resume on the row REACHED the printer (the record): the
+        print ran after the fault — production closed the row right there — so a jam now is not this hold."""
+        printer_incidents._open_cache[7] = {  # noqa: SLF001
+            1: {
+                "id": 1,
+                "kind": KIND_RUNOUT,
+                "farm_actions": [
+                    {
+                        "action_id": 50,
+                        "command": "resume",
+                        "target": None,
+                        "answer": "reached",
+                        "sent_at": "2026-10-12T08:00:00",
+                        "answered_at": "2026-10-12T08:00:05",
+                        "step_reading": None,
+                        "reason": None,
+                        "unsent": False,
+                    }
+                ],
+            }
+        }
+        try:
+            verdict = resolve(_wire_row(fault_layer=50), "new_fault", self._running(layer=50, hms=[_jam_hms()]))
+        finally:
+            printer_incidents._reset_state()  # noqa: SLF001
+
+        assert (verdict.close, verdict.source) == (True, RESOLVE_OBSERVED_RUNNING)
+        assert verdict.evidence == incident_resolution._WIRE_EVIDENCE_NEW_FAULT_RESUMED  # noqa: SLF001
+
+
+def _replace_row(row: PrinterIncident, **changes) -> PrinterIncident:
+    """A copy of an unattached row with ``changes`` applied."""
+    fields = {
+        name: getattr(row, name)
+        for name in (
+            "id",
+            "printer_id",
+            "job_id",
+            "item_id",
+            "kind",
+            "code",
+            "codes",
+            "slot_global_tray",
+            "status",
+            "created_at",
+            "fault_layer",
+        )
+    }
+    return PrinterIncident(**{**fields, **changes})
+
+
 class TestTheRepairLaneMotionEvidence:
-    def _ctx(self, *, live="IDLE", hms=None, load_at=None, ams_status_main=0, tray_now=None):
-        state = _state(live, hms=hms, ams_status_main=ams_status_main, tray_now=tray_now)
-        return Context(state=state, ledger=_ledger_with(load_at=load_at), driver_live=False, feed=_feed_of(state))
+    def _ctx(self, *, live="IDLE", hms=None, load_at=None, ams_status_main=0, tray_now=None, layer=10):
+        state = _state(live, hms=hms, ams_status_main=ams_status_main, tray_now=tray_now, layer=layer)
+        return _ctx_of(state, observed_load_at=load_at)
 
     def test_an_idle_clean_printer_is_not_evidence(self):
         """THE 003-H2S pin: the firmware wipes its standing HMS list at every terminal,
@@ -712,7 +971,7 @@ class TestTheRepairLaneMotionEvidence:
 
         verdict = resolve(_row(RESOLUTION_REPAIR), "sweep_tick", ctx)
 
-        assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_REPAIR_OBSERVED, True)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_REPAIR_OBSERVED)
         assert verdict.evidence == incident_resolution._REPAIR_EVIDENCE_LOAD  # noqa: SLF001
 
     def test_a_load_before_the_fault_is_the_one_that_jammed(self):
@@ -720,12 +979,32 @@ class TestTheRepairLaneMotionEvidence:
 
         assert resolve(_row(RESOLUTION_REPAIR), "sweep_tick", ctx).close is False
 
-    def test_a_running_print_with_no_eject_closes_it(self):
-        """A print FEEDING through the path: RUNNING with the active extruder fed (K12)."""
+    def test_a_print_fed_past_the_fault_layer_closes_it(self):
+        """A print FEEDING through the path (RUNNING with the active extruder fed — K12) that has
+        printed a layer past the one the fault stopped it at: the layer advance is the event."""
         verdict = resolve(_row(RESOLUTION_REPAIR), "sweep_tick", self._ctx(live="RUNNING", tray_now=1))
 
         assert verdict.source == RESOLVE_REPAIR_OBSERVED
         assert verdict.evidence == incident_resolution._REPAIR_EVIDENCE_RUNNING  # noqa: SLF001
+
+    def test_a_print_feeding_at_the_fault_layer_has_not_run_past_it(self):
+        """Fed and RUNNING, but still at the fault's own layer: nothing has run through the path since
+        the fault yet. The next layer answers — no clock."""
+        row = _row(RESOLUTION_REPAIR, fault_layer=10)
+
+        held = resolve(row, "sweep_tick", self._ctx(live="RUNNING", tray_now=1, layer=10))
+        assert held.close is False
+        assert "past the fault" in held.evidence
+        assert resolve(row, "sweep_tick", self._ctx(live="RUNNING", tray_now=1, layer=11)).close is True
+
+    def test_a_row_with_no_fault_layer_needs_other_evidence(self):
+        """A row opened before the column existed records no layer: a feeding print on its job says
+        nothing about "after the fault"; the record's uncommanded load still does."""
+        row = _row(RESOLUTION_REPAIR, fault_layer=None)
+
+        assert resolve(row, "sweep_tick", self._ctx(live="RUNNING", tray_now=1, layer=40)).close is False
+        loaded = self._ctx(load_at=_OPENED_AT + timedelta(seconds=30))
+        assert resolve(row, "sweep_tick", loaded).close is True
 
     def test_an_eject_sweep_is_not_a_print_through_the_path(self):
         """A sweep is filament-LESS: a toolhead crossing the plate says nothing about
@@ -764,18 +1043,18 @@ class TestTheRepairLaneMotionEvidence:
 
         assert resolve(_row(RESOLUTION_REPAIR), "sweep_tick", ctx).close is False
 
-    def test_the_startup_cell_takes_the_same_evidence_with_no_dwell(self):
+    def test_the_startup_cell_takes_the_same_evidence(self):
         ctx = self._ctx(live="RUNNING", tray_now=1)
 
         verdict = resolve(_row(RESOLUTION_REPAIR), "startup", ctx)
 
-        assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_REARM, False)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_REARM)
 
     def test_recover_closes_it_and_a_routine_clear_plate_does_not(self):
         """The two plate verbs are different statements. "The bed is empty" says
         nothing about the filament path; "I inspected this machine" is the class's
         third return-to-normal."""
-        base = Context(state=_state(), ledger=MotionLedger(), driver_live=False)
+        base = Context(state=_state(), driver_live=False)
 
         def _verdict(*, recover: bool):
             return resolve(
@@ -797,23 +1076,20 @@ class TestTheCompletedArm:
     Every qualification below closes a way that reading could be wrong.
     """
 
-    def _ctx(self, *, status="completed", eject=False, job_id=_JOB, running_at="after", hms=None, unfed=False):
-        seen = {
-            "after": _OPENED_AT + timedelta(seconds=30),
-            "before": _OPENED_AT - timedelta(seconds=30),
-            None: None,
-        }[running_at]
+    def _ctx(self, *, status="completed", eject=False, job_id=_JOB, last_layer=20, hms=None, unfed=False, load_at=None):
         return Context(
             state=_state("FINISH", hms=hms),
-            ledger=_ledger_with(ran_at=seen),
             driver_live=False,
-            terminal=TerminalEvent(status=status, eject=eject, job_id=job_id, printed_unfed=unfed),
+            observed_load_at=load_at,
+            terminal=TerminalEvent(
+                status=status, eject=eject, job_id=job_id, printed_unfed=unfed, last_layer=last_layer
+            ),
         )
 
     def test_the_same_job_completing_closes_it(self):
         verdict = resolve(_row(RESOLUTION_REPAIR), "job_terminal", self._ctx())
 
-        assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_REPAIR_COMPLETED, False)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_REPAIR_COMPLETED)
         assert verdict.evidence == incident_resolution._REPAIR_EVIDENCE_COMPLETED  # noqa: SLF001
 
     def test_a_finish_that_printed_on_air_is_not_filament_fed_to_the_end(self):
@@ -846,6 +1122,8 @@ class TestTheCompletedArm:
         keywords = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
 
         assert keywords.get("printed_unfed") == "_evidence.printed_unfed"
+        # ...and how far the job got, off the same parse: the completed arm's "printed past the fault".
+        assert keywords.get("last_layer") == "_evidence.last_layer_num"
 
     def test_another_job_completing_launders_nothing(self):
         """The row blocks the DISPATCHER, not the touchscreen: a screen-started print
@@ -881,14 +1159,25 @@ class TestTheCompletedArm:
         without this the farm's own eject would launder every physical hold it met."""
         assert resolve(_row(RESOLUTION_REPAIR), "job_terminal", self._ctx(eject=True)).close is False
 
-    def test_no_running_sighting_after_the_fault_stands(self):
-        """The disqualifier for a pull-back timeout raised at END-OF-PRINT unload: the
-        job completes, but nothing ever ran through the path after the fault."""
-        assert resolve(_row(RESOLUTION_REPAIR), "job_terminal", self._ctx(running_at=None)).close is False
+    def test_no_layer_printed_past_the_fault_stands(self):
+        """The disqualifier for a pull-back timeout raised at END-OF-PRINT unload: the job completes,
+        but its last layer IS the fault's — nothing ran through the path after the fault."""
+        ctx = self._ctx(last_layer=_FAULT_LAYER)
 
-    def test_a_running_sighting_from_BEFORE_the_row_stands(self):
-        """The print that was running when the fault arrived is the one it interrupted."""
-        assert resolve(_row(RESOLUTION_REPAIR), "job_terminal", self._ctx(running_at="before")).close is False
+        verdict = resolve(_row(RESOLUTION_REPAIR), "job_terminal", ctx)
+
+        assert verdict.close is False
+        assert "no layer past the fault" in verdict.evidence
+
+    def test_a_load_nobody_commanded_after_the_fault_is_evidence_too(self):
+        """The record's uncommanded load after the row opened is filament through the path."""
+        ctx = self._ctx(last_layer=_FAULT_LAYER, load_at=_OPENED_AT + timedelta(seconds=30))
+
+        assert resolve(_row(RESOLUTION_REPAIR), "job_terminal", ctx).close is True
+
+    def test_a_row_with_no_fault_layer_stands_on_the_completion_alone(self):
+        """A row opened before the column existed: the completion cannot say it ran past the fault."""
+        assert resolve(_row(RESOLUTION_REPAIR, fault_layer=None), "job_terminal", self._ctx()).close is False
 
     def test_a_fault_still_standing_at_the_terminal_stands(self):
         """Evidence is not a latch here either."""
@@ -899,169 +1188,9 @@ class TestTheCompletedArm:
     def test_a_wire_row_still_closes_on_any_terminal(self):
         """The completed arm is the REPAIR class's. A wire hold is over when its job
         ends, whatever the outcome — that rule is untouched."""
-        verdict = resolve(_row(RESOLUTION_WIRE), "job_terminal", self._ctx(status="aborted", running_at=None))
+        verdict = resolve(_row(RESOLUTION_WIRE), "job_terminal", self._ctx(status="aborted", last_layer=0))
 
         assert (verdict.close, verdict.source) == (True, RESOLVE_TERMINAL)
-
-
-class TestMotionLedger:
-    """The ledger's two facts, read off the client's FEED STATE (invariant 16): the load edge is the
-    feed state's ``load_landed`` event, consumed once per printer by its ``seq``; the sighting is a
-    POSITIVE reading of a print feeding. Every push here is a real tracker step (``ScriptedFeed``)
-    handed to the ledger's one writer, as the per-push sampler hands it."""
-
-    @pytest.fixture
-    def feed(self):
-        """Printer 7's client, whose landings carry production's attribution (a live driver)."""
-        return ScriptedFeed(farm_acting=lambda: printer_incidents.driver_live(7))
-
-    @staticmethod
-    def _sample(ledger, feed, *, tray_now, epoch=1, live="IDLE", printer_id=7):
-        _observe(ledger, _state(live, tray_now=tray_now, epoch=epoch), feed, printer_id=printer_id)
-
-    def test_the_first_samples_only_seed(self, feed):
-        """A session's first report re-seeds the feed state and its first reading is a reading: an
-        edge that happened before we looked is not an edge we witnessed."""
-        ledger = MotionLedger()
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=1)
-
-        assert ledger.load_completed_at(7) is None
-
-    def test_a_landing_onto_a_real_feeder_stamps(self, feed):
-        ledger = MotionLedger()
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=1)
-
-        assert ledger.load_completed_at(7) is not None
-
-    def test_a_landing_is_consumed_once(self, feed):
-        """The reading holds the LAST landing until the next: the ledger's cursor consumes it once,
-        so a later stamp is a later landing, never the same one read again."""
-        ledger = MotionLedger()
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=1)
-        first = ledger.load_completed_at(7)
-        self._sample(ledger, feed, tray_now=1)
-
-        assert ledger.load_completed_at(7) == first
-
-    def test_a_standing_level_never_stamps(self, feed):
-        """003-H2S read ``tray_now == 1`` before, during and after its fault."""
-        ledger = MotionLedger()
-        for _ in range(4):
-            self._sample(ledger, feed, tray_now=1)
-
-        assert ledger.load_completed_at(7) is None
-
-    @pytest.mark.parametrize("sentinel", [254, 255])
-    def test_a_sentinel_is_not_a_feeder(self, feed, sentinel):
-        """254 is the external holder and 255 is "nothing is feeding" — neither is
-        something a load can complete ONTO."""
-        ledger = MotionLedger()
-        self._sample(ledger, feed, tray_now=1)
-        self._sample(ledger, feed, tray_now=1)
-        self._sample(ledger, feed, tray_now=sentinel)
-
-        assert ledger.load_completed_at(7) is None
-
-    def test_an_epoch_change_cannot_fabricate_a_load_edge(self, feed):
-        """A new MQTT session re-seeds every wire fact at once, so a tray "changing"
-        across it is a reading, not an event."""
-        ledger = MotionLedger()
-        self._sample(ledger, feed, tray_now=255, epoch=1)
-        self._sample(ledger, feed, tray_now=255, epoch=1)
-        self._sample(ledger, feed, tray_now=1, epoch=2)
-
-        assert ledger.load_completed_at(7) is None
-
-    def test_a_pre_flip_inside_a_drained_rolls_tail_is_no_landing(self, feed):
-        """005/001-H2S 2026-10-10: the roll ran dry at the AMS and ``tray_now`` pre-flipped to the
-        backup while the tail still fed — no load landed, so no repair evidence. The landing is the
-        backup actually feeding, after the firmware's change."""
-        ledger = MotionLedger()
-        for _ in range(2):
-            _observe(ledger, _state("RUNNING", tray_now=1), feed)
-        _observe(ledger, _state("RUNNING", tray_now=1, absent={1}), feed)  # the roll ran dry
-        _observe(ledger, _state("RUNNING", tray_now=0, absent={1}), feed)  # the pre-flip
-        assert ledger.load_completed_at(7) is None
-
-        _observe(ledger, _state("RUNNING", tray_now=255, absent={1}, ams_status_main=1), feed)  # the change
-        _observe(ledger, _state("RUNNING", tray_now=0, absent={1}), feed)  # the backup lands
-        assert ledger.load_completed_at(7) is not None
-
-    def test_running_is_stamped_on_the_positive_reading_with_no_edge(self):
-        """No edge, no epoch test: "this printer was demonstrably printing" is a fact a reconnect
-        cannot fabricate, and it is usable on the feed state's first READING after one."""
-        ledger = MotionLedger()
-        _observe(ledger, _state("RUNNING", tray_now=1))
-
-        assert ledger.path_ran_at(7) is not None
-
-    @pytest.mark.parametrize("live", ["IDLE", "PAUSE", "FINISH", "PREPARE", ""])
-    def test_only_running_stamps_the_sighting(self, live):
-        ledger = MotionLedger()
-        _observe(ledger, _state(live, tray_now=1))
-
-        assert ledger.path_ran_at(7) is None
-
-    def test_a_running_eject_sweep_never_enters_the_ledger(self):
-        """The eject exclusion is asked at STAMP time for this fact, so a sweep's
-        RUNNING can never become the "a print ran through the path" evidence the
-        completed arm reads back hours later."""
-        plate_occupancy.hydrate_plate(7, _JOB, EscalationOnly())
-        plate_occupancy.hydrate_eject(
-            7,
-            PendingEject(
-                purpose="manual",
-                run_id=None,
-                queue_item_id=None,
-                dispatched_at=datetime.now(timezone.utc),
-                started_at=None,
-                hydrated=True,
-            ),
-        )
-        ledger = MotionLedger()
-        _observe(ledger, _state("RUNNING", tray_now=1))
-
-        assert ledger.path_ran_at(7) is None
-
-    def test_the_ledger_is_per_printer(self, feed):
-        ledger = MotionLedger()
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=1)
-
-        assert ledger.load_completed_at(8) is None
-
-    def test_no_reading_is_no_evidence(self):
-        """No client (no feed state): no landing, nothing fed."""
-        ledger = MotionLedger()
-        ledger.observe(7, _state("RUNNING", tray_now=1), None)
-
-        assert (ledger.load_completed_at(7), ledger.path_ran_at(7)) == (None, None)
-
-    def test_reset_drops_everything(self, feed):
-        """``spool_recovery._reset_state`` delegates here — no second test fixture."""
-        ledger = MotionLedger()
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=255)
-        self._sample(ledger, feed, tray_now=1, live="RUNNING")
-        assert ledger.load_completed_at(7) is not None
-        assert ledger.path_ran_at(7) is not None
-
-        ledger.reset()
-
-        assert ledger.load_completed_at(7) is None
-        assert ledger.path_ran_at(7) is None
-        # ...including the landing cursor: a restart builds a new client, whose feed state emits no
-        # landing until one is seen after its seed.
-        restarted = ScriptedFeed()
-        self._sample(ledger, restarted, tray_now=2)
-        self._sample(ledger, restarted, tray_now=2)
-        assert ledger.load_completed_at(7) is None
 
 
 class _LiveTask:
@@ -1082,55 +1211,6 @@ def live_driver():
     printer_incidents.release_driver(7, task)
 
 
-class TestTheSightingIsQualified:
-    """``path_ran_at`` is "a print ran THROUGH THE PATH", qualified when it is WRITTEN — the
-    reading is used long after the sample, when the printer's state then says nothing
-    about the state at the sample. Each exclusion below is a RUNNING reading that is not
-    filament feeding through a repaired path."""
-
-    @staticmethod
-    def _sample(ledger, *, hms=None, ams_status_main=0):
-        _observe(ledger, _state("RUNNING", hms=hms, tray_now=1, ams_status_main=ams_status_main))
-
-    def test_a_quiet_running_print_with_no_driver_is_a_sighting(self):
-        ledger = MotionLedger()
-        self._sample(ledger)
-
-        assert ledger.path_ran_at(7) is not None
-
-    def test_running_with_a_fault_standing_is_not(self):
-        """The fault-before-PAUSE window: the row opens on the HMS push, BEFORE the PAUSE
-        lands, and the samples between carry the very fault it is about."""
-        ledger = MotionLedger()
-        self._sample(ledger, hms=[_ptfe_breakage_hms()])
-
-        assert ledger.path_ran_at(7) is None
-
-    def test_running_with_the_ams_mid_change_is_not(self):
-        """A wedge outlives its code: a fault-free wire with the AMS mid-change is not quiet."""
-        ledger = MotionLedger()
-        self._sample(ledger, ams_status_main=1)
-
-        assert ledger.path_ran_at(7) is None
-
-    def test_running_under_a_live_recovery_driver_is_not(self, live_driver):
-        """A driver's own lever resume: the running-edge cells' rule — a RUNNING sample taken
-        during a resume the driver published is its intermediate reading."""
-        ledger = MotionLedger()
-        self._sample(ledger)
-
-        assert ledger.path_ran_at(7) is None
-
-    def test_the_driver_releasing_lets_the_next_quiet_sample_count(self, live_driver):
-        ledger = MotionLedger()
-        self._sample(ledger)
-        printer_incidents.release_driver(7, live_driver)
-
-        self._sample(ledger)
-
-        assert ledger.path_ran_at(7) is not None
-
-
 def _pull_back_hms() -> list[HMSError]:
     """002-H2S's pull-back pair, one per wire lane: ``0700_0011`` (hms[], AMS A slot 3 —
     "pull-back timeout") and ``0700_8004`` (print_error — "failed to pull back")."""
@@ -1146,9 +1226,11 @@ def _extruder_overload_hms() -> HMSError:
     return HMSError(code="801E", attr=0x03000000, module=3, severity=2)
 
 
-def _physical_row(opened_on: list[HMSError], *, created_at: datetime) -> PrinterIncident:
+def _physical_row(
+    opened_on: list[HMSError], *, created_at: datetime, fault_layer: int | None = _FAULT_LAYER
+) -> PrinterIncident:
     """An open AMS-side PHYSICAL row (the ``repair`` class) whose ``codes`` are the entry
-    gate's own fingerprint of the faults it opened on."""
+    gate's own fingerprint of the faults it opened on, at job layer ``fault_layer``."""
     return PrinterIncident(
         id=1,
         printer_id=7,
@@ -1160,12 +1242,12 @@ def _physical_row(opened_on: list[HMSError], *, created_at: datetime) -> Printer
         slot_global_tray=2,
         status=STATUS_ESCALATED,
         created_at=created_at,
+        fault_layer=fault_layer,
     )
 
 
 def _opened_minutes_ago() -> datetime:
-    """``created_at`` safely before any sighting this case then writes (the ledger stamps
-    the wall clock at ``observe``)."""
+    """``created_at`` safely in the past."""
     return datetime.utcnow() - timedelta(minutes=5)
 
 
@@ -1176,45 +1258,41 @@ class TestTheNewFaultOccasion:
     ``0700_8004`` pull-back rows; 006-H2S 2026-09-21: a ``0300_801E`` behind incident 289.
     The rework made the RUNNING edge no repair evidence for the class, so the rows
     outlived the resume that had repaired the path, and the entry refused every new fault
-    as "already held". A repair row now closes ``repair_observed`` on a new fault once a
-    print demonstrably RAN through the path after it opened — and on nothing weaker.
-
-    Every sighting is written the way production writes it, through
-    ``MotionLedger.observe`` (the sampler's own call), never pre-seeded.
+    as "already held". A repair row now closes ``repair_observed`` on a new fault once the
+    print demonstrably RAN through the path after it opened — a layer printed FED past the row's
+    ``fault_layer`` (the job's own record), or a load nobody commanded since — and on nothing weaker.
     """
 
     @staticmethod
-    def _ran(ledger: MotionLedger, *, hms=None) -> None:
-        """One RUNNING push through the sampler's call (qualified or not is the ledger's)."""
-        _observe(ledger, _state("RUNNING", hms=hms, tray_now=1))
-
-    @staticmethod
-    def _now_on_wire(ledger: MotionLedger, hms, *, live="PAUSE", driver_live=False) -> Context:
-        state = _state(live, hms=hms, tray_now=1)
-        return Context(state=state, ledger=ledger, driver_live=driver_live, feed=_feed_of(state))
+    def _now_on_wire(hms, *, live="PAUSE", driver_live=False, layer=10, job=_JOB, feed=None) -> Context:
+        state = _state(live, hms=hms, tray_now=1, layer=layer)
+        state.subtask_id = job
+        return Context(
+            state=state,
+            driver_live=driver_live,
+            feed=feed if feed is not None else _feed_of(state),
+            job_layer=layer,
+        )
 
     @pytest.mark.parametrize(
         "new_fault",
         [pytest.param(_jam_hms, id="002-H2S-0700_8010"), pytest.param(_extruder_overload_hms, id="006-H2S-0300_801E")],
     )
     def test_a_new_fault_after_a_print_ran_through_the_path_closes_it(self, new_fault):
-        ledger = MotionLedger()
+        """The operator repaired the path and resumed; it printed on, past the fault's layer."""
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger)  # the operator repaired the path and resumed; it printed
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [new_fault()], live="RUNNING"))
+        verdict = resolve(row, "new_fault", self._now_on_wire([new_fault()], live="RUNNING"))
 
-        assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_REPAIR_OBSERVED, False)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_REPAIR_OBSERVED)
         assert verdict.evidence == incident_resolution._REPAIR_EVIDENCE_NEW_FAULT  # noqa: SLF001
 
     def test_the_rows_own_fault_still_standing_keeps_it(self):
         """A new code BESIDE the row's own is the same blockage, better described — the
         entry's outrank test is what re-classifies a row, never this close."""
-        ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger)
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [*_pull_back_hms(), _jam_hms()]))
+        verdict = resolve(row, "new_fault", self._now_on_wire([*_pull_back_hms(), _jam_hms()]))
 
         assert verdict.close is False
         assert "own fault still stands" in verdict.evidence
@@ -1222,140 +1300,109 @@ class TestTheNewFaultOccasion:
     @pytest.mark.parametrize("lane", [0, 1], ids=["hms-lane-0700_0011", "print-error-lane-0700_8004"])
     def test_one_own_code_on_either_wire_lane_keeps_it(self, lane):
         """Both lanes are the row's own words: either one standing is the old fault."""
-        ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger)
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_pull_back_hms()[lane], _jam_hms()]))
+        verdict = resolve(row, "new_fault", self._now_on_wire([_pull_back_hms()[lane], _jam_hms()]))
 
         assert verdict.close is False
 
     def test_the_same_code_on_another_slot_is_a_different_fault(self):
         """The comparison is the entry gate's own slot-qualified token: a second slot's
         breakage is a new fault, exactly as a second roll running dry is a new runout."""
-        ledger = MotionLedger()
         row = _physical_row([_ptfe_breakage_hms(tray_id=3)], created_at=_opened_minutes_ago())
-        self._ran(ledger)
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_ptfe_breakage_hms(tray_id=1)]))
+        verdict = resolve(row, "new_fault", self._now_on_wire([_ptfe_breakage_hms(tray_id=1)]))
 
         assert (verdict.close, verdict.source) == (True, RESOLVE_REPAIR_OBSERVED)
 
     def test_no_actionable_fault_is_no_new_fault(self):
-        ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger)
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, []))
+        verdict = resolve(row, "new_fault", self._now_on_wire([]))
 
         assert verdict.close is False
 
-    def test_a_sighting_from_a_drivers_own_resume_does_not_count(self, live_driver):
-        """A RUNNING sample during a resume a live driver published is its reading — on an
-        UPGRADED row too, whose ``created_at`` is the jam's."""
-        ledger = MotionLedger()
-        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger)  # the driver's lever resume: RUNNING, quiet, driver live
-        printer_incidents.release_driver(7, live_driver)  # it handed over
+    def test_layers_before_a_re_classification_are_not_after_the_fault(self):
+        """An UPGRADED row keeps the jam's ``created_at`` — a recovery driver's own lever resumes could
+        print layers after it — but the upgrade re-stamps ``fault_layer`` to the worse fault's layer, so
+        those layers are not "past the fault"."""
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago(), fault_layer=10)
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()]))
+        verdict = resolve(row, "new_fault", self._now_on_wire([_jam_hms()], layer=10))
 
         assert verdict.close is False
         assert "no print ran through the path" in verdict.evidence
 
-    def test_the_fault_before_pause_window_does_not_count(self):
-        """The row opens on the HMS push, BEFORE the PAUSE lands; the RUNNING samples in
-        between carry the very fault it is about — a sighting there is not the path running."""
-        ledger = MotionLedger()
+    def test_a_job_that_printed_air_proves_nothing_about_the_path(self):
+        """K12: layers printed with NOTHING fed (the feed state's ``first_unfed_layer``) ran no filament
+        through anything — the next jam is still the same blockage as far as the farm can tell."""
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger, hms=_pull_back_hms())
-        self._ran(ledger, hms=_pull_back_hms())
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()]))
+        verdict = resolve(row, "new_fault", self._now_on_wire([_jam_hms()], layer=12, feed=_air_feed()))
 
         assert verdict.close is False
-        assert "no print ran through the path" in verdict.evidence
 
-    def test_a_sighting_from_before_the_row_opened_does_not_count(self):
-        """The print that was running when the fault arrived is the one it interrupted."""
-        ledger = MotionLedger()
-        self._ran(ledger)
-        row = _physical_row(_pull_back_hms(), created_at=ledger.path_ran_at(7) + timedelta(seconds=1))
+    def test_another_job_that_printed_is_evidence(self):
+        """The interrupted job is over and another one printed through the path since."""
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
 
-        assert resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()])).close is False
+        verdict = resolve(row, "new_fault", self._now_on_wire([_jam_hms()], job="other-job", layer=1))
+
+        assert verdict.close is True
+
+    def test_a_job_naming_no_id_proves_nothing(self):
+        """``job_identity``: an id-less job is ``unknown`` — never the same job, never another."""
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
+
+        assert resolve(row, "new_fault", self._now_on_wire([_jam_hms()], job="")).close is False
 
     def test_a_live_driver_at_the_verdict_stands_aside(self):
         """The told-occasion ownership rule: closing a row from under a live driver would let
         the entry spawn a second driver onto one AMS (006-H2S 2026-09-04)."""
-        ledger = MotionLedger()
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger)
 
-        verdict = resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()], driver_live=True))
+        verdict = resolve(row, "new_fault", self._now_on_wire([_jam_hms()], driver_live=True))
 
         assert verdict.close is False
         assert "closer stands aside" in verdict.evidence
 
-    def test_after_a_restart_the_row_stands_until_this_process_sees_the_path_run(self):
-        """The ledger is process memory, and a restart empties it (``ledger.reset`` is what a
-        restart leaves). With no sighting of its own the process never ends a hold on motion
-        it did not witness — the SAFE direction: the row stands and the new fault waits.
-        The first quiet RUNNING the new process samples is the evidence again."""
-        ledger = MotionLedger()
+    def test_the_evidence_is_the_same_after_a_restart(self):
+        """The motion ledger was process memory: a restart emptied it and the row stood until the new
+        process happened to see the path run. The job's own record — its layer past the row's
+        ``fault_layer`` — reads the same in any process."""
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        self._ran(ledger)
-        ledger.reset()  # the restart
 
-        assert resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()])).close is False
-
-        self._ran(ledger)  # after the restart, the printer prints on a quiet path
-
-        assert resolve(row, "new_fault", self._now_on_wire(ledger, [_jam_hms()])).close is True
+        assert resolve(row, "new_fault", self._now_on_wire([_jam_hms()])).close is True
 
 
-class TestTheCompletedArmReadsTheSharedSighting:
-    """``_repair_job_terminal`` and the new-fault arm read ONE predicate of "a print ran
-    through the path" (``_ran_through_path_since``, over the qualified sighting). These
-    fail if the completed arm read a bare RUNNING stamp: each writes a RUNNING sample the
-    old stamp recorded and the qualified one does not."""
+class TestTheCompletedArmReadsTheJobsOwnRecord:
+    """``_repair_job_terminal`` reads the terminal PAYLOAD'S peak against the row's ``fault_layer`` —
+    durable both — never a sighting held in memory."""
 
     @staticmethod
-    def _completed(ledger: MotionLedger, row: PrinterIncident):
+    def _completed(row: PrinterIncident, *, last_layer: int):
         return resolve(
             row,
             "job_terminal",
             Context(
                 state=_state("FINISH"),
-                ledger=ledger,
                 driver_live=False,
-                terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB),
+                terminal=TerminalEvent(status="completed", eject=False, job_id=_JOB, last_layer=last_layer),
             ),
         )
 
-    def test_a_qualified_sighting_lets_the_completion_close_it(self):
-        ledger = MotionLedger()
+    def test_a_completion_past_the_fault_closes_it(self):
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        _observe(ledger, _state("RUNNING", tray_now=1))
 
-        verdict = self._completed(ledger, row)
+        verdict = self._completed(row, last_layer=40)
 
         assert (verdict.close, verdict.source) == (True, RESOLVE_REPAIR_COMPLETED)
 
-    def test_a_drivers_own_resume_does_not_launder_the_completion(self, live_driver):
-        ledger = MotionLedger()
-        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        _observe(ledger, _state("RUNNING", tray_now=1))
-        printer_incidents.release_driver(7, live_driver)
+    def test_a_re_classified_row_reads_its_re_stamped_layer(self):
+        """A driver's own resumes before an upgrade printed up to the worse fault — not past it."""
+        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago(), fault_layer=40)
 
-        assert self._completed(ledger, row).close is False
-
-    def test_running_with_the_fault_standing_does_not_launder_it_either(self):
-        """The fault-before-PAUSE samples, then the firmware wipes its list at the terminal."""
-        ledger = MotionLedger()
-        row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        _observe(ledger, _state("RUNNING", hms=_pull_back_hms(), tray_now=1))
-
-        assert self._completed(ledger, row).close is False
+        assert self._completed(row, last_layer=40).close is False
 
 
 class TestRepairEvidenceNeedsFilamentFed:
@@ -1364,12 +1411,12 @@ class TestRepairEvidenceNeedsFilamentFed:
     so a physical hold could close on a print laying down air. The ``repair`` class's motion
     evidence is now ``feeding_through_path``: RUNNING with no eject AND the toolhead's feed state
     FED or TAIL from an AMS feeder (``feed_state``, invariant 16 — the ACTIVE extruder's phase). It
-    decides the (b) cell and the ledger's ``path_ran_at`` stamp, so the completed and new-fault
-    arms inherit it."""
+    decides the (b) cell, and the new-fault arm reads the same feed state (a job that printed air, or
+    runs with nothing at the active extruder, ran nothing through the path)."""
 
     @staticmethod
-    def _ctx(state: PrinterState, ledger: MotionLedger | None = None, **kw) -> Context:
-        return Context(state=state, ledger=ledger or MotionLedger(), driver_live=False, feed=_feed_of(state), **kw)
+    def _ctx(state: PrinterState, **kw) -> Context:
+        return _ctx_of(state, **kw)
 
     @pytest.mark.parametrize("occasion", ["sweep_tick", "startup"])
     def test_a_print_running_on_air_never_closes_a_physical_hold(self, occasion):
@@ -1395,39 +1442,25 @@ class TestRepairEvidenceNeedsFilamentFed:
         assert verdict.close is True
         assert verdict.evidence == incident_resolution._REPAIR_EVIDENCE_RUNNING  # noqa: SLF001
 
-    def test_an_air_running_sample_never_stamps_the_sighting(self):
-        ledger = MotionLedger()
-        _observe(ledger, _state("RUNNING", tray_now=255))
-
-        assert ledger.path_ran_at(7) is None
-
-    def test_a_fed_running_sample_still_stamps_it(self):
-        ledger = MotionLedger()
-        _observe(ledger, _state("RUNNING", tray_now=1))
-
-        assert ledger.path_ran_at(7) is not None
-
     def test_an_air_print_never_lets_a_new_fault_close_a_physical_row(self):
-        """The new-fault arm reads the sighting: an air print after the row opened is no
-        sighting, so the next jam is still the same blockage as far as the farm can tell."""
-        ledger = MotionLedger()
+        """The new-fault arm reads the feed state: a print RUNNING with nothing at the active extruder
+        ran no filament through the path, so the next jam is still the same blockage."""
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        _observe(ledger, _state("RUNNING", tray_now=255))
 
-        verdict = resolve(row, "new_fault", self._ctx(_state("RUNNING", hms=[_jam_hms()], tray_now=255), ledger))
+        verdict = resolve(row, "new_fault", self._ctx(_state("RUNNING", hms=[_jam_hms()], tray_now=255)))
 
         assert verdict.close is False
         assert "no print ran through the path" in verdict.evidence
 
     def test_an_air_print_never_lets_its_completion_close_a_physical_row(self):
-        """The completed arm reads it too — even off a payload that measured no unfed layer
-        (an older payload, or one whose air run never advanced a layer)."""
-        ledger = MotionLedger()
+        """The completed arm reads the payload's own measurement of the air (``printed_unfed``) —
+        and a job whose air run never advanced a layer printed nothing past the fault either."""
         row = _physical_row(_pull_back_hms(), created_at=_opened_minutes_ago())
-        _observe(ledger, _state("RUNNING", tray_now=255))
-        terminal = TerminalEvent(status="completed", eject=False, job_id=_JOB)
+        unfed = TerminalEvent(status="completed", eject=False, job_id=_JOB, printed_unfed=True, last_layer=40)
+        still = TerminalEvent(status="completed", eject=False, job_id=_JOB, last_layer=_FAULT_LAYER)
 
-        assert resolve(row, "job_terminal", self._ctx(_state("FINISH"), ledger, terminal=terminal)).close is False
+        assert resolve(row, "job_terminal", self._ctx(_state("FINISH"), terminal=unfed)).close is False
+        assert resolve(row, "job_terminal", self._ctx(_state("FINISH"), terminal=still)).close is False
 
     @pytest.mark.parametrize(
         ("snow", "active", "feeding"),
@@ -1440,10 +1473,7 @@ class TestRepairEvidenceNeedsFilamentFed:
         """H2C/H2D: an empty ACTIVE nozzle beside a loaded one prints air (K1) — the deputy's
         filament is not feeding the print."""
         running = _state("RUNNING", tray_now=3, snow=snow, active=active)
-        ledger = MotionLedger()
-        _observe(ledger, running)
 
-        assert (ledger.path_ran_at(7) is not None) is feeding
         assert resolve(_row(RESOLUTION_REPAIR), "sweep_tick", self._ctx(running)).close is feeding
 
     @pytest.mark.parametrize("occasion", ["running_edge", "sweep_tick", "startup"])
@@ -1457,70 +1487,6 @@ class TestRepairEvidenceNeedsFilamentFed:
             True,
             RESOLVE_REARM if occasion == "startup" else RESOLVE_OBSERVED_RUNNING,
         )
-
-
-class TestTheLoadEdgeIsAHumanRepair:
-    """K12: the load edge is a load NO FARM MOTION made — a person's repair ("free the path, load a
-    slot"), or the printer's own. The farm's OWN swap and refill loads land under a live recovery
-    driver (or a farm command pending), and the feed state attributes each landing at the STEP it
-    happened on (``LoadLanded.farm_acting``, the provider the registry injects); the ledger's one
-    writer stamps only the others, and logs the farm's own. Each landing is consumed once, so the
-    feeder the driver left is never compared against again."""
-
-    @pytest.fixture
-    def feed(self):
-        return ScriptedFeed(
-            farm_acting=lambda: printer_incidents.driver_live(7) or printer_incidents.pending_command(7) is not None
-        )
-
-    @staticmethod
-    def _sample(ledger: MotionLedger, feed, tray_now: int, **kw) -> None:
-        _observe(ledger, _state("PAUSE", tray_now=tray_now, **kw), feed)
-
-    def test_a_load_under_a_live_driver_is_not_stamped(self, feed, live_driver, caplog):
-        import logging
-
-        ledger = MotionLedger()
-        self._sample(ledger, feed, 255)
-        self._sample(ledger, feed, 255)
-        with caplog.at_level(logging.INFO, logger="backend.app.services.incident_resolution"):
-            self._sample(ledger, feed, 1)  # the driver's own load
-
-        assert ledger.load_completed_at(7) is None
-        assert any("the farm's own load" in r.getMessage() for r in caplog.records)
-
-    def test_the_farms_landing_is_consumed_and_a_persons_load_after_it_stamps(self, feed, live_driver):
-        ledger = MotionLedger()
-        self._sample(ledger, feed, 255)
-        self._sample(ledger, feed, 255)
-        self._sample(ledger, feed, 1)  # the driver's refill
-        printer_incidents.release_driver(7, live_driver)
-
-        self._sample(ledger, feed, 1)  # the feeder the driver left: its landing is already consumed
-        assert ledger.load_completed_at(7) is None
-
-        self._sample(ledger, feed, 255)
-        self._sample(ledger, feed, 2)  # a person unloads and loads slot 3
-        assert ledger.load_completed_at(7) is not None
-
-    def test_an_active_extruder_switch_is_not_a_load(self, feed):
-        """Dual nozzle: the edge is the ACTIVE extruder's feeder changing. A nozzle switch
-        changes which feeder the toolhead reads without anything loading."""
-        ledger = MotionLedger()
-        snow = {0: 2, 1: 6}
-        self._sample(ledger, feed, 2, snow=snow, active=0)
-        self._sample(ledger, feed, 2, snow=snow, active=0)
-        self._sample(ledger, feed, 6, snow=snow, active=1)
-
-        assert ledger.load_completed_at(7) is None
-
-    def test_a_load_onto_the_active_extruder_stamps(self, feed):
-        ledger = MotionLedger()
-        self._sample(ledger, feed, 255, snow={0: 255, 1: 6}, active=0)
-        self._sample(ledger, feed, 255, snow={0: 255, 1: 6}, active=0)
-        self._sample(ledger, feed, 2, snow={0: 2, 1: 6}, active=0)
-
-        assert ledger.load_completed_at(7) is not None
 
 
 class TestDriverOwns:
@@ -1584,7 +1550,7 @@ class TestTheToolheadLane:
 
     def _ctx(self, live="RUNNING", *, tray_now=0, driver_live=False, **kw):
         state = _state(live, tray_now=tray_now)
-        return Context(state=state, ledger=MotionLedger(), driver_live=driver_live, feed=_feed_of(state), **kw)
+        return Context(state=state, driver_live=driver_live, feed=_feed_of(state), **kw)
 
     def test_a_print_running_on_air_is_not_its_end(self):
         verdict = resolve(_row(RESOLUTION_TOOLHEAD), "running_edge", self._ctx(tray_now=255))
@@ -1606,9 +1572,9 @@ class TestTheToolheadLane:
     @pytest.mark.parametrize("live", ["FINISH", "FAILED", "IDLE"])
     def test_the_sweep_closes_a_hold_whose_job_the_printer_reports_over(self, live):
         """A toolhead hold cannot outlive its job: the printer's POSITIVE report that the job is
-        over (a terminal the farm never saw) closes it after the dwell."""
+        over (a terminal the farm never saw) closes it."""
         verdict = resolve(_row(RESOLUTION_TOOLHEAD), "sweep_tick", self._ctx(live, tray_now=255))
-        assert (verdict.close, verdict.source, verdict.dwell) == (True, RESOLVE_JOB_ENDED_UNSEEN, True)
+        assert (verdict.close, verdict.source) == (True, RESOLVE_JOB_ENDED_UNSEEN)
 
     def test_a_paused_print_is_the_hold(self):
         for occasion in ("sweep_tick", "startup"):
@@ -1632,21 +1598,141 @@ class TestTheToolheadLane:
         assert resolve(_row(RESOLUTION_TOOLHEAD), "job_terminal", self._ctx(terminal=terminal)).close is True
 
 
+class TestTheResumeBudget:
+    """``incident_resolution.resume_spent`` — THE one decider of how many farm resumes a row may send (R14,
+    2026-10-12). A RUNOUT row's refill resume that the printer REFUSED, or left unanswered past its self-heal
+    bound, is owed again until 3 resumes went out (measured on production: 56 refill episodes over 90 days,
+    the farm published 2 resumes, both landed in 7-11 s, no refusal ever logged — the cap only bounds a
+    loop); a REACHED one spends the row; every other class stays at one resume per row."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        printer_incidents._reset_state()  # noqa: SLF001
+        yield
+        printer_incidents._reset_state()  # noqa: SLF001
+
+    @staticmethod
+    def _row_with(kind: str, *answers: str | None, unsent: tuple[int, ...] = ()) -> None:
+        actions = [
+            {
+                "action_id": 50 + index,
+                "command": "resume",
+                "target": None,
+                "answer": answer,
+                "sent_at": "2026-10-12T08:00:00",
+                "answered_at": None if answer is None else "2026-10-12T08:00:05",
+                "step_reading": None,
+                "reason": None,
+                "unsent": index in unsent,
+            }
+            for index, answer in enumerate(answers)
+        ]
+        printer_incidents._open_cache[7] = {1: {"id": 1, "kind": kind, "farm_actions": actions}}  # noqa: SLF001
+
+    def test_the_cap_is_three(self):
+        assert incident_resolution.RUNOUT_RESUME_CAP == 3
+
+    def test_no_resume_yet_is_owed(self):
+        self._row_with(KIND_RUNOUT)
+        assert incident_resolution.resume_spent(7, 1) is None
+
+    def test_a_runout_resume_out_and_awaiting_the_printer_spends_it_without_a_give_up(self):
+        self._row_with(KIND_RUNOUT, None)
+        spent = incident_resolution.resume_spent(7, 1)
+        assert spent is not None and spent.gave_up is False
+        assert "awaiting the printer" in spent.why
+
+    @pytest.mark.parametrize("sent", [1, 2])
+    def test_a_refused_runout_resume_is_owed_again_under_the_cap(self, sent):
+        self._row_with(KIND_RUNOUT, *(["refused"] * sent))
+        assert incident_resolution.resume_spent(7, 1) is None
+
+    @pytest.mark.parametrize("sent", [1, 2])
+    def test_an_unanswered_runout_resume_past_its_bound_is_owed_again_under_the_cap(self, sent):
+        """Outstanding, the record passed its self-heal bound (the caller hands those ids in)."""
+        self._row_with(KIND_RUNOUT, *(["refused"] * (sent - 1)), None)
+        assert incident_resolution.resume_spent(7, 1, unanswered=frozenset({50 + sent - 1})) is None
+
+    def test_the_third_refused_runout_resume_gives_up(self):
+        self._row_with(KIND_RUNOUT, "refused", "refused", "refused")
+        spent = incident_resolution.resume_spent(7, 1)
+        assert spent is not None and spent.gave_up is True
+        assert "3 of 3" in spent.why and "refused" in spent.why
+
+    def test_the_third_unanswered_runout_resume_gives_up(self):
+        self._row_with(KIND_RUNOUT, "refused", "refused", None)
+        spent = incident_resolution.resume_spent(7, 1, unanswered=frozenset({52}))
+        assert spent is not None and spent.gave_up is True
+        assert "unanswered" in spent.why
+
+    def test_a_reached_resume_spends_the_row_whatever_came_before(self):
+        self._row_with(KIND_RUNOUT, "refused", "reached")
+        spent = incident_resolution.resume_spent(7, 1)
+        assert spent is not None and spent.gave_up is False
+
+    def test_a_person_taking_it_over_spends_it(self):
+        self._row_with(KIND_RUNOUT, "refused", "taken_over")
+        spent = incident_resolution.resume_spent(7, 1)
+        assert spent is not None and spent.gave_up is False
+
+    def test_a_resume_the_printer_never_received_spends_nothing(self):
+        """``void`` and a frame that never left the farm are owed again — and never count toward the cap."""
+        self._row_with(KIND_RUNOUT, "refused", "void", "refused", "refused", unsent=(3,))
+        assert incident_resolution.resume_spent(7, 1) is None
+
+    @pytest.mark.parametrize("kind", [KIND_TOOLHEAD_REFILL, KIND_PHYSICAL])
+    def test_every_other_class_is_one_resume_per_row(self, kind):
+        """A toolhead row (and a repair row) is not given the runout row's budget: a per-kind-and-job
+        budget was ruled out as a new human gate — one refused resume is the give-up, at once."""
+        self._row_with(kind, "refused")
+        spent = incident_resolution.resume_spent(7, 1)
+        assert spent is not None and spent.gave_up is True
+        assert "1 of 1" in spent.why
+
+
 class TestTheResumeOwedVerdict:
-    """``resume_owed`` — operator-ratified 2026-10-10 (P2): a row the farm holds over a PAUSEd print
-    whose toolhead the PRINTER or a PERSON put back is resumed ONCE. One total table keyed by the
+    """``resume_owed`` — a row the farm holds over a PAUSEd print whose toolhead the PRINTER or a
+    PERSON put back is resumed ONCE (doctrine rule 1; Raymond 2026-10-11: "will i have to click resume
+    on a filament swap after this is shipped? the answer should be no"). One total table keyed by the
     resolution class (``_RESUME_OWED``; a missing class RAISES): ``repair`` — the repair evidence (a
-    load after the fault, the path quiet, the job PAUSEd); ``toolhead`` — fed again after a load no
-    farm motion made, after the row opened; every other class — never (a jam's exit is the printer's
-    Retry; a runout is the refill lane's, invariant 9)."""
+    load after the fault, the path quiet, the job PAUSEd); ``toolhead`` — a LEVEL: fed now, no farm load
+    on the row reached, no AMS hold beside it; every other class — never. Over it the shared guards:
+    maintenance mode, the plate check, a runout row, and the ONCE — the record's farm resume on the
+    row."""
 
     _AFTER = _OPENED_AT + timedelta(seconds=30)
     _BEFORE = _OPENED_AT - timedelta(seconds=30)
 
+    @pytest.fixture(autouse=True)
+    def _clean_store(self):
+        printer_incidents._reset_state()  # noqa: SLF001
+        yield
+        printer_incidents._reset_state()  # noqa: SLF001
+
     def _ctx(self, *, live="PAUSE", tray_now=1, load_at=_AFTER, job=_JOB, hms=None, **kw) -> Context:
         state = _state(live, tray_now=tray_now, hms=hms)
         state.subtask_id = job
-        return Context(state=state, ledger=_ledger_with(load_at=load_at), driver_live=False, feed=_feed_of(state), **kw)
+        return Context(state=state, observed_load_at=load_at, driver_live=False, feed=_feed_of(state), **kw)
+
+    @staticmethod
+    def _held(*rows: dict) -> None:
+        """The store's open rows of printer 7, as its projection carries them (``farm_actions`` the
+        record's farm actions on each row)."""
+        printer_incidents._open_cache[7] = {row["id"]: row for row in rows}  # noqa: SLF001
+
+    @staticmethod
+    def _action(command: str, answer: str | None, *, action_id: int = 41, unsent: bool = False) -> dict:
+        return {
+            "action_id": action_id,
+            "command": command,
+            "target": None,
+            "answer": answer,
+            "sent_at": "2026-10-11T03:43:00",
+            "answered_at": None if answer is None else "2026-10-11T03:43:05",
+            "step_reading": None,
+            "reason": None,
+            "unsent": unsent,
+        }
 
     def test_the_table_is_total_over_the_resolution_classes(self):
         assert set(incident_resolution._RESUME_OWED) == set(RESOLVES_ON.values())  # noqa: SLF001
@@ -1680,14 +1766,31 @@ class TestTheResumeOwedVerdict:
             pytest.param({"live": "RUNNING"}, id="not_paused"),
             pytest.param({"job": "other-job"}, id="another_job"),
             pytest.param({"job": ""}, id="a_job_naming_nothing"),
-            pytest.param({"load_at": _BEFORE}, id="the_load_before_the_row_opened"),
-            pytest.param({"load_at": None}, id="no_load_the_farm_did_not_make"),
             pytest.param({"hms": [_jam_hms()]}, id="a_fault_standing"),
             pytest.param({"command_pending": True}, id="a_farm_command_pending"),
         ],
     )
     def test_never(self, resolution, change):
         assert incident_resolution.resume_owed(_row(resolution), self._ctx(**change)).owed is False
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            pytest.param({"load_at": _BEFORE}, id="the_load_before_the_row_opened"),
+            pytest.param({"load_at": None}, id="no_load_the_farm_did_not_make"),
+        ],
+    )
+    def test_the_repair_class_needs_a_load_after_the_fault(self, change):
+        assert incident_resolution.resume_owed(_row(RESOLUTION_REPAIR), self._ctx(**change)).owed is False
+
+    @pytest.mark.parametrize("load_at", [None, _BEFORE], ids=["no_landing_recorded", "a_landing_before_the_hold"])
+    def test_a_fed_toolhead_is_owed_without_any_recorded_landing(self, load_at):
+        """001-H2S incident 574: the firmware's backup switch landed while the build that opened the
+        hold had no record to write it to — after the deploy the toolhead reads FED and no landing is
+        recorded after the hold opened. The level answers: owed."""
+        verdict = incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx(load_at=load_at))
+
+        assert verdict.owed is True
 
     def test_the_toolhead_must_read_fed(self):
         """A person's load that did not reach the nozzle (or the farm's queued pull-back emptying it
@@ -1700,3 +1803,162 @@ class TestTheResumeOwedVerdict:
     def test_the_external_holder_is_fed_for_the_toolhead_class(self):
         """The toolhead class asks only "is it printing air": a person's external spool is fed."""
         assert incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx(tray_now=254)).owed is True
+
+    def test_the_farms_own_refill_is_its_episodes_to_resume(self):
+        """A farm load on the row that REACHED the toolhead: the refill episode publishes the resume."""
+        self._held({"id": 1, "kind": KIND_TOOLHEAD_REFILL, "farm_actions": [self._action("load", "reached")]})
+
+        verdict = incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx())
+
+        assert verdict.owed is False
+        assert "farm's own refill" in verdict.evidence
+
+    @pytest.mark.parametrize("answer", ["refused", "void"])
+    def test_a_farm_load_that_never_reached_leaves_it_owed(self, answer):
+        """A failed refill (refused / void) and then a person's load: the toolhead reads fed — owed."""
+        self._held({"id": 1, "kind": KIND_TOOLHEAD_REFILL, "farm_actions": [self._action("load", answer)]})
+
+        assert incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx()).owed is True
+
+    def test_an_ams_hold_beside_it_answers_the_pause(self):
+        self._held({"id": 1, "kind": KIND_TOOLHEAD_REFILL}, {"id": 2, "kind": KIND_JAM})
+
+        verdict = incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx())
+
+        assert verdict.owed is False
+        assert "AMS hold" in verdict.evidence
+
+    @pytest.mark.parametrize("resolution", [RESOLUTION_TOOLHEAD, RESOLUTION_REPAIR])
+    @pytest.mark.parametrize("answer", [None, "reached", "refused", "taken_over"], ids=lambda a: a or "outstanding")
+    def test_once_a_farm_resume_on_the_row_spends_it(self, resolution, answer):
+        """The ONCE is the record's — a farm resume on the row outstanding, reached, refused by the
+        printer or taken over by a person — durable across a restart. One resume per row for every class
+        but a runout row's refill (``incident_resolution.resume_spent``, the one decider)."""
+        kind = _KIND_BY_CLASS[resolution][0]
+        self._held({"id": 1, "kind": kind, "farm_actions": [self._action("resume", answer)]})
+
+        verdict = incident_resolution.resume_owed(_row(resolution), self._ctx())
+
+        assert verdict.owed is False
+        spent = incident_resolution.resume_spent(7, 1)
+        assert spent is not None and verdict.evidence == spent.why
+        assert "action 41" in verdict.evidence
+        # A refusal spends a one-resume row with the give-up owed (the page), at once.
+        assert spent.gave_up is (answer == "refused")
+
+    @pytest.mark.parametrize("resolution", [RESOLUTION_TOOLHEAD, RESOLUTION_REPAIR])
+    @pytest.mark.parametrize(
+        "action",
+        [
+            pytest.param({"answer": "void"}, id="void"),
+            pytest.param({"answer": "refused", "unsent": True}, id="never_left_the_farm"),
+        ],
+    )
+    def test_a_resume_the_printer_never_received_is_owed_again(self, resolution, action):
+        kind = _KIND_BY_CLASS[resolution][0]
+        self._held({"id": 1, "kind": kind, "farm_actions": [self._action("resume", **action)]})
+
+        assert incident_resolution.resume_owed(_row(resolution), self._ctx()).owed is True
+
+    @pytest.mark.parametrize("resolution", [RESOLUTION_TOOLHEAD, RESOLUTION_REPAIR])
+    def test_maintenance_mode_resumes_nothing(self, resolution):
+        kind = _KIND_BY_CLASS[resolution][0]
+        self._held({"id": 1, "kind": kind}, {"id": 3, "kind": KIND_SERVICE_HOLD})
+
+        verdict = incident_resolution.resume_owed(_row(resolution), self._ctx())
+
+        assert verdict.owed is False
+        assert "maintenance mode" in verdict.evidence
+
+    @pytest.mark.parametrize("resolution", [RESOLUTION_TOOLHEAD, RESOLUTION_REPAIR])
+    def test_a_plate_check_pause_is_its_own_ladders(self, resolution):
+        kind = _KIND_BY_CLASS[resolution][0]
+        self._held({"id": 1, "kind": kind}, {"id": 4, "kind": KIND_PLATE_VISION})
+
+        verdict = incident_resolution.resume_owed(_row(resolution), self._ctx())
+
+        assert verdict.owed is False
+        assert "plate check" in verdict.evidence
+
+    def test_a_runout_row_beside_a_repair_hold_is_the_refill_lanes(self):
+        self._held({"id": 1, "kind": KIND_PHYSICAL}, {"id": 5, "kind": KIND_RUNOUT})
+
+        verdict = incident_resolution.resume_owed(_row(RESOLUTION_REPAIR), self._ctx())
+
+        assert verdict.owed is False
+        assert "runout row" in verdict.evidence
+
+
+class TestTheResumeVerdictIsClosed:
+    """``resume_owed`` answers ONE of ``owed`` / ``waiting`` / ``declined`` — the spawner acts on ``owed``
+    alone; ``waiting`` is a guard the farm itself waits out; a ``declined`` whose pause another open row
+    owns names that row's kind (the hold chip shows that row, never "Press Resume")."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_store(self):
+        printer_incidents._reset_state()  # noqa: SLF001
+        yield
+        printer_incidents._reset_state()  # noqa: SLF001
+
+    def _ctx(self, *, tray_now=1, hms=None, **kw) -> Context:
+        state = _state("PAUSE", tray_now=tray_now, hms=hms)
+        state.subtask_id = _JOB
+        return Context(state=state, driver_live=False, feed=_feed_of(state), **kw)
+
+    @staticmethod
+    def _held(*kinds: str, actions: list | None = None) -> None:
+        rows = {1: {"id": 1, "kind": KIND_TOOLHEAD_REFILL, "farm_actions": actions or []}}
+        for offset, kind in enumerate(kinds, start=2):
+            rows[offset] = {"id": offset, "kind": kind}
+        printer_incidents._open_cache[7] = rows  # noqa: SLF001
+
+    def _verdict(self, **kw):
+        return incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), self._ctx(**kw))
+
+    def test_owed(self):
+        self._held()
+        verdict = self._verdict()
+        assert (verdict.verdict, verdict.owed, verdict.owner) == ("owed", True, None)
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            pytest.param({"command_pending": True}, id="a_farm_command_pending"),
+            pytest.param({"hms": [_jam_hms()]}, id="the_path_not_quiet"),
+        ],
+    )
+    def test_a_guard_the_farm_waits_out_is_waiting(self, change):
+        self._held()
+        verdict = self._verdict(**change)
+        assert (verdict.verdict, verdict.owed) == ("waiting", False)
+
+    @pytest.mark.parametrize(
+        ("kind", "owner"),
+        [(KIND_PLATE_VISION, KIND_PLATE_VISION), (KIND_RUNOUT, KIND_RUNOUT), (KIND_JAM, KIND_JAM)],
+    )
+    def test_another_row_owning_the_pause_is_declined_and_named(self, kind, owner):
+        self._held(kind)
+        verdict = self._verdict()
+        assert (verdict.verdict, verdict.owner) == ("declined", owner)
+
+    def test_maintenance_and_a_spent_once_are_declined_with_no_owner(self):
+        self._held(KIND_SERVICE_HOLD)
+        assert (self._verdict().verdict, self._verdict().owner) == ("declined", None)
+        printer_incidents._reset_state()  # noqa: SLF001
+        self._held(actions=[{"action_id": 3, "command": "resume", "answer": "reached"}])
+        assert (self._verdict().verdict, self._verdict().owner) == ("declined", None)
+
+
+def test_a_rebooted_printer_at_the_power_loss_prompt_is_waiting_never_owed():
+    """After a reboot the job comes back PAUSEd on its id with the toolhead fed and ``0300_8007``
+    standing: the power-loss recovery (``pause_recovery``) owns that resume — the farm waits for it."""
+    printer_incidents._reset_state()  # noqa: SLF001
+    prompt = HMSError(code="8007", attr=0x03000000, module=3, severity=3, full_code="0300000000008007")
+    state = _state("PAUSE", tray_now=1, hms=[prompt])
+    state.subtask_id = _JOB
+    ctx = Context(state=state, driver_live=False, feed=_feed_of(state))
+
+    verdict = incident_resolution.resume_owed(_row(RESOLUTION_TOOLHEAD), ctx)
+
+    assert (verdict.verdict, verdict.owed) == ("waiting", False)
+    assert "power-loss" in verdict.evidence

@@ -14,6 +14,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app.services.print_scheduler import PrintScheduler
+from backend.tests._fixtures.printer_action import route_verbs_mp
+
+
+@pytest.fixture(autouse=True)
+def _drying_through_the_record(monkeypatch):
+    """The scheduler's drying commands go through the record (``printer_action``); this file's
+    assertions read them on the registry-shaped double each test patches in as the scheduler's
+    ``printer_manager`` (looked up at call time, so a test's own ``@patch`` is the one seen)."""
+    from backend.app.services import print_scheduler
+
+    route_verbs_mp(
+        monkeypatch, drying=lambda *args, **kwargs: print_scheduler.printer_manager.send_drying_command(*args, **kwargs)
+    )
 
 
 class TestConservativeDryingParams:
@@ -222,8 +235,8 @@ class TestStopDrying:
         # Should send stop to AMS 0 and 128, not AMS 1
         calls = mock_pm.send_drying_command.call_args_list
         assert len(calls) == 2
-        assert calls[0].args == (1, 0, 0, 0)
-        assert calls[1].args == (1, 128, 0, 0)
+        assert (calls[0].args, calls[0].kwargs) == ((1, 0), {"temp": 0, "duration": 0, "mode": 0})
+        assert (calls[1].args, calls[1].kwargs) == ((1, 128), {"temp": 0, "duration": 0, "mode": 0})
         assert 1 not in scheduler._drying_in_progress
 
     @pytest.mark.asyncio

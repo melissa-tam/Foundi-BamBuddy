@@ -1081,10 +1081,10 @@ export function SettingsPage() {
       (settings.farm_offline_stall_minutes ?? 30) !== (localSettings.farm_offline_stall_minutes ?? 30) ||
       (settings.farm_pause_stall_minutes ?? 15) !== (localSettings.farm_pause_stall_minutes ?? 15) ||
       (settings.farm_plate_check_decision_minutes ?? 10) !== (localSettings.farm_plate_check_decision_minutes ?? 10) ||
+      (settings.farm_attention_page_minutes ?? 10) !== (localSettings.farm_attention_page_minutes ?? 10) ||
       (settings.respool_prompt_threshold_g ?? 30) !== (localSettings.respool_prompt_threshold_g ?? 30) ||
       (settings.farm_cooldown_stall_window_minutes ?? 15) !== (localSettings.farm_cooldown_stall_window_minutes ?? 15) ||
       (settings.farm_cooldown_stall_epsilon_c ?? 1) !== (localSettings.farm_cooldown_stall_epsilon_c ?? 1) ||
-      (settings.farm_cooldown_max_hold_minutes ?? 180) !== (localSettings.farm_cooldown_max_hold_minutes ?? 180) ||
       (settings.farm_cooldown_plateau_eject_margin_c ?? 3) !== (localSettings.farm_cooldown_plateau_eject_margin_c ?? 3) ||
       (settings.farm_cooldown_margin_c ?? 2) !== (localSettings.farm_cooldown_margin_c ?? 2) ||
       (settings.farm_cooldown_aux_fan_enabled ?? true) !== (localSettings.farm_cooldown_aux_fan_enabled ?? true) ||
@@ -1214,10 +1214,10 @@ export function SettingsPage() {
         farm_offline_stall_minutes: localSettings.farm_offline_stall_minutes,
         farm_pause_stall_minutes: localSettings.farm_pause_stall_minutes,
         farm_plate_check_decision_minutes: localSettings.farm_plate_check_decision_minutes,
+        farm_attention_page_minutes: localSettings.farm_attention_page_minutes,
         respool_prompt_threshold_g: localSettings.respool_prompt_threshold_g,
         farm_cooldown_stall_window_minutes: localSettings.farm_cooldown_stall_window_minutes,
         farm_cooldown_stall_epsilon_c: localSettings.farm_cooldown_stall_epsilon_c,
-        farm_cooldown_max_hold_minutes: localSettings.farm_cooldown_max_hold_minutes,
         farm_cooldown_plateau_eject_margin_c: localSettings.farm_cooldown_plateau_eject_margin_c,
         farm_cooldown_margin_c: localSettings.farm_cooldown_margin_c,
         farm_cooldown_aux_fan_enabled: localSettings.farm_cooldown_aux_fan_enabled,
@@ -5240,6 +5240,15 @@ export function SettingsPage() {
                 min={1}
                 max={120}
               />
+              <SettingNumber
+                id="farm-attention-page-minutes"
+                label={t('settings.farmAttentionPageMinutes', 'Waiting page (min)')}
+                hint={t('settings.farmAttentionPageMinutesHelp', 'A printer that has not carried out a command, or stays in a state the farm waits on, is paged after this long and hourly after. The page decides nothing.')}
+                value={localSettings.farm_attention_page_minutes ?? 10}
+                onChange={(value) => updateSetting('farm_attention_page_minutes', value)}
+                min={1}
+                max={120}
+              />
               <div className="flex items-center justify-between pt-1">
                 <div className="flex-1 mr-4">
                   <p className="text-sm text-white">
@@ -5351,7 +5360,7 @@ export function SettingsPage() {
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownStallWindowHelp', 'How often to confirm the bed is still cooling before an eject. Two failed checks in a row quarantine the printer. 0 turns the check off.')}
+                    {t('settings.farmCooldownStallWindowHelp', 'How often to confirm the bed is still cooling before an eject. Two failed checks in a row hold the plate and page an operator. 0 turns the check off.')}
                   </p>
                 </div>
                 <div>
@@ -5377,26 +5386,6 @@ export function SettingsPage() {
                 </div>
                 <div>
                   <div className="flex items-center gap-1.5 mb-1">
-                    <label htmlFor="farm-cooldown-max-hold" className="block text-xs text-bambu-gray">
-                      {t('settings.farmCooldownMaxHold', 'Give-up timer (min)')}
-                    </label>
-                    <InfoHint text={t('settings.farmCooldownMaxHoldHelp')} />
-                  </div>
-                  <input
-                    id="farm-cooldown-max-hold"
-                    type="number"
-                    min={0}
-                    max={720}
-                    value={localSettings.farm_cooldown_max_hold_minutes ?? 180}
-                    onChange={(e) => updateSetting('farm_cooldown_max_hold_minutes', Math.max(0, Math.min(720, parseInt(e.target.value) || 0)))}
-                    className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
-                  />
-                  <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownMaxHoldHelp', 'If the bed is still warmer than the eject temperature after this long, eject anyway. 0 = keep waiting.')}
-                  </p>
-                </div>
-                <div>
-                  <div className="flex items-center gap-1.5 mb-1">
                     <label htmlFor="farm-cooldown-plateau-margin" className="block text-xs text-bambu-gray">
                       {t('settings.farmCooldownPlateauMargin', 'Close-enough margin (°C)')}
                     </label>
@@ -5413,7 +5402,7 @@ export function SettingsPage() {
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
-                    {t('settings.farmCooldownPlateauMarginHelp', 'If cooling stalls with the bed within this many degrees of its own chamber air, treat it as cooled and eject; stuck hotter than that quarantines the printer.')}
+                    {t('settings.farmCooldownPlateauMarginHelp', 'If cooling stalls with the bed within this many degrees of its own chamber air, treat it as cooled and eject; stuck hotter than that holds the plate and pages an operator.')}
                   </p>
                 </div>
               </div>

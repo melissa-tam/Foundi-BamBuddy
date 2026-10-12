@@ -61,6 +61,7 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
   const [onPrintStalled, setOnPrintStalled] = useState(provider?.on_print_stalled ?? true);
   const [onStorageLow, setOnStorageLow] = useState(provider?.on_storage_low ?? true);
   const [onCooldownEscalation, setOnCooldownEscalation] = useState(provider?.on_cooldown_escalation ?? true);
+  const [onPrinterWaiting, setOnPrinterWaiting] = useState(provider?.on_printer_waiting ?? true);
 
   // Provider-specific config (scalar fields only — event_priorities is split out
   // into its own state because it's an object, not a string).
@@ -197,6 +198,7 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
       on_print_stalled: onPrintStalled,
       on_storage_low: onStorageLow,
       on_cooldown_escalation: onCooldownEscalation,
+      on_printer_waiting: onPrinterWaiting,
     };
 
     if (isEditing) {
@@ -659,6 +661,10 @@ export function AddNotificationModal({ provider, onClose }: AddNotificationModal
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-white">{t('notifications.cooldownEscalation')}</span>
                   <Toggle checked={onCooldownEscalation} onChange={setOnCooldownEscalation} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-white">{t('notifications.printerWaiting')}</span>
+                  <Toggle checked={onPrinterWaiting} onChange={setOnPrinterWaiting} />
                 </div>
               </div>
             </div>

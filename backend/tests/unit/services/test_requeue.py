@@ -218,7 +218,7 @@ class TestReturnToQueue:
         claim = await _claim(db_session, position=7, printer_id=5)
         waiting = [await _row(db_session, position=p, printer_id=5) for p in (1, 2)]
 
-        outcome = await requeue.return_to_queue(db_session, claim.id, cause="start_watchdog")
+        outcome = await requeue.return_to_queue(db_session, claim.id, cause="start_void")
         await db_session.commit()
 
         assert outcome == "returned"
@@ -235,7 +235,7 @@ class TestReturnToQueue:
         pool_waiting = await _row(db_session, position=1, target_model="H2S")
         pinned_waiting = await _row(db_session, position=1, printer_id=5)
 
-        outcome = await requeue.return_to_queue(db_session, claim.id, cause="dead_claim")
+        outcome = await requeue.return_to_queue(db_session, claim.id, cause="start_unrecorded")
         await db_session.commit()
 
         assert outcome == "returned"
@@ -263,7 +263,7 @@ class TestReturnToQueue:
         claim = await _claim(db_session, position=3, printer_id=5, batch_id=batch.id)
         waiting = await _row(db_session, position=1, printer_id=5)
 
-        assert await requeue.return_to_queue(db_session, claim.id, cause="start_watchdog") == "cancelled"
+        assert await requeue.return_to_queue(db_session, claim.id, cause="start_void") == "cancelled"
         await db_session.commit()
 
         row = await _fresh(db_session, claim.id)
@@ -274,7 +274,7 @@ class TestReturnToQueue:
     async def test_a_row_that_moved_on_is_left_alone(self, db_session):
         done = await _row(db_session, position=3, status="completed", printer_id=5)
 
-        assert await requeue.return_to_queue(db_session, done.id, cause="dead_claim") == "moved_on"
+        assert await requeue.return_to_queue(db_session, done.id, cause="start_unrecorded") == "moved_on"
         await db_session.commit()
 
         row = await _fresh(db_session, done.id)
@@ -370,6 +370,39 @@ class TestLineage:
         assert await requeue.failed_ancestor_count(db_session, row) == requeue._LINEAGE_WALK_MAX
         assert (await requeue.lineage_root(db_session, row)).id == row.id
 
+    async def test_a_retry_of_a_plate_check_retry_is_read_off_its_nearest_ancestor(self, db_session):
+        """The plate-check ladder's ONE decision (operator ruling 2026-09-29: "If the retry's re-check
+        fails too, escalate"), read off the lineage — never a clock (2026-10-11). Only the attempt this
+        unit REPLACES speaks: a plate-check retry further up the chain was followed by an attempt that
+        passed its own check."""
+        from backend.app.models.printer_incident import KIND_PLATE_VISION
+        from backend.app.services import printer_incidents
+
+        chain = await self._chain(db_session, ["cancelled", "cancelled", "printing"])
+        assert await requeue.retries_a_plate_check_retry(db_session, chain[0]) is False  # an original
+        assert await requeue.retries_a_plate_check_retry(db_session, chain[-1]) is False  # no episode
+
+        async def _episode(item, name):
+            row = await printer_incidents.open_new(
+                db_session,
+                printer_id=3,
+                job_id=f"JOB-{item.id}",
+                item_id=item.id,
+                kind=KIND_PLATE_VISION,
+                code="0500_808C",
+                codes="0500_808C",
+                slot_global_tray=None,
+            )
+            await printer_incidents.note_step(db_session, row.id, seq=1, kind="stop", name=name)
+            await printer_incidents.close(db_session, row.id, status="resolved", source="terminal")
+
+        await _episode(chain[0], "retry_stop")
+        assert await requeue.retries_a_plate_check_retry(db_session, chain[1]) is True  # its parent was retried
+        assert await requeue.retries_a_plate_check_retry(db_session, chain[-1]) is False  # a grand-parent's: no
+
+        await _episode(chain[1], "deadline_stop")
+        assert await requeue.retries_a_plate_check_retry(db_session, chain[-1]) is False  # an escalation, not a retry
+
     async def test_a_plate_gets_one_fault_restart_read_off_its_ancestors(self, db_session):
         """R1 (operator ruling 2026-09-29): the recovery driver restarts a plate ONCE. Spent
         is derived from the lineage — an ANCESTOR ended with the restart verdict — never
@@ -416,7 +449,7 @@ class TestTheSchedulerServesARequeuedPlateFirst:
         waiting = await _row(db_session, position=1, printer_id=2)
         claim = await _claim(db_session, position=8, printer_id=2)
 
-        await requeue.return_to_queue(db_session, claim.id, cause="start_watchdog")
+        await requeue.return_to_queue(db_session, claim.id, cause="start_void")
         await db_session.commit()
 
         assert await self._order(db_session, shortest_first=False) == [claim.id, waiting.id]

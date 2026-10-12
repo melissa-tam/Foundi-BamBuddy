@@ -18,7 +18,6 @@ from backend.app.services.eject.generator import (
     PHASE_BEACON_REFERENCED,
     PHASE_BEACON_SWEEP,
     SWEEP_PHASE_MARKER,
-    UNMODELLED_EPILOGUE_ALLOWANCE_S,
     Z_REFERENCE_OVERTRAVEL_MM,
     EjectGenerationError,
     HoldPlacement,
@@ -36,7 +35,6 @@ from backend.app.services.eject.generator import (
     z_reference_prologue_lines,
 )
 from backend.app.services.eject.geometry import ModelGeometry
-from backend.app.services.eject.remote import eject_abort_deadline_s
 from backend.app.services.eject.validator import validate_eject_gcode
 from backend.app.utils.printer_models import DUAL_NOZZLE_HOME
 from backend.tests.unit.services.eject.geometry_fixtures import (
@@ -846,10 +844,10 @@ class TestEstimateRuntime:
         # only direction a deadline may be wrong in.
         seconds = estimate_runtime_s(_INCIDENT_SHAPE_BLOCK)
         assert 67.0 <= seconds <= 97.0, f"estimated {seconds:.1f}s, expected 82±15s"
-        # The watchdog must fire well before the incident's 179 s while leaving every
-        # nominal 80-83 s sweep untouched.
-        assert eject_abort_deadline_s(seconds) < 179.0
-        assert eject_abort_deadline_s(seconds) >= 83.0
+        # The estimate is a MEASUREMENT now (2026-10-11: no whole-job deadline stops a sweep;
+        # the attention owner pages one past its estimate + the page bound): it must stay well
+        # clear of the incident's 179 s run, so a stalled job reads as one.
+        assert seconds < 179.0
 
     def test_the_one_flow_shape_keeps_the_same_guarantees(self):
         # The same profile under the CURRENT order: lift, home, then the drop as a round
@@ -861,8 +859,7 @@ class TestEstimateRuntime:
         # first move). Both ends of the incident calibration must still hold at that.
         seconds = estimate_runtime_s(_ONE_FLOW_SHAPE_BLOCK, z_travel_mm=340.0)
         assert 67.0 <= seconds <= 115.0, f"estimated {seconds:.1f}s"
-        assert eject_abort_deadline_s(seconds) < 179.0
-        assert eject_abort_deadline_s(seconds) >= 83.0
+        assert seconds < 179.0
         # Seeded from the cooldown hold, the same block estimates slightly TIGHTER: the
         # drop leg is measured from 2 mm instead of bounded from anywhere.
         seeded = estimate_runtime_s(_ONE_FLOW_SHAPE_BLOCK, start_z=2.0, z_travel_mm=340.0)
@@ -1339,15 +1336,9 @@ class TestEstimateRuntimeSegments:
         seg = estimate_runtime_segments(gcode)
         assert (seg.pre_s, seg.drop_span_s) == (0.0, 0.0)
         assert seg.sweep_span_s == pytest.approx(2.0)
-        # The tail's own conditional purge is the very omission
-        # UNMODELLED_EPILOGUE_ALLOWANCE_S compensates for — it must not appear here.
+        # The tail's own conditional purge is a deliberate omission (firmware state this
+        # process cannot read) — it must not appear here.
         assert seg.tail_s == pytest.approx(1.0)
-
-    def test_the_epilogue_allowance_covers_the_purge_it_is_sized_against(self):
-        # Sized as one firing of the conditional air purge (M400 S180) plus chime and
-        # publish slop. The estimator deliberately counts neither, so an allowance below
-        # the purge could not absorb a single firing of it.
-        assert UNMODELLED_EPILOGUE_ALLOWANCE_S >= 180.0
 
 
 class TestZReferencePrologue:

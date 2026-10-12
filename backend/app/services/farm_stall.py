@@ -19,20 +19,21 @@ reconcile / operator resolves the true outcome.
   double-notify — and restarts its grace timer when such a pause later becomes
   unattended.
 
-* ``check_dead_dispatch_claims`` — the printer is CONNECTED and demonstrably NOT
-  printing, yet a unit still claims it. The one watch here that WRITES the queue
-  row's status, and the charter above survives it intact: ``printing → pending`` is
-  un-claiming a dispatch that never landed, not fabricating an outcome. Nothing else
-  could retire such a row — no terminal echo ever arrives for a print that never
-  began (2026-08-29, 001-H2S item 1010: 15 h, seven units queued behind it).
-  It gathers and applies; the DECISION is ``dispatch_claim.judge``, a pure verdict
-  over frozen evidence, and the start watchdog's ownership is ASKED
-  (``dispatch_claim.has_live_start_watchdog``) rather than inferred from a clock.
+* ``check_unowned_ejects`` — a pending eject whose runtime verdict fired and whose
+  terminal never arrived, on a printer that never dropped its session (so the printer's
+  session start can never see it): the eject reconciler is re-driven. (Its former sibling,
+  the dead dispatch-claim release, is gone: a claim whose print never started is decided by
+  its start's own answer on the record — ``services/dispatch_start`` — never by an age and a
+  dwell, 2026-10-11.)
 
-  Its eject sibling rides the same call (``_reconcile_unowned_ejects``): a pending
-  eject whose runtime verdict fired and whose terminal never arrived is the same
-  "claim nobody will retire" shape, on a printer that never dropped its session — so
-  neither the startup reconcile nor the connected edge can ever see it.
+* ``check_waiting_on_printers`` — THE attention owner (owner 5): it pages a person about a wait on
+  the printer, once and then hourly, and never resolves, escalates or acts — every page bound lives
+  here (``TestAttentionOwnership``). It pages a command the printer has not carried out (the record's
+  unanswered actions, aged in ONLINE seconds), a printer RUNNING inside a firmware change or with
+  nothing fed, an unreadable feed, a dispatch held on a stalled upload, a cooldown running long and a
+  plate only a person may clear. An action whose self-heal bound passed is SKIPPED — its lane took
+  production's fallback and pages its own hand-over (2026-10-12: "if it was self heal, it should stay
+  self heal") — except a farm motion command still pending on its row, which nothing else pages.
 
 * ``check_ams_wedged_idle`` — the printer is CONNECTED, IDLE and taking no work
   because its AMS is parked mid filament-change (``ams_status_main == 1``): the
@@ -40,7 +41,7 @@ reconcile / operator resolves the true outcome.
   commanded anything here. Nothing else can see it: no print, no incident row, no
   HMS code once the jam that caused it clears (002-H2S 2026-09-11). One WARNING +
   one ``on_ams_wedged_idle`` page per episode. What a load or unload does in this
-  posture is measured per command by ``ams_command`` (``[ams-command] … answer=``).
+  posture is measured per command by ``command_outcome.classify`` (``[ams-command] … answer=``).
 
 Invoked as guarded calls from the scheduler's ``check_queue`` tick (mirroring the
 stagger consumer), so there is no new periodic loop / lifespan task. State (edge
@@ -52,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -69,9 +71,7 @@ from backend.app.models.printer_incident import (
     STATUS_ESCALATED,
 )
 from backend.app.services import notify_dedup
-from backend.app.services.dispatch_claim import ClaimEvidence, has_live_start_watchdog, judge
 from backend.app.services.hms_errors import current_runout_demand
-from backend.app.services.incident_resolution import driver_owns
 from backend.app.services.plate_occupancy import ACTIVE_PRINT_STATES, plate_occupancy
 from backend.app.services.printer_incidents import (
     RECOVERY_WAITING_REASONS,
@@ -159,10 +159,10 @@ def _reset_state() -> None:
     _attention_first_seen.clear()
     _foreign_paused_at.clear()
     _foreign_notified.clear()
-    _dead_claim_since.clear()
     _ams_wedged_since.clear()
     _ams_wedged_paged.clear()
     _eject_verdict_reconciled.clear()
+    _waiting_since.clear()
 
 
 async def _grace_seconds(db: AsyncSession, key: str, default: int) -> float:
@@ -179,10 +179,10 @@ async def _grace_seconds(db: AsyncSession, key: str, default: int) -> float:
 
 
 async def offline_stall_seconds(db: AsyncSession) -> float:
-    """How long a printer may stay off its session before the farm stops waiting for it —
-    THE reading of ``farm_offline_stall_minutes``. Two readers: this module's stall watch
-    flags a printing unit past it, and a recovery driver waiting out a session gap gives up
-    past it (``spool_recovery.RecoverySettings.offline_bound_s``)."""
+    """How long a printer may stay off its session before a person is told — THE reading of
+    ``farm_offline_stall_minutes``, and the session-gap page's bound: this module's stall watch
+    flags a printing unit past it and pages. Nothing waiting out a gap gives up on it (2026-10-11:
+    a recovery driver waits for the printer's next session however long the gap runs)."""
     return await _grace_seconds(db, "farm_offline_stall_minutes", _DEFAULT_GRACE_MINUTES)
 
 
@@ -441,35 +441,10 @@ async def check_paused_prints(db: AsyncSession, *, manager=printer_manager, now:
 
 
 # --------------------------------------------------------------------------- #
-# The dead dispatch claim: a ``printing`` row whose print never started
+# The unowned eject: a pending eject whose terminal never arrived
 # --------------------------------------------------------------------------- #
-# item_id -> the ts ``dispatch_claim.judge`` FIRST answered ``dead`` for this item.
-# Popped the moment any other verdict comes back, and pruned against the live
-# ``printing`` set, so the dwell measures one continuous dead shape rather than an
-# accumulation of glimpses.
-#
-# Process-lifetime (derive-don't-store): a restart re-derives the whole shape from
-# the DB row plus the live wire on the next tick, and the dwell simply restarts —
-# the safe direction, worst cost one extra dwell before a stranded unit is freed.
-_dead_claim_since: dict[int, float] = {}
-
-# How long the ``dead`` verdict must hold continuously: two consecutive scheduler
-# ticks. A printer's live state and subtask echo both flap around a dispatch, so one
-# poll is not evidence — but two are, now that each observation is additionally
-# required to rest on a NON-STALE live state (``ClaimEvidence.state_fresh``), which is
-# what a longer dwell was really standing in for.
-#
-# It was 120 s beside a 600 s minimum age, ~12 min in total. Both numbers existed to
-# keep this watch behind the start watchdog without asking whether that watchdog was
-# alive; ``dispatch_claim`` asks instead, so the age floor is gone and what remains is
-# a genuine flap filter.
-_DEAD_CLAIM_DWELL_S = 30.0
-
-# The EJECT sibling's own dwell. It shared ``_DEAD_CLAIM_DWELL_S``'s NAME, never its
-# reasoning: there the wait is for the LIVE terminal handler, the first responder to a
-# stopped sweep, and nothing about the dispatch-ownership handoff says anything about
-# how long that takes. Split so the dead-claim value could move without silently
-# re-timing an eject lane nobody had measured. Eject behaviour is unchanged.
+# The unowned eject's dwell: the wait is for the LIVE terminal handler, the first responder to a
+# stopped sweep (the eject lane's own clock — Lane H of the event-not-clock plan).
 _UNOWNED_EJECT_DWELL_S = 120.0
 
 # printer_id -> the eject runtime VERDICT this watch has already re-triggered the
@@ -485,10 +460,10 @@ _eject_verdict_reconciled: dict[int, object] = {}
 async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
     """Re-drive the eject reconciler for a LOST TERMINAL ECHO on a connected printer.
 
-    The third trigger of the one reconciler (startup and the printer's connected edge
-    are the other two), and the only one for the shape neither of those can see: the
-    printer never dropped its session, so there is no connected edge to ride and no
-    restart to wait for — the eject's terminal echo simply never arrived (or arrived
+    The second trigger of the one reconciler (the printer's session start is the other),
+    and the only one for the shape the session start cannot see: the printer never dropped
+    its session, so there is no first fresh report to ride and no restart to wait for — the
+    eject's terminal echo simply never arrived (or arrived
     while the watchdog was mid-kill) and the record sits registered, refusing every
     later eject with ``eject_in_flight``.
 
@@ -497,7 +472,7 @@ async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
     only guess), and the watchdog's verdict must be at least
     :data:`_UNOWNED_EJECT_DWELL_S` old — because the LIVE terminal handler is the first
     responder to a stopped sweep and this must only ever see what it missed. A record
-    with no verdict at all (a hydrated one the startup sweep left in flight) is
+    with no verdict at all (a hydrated one its session start left in flight) is
     deliberately not touched here: nothing has judged it, so there is nothing to
     conclude.
 
@@ -505,8 +480,6 @@ async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
     terminal through ``farm_policy`` and may re-drive a stop, and the tick must not
     wait on either.
     """
-    from datetime import datetime, timezone
-
     from backend.app.core.tasks import spawn_background_task
     from backend.app.services.eject.monitor import reconcile_pending_eject
 
@@ -539,195 +512,15 @@ async def _reconcile_unowned_ejects(*, manager, now: float) -> None:
             logger.exception("farm_stall: unowned-eject reconcile trigger failed for printer %s", pid)
 
 
-def _live_state_is_fresh(manager, printer_id: int) -> bool:
-    """Is this printer's cached ``PrinterState`` backed by a RECENT message?
-
-    ``is_connected`` is not the same question. It calls ``check_staleness``, which
-    declines to force-close a second time inside ``STALE_RECONNECT_COOLDOWN`` — so for
-    up to 30 s a genuinely silent printer still answers connected, over a snapshot
-    nobody is refreshing. A release decided on that snapshot is a guess, and the cost
-    of a wrong one is a print onto an occupied plate.
-
-    Fails OPEN (a printer whose client cannot be reached reads FRESH), because past the
-    ``connected`` guard a missing client is the test doubles' shape rather than a
-    printer's: ``printer_manager`` answers ``is_connected`` False for an id it holds no
-    client for. Opening here therefore changes no production verdict, and closing would
-    make the freshness test silently veto every release in a double-driven test.
-    """
-    get_client = getattr(manager, "get_client", None)
-    if get_client is None:
-        return True
-    client = get_client(printer_id)
-    if client is None:
-        return True
-    try:
-        return not client.is_stale()
-    except Exception:  # noqa: BLE001 — a staleness probe must not abort the watch
-        logger.exception("farm_stall: staleness probe failed for printer %s", printer_id)
-        return True
-
-
-async def check_dead_dispatch_claims(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
-    """Release a ``printing`` claim whose print demonstrably never started.
-
-    ``printing`` is written optimistically: the dispatcher commits it BEFORE the
-    print command goes out, so that a crash in between leaves a unit wrongly marked
-    printing rather than one that silently reprints hours later. The cost of that
-    (correct) choice is a row that can outlive the dispatch it describes — and
-    nothing on the farm could ever retire one. No terminal echo will arrive for a
-    print that never began; the downtime reconcile is archive-scoped and an archive
-    row only reaches ``printing`` at PRINT START; the dispatch watchdog releases its
-    hold on any transition into an active state, PAUSE included. Production
-    2026-08-29 on 001-H2S: item 1010 was dispatched into a standing AMS fault at
-    01:25:13, the print never started, and the row seeded ``busy_printers`` every
-    30 s for 15 hours with seven pending units queued behind it.
-
-    **This function GATHERS and APPLIES; it does not decide.** The decision is
-    ``dispatch_claim.judge`` — a pure, table-tested function over a frozen
-    :class:`~backend.app.services.dispatch_claim.ClaimEvidence`, whose six verdicts are
-    the six guards this docstring used to enumerate in prose. What is gathered, per
-    claim: the live wire (connected, non-stale, state, echoed subtask), the DB (the
-    archive-printing disjointness, the claim's age), and the two liveness registries
-    (``dispatch_claim.has_live_start_watchdog``, ``printer_incidents.driver_live``).
-
-    **Ownership is ASKED, not timed (2026-09-19).** The old guard 4 required a claim to
-    be 600 s old before this watch would look at it, so that the start watchdog was
-    "ALWAYS the first responder" — a clock standing in for another task's liveness.
-    Since the watchdog exits on any active state and dies with every restart, the claims
-    with NO watchdog (the ones nothing else on the farm can retire) waited ~12 minutes
-    while the UI said "printing" over a demonstrably idle printer, and operators stopped
-    them by hand first. Now a live watchdog answers ``watchdog_owns`` at any age and
-    keeps its full budget, while an unwatched claim needs only
-    ``DISPATCH_START_BUDGET_S`` — the watchdog's own Phase A figure, one origin — plus
-    this watch's dwell.
-
-    The APPLY half is two rules: any verdict but ``dead`` pops the dwell (so it measures
-    one continuous dead shape, never an accumulation of glimpses), and ``dead`` seeds it
-    and then, past :data:`_DEAD_CLAIM_DWELL_S`, releases.
-
-    The module's "never writes a terminal status" charter is intact — un-claiming is
-    not an outcome, and the release is ``requeue.return_to_queue``'s: the unit goes back
-    to the queue NEXT in line and the scheduler re-dispatches it. The one terminal that
-    can follow is the RUN's rule, applied by that owner, never a stall verdict: a claim
-    returned under an aborted or completed run is cancelled there, because an ended
-    run must not print one more plate. There is no new notification event: the
-    run-changed broadcast and the WARNING below are the operator surface.
-
-    Injectable ``manager``/``now`` (epoch seconds — it drives the age and the dwell)
-    for tests.
-
-    The EJECT sibling of the same question rides this call
-    (:func:`_reconcile_unowned_ejects`): "a claim on a printer that nothing will ever
-    retire" is one shape with two records behind it — a queue row claiming ``printing``
-    and a pending eject whose terminal never came — and both are answered on the tick
-    with the same dwell. It runs FIRST and in its own guard, so a queue-side failure
-    cannot starve the eject side or the reverse, and it is deliberately not gated on
-    there being any ``printing`` row: a stranded eject blocks the printer with an empty
-    queue just as thoroughly.
-    """
+async def check_unowned_ejects(*, manager=printer_manager, now: float | None = None) -> None:
+    """The scheduler tick's unowned-eject watch (:func:`_reconcile_unowned_ejects`): a pending eject whose
+    runtime verdict fired and whose terminal never arrived, on a printer that never dropped its session.
+    Guarded — it must never kill the tick. Injectable ``manager``/``now`` (epoch seconds) for tests."""
     now = time.time() if now is None else now
-    from datetime import datetime, timezone
-
-    from backend.app.services import printer_incidents
-    from backend.app.services.print_binding import printers_with_live_print
-    from backend.app.services.requeue import return_to_queue
-
     try:
         await _reconcile_unowned_ejects(manager=manager, now=now)
-    except Exception:  # noqa: BLE001 — the eject sibling must not abort the queue watch
+    except Exception:  # noqa: BLE001 — the tick must never die on this watch
         logger.exception("farm_stall: unowned-eject reconcile sweep failed")
-
-    wall = datetime.fromtimestamp(now, tz=timezone.utc)
-
-    result = await db.execute(
-        select(PrintQueueItem).where(PrintQueueItem.status == "printing").where(PrintQueueItem.printer_id.is_not(None))
-    )
-    items = list(result.scalars().all())
-    live_ids = {item.id for item in items}
-    for stale in [iid for iid in _dead_claim_since if iid not in live_ids]:
-        _dead_claim_since.pop(stale, None)
-    if not items:
-        return
-
-    # Guard 3's disjointness half, read ONCE per tick: which printers the archive
-    # side believes are mid-print.
-    archive_printers = await printers_with_live_print(db)
-
-    for item in items:
-        pid = item.printer_id
-        if pid is None:
-            continue
-        try:
-            st = manager.get_status(pid)
-            started_at = item.started_at
-            if started_at is not None and started_at.tzinfo is None:
-                # Naive stamps read as UTC, as ``stagger`` does.
-                started_at = started_at.replace(tzinfo=timezone.utc)
-            evidence = ClaimEvidence(
-                connected=bool(manager.is_connected(pid)),
-                state_fresh=_live_state_is_fresh(manager, pid),
-                live_state=(getattr(st, "state", None) or "").upper(),
-                offline_stalled=item.waiting_reason == "printer_offline_stalled",
-                archive_printing=pid in archive_printers,
-                dispatch_subtask=(item.dispatch_subtask_id or "").strip(),
-                live_subtask=(getattr(st, "subtask_id", None) or "").strip(),
-                claim_age_s=None if started_at is None else (wall - started_at).total_seconds(),
-                watchdog_live=has_live_start_watchdog(item.id),
-                # Stand down only while somebody is ACTING on the printer — a live
-                # recovery task, or an open row a driver owns without one
-                # (``incident_resolution.driver_owns``, the ONE spelling: an AMS
-                # ``recovering`` row is the startup re-entry's promise; a ``job_pause`` row
-                # is owned only while its driver lives). An ESCALATED hold is a human's,
-                # not an actor that can land a print, and under the equipment-fault model
-                # it can be PERMANENT: 003-H2S's item 1988 (dispatched, never started,
-                # behind a physical hold the terminal no longer launders) must still be
-                # released. The live task is asked first and on its own, because a driver
-                # finishing after its row closed is still acting on the printer.
-                recovery_acting=(
-                    printer_incidents.driver_live(pid)
-                    or any(driver_owns(row, live=False) for row in await printer_incidents.open_rows(db, pid))
-                ),
-            )
-            verdict = judge(evidence)
-            if verdict != "dead":
-                _dead_claim_since.pop(item.id, None)
-                continue
-
-            first = _dead_claim_since.get(item.id)
-            if first is None:
-                _dead_claim_since[item.id] = now
-                continue
-            if now - first < _DEAD_CLAIM_DWELL_S:
-                continue
-
-            outcome = await return_to_queue(db, item.id, cause="dead_claim")
-            if outcome == "moved_on":
-                # It moved between the query and the write — somebody else owns it.
-                _dead_claim_since.pop(item.id, None)
-                continue
-            await db.commit()
-            # The row claim and the PRINTER claim are two different things with two
-            # different writers, and un-making a dispatch means dropping both: the
-            # return above releases the queue row, this releases the occupancy lease
-            # that would otherwise hold the printer out of the queue.
-            plate_occupancy.release_dispatch(pid, "dead dispatch claim")
-            _dead_claim_since.pop(item.id, None)
-            await _notify_run_changed(db, item)
-            # The WARNING carries the EVIDENCE the verdict was read off, not a summary
-            # of it: a release is the one thing this module does that changes a queue
-            # row, so the log line has to be enough to re-judge the decision afterwards.
-            logger.warning(
-                "farm_stall: printer %s unit %s claimed 'printing' %.1f min ago but never started — "
-                "returned to the queue (%s) for re-dispatch (verdict=%s, %s)",
-                pid,
-                item.id,
-                (evidence.claim_age_s or 0.0) / 60.0,
-                outcome,
-                verdict,
-                evidence,
-            )
-        except Exception:  # noqa: BLE001 — one bad item must not abort the watch
-            logger.exception("farm_stall: dead-claim watch failed for printer %s item %s", pid, item.id)
 
 
 # --------------------------------------------------------------------------- #
@@ -753,7 +546,7 @@ async def check_ams_wedged_idle(db: AsyncSession, *, manager=printer_manager, no
     At ``ams_status_main == 1`` (:func:`bambu_mqtt.ams_mid_filament_change`) the
     scheduler's idle gate refuses to dispatch (since 2026-09-11), and with no incident
     open and no recovery driver live the farm has not commanded anything here. What a
-    load or unload does in this posture is not assumed: :mod:`ams_command` measures
+    load or unload does in this posture is not assumed: :mod:`command_outcome` measures
     each one and logs the wire's answer. The refusal is correct and it is also SILENT:
     with no print running and no incident open, a parked AMS holds the printer out of
     the queue with nothing anywhere saying so
@@ -1223,7 +1016,7 @@ async def _remind_refused_plates(
     The escalation end of the plate-check ladder (operator ruling 2026-09-29: "escalate …
     make sure the bed is not at the bottom"): the terminal gated the plate with the
     printer's words (``EscalationOnly`` carrying a ``PlateRefusal``), the eject monitor sent
-    the FIRST page at once (``eject.monitor.escalation_first_page_s``), and this arm repeats
+    the FIRST page at once (the refusal is its event — ``eject.monitor.watch_gate_escalation_only``), and this arm repeats
     it once per :data:`_ATTENTION_REMINDER_S` until the gate clears. The plate-check ROW was
     closed by that terminal, so the incident arm cannot see this hold; the GATE is the fact,
     read off the plate authority's view.
@@ -1392,3 +1185,373 @@ async def check_attention_reminders(db: AsyncSession, *, manager=printer_manager
     for key in list(_attention_first_seen.keys()):
         if key not in held_keys:
             _attention_first_seen.pop(key, None)
+
+
+# --------------------------------------------------------------------------- #
+# Waiting on the printer — THE attention owner (owner 5, 2026-10-11)
+# --------------------------------------------------------------------------- #
+
+# THE page bound for a command the printer has not carried out and for a printer stuck in a state the
+# farm waits on: ``farm_attention_page_minutes`` (Settings → Farm). It decides only WHEN a person hears —
+# never an outcome. The default sits above the slowest measured answer a healthy printer gives: an
+# accepted AMS pull-back that ran on its own 274-280 s after the send (011-H2S 2026-10-09, 014-H2S
+# 2026-10-10), a plate-check stop answered in 56-62 s (014-H2S 2026-10-05), an H2D start that sat at
+# FINISH ~50 s before PREPARE (#1078).
+_PAGE_BOUND_KEY = "farm_attention_page_minutes"
+_DEFAULT_PAGE_BOUND_MINUTES = 10
+
+# Bounds whose physics set their own, owned here with every other page bound:
+# * a print RUNNING with nothing fed and no firmware sequence (the feed state's EMPTY_UNCONFIRMED): the
+#   tray field leads the change posture by ~3 s (shape 41), so a printer reporting normally answers
+#   long before this; a print in this state is a print about to lay down air;
+_NOTHING_FED_PAGE_S = 60.0
+# * a cooldown running long — the cooldown watch's published wait; a person often clears a finished
+#   part on their own well inside it;
+_COOLDOWN_PAGE_S = 5400.0
+# * a plate only a person may clear (an ``EscalationOnly`` gate with no refusal: a farm part whose eject
+#   never ran, a foreign deposit, a stalled cooldown) — the same patience, from the gate's own stamp.
+#   A plate the printer REFUSED is paged by its event (the escalation-only watch) and repeated hourly
+#   by :func:`_remind_refused_plates`.
+_GATED_PLATE_PAGE_S = 5400.0
+
+# Durable once-guard for every page below (``notify_dedup``'s ledger, so a restart neither re-pages an
+# hour-old wait nor forgets one): one key per waiting EPISODE, re-paged once per hour while it stands.
+_WAITING_SCOPE = "waiting"
+
+# (kind, printer_id[, …]) -> wall time this process FIRST saw a level condition (an episode's start).
+# Process memory, page-only: a restart restarts the episode, so its page lands one bound later — the
+# safe direction for a page, and nothing is decided by it.
+_waiting_since: dict[tuple, float] = {}
+
+
+def _family_noun(command: str, target: int | None) -> str:
+    """What was sent, in the operator's words."""
+    from backend.app.services.command_outcome import Family, spec_of
+
+    if command == "unload":
+        return "the pull-back"
+    if command == "load":
+        slot = runout_slot_desc(target)
+        return f"the load of {slot}" if slot else "the load"
+    try:
+        family = spec_of(command).family
+    except LookupError:
+        return f"the {command} command"
+    nouns = {
+        Family.RESUME: "the resume",
+        Family.PAUSE: "the pause",
+        Family.STOP: "the stop",
+        Family.POWER_LOSS_RESUME: "the resume after the power loss",
+        Family.PRINT_START: "the print start",
+        Family.EJECT_START: "the eject start",
+        Family.AMS_LEVER: "the AMS command",
+        Family.DIALOG: "the dialog button",
+    }
+    return nouns.get(family, f"the {command.replace('_', ' ')} command")
+
+
+def _action_sentence(action, state, minutes: int) -> str:
+    """The page for one outstanding action — what was sent, by whom, what the printer did with it, for how
+    long — in the printer's terms (sys-admin register: the fact, then what follows)."""
+    from backend.app.services.bambu_mqtt import ams_mid_filament_change
+
+    noun = _family_noun(action.command, action.target)
+    connected = bool(getattr(state, "connected", False)) if state is not None else False
+    live = (getattr(state, "state", None) or "").upper() if connected else ""
+    if action.command in ("load", "unload") and action.acked:
+        if connected and ams_mid_filament_change(state):
+            # Capsule 3's copy: the AMS holds the farm's swap command behind its own change.
+            return (
+                "The AMS went back into a filament change and holds the farm's swap command behind it. "
+                "Free the spool, then press Retry on the printer."
+            )
+        return f"The AMS accepted {noun} {minutes} min ago and has not run it. Recovery resumes when it runs."
+    who = "A person sent" if action.actor == "operator" else "The farm sent"
+    if action.acked:
+        sentence = f"The printer accepted {noun} {minutes} min ago and has not carried it out."
+    else:
+        sentence = f"{who} {noun} {minutes} min ago and the printer has not answered."
+    if not connected:
+        return f"{sentence} The printer is not connected."
+    return f"{sentence} The printer reads {live or 'no state'}." if live else sentence
+
+
+def _held_on_its_row(action) -> bool:
+    """Is ``action`` the farm AMS motion command its open row still holds PENDING
+    (``printer_incidents.pending_command`` — the projection over the record; accepted and not yet run, or
+    not yet read)? Such a command passed its step bound and sits in the recovery driver's deliberately
+    unbounded wait for it to run (``spool_recovery._await_pending_command``, ruling 2026-10-10), which
+    pages nothing — so the attention owner keeps paging it past its self-heal bound, at the page bound."""
+    from backend.app.services import printer_incidents
+
+    if action.incident_id is None:
+        return False
+    pending = printer_incidents.pending_command(action.printer_id, incident_id=action.incident_id)
+    return pending is not None and pending.action_id == action.action_id
+
+
+def _level(key: tuple, present: bool, now: float) -> float | None:
+    """An episode's start for a LEVEL condition: stamped on its first sighting, dropped when it ends."""
+    if not present:
+        _waiting_since.pop(key, None)
+        return None
+    return _waiting_since.setdefault(key, now)
+
+
+def _ledger_ts(stamp) -> float:
+    """A ledger stamp (naive UTC, ``notify_dedup``) as epoch seconds."""
+    return stamp.replace(tzinfo=timezone.utc).timestamp() if stamp.tzinfo is None else stamp.timestamp()
+
+
+async def _due(db: AsyncSession, key: str, now: float) -> bool:
+    """Is a page owed for this episode key: never sent, or last sent a full :data:`_ATTENTION_REMINDER_S`
+    ago? The durable ledger is the once-guard, so a restart neither repeats nor forgets a page."""
+    last = await notify_dedup.last_sent_at(db, _WAITING_SCOPE, key)
+    return last is None or now - _ledger_ts(last) >= _ATTENTION_REMINDER_S
+
+
+async def _page_waiting(db: AsyncSession, notif, printer_id: int | None, key: str, detail: str, now: float) -> None:
+    """ONE ``on_printer_waiting`` page per episode key, then once per :data:`_ATTENTION_REMINDER_S` while it
+    stands."""
+    from backend.app.models.printer import Printer
+
+    if not await _due(db, key, now):
+        return
+    printer = await db.get(Printer, printer_id) if printer_id is not None else None
+    printer_name = printer.name if printer is not None else (f"printer {printer_id}" if printer_id else "farm")
+    await notif.on_printer_waiting(printer_id, printer_name, detail, db)
+    await notify_dedup.record_sent(db, _WAITING_SCOPE, key, now)
+    logger.warning("farm_stall: printer %s — waiting page (%s): %s", printer_id, key, detail)
+
+
+async def check_waiting_on_printers(db: AsyncSession, *, manager=printer_manager, now: float | None = None) -> None:
+    """Page every wait the farm decides by the printer's own EVENT, past its bound — THE attention owner
+    (owner 5, 2026-10-11). It reads, it pages; it never resolves, escalates or acts.
+
+    * The record's UNANSWERED actions (``printer_action.outstanding_actions`` — in memory, no query),
+      after the record evaluates its self-heal bounds (``printer_action.check_bounds``): a command out
+      longer than the page bound (``farm_attention_page_minutes``) in the printer's ONLINE seconds
+      (``printer_action.online_seconds_since``), named by its family and by whether the printer accepted
+      it — an AMS command held behind the printer's own filament change takes capsule 3's copy. This
+      covers every command the farm (or a person through Bambuddy) sent and the printer has not carried
+      out: a resume, a stop, a start, an eject start, a plate-check press, a power-loss resume, a lever, a
+      dialog button. An action whose self-heal bound passed is skipped: its lane took the fallback and
+      pages its own hand-over. The one exception is a farm AMS motion command its row still holds pending
+      (:func:`_held_on_its_row`): past its step bound it sits in the recovery driver's deliberately
+      unbounded wait for it to run, which pages nothing, so it is paged here at the same bound (the
+      2026-10-10 ruling: "One page goes out if it has not run 10 min after the send"; production paged at
+      600 s). A command with no echo by design is never outstanding, so it is never paged.
+    * The LEVELS (one in-memory read per connected printer): a print RUNNING inside a firmware filament
+      change past the bound (the 009 hang); a print RUNNING with nothing fed and no firmware sequence past
+      :data:`_NOTHING_FED_PAGE_S`; an unreadable feed while a job is on the printer; a print that resumed
+      at its plate check and has not reached layer 1; a unit held on a stalled upload (one query); a
+      cooldown running long (``eject.monitor.cooldown_waits``); a plate only a person may clear (the plate
+      authority's view). A commanded RFID read is never paged: its self-heal bound
+      (``ams_presence._IDENTIFY_SELF_HEAL``, 30 s online) concludes it well inside the page bound (production
+      paged none).
+
+    A printer in maintenance mode is never paged (the person is at the machine). Cost per tick: no DB
+    read for the actions or the levels, one query for the stalled-upload holds, one active-printer query,
+    and one ledger read per candidate PAST its bound (zero in a healthy farm). Guarded per printer and per
+    item: one bad reading never costs the others their page.
+    """
+    from backend.app.services import printer_action, printer_incidents
+    from backend.app.services.eject.monitor import cooldown_waits, escalation_sentence
+    from backend.app.services.feed_state import FeedPhase
+    from backend.app.services.notification_service import notification_service
+    from backend.app.services.plate_occupancy import EscalationOnly
+
+    now = time.time() if now is None else now
+    bound_s = await _grace_seconds(db, _PAGE_BOUND_KEY, _DEFAULT_PAGE_BOUND_MINUTES)
+    utc_now = datetime.utcnow()
+    notif = notification_service
+
+    # 0. the record's self-heal bounds, for the printer that reports rarely (the record evaluates them on
+    #    every status push too) — first, so an action whose bound passes now is its lane's below
+    try:
+        printer_action.check_bounds()
+    except Exception:  # noqa: BLE001 — the record's evaluation must not cost the pages theirs
+        logger.exception("farm_stall: the record's self-heal bounds could not be evaluated")
+
+    # 1. the record's unanswered actions, aged in the printer's ONLINE seconds (offline time is no wait on
+    #    the printer); one whose self-heal bound passed is its lane's, which pages its own hand-over — except
+    #    a farm AMS motion command its row still holds pending (:func:`_held_on_its_row`)
+    for action in printer_action.outstanding_actions():
+        try:
+            if action.bound_passed and not _held_on_its_row(action):
+                continue
+            age = printer_action.online_seconds_since(action.printer_id, action.sent_at)
+            if age < bound_s or printer_incidents.automation_held(action.printer_id):
+                continue
+            state = manager.get_status(action.printer_id)
+            await _page_waiting(
+                db,
+                notif,
+                action.printer_id,
+                f"action:{action.action_id}",
+                _action_sentence(action, state, int(age // 60)),
+                now,
+            )
+        except Exception:  # noqa: BLE001 — one action's page must not cost the others theirs
+            logger.exception("farm_stall: waiting page failed for action %s", action.action_id)
+
+    # 2. the levels, per connected printer
+    from backend.app.models.printer import Printer
+
+    printers = (await db.execute(select(Printer.id).where(Printer.is_active.is_(True)))).scalars().all()
+    waits = cooldown_waits()
+    for pid in printers:
+        try:
+            if printer_incidents.automation_held(pid):
+                continue
+            state = manager.get_status(pid) if manager.is_connected(pid) else None
+            live = (getattr(state, "state", None) or "").upper() if state is not None else ""
+            client = manager.get_client(pid) if state is not None else None
+            phase = client.feed().phase if client is not None else None
+            running = live == "RUNNING"
+
+            since = _level(("changing", pid), running and phase is FeedPhase.CHANGING, now)
+            if since is not None and now - since >= bound_s:
+                await _page_waiting(
+                    db,
+                    notif,
+                    pid,
+                    f"changing:{pid}:{int(since)}",
+                    f"The printer has been RUNNING inside a filament change for {int((now - since) // 60)} min "
+                    "with no layer printed. Check the AMS and the toolhead.",
+                    now,
+                )
+            since = _level(("nothing_fed", pid), running and phase is FeedPhase.EMPTY_UNCONFIRMED, now)
+            if since is not None and now - since >= _NOTHING_FED_PAGE_S:
+                await _page_waiting(
+                    db,
+                    notif,
+                    pid,
+                    f"nothing_fed:{pid}:{int(since)}",
+                    "The printer is RUNNING with the toolhead empty and no AMS filament change reported. "
+                    "The farm stops the print at the first layer printed empty.",
+                    now,
+                )
+            in_job = live in ("RUNNING", "PAUSE")
+            since = _level(("unreadable_feed", pid), in_job and phase is FeedPhase.UNKNOWN, now)
+            if since is not None and now - since >= bound_s:
+                await _page_waiting(
+                    db,
+                    notif,
+                    pid,
+                    f"unreadable_feed:{pid}:{int(since)}",
+                    f"The printer's toolhead feed has been unreadable for {int((now - since) // 60)} min with a "
+                    "job on it. The farm decides nothing about the feed until it reads again.",
+                    now,
+                )
+            plate_check = printer_incidents.snapshot(pid, kind=KIND_PLATE_VISION)
+            before_layer_1 = (
+                running
+                and plate_check is not None
+                and plate_check.get("status") == "recovering"
+                and int(getattr(state, "layer_num", 0) or 0) < 1
+            )
+            since = _level(("plate_check_layer", pid), before_layer_1, now)
+            if since is not None and now - since >= bound_s:
+                await _page_waiting(
+                    db,
+                    notif,
+                    pid,
+                    f"plate_check_layer:{pid}:{int(since)}",
+                    f"The print resumed at its plate check {int((now - since) // 60)} min ago and has not reached "
+                    "layer 1.",
+                    now,
+                )
+            wait = waits.get(pid)
+            cooling_long = wait is not None and not wait.held and wait.waited_s >= _COOLDOWN_PAGE_S
+            since = _level(("cooldown", pid), cooling_long, now)
+            if since is not None and wait is not None:
+                key = f"cooldown:{pid}:{int(since)}"
+                if await _due(db, key, now):
+                    from backend.app.models.printer import Printer as _Printer
+
+                    printer = await db.get(_Printer, pid)
+                    await notif.on_cooldown_escalation(
+                        pid,
+                        printer.name if printer is not None else f"printer {pid}",
+                        bed_c=wait.bed_c,
+                        line_c=wait.line_c,
+                        db=db,
+                    )
+                    await notify_dedup.record_sent(db, _WAITING_SCOPE, key, now)
+                    logger.warning(
+                        "farm_stall: printer %s cooldown still unreleased after %ss — paged", pid, wait.waited_s
+                    )
+            # An eject sweep running long past its estimate: nothing stops a sweep on elapsed time any
+            # more (2026-10-11 — its beacons and its terminal answer it; only the bed-drop guard can stop
+            # one), so a sweep still running its estimate plus the page bound after the printer started it
+            # is a person's to look at. A sweep the farm already decided to stop is the kill path's page.
+            pending = plate_occupancy.pending_eject_view(pid)
+            if (
+                pending is not None
+                and pending.started_at is not None
+                and pending.expected_runtime_s is not None
+                and pending.runtime_exceeded_at is None
+            ):
+                ran_s = (datetime.now(timezone.utc) - pending.started_at).total_seconds()
+                if ran_s >= pending.expected_runtime_s + bound_s:
+                    await _page_waiting(
+                        db,
+                        notif,
+                        pid,
+                        f"eject:{pid}:{pending.started_at.isoformat()}",
+                        f"The eject sweep has run {int(ran_s // 60)} min against an expected "
+                        f"{pending.expected_runtime_s:.0f} s and has not finished. The plate stays gated until it "
+                        "does; check the printer.",
+                        now,
+                    )
+            view = plate_occupancy.snapshot(pid)
+            policy = view.plate_policy
+            deposit = view.plate_occupied and isinstance(policy, EscalationOnly) and policy.refusal is None
+            if deposit and view.plate_since is not None:
+                gated_s = (utc_now - view.plate_since.replace(tzinfo=None)).total_seconds()
+                if gated_s >= _GATED_PLATE_PAGE_S:
+                    from backend.app.services.eject.monitor import notify_plate_not_empty
+
+                    key = f"plate:{pid}:{view.plate_since.isoformat()}"
+                    if await _due(db, key, now):
+                        await notify_plate_not_empty(
+                            pid,
+                            source_detail=escalation_sentence(
+                                farm_source=view.plate_source_subtask_id is not None, refusal=None
+                            ),
+                        )
+                        await notify_dedup.record_sent(db, _WAITING_SCOPE, key, now)
+                        logger.warning("farm_stall: printer %s plate held for a person — paged", pid)
+        except Exception:  # noqa: BLE001 — one printer's page must not cost the others theirs
+            logger.exception("farm_stall: waiting levels failed for printer %s", pid)
+
+    # 3. a unit held on a stalled upload (one query)
+    from backend.app.services.print_scheduler import WAITING_REASON_UPLOAD_STALLED
+
+    held_items = (
+        await db.execute(
+            select(PrintQueueItem.id, PrintQueueItem.printer_id).where(
+                PrintQueueItem.waiting_reason == WAITING_REASON_UPLOAD_STALLED
+            )
+        )
+    ).all()
+    live_items = {item_id for item_id, _pid in held_items}
+    for key in [k for k in _waiting_since if k[0] == "upload_stalled" and k[1] not in live_items]:
+        _waiting_since.pop(key, None)
+    for item_id, item_printer in held_items:
+        try:
+            since = _level(("upload_stalled", item_id), True, now)
+            if since is None or now - since < bound_s:
+                continue
+            await _page_waiting(
+                db,
+                notif,
+                item_printer,
+                f"upload_stalled:{item_id}:{int(since)}",
+                f"Queue unit {item_id}: upload to its pinned printer stalled; unit held {int((now - since) // 60)} "
+                "min. Check the printer's network and USB drive.",
+                now,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("farm_stall: stalled-upload page failed for unit %s", item_id)

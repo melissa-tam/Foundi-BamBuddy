@@ -31,6 +31,7 @@ _TABLE = "printer_incident_step"
 _EXPECTED_INDEXES: dict[str, tuple[bool, list[str]]] = {
     "ux_printer_incident_step_seq": (True, ["incident_id", "seq"]),
     "ix_printer_incident_step_incident": (False, ["incident_id"]),
+    "ix_printer_incident_step_action": (False, ["action_id"]),
 }
 
 _INSERT_STEP = text(

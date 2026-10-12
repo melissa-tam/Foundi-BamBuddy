@@ -129,6 +129,9 @@ class NotificationProvider(Base):
     on_ams_wedged_idle = Column(
         Boolean, default=True
     )  # AMS parked mid filament-change on an IDLE printer: the dispatcher refuses it while the AMS is mid-change
+    on_printer_waiting = Column(
+        Boolean, default=True
+    )  # The farm is WAITING on a printer past the page bound: a command it accepted and has not carried out, a printer stuck in a state the farm waits for (farm_stall, 2026-10-11)
     on_storage_low = Column(
         Boolean, default=True
     )  # Printer USB storage FAILURE — auto-cleanup could not free space, FTPS/USB unreachable, or the drive dropped mid-print (successful cleanups are silent)

@@ -59,7 +59,6 @@ CREATE_ASYNC_ENGINE_ALLOWLIST = frozenset(
         "backend/tests/unit/test_scheduler_clear_plate.py",
         "backend/tests/unit/test_scheduler_filament_deficit.py",
         "backend/tests/unit/test_scheduler_pin_contract.py",
-        "backend/tests/unit/test_scheduler_watchdog.py",
         "backend/tests/unit/test_user_print_template_rename_migration.py",
     }
 )
@@ -83,7 +82,6 @@ ASYNC_SESSIONMAKER_ALLOWLIST = frozenset(
         "backend/tests/integration/test_spoolman_tracking_slot_fallback.py",
         "backend/tests/unit/services/test_ams_presence.py",
         "backend/tests/unit/services/test_farm_staging.py",
-        "backend/tests/unit/services/test_farm_stall.py",
         "backend/tests/unit/services/test_hms_event.py",
         "backend/tests/unit/services/test_incident_wire_sweep.py",
         "backend/tests/unit/services/test_pause_recovery.py",
@@ -115,7 +113,6 @@ ASYNC_SESSIONMAKER_ALLOWLIST = frozenset(
         "backend/tests/unit/test_scheduler_pin_contract.py",
         "backend/tests/unit/test_scheduler_skip_machine_code.py",
         "backend/tests/unit/test_scheduler_stagger.py",
-        "backend/tests/unit/test_scheduler_watchdog.py",
     }
 )
 

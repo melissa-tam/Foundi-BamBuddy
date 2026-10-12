@@ -74,7 +74,6 @@ def frame(
     total: int = _TOTAL,
     feed: tray_fields.ToolheadFeed | None = None,
     posture: bool = False,
-    carried: bool = True,
     absent=(),
     unknown=(),
     demand: tuple[int, int] | None = None,
@@ -84,18 +83,15 @@ def frame(
     job: bool = True,
     live: bool = True,
     epoch: int = 1,
-    farm_acting: bool = False,
     boundary: JobBoundary = JobBoundary.NONE,
 ) -> FeedFrame:
-    """ONE push. ``carried``: the push carried ``ams_status`` (a push raising the posture always
-    did). ``held``: a slot-agnostic runout word (``07xx_8011``) stands; ``demand``: the slotted
-    ``0x00020001`` demand stands."""
+    """ONE push. ``held``: a slot-agnostic runout word (``07xx_8011``) stands; ``demand``: the
+    slotted ``0x00020001`` demand stands."""
     return FeedFrame(
         live=live,
         epoch=epoch,
         gcode_state=gcode,
         feed=feed if feed is not None else _single(tray),
-        posture_carried=carried or posture,
         posture=posture,
         presence=_presence(absent, unknown),
         runout_demand=demand,
@@ -105,7 +101,6 @@ def frame(
         layer=layer,
         total_layers=total,
         job_active=job,
-        farm_acting=farm_acting,
         boundary=boundary,
     )
 
@@ -149,13 +144,9 @@ class _Printer:
         return [seen[seq] for seq in sorted(seen)]
 
     def assert_never_air(self) -> None:
-        """No AIR, and no run of six EMPTY_UNCONFIRMED frames (a firmware change is never air)."""
+        """No AIR, and no ``air_began`` (a firmware change is never air)."""
         assert AIR not in self.phases()
         assert self.events("air_began") == []
-        run = 0
-        for phase in self.phases():
-            run = run + 1 if phase is EMPTY_UNCONFIRMED else 0
-            assert run < feed_state._AIR_CONFIRM_FRAMES
 
 
 def _fed_to(p: _Printer, tray: int, upto: int) -> None:
@@ -333,7 +324,7 @@ class TestTheRunoutHolds:
 class TestChangeOrAir:
     def test_shape_41_the_tray_field_leads_the_posture(self):
         """012-H2S: 255 lands up to ~3 s before the posture — EMPTY_UNCONFIRMED, then
-        CHANGING(posture) before six quiet votes."""
+        CHANGING(posture); the layer never advances, so it is never air."""
         p = _Printer()
         p.start(2)
         _fed_to(p, 2, 50)
@@ -365,60 +356,37 @@ class TestChangeOrAir:
         assert [e.layer for e in p.events("air_began")] == [93]
         assert p.last.first_unfed_layer == 93
 
-    def test_shape_39_a_screen_resume_onto_an_empty_toolhead_confirms_air_in_six_quiet_reports(self):
+    def test_shape_39_a_screen_resume_onto_an_empty_toolhead_is_air_at_the_first_layer_advance(self):
+        """A resume onto an empty toolhead: RUNNING with nothing fed reads EMPTY_UNCONFIRMED for as
+        many reports as the layer stays put — no count of reports decides air (2026-10-11: a frame
+        count is a clock) — and AIR at the first layer it prints empty."""
         p = _Printer()
         p.start(2)
         _fed_to(p, 2, 59)
         p.push(255, layer=60, gcode="PAUSE")
         assert p.phase is EMPTY_PAUSED
-        for vote in range(1, feed_state._AIR_CONFIRM_FRAMES):
+        for report in range(40):
             p.push(255, layer=60)
-            assert p.phase is EMPTY_UNCONFIRMED, vote
-        p.push(255, layer=60)
+            assert p.phase is EMPTY_UNCONFIRMED, report
+        p.push(255, layer=61)
 
         assert p.phase is AIR
         assert [e.layer for e in p.events("air_began")] == [60]
-        assert p.last.first_unfed_layer is None, "no layer was printed yet"
-
-    def test_shape_39_without_the_posture_on_the_wire_nothing_votes_until_a_layer_advances(self):
-        """A push that did not carry ``ams_status`` neither votes nor breaks the streak
-        (invariant 12's corroboration rule)."""
-        p = _Printer()
-        p.start(2)
-        _fed_to(p, 2, 59)
-        p.push(255, layer=60, gcode="PAUSE")
-        for _ in range(12):
-            p.push(255, layer=60, carried=False)
-        assert p.phase is EMPTY_UNCONFIRMED
-        p.push(255, layer=61, carried=False)
-
-        assert p.phase is AIR
         assert p.last.first_unfed_layer == 60
 
-    def test_a_silent_report_neither_votes_nor_breaks_the_streak(self):
+    def test_a_runout_word_or_a_quiet_report_never_decides_air(self):
+        """The loud and the quiet empty reports are one signal: only the layer advances air."""
         p = _Printer()
         p.start(2)
         _fed_to(p, 2, 20)
-        for _ in range(3):
-            p.push(255, layer=20)
-        p.push(255, layer=20, carried=False)
-        for _ in range(2):
-            p.push(255, layer=20)
-        assert p.phase is EMPTY_UNCONFIRMED
-        p.push(255, layer=20)
-        assert p.phase is AIR
-
-    def test_a_runout_word_resets_the_streak(self):
-        p = _Printer()
-        p.start(2)
-        _fed_to(p, 2, 20)
-        for _ in range(5):
+        for _ in range(10):
             p.push(255, layer=20)
         p.push(255, layer=20, pull_back=True)
-        for _ in range(5):
+        for _ in range(10):
             p.push(255, layer=20)
         assert p.phase is EMPTY_UNCONFIRMED
-        p.push(255, layer=20)
+        assert p.events("air_began") == []
+        p.push(255, layer=21)
         assert p.phase is AIR
 
     def test_a_false_tail_flaps_back_to_fed(self):
@@ -436,7 +404,7 @@ class TestChangeOrAir:
 
     def test_a_false_tail_whose_change_never_comes_exits_to_air_on_a_layer_advance(self):
         """An operator pull mid-print: TAIL, then 255 with no firmware sequence. Every CHANGING
-        cause keeps the two exits to AIR, so a false TAIL never hides air to the FINISH."""
+        cause keeps the exit to AIR, so a false TAIL never hides air to the FINISH."""
         p = _Printer()
         p.start(1)
         _fed_to(p, 1, 30)
@@ -449,15 +417,18 @@ class TestChangeOrAir:
         assert p.phase is AIR
         assert p.last.first_unfed_layer == 31
 
-    def test_a_false_tail_whose_change_never_comes_exits_to_air_on_six_quiet_votes(self):
+    def test_a_change_that_never_advances_a_layer_is_never_air(self):
+        """However many reports the firmware's change spans (the measured switch runs minutes),
+        no layer advance means no air."""
         p = _Printer()
         p.start(1)
         _fed_to(p, 1, 30)
         p.push(1, layer=31, absent={1})
-        for _ in range(feed_state._AIR_CONFIRM_FRAMES):
+        for _ in range(60):
             p.push(255, layer=31, absent={1})
 
-        assert p.phase is AIR
+        assert (p.phase, p.last.cause) == (CHANGING, ChangeCause.RUNOUT_SWITCH)
+        p.assert_never_air()
 
 
 # --- the start block, the end retract ----------------------------------------------------------------
@@ -536,6 +507,38 @@ class TestSessions:
         assert len(p.events("load_landed")) == landed
         p.push(2, layer=10, epoch=2)
         assert [e.tray for e in p.events("load_landed")][-1] == 2
+
+    def test_a_new_sessions_first_live_report_is_read_for_its_level(self):
+        """A reconnect whose FIRST frame is already live (the client marks the push that applies the
+        session's report live): it re-seeds and READS that frame — a paused print fed from a slot is
+        FED at once — and emits no event."""
+        p = _Printer()
+        p.start(1)
+        _fed_to(p, 1, 10)
+        landed = len(p.events("load_landed"))
+        p.push(1, layer=10, gcode="PAUSE", epoch=2)
+
+        assert (p.phase, p.last.feeder) == (FED, 1)
+        assert len(p.events("load_landed")) == landed
+        assert p.last.events == ()
+
+    def test_a_fresh_trackers_first_report_on_a_paused_print_reads_fed(self):
+        """001-H2S incident 574, after the deploy: a NEW client attaching to a job PAUSEd at layer 85
+        whose active extruder the firmware's backup switch fed from slot 2. The session's first fresh
+        report must read FED — the resume the hold is owed reads that level at the session start."""
+        p = _Printer()
+        p.push(1, layer=85, gcode="PAUSE", boundary=JobBoundary.ATTACH)
+
+        assert (p.phase, p.last.feeder) == (FED, 1)
+        assert p.last.events == ()
+        assert p.last.tray_change_log == ()
+
+    def test_a_fresh_trackers_first_report_on_an_empty_paused_print_reads_empty_paused(self):
+        p = _Printer()
+        p.push(255, layer=85, gcode="PAUSE", boundary=JobBoundary.ATTACH)
+
+        assert p.phase is EMPTY_PAUSED
+        assert p.last.events == ()
 
     def test_an_attach_mid_tail_seeds_the_tail_without_an_event(self):
         """Bambuddy restarted while a roll's tail fed: the attach reading is the phase, never a
@@ -630,18 +633,20 @@ class TestIdleLoads:
         p.push(2, gcode="IDLE", job=False, layer=0)
 
         (landed,) = p.events("load_landed")
-        assert (landed.tray, landed.from_phase, landed.farm_acting) == (2, IDLE, False)
+        assert (landed.tray, landed.from_phase) == (2, IDLE)
         assert p.last.tray_change_log == (), "no job, no segment"
         assert p.last.last_loaded == 2
 
-    def test_a_load_under_a_farm_motion_carries_farm_acting(self):
+    def test_a_landing_carries_no_attribution(self):
+        """Whose load landed is the record's (``printer_action``: an outstanding farm or operator load of
+        the tray, else ``observed_load``) — never the frame's, so a restart cannot lose it."""
         p = _Printer()
         for _ in range(2):
             p.push(255, gcode="IDLE", job=False, layer=0)
-        p.push(3, gcode="IDLE", job=False, layer=0, farm_acting=True)
+        p.push(3, gcode="IDLE", job=False, layer=0)
 
         (landed,) = p.events("load_landed")
-        assert landed.farm_acting is True
+        assert not hasattr(landed, "farm_acting")
 
     def test_the_external_holder_is_a_feeder_but_no_landing(self):
         p = _Printer()
@@ -657,6 +662,19 @@ class TestIdleLoads:
 
 
 class TestTheSequence:
+    def test_every_push_returns_a_new_reading_even_when_nothing_changed(self):
+        """The per-push marker the AMS recovery driver reads an ACK-answered lever by
+        (``spool_recovery._watch_lever``: the first push AFTER the ACK is a new reading object): two
+        consecutive pushes with identical content are two readings. A tracker that memoized an
+        unchanged reading would leave that read waiting forever."""
+        p = _Printer()
+        p.start(1)
+        first = p.push(1, layer=3, gcode="PAUSE")
+        second = p.push(1, layer=3, gcode="PAUSE")
+
+        assert first == second  # nothing changed...
+        assert first is not second  # ...and still a new reading for the new push
+
     def test_events_are_ordered_by_one_process_global_sequence(self):
         """A reconnect builds a new client: a per-instance counter would restart under a
         consumer's cursor."""
@@ -688,6 +706,24 @@ class TestTheSequence:
         assert isinstance(switched, AutoSwitched)
         assert landed.seq < switched.seq
 
+    def test_a_reading_carries_the_events_of_its_own_step_alone(self):
+        """``FeedReading.events`` is what the client re-publishes (``printer_events``): the step's
+        events in their within-push order, and nothing on a step that produced none — while the
+        last-of-kind fields keep the latest of each."""
+        p = _Printer()
+        p.start(1)
+        _fed_to(p, 1, 5)
+        drained = p.push(1, layer=6, absent={1})
+        quiet = p.push(1, layer=6, absent={1})
+        p.push(255, layer=6, absent={1})
+        p.push(255, layer=6, posture=True, absent={1})
+        switched = p.push(0, layer=6, absent={1})
+
+        assert [e.kind for e in drained.events] == ["roll_drained"]
+        assert quiet.events == () and quiet.roll_drained == drained.events[0]
+        assert [e.kind for e in switched.events] == ["load_landed", "auto_switched"]
+        assert switched.events == (switched.load_landed, switched.auto_switched)
+
 
 # --- the table ---------------------------------------------------------------------------------------------
 
@@ -717,7 +753,8 @@ class TestTheTable:
             pytest.param({"presence": None}, UNKNOWN, id="no_presence"),
             pytest.param({"layer": "x"}, UNKNOWN, id="a_text_layer"),
             pytest.param({"total_layers": None}, UNKNOWN, id="no_total"),
-            pytest.param({"epoch": None}, UNKNOWN, id="no_epoch"),
+            # An unreadable epoch is a new session: re-seeded, and its frame READ for its level.
+            pytest.param({"epoch": None}, FED, id="no_epoch"),
             # Readable, just unplaceable: a gcode state the job gate cannot place keeps the phase.
             pytest.param({"gcode_state": None}, FED, id="no_state"),
         ],
@@ -730,8 +767,7 @@ class TestTheTable:
         reading = p.tracker.step(FeedFrame(**{**good.__dict__, **broken}))
 
         assert reading.phase is phase
-        # The frames after it still step (an unreadable epoch is a new session: it takes the one
-        # re-seeding frame more).
+        # The frames after it still step.
         p.tracker.step(frame(1, layer=5))
         assert p.tracker.step(frame(1, layer=6)).phase is FED
 
@@ -762,11 +798,9 @@ class TestTheFrame:
         f = FeedFrame.of(
             state,
             live=True,
-            posture_carried=True,
             posture=False,
             layer=33,
             job_active=True,
-            farm_acting=False,
             boundary=JobBoundary.NONE,
         )
 
@@ -781,11 +815,9 @@ class TestTheFrame:
         f = FeedFrame.of(
             state,
             live=True,
-            posture_carried=False,
             posture=False,
             layer=1,
             job_active=True,
-            farm_acting=False,
             boundary=JobBoundary.NONE,
         )
         assert (f.runout_demand, f.runout_demand_standing, f.pull_back, f.auto_switched) == ((0, 2), True, False, False)

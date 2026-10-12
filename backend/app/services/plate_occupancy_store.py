@@ -11,7 +11,8 @@ out through (:func:`wire_core` injects them at lifespan).
 * ``printer_manager.load_awaiting_plate_clear_from_db`` — the plate itself, from
   ``printers.awaiting_plate_clear`` / ``printers.plate_gate_subtask_id``;
 * ``eject.remote.hydrate_pending_ejects_from_db`` — the pending eject, from
-  ``print_queue.eject_dispatched_at``, 24 h TTL, one per printer, newest wins;
+  ``print_queue.eject_dispatched_at``, one per printer, newest wins (no age limit: the
+  session start's eject reconcile decides a hydrated eject against the printer's report);
 * ``eject.monitor.rearm_on_startup`` — which of those plates may auto-clear, decided
   by the SAME :func:`~backend.app.services.eject.monitor.should_rearm` rule (imported,
   never re-spelled) and expressed now as a POLICY on the plate rather than a spawned
@@ -23,7 +24,7 @@ re-derives per tick as ``Evidence.db_claim``.
 
 **Ordering inside :func:`hydrate` is load-bearing.** Ejects are rebuilt FIRST so that
 the plate's policy decision — and the policy driver's first view of that plate — can
-both see an eject the startup reconciler owns. A cooldown policy armed over a plate
+both see an eject the session-start reconciler owns. A cooldown policy armed over a plate
 that already carries a pending eject is the double-dispatch the legacy rearm avoided
 by skipping such printers outright (``monitor.py:898-906``); here it degrades to
 :class:`~backend.app.services.plate_occupancy.EscalationOnly` instead of to nothing,
@@ -44,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Coroutine
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -66,10 +67,6 @@ from backend.app.services.printer_manager import printer_manager
 
 logger = logging.getLogger(__name__)
 
-# A durable eject stamp older than this is not evidence of an eject in flight — it is
-# residue from a crash days ago. Ported verbatim from ``eject.remote`` (whose twin is
-# deleted with ``hydrate_pending_ejects_from_db`` at cut-over).
-_PENDING_EJECT_STALE_TTL_H = 24
 
 # What the operator is told when a plate ends up with no policy the farm can arm. The
 # page is the last rung of the never-armless ladder (2026-07-18/07-21), reached only
@@ -116,10 +113,13 @@ async def hydrate() -> None:
 async def _hydrate_ejects() -> int:
     """Rebuild pending ejects from ``print_queue.eject_dispatched_at``. Returns the count.
 
-    Port of ``eject.remote.hydrate_pending_ejects_from_db``, decision for decision:
-    newest stamp first; a stamp past the TTL is dropped AND NULLed with a WARNING; a
-    stamp with no ``printer_id`` likewise; a second stamp for a printer that already has
-    one is NULLed, because the record is one-per-printer by construction. ``purpose`` is
+    Newest stamp first; a stamp with no ``printer_id`` is dropped AND NULLed with a WARNING; a
+    second stamp for a printer that already has one is NULLed, because the record is
+    one-per-printer by construction. A stamp's AGE decides nothing (2026-10-11): the 24 h
+    "residue" TTL this replaced dropped an eject without asking the printer, where the session
+    start's reconcile (``eject.monitor.reconcile_pending_eject``, on the printer's first fresh
+    report) reads what the printer says about that eject — still running it, FINISHed it
+    (the gate clears on its terminal), or idle with no trace (dropped, gate kept for a person). ``purpose`` is
     the item's own ``first_article`` flag — a MANUAL eject carries no queue item, so it
     has no durable mirror and can never be hydrated (the prior ruling: a mid-eject
     restart degrades to an escalation-only hold).
@@ -130,7 +130,6 @@ async def _hydrate_ejects() -> int:
     """
     from backend.app.core.database import async_session
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=_PENDING_EJECT_STALE_TTL_H)
     hydrated = 0
     try:
         async with async_session() as db:
@@ -144,16 +143,6 @@ async def _hydrate_ejects() -> int:
             changed = False
             for item in rows:
                 stamp = _as_utc(item.eject_dispatched_at)
-                if stamp is None or stamp < cutoff:
-                    logger.warning(
-                        "[occupancy-store] dropping stale pending-eject stamp on item %s (dispatched %s, TTL %sh)",
-                        item.id,
-                        item.eject_dispatched_at,
-                        _PENDING_EJECT_STALE_TTL_H,
-                    )
-                    item.eject_dispatched_at = None
-                    changed = True
-                    continue
                 if item.printer_id is None:
                     logger.warning("[occupancy-store] dropping pending-eject stamp on item %s — no printer_id", item.id)
                     item.eject_dispatched_at = None
@@ -252,7 +241,7 @@ async def _startup_policy(
 
     if plate_occupancy.eject_identity(printer_id) is not None:
         logger.info(
-            "[occupancy-store] p%s has a hydrated pending eject — the startup reconciler owns it; escalation-only",
+            "[occupancy-store] p%s has a hydrated pending eject — the session-start reconciler owns it; escalation-only",
             printer_id,
         )
         return EscalationOnly()

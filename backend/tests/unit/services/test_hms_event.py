@@ -59,13 +59,11 @@ def _reset_hms_state():
     notify_dedup._reset_state()
     main_module._hms_event_written_at.clear()
     main_module._printer_offline_edge_at.clear()
-    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
     yield
     notify_dedup._reset_state()
     main_module._hms_event_written_at.clear()
     main_module._printer_offline_edge_at.clear()
-    main_module._printer_reconciled_epoch.clear()
     main_module._last_status_broadcast.clear()
 
 

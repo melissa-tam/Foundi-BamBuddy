@@ -89,10 +89,14 @@ CAUSE_ENTER = "service hold"
 _KICK_REASON = "service_hold_released"
 
 #: How long :func:`quiesce_for_teardown` waits for a cancelled plate watch to run its
-#: ``finally`` — the plate hold's release and both fans-off publishes. Generous on
-#: purpose: it bounds a task that should finish in milliseconds (the publishes are
-#: fire-and-forget MQTT), and the cost of being wrong is the 6.3-hour fan run this whole
-#: module exists for, against at most ten seconds on the operator's click.
+#: ``finally`` — the plate hold's release and both fans-off publishes (production; restored
+#: 2026-10-12, Raymond: "if it was self heal, it should stay self heal"). The watch's own end is
+#: the event and comes first; this bounds a task that should finish in milliseconds (the
+#: publishes are fire-and-forget MQTT) but whose ``finally`` also publishes through the DB, so a
+#: stuck session can never hold the operator's deactivate forever. Generous on purpose: the cost
+#: of being wrong is the 6.3-hour fan run this whole module exists for, against at most ten
+#: seconds on the operator's click. A client-side bound on a local task, never a printer's
+#: answer, so it is a named constant rather than a record bound.
 _STAND_DOWN_WAIT_S = 10.0
 
 
@@ -211,7 +215,8 @@ async def quiesce_for_teardown(printer_id: int, *, cause: str) -> QuiesceReport:
     printing from its own USB storage with nobody watching; the queue row stays
     ``printing`` until the reconcile that runs on re-activation resolves it.
 
-    The watch goes FIRST and is AWAITED, bounded. ``stand_down``'s cancellation runs the
+    The watch goes FIRST and is AWAITED to its own end, bounded by ``_STAND_DOWN_WAIT_S``
+    (production, restored 2026-10-12). ``stand_down``'s cancellation runs the
     watch task's own ``finally``, which retires the :mod:`cooldown_prep` — plate hold
     released, both cooldown fans commanded OFF — and every one of those publishes needs a
     live client: 2026-09-12, 010-H2S ran its cooldown fans 22 821 s because the session
@@ -219,8 +224,9 @@ async def quiesce_for_teardown(printer_id: int, *, cause: str) -> QuiesceReport:
     SCHEDULES the CancelledError, so the ``finally`` runs on a LATER loop turn while the
     caller deletes the client the instant this returns — the 2026-09-12 probe caught
     exactly that one-millisecond gap on the deactivate path. The wait is non-raising
-    (``asyncio.wait`` collects the cancellation instead of re-raising it), so a watch that
-    will not retire costs a WARNING and the quiesce still runs.
+    (``asyncio.wait`` collects the cancellation instead of re-raising it), so a watch that will not
+    retire within the bound costs a WARNING and the quiesce still runs — the watch's ``finally``
+    publishes through the DB, and an unbounded wait on it would hold the deactivate hostage to it.
 
     The plate's STORED policy is untouched: re-activating the printer calls
     ``eject_cooldown_monitor.reconsider``, which re-arms exactly what was running.

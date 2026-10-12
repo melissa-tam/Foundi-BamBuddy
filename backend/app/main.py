@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
@@ -86,7 +87,7 @@ from backend.app.core.database import async_session, engine, init_db
 from backend.app.core.tasks import spawn_background_task
 from backend.app.core.websocket import ws_manager
 from backend.app.models.smart_plug import SmartPlug
-from backend.app.services import job_terminal, live_reading, notify_dedup, print_reconcile
+from backend.app.services import job_terminal, notify_dedup, print_reconcile, printer_action, printer_events
 from backend.app.services.archive import ArchiveService
 from backend.app.services.archive_purge import archive_purge_service
 from backend.app.services.bambu_ftp import clear_3mf_cache
@@ -376,17 +377,6 @@ _stage22_finish_frames: dict[int, bytes] = {}
 # consumer's RTSP fallback can't collide with the producer's still-in-flight RTSP
 # grab (Bambu printers allow only one RTSP client at a time).
 _stage22_finish_in_flight: dict[int, asyncio.Event] = {}
-
-# printer_id -> the MQTT SESSION we have already reconciled for, so
-# `reconcile_stale_active_prints` runs exactly once per (re)connection
-# (#1542 follow-up — power-cycle ghost prints). A BOOKMARK, not a definition: the
-# session boundary itself is the transport's fact (`PrinterState.connection_epoch`,
-# incremented in `_on_connect`), and this only remembers what this process already did
-# about it. Retiring the old boolean latch onto the epoch also removes its one blind
-# spot — it re-armed only when we OBSERVED a `state.connected = False` callback, so a
-# reconnect whose disconnect callback was suppressed (the stale-reconnect path, which
-# is exactly how the 2026-09-04 outage arrived) left reconciliation disarmed.
-_printer_reconciled_epoch: dict[int, int] = {}
 
 # Track progress milestones for notifications: {printer_id: last_milestone_notified}
 # Milestones are 25, 50, 75. Value of 0 means no milestone notified yet for current print.
@@ -816,64 +806,6 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     """Handle printer status changes - broadcast via WebSocket."""
     logger = logging.getLogger(__name__)
 
-    # Stagger bed-ramp watch (latency Phase E): every status push is the
-    # observation point for a just-started printer's bed reaching target. If this
-    # printer is armed, the policy fires a one-shot ``bed_at_target`` dispatch kick
-    # so the freed stagger slot is admitted immediately instead of at the next
-    # fallback poll. Cheap no-op for un-watched printers; guarded like the Phase A
-    # kick hooks so an observation-side failure never breaks status broadcast.
-    try:
-        from backend.app.services.stagger import stagger_policy
-
-        stagger_policy.on_status_push(printer_id, state)
-    except Exception as _stagger_exc:  # noqa: BLE001
-        logger.debug("stagger on_status_push failed for printer %s: %s", printer_id, _stagger_exc)
-    # Connected-edge reconciliation (#1542 follow-up). When the printer
-    # transitions disconnected → connected — which covers both Bambuddy
-    # startup (no prior connection) and a mid-session MQTT reconnect — fire
-    # `reconcile_stale_active_prints` exactly once for this connection so
-    # the printer's live archive is judged against what the printer runs now
-    # (`services/print_reconcile`): a print that finished during a disconnect
-    # window + a smart-plug power cycle leaves the .3mf on the SD card and the
-    # firmware ghost-replays it on next boot. Reconciliation runs concurrently —
-    # it must not block the WebSocket dedup / broadcast logic below, and the
-    # epoch is bookmarked BEFORE the spawn so concurrent status updates inside
-    # the same connection don't re-trigger reconciliation.
-    #
-    # Wait for the session's FIRST FRESH REPORT (`report_epoch == connection_epoch`),
-    # never merely a known state. `_on_connect` broadcasts IMMEDIATELY after the
-    # broker accepts the connection, BEFORE `_request_push_all` round-trips — and
-    # what it broadcasts is the PREVIOUS session's cached state (nothing is reset on a
-    # disconnect). The old `state.state not in ("", "unknown")` gate (#1679) caught
-    # only the construction defaults of a first connect; on a RE-connect the cache
-    # reads e.g. RUNNING with the old job's id, and the reconcile judged the new
-    # session on the old session's job (2026-09-25). The transport stamps
-    # `report_epoch` at the end of the first report it APPLIES, so this fires on that
-    # very push, once per session.
-    if live_reading.is_fresh(state) and _printer_reconciled_epoch.get(printer_id) != state.connection_epoch:
-        _printer_reconciled_epoch[printer_id] = state.connection_epoch
-        spawn_background_task(
-            reconcile_stale_active_prints(printer_id),
-            name=f"reconcile-stale-prints-{printer_id}",
-        )
-        # The same edge, for the EJECT half of "what happened while we could not see
-        # this printer" (2026-09-12, 001/009-H2S). An eject whose watchdog gave its
-        # verdict — or whose record was rebuilt at startup — has nobody left to retire
-        # it: its terminal echo arrived while the session was down, so the pending sat
-        # registered and every later eject refused `eject_in_flight` for hours. Same
-        # epoch latch, same "once per connection" rule, and a no-op unless the
-        # authority says the eject is unowned, so a live sweep under a running
-        # watchdog is never touched.
-        from backend.app.services.plate_occupancy import plate_occupancy as _edge_occupancy
-
-        if _edge_occupancy.unowned_eject(printer_id):
-            from backend.app.services.eject.monitor import reconcile_pending_eject
-
-            spawn_background_task(
-                reconcile_pending_eject(printer_id),
-                name=f"eject-pending-reconcile-{printer_id}",
-            )
-
     # Device-vs-declared model reconciliation. Evaluated on any connected
     # status change; acted on only at a STATE TRANSITION so the one-shot
     # notification fires once per mismatch (not every tick). An absent device
@@ -995,22 +927,26 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     except Exception:
         pass  # Don't fail status callback if MQTT fails
 
-    # Wire-HMS APPEARANCE EDGES (services/hms_edges), consumed exactly ONCE per push and
-    # fanned out to the edge-triggered STATE consumers below. These five decide farm
-    # STATE off an HMS code — spent_at stamps, a plate gate, a USB cleanup, an
-    # escalation's guidance — and they used to ride ``new_error_codes``, i.e.
-    # notify_dedup's 600 s re-NOTIFY window. That window is an alert policy on a level:
-    # it deliberately calls a code flapping out-and-back inside it ONE continuing
-    # incident, and pre-marks every code standing at restart as already-seen. Both are
-    # right for paging a human and wrong for a state decision — a runout re-appearing
-    # under a NEW job is a second physical exhaustion that must stamp again. Same axis
-    # error as the incident-spawn silent class kept at the bottom of this block (9
-    # runout episodes with no incident, no alert and no log line, 2026-08-09); that one
-    # is fixed by deriving from the LIVE list per push, these by an appearance edge.
+    # The farm lanes that act on a push are SUBSCRIBERS of the printer-event hub
+    # (``services/printer_events``; their order is written once, in ``printer_event_wiring``),
+    # never hand-called here. Two facts are published per push, and this handler is their one
+    # producer:
     #
-    # The tracker owns restart-replay suppression too: its first consumed frame per
-    # printer SEEDS without edging, so a code live when the process first sees the
-    # printer never fires (which is why the spool_respool S1 seed it replaced is gone).
+    # * the wire-HMS APPEARANCE EDGES (``services/hms_edges``), consumed exactly ONCE per push
+    #   (``HmsEdgesAppeared``, when the push edged) — the edge-triggered STATE consumers: the
+    #   runout spent stamps, the USB storage-low sweep, the runout guidance refresh. They used to
+    #   ride ``new_error_codes``, notify_dedup's 600 s re-NOTIFY window, which is an alert policy
+    #   on a level and wrong for a state decision (a runout re-appearing under a NEW job is a
+    #   second exhaustion that must stamp again). The tracker owns restart-replay suppression
+    #   too: its first consumed frame per printer SEEDS without edging;
+    # * the push itself (``StatusReported``) — the per-push samplers: the stagger bed-ramp watch,
+    #   the backup-swap sampler, the AMS-incident wire sampler and the pause-recovery sampler, each
+    #   sync, in-memory and idempotent through its own edge, so each rides every push.
+    #
+    # The session's FIRST FRESH REPORT is not decided here: the transport stamps it once per
+    # session and the hub's ``FirstFreshReport`` drives the one session-start re-evaluation
+    # (``services/session_start``) — the downtime reconcile and the pending-eject reconcile
+    # that this handler used to spawn behind an epoch bookmark included.
     edges = None
     try:
         from backend.app.services import hms_edges
@@ -1018,123 +954,9 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         edges = hms_edges.note_push(printer_id, state)
     except Exception as _ee:  # noqa: BLE001 — edge detection must never crash the status flow
         logging.getLogger(__name__).warning("[HMS-EDGES] edge detection failed for printer %s: %s", printer_id, _ee)
-
     if edges:
-        # Reused-tag re-spool Tier 1, BOTH lanes: a runout HMS code that APPEARED on
-        # this frame stamps spent_at on the exhausted tray's spool, so the reused tag
-        # re-spools automatically on refill instead of mapping to the spent donor. The
-        # unrescued vocabulary (RUNOUT_HMS_CODES) and the firmware's own slot-attributed
-        # AUTO-SWITCH statement are separate lanes with separate attribution rules;
-        # deriving both from the appeared entries lives in the service, which owns the
-        # session and the guard. Thin fire-and-forget hook only.
-        #
-        # Spawned through ``core.tasks`` and NOT a bare ``asyncio.create_task``: asyncio
-        # holds only a WEAK reference to a task whose handle the caller discards, so a
-        # discarded stamp task can be collected mid-await (or dropped at loop shutdown)
-        # and vanish without a traceback — one of the ways spent stamps died silently
-        # while every absence metric read "quiet". The helper keeps the strong reference
-        # and surfaces an uncaught exception under the task's name.
-        try:
-            from backend.app.services.spool_respool import apply_runout_edges
-
-            spawn_background_task(apply_runout_edges(printer_id, edges, state), name=f"runout-edges-p{printer_id}")
-        except Exception as _re:  # noqa: BLE001 — hook must never crash the status flow
-            logging.getLogger(__name__).warning(
-                "[RESPOOL] spent-on-runout hook failed for printer %s: %s", printer_id, _re
-            )
-
-        # USB storage-low capture. The ARRIVAL of the HMS storage-low code triggers the
-        # USB sweep (``usb_storage``): files older than its age floor leave the drive,
-        # recordings and the root files the farm wrote outside the keep-set, over ONE
-        # FTPS session. It pages failures only (space still low after the sweep,
-        # undeletable files, nothing cleanable, an unreachable drive), at most once per
-        # printer per 6 h; a trigger a sweep gate swallows is retried by the
-        # deferred-retry path below.
-        # Fire-and-forget so the slow FTP work never blocks the status flow; the service
-        # never raises (an unreachable drive is a page, never an exception).
-        # Strong-referenced for the same reason as the runout hook above: a long FTPS
-        # sweep is exactly the shape a weakly-held task loses.
-        _new_storage = edges.appeared_full & HMS_STORAGE_LOW_FULL_CODES
-        if _new_storage:
-            try:
-                spawn_background_task(on_storage_low(printer_id, set(_new_storage)), name=f"storage-low-p{printer_id}")
-            except Exception as _se:  # noqa: BLE001 — hook must never crash the status flow
-                logging.getLogger(__name__).warning(
-                    "[USB-STORAGE] storage-low hook failed for printer %s: %s", printer_id, _se
-                )
-
-        # Runout DEMAND-CHANGE guidance refresh (006-H2S 2026-07-26). While a unit sits
-        # ESCALATED on a runout, the firmware can move its demand to a DIFFERENT slot (a
-        # second roll empties, or the operator refilled the wrong one). Recovery's
-        # escalation latch correctly refuses to re-enter — but it also swallowed every
-        # trace of the move, leaving the operator with the original slot in hand for
-        # 12 h. This re-announces the escalation with the FRESH slot; it is GUIDANCE ONLY
-        # and never touches the latch. Orchestration + its own `_guidance_sent` dedup
-        # live in spool_recovery; this is a guarded hook.
-        try:
-            from backend.app.services.spool_recovery import maybe_refresh_runout_guidance
-
-            await maybe_refresh_runout_guidance(printer_id, edges.appeared_full, state)
-        except Exception as _ge:  # noqa: BLE001 — hook must never crash the status flow
-            logging.getLogger(__name__).warning(
-                "[SPOOL-RECOVERY] runout guidance refresh failed for printer %s: %s", printer_id, _ge
-            )
-
-    # Re-spool Tier 1, the firmware's AMS backup swap (a runout it RESCUED). Sampled
-    # HERE, on every status push, and NOT from the AMS-change callback, which is gated on
-    # bambu_mqtt's AMS hash. The switch itself is the toolhead feed state's
-    # ``auto_switched`` event (invariant 16); the sampler applies respool's policy to it
-    # once per event, sync, in-memory and session-free so it can ride this ~1 Hz cadence.
-    # Only an admitted switch pays for a session, fired and forgotten with the Spoolman
-    # gate and the per-job dedup inside it, under THIS push's job — strong-referenced
-    # (Path B is a spent lane too, and a collected confirmer is a missing stamp nobody
-    # can see).
-    try:
-        from backend.app.services.spool_respool import confirm_backup_swaps, sample_status_push
-
-        _departed_trays = sample_status_push(printer_id, state)
-        if _departed_trays:
-            spawn_background_task(
-                confirm_backup_swaps(printer_id, _departed_trays, subtask_id=state.subtask_id),
-                name=f"backup-swap-confirm-p{printer_id}",
-            )
-    except Exception as _bse:  # noqa: BLE001 — sampling must never crash the status flow
-        logging.getLogger(__name__).warning("[RESPOOL] backup-swap sampler failed for printer %s: %s", printer_id, _bse)
-
-    # AMS-incident wire sampler. Sync, in-memory and session-free like the
-    # backup-swap sampler above, and OUTSIDE the "HMS present" branch on purpose: the
-    # two edges it watches are the DISAPPEARANCE of a fault (the firmware stopped
-    # demanding filament) and the printer running again — both of which are pushes
-    # where hms may be empty. It owns the refill auto-resume's second spawn source
-    # and the close that ends a hold whoever resumed the printer, which before the incident store
-    # only the farm's own auto-resume could do (a screen resume left the unit holding
-    # "filament_runout_recovery_failed" forever).
-    try:
-        from backend.app.services.spool_recovery import note_demand_watch
-
-        note_demand_watch(printer_id, state)
-    except Exception as _dwe:  # noqa: BLE001 — sampling must never crash the status flow
-        logging.getLogger(__name__).warning(
-            "[SPOOL-RECOVERY] incident wire sampler failed for printer %s: %s", printer_id, _dwe
-        )
-
-    # Pause-recovery sampler (the 2026-09-04 fleet outage; the plate-check ladder,
-    # 2026-09-29). Same shape and the same placement rationale as the sampler above:
-    # sync, in-memory, session-free, and OUTSIDE the "HMS present" branch because what it
-    # reads — a RECONNECT, the printer's current ``print_error`` dialog — arrives on
-    # pushes that carry no HMS at all. It is the ONLY trigger of both pause causes: at
-    # most one power-loss driver per printer while the firmware's own recovery prompt
-    # stands, the plate-check episode driver on a plate-check pause (or its re-entry after
-    # a restart), and the lost-Z-reference hold for a printer that came back from a FLEET
-    # outage with a part still on its plate.
-    try:
-        from backend.app.services.pause_recovery import note_status_push
-
-        note_status_push(printer_id, state)
-    except Exception as _ple:  # noqa: BLE001 — sampling must never crash the status flow
-        logging.getLogger(__name__).warning(
-            "[PAUSE-RECOVERY] pause-recovery sampler failed for printer %s: %s", printer_id, _ple
-        )
+        await printer_events.publish(printer_events.HmsEdgesAppeared(printer_id=printer_id, edges=edges, state=state))
+    await printer_events.publish(printer_events.StatusReported(printer_id=printer_id, state=state))
 
     # The status key decides ONE thing: whether this push's WebSocket broadcast goes out (the
     # ``if broadcast_due:`` at the end of this handler) — it dedups the card's redraws, and
@@ -1142,8 +964,8 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
     # while it RETURNED here every block after it skipped exactly the pushes a firmware change,
     # a fault edge or a USB unmount lives on (2026-10-10: a runout auto-switch's posture and HMS
     # words arrive on pushes the key reads as unchanged). EVERY block of this handler runs on
-    # EVERY push — the samplers above, the milestones, the HMS lane and the USB lanes below — in
-    # this one order, each idempotent through its own cursor or edge: the samplers' edges, the
+    # EVERY push — the hub's subscribers above, the milestones, the HMS lane and the USB lanes
+    # below — in this one order, each idempotent through its own cursor or edge: the samplers' edges, the
     # milestone cursor, the re-notify ledger (its last-seen is bumped on every push — behind the
     # key, a code standing on a printer whose key held still past the window re-notified as
     # new), the per-code hms_event throttle, the one-shot standing seed, the AMS-fault entry
@@ -1330,18 +1152,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
         # ledger self-bounds (prunes absent-too-long codes) and is per-printer.
         new_error_codes = notify_dedup.new_codes(printer_id, current_error_codes, time.time())
 
-        from backend.app.services.hms_errors import is_notify_suppressed, live_candidates
-        from backend.app.services.spool_recovery import on_ams_fault
-
-        # The ACTIONABLE AMS faults standing now, derived from ALL live HMS entries
-        # through the fault taxonomy — not from ``new_error_codes``. That decoupling is
-        # the fix for the silent class: a code standing at restart (seed_standing marks
-        # it already-seen) or flapping inside the 600 s re-notify window never entered
-        # ``new_error_codes``, so the old spawn never fired and never logged — 9 runout
-        # episodes passed with no incident, no alert and no trace. It gates the
-        # incident spawn below; which codes an incident SPEAKS FOR is the owner's answer
-        # (``spool_recovery.owned_full_codes``), asked in the notify session.
-        _actionable = live_candidates(state)
+        from backend.app.services.hms_errors import is_notify_suppressed
 
         if new_error_codes:
             # Get the actual new errors for the notification.
@@ -1545,26 +1356,9 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
             except Exception as e:
                 logging.getLogger(__name__).warning(f"HMS error notification failed: {e}")
 
-        # Automatic AMS incident ownership: a mechanical feed fault (tangle /
-        # assist-motor overload / failed send-out) PAUSEs a farm print with no
-        # self-recovery; a runout holds for a same-slot refill; a physical fault needs
-        # hands. Spawn the incident machine — it opens the durable incident, routes by
-        # fault class and print origin (farm or foreign), and owns every notification.
-        #
-        # DELIBERATELY OUTSIDE the ``if new_error_codes:`` branch above and fired per
-        # push: gating the spawn on the notification dedup's new-code edge is what made
-        # 9 runout episodes silent (a code standing at restart, or flapping inside the
-        # 600 s window, is never "new"). The service's own entry throttle keeps a
-        # standing fault from re-querying every second; all other gating lives there
-        # too. Guarded fire-and-forget hook only, strong-referenced through ``core.tasks`` like
-        # the hooks above (a discarded bare task can be collected mid-await).
-        if _actionable:
-            try:
-                spawn_background_task(on_ams_fault(printer_id, state), name=f"ams-fault-p{printer_id}")
-            except Exception as _fe:  # noqa: BLE001 — hook must never crash the status flow
-                logging.getLogger(__name__).warning(
-                    "[SPOOL-RECOVERY] AMS fault hook failed for printer %s: %s", printer_id, _fe
-                )
+        # The automatic AMS incident entry (``spool_recovery.on_ams_fault``) is a subscriber of
+        # the printer-event hub (``printer_event_wiring``: every push carrying an actionable fault),
+        # never hand-called here.
 
     # An empty hms list needs no bookkeeping: notify_dedup ages each code out by
     # its own last-seen timestamp, so a flapping code that briefly clears is still
@@ -2469,7 +2263,14 @@ async def on_print_start(printer_id: int, data: dict):
                     light_was_off = not client.state.chamber_light
                     if light_was_off:
                         logger.info("[PLATE CHECK] Turning on chamber light for printer %s", printer_id)
-                        client.set_chamber_light(True)
+                        await printer_action.send(
+                            printer_id,
+                            printer_action.Command(
+                                "ledctrl", lambda live, seq: live.set_chamber_light(True, sequence_id=seq)
+                            ),
+                            actor=printer_action.ACTOR_FARM,
+                            client=client,
+                        )
                         # Wait for light to physically turn on and camera to adjust exposure
                         await asyncio.sleep(2.5)
 
@@ -2490,7 +2291,14 @@ async def on_print_start(printer_id: int, data: dict):
                 # Restore chamber light to original state
                 if light_was_off and client:
                     logger.info("[PLATE CHECK] Restoring chamber light to off for printer %s", printer_id)
-                    client.set_chamber_light(False)
+                    await printer_action.send(
+                        printer_id,
+                        printer_action.Command(
+                            "ledctrl", lambda live, seq: live.set_chamber_light(False, sequence_id=seq)
+                        ),
+                        actor=printer_action.ACTOR_FARM,
+                        client=client,
+                    )
 
                 if not plate_result.needs_calibration and not plate_result.is_empty:
                     # Objects detected - pause the print!
@@ -2499,7 +2307,15 @@ async def on_print_start(printer_id: int, data: dict):
                         f"Confidence: {plate_result.confidence:.0%}, Diff: {plate_result.difference_percent:.1f}%"
                     )
                     client = printer_manager.get_client(printer_id)
-                    if client and client.pause_print():
+                    paused = (
+                        client is not None
+                        and (
+                            await printer_action.send(
+                                printer_id, printer_action.pause(), actor=printer_action.ACTOR_FARM, client=client
+                            )
+                        ).published
+                    )
+                    if paused:
                         logger.info("[PLATE CHECK] Print paused for printer %s", printer_id)
                     else:
                         # Safety-critical: objects are on the plate but the PAUSE
@@ -3358,13 +3174,14 @@ async def on_print_running_observed(printer_id: int, data: dict):
 
 
 async def reconcile_stale_active_prints(printer_id: int) -> int:
-    """The connected-edge hook's body: judge the printer's live archive against what it runs NOW.
+    """The downtime reconcile's body: judge the printer's live archive against what it runs NOW.
 
-    Spawned once per MQTT session by :func:`on_printer_status_change`, on the session's first
-    fresh report. The judging, the gathering and the applying are the binding owner's
-    (``services/print_reconcile``); this hands over the live state and THIS module's full
-    terminal, which the ``ended`` verdict runs bound to the judged archive by id — the service
-    never imports ``main``. Returns the number of archives acted on.
+    Injected into the session start (``services/session_start``, wired by
+    ``printer_event_wiring``) and run once per MQTT session, first, on the session's first fresh
+    report (``printer_events.FirstFreshReport``). The judging, the gathering and the applying are
+    the binding owner's (``services/print_reconcile``); this hands over the live state and THIS
+    module's full terminal, which the ``ended`` verdict runs bound to the judged archive by id —
+    the service never imports ``main``. Returns the number of archives acted on.
     """
     return await print_reconcile.reconcile_printer(
         printer_id, printer_manager.get_status(printer_id), terminal=on_print_complete
@@ -3799,6 +3616,23 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             _raw_status,
             _outcome.verdict,
         )
+    # The terminal, re-published on the printer-event hub (``printer_events.JobTerminal``) from
+    # its ONE entry — so a terminal the downtime reconcile synthesised reaches a lane waiting on
+    # this job exactly as a live one does — once THE outcome is built from the classification
+    # inputs captured above, and before any sink below acts on it. The payload rides as it
+    # arrived (read-only); the outcome's word rides beside it.
+    await printer_events.publish(
+        printer_events.JobTerminal(
+            printer_id=printer_id,
+            status=_raw_status,
+            recorded_status=_outcome.recorded_status,
+            job_id=data.get("subtask_id"),
+            is_eject=_is_eject_job,
+            reconciled=bool(data.get("_reconciled")),
+            archive_id=archive_id,
+            payload=MappingProxyType(dict(data)),
+        )
+    )
     # The upstream sinks (relay, archive, notification, smart plug, timelapse) read the
     # payload's status; they read the OUTCOME's word through it.
     data = {**data, "status": _outcome.recorded_status}
@@ -3835,6 +3669,9 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
                 # A FINISH over an empty toolhead is no repair evidence (011/014-H2S 2026-10-09):
                 # the payload's own measurement, off the same parse the outcome was built from.
                 printed_unfed=_evidence.printed_unfed,
+                # How far the job got — against a repair row's fault layer, the job printed past
+                # the fault (durable, where a restart-wiped motion sighting used to stand).
+                last_layer=_evidence.last_layer_num,
             ),
         )
     except Exception as _ite:  # noqa: BLE001 — incident close must never crash the completion callback
@@ -4164,38 +4001,16 @@ async def on_print_complete(printer_id: int, data: dict, *, archive_id: int | No
             except Exception:
                 pass  # Don't fail if notification fails
 
-            # Handle auto_off_after - power off printer if requested (after cooldown)
+            # Handle auto_off_after: each enabled plug is cut by the smart-plug manager once the
+            # nozzles read below that plug's threshold.
             if queue_auto_off:
                 async with async_session() as db:
                     result = await db.execute(select(SmartPlug).where(SmartPlug.printer_id == printer_id))
                     plugs = list(result.scalars().all())
-                enabled_plugs = [p for p in plugs if p.enabled]
-                if enabled_plugs:
-                    logger.info("Auto-off requested for printer %s, waiting for cooldown...", printer_id)
-
-                    async def cooldown_and_poweroff(pid: int, plug_ids: list[int]):
-                        # Wait for nozzle to cool down
-                        await printer_manager.wait_for_cooldown(pid, target_temp=50.0, timeout=600)
-                        # Re-fetch plugs in new session and turn off each one
-                        async with async_session() as new_db:
-                            for plug_id in plug_ids:
-                                try:
-                                    result = await new_db.execute(select(SmartPlug).where(SmartPlug.id == plug_id))
-                                    p = result.scalar_one_or_none()
-                                    if p and p.enabled:
-                                        service = await smart_plug_manager.get_service_for_plug(p, new_db)
-                                        success = await service.turn_off(p)
-                                        if success:
-                                            logger.info("Powered off printer %s via smart plug '%s'", pid, p.name)
-                                        else:
-                                            logger.warning("Failed to power off plug '%s' for printer %s", p.name, pid)
-                                except Exception as e:
-                                    logger.warning("Failed to power off plug %s for printer %s: %s", plug_id, pid, e)
-
-                    spawn_background_task(
-                        cooldown_and_poweroff(printer_id, [p.id for p in enabled_plugs]),
-                        name=f"cooldown-poweroff-{printer_id}",
-                    )
+                for plug in plugs:
+                    if plug.enabled:
+                        logger.info("Auto-off: plug '%s' for printer %s cuts once cooled", plug.name, printer_id)
+                        smart_plug_manager.schedule_temp_based_off(plug, printer_id, plug.off_temp_threshold)
     except Exception as e:
         logging.getLogger(__name__).warning(f"Queue item update failed: {e}")
 
@@ -5754,7 +5569,7 @@ async def lifespan(app: FastAPI):
     # The order is load-bearing — hydrating an occupied plate notifies its policy, and
     # that notification is what re-arms the watch the restart lost, so a driver wired
     # afterwards would leave every rebuilt gate armless.
-    from backend.app.services import plate_occupancy_store, printer_incidents
+    from backend.app.services import plate_occupancy_store, printer_action, printer_incidents
     from backend.app.services.eject.monitor import wire_policy_driver
 
     plate_occupancy_store.wire_core()
@@ -5763,11 +5578,14 @@ async def lifespan(app: FastAPI):
     # read-and-rebuild (no transition, no notification), and the plate policy driver
     # asks ``printer_incidents.automation_held`` at the moment it arms a watch — so a
     # cache that is still empty here would arm a cooldown, its fans and its dispatch
-    # lane on a printer a human had declared held before the restart. The AMS sweep
-    # (``rearm_incidents_on_startup``) stays where it is and rebuilds this again after
-    # its own closes; running it twice costs one query.
+    # lane on a printer a human had declared held before the restart. This is THE one
+    # rebuild: every later close or open maintains the projection itself.
     try:
         async with async_session() as _inc_db:
+            # The record's outstanding actions first: the incident projection's pending command is
+            # derived from them. Pure reads — each outstanding action is re-read on its printer's
+            # first fresh report (``session_start``), never decided here.
+            await printer_action.rehydrate(_inc_db)
             _open_holds = await printer_incidents.rehydrate(_inc_db)
         if _open_holds:
             logging.getLogger(__name__).info(
@@ -5844,32 +5662,19 @@ async def lifespan(app: FastAPI):
     except Exception as _hpe:  # noqa: BLE001 — hygiene must never block startup
         logging.getLogger(__name__).warning("HMS vocabulary prune failed: %s", _hpe)
 
-    # AMS incidents: reconcile holds left open by the restart, then rehydrate
-    # the printer-card projection. A printer now running was resumed while we were
-    # down (close it — a stale open row would block every future incident there); one
-    # still PAUSEd keeps its hold and its hourly reminder. Fully self-guarded.
-    from backend.app.services.spool_recovery import rearm_incidents_on_startup
+    # The printer-event hub's subscribers (``services/printer_event_wiring``, the one place
+    # their order is written), wired BEFORE any printer connects so no first report lands with
+    # nobody listening. Nothing in this lifespan decides anything about a printer: it only
+    # REHYDRATES durable facts (the incident projection, the plates, the quarantine set, above).
+    # Every evidence decision a restart owes — an open hold closed or re-entered, a resume owed,
+    # a plate-check decision deadline, the downtime reconcile, a pending eject's reconcile, the
+    # lost-Z arm — runs per printer on that printer's FIRST FRESH REPORT
+    # (``services/session_start``), once it has said what it is doing NOW. Decided here, before
+    # ``init_printer_connections``, every printer read as unreported: the 001-H2S hold stood all
+    # night over a toolhead the wire reported fed (2026-10-11).
+    from backend.app.services import printer_event_wiring
 
-    await rearm_incidents_on_startup()
-
-    # Plate-check decision holds (operator ruling 2026-10-05): a hold's deadline is a timer —
-    # process memory — so re-arm it from the row's ``escalated_at`` + the setting, after the
-    # projection rehydrate above; a window that ran out during the downtime stops at once.
-    from backend.app.services.pause_recovery import rearm_decision_deadlines
-
-    await rearm_decision_deadlines()
-
-    # Reconcile ejects that reached terminal (or failed) during the downtime window:
-    # one background task per hydrated printer, each polling until its printer
-    # connects and then acting on the missed outcome (resolves the eject on FINISH,
-    # quarantines on FAILED, never clears a gate on guesswork). Lives in the eject
-    # monitor beside the watches it owns. The cooldown re-arm that used to run here is
-    # gone: ``hydrate()`` decided each rebuilt plate's POLICY, and the policy driver
-    # armed the watch for it, so a gate can no longer come back from a restart with
-    # nothing looking after it.
-    from backend.app.services.eject.monitor import reconcile_pending_ejects_on_startup
-
-    spawn_background_task(reconcile_pending_ejects_on_startup(), name="eject-pending-reconcile")
+    printer_event_wiring.wire(downtime_reconcile=reconcile_stale_active_prints)
 
     # Layer change callback for external camera timelapse
     async def on_layer_change(printer_id: int, layer_num: int):
@@ -6133,6 +5938,7 @@ async def lifespan(app: FastAPI):
         logging.warning("Failed to shut down camera broadcasters: %s", e)
     stop_auth_cleanup()
     printer_manager.disconnect_all()
+    printer_event_wiring.unwire()
     await close_spoolman_client()
 
     # Stop all virtual printer services

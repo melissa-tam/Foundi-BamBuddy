@@ -6,6 +6,8 @@ that could cause runtime errors but aren't caught by normal tests.
 """
 
 import ast
+import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -304,13 +306,13 @@ _OPERATOR_STOP_CALLERS = {
 #                           it on the backup spool (operator ruling 2026-09-29, 013-H2S
 #                           incidents 410/411). Published by the ``_LEVERS`` table alone
 #                           (``TestRecoveryDriverOwnership``).
-# ``printer_manager`` is the per-printer facade that forwards to the client. Every route's
-# bare stop is gone — an operator's stop goes through ``print_control`` so it carries its
-# request.
+# Every route's bare stop is gone — an operator's stop goes through ``print_control`` so it
+# carries its request. Since 2026-10-11 a lane's stop is a ``printer_action.stop`` COMMAND sent
+# through the record (the one caller of the client's ``stop_print`` — ``TestPrinterActionOwnership``),
+# so the lane's decision is its reference to that builder.
 _RAW_STOP_CALLERS = {
     ("services", "print_control.py"),
     ("services", "eject", "remote.py"),
-    ("services", "printer_manager.py"),
     ("services", "pause_recovery.py"),
     ("services", "spool_recovery.py"),
 }
@@ -340,17 +342,19 @@ def _scan_operator_stops(py_file: Path) -> list[tuple[str, int]]:
 
 
 def _scan_raw_stops(py_file: Path) -> list[tuple[str, int]]:
-    """Every CALL of ``stop_print`` (the method or a function of that name)."""
+    """Every reference to the record's stop COMMAND (``printer_action.stop``) — called or handed to a
+    table — outside the record itself, which builds it."""
+    if _relative_parts(py_file) == _PRINTER_ACTION:
+        return []
     tree = ast.parse(py_file.read_text(encoding="utf-8"))
-    hits: list[tuple[str, int]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-        if name == "stop_print":
-            hits.append(("stop_print()", node.lineno))
-    return hits
+    return [
+        ("printer_action.stop", node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "stop"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "printer_action"
+    ]
 
 
 class TestRawStopOwnership:
@@ -390,10 +394,11 @@ class TestRawStopOwnership:
 # are named here with the reason each is not a resume onto air:
 _RESUME_CALLERS: dict[tuple[str, ...], dict[str, str]] = {
     ("services", "spool_recovery.py"): {
-        # THE resume of a paused print (K9): the verb's publisher and the refill driver's resume
-        # once its load reached the toolhead. Every route resume, the HMS dialog's resume buttons,
-        # the refill lane and the repair self-heal publish through it.
-        "_plain_resume": "the K9 body",
+        # THE resume of a paused print (K9): the verb's publish and the refill driver's resume once
+        # its load reached the toolhead. Every route resume, the HMS dialog's resume buttons, the
+        # refill lane and the repair self-heal publish through it.
+        "resume_paused_print": "the K9 body",
+        "_refill_then_resume": "the refill driver's resume, once its load reached the toolhead",
         # The release ladder's verbs (``resume``, ``resume_then_pause``): releases INSIDE the
         # recovery driver's own segment, each read by THE reader (``_read_after``), which never
         # reads a print running on nothing as a success; withheld outright over an extruder the
@@ -409,8 +414,15 @@ _RESUME_CALLERS: dict[tuple[str, ...], dict[str, str]] = {
     ("services", "pause_recovery.py"): {
         # The firmware's power-loss prompt (``0300_8007``): the plain resume is the prompt's answer
         # — the firmware's own post-reboot recovery — and K7 excludes the prompt (a ``tray_now``
-        # read across a reboot is the reset, not a measurement).
+        # read across a reboot is the reset, not a measurement). Sent as an action the record
+        # answers (2026-10-11), from the driver's own body.
         "_resume_after_power_loss": "the power-loss prompt's answer",
+    },
+    ("services", "printer_action.py"): {
+        # The record's two resume COMMANDS: the only callers of the client's ``resume_print``
+        # outside the client, each published under its action's id (``TestPrinterActionOwnership``).
+        "resume": "the record's resume command",
+        "power_loss_resume": "the record's power-loss resume command",
     },
 }
 
@@ -421,10 +433,20 @@ class TestResumeOwnership:
 
     @staticmethod
     def _resume_publishes() -> set[tuple[tuple[str, ...], str]]:
+        """Every call of the client's ``resume_print``, and every reference to the record's resume
+        COMMANDS (``printer_action.resume`` / ``power_loss_resume``) outside the record."""
         found: set[tuple[tuple[str, ...], str]] = set()
         for parts, tree in _app_trees():
             for node, scope in _scoped_nodes(tree):
-                if isinstance(node, ast.Call) and _called(node.func)[1] == "resume_print":
+                is_call = isinstance(node, ast.Call) and _called(node.func)[1] == "resume_print"
+                is_command = (
+                    parts != _PRINTER_ACTION
+                    and isinstance(node, ast.Attribute)
+                    and node.attr in ("resume", "power_loss_resume")
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "printer_action"
+                )
+                if is_call or is_command:
                     found.add((parts, scope[-1] if scope else "<module>"))
         return found
 
@@ -457,7 +479,7 @@ class TestResumeOwnership:
             node
             for node, scope in _scoped_nodes(tree)
             if isinstance(node, ast.Call)
-            and _called(node.func)[1] == "execute_hms_action"
+            and _called(node.func) == ("printer_action", "dialog_press")
             and scope[-1:] == ("_resume_button",)
         ]
         assert len(presses_in_the_resume_button) == 1  # the press handed to the verb
@@ -475,10 +497,11 @@ class TestResumeOwnership:
         in flight — appear together nowhere else in the app as a refill decision; every reader reads
         the VERDICT. Its readers, each with its reason: the resume verb (T3), the refill driver at its
         publish, the give-up (T3 — would a person's Resume print air; it kept a private subset of the
-        exclusions until 2026-10-10), the restart re-entry and the per-push detectors (T2 / T4), all in
-        ``spool_recovery``; and the status frame's ``toolhead.refill_reason`` (T3 — what a Resume would
-        do, so the card never re-derives K7). The settle rule (``pending_settles``) is read by the
-        verdict and the driver's own waits only."""
+        exclusions until 2026-10-10), the restart re-entry, the one "is this print on air the farm acts on"
+        read (``_prints_on_air``, T4 — the air stop, the jam driver's step 1, the reader's air arm and the
+        per-push detector D2 ask it), all in ``spool_recovery``; and the hold
+        chip (``hold_chip``, T3 — what a Resume would do, so the card never re-derives K7). The settle
+        rule (``pending_settles``) is read by the verdict and the driver's own waits only."""
         found: set[tuple[tuple[str, ...], str]] = set()
         settle_readers: set[tuple[tuple[str, ...], str]] = set()
         give_up_calls: set[str] = set()
@@ -494,22 +517,24 @@ class TestResumeOwnership:
                 elif name == "pending_settles":
                     settle_readers.add((parts, scope[-1] if scope else "<module>"))
         verdict = ("services", "refill_verdict.py")
-        manager = ("services", "printer_manager.py")
         assert found == {
             (_SPOOL_RECOVERY, "resume_paused_print"),
             (_SPOOL_RECOVERY, "_refill_then_resume"),
             (_SPOOL_RECOVERY, "_give_up"),
             (_SPOOL_RECOVERY, "_reentered_trigger"),
-            (_SPOOL_RECOVERY, "_sample_toolhead"),
-            (manager, "toolhead_payload"),
+            (_SPOOL_RECOVERY, "_prints_on_air"),
+            (("services", "hold_chip.py"), "_hold_chip"),
         }
         # The give-up composes none of the exclusions itself: it asks the verdict.
         assert not give_up_calls & {"ams_mid_filament_change", "toolhead_feed", "reads_live"}, give_up_calls
+        # Since 2026-10-11 the settle rule is the outcome leaf's (``command_outcome.pending_settles``),
+        # and a farm command that ran after the hand-over reaches the detector as the RECORD's answer
+        # (``spool_recovery.on_action_answered``), never a per-push settle reading.
         assert settle_readers == {
             (verdict, "refill_owed"),
             (_SPOOL_RECOVERY, "_await_pending_command"),
-            (_SPOOL_RECOVERY, "_settle_pending"),
-            (_SPOOL_RECOVERY, "_sample_toolhead"),
+            # D2's settle of a pending command the toolhead shows ran (T2 under a RUNNING print).
+            (_SPOOL_RECOVERY, "_ran_farm_motion"),
         }
 
 
@@ -745,6 +770,28 @@ class TestRequeueOwnership:
                 "NEXT in line and applies the run gate (a paused run stages it, an ended run "
                 "cancels it) — the storage transition alone does neither."
             )
+
+    def test_an_unstarted_claim_is_returned_only_on_the_starts_answer(self):
+        """``requeue.return_to_queue`` (the one verb over ``release_unstarted_claim``) has exactly two
+        callers (2026-10-11, owner 9): ``services/dispatch_start`` — the START's answer on the record
+        (refused / void / taken over, or a claim with no start the session's first report shows never
+        started), and the start's self-heal bound the record counts (2026-10-12: production's Phase A / B,
+        ``dispatch_start.on_self_heal_due``) — and ``services/print_scheduler``'s own unwinds of a dispatch
+        it is still making (the refused commit, a start frame that never left). A third caller is a claim
+        returned on something else — a lane's own clock (the old watchdog task, the dead-claim watch) was
+        exactly that."""
+        allowed = {("services", "dispatch_start.py"), ("services", "print_scheduler.py"), _REQUEUE_OWNER}
+        callers = sorted(
+            {
+                "/".join(parts)
+                for parts, tree in _app_trees()
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and _called_attr(node) == "return_to_queue"
+            }
+        )
+        strays = [c for c in callers if tuple(c.split("/")) not in allowed]
+        assert strays == [], f"return_to_queue called outside the start's answer and the dispatcher: {strays}"
+        assert {"services/dispatch_start.py", "services/print_scheduler.py"} <= set(callers)
 
     def test_only_the_requeue_owner_writes_lineage(self):
         strays = [
@@ -1073,9 +1120,6 @@ _JOB_ID_COMPARISONS: dict[tuple[str, str], str] = {
     ),
     ("services/spool_recovery.py", "_resolve_farm_item"): "SQL filter: the unit an echoed job id names",
     ("services/usage_tracker.py", "_resolve_run_item"): "SQL filter: tier 1, the unit the terminal's echo names",
-    ("services/print_scheduler.py", "PrintScheduler._watchdog_print_start"): (
-        "change detection of the printer's OWN echo across the dispatch (did it flip?), not two jobs compared"
-    ),
     ("services/printer_incidents.py", "find_closed"): "SQL filter: the closed rows of one (printer, job, fingerprint)",
     ("services/printer_incidents.py", "count_resolved"): "SQL filter: the recovered rows of one job",
 }
@@ -1241,7 +1285,7 @@ class TestPrintRecordResolution:
         for site in (
             incident_resolution._repair_job_terminal,  # noqa: SLF001
             incident_resolution._held_job_paused,  # noqa: SLF001
-            spool_recovery._takeover,  # noqa: SLF001
+            spool_recovery._driver_reading,  # noqa: SLF001
         ):
             assert "same_job" in _source_of(site), site.__name__
 
@@ -1485,20 +1529,32 @@ class TestUnitTerminalOwnership:
 # --- The recovery driver's single owners (2026-09-23, the wedge release ladder) -------
 
 _SPOOL_RECOVERY = ("services", "spool_recovery.py")
-_AMS_COMMAND = ("services", "ams_command.py")
+_COMMAND_OUTCOME = ("services", "command_outcome.py")
+_PRINTER_ACTION = ("services", "printer_action.py")
 _PRINTER_INCIDENTS = ("services", "printer_incidents.py")
 
 # The frames a release verb publishes. In ``spool_recovery`` they are published by the
-# lever table's own lambdas, by THE reader's pause arms, and by the K9 resume of a paused
-# print (2026-10-10 — a different feature from the ladder: ``_plain_resume``, the one plain
-# resume of the verb and the refill driver, which replaced the evidence lanes' deleted
-# ``_resume_after_evidence``; and ``_stop_air_print``, the refill's one pause — T4's first
-# act on a print running onto an empty toolhead, and its answer to its own resume reading
-# RUNNING with nothing fed) — and nowhere else, so no second reading of a verb's effect can
-# grow beside the reader. The restart rung's ``stop_print`` is one of them, and its home is
-# narrower still: the table alone (``test_the_restart_stop_is_published_by_its_rung_alone``).
-_RELEASE_FRAMES = {"resume_print", "pause_print", "ams_control", "clean_print_error", "stop_print"}
-_RELEASE_FRAME_SCOPES = {"_LEVERS", "_read_after", "_plain_resume", "_stop_air_print"}
+# lever table's own lambdas, by the K9 resume of a paused print (2026-10-10 — a different
+# feature from the ladder: ``_plain_resume``, the one plain resume of the verb and the refill
+# driver, which replaced the evidence lanes' deleted ``_resume_after_evidence``), by THE farm
+# pause, ``_farm_pause`` (2026-10-11: the one pause body — THE reader's pause arms pause through it),
+# and by THE air stop, ``_stop_printing_on_air`` (2026-10-12, operator ruling: a print that printed a
+# layer on air is STOPPED and retried, never paused — the jam driver's step 1, the reader's air arm and
+# the refill episode's T4 all stop through it) — and nowhere else, so no second reading of a verb's
+# effect can grow beside the reader. The two ``stop_print`` homes are narrower still: the restart rung's
+# is the table alone (``test_the_restart_stop_is_published_by_its_rung_alone``), the air stop's its owner
+# alone (``test_the_air_stop_is_published_by_its_owner_alone``).
+# Since 2026-10-11 each frame is the record's COMMAND (``printer_action.resume`` / ``pause`` /
+# ``ams_control`` / ``clean_print_error`` / ``stop``), sent through the record; the K9 resume is
+# ``resume_paused_print`` and the refill driver's ``_refill_then_resume``.
+_RELEASE_FRAMES = {"resume", "pause", "ams_control", "clean_print_error", "stop"}
+_RELEASE_FRAME_SCOPES = {
+    "_LEVERS",
+    "_farm_pause",
+    "_stop_printing_on_air",
+    "resume_paused_print",
+    "_refill_then_resume",
+}
 
 
 def _called(func: ast.expr) -> tuple[str | None, str | None]:
@@ -1548,26 +1604,28 @@ class TestRecoveryDriverOwnership:
     """ONE owner per fact of the recovery driver. SOURCE pins, like their neighbours: every
     failure they catch is a well-formed second copy that every behaviour test passes."""
 
-    def test_no_answer_is_re_judged_from_a_posture_outside_ams_command(self):
-        """``ams_command.classify`` is THE reading of a command's answer, and the posture is
-        its private key: nothing outside ``ams_command`` may read ``posture()`` or re-derive
-        a verdict from a mid-change posture set (``MID_CHANGE_POSTURES`` is deleted) — the
-        feeder question is ``spool_recovery._feeding_position``'s."""
+    def test_no_answer_is_re_judged_from_a_posture_outside_the_outcome_leaf(self):
+        """``command_outcome.classify`` is THE reading of a motion command's answer, and the posture
+        is its private key: nothing outside the leaf may read ``posture()`` — except the record
+        (``printer_action``), which STORES the posture a command was sent into (the action's
+        ``entry``) and never reads an answer off it — or re-derive a verdict from a mid-change posture
+        set (``MID_CHANGE_POSTURES`` is deleted). The feeder question is
+        ``spool_recovery._feeding_position``'s."""
         strays: list[str] = []
         for parts, tree in _app_trees():
-            if parts == _AMS_COMMAND:
+            if parts in (_COMMAND_OUTCOME, _PRINTER_ACTION):
                 continue
             posture_imported = any(
                 isinstance(n, ast.ImportFrom)
-                and (n.module or "").endswith("ams_command")
+                and (n.module or "").endswith("command_outcome")
                 and any(alias.name == "posture" for alias in n.names)
                 for n in ast.walk(tree)
             )
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call):
                     owner, name = _called(node.func)
-                    if name == "posture" and (owner == "ams_command" or (owner is None and posture_imported)):
-                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} calls ams_command.posture()")
+                    if name == "posture" and (owner == "command_outcome" or (owner is None and posture_imported)):
+                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} calls command_outcome.posture()")
                 if (isinstance(node, ast.Name) and node.id == "MID_CHANGE_POSTURES") or (
                     isinstance(node, ast.Attribute) and node.attr == "MID_CHANGE_POSTURES"
                 ):
@@ -1575,7 +1633,7 @@ class TestRecoveryDriverOwnership:
         assert not strays, "An AMS command's answer is re-judged from its posture:\n" + "\n".join(strays)
 
         # Liveness: the classifier still keys its rows by the posture it owns.
-        (tree,) = [t for parts, t in _app_trees() if parts == _AMS_COMMAND]
+        (tree,) = [t for parts, t in _app_trees() if parts == _COMMAND_OUTCOME]
         assert any(isinstance(n, ast.FunctionDef) and n.name == "posture" for n in ast.walk(tree))
         assert not any(isinstance(n, ast.Name) and n.id == "MID_CHANGE_POSTURES" for n in ast.walk(tree))
 
@@ -1631,17 +1689,22 @@ class TestRecoveryDriverOwnership:
         assert found == {"note_step", "answer_step"}
 
     def test_the_release_frames_have_one_publisher_per_role(self):
-        """In ``spool_recovery`` a release frame (resume / pause / ams_control /
-        clean_print_error) is published by the lever table's lambdas, THE reader's pause
-        arms (``_read_after``) and the K9 resume of a paused print (``_plain_resume``, its
-        refill's pause ``_stop_air_print``) — nowhere else."""
+        """In ``spool_recovery`` a release frame (the record's resume / pause / ams_control /
+        clean_print_error / stop command) is built by the lever table, the K9 resume of a paused print
+        (``resume_paused_print``), the refill driver's resume (``_refill_then_resume``), THE farm
+        pause (``_farm_pause`` — every pause the module publishes) and THE air stop
+        (``_stop_printing_on_air``) — nowhere else."""
         (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
         seen: set[str] = set()
         strays: list[str] = []
         for node, scope in _scoped_nodes(tree):
-            if not isinstance(node, ast.Call):
+            if not (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "printer_action"
+            ):
                 continue
-            _owner, name = _called(node.func)
+            name = node.attr
             if name not in _RELEASE_FRAMES:
                 continue
             home = next((s for s in scope if s in _RELEASE_FRAME_SCOPES), None)
@@ -1655,15 +1718,21 @@ class TestRecoveryDriverOwnership:
     def test_the_restart_stop_is_published_by_its_rung_alone(self):
         """The driver ends a job ONLY through the last rung of ``_LEVERS`` (operator ruling
         2026-09-29) — never from a reader arm or another lane — so the stop is pulled by the
-        rung's own pull rule (a farm unit, nothing deposited) and read by THE reader."""
+        rung's own pull rule (a farm unit, nothing deposited) and read by THE reader. The module's one
+        other ``print.stop`` is the air stop's (2026-10-12), pinned beside this one
+        (:meth:`test_the_air_stop_is_published_by_its_owner_alone`)."""
         (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
         homes = [
             (node.lineno, scope)
             for node, scope in _scoped_nodes(tree)
-            if isinstance(node, ast.Call) and _called(node.func)[1] == "stop_print"
+            if isinstance(node, ast.Attribute)
+            and node.attr == "stop"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "printer_action"
         ]
-        assert len(homes) == 1, f"spool_recovery must publish print.stop exactly once, found {homes}"
-        assert homes[0][1] == ("_LEVERS",), f"the restart stop is published outside the lever table: {homes}"
+        assert sorted(scope[-1] for _line, scope in homes) == ["_LEVERS", "_stop_printing_on_air"], (
+            f"spool_recovery must publish print.stop exactly twice — the restart rung and the air stop: {homes}"
+        )
         # ...and it is the ``publish`` of the rung keyed ``FAULT_RESTART_STEP`` — the one rung
         # whose pull rule requires a farm unit and nothing deposited, not any other row.
         table = next(
@@ -1681,10 +1750,62 @@ class TestRecoveryDriverOwnership:
             for key, value in zip(table.keys, table.values, strict=True)
             if isinstance(key, ast.Name) and key.id == "FAULT_RESTART_STEP"
         ]
-        publish = next(kw.value for kw in spec.keywords if kw.arg == "publish")
-        assert any(
-            isinstance(node, ast.Call) and _called(node.func)[1] == "stop_print" for node in ast.walk(publish)
-        ), "the restart stop is not _LEVERS[FAULT_RESTART_STEP].publish"
+        command = next(kw.value for kw in spec.keywords if kw.arg == "command")
+        assert any(isinstance(node, ast.Attribute) and node.attr == "stop" for node in ast.walk(command)), (
+            "the restart stop is not _LEVERS[FAULT_RESTART_STEP].command"
+        )
+
+    def test_the_air_stop_is_published_by_its_owner_alone(self):
+        """A print found on AIR is STOPPED through ONE function (operator ruling 2026-10-12: "printing on
+        air = ruined print already"), ``_stop_printing_on_air`` — the jam driver's step 1, the reader's air
+        arm and the refill episode's T4 all call it, and nothing else in ``spool_recovery`` publishes a
+        stop beside the restart rung's. Inside it, the step the terminal classifier reads
+        (``AirStopStep`` → ``printer_incidents.AIR_STOP_STEP`` → ``PAYLOAD_AIR_STOP``, the ``air_stop``
+        verdict) is noted on the ledger BEFORE the frame goes out, so the terminal never meets a
+        projection that does not say the farm sent it; and the old pause on air is gone."""
+        (tree,) = [t for parts, t in _app_trees() if parts == _SPOOL_RECOVERY]
+        owner = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_stop_printing_on_air"
+        )
+        stops = [
+            node
+            for node in ast.walk(owner)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "stop"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "printer_action"
+        ]
+        assert len(stops) == 1, "the air stop publishes print.stop exactly once"
+        notes = [
+            node.lineno
+            for node in ast.walk(owner)
+            if isinstance(node, ast.Call)
+            and _called(node.func)[1] == "note"
+            and any(_called(arg.func) == ("AirStopStep", "draft") for arg in node.args if isinstance(arg, ast.Call))
+        ]
+        publishes = [
+            node.lineno
+            for node in ast.walk(owner)
+            if isinstance(node, ast.Call) and _called(node.func) == ("printer_action", "publish")
+        ]
+        assert len(notes) == 1 and len(publishes) == 1 and notes[0] < publishes[0], (
+            "the air stop's step must be noted on the ledger before its frame is published"
+        )
+        # Every caller is one of the three air exits the ruling names.
+        callers = {
+            scope[-1]
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Call) and _called(node.func) == (None, "_stop_printing_on_air")
+        }
+        assert callers == {"_drive_recovery", "_read_after", "_refill_episode", "_refill_then_resume"}, callers
+        # The step the classifier reads is spelled once, by the store.
+        entry = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "AirStopStep")
+        assert any(isinstance(n, ast.Name) and n.id == "AIR_STOP_STEP" for n in ast.walk(entry))
+        source = (BACKEND_DIR / "services" / "spool_recovery.py").read_text(encoding="utf-8")
+        for gone in ("_pause_on_air", "_air_paused", "AirPause", "air_pause_refused"):
+            assert gone not in source, f"{gone} came back: a print on air is stopped, never paused"
 
     def test_the_restart_rung_reads_the_deposit_predicate_and_no_peak(self):
         """ "Has this job deposited anything" is ``plate_occupancy.DepositEvidence``'s one
@@ -2217,7 +2338,7 @@ class TestDepositEvidenceConstruction:
                 if parts == _PLATE_OCCUPANCY and name == "cls" and scope[:1] == ("DepositEvidence",):
                     builders.add(scope[-1])
         assert not strays, "DepositEvidence is constructed outside its classmethods:\n" + "\n".join(strays)
-        assert builders == {"from_terminal_payload", "unknown", "live"}
+        assert builders == {"from_terminal_payload", "unknown", "live", "recorded"}
 
 
 class TestLineageWalkOwnership:
@@ -3429,9 +3550,17 @@ class TestPlateCheckDialogOwnership:
     _DIALOG_PRESSERS = {("api", "routes", "printers.py"), _PAUSE_RECOVERY}
 
     def test_the_dialog_is_pressed_only_by_the_route_and_the_plate_check_lane(self):
-        pressers = {parts for parts, _scope, _node in _calls_named("execute_hms_action")}
+        """A press is the record's ``dialog_press`` command (2026-10-11): the client's
+        ``execute_hms_action`` is called by the record alone, and the command by the two pressers."""
+        frame_callers = {parts for parts, _scope, _node in _calls_named("execute_hms_action")}
+        assert frame_callers == {_PRINTER_ACTION}, f"execute_hms_action is called off the record: {frame_callers}"
+        pressers = {
+            parts
+            for parts, _scope, node in _calls_named("dialog_press")
+            if _called(node.func) == ("printer_action", "dialog_press")
+        }
         strays = pressers - self._DIALOG_PRESSERS
-        assert not strays, f"execute_hms_action is called outside the allowlisted pressers: {sorted(strays)}"
+        assert not strays, f"a dialog is pressed outside the allowlisted pressers: {sorted(strays)}"
         # Liveness: both allowlisted pressers still press.
         assert pressers == self._DIALOG_PRESSERS
 
@@ -3501,3 +3630,1322 @@ class TestPlateCheckDialogOwnership:
                 assert scope == ("on_plate_cleared",), f"a table-verdict close outside on_plate_cleared: {scope}"
         # The driver's sources, all of them, and both still there.
         assert constants == {"RESOLVE_RECHECK_PASSED", "RESOLVE_HANDED_OVER"}
+
+
+# --- the printer-event hub (2026-10-11): one producer per event, one composition root -----------
+
+_EVENT_PUBLISHERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "CommandAcked": (("services", "printer_manager.py"), ("PrinterManager", "connect_printer", "on_command_ack")),
+    "FeedEventReported": (("services", "printer_manager.py"), ("PrinterManager", "connect_printer", "on_feed_event")),
+    "FirstFreshReport": (
+        ("services", "printer_manager.py"),
+        ("PrinterManager", "connect_printer", "on_session_report"),
+    ),
+    # 2026-10-12: the session's end (the online clock's offline edge) and a self-heal bound's pass.
+    "SessionLost": (("services", "printer_manager.py"), ("PrinterManager", "connect_printer", "on_session_lost")),
+    "StatusReported": (("main.py",), ("on_printer_status_change",)),
+    "HmsEdgesAppeared": (("main.py",), ("on_printer_status_change",)),
+    "JobTerminal": (("main.py",), ("on_print_complete",)),
+    "ActionAnswered": (("services", "printer_action.py"), ("_answer",)),
+    "SelfHealDue": (("services", "printer_action.py"), ("_pass_bound",)),
+}
+
+
+class TestPrinterEventOwnership:
+    """``services/printer_events`` RE-PUBLISHES the producers it names, never a second copy of one.
+
+    * every event class is constructed at exactly ONE site — the producer's own (the registry's
+      closure for a client fact, main's two handlers for the status push, its HMS edges and the
+      terminal) — so a second publisher of a fact is a red pin, not a race;
+    * ``printer_events.publish`` is called from those producers alone;
+    * ``printer_events.subscribe`` is called only by the composition root
+      (``printer_event_wiring``), so the ORDER every subscriber runs in is written in one place;
+    * ``hms_edges.note_push`` — the edge tracker that consumes a frame — has one caller, main's
+      status handler, whose result the hub re-publishes;
+    * the epoch bookmark the session-start subscriber replaced is gone.
+
+    2026-10-12 (operator ruling: "if it was self heal, it should stay self heal … not rely on timers
+    only"): two producers joined, each with ONE site — ``SessionLost`` (the client's session end, built in
+    the registry's closure like the other client facts) and ``SelfHealDue`` (a self-heal bound's first
+    pass, built and published by the record's ``_pass_bound`` alone).
+    """
+
+    def test_every_event_is_built_at_its_producer_alone(self):
+        sites: dict[str, set[tuple[tuple[str, ...], tuple[str, ...]]]] = {name: set() for name in _EVENT_PUBLISHERS}
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if isinstance(node, ast.Call):
+                    name = _called(node.func)[1]
+                    if name in sites:
+                        sites[name].add((parts, scope))
+        assert sites == {name: {site} for name, site in _EVENT_PUBLISHERS.items()}, sites
+
+    def test_publish_is_called_by_the_producers_alone(self):
+        calls: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        for parts, tree in _app_trees():
+            if parts == ("services", "printer_events.py"):
+                continue
+            for node, scope in _scoped_nodes(tree):
+                if isinstance(node, ast.Call) and _called(node.func) == ("printer_events", "publish"):
+                    calls.add((parts, scope))
+        assert calls == {
+            (("services", "printer_manager.py"), ("PrinterManager", "_emit")),
+            (("main.py",), ("on_printer_status_change",)),
+            (("main.py",), ("on_print_complete",)),
+            (("services", "printer_action.py"), ("_answer",)),
+            (("services", "printer_action.py"), ("_pass_bound",)),
+        }, calls
+
+    def test_subscribe_is_called_by_the_composition_root_alone(self):
+        calls: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        for parts, tree in _app_trees():
+            if parts == ("services", "printer_events.py"):
+                continue
+            for node, scope in _scoped_nodes(tree):
+                if isinstance(node, ast.Call) and _called(node.func) == ("printer_events", "subscribe"):
+                    calls.add((parts, scope))
+        assert calls == {(("services", "printer_event_wiring.py"), ("wire",))}, calls
+
+    def test_the_edge_tracker_has_one_caller(self):
+        calls: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if isinstance(node, ast.Call) and _called(node.func)[1] == "note_push":
+                    calls.add((parts, scope))
+        assert calls == {(("main.py",), ("on_printer_status_change",))}, calls
+
+    def test_the_reconnect_bookmark_is_gone(self):
+        source = (BACKEND_DIR / "main.py").read_text(encoding="utf-8")
+        assert "_printer_reconciled_epoch" not in source
+
+
+# The per-session evidence decisions: each runs ONLY from the session start, on a printer's first
+# fresh report — never from the lifespan, before the printer has said anything.
+_SESSION_START_RUN = (("services", "session_start.py"), ("SessionStart", "_run"))
+_SESSION_DECISIONS: dict[str, frozenset[tuple[tuple[str, ...], tuple[str, ...]]]] = {
+    "reevaluate_session": frozenset({_SESSION_START_RUN}),
+    "rearm_decision_deadlines": frozenset({_SESSION_START_RUN}),
+    "note_session_start": frozenset({_SESSION_START_RUN}),
+    # The eject reconcile has its second, lost-echo trigger on the scheduler tick (``farm_stall``).
+    "reconcile_pending_eject": frozenset(
+        {_SESSION_START_RUN, (("services", "farm_stall.py"), ("_reconcile_unowned_ejects",))}
+    ),
+}
+
+
+class TestSessionStartOwnership:
+    """Owner 7: a printer's session decisions run from ONE subscriber, on its first fresh report.
+
+    The lifespan only REHYDRATES (the incident projection, the plates, the quarantine set) and
+    wires the hub before any printer connects; it decides nothing about a printer. Deciding before
+    ``init_printer_connections`` read every printer as unreported — the 001-H2S hold stood all
+    night over a toolhead the wire reported fed (2026-10-11).
+    """
+
+    @staticmethod
+    def _lifespan() -> ast.AsyncFunctionDef:
+        tree = ast.parse((BACKEND_DIR / "main.py").read_text(encoding="utf-8"))
+        return next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "lifespan")
+
+    def test_the_lifespan_calls_no_session_decision(self):
+        decisions = {
+            *_SESSION_DECISIONS,
+            "rearm_incidents_on_startup",
+            "reconcile_pending_ejects_on_startup",
+            "reconcile_stale_active_prints",
+            "on_first_fresh_report",
+        }
+        called = {_called(node.func)[1] for node in ast.walk(self._lifespan()) if isinstance(node, ast.Call)}
+        assert called & decisions == set(), called & decisions
+
+    def test_the_lifespan_rehydrates_then_wires_the_hub_before_any_printer_connects(self):
+        wanted = {
+            ("printer_incidents", "rehydrate"),
+            ("printer_event_wiring", "wire"),
+            (None, "init_printer_connections"),
+        }
+        order = sorted(
+            (node.lineno, _called(node.func))
+            for node in ast.walk(self._lifespan())
+            if isinstance(node, ast.Call) and _called(node.func) in wanted
+        )
+        assert [call for _line, call in order] == [
+            ("printer_incidents", "rehydrate"),
+            ("printer_event_wiring", "wire"),
+            (None, "init_printer_connections"),
+        ]
+
+    def test_each_session_decision_runs_from_the_session_start(self):
+        calls: dict[str, set[tuple[tuple[str, ...], tuple[str, ...]]]] = {name: set() for name in _SESSION_DECISIONS}
+        for parts, tree in _app_trees():
+            for node, scope in _scoped_nodes(tree):
+                if isinstance(node, ast.Call):
+                    name = _called(node.func)[1]
+                    if name in calls:
+                        calls[name].add((parts, scope))
+        assert {name: frozenset(sites) for name, sites in calls.items()} == _SESSION_DECISIONS
+
+    def test_the_startup_sweeps_are_gone(self):
+        from backend.app.services import spool_recovery
+        from backend.app.services.eject import monitor
+
+        assert not hasattr(spool_recovery, "rearm_incidents_on_startup")
+        assert not hasattr(monitor, "reconcile_pending_ejects_on_startup")
+
+
+# --- The action record (2026-10-11): one owner of every printer command and its answer --------------
+
+# The client's state-changing publishers. Each takes its ``sequence_id`` from its caller — the
+# ``printer_action`` row id — so each is called only by the record (or inside a COMMAND handed to it).
+_CLIENT_PUBLISHERS = frozenset(
+    {
+        "start_print",
+        "stop_print",
+        "set_xcam_option",
+        "set_ams_filament_backup",
+        "start_calibration",
+        "send_drying_command",
+        "set_kprofile",
+        "set_kprofiles_batch",
+        "delete_kprofile",
+        "pause_print",
+        "resume_print",
+        "clean_print_error",
+        "clear_hms_errors",
+        "skip_objects",
+        "send_gcode",
+        "set_bed_temperature",
+        "set_nozzle_temperature",
+        "set_chamber_temperature",
+        "set_print_speed",
+        "set_fan_speed",
+        "set_fan_percent",
+        "set_airduct_mode",
+        "set_chamber_light",
+        "select_extruder",
+        "home_axes",
+        "move_axis",
+        "disable_motors",
+        "enable_motors",
+        "ams_load_filament",
+        "ams_unload_filament",
+        "ams_control",
+        "ams_refresh_tray",
+        "ams_set_filament_setting",
+        "reset_ams_slot",
+        "extrusion_cali_sel",
+        "extrusion_cali_set",
+        "set_timelapse",
+        "set_liveview",
+        "execute_hms_action",
+        "publish_forwarded",
+    }
+)
+_BAMBU_MQTT = ("services", "bambu_mqtt.py")
+# The frames that change no printer state (reads, and the system-topic dialog close whose echo is never
+# an ACK): they carry ``"0"`` and get no action row.
+_READ_COMMANDS = frozenset({"pushall", "get_version", "get_accessories", "extrusion_cali_get", "uiop"})
+
+
+def _command_scopes(tree: ast.Module) -> tuple[set[int], set[str]]:
+    """The lambdas, and the names of nested functions, handed to a record COMMAND
+    (``printer_action.Command`` / ``printer_action.operator_verb``) — a publisher called inside one is
+    published by the record, under its action's id."""
+    lambdas: set[int] = set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _called(node.func) in (
+            ("printer_action", "Command"),
+            ("printer_action", "operator_verb"),
+        ):
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                if isinstance(arg, ast.Lambda):
+                    lambdas.add(id(arg))
+                elif isinstance(arg, ast.Name):
+                    names.add(arg.id)
+    return lambdas, names
+
+
+class TestPrinterActionOwnership:
+    """``services/printer_action`` is THE record of every printer command and its answer: its row id IS
+    the wire ``sequence_id``, its answers come from events through ``command_outcome``. SOURCE pins: a
+    second publisher, a client counter or a second ACK reader is a well-formed copy every behaviour
+    test passes."""
+
+    def test_a_printer_action_row_is_built_by_the_record_alone(self):
+        builders = {parts for parts, _scope, _node in _calls_named("PrinterAction")}
+        assert builders == {_PRINTER_ACTION}, builders
+
+    def test_the_client_publishers_are_called_by_the_record_alone(self):
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            if parts in (_PRINTER_ACTION, _BAMBU_MQTT):
+                continue
+            lambdas, names = _command_scopes(tree)
+            parents: dict[int, ast.AST] = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    parents[id(child)] = node
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                    continue
+                if node.func.attr not in _CLIENT_PUBLISHERS or _called(node.func)[0] == "printer_action":
+                    continue  # ``printer_action.ams_control(...)`` is the record's own command builder
+                cursor: ast.AST | None = node
+                inside = False
+                while cursor is not None:
+                    if id(cursor) in lambdas or (
+                        isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef)) and cursor.name in names
+                    ):
+                        inside = True
+                        break
+                    cursor = parents.get(id(cursor))
+                if not inside:
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} calls {node.func.attr}() off the record")
+        assert not strays, "A printer command is published off the record:\n" + "\n".join(strays)
+
+    def test_no_frame_reaches_a_printer_off_the_record(self):
+        """A printer's request topic is published on by the client's own publishers alone, each driven by the
+        record (2026-10-11): the virtual printer's bridge forwarded a slicer's frame through ``publish_raw``
+        with the slicer's own ``sequence_id``, which could answer an outstanding farm action sharing that
+        number. It now sends through ``printer_action.slicer_forward``. No module but the client builds a
+        ``device/<serial>/request`` topic to publish on, and the raw publisher stays gone."""
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "publish_raw":
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} defines publish_raw")
+                if isinstance(node, ast.Attribute) and node.attr == "publish_raw":
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} calls publish_raw")
+                if parts != _BAMBU_MQTT and isinstance(node, ast.JoinedStr):
+                    literal = "".join(
+                        v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                    )
+                    if literal.startswith("device/") and literal.endswith("/request"):
+                        strays.append(f"  - {'/'.join(parts)}:{node.lineno} builds a printer request topic")
+        assert not strays, "A frame reaches a printer off the record:\n" + "\n".join(strays)
+
+    def test_the_client_keeps_no_sequence_counter(self):
+        """The id is the action's row (no ``_sequence_id`` counter, no per-command record of the last
+        send); the virtual printer's server numbers its OWN simulated reports and is no client."""
+        strays = [
+            f"  - {'/'.join(parts)}:{node.lineno}"
+            for parts, tree in _app_trees()
+            if parts[:2] != ("services", "virtual_printer")
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Attribute) and node.attr in ("_sequence_id", "_last_sent_sequence"))
+            or (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in ("_next_sequence_id", "last_sent_sequence_id", "await_ack")
+            )
+        ]
+        assert not strays, "A client-side sequence counter is back:\n" + "\n".join(strays)
+
+    def test_every_sequence_id_is_an_action_id_or_a_reads_zero(self):
+        (tree,) = [t for parts, t in _app_trees() if parts == _BAMBU_MQTT]
+        strays: list[str] = []
+        for node, scope in _scoped_nodes(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            fields = {
+                key.value: value
+                for key, value in zip(node.keys, node.values, strict=True)
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            if "sequence_id" not in fields:
+                continue
+            value = fields["sequence_id"]
+            command = fields.get("command")
+            command_name = command.value if isinstance(command, ast.Constant) else None
+            if isinstance(value, ast.Name) and value.id == "sequence_id":
+                continue
+            if isinstance(value, ast.Constant) and value.value == "0" and command_name in _READ_COMMANDS:
+                continue
+            if isinstance(value, ast.Name) and value.id == "seq" and scope[-1:] == ("_probe_developer_mode",):
+                continue  # the developer-mode probe: a transport probe, carrying the reads' "0"
+            strays.append(f"  - bambu_mqtt:{node.lineno} {command_name!r} carries {ast.unparse(value)}")
+        assert not strays, "A frame carries a sequence id that is no action's:\n" + "\n".join(strays)
+
+    def test_the_ack_log_has_one_writer_and_one_reader(self):
+        appends = [
+            (parts, scope)
+            for parts, tree in _app_trees()
+            for node, scope in _scoped_nodes(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "append"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "command_acks"
+        ]
+        assert appends == [(_BAMBU_MQTT, ("BambuMQTTClient", "_record_command_ack"))], appends
+        readers = sorted((parts, scope[-1]) for parts, scope, _node in _calls_named("ack_for"))
+        assert readers == [(_PRINTER_ACTION, "ack_of")], readers
+
+    def test_the_deleted_owners_stay_deleted(self):
+        from backend.app.services import incident_resolution, refill_verdict, spool_recovery, spool_respool
+
+        assert importlib.util.find_spec("backend.app.services.ams_command") is None
+        assert not hasattr(refill_verdict, "ran") and not hasattr(refill_verdict, "pending_settles")
+        assert not hasattr(spool_recovery, "_takeover") and not hasattr(spool_recovery, "_void_on_reboot")
+        assert not hasattr(spool_respool, "note_commanded_load") and not hasattr(spool_respool, "_commanded_loads")
+        assert not hasattr(incident_resolution, "MotionLedger") and not hasattr(incident_resolution, "ledger")
+
+    def test_the_step_mirror_columns_are_written_never_read(self):
+        """``printer_incident_step.sent_at`` / ``target`` are the rollback build's mirror of the
+        action's own columns: the step's one writer writes them, and nothing in this build reads
+        them back off a step (``core.database._RETIRED_COLUMNS`` lists the drop owed)."""
+        from backend.app.core.database import _RETIRED_COLUMNS
+
+        assert _RETIRED_COLUMNS["printer_incident_step"] == ("sent_at", "target")
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr in ("sent_at", "target")
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "PrinterIncidentStep"
+                ):
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno} reads PrinterIncidentStep.{node.attr}")
+        assert not strays, "The step's mirror columns are read:\n" + "\n".join(strays)
+
+
+# --- The self-heal bound (2026-10-12): one owner of every elapsed-time read against a send -------------
+
+# The names an elapsed-time read against a send or a bound's anchor subtracts: an action's ``sent_at``,
+# a bound's ``anchor_at``.
+_BOUND_ANCHORS = frozenset({"sent_at", "anchor_at"})
+# A raw SQL write (prose that merely says "INSERTed" or "UPDATE" is no statement).
+_WRITE_SQL = re.compile(r"\bUPDATE\s+\w+\s+SET\b|\bINSERT\s+INTO\b", re.IGNORECASE)
+
+# NAMED EXCEPTIONS to "only the record subtracts a send or an anchor": (file, function, constant) → why.
+# Each must still match exactly (a stale entry fails), and none may be added to go green. Empty since
+# capsule 7 (2026-10-12): ``dispatch_start.watch_start``'s ``_START_UNACKED_RECONNECT_S`` became the
+# record's ``dispatch_start._START_SELF_HEAL`` (R18).
+_ANCHOR_ARITHMETIC_EXCEPTIONS: dict[tuple[tuple[str, ...], str, str], str] = {}
+
+
+def _enclosing_functions(tree: ast.Module):
+    """Every node with the names of its enclosing FUNCTIONS (outermost first) and whether a class encloses
+    it — a function's own scope, not ``_scoped_nodes``' class-and-table scope."""
+    stack: list[tuple[ast.AST, tuple[str, ...], bool]] = [(tree, (), False)]
+    while stack:
+        node, functions, in_class = stack.pop()
+        yield node, functions, in_class
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.append((child, (*functions, child.name), in_class))
+            elif isinstance(child, ast.ClassDef):
+                stack.append((child, functions, True))
+            else:
+                stack.append((child, functions, in_class))
+
+
+def _names_anchor(node: ast.expr) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr in _BOUND_ANCHORS) or (
+        isinstance(node, ast.Name) and node.id in _BOUND_ANCHORS
+    )
+
+
+class TestSelfHealBoundOwnership:
+    """``services/printer_action`` owns the self-heal bound (2026-10-12, operator ruling: "if it was self
+    heal, it should stay self heal … not rely on timers only"): events decide every outcome, and a wait's
+    fallback is a NAMED bound counted in the printer's online seconds by the record — never a lane's own
+    clock. Constructive source pins:
+
+    * (a) a :class:`SelfHealBound` is built only at module scope (a fixed ``_X_SELF_HEAL``) or inside a
+      lane function named ``*_bound`` (a bound from settings) — a bound built inline in a wait is a clock
+      nobody can find;
+    * (b) ``bound_passed_at`` is written only by the record (the model and the migration declare it);
+    * (c) arithmetic that subtracts an action's ``sent_at`` or a bound's ``anchor_at`` happens only in the
+      record, but for the named exceptions in :data:`_ANCHOR_ARITHMETIC_EXCEPTIONS`.
+    """
+
+    def test_a_bound_is_built_at_module_scope_or_in_a_bound_function(self):
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            for node, functions, in_class in _enclosing_functions(tree):
+                if not (isinstance(node, ast.Call) and _called(node.func)[1] == "SelfHealBound"):
+                    continue
+                at_module = not functions and not in_class
+                if not at_module and not (functions and functions[-1].endswith("_bound")):
+                    where = ".".join(functions) or "<class body>"
+                    strays.append(f"  - {'/'.join(parts)}:{where} (line {node.lineno})")
+        assert not strays, "A SelfHealBound is built outside module scope or a *_bound function:\n" + "\n".join(strays)
+
+    def test_bound_passed_at_is_written_by_the_record_alone(self):
+        strays: list[str] = []
+        for parts, tree in _app_trees():
+            if parts == _PRINTER_ACTION:
+                continue
+            for node, functions, _in_class in _enclosing_functions(tree):
+                where = f"{'/'.join(parts)}:{'.'.join(functions) or '<module>'}"
+                if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if any(isinstance(t, ast.Attribute) and t.attr == "bound_passed_at" for t in targets):
+                        strays.append(f"  - {where} assigns bound_passed_at (line {node.lineno})")
+                elif isinstance(node, ast.keyword) and node.arg == "bound_passed_at":
+                    strays.append(f"  - {where} passes bound_passed_at= (line {node.value.lineno})")
+                elif isinstance(node, ast.Dict) and any(
+                    isinstance(k, ast.Constant) and k.value == "bound_passed_at" for k in node.keys
+                ):
+                    strays.append(f"  - {where} writes a bound_passed_at field (line {node.lineno})")
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str) and "bound_passed_at" in node.value:
+                    if _WRITE_SQL.search(node.value):
+                        strays.append(f"  - {where} writes bound_passed_at in SQL (line {node.lineno})")
+        assert not strays, "bound_passed_at is written off the record:\n" + "\n".join(strays)
+
+    def test_only_the_record_subtracts_a_send_or_a_bound_anchor(self):
+        found: dict[tuple[tuple[str, ...], str], list[int]] = {}
+        for parts, tree in _app_trees():
+            if parts == _PRINTER_ACTION:
+                continue
+            for node, functions, _in_class in _enclosing_functions(tree):
+                if (
+                    isinstance(node, ast.BinOp)
+                    and isinstance(node.op, ast.Sub)
+                    and (_names_anchor(node.left) or _names_anchor(node.right))
+                ):
+                    found.setdefault((parts, ".".join(functions) or "<module>"), []).append(node.lineno)
+        allowed = {(parts, function) for parts, function, _constant in _ANCHOR_ARITHMETIC_EXCEPTIONS}
+        strays = [
+            f"  - {'/'.join(parts)}:{function} (line {', '.join(map(str, lines))})"
+            for (parts, function), lines in sorted(found.items())
+            if (parts, function) not in allowed
+        ]
+        assert not strays, (
+            "Elapsed time against an action's send or a bound's anchor is computed off the record "
+            "(read it through printer_action.online_seconds_since / bound_due, or a SelfHealBound):\n"
+            + "\n".join(strays)
+        )
+
+    def test_every_named_exception_still_matches_exactly(self):
+        """A named exception names a function that still does the arithmetic, against the named constant —
+        a stale entry (the code moved onto the record) fails, so the list only ever shrinks."""
+        trees = dict(_app_trees())
+        for (parts, function, constant), reason in _ANCHOR_ARITHMETIC_EXCEPTIONS.items():
+            assert reason.strip(), (parts, function)
+            tree = trees[parts]
+            body = next(
+                (
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
+                ),
+                None,
+            )
+            assert body is not None, f"{'/'.join(parts)}:{function} is gone — drop its named exception"
+            subtracts = any(
+                isinstance(n, ast.BinOp)
+                and isinstance(n.op, ast.Sub)
+                and (_names_anchor(n.left) or _names_anchor(n.right))
+                for n in ast.walk(body)
+            )
+            names_constant = any(isinstance(n, ast.Name) and n.id == constant for n in ast.walk(body))
+            assert subtracts and names_constant, (
+                f"{'/'.join(parts)}:{function} no longer subtracts an anchor against {constant} — drop its named exception"
+            )
+
+
+class TestDeletionSweep:
+    """Capsule 8 (2026-10-11): the dead ends the lanes left. ``printer_manager.await_state`` (the polled
+    "did the printer do it" confirm wait) lost its last caller to the record's answers; the client's
+    generic ``send_command`` (and its verb helper) and ``publish_raw`` were publishers outside the record;
+    the occupancy store's 24 h TTL dropped a hydrated eject by its age, where the session start's reconcile
+    reads what the printer says about it. A name coming back fails here."""
+
+    _GONE = {
+        ("services", "printer_manager.py"): ("def await_state",),
+        ("services", "bambu_mqtt.py"): ("def send_command", "_command_verb", "def publish_raw"),
+        ("services", "virtual_printer", "mqtt_bridge.py"): ("publish_raw",),
+        ("services", "plate_occupancy_store.py"): ("_PENDING_EJECT_STALE_TTL_H", "stale pending-eject"),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+
+class TestLaneBDeletions:
+    """Capsule 3 (2026-10-11): the AMS jam driver's stable-success hold, its own deadline loop and its
+    offline give-up are gone — each step is the record's answer to an event. A name coming back fails here;
+    the driver never asks the operator click's bounded read (``classify``) itself.
+
+    Narrowed 2026-10-12 (Raymond: "if it was self heal, it should stay self heal … not rely on timers
+    only"): the step bound came back as the self-heal FALLBACK behind the events — the setting
+    (``spool_recovery_step_timeout_s``, ``_DEFAULT_STEP_TIMEOUT_S``) read into ``step_bound``, the restart
+    continuation's ``_await_stop_settled``, and production's held-command rule (``_held_outcome`` →
+    ``swap_held_after_release``). Those names left this list; :meth:`test_the_step_setting_feeds_one_self_heal_bound`
+    pins what they are now."""
+
+    _GONE = {
+        ("services", "spool_recovery.py"): (
+            "_POST_RESUME_STABLE_S",
+            "_await_live_state",
+            "_PrinterOffline",
+            "offline_bound_s",
+            "command_outcome.classify",
+            "command_outcome.Observation",
+            "printer_action.ack_of",
+        ),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_the_drivers_settings_carry_one_step_bound(self):
+        """The 2026-10-12 ruling ("if it was self heal, it should stay self heal … not rely on timers only"):
+        the driver's settings carry exactly ONE time knob, the step bound — the self-heal fallback behind the
+        events, never a second window."""
+        from dataclasses import fields
+
+        from backend.app.services.spool_recovery import RecoverySettings
+
+        assert [f.name for f in fields(RecoverySettings)] == [
+            "enabled",
+            "max_attempts",
+            "step_bound_s",
+            "protect_layers",
+        ]
+
+    def test_the_step_setting_feeds_one_self_heal_bound(self):
+        """The restored names are a FALLBACK, not a window: ``_DEFAULT_STEP_TIMEOUT_S`` is production's 90 s
+        default, and the setting reaches the driver only as the record's ``SelfHealBound`` (``step_bound``),
+        named after the setting and carrying its witness — counted in the printer's online seconds by the record."""
+        from backend.app.services import printer_action, spool_recovery
+
+        assert spool_recovery._DEFAULT_STEP_TIMEOUT_S == 90
+        settings = spool_recovery.RecoverySettings(enabled=True, max_attempts=2, step_bound_s=120, protect_layers=7)
+        bound = spool_recovery.step_bound(settings)
+        assert isinstance(bound, printer_action.SelfHealBound)
+        assert (bound.name, bound.seconds) == ("spool_recovery_step_timeout_s", 120.0)
+        assert "012-H2S 2026-09-23" in bound.witness
+
+
+class TestLaneCDeletions:
+    """Capsule 4 (2026-10-11): every spool / identity outcome decided by a window or a push count is gone —
+    the identify echo's 30 s (a slow read's settle-back returned a jammed roll to rotation), the drying
+    latch's deadline (it overrode a reported ``dry_time: 0``), the reconcile epsilon. Each is now the event
+    it stood in for: the read's own answer, the unit's report and its echo, a charged terminal. A name coming
+    back fails here.
+
+    Narrowed 2026-10-12 (operator ruling "the behaviour should stay the same for the most part"): invariant
+    12's two three-push streaks, the remain-jump's 2 pushes + 10 s, the decrease reconcile's 2 pushes + 10 s
+    and the no-live-job 600 s bay-clear window are production's MEASURED corroboration rules and came back
+    as the one rule per fact (capsule R-C9); :meth:`test_the_restored_corroboration_rules_stand` pins them.
+
+    Narrowed again 2026-10-12 (capsule R-C10; operator ruling: "The behaviour should stay the same for the
+    most part, im not asking to change behaviour, i was asking to not rely on timers only as it's finnikey.
+    so if it was self heal, it should stay self heal."): production's identify bounds
+    (``_IDENTIFY_ACTIVE_S`` 30 s over the ``_NO_TAG_ANSWER_SETTLE_S`` 15 s floor, the echo's
+    ``_ECHO_PENDING_STALE_S``) came back as ONE record bound behind the read's events, ``_IDENTIFY_SELF_HEAL``
+    (the old names survive only in its witness), and the client drying latch (``_DRYING_LATCH_SLACK_S``,
+    ``_DRYING_LATCH_DEFAULT_S``, ``latched_until``) came back behind the unit's answers. Those names left this
+    list; :meth:`test_the_identify_wait_concludes_on_one_self_heal_bound` and
+    :meth:`test_the_drying_latch_bounds_an_unanswered_start` pin what they are now."""
+
+    _GONE = {
+        ("services", "bambu_mqtt.py"): (
+            # The single-full-report substitute for the zero-mask streak (2026-10-11), removed 2026-10-12.
+            "full_report_of_session",
+        ),
+        ("services", "spool_tagless.py"): ("_RECONCILE_BOUNDARY_EPSILON_S",),
+    }
+
+    def test_the_identify_wait_concludes_on_one_self_heal_bound(self):
+        """Operator ruling 2026-10-12 ("if it was self heal, it should stay self heal"): a commanded read's
+        answer is its events first, and production's 30 s identify bound (``_IDENTIFY_ACTIVE_S``, over the
+        15 s ``_NO_TAG_ANSWER_SETTLE_S`` floor; the echo's ``_ECHO_PENDING_STALE_S``) is ONE module-scope
+        ``SelfHealBound`` read through the record's ``bound_due`` — no lane clock, no second window."""
+        from backend.app.services import ams_presence, printer_action
+
+        bound = ams_presence._IDENTIFY_SELF_HEAL
+        assert isinstance(bound, printer_action.SelfHealBound)
+        assert (bound.name, bound.seconds) == ("_IDENTIFY_SELF_HEAL", 30.0)
+        assert "_IDENTIFY_ACTIVE_S" in bound.witness and "_NO_TAG_ANSWER_SETTLE_S" in bound.witness
+        source = (Path(__file__).resolve().parents[2] / "app" / "services" / "ams_presence.py").read_text(
+            encoding="utf-8"
+        )
+        for gone in ("_IDENTIFY_ACTIVE_S =", "_ECHO_PENDING_STALE_S =", "_NO_TAG_ANSWER_SETTLE_S ="):
+            assert gone not in source, f"{gone} came back as a lane constant beside the bound"
+        assert source.count("printer_action.bound_due(") == 2  # the read's conclusion and the echo's expiry
+
+    def test_the_drying_latch_bounds_an_unanswered_start(self):
+        """Operator ruling 2026-10-12 ("if it was self heal, it should stay self heal"): production's client
+        drying latch is the fallback behind an awaited start — cycle duration + 1800 s, or 24 h with none —
+        so a start the unit never answers cannot refuse every AMS write forever."""
+        from backend.app.services import bambu_mqtt
+
+        assert bambu_mqtt._DRYING_LATCH_SLACK_S == 1800
+        assert bambu_mqtt._DRYING_LATCH_DEFAULT_S == 24 * 3600
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_the_restored_corroboration_rules_stand(self):
+        """Operator ruling 2026-10-12 ("the behaviour should stay the same for the most part"): production's
+        measured corroboration rules are the ONE rule per fact — invariant 12's streaks (shape 28), the
+        remain jump's and the decrease reconcile's 2 pushes over 10 s (doctrine rule 10: every respool prompt
+        so far was a false positive) and the no-live-job bay-clear window (the 2026-08-13 timed pairs). The
+        rewrite's single-frame substitutes stay gone: the respool and decrease lanes never ask the
+        completed-read predicate."""
+        from backend.app.services import bambu_mqtt, spool_respool, usage_tracker
+
+        assert bambu_mqtt._ZERO_EXIST_BITS_TRUST_PUSHES == 3
+        assert bambu_mqtt._CONTRADICTED_STATE_TRUST_PUSHES == 3
+        assert (spool_respool._JUMP_MIN_PUSHES, spool_respool._JUMP_STABLE_S) == (2, 10.0)
+        assert spool_respool._BAY_CLEAR_TO_RUNOUT_GAP_S == 600.0
+        assert (usage_tracker._LEDGER_DECREASE_MIN_PUSHES, usage_tracker._LEDGER_DECREASE_STABLE_S) == (2, 10.0)
+        app = Path(__file__).resolve().parents[2] / "app" / "services"
+        for name in ("spool_respool.py", "usage_tracker.py"):
+            source = (app / name).read_text(encoding="utf-8")
+            assert "read_answered_since_seating(" not in source, f"{name} asks the completed-read substitute"
+
+
+class TestLaneEDeletions:
+    """Capsule 5 (2026-10-11): every verdict the plate-check ladder read off a window is gone — the press's
+    2.5 s ACK read, the re-check's 30 s "still paused", the stop's 5 s one retry, the "first farm stop in
+    60 min" count. The press and the stop are actions answered by the record on an event, a frame that never
+    left is sent again on the next session, and the retry-or-hold decision reads the unit's lineage and the
+    printer's last plate-check stop. A name coming back fails here. The 900 s first layer and the stop's
+    120 s came back on 2026-10-12 as named self-heal bounds behind the events (:data:`_BECAME_BOUNDS`)."""
+
+    _GONE = {
+        ("services", "pause_recovery.py"): (
+            "_RECHECK_ACK_S",
+            "_RECHECK_CONFIRM_S",
+            "_VISION_STOP_RETRY_S",
+            "PLATE_RECHECK_WINDOW_S",
+            "count_rows_with_step",
+            "await_state",
+            "ack_within(",
+            "_LEGACY_STOP_NAME",
+        ),
+        ("services", "terminal_outcome.py"): ("PLATE_RECHECK_WINDOW_S",),
+        ("services", "printer_incidents.py"): ("count_rows_with_step",),
+    }
+
+    # Narrowed 2026-10-12 (operator ruling: "if it was self heal, it should stay self heal"): production's
+    # first-layer and stop waits came back as NAMED self-heal bounds behind the printer's events. Each name
+    # (bound → the production constant whose figure and witness it carries) may now appear only inside that
+    # bound's witness — never as a clock constant of its own.
+    # The stop's bound has ONE origin since 2026-10-12, the record (``printer_action.STOP_SELF_HEAL``): the
+    # plate-check ladder and the air stop send the same verb to the same printers, so the measured figure
+    # is the record's knowledge, imported by both lanes.
+    _BECAME_BOUNDS = {
+        "_RECHECK_FIRST_LAYER_SELF_HEAL": (("services", "pause_recovery.py"), "_RECHECK_FIRST_LAYER_S", 900.0),
+        "STOP_SELF_HEAL": (_PRINTER_ACTION, "_STOP_CONFIRM_S", 120.0),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_the_returned_waits_are_self_heal_bounds_and_nothing_else(self):
+        """The production constant is, and only feeds, its ``SelfHealBound``: the bound has production's
+        figure and names the constant in its witness, and no other node of its module — no assignment, no
+        name, no other string — carries the old name. The stop's bound lives in the record and nowhere
+        else: ``pause_recovery`` and ``spool_recovery`` import it, and neither builds a stop bound of its
+        own."""
+        import importlib
+
+        from backend.app.services import pause_recovery, printer_action, spool_recovery
+        from backend.app.services.printer_action import SelfHealBound
+
+        for bound_name, (parts, old_name, seconds) in self._BECAME_BOUNDS.items():
+            tree = ast.parse(BACKEND_DIR.joinpath(*parts).read_text(encoding="utf-8"))
+            witnesses: set[int] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and _called(node.func)[1] == "SelfHealBound":
+                    witness = (
+                        node.args[2]
+                        if len(node.args) > 2
+                        else next(kw.value for kw in node.keywords if kw.arg == "witness")
+                    )
+                    witnesses.add(id(witness))
+            module = importlib.import_module("backend.app." + ".".join(parts).removesuffix(".py"))
+            bound = getattr(module, bound_name)
+            assert isinstance(bound, SelfHealBound) and bound.name == bound_name
+            assert bound.seconds == seconds and old_name in bound.witness
+            strays = [
+                node.lineno
+                for node in ast.walk(tree)
+                if (isinstance(node, ast.Name) and node.id == old_name)
+                or (isinstance(node, ast.Attribute) and node.attr == old_name)
+                or (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and re.search(rf"\b{old_name}\b", node.value)
+                    and id(node) not in witnesses
+                )
+            ]
+            assert strays == [], f"{old_name} lives on outside {bound_name}'s witness (lines {strays})"
+        # ONE origin for the stop bound: both stop lanes hold the record's object, and neither names the
+        # retired lane-local constant.
+        assert pause_recovery.STOP_SELF_HEAL is printer_action.STOP_SELF_HEAL
+        assert spool_recovery.STOP_SELF_HEAL is printer_action.STOP_SELF_HEAL
+        for lane in ("pause_recovery.py", "spool_recovery.py"):
+            source = (BACKEND_DIR / "services" / lane).read_text(encoding="utf-8")
+            assert "_STOP_SELF_HEAL" not in source, f"{lane} carries a lane-local stop bound"
+
+
+class TestNextSessionWaitOwnership:
+    """``printer_action.await_next_session`` is THE wait for a printer's next session — the event a command
+    whose frame never left the farm waits for before it is sent again (2026-10-11). Two lanes each grew
+    their own (``spool_recovery._await_new_session``, ``pause_recovery._await_next_session``); both are
+    gone. No other module defines a next-session wait: a ``while`` loop that COMPARES ``connection_epoch``
+    and sleeps (a poll for a session to turn) lives only in the owner. A re-send loop that hands its send's
+    epoch to the owner compares nothing, and the recovery driver's session gate (``_live_reading``) waits
+    for ANY live reading, never a next session."""
+
+    def test_the_old_waits_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts in (("services", "spool_recovery.py"), ("services", "pause_recovery.py"))
+            for name in ("_await_new_session", "_await_next_session")
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_only_the_record_loops_on_a_session(self):
+        strays: list[str] = []
+        definers: list[str] = []
+        for parts, tree in _app_trees():
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "await_next_session":
+                    definers.append("/".join(parts))
+                if not isinstance(node, ast.While):
+                    continue
+                compares_epoch = any(
+                    isinstance(cmp, ast.Compare)
+                    and any(
+                        (isinstance(sub, ast.Attribute) and sub.attr == "connection_epoch")
+                        or (isinstance(sub, ast.Constant) and sub.value == "connection_epoch")
+                        for sub in ast.walk(cmp)
+                    )
+                    for cmp in ast.walk(node)
+                )
+                sleeps = any(
+                    isinstance(call, ast.Call) and _called(call.func)[1] in ("sleep", "wait_for")
+                    for call in ast.walk(node)
+                )
+                if compares_epoch and sleeps and parts != ("services", "printer_action.py"):
+                    strays.append(f"  - {'/'.join(parts)}:{node.lineno}")
+        assert definers == ["services/printer_action.py"]
+        assert not strays, "A next-session wait outside printer_action:\n" + "\n".join(strays)
+
+
+class TestLaneFDeletions:
+    """Capsule 5 (2026-10-11): the power-loss resume's 15 s settle, its one 30 s retry and its 30 s
+    confirm are gone. The resume is sent on the session's first fresh report showing the prompt and answered
+    by the record (RUNNING however late; the printer's fail ACK or its ``0300_400D`` refuse it); a frame that
+    never left is sent again on the next session. A name coming back fails here.
+
+    Narrowed 2026-10-12 (operator ruling: "if it was self heal, it should stay self heal"): the 30 s confirm
+    came back as the record's self-heal bound ``_POWER_LOSS_SELF_HEAL`` behind the resume's events (R5) —
+    its old name may appear only in that bound's witness. The settle (the session's first fresh report) and
+    the retry (the next session) stay events."""
+
+    _GONE = {
+        ("services", "pause_recovery.py"): (
+            "_POWER_LOSS_SETTLE_S",
+            "_POWER_LOSS_RETRY_S",
+            "_POWER_LOSS_POLL_S",
+            "_confirm_running",
+        ),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_the_confirm_is_the_resumes_self_heal_bound_and_nothing_else(self):
+        """``_POWER_LOSS_CONFIRM_S`` (production, 30 s) is, and only feeds, ``_POWER_LOSS_SELF_HEAL``: the bound
+        carries production's figure and names the constant in its witness, the resume awaits its action with
+        it, and no other node of the module carries the old name."""
+        from backend.app.services import pause_recovery
+        from backend.app.services.printer_action import SelfHealBound
+
+        bound = pause_recovery._POWER_LOSS_SELF_HEAL
+        assert isinstance(bound, SelfHealBound) and bound.name == "_POWER_LOSS_SELF_HEAL"
+        assert bound.seconds == 30.0 and "_POWER_LOSS_CONFIRM_S" in bound.witness
+        assert "bound=_POWER_LOSS_SELF_HEAL" in _source_of(pause_recovery._resume_after_power_loss)
+        tree = ast.parse((BACKEND_DIR / "services" / "pause_recovery.py").read_text(encoding="utf-8"))
+        witnesses = {
+            id(node.args[2])
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _called(node.func)[1] == "SelfHealBound" and len(node.args) > 2
+        }
+        strays = [
+            node.lineno
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Name) and node.id == "_POWER_LOSS_CONFIRM_S")
+            or (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "_POWER_LOSS_CONFIRM_S" in node.value
+                and id(node) not in witnesses
+            )
+        ]
+        assert strays == [], f"_POWER_LOSS_CONFIRM_S lives on outside the bound's witness (lines {strays})"
+
+
+class TestLaneGDeletions:
+    """Capsule 6 (2026-10-11, owner 9): the dispatch claim is decided by the START's answer on the record.
+    The start watchdog (90 s + 180 s), its registry, the dead-claim watch (a 90 s budget plus a 30 s
+    dwell) and the dispatch lease's 60 s / 180 s read-time settlement are gone: a REFUSED / VOID /
+    TAKEN-OVER start returns the unit (``dispatch_start``), a REACHED one keeps it. A name coming back
+    fails here.
+
+    Capsule 7 (2026-10-12, operator ruling: "if it was self heal, it should stay self heal"): the
+    watchdog's two figures came back as the RECORD's self-heal bounds, never as a lane clock — an
+    outstanding start waits for its event, and production's fallback fires at the bound
+    (:meth:`test_the_watchdogs_figures_are_the_records_bounds`)."""
+
+    _GONE = {
+        ("services", "print_scheduler.py"): (
+            "_watchdog_print_start",
+            "register_start_watchdog",
+            "DISPATCH_START_BUDGET_S",
+            "_dispatch_min_cooldown",
+            "_dispatch_max_hold",
+            "phase_b_timeout",
+        ),
+        ("services", "dispatch_claim.py"): (
+            "_start_watchdogs",
+            "register_start_watchdog",
+            "has_live_start_watchdog",
+            "DISPATCH_START_BUDGET_S",
+            "claim_age_s",
+            "watchdog_owns",
+            "too_fresh",
+        ),
+        ("services", "farm_stall.py"): (
+            "check_dead_dispatch_claims",
+            "_DEAD_CLAIM_DWELL_S",
+            "_dead_claim_since",
+            "has_live_start_watchdog",
+            'cause="dead_claim"',
+        ),
+        ("services", "plate_occupancy.py"): ("min_hold_s", "max_hold_s", "pre_subtask"),
+        ("services", "requeue.py"): ('"start_watchdog"', '"dead_claim"'),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_the_watchdogs_figures_are_the_records_bounds(self):
+        """Production's ``_watchdog_print_start`` (337f4954): Phase A 90 s (#1078 raised it 45 → 90) and Phase
+        B 180 s (#1678) — restored as ``SelfHealBound``\\ s the record counts in online seconds, the Phase A one
+        armed at the start's send and by the rehydrated-start factory; the lane-clock constant that stood in
+        for Phase A (``_START_UNACKED_RECONNECT_S``) is deleted, one constant and one clock."""
+        from backend.app.services import dispatch_start, printer_action
+
+        assert isinstance(dispatch_start._START_SELF_HEAL, printer_action.SelfHealBound)
+        assert dispatch_start._START_SELF_HEAL.seconds == 90.0
+        assert isinstance(dispatch_start._START_ACTIVE_SELF_HEAL, printer_action.SelfHealBound)
+        assert dispatch_start._START_ACTIVE_SELF_HEAL.seconds == 180.0
+        assert not hasattr(dispatch_start, "_START_UNACKED_RECONNECT_S")
+        assert "bound=_START_SELF_HEAL" in _source_of(dispatch_start.send_start)
+        assert "_START_SELF_HEAL" in _source_of(dispatch_start.rehydrated_start_bound)
+
+
+class TestLaneHDeletions:
+    """Capsule 7b (2026-10-11, Lane H): every server-side wait around the eject is an EVENT first. The
+    epilogue deadline is gone (it killed harmless firmware tails into human gates); the single 5 s stop
+    retry is the next session's reconcile re-drive; the max-hold eject onto a hot bed and its Farm
+    setting are gone; the cooldown prep arms on the connected edge, not a 300 s poll; the service-hold
+    stand-down awaits the watch's own end. A name coming back fails here.
+
+    NARROWED 2026-10-12 (capsule R-C8; operator ruling: "The behaviour should stay the same for the most
+    part, im not asking to change behaviour, i was asking to not rely on timers only as it's finnikey. so
+    if it was self heal, it should stay self heal."): production's eject START deadline
+    (``EJECT_START_TIMEOUT_S``, 180 s) and WHOLE-JOB deadline (``EJECT_ABORT_MARGIN_*``,
+    ``eject_abort_deadline_s``, ``_abort_margin_s``, stage ``"total"``) are back as the record's
+    self-heal bounds — each name's positive replacement is pinned below; their old timer machinery
+    (``_start_deadline`` & co., ``_binding_deadline``) stays deleted.
+
+    NARROWED again 2026-10-12 (capsule R-C10, the same ruling): the service-hold stand-down's bound
+    (``_STAND_DOWN_WAIT_S`` 10 s, ``asyncio.wait(..., timeout=)``) is back behind the watch's own end — its
+    ``finally`` publishes through the DB, so an unbounded wait could hold a deactivate forever;
+    :meth:`test_the_stand_down_waits_at_most_production_s_bound` pins it."""
+
+    _GONE = {
+        ("services", "eject", "remote.py"): (
+            "_start_deadline",
+            "_arm_start_deadline",
+            "_cancel_start_deadline",
+            "_binding_deadline",
+            "_EDGE_LANE_MIN_LEAD_S",
+            "_STOP_RETRY_DELAY_S",
+            "UNMODELLED_EPILOGUE_ALLOWANCE_S",
+            '"deadline_only"',
+            '"epilogue"',
+        ),
+        ("services", "eject", "generator.py"): ("UNMODELLED_EPILOGUE_ALLOWANCE_S",),
+        ("services", "eject", "monitor.py"): (
+            "max_hold",
+            "_PREP_CONNECT_WAIT_S",
+            "_PREP_CONNECT_POLL_S",
+            "farm_cooldown_max_hold_minutes",
+        ),
+        ("services", "notification_service.py"): ("max_hold_minutes", "forced-eject cap"),
+        ("services", "farm_stall.py"): ("max_hold",),
+        ("schemas", "settings.py"): ("farm_cooldown_max_hold_minutes",),
+        ("api", "routes", "settings.py"): ("farm_cooldown_max_hold_minutes",),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_the_stand_down_waits_at_most_production_s_bound(self):
+        """Operator ruling 2026-10-12 ("if it was self heal, it should stay self heal"): the teardown waits for
+        the plate watch's own end at most production's ``_STAND_DOWN_WAIT_S`` (10 s), then WARNs and
+        quiesces — one bounded wait, in ``quiesce_for_teardown`` alone."""
+        from backend.app.services import service_hold
+
+        assert service_hold._STAND_DOWN_WAIT_S == 10.0
+        source = (Path(__file__).resolve().parents[2] / "app" / "services" / "service_hold.py").read_text(
+            encoding="utf-8"
+        )
+        assert source.count("timeout=_STAND_DOWN_WAIT_S") == 1
+
+    def test_the_timed_stops_are_the_whole_job_bound_and_the_drop_guard(self):
+        """The stops made on elapsed time are exactly production's two that survive (2026-10-12 ruling:
+        "if it was self heal, it should stay self heal"): the whole-job bound (``"total"``) and the bed-drop
+        guard's two stages — plus the three re-drives / a person's act that time nothing. No epilogue."""
+        from typing import get_args
+
+        from backend.app.services.eject import remote
+
+        assert set(get_args(remote.EjectStopStage)) == {
+            "total",
+            "drop",
+            "drop_late",
+            "power_loss",
+            "service_hold",
+            "reconnect",
+        }
+
+    def test_the_eject_start_deadline_is_the_records_self_heal_bound(self):
+        """``EJECT_START_TIMEOUT_S`` (production, 180 s) came back as ``_EJECT_START_SELF_HEAL`` (2026-10-12
+        ruling: "if it was self heal, it should stay self heal"): a module-scope ``SelfHealBound`` armed on
+        the sweep's ``eject_start`` send, never a lane timer."""
+        from backend.app.services import printer_action
+        from backend.app.services.eject import remote
+
+        bound = remote._EJECT_START_SELF_HEAL
+        assert isinstance(bound, printer_action.SelfHealBound)
+        assert bound.seconds == 180.0 and "EJECT_START_TIMEOUT_S" in bound.witness
+        source = (Path(__file__).resolve().parents[2] / "app" / "services" / "eject" / "remote.py").read_text(
+            encoding="utf-8"
+        )
+        assert "bound=_EJECT_START_SELF_HEAL" in source
+
+    def test_the_whole_job_deadline_feeds_the_records_self_heal_bound(self):
+        """``EJECT_ABORT_MARGIN_*`` / ``eject_abort_deadline_s`` (production since 2026-07-31) came back
+        feeding ``_whole_job_bound`` (2026-10-12 ruling: "if it was self heal, it should stay self heal"): a
+        ``SelfHealBound`` of expected + clamp(25 %, 20 s, 60 s), read through ``printer_action.bound_due``."""
+        from backend.app.services import printer_action
+        from backend.app.services.eject import remote
+
+        assert (remote.EJECT_ABORT_MARGIN_FRAC, remote.EJECT_ABORT_MARGIN_MIN_S, remote.EJECT_ABORT_MARGIN_MAX_S) == (
+            0.25,
+            20.0,
+            60.0,
+        )
+        bound = remote._whole_job_bound(83.0)
+        assert isinstance(bound, printer_action.SelfHealBound)
+        assert bound.seconds == remote.eject_abort_deadline_s(83.0) == 103.75
+
+
+class TestLaneDDeletions:
+    """Capsule 4 (2026-10-11): the incident sweep's 120 s dwell and the process memory a restart wiped — the
+    motion ledger (the ``repair`` class's "a print ran through the path"), the ABORTED close's re-entry bar
+    — are gone. A hold closes on an event (a running edge, a terminal, a live clean report after the
+    session's own re-evaluation, a layer printed fed past the row's ``fault_layer``), and the bar is the
+    closed row (``rearmed_at``). A name coming back fails here."""
+
+    _GONE = {
+        ("services", "incident_resolution.py"): ("MotionLedger", "path_ran_at", "dwell=True", "ledger.observe"),
+        ("services", "spool_recovery.py"): (
+            "_HOLD_OVER_DWELL_S",
+            "_hold_over_since",
+            "ledger.observe",
+            "incident_resolution.ledger",
+            "ledger=ledger",
+        ),
+        ("services", "pause_recovery.py"): ("ledger=ledger",),
+        ("services", "hold_chip.py"): ("incident_resolution.ledger",),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_a_verdict_carries_no_window(self):
+        from dataclasses import fields
+
+        from backend.app.services.incident_resolution import Context, Verdict
+
+        assert [f.name for f in fields(Verdict)] == ["close", "source", "evidence"]
+        assert "ledger" not in {f.name for f in fields(Context)}
+
+    def test_the_sweep_takes_no_clock(self):
+        import inspect
+
+        from backend.app.services.spool_recovery import sweep_open_incidents
+
+        assert list(inspect.signature(sweep_open_incidents).parameters) == []
+
+
+class TestLaneADeletions:
+    """Capsule 2 (2026-10-11): every outcome the toolhead refill lane decided by a clock, a frame count or
+    restart-wiped memory is gone — the resume confirm window, the air vote, the process set that was the
+    resume's once, the pause-not-landed abort. A name coming back fails here.
+
+    Narrowed 2026-10-12 (operator ruling: "if it was self heal, it should stay self heal … not rely on
+    timers only"): production's 30 s runout resume confirm came back as the refill lane's named self-heal
+    BOUND behind the printer's events (``_RUNOUT_RESUME_SELF_HEAL`` — a refused or unanswered refill resume
+    is owed again, up to the runout row's cap). ``_RUNOUT_RESUME_CONFIRM_S`` left this list:
+    :meth:`test_the_runout_resume_confirm_is_a_self_heal_bound_and_nothing_else` pins what it is now. The
+    air stop's old name ``_stop_air_print`` stays deleted (the stop is ``_stop_printing_on_air``)."""
+
+    _GONE = {
+        ("services", "spool_recovery.py"): (
+            "_repair_resume_sent",
+            "toolhead_resume_unconfirmed",
+            "_stop_air_print",
+            "_resume_confirmed",
+        ),
+        ("services", "feed_state.py"): (
+            "_AIR_CONFIRM_FRAMES",
+            "EMPTY_CONFIRMED",
+            "EMPTY_QUIET",
+            "EMPTY_LOUD",
+            "EMPTY_SILENT",
+            "posture_carried",
+            "_votes",
+        ),
+        ("services", "bambu_mqtt.py"): ("_push_carried_posture",),
+        ("services", "refill_verdict.py"): ("_AIR_CONFIRM_FRAMES",),
+    }
+
+    def test_the_deleted_names_stay_deleted(self):
+        app = Path(__file__).resolve().parents[2] / "app"
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (app.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_the_runout_resume_confirm_is_a_self_heal_bound_and_nothing_else(self):
+        """``_RUNOUT_RESUME_CONFIRM_S`` (production, 30 s) is, and only feeds, the refill lane's
+        ``SelfHealBound``: the bound has production's figure and names the constant in its witness, and no
+        other node of ``spool_recovery`` — no assignment, no name, no other string — carries the old name.
+        The bound is the record's to count (``printer_action``): the lane hands it to its send."""
+        from backend.app.services import spool_recovery
+        from backend.app.services.printer_action import SelfHealBound
+
+        bound = spool_recovery._RUNOUT_RESUME_SELF_HEAL
+        assert isinstance(bound, SelfHealBound) and bound.name == "_RUNOUT_RESUME_SELF_HEAL"
+        assert bound.seconds == 30.0 and "_RUNOUT_RESUME_CONFIRM_S" in bound.witness
+        tree = ast.parse((BACKEND_DIR / "services" / "spool_recovery.py").read_text(encoding="utf-8"))
+        witnesses = {
+            id(node.args[2] if len(node.args) > 2 else next(kw.value for kw in node.keywords if kw.arg == "witness"))
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _called(node.func)[1] == "SelfHealBound"
+        }
+        strays = [
+            node.lineno
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Name) and node.id == "_RUNOUT_RESUME_CONFIRM_S")
+            or (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "_RUNOUT_RESUME_CONFIRM_S" in node.value
+                and id(node) not in witnesses
+            )
+        ]
+        assert strays == [], f"_RUNOUT_RESUME_CONFIRM_S lives on outside the bound's witness (lines {strays})"
+
+
+class TestAttentionOwnership:
+    """Owner 5 (2026-10-11): ``farm_stall`` is THE attention owner. Every wait the farm decides by the
+    printer's own event is PAGED there, past a bound that lives there, and nowhere else: a recovery
+    driver, the plate-check ladder, the cooldown watch and the dispatch watch wait and page nothing on a
+    clock. A page bound or a clock page returning to another module fails here."""
+
+    _APP = Path(__file__).resolve().parents[2] / "app"
+
+    _GONE = {
+        ("services", "spool_recovery.py"): (
+            "_HELD_COMMAND_PAGE_S",
+            "_RESUMED_FEED_PAGE_S",
+            "_page_only",
+            "_page_pending_command",
+            "_RESUMED_FEED_PAGE_DETAIL",
+        ),
+        ("services", "eject", "monitor.py"): (
+            "_WATCH_ESCALATE_S",
+            "escalation_first_page_s",
+            "_default_notify_cooldown_escalation",
+            "escalate_s",
+        ),
+    }
+
+    def test_the_moved_names_stay_gone_from_their_old_homes(self):
+        found = [
+            f"{'/'.join(parts)}: {name}"
+            for parts, names in self._GONE.items()
+            for name in names
+            if name in (self._APP.joinpath(*parts)).read_text(encoding="utf-8")
+        ]
+        assert found == []
+
+    def test_every_page_bound_lives_in_the_attention_owner(self):
+        """A module-level constant named ``*_PAGE_S`` (a page bound) is defined only in ``farm_stall``."""
+        offenders = []
+        for path in (self._APP / "services").rglob("*.py"):
+            if path.name == "farm_stall.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                    if isinstance(node, ast.AnnAssign)
+                    else []
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id.endswith("_PAGE_S"):
+                        offenders.append(f"{path.relative_to(self._APP)}: {target.id}")
+        assert offenders == []
+
+    def test_the_clock_pages_have_one_caller(self):
+        """``on_printer_waiting`` (the waiting page) and ``on_cooldown_escalation`` (a cooldown running long)
+        are fired only by the attention owner."""
+        callers = []
+        for path in self._APP.rglob("*.py"):
+            if path.name in ("farm_stall.py", "notification_service.py"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for event in ("on_printer_waiting(", "on_cooldown_escalation("):
+                if event in text:
+                    callers.append(f"{path.relative_to(self._APP)}: {event}")
+        assert callers == []
+
+    def test_nothing_imports_the_attention_owner_to_page(self):
+        """The scheduler's tick runs the watches; ``pause_recovery`` reads its one minutes resolver. No other
+        module reaches into ``farm_stall`` — a lane that wants a page records its wait, and the owner reads it."""
+        allowed = {"print_scheduler.py", "pause_recovery.py", "farm_stall.py"}
+        importers = sorted(
+            str(path.relative_to(self._APP))
+            for path in self._APP.rglob("*.py")
+            if path.name not in allowed and "farm_stall import" in path.read_text(encoding="utf-8")
+        )
+        assert importers == []
+
+
+class TestQuarantineOwnership:
+    """Owner 6 (2026-10-11): ``farm_policy`` is the ONE quarantine decider, on events — N failures or
+    escalations with no completed print between them. It is the only module that quarantines a printer
+    and the only writer of a ``recovery_escalation`` row; the eject monitor never quarantines (a cooling
+    bed is waited for and paged); the 2-in-24 h clock window is gone; and ``farm_policy`` imports no eject
+    watch (the ``farm_policy`` ↔ ``eject.monitor`` cycle is dissolved)."""
+
+    _APP = Path(__file__).resolve().parents[2] / "app"
+
+    def _sources(self):
+        for path in self._APP.rglob("*.py"):
+            yield path, path.read_text(encoding="utf-8")
+
+    def test_only_farm_policy_quarantines(self):
+        offenders = [
+            str(path.relative_to(self._APP))
+            for path, text in self._sources()
+            if path.name != "farm_policy.py" and ("quarantine_printer(" in text or ".quarantined = True" in text)
+        ]
+        assert offenders == []
+
+    def test_only_farm_policy_writes_an_escalation_row(self):
+        offenders = [
+            str(path.relative_to(self._APP))
+            for path, text in self._sources()
+            if path.name != "farm_policy.py"
+            and "RecoveryEscalation(" in text
+            and "class RecoveryEscalation(" not in text
+        ]
+        assert offenders == []
+
+    def test_the_clock_window_is_gone(self):
+        spool_recovery = (self._APP / "services" / "spool_recovery.py").read_text(encoding="utf-8")
+        assert "_JAM_QUARANTINE_WINDOW_H" not in spool_recovery
+        assert "_JAM_QUARANTINE_THRESHOLD" not in spool_recovery
+        assert "_act_on_cooldown_stall" not in (self._APP / "services" / "eject" / "monitor.py").read_text(
+            encoding="utf-8"
+        )
+
+    def test_farm_policy_imports_no_eject_watch(self):
+        imports = [
+            line.strip()
+            for line in (self._APP / "services" / "farm_policy.py").read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith(("import ", "from "))
+        ]
+        assert [line for line in imports if "eject.monitor" in line or "eject import monitor" in line] == []

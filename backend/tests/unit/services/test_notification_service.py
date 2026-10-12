@@ -2859,8 +2859,9 @@ class TestOnCooldownEscalation:
         return db
 
     @pytest.mark.asyncio
-    async def test_sends_with_cap_detail(self, service, mock_db):
-        """max_hold_minutes > 0 → detail names the forced-eject cap."""
+    async def test_sends_with_the_wait_detail(self, service, mock_db):
+        """The detail states the bed, the line and what ends the wait — never a forced-eject cap: no
+        time cap exists (2026-10-11)."""
         with (
             patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
             patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
@@ -2869,9 +2870,7 @@ class TestOnCooldownEscalation:
             mock_get.return_value = [MagicMock()]
             mock_build.return_value = ("Cooldown running long — 001-H2S", "body")
 
-            await service.on_cooldown_escalation(
-                1, "001-H2S", bed_c=41.0, line_c=33.0, max_hold_minutes=180, db=mock_db
-            )
+            await service.on_cooldown_escalation(1, "001-H2S", bed_c=41.0, line_c=33.0, db=mock_db)
 
             mock_get.assert_awaited_once_with(mock_db, "on_cooldown_escalation", 1)
             _, event, variables = mock_build.call_args.args
@@ -2879,25 +2878,9 @@ class TestOnCooldownEscalation:
             detail = variables["detail"]
             assert "bed 41 °C" in detail
             assert "eject line 33 °C" in detail
-            assert "forced eject at the 180-minute cap" in detail
+            assert "The eject runs when the bed reaches the line or stops cooling." in detail
+            assert "cap" not in detail
             mock_send.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_sends_with_no_cap_detail(self, service, mock_db):
-        """max_hold_minutes == 0 → detail says no forced-eject cap is set."""
-        with (
-            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
-            patch.object(service, "_send_to_providers", new_callable=AsyncMock),
-            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
-        ):
-            mock_get.return_value = [MagicMock()]
-            mock_build.return_value = ("t", "b")
-
-            await service.on_cooldown_escalation(2, "002-H2S", bed_c=35.0, line_c=33.0, max_hold_minutes=0, db=mock_db)
-
-            _, _event, variables = mock_build.call_args.args
-            assert "no forced-eject cap is set" in variables["detail"]
-            assert "cap" not in variables["detail"].replace("no forced-eject cap is set", "")
 
     @pytest.mark.asyncio
     async def test_unknown_bed_when_none(self, service, mock_db):
@@ -2910,7 +2893,7 @@ class TestOnCooldownEscalation:
             mock_get.return_value = [MagicMock()]
             mock_build.return_value = ("t", "b")
 
-            await service.on_cooldown_escalation(3, "003-H2S", bed_c=None, line_c=33.0, max_hold_minutes=90, db=mock_db)
+            await service.on_cooldown_escalation(3, "003-H2S", bed_c=None, line_c=33.0, db=mock_db)
 
             _, _event, variables = mock_build.call_args.args
             assert "bed unknown °C" in variables["detail"]
@@ -2927,9 +2910,7 @@ class TestOnCooldownEscalation:
             mock_get.return_value = [MagicMock()]
             mock_build.return_value = ("t", "b")
 
-            await service.on_cooldown_escalation(
-                5, "005-H2S", bed_c=36.0, line_c=None, max_hold_minutes=180, db=mock_db
-            )
+            await service.on_cooldown_escalation(5, "005-H2S", bed_c=36.0, line_c=None, db=mock_db)
 
             _, _event, variables = mock_build.call_args.args
             assert "no eject line (shop air unknown)" in variables["detail"]
@@ -2993,9 +2974,7 @@ class TestOnCooldownEscalation:
         ):
             mock_get.return_value = []
 
-            await service.on_cooldown_escalation(
-                4, "004-H2S", bed_c=40.0, line_c=33.0, max_hold_minutes=180, db=mock_db
-            )
+            await service.on_cooldown_escalation(4, "004-H2S", bed_c=40.0, line_c=33.0, db=mock_db)
 
             mock_send.assert_not_called()
 

@@ -34,7 +34,6 @@ from backend.app.services.bambu_mqtt import (
     BambuMQTTClient,
     CommandAck,
     HMSError,
-    SentCommand,
     ams_mid_filament_change,
     apply_tray_exist_bits,
 )
@@ -59,6 +58,14 @@ def _make_client(*, serial="TEST123", connected=False, publish_target=False, tra
         client.state.connected = True
     if tray_now is not None:
         client.state.tray_now = tray_now
+    return client
+
+
+def _live_session(client):
+    """Mark the client's current MQTT session as REPORTING (connected, its first report applied —
+    ``live_reading.is_fresh``): only such frames count toward the exist-bit corroboration streaks."""
+    client.state.connected = True
+    client.state.report_epoch = client.state.connection_epoch
     return client
 
 
@@ -658,8 +665,9 @@ class TestAMSDataMerging:
         """The trust ladder at the merge level: a single all-zero mask is not acted on —
         that value is what a boot frame or a truncated report degrades to, and it
         authorizes emptying every slot. After ``_ZERO_EXIST_BITS_TRUST_PUSHES``
-        consecutive pushes say it, the slot is cleared to the full cleared shape.
+        consecutive FRESH pushes say it, the slot is cleared to the full cleared shape.
         """
+        _live_session(mqtt_client)
         mqtt_client._handle_ams_data(
             {
                 "ams": [{"id": 0, "tray": [{"id": 0, "tray_type": "PLA", "tray_color": "FF0000", "remain": 80}]}],
@@ -684,6 +692,7 @@ class TestAMSDataMerging:
 
     def test_one_anomalous_zero_frame_never_empties_a_slot(self, mqtt_client):
         """The streak is CONSECUTIVE: 'f' … '0' … 'f' leaves the slot untouched."""
+        _live_session(mqtt_client)
         loaded = {
             "ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PLA", "remain": 80}]}],
             "tray_exist_bits": "f",
@@ -693,6 +702,46 @@ class TestAMSDataMerging:
         mqtt_client._handle_ams_data(loaded)
         assert mqtt_client.state.raw_data["ams"][0]["tray"][0]["tray_type"] == "PLA"
         assert mqtt_client._zero_exist_bits_streak == 0
+
+    def test_a_reconnect_frame_never_extends_the_zero_streak(self, mqtt_client):
+        """A frame of a session whose first report has not landed (``_on_connect`` bumped the epoch)
+        breaks the run: two zeros before a reconnect plus one after are never three."""
+        _live_session(mqtt_client)
+        mqtt_client._handle_ams_data(
+            {"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PLA"}]}], "tray_exist_bits": "1"}
+        )
+        zero_push = {"ams": [{"id": 0, "tray": [{"id": 0}]}], "tray_exist_bits": "0"}
+        for _ in range(_ZERO_EXIST_BITS_TRUST_PUSHES - 1):
+            mqtt_client._handle_ams_data(zero_push)
+        mqtt_client.state.connection_epoch += 1
+        mqtt_client.state.report_epoch = None
+        mqtt_client._handle_ams_data(zero_push)
+        assert mqtt_client.state.ams_bits_trusted is False
+        assert mqtt_client.state.raw_data["ams"][0]["tray"][0]["tray_type"] == "PLA"
+
+    def test_a_reconnect_replays_no_ams_frame_to_the_corroboration_lanes(self):
+        """The respool remain-jump (``spool_respool._jump_seen``) and the ledger-decrease reconcile
+        (``usage_tracker._ledger_decrease_seen``) count frames delivered by ``on_ams_change``, which only
+        a live push's AMS change fires. The real reconnect (``_on_connect``) re-broadcasts the previous
+        session's cached state through ``on_state_change`` and never through ``on_ams_change``, so a
+        replayed frame can never extend either corroboration window; and it starts the streaks here over
+        (the session's first report has not landed)."""
+        client = _live_session(_make_client(connected=True))
+        ams_frames: list = []
+        client.on_ams_change = ams_frames.append
+        client._client.subscribe.return_value = (0, 1)
+        zero_push = {"ams": [{"id": 0, "tray": [{"id": 0, "state": 11, "tray_type": "PLA"}]}], "tray_exist_bits": "0"}
+        for _ in range(_ZERO_EXIST_BITS_TRUST_PUSHES - 1):
+            client._handle_ams_data(zero_push)
+        frames_before = len(ams_frames)
+        assert frames_before >= 1
+
+        client._on_connect(client._client, None, None, 0)
+
+        assert len(ams_frames) == frames_before, "the reconnect replays nothing to on_ams_change"
+        client._handle_ams_data(zero_push)  # the new session's first frame, not yet fresh
+        assert client.state.ams_bits_trusted is False
+        assert client._zero_exist_bits_streak == 0
 
     def test_the_status_surface_reports_what_the_wire_said(self, mqtt_client):
         """Triage fields: the raw hex, the firmware's flag, and OUR verdict — the flag
@@ -2381,6 +2430,27 @@ class TestTheFeedProjections:
         switched = mqtt_client.feed().auto_switched
         assert (switched.departed, switched.arrived) == (1, 0)
 
+    def test_every_event_the_step_produced_is_handed_over_in_order(self):
+        """Each feed-state event goes to the registry once, with the reading its step produced
+        (``printer_events.FeedEventReported``): the drain, then the landing and the switch on the
+        push the backup's load lands."""
+        handed: list[tuple[str, tuple[str, ...]]] = []
+        client = _make_client(
+            serial="PROJ1",
+            connected=True,
+            on_feed_event=lambda event, reading: handed.append((event.kind, tuple(e.kind for e in reading.events))),
+        )
+        self._run_the_005_switch(client)
+        self._push(client, tray=255, layer=110, absent={1}, ams_status=0x0300)
+        self._push(client, tray=0, layer=110, absent={1}, ams_status=0x0300)
+        self._push(client, tray=0, layer=111, absent={1}, ams_status=0x0300)
+
+        assert handed == [
+            ("roll_drained", ("roll_drained",)),
+            ("load_landed", ("load_landed", "auto_switched")),
+            ("auto_switched", ("load_landed", "auto_switched")),
+        ]
+
     def test_the_sequence_is_logged_for_triage(self, mqtt_client, caplog):
         """``TAIL → CHANGING → FED`` and the segment append, one INFO line each — the post-deploy
         check reads them, and support-bundle greps read ``Tray change during print``."""
@@ -2436,33 +2506,51 @@ class TestTheFeedState:
         assert client.feed().phase is FeedPhase.IDLE
         assert client.feed().feeder == 2
 
-    @pytest.mark.parametrize("acting", [False, True])
-    def test_a_landing_carries_the_injected_farm_acting_answer(self, acting):
-        client = _make_client(connected=True, farm_acting=lambda: acting)
+    def test_a_landing_is_read_off_the_wire_alone(self):
+        """The landing carries no attribution: whose load it was is the record's
+        (``printer_action``), so the client injects no provider and imports nothing above itself."""
+        client = _make_client(connected=True)
         for tray in ("255", "255", "3"):
             client._process_message({"print": {"gcode_state": "IDLE", "ams": {"tray_now": tray}}})
 
-        landed = client.feed().load_landed
-        assert (landed.tray, landed.farm_acting) == (3, acting)
+        assert client.feed().load_landed.tray == 3
 
-    def test_a_failing_provider_reads_as_no_farm_motion(self):
-        def boom() -> bool:
-            raise RuntimeError("store down")
+    def test_the_sessions_first_report_is_read_for_its_level(self):
+        """001-H2S incident 574, after the deploy: a NEW client's first push is its session's report
+        (it carries ``gcode_state``) — the feed state reads it LIVE, though ``report_epoch`` is
+        stamped only after the step, so a print PAUSEd fed from slot 2 reads FED when the session's
+        ``FirstFreshReport`` is handed over, never one report later."""
+        from backend.app.services.feed_state import FeedPhase
 
-        client = _make_client(connected=True, farm_acting=boom)
-        for tray in ("255", "255", "3"):
-            client._process_message({"print": {"gcode_state": "IDLE", "ams": {"tray_now": tray}}})
+        sessions: list[int] = []
+        client = _make_client(connected=True, on_session_report=sessions.append)
+        client._process_message(
+            {
+                "print": {
+                    "gcode_state": "PAUSE",
+                    "gcode_file": "/data/Metadata/plate_1.gcode",
+                    "subtask_name": "SKU007.01",
+                    "subtask_id": "674664134",
+                    "layer_num": 85,
+                    "total_layer_num": 167,
+                    "ams": {"tray_now": "1"},
+                }
+            }
+        )
 
-        assert client.feed().load_landed.farm_acting is False
+        assert sessions == [client.state.connection_epoch]
+        assert client.feed().phase is FeedPhase.FED
+        assert client.feed().feeder == 1
+        assert client.feed().events == ()
 
-    def test_only_a_push_that_carried_the_posture_votes(self, mqtt_client):
-        """``ams_status`` on either wire path marks the push; a push without it does not."""
-        mqtt_client._process_message({"print": {"ams_status": 0x0300}})
-        assert mqtt_client._push_carried_posture is True
-        mqtt_client._process_message({"print": {"ams": {"ams_status": 0x0300}}})
-        assert mqtt_client._push_carried_posture is True
-        mqtt_client._process_message({"print": {"layer_num": 3}})
-        assert mqtt_client._push_carried_posture is False
+    def test_a_push_carrying_no_report_is_not_read_before_the_session_reports(self):
+        """A pre-report push of a session (no ``gcode_state``) is no reading yet: UNKNOWN."""
+        from backend.app.services.feed_state import FeedPhase
+
+        client = _make_client(connected=True)
+        client._process_message({"print": {"ams": {"tray_now": "1"}}})
+
+        assert client.feed().phase is FeedPhase.UNKNOWN
 
 
 class TestDeveloperModeDetection:
@@ -2631,7 +2719,8 @@ class TestDeveloperModeProbeTimeout:
         assert state_changes
 
     def test_successful_probe_resets_failure_counter(self, mqtt_client):
-        """The answer is matched by ``sequence_id``, and the retry mints a new one."""
+        """The answer is matched by ``sequence_id``: the probe is a transport read carrying the reads'
+        ``"0"`` (no action row), so the retry asks the same question under the same id."""
         mqtt_client._update_state(self.PUSHALL)
         first_seq = mqtt_client._dev_mode_probe_seq
         self._expire_the_probe(mqtt_client)
@@ -2640,7 +2729,7 @@ class TestDeveloperModeProbeTimeout:
 
         mqtt_client._update_state(self.PUSHALL)
         retry_seq = mqtt_client._dev_mode_probe_seq
-        assert retry_seq is not None and retry_seq != first_seq
+        assert retry_seq == first_seq == "0"
 
         mqtt_client._handle_dev_mode_probe_response(
             {"command": "ams_filament_setting", "sequence_id": retry_seq, "result": "success"}
@@ -2727,14 +2816,16 @@ class TestSendDryingCommand:
         ],
     )
     def test_rotate_tray_is_sent_explicitly(self, mqtt_client, kwargs, rotate_tray):
-        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, **kwargs)
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, **kwargs, sequence_id="1")
 
         assert _published_command(mqtt_client)["rotate_tray"] is rotate_tray
 
     def test_all_required_fields_present(self, mqtt_client):
         """The firmware wants the whole frame, including the fields the farm never
         varies — a missing key is rejected, not defaulted."""
-        mqtt_client.send_drying_command(ams_id=128, temp=75, duration=8, mode=1, filament="ABS", rotate_tray=True)
+        mqtt_client.send_drying_command(
+            ams_id=128, temp=75, duration=8, mode=1, filament="ABS", rotate_tray=True, sequence_id="1"
+        )
 
         cmd = _published_command(mqtt_client)
         assert cmd["command"] == "ams_filament_drying"
@@ -2752,48 +2843,97 @@ class TestSendDryingCommand:
     def test_publishes_with_qos_1(self, mqtt_client):
         """A dropped drying command would leave the operator's UI claiming a dry that
         never started."""
-        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4)
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, sequence_id="1")
 
         call_args = mqtt_client._client.publish.call_args
         qos = call_args.kwargs.get("qos", call_args[0][2] if len(call_args[0]) > 2 else None)
         assert qos == 1
 
     def test_start_caches_target_for_badge(self, mqtt_client):
-        """The cache carries a monotonic ``latched_until`` as well, which drives
-        ``ams_unit_drying`` until the first ``dry_time`` push arrives."""
-        mqtt_client.send_drying_command(ams_id=2, temp=65, duration=12, mode=1, filament="PETG")
+        """The cache carries ``awaiting_start`` as well, which drives ``ams_unit_drying`` until
+        the unit REPORTS its cycle — or, with no answer at all, until the client latch (cycle
+        duration + slack) ends the wait."""
+        mqtt_client.send_drying_command(ams_id=2, temp=65, duration=12, mode=1, filament="PETG", sequence_id="1")
 
         entry = mqtt_client._drying_targets[2]
         assert entry["filament"] == "PETG"
         assert entry["temp"] == 65
-        assert isinstance(entry["latched_until"], float)
+        assert entry["awaiting_start"] is True
 
     def test_start_overwrites_prior_target_for_same_ams(self, mqtt_client):
-        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, mode=1, filament="PLA")
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, mode=1, filament="PLA", sequence_id="1")
 
-        mqtt_client.send_drying_command(ams_id=0, temp=70, duration=6, mode=1, filament="ABS")
+        mqtt_client.send_drying_command(ams_id=0, temp=70, duration=6, mode=1, filament="ABS", sequence_id="1")
 
         assert mqtt_client._drying_targets[0]["filament"] == "ABS"
         assert mqtt_client._drying_targets[0]["temp"] == 70
 
-    def test_stop_clears_target(self, mqtt_client):
-        mqtt_client.send_drying_command(ams_id=1, temp=55, duration=4, mode=1, filament="PLA")
+    def test_a_stop_ends_the_target_on_the_units_answer(self, mqtt_client):
+        """A stop SENT changes nothing — the unit may not have stopped: its success echo (or its
+        dry_time falling to 0) does. Until then every AMS write stays refused (the safe side)."""
+        mqtt_client.send_drying_command(ams_id=1, temp=55, duration=4, mode=1, filament="PLA", sequence_id="1")
         assert 1 in mqtt_client._drying_targets
 
-        mqtt_client.send_drying_command(ams_id=1, temp=0, duration=0, mode=0)
+        mqtt_client.send_drying_command(ams_id=1, temp=0, duration=0, mode=0, sequence_id="1")
+        assert mqtt_client.ams_unit_drying(1) is True
 
+        mqtt_client._handle_drying_echo({"result": "success", "ams_id": 1, "mode": 0})
         assert 1 not in mqtt_client._drying_targets
 
     def test_targets_isolated_per_ams_id(self, mqtt_client):
         """Units dry independently — stopping one must not blank another's badge."""
-        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, mode=1, filament="PLA")
-        mqtt_client.send_drying_command(ams_id=128, temp=80, duration=6, mode=1, filament="PA-CF")
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, mode=1, filament="PLA", sequence_id="1")
+        mqtt_client.send_drying_command(ams_id=128, temp=80, duration=6, mode=1, filament="PA-CF", sequence_id="1")
 
-        mqtt_client.send_drying_command(ams_id=0, temp=0, duration=0, mode=0)
+        mqtt_client.send_drying_command(ams_id=0, temp=0, duration=0, mode=0, sequence_id="1")
+        mqtt_client._handle_drying_echo({"result": "success", "ams_id": 0, "mode": 0})
 
         assert 0 not in mqtt_client._drying_targets
         assert mqtt_client._drying_targets[128]["filament"] == "PA-CF"
         assert mqtt_client._drying_targets[128]["temp"] == 80
+
+
+class TestTheTerminalMarkHasNoWindow:
+    """FIX 1 of capsule 4's review: the job-over gcode_state is written ~1400 lines before the
+    completion detection schedules the terminal handler, on the same push. A loop reader between the
+    two (the incident sweep, the session start) must still see a terminal in flight — the mark is up
+    BEFORE the job-over state is visible, and down only once the push is applied."""
+
+    def test_a_reader_inside_the_window_sees_the_terminal_in_flight(self, mqtt_client, monkeypatch):
+        from backend.app.services.printer_manager import printer_manager
+
+        monkeypatch.setitem(printer_manager._clients, 99, mqtt_client)
+        mqtt_client._process_message({"print": {"gcode_state": "RUNNING", "gcode_file": "a.gcode", "subtask_id": "7"}})
+        assert printer_manager.terminal_in_flight(99) is False
+
+        seen: list[tuple[str, bool]] = []
+        real_step = mqtt_client._step_feed
+
+        def _spy(*args, **kwargs):  # runs between the state write and the completion detection
+            seen.append((mqtt_client.state.state, printer_manager.terminal_in_flight(99)))
+            return real_step(*args, **kwargs)
+
+        monkeypatch.setattr(mqtt_client, "_step_feed", _spy)
+        mqtt_client._process_message({"print": {"gcode_state": "FAILED", "subtask_id": "7"}})
+
+        assert seen == [("FAILED", True)]
+        # The push is applied; no loop runs here, so no handler is in flight: the mark is down.
+        assert printer_manager.terminal_in_flight(99) is False
+
+    def test_no_mark_without_a_job_over_entry(self, mqtt_client, monkeypatch):
+        from backend.app.services.printer_manager import printer_manager
+
+        monkeypatch.setitem(printer_manager._clients, 99, mqtt_client)
+        seen: list[bool] = []
+        real_step = mqtt_client._step_feed
+        monkeypatch.setattr(
+            mqtt_client,
+            "_step_feed",
+            lambda *a, **k: (seen.append(printer_manager.terminal_in_flight(99)), real_step(*a, **k))[1],
+        )
+        mqtt_client._process_message({"print": {"gcode_state": "RUNNING", "gcode_file": "a.gcode"}})
+        mqtt_client._process_message({"print": {"gcode_state": "RUNNING"}})
+        assert seen == [False, False]
 
 
 class TestStartPrintAmsMapping:
@@ -2893,7 +3033,7 @@ class TestStartPrintAmsMapping:
         if model is not None:
             mqtt_client.model = model
 
-        mqtt_client.start_print("test.3mf", ams_mapping=mapping)
+        mqtt_client.start_print("test.3mf", ams_mapping=mapping, sequence_id="1")
 
         cmd = _published_command(mqtt_client)
         assert cmd["ams_mapping"] == flat
@@ -2919,14 +3059,14 @@ class TestStartPrintAmsMapping:
         if model is not None:
             mqtt_client.model = model
 
-        mqtt_client.start_print("test.3mf", ams_mapping=mapping, use_ams=True)
+        mqtt_client.start_print("test.3mf", ams_mapping=mapping, use_ams=True, sequence_id="1")
 
         assert _published_command(mqtt_client)["use_ams"] is use_ams
 
     def test_no_ams_mapping_omits_fields(self, mqtt_client):
         """Absent, not empty: the fields are left out entirely so firmware falls back
         to whatever the file itself specifies."""
-        mqtt_client.start_print("test.3mf", ams_mapping=None)
+        mqtt_client.start_print("test.3mf", ams_mapping=None, sequence_id="1")
 
         cmd = _published_command(mqtt_client)
         assert "ams_mapping" not in cmd
@@ -2957,6 +3097,7 @@ class TestStartPrintAmsMapping:
             flow_cali=flow_cali,
             vibration_cali=False,
             layer_inspect=True,
+            sequence_id="1",
         )
 
         cmd = _published_command(mqtt_client)
@@ -2985,7 +3126,7 @@ class TestStartPrintAmsMapping:
         mqtt_client.model = model
         kwargs = {} if requested is None else {"nozzle_offset_cali": requested}
 
-        mqtt_client.start_print("test.3mf", **kwargs)
+        mqtt_client.start_print("test.3mf", **kwargs, sequence_id="1")
 
         assert _published_command(mqtt_client)["nozzle_offset_cali"] == wire_value
 
@@ -3002,7 +3143,7 @@ class TestStartPrintUniqueIdentityFields:
     client_kwargs = {"connected": True}
 
     def test_identity_fields_are_non_zero(self, mqtt_client):
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         cmd = _published_command(mqtt_client)
         assert cmd["project_id"] != "0"
@@ -3010,7 +3151,7 @@ class TestStartPrintUniqueIdentityFields:
         assert cmd["task_id"] != "0"
 
     def test_identity_fields_are_all_equal_per_submission(self, mqtt_client):
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         cmd = _published_command(mqtt_client)
         assert cmd["project_id"] == cmd["subtask_id"] == cmd["task_id"]
@@ -3019,16 +3160,16 @@ class TestStartPrintUniqueIdentityFields:
         """Firmware treats "" as "skip validation", and the real digest is not
         available here — a synthetic one would switch validation ON against a value
         that cannot match."""
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         assert _published_command(mqtt_client)["md5"] == ""
 
     def test_identity_fields_change_between_submissions(self, mqtt_client):
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
         first = _published_command(mqtt_client)
 
         time.sleep(0.002)
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
         second = _published_command(mqtt_client)
 
         assert first["task_id"] != second["task_id"]
@@ -3038,7 +3179,7 @@ class TestStartPrintUniqueIdentityFields:
     def test_submission_id_is_numeric_string(self, mqtt_client):
         """Digits-only, like Studio's cloud task ids: the DB column is VARCHAR(64) and
         the farm's own subtask_id parser reads '0' and '' as absent."""
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         task_id = _published_command(mqtt_client)["task_id"]
         assert task_id.isdigit()
@@ -3050,7 +3191,7 @@ class TestStartPrintUniqueIdentityFields:
         raw epoch-ms (~1.7e12) and every submission arrives as the same saturated
         constant, so fresh dispatches read as continuations of the last FAILED job and
         the printer never leaves IDLE."""
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         cmd = _published_command(mqtt_client)
         assert int(cmd["task_id"]) < 2**31
@@ -3062,26 +3203,26 @@ class TestStartPrintUniqueIdentityFields:
         resume the job by id (#1485)."""
         assert mqtt_client.last_dispatch_subtask_id is None
 
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         assert mqtt_client.last_dispatch_subtask_id == _published_command(mqtt_client)["subtask_id"]
 
     def test_last_dispatch_subtask_id_updates_per_submission(self, mqtt_client):
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
         first = mqtt_client.last_dispatch_subtask_id
 
         time.sleep(0.002)
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         assert mqtt_client.last_dispatch_subtask_id != first
         assert mqtt_client.last_dispatch_subtask_id == _published_command(mqtt_client)["subtask_id"]
 
     def test_unrelated_payload_fields_untouched(self, mqtt_client):
         """The rest of the frame is what the printer actually acts on."""
-        mqtt_client.start_print("test.3mf")
+        mqtt_client.start_print("test.3mf", sequence_id="1")
 
         cmd = _published_command(mqtt_client)
-        assert cmd["sequence_id"] == "20000"
+        assert cmd["sequence_id"] == "1"  # the start's action id (``printer_action``)
         assert cmd["command"] == "project_file"
         assert cmd["param"] == "Metadata/plate_1.gcode"
         assert cmd["url"] == "ftp://test.3mf"
@@ -3120,7 +3261,9 @@ class TestDeleteKProfileDualNozzleDetection:
         client.model = model
         client._is_dual_nozzle = dual_runtime
 
-        client.delete_kprofile(cali_idx=1, filament_id="GFA00", nozzle_id="HH00-0.4", setting_id="PFB123")
+        client.delete_kprofile(
+            cali_idx=1, filament_id="GFA00", nozzle_id="HH00-0.4", setting_id="PFB123", sequence_id="1"
+        )
 
         cmd = _published_command(client)
         if dual_format:
@@ -3435,9 +3578,10 @@ class TestZombieSessionDetection:
                 tray_color="FF0000FF",
                 nozzle_temp_min=190,
                 nozzle_temp_max=230,
+                sequence_id="1",
             )
         else:
-            mqtt_client.reset_ams_slot(ams_id=0, tray_id=0)
+            mqtt_client.reset_ams_slot(ams_id=0, tray_id=0, sequence_id="1")
 
         assert mqtt_client._last_ams_cmd_time >= before
 
@@ -3692,7 +3836,7 @@ class TestHMSWireStamp:
         mqtt_client._client = MagicMock()
         mqtt_client.state.connected = True
 
-        assert mqtt_client.clear_hms_errors() is True
+        assert mqtt_client.clear_hms_errors(sequence_id="1") is True
 
         assert mqtt_client.state.hms_errors == []
         assert mqtt_client.state.hms_wire_at == self.SENTINEL
@@ -3885,16 +4029,16 @@ class TestStartPrintRecordsDispatchedPlate:
         assert mqtt_client.state.dispatched_plate_id is None
         assert mqtt_client.state.dispatched_subtask is None
 
-        mqtt_client.start_print("Luigi.3mf", **kwargs)
+        mqtt_client.start_print("Luigi.3mf", **kwargs, sequence_id="1")
 
         assert mqtt_client.state.dispatched_plate_id == plate_id
         assert mqtt_client.state.dispatched_subtask == subtask
 
     def test_dispatched_plate_overwritten_by_subsequent_dispatch(self, mqtt_client):
         """Never serve a stale plate from an older print."""
-        mqtt_client.start_print("First.3mf", plate_id=4)
+        mqtt_client.start_print("First.3mf", plate_id=4, sequence_id="1")
 
-        mqtt_client.start_print("Second.3mf", plate_id=2)
+        mqtt_client.start_print("Second.3mf", plate_id=2, sequence_id="1")
 
         assert mqtt_client.state.dispatched_plate_id == 2
         assert mqtt_client.state.dispatched_subtask == "Second"
@@ -3904,7 +4048,7 @@ class TestStartPrintRecordsDispatchedPlate:
         otherwise believe a phantom dispatch happened."""
         mqtt_client.state.connected = False
 
-        assert mqtt_client.start_print("Phantom.3mf", plate_id=3) is False
+        assert mqtt_client.start_print("Phantom.3mf", plate_id=3, sequence_id="1") is False
 
         assert mqtt_client.state.dispatched_plate_id is None
         assert mqtt_client.state.dispatched_subtask is None
@@ -3952,7 +4096,7 @@ class TestStartPrintNozzleMappingDispatch:
             mqtt_client.model = "P1S"
 
         with caplog.at_level(logging.WARNING):
-            assert mqtt_client.start_print("test.3mf", nozzle_mapping=nozzle_mapping) is True
+            assert mqtt_client.start_print("test.3mf", nozzle_mapping=nozzle_mapping, sequence_id="1") is True
 
         cmd = _published_command(mqtt_client)
         if injected is None:
@@ -4035,7 +4179,7 @@ class TestAmsLoadFilamentEncoding:
         if nozzle_2_temp is not None:
             mqtt_client.state.temperatures["nozzle_2"] = nozzle_2_temp
 
-        assert mqtt_client.ams_load_filament(tray_id) is True
+        assert mqtt_client.ams_load_filament(tray_id, sequence_id="1") is True
 
         cmd = _published_command(mqtt_client)
         assert cmd["command"] == "ams_change_filament"
@@ -4048,7 +4192,7 @@ class TestAmsLoadFilamentEncoding:
     def test_returns_false_when_disconnected(self, mqtt_client):
         mqtt_client.state.connected = False
 
-        assert mqtt_client.ams_load_filament(0) is False
+        assert mqtt_client.ams_load_filament(0, sequence_id="1") is False
 
         mqtt_client._client.publish.assert_not_called()
 
@@ -4096,7 +4240,7 @@ class TestAmsFilamentSettingExternalSpoolEncoding:
     ):
         mqtt_client.state.raw_data = {"vt_tray": vt_tray}
 
-        assert mqtt_client.ams_set_filament_setting(ams_id=ams_id, tray_id=tray_id, **self.SETTING)
+        assert mqtt_client.ams_set_filament_setting(ams_id=ams_id, tray_id=tray_id, **self.SETTING, sequence_id="1")
 
         cmd = _published_command(mqtt_client)
         assert cmd["command"] == "ams_filament_setting"
@@ -4108,7 +4252,7 @@ class TestAmsFilamentSettingExternalSpoolEncoding:
         """A reset shares the convention, and clears the filament identity."""
         mqtt_client.state.raw_data = {"vt_tray": [{"id": "255"}]}
 
-        assert mqtt_client.reset_ams_slot(ams_id=255, tray_id=0)
+        assert mqtt_client.reset_ams_slot(ams_id=255, tray_id=0, sequence_id="1")
 
         cmd = _published_command(mqtt_client)
         assert cmd["ams_id"] == 255
@@ -4130,7 +4274,7 @@ class TestAmsFilamentSettingExternalSpoolEncoding:
         """
         mqtt_client.state.raw_data = {}
 
-        assert mqtt_client.reset_ams_slot(ams_id=1, tray_id=2)
+        assert mqtt_client.reset_ams_slot(ams_id=1, tray_id=2, sequence_id="1")
 
         assert _published_command(mqtt_client) == {
             "command": "ams_filament_setting",
@@ -4143,7 +4287,7 @@ class TestAmsFilamentSettingExternalSpoolEncoding:
             "tray_color": "00000000",
             "nozzle_temp_min": 0,
             "nozzle_temp_max": 0,
-            "sequence_id": "0",
+            "sequence_id": "1",
         }
 
 
@@ -4386,7 +4530,7 @@ class TestAmsFilamentBackupHoldTimer:
     CFG_BIT18_SET = "C0340FC219"
 
     def test_cfg_push_with_old_value_is_ignored_during_hold(self, mqtt_client):
-        mqtt_client.set_ams_filament_backup(True)
+        mqtt_client.set_ams_filament_backup(True, sequence_id="1")
         assert mqtt_client.state.ams_filament_backup is True
 
         mqtt_client._process_message({"print": {"cfg": self.CFG_BIT18_CLEAR}})
@@ -4394,7 +4538,7 @@ class TestAmsFilamentBackupHoldTimer:
         assert mqtt_client.state.ams_filament_backup is True
 
     def test_cfg_push_after_hold_expires_overrides_state(self, mqtt_client):
-        mqtt_client.set_ams_filament_backup(True)
+        mqtt_client.set_ams_filament_backup(True, sequence_id="1")
         mqtt_client._xcam_hold_start["print_option_auto_switch_filament"] = time.time() - 10.0
 
         mqtt_client._process_message({"print": {"cfg": self.CFG_BIT18_CLEAR}})
@@ -4403,7 +4547,7 @@ class TestAmsFilamentBackupHoldTimer:
 
     def test_cfg_push_with_matching_value_during_hold_is_a_noop(self, mqtt_client):
         """A same-value push must not even re-arm the hold."""
-        mqtt_client.set_ams_filament_backup(True)
+        mqtt_client.set_ams_filament_backup(True, sequence_id="1")
         armed_at = mqtt_client._xcam_hold_start["print_option_auto_switch_filament"]
 
         mqtt_client._process_message({"print": {"cfg": self.CFG_BIT18_SET}})
@@ -4594,12 +4738,14 @@ class TestAmsChangeHashPresence:
 
 
 _AMS_WRITE_ARGS = {
-    "ams_get_rfid": lambda c, ams, slot: c.ams_refresh_tray(ams, slot)[0],
+    "ams_get_rfid": lambda c, ams, slot: c.ams_refresh_tray(ams, slot, sequence_id="1")[0],
     "ams_filament_setting": lambda c, ams, slot: c.ams_set_filament_setting(
-        ams, slot, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230
+        ams, slot, "GFL05", "PLA", "PLA Basic", "FFFF00FF", 190, 230, sequence_id="1"
     ),
-    "reset_ams_slot": lambda c, ams, slot: c.reset_ams_slot(ams, slot),
-    "extrusion_cali_sel": lambda c, ams, slot: c.extrusion_cali_sel(ams, slot, cali_idx=-1, filament_id="GFL05"),
+    "reset_ams_slot": lambda c, ams, slot: c.reset_ams_slot(ams, slot, sequence_id="1"),
+    "extrusion_cali_sel": lambda c, ams, slot: c.extrusion_cali_sel(
+        ams, slot, cali_idx=-1, filament_id="GFL05", sequence_id="1"
+    ),
 }
 """THE four AMS write choke points, by the op name their refusal logs (invariant 2:
 wire safety belongs to the client, and every write re-evaluates it at publish time)."""
@@ -4675,7 +4821,7 @@ class TestAmsWriteRefusalHelper:
         client = _make_client(serial="REFUSE1", connected=True, tray_now=255)
         _arm_ams_hazard(client, reason)
 
-        ok, msg = client.ams_refresh_tray(0, 0)
+        ok, msg = client.ams_refresh_tray(0, 0, sequence_id="1")
 
         assert ok is False
         assert msg == _AMS_REFRESH_REFUSAL_MESSAGE[reason]
@@ -4701,7 +4847,7 @@ class TestAmsWriteRefusalHelper:
         client.state.h2d_extruder_snow = dict(snow)
         client.state.active_extruder = 0
 
-        ok, msg = client.ams_refresh_tray(0, 0)
+        ok, msg = client.ams_refresh_tray(0, 0, sequence_id="1")
 
         assert ok is (not refused)
         assert msg.startswith("Please unload filament first") is refused
@@ -4773,7 +4919,7 @@ class TestAmsDryingGuards:
         entry = mqtt_client._drying_targets[0]
         assert entry["filament"] == "PETG"
         assert entry["temp"] == 65
-        assert isinstance(entry["latched_until"], float)
+        assert entry["awaiting_start"] is True
 
     def test_mode0_echo_clears_latch(self, mqtt_client):
         mqtt_client._handle_drying_echo(
@@ -4812,23 +4958,95 @@ class TestAmsDryingGuards:
 
         assert 0 not in mqtt_client._drying_targets
 
-    def test_latch_expiry_via_monotonic(self, mqtt_client, monkeypatch):
-        """The latch is bounded: duration + 30 min slack, then it stops claiming a
-        hazard it can no longer see — a printer that never reports ``dry_time`` must
-        not be locked out forever."""
-        now = [1000.0]
-        monkeypatch.setattr(mqtt_mod.time, "monotonic", lambda: now[0])
+    def test_a_reported_dry_time_of_zero_is_never_overridden(self, mqtt_client):
+        """The audit's "drying latch overrides ``dry_time: 0``" (2026-10-11): once the unit REPORTS
+        its cycle the report decides — its own 0 ends the drying, with no deadline still claiming it."""
+        mqtt_client._handle_drying_echo(
+            {"result": "success", "ams_id": 0, "mode": 1, "filament": "PLA", "temp": 55, "duration": 12}
+        )
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "dry_time": 700, "tray": [{"id": 0, "state": 10}]}]})
+        assert mqtt_client._drying_targets[0]["awaiting_start"] is False  # handed over to the report
+
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "dry_time": 0, "tray": [{"id": 0, "state": 10}]}]})
+        assert mqtt_client.ams_unit_drying(0) is False
+
+    def test_slow_firmware_a_start_is_awaited_until_the_unit_answers(self, mqtt_client):
+        """Slow firmware: a unit slow to report its cycle stays drying for every write (the 0700_C069
+        side) inside its latch — and its positive ``dry_time`` five minutes in ends the AWAIT, the
+        report deciding from there (events first)."""
         mqtt_client._handle_drying_echo(
             {"result": "success", "ams_id": 0, "mode": 1, "filament": "PLA", "temp": 55, "duration": 1}
         )
-        assert mqtt_client.ams_unit_drying(0) is True  # latched to 1000 + 3600 + 1800
-
-        now[0] = 6399.0
+        for _ in range(3):  # pushes that carry no dry_time say nothing about drying
+            mqtt_client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 10}]}]})
+        mqtt_client._drying_targets[0]["latched_until"] -= 300  # five minutes of the latch spent
         assert mqtt_client.ams_unit_drying(0) is True
 
-        now[0] = 6401.0
-        assert mqtt_client.ams_unit_drying(0) is False
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "dry_time": 55, "tray": [{"id": 0, "state": 10}]}]})
+        assert mqtt_client._drying_targets[0]["awaiting_start"] is False  # the unit answered
+        assert mqtt_client.ams_unit_drying(0) is True  # its own dry_time decides now
+
+    @pytest.mark.parametrize(
+        ("duration_h", "latch_s"),
+        [pytest.param(4, 4 * 3600 + 1800, id="cycle_plus_slack"), pytest.param(0, 24 * 3600 + 1800, id="cap")],
+    )
+    def test_an_unanswered_start_ends_at_the_client_latch(self, mqtt_client, caplog, duration_h, latch_s):
+        """Restored 2026-10-12 (Raymond: "if it was self heal, it should stay self heal"): a start no
+        event answers — no positive ``dry_time``, no fail echo, no later session's 0 — stops counting as
+        drying at the cycle's duration + ``_DRYING_LATCH_SLACK_S`` (``_DRYING_LATCH_DEFAULT_S`` + slack
+        with no duration), so the unit can never refuse every AMS write forever."""
+        before = mqtt_mod.time.monotonic()
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=duration_h, mode=1, filament="PLA", sequence_id="1")
+        after = mqtt_mod.time.monotonic()
+        deadline = mqtt_client._drying_targets[0]["latched_until"]
+        assert before + latch_s <= deadline <= after + latch_s
+
+        # A heartbeat before the deadline: still drying (the safe side for every write).
+        mqtt_client._drying_targets[0]["latched_until"] = mqtt_mod.time.monotonic() + 1
+        assert mqtt_client.ams_unit_drying(0) is True
+        # The deadline passes with no answer: the latch ends the wait, with a WARNING.
+        mqtt_client._drying_targets[0]["latched_until"] = mqtt_mod.time.monotonic() - 1
+        with caplog.at_level("WARNING"):
+            assert mqtt_client.ams_unit_drying(0) is False
         assert 0 not in mqtt_client._drying_targets
+        assert any("drying start never reported" in r.getMessage() for r in caplog.records)
+        # LIVENESS: the unit's writes are no longer refused for drying.
+        assert mqtt_client._ams_write_refusal(0) != "drying"
+
+    def test_the_echo_seeds_the_same_latch_from_its_own_duration(self, mqtt_client):
+        """A touchscreen-started cycle is latched by its echo's ``duration`` (hours), exactly as a
+        command's is."""
+        before = mqtt_mod.time.monotonic()
+        mqtt_client._handle_drying_echo(
+            {"result": "success", "ams_id": 0, "mode": 1, "filament": "PLA", "temp": 55, "duration": 2}
+        )
+        deadline = mqtt_client._drying_targets[0]["latched_until"]
+        assert deadline >= before + 2 * 3600 + mqtt_mod._DRYING_LATCH_SLACK_S
+
+    def test_a_reported_cycle_is_never_ended_by_the_latch(self, mqtt_client):
+        """Once the unit reports its cycle the latch is out of the question: an expired latch over a
+        positive ``dry_time`` still reads drying (the report decides)."""
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=1, mode=1, filament="PLA", sequence_id="1")
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "dry_time": 50, "tray": [{"id": 0, "state": 10}]}]})
+        mqtt_client._drying_targets[0]["latched_until"] = mqtt_mod.time.monotonic() - 1
+        assert mqtt_client.ams_unit_drying(0) is True
+        assert 0 in mqtt_client._drying_targets  # the badge keeps its target until the falling edge
+
+    def test_a_refused_start_echo_awaits_nothing(self, mqtt_client):
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, mode=1, filament="PLA", sequence_id="1")
+        mqtt_client._handle_drying_echo({"result": "fail", "ams_id": 0, "mode": 1})
+        assert mqtt_client.ams_unit_drying(0) is False
+
+    def test_a_later_sessions_report_of_no_drying_ends_an_unstarted_start(self, mqtt_client):
+        """The start was awaited in one MQTT session; a later session's report of ``dry_time: 0``
+        says the cycle never ran (or ended unseen across the gap)."""
+        mqtt_client.send_drying_command(ams_id=0, temp=55, duration=4, mode=1, filament="PLA", sequence_id="1")
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "dry_time": 0, "tray": [{"id": 0, "state": 10}]}]})
+        assert mqtt_client.ams_unit_drying(0) is True  # the same session: the start may still come
+
+        mqtt_client.state.connection_epoch += 1  # a reconnect
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "dry_time": 0, "tray": [{"id": 0, "state": 10}]}]})
+        assert mqtt_client.ams_unit_drying(0) is False
 
     @pytest.mark.parametrize("op", _AMS_WRITE_OPS)
     def test_other_unit_unaffected_by_drying(self, mqtt_client, op):
@@ -4876,10 +5094,10 @@ class TestIdentifyGate:
 
     def test_second_refresh_inside_gate_refused(self, mqtt_client):
         """Including a DIFFERENT slot — the gate is per printer, not per tray."""
-        assert mqtt_client.ams_refresh_tray(0, 0)[0] is True
+        assert mqtt_client.ams_refresh_tray(0, 0, sequence_id="1")[0] is True
         assert mqtt_client._identify_gate_until > 0
 
-        ok, msg = mqtt_client.ams_refresh_tray(0, 1)
+        ok, msg = mqtt_client.ams_refresh_tray(0, 1, sequence_id="1")
 
         assert ok is False
         assert "identifying another tray" in msg.lower()
@@ -4887,7 +5105,7 @@ class TestIdentifyGate:
 
     @pytest.mark.parametrize("op", _AMS_WRITE_OPS)
     def test_a_real_identify_gates_every_other_write(self, mqtt_client, op):
-        assert mqtt_client.ams_refresh_tray(0, 0)[0] is True, "arms the gate"
+        assert mqtt_client.ams_refresh_tray(0, 0, sequence_id="1")[0] is True, "arms the gate"
 
         assert _AMS_WRITE_ARGS[op](mqtt_client, 0, 1) is False
 
@@ -4895,7 +5113,7 @@ class TestIdentifyGate:
 
     @pytest.mark.parametrize("op", _AMS_WRITE_OPS)
     def test_the_release_frees_every_write(self, mqtt_client, op):
-        mqtt_client.ams_refresh_tray(0, 0)
+        mqtt_client.ams_refresh_tray(0, 0, sequence_id="1")
 
         self._release_by_ams_going_idle(mqtt_client)
 
@@ -4906,7 +5124,7 @@ class TestIdentifyGate:
     def test_the_expiry_frees_every_write(self, mqtt_client, monkeypatch, op):
         now = [1000.0]
         monkeypatch.setattr(mqtt_mod.time, "monotonic", lambda: now[0])
-        assert mqtt_client.ams_refresh_tray(0, 0)[0] is True, "arms the gate to 1030"
+        assert mqtt_client.ams_refresh_tray(0, 0, sequence_id="1")[0] is True, "arms the gate to 1030"
 
         now[0] = 1029.0
         assert _AMS_WRITE_ARGS[op](mqtt_client, 0, 1) is False
@@ -4939,13 +5157,13 @@ class TestAmsChangeFilamentGuards:
     def test_a_load_is_refused_for_every_reason(self, mqtt_client, caplog, reason):
         if reason == "identify_in_flight":
             mqtt_client.state.tray_now = 255  # ams_refresh_tray's own "nothing loaded" check
-            assert mqtt_client.ams_refresh_tray(0, 0)[0] is True, "arms the gate for real"
+            assert mqtt_client.ams_refresh_tray(0, 0, sequence_id="1")[0] is True, "arms the gate for real"
         else:
             _arm_ams_hazard(mqtt_client, reason)
         published_before = mqtt_client._client.publish.call_count
 
         with caplog.at_level(logging.WARNING, logger="backend.app.services.bambu_mqtt"):
-            assert mqtt_client.ams_load_filament(0) is False
+            assert mqtt_client.ams_load_filament(0, sequence_id="1") is False
 
         assert mqtt_client._client.publish.call_count == published_before
         if reason != "identify_in_flight":
@@ -4957,7 +5175,7 @@ class TestAmsChangeFilamentGuards:
         self._dry(mqtt_client, 1)
 
         with caplog.at_level(logging.WARNING, logger="backend.app.services.bambu_mqtt"):
-            assert mqtt_client.ams_unload_filament() is False
+            assert mqtt_client.ams_unload_filament(sequence_id="1") is False
 
         mqtt_client._client.publish.assert_not_called()
         warned = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
@@ -4966,7 +5184,7 @@ class TestAmsChangeFilamentGuards:
     def test_unload_refused_while_identifying(self, mqtt_client):
         _arm_ams_hazard(mqtt_client, "identifying")
 
-        assert mqtt_client.ams_unload_filament() is False
+        assert mqtt_client.ams_unload_filament(sequence_id="1") is False
 
         mqtt_client._client.publish.assert_not_called()
 
@@ -4974,7 +5192,7 @@ class TestAmsChangeFilamentGuards:
         mqtt_client.state.tray_now = 255
         self._dry(mqtt_client, 0)
 
-        assert mqtt_client.ams_unload_filament() is True
+        assert mqtt_client.ams_unload_filament(sequence_id="1") is True
 
         mqtt_client._client.publish.assert_called_once()
 
@@ -4986,28 +5204,18 @@ class TestAmsChangeFilamentGuards:
         ]
         mqtt_client.state.tray_now = 255  # nothing feeding — the live incident's telemetry
 
-        assert mqtt_client.ams_unload_filament() is True
-        assert mqtt_client.ams_load_filament(2) is True
+        assert mqtt_client.ams_unload_filament(sequence_id="1") is True
+        assert mqtt_client.ams_load_filament(2, sequence_id="1") is True
 
         assert mqtt_client._client.publish.call_count == 2
 
     def test_neither_arms_the_identify_gate(self, mqtt_client):
-        assert mqtt_client.ams_unload_filament() is True
-        assert mqtt_client.ams_load_filament(1) is True
+        assert mqtt_client.ams_unload_filament(sequence_id="1") is True
+        assert mqtt_client.ams_load_filament(1, sequence_id="1") is True
 
         assert mqtt_client._identify_gate_until == 0.0, "motion is not an identify"
         mqtt_client.state.tray_now = 255
-        assert mqtt_client.ams_refresh_tray(0, 0)[0] is True, "so a later identify is free"
-
-    def test_load_does_not_burn_a_sequence_id_when_refused(self, mqtt_client):
-        """A refused command must cost nothing — a burnt sequence id desynchronises
-        the response matching for every later command."""
-        _arm_ams_hazard(mqtt_client, "identifying")
-        before = mqtt_client._sequence_id
-
-        assert mqtt_client.ams_load_filament(0) is False
-
-        assert mqtt_client._sequence_id == before
+        assert mqtt_client.ams_refresh_tray(0, 0, sequence_id="1")[0] is True, "so a later identify is free"
 
 
 class TestWaitAmsSettle:
@@ -5168,6 +5376,7 @@ class TestTrayExistBitsStatePromotionMerge:
         assert tray["state"] == 10, "and the stuck 9 promoted"
 
     def test_state9_partial_with_cached_bit_clear_still_wipes(self, mqtt_client):
+        _live_session(mqtt_client)
         mqtt_client._handle_ams_data({**self.LOADED_SLOT_0, "tray_exist_bits": "1"})
 
         # Tray-less pushes carrying an all-zero mask return BEFORE the merge, so they
@@ -5553,6 +5762,7 @@ class TestEvidencePushall:
         The answer is an all-zero mask, so it must repeat before the farm may act on
         it — until then it is treated exactly as a bits-less push, owed slots included.
         """
+        _live_session(mqtt_client)
         self._seat_with_bits(mqtt_client)
         self._minimal_partial(mqtt_client, times=2)
         assert mqtt_client._evidence_owed, "precondition: the slot is owed a report"
@@ -5639,7 +5849,7 @@ class TestStartPrintAllNegativeMappingRefused:
     @pytest.mark.parametrize("mapping", [[-1], [-1, -1], [-1, -1, -1, -1], [None, -1], [None]])
     def test_all_negative_refuses_and_never_publishes(self, mqtt_client, mapping, caplog):
         with caplog.at_level(logging.ERROR):
-            assert mqtt_client.start_print("test.3mf", ams_mapping=mapping) is False
+            assert mqtt_client.start_print("test.3mf", ams_mapping=mapping, sequence_id="1") is False
 
         mqtt_client._client.publish.assert_not_called()
         assert "Refusing print start" in caplog.text
@@ -5651,7 +5861,7 @@ class TestStartPrintAllNegativeMappingRefused:
         client = _make_client(serial="T2", connected=True)
         client.last_dispatch_subtask_id = "previous"
 
-        assert client.start_print("test.3mf", ams_mapping=[-1, -1]) is False
+        assert client.start_print("test.3mf", ams_mapping=[-1, -1], sequence_id="1") is False
 
         assert client.last_dispatch_subtask_id == "previous"
         assert client.state.dispatched_plate_id is None
@@ -5659,7 +5869,7 @@ class TestStartPrintAllNegativeMappingRefused:
     @pytest.mark.parametrize("use_ams", [True, False])
     def test_refusal_is_unconditional_on_use_ams(self, mqtt_client, use_ams):
         """The mapping is untranslatable whatever the caller asked for."""
-        assert mqtt_client.start_print("t.3mf", ams_mapping=[-1], use_ams=use_ams) is False
+        assert mqtt_client.start_print("t.3mf", ams_mapping=[-1], use_ams=use_ams, sequence_id="1") is False
 
         mqtt_client._client.publish.assert_not_called()
 
@@ -5667,13 +5877,13 @@ class TestStartPrintAllNegativeMappingRefused:
         """Dual-nozzle models bypass the use_ams coercion, not the honesty check."""
         mqtt_client._is_dual_nozzle = True
 
-        assert mqtt_client.start_print("t.3mf", ams_mapping=[-1, -1]) is False
+        assert mqtt_client.start_print("t.3mf", ams_mapping=[-1, -1], sequence_id="1") is False
 
         mqtt_client._client.publish.assert_not_called()
 
     def test_one_external_entry_makes_it_a_real_external_print(self, mqtt_client):
         """``[-1, 254]`` is a genuine external print with one unused filament slot."""
-        assert mqtt_client.start_print("test.3mf", ams_mapping=[-1, 254], use_ams=True) is True
+        assert mqtt_client.start_print("test.3mf", ams_mapping=[-1, 254], use_ams=True, sequence_id="1") is True
 
         cmd = _published_command(mqtt_client)
         assert cmd["ams_mapping"] == [-1, -1]
@@ -5682,7 +5892,7 @@ class TestStartPrintAllNegativeMappingRefused:
 
     def test_a_plain_ams_mapping_is_unchanged(self, mqtt_client):
         """The regression fence: an ordinary dispatch translates exactly as before."""
-        assert mqtt_client.start_print("test.3mf", ams_mapping=[4], use_ams=True) is True
+        assert mqtt_client.start_print("test.3mf", ams_mapping=[4], use_ams=True, sequence_id="1") is True
 
         cmd = _published_command(mqtt_client)
         assert cmd["ams_mapping"] == [4]
@@ -5693,12 +5903,12 @@ class TestStartPrintAllNegativeMappingRefused:
         """``None`` means "this print needs no mapping" — a legitimate mapping-free
         dispatch (an eject file, a single-filament print with no AMS). Only a
         NON-EMPTY all-negative mapping is a lie."""
-        assert mqtt_client.start_print("test.3mf", ams_mapping=None) is True
+        assert mqtt_client.start_print("test.3mf", ams_mapping=None, sequence_id="1") is True
 
         assert "ams_mapping" not in _published_command(mqtt_client)
 
     def test_empty_mapping_is_not_a_refusal(self, mqtt_client):
-        assert mqtt_client.start_print("test.3mf", ams_mapping=[]) is True
+        assert mqtt_client.start_print("test.3mf", ams_mapping=[], sequence_id="1") is True
 
         mqtt_client._client.publish.assert_called_once()
 
@@ -6618,6 +6828,58 @@ class TestReportEpoch:
         assert mqtt_client.state.report_epoch is None
 
 
+class TestThePrinterEventFactsAreHandedOver:
+    """The three transport facts the printer-event hub re-publishes (``printer_events``), each
+    handed to its injected registry callback at its ONE producer, on the raw push: the session's
+    first fresh report (the ``report_epoch`` stamp), a recorded ACK and a feed-state event."""
+
+    client_kwargs = {"publish_target": True}
+
+    @staticmethod
+    def _connect(client):
+        client._client.subscribe.return_value = (0, 1)  # (result, mid)
+        client._on_connect(client._client, None, None, 0)
+
+    def test_the_first_fresh_report_of_each_session_is_handed_over_once(self):
+        sessions: list[int] = []
+        client = _make_client(publish_target=True, on_session_report=sessions.append)
+
+        self._connect(client)
+        assert sessions == []  # the connect broadcast is the cached state, not a report
+        client._process_message(_job_push("RUNNING"))
+        client._process_message(_job_push("RUNNING"))
+        client._process_message({"print": {"nozzle_temper": 212.0}})  # no lifecycle state: no stamp
+        assert sessions == [1]
+
+        self._connect(client)  # a reconnect: the previous session's RUNNING is re-broadcast
+        assert sessions == [1]
+        client._process_message(_job_push("IDLE"))
+        client._process_message(_job_push("IDLE"))
+        assert sessions == [1, 2]
+
+    def test_a_handler_failure_never_breaks_the_push(self):
+        def _boom(_epoch):
+            raise RuntimeError("farm side on fire")
+
+        client = _make_client(publish_target=True, on_session_report=_boom)
+        self._connect(client)
+
+        client._process_message(_job_push("RUNNING"))
+
+        assert client.state.report_epoch == client.state.connection_epoch == 1
+        assert client.state.state == "RUNNING"
+
+    def test_the_recorded_ack_is_handed_over(self):
+        acks: list[CommandAck] = []
+        client = _make_client(publish_target=True, on_command_ack=acks.append)
+
+        client._process_message({"print": {"command": "resume", "sequence_id": "41", "result": "success"}})
+        client._process_message({"print": {"command": "push_status", "sequence_id": "0"}})  # not an ACK
+
+        assert acks == [client.state.command_acks[-1]]
+        assert (acks[0].command, acks[0].sequence_id, acks[0].succeeded) == ("resume", "41", True)
+
+
 class TestSetFanPercent:
     """``set_fan_percent`` is the ONE origin of the percent→PWM conversion.
 
@@ -6643,7 +6905,7 @@ class TestSetFanPercent:
         ],
     )
     def test_percent_maps_to_pwm(self, mqtt_client, percent, expected):
-        assert mqtt_client.set_fan_percent(2, percent) is True
+        assert mqtt_client.set_fan_percent(2, percent, sequence_id="1") is True
         assert self._published_gcode(mqtt_client) == [expected]
 
     @pytest.mark.parametrize(
@@ -6658,25 +6920,25 @@ class TestSetFanPercent:
     def test_out_of_range_percent_clamps(self, mqtt_client, percent, expected):
         """Clamped, never scaled past the wire's 0-255 — an out-of-range percent must not
         become an out-of-range PWM the firmware would reject or misread."""
-        assert mqtt_client.set_fan_percent(2, percent) is True
+        assert mqtt_client.set_fan_percent(2, percent, sequence_id="1") is True
         assert self._published_gcode(mqtt_client) == [expected]
 
     def test_fan_index_rides_through_to_the_command(self, mqtt_client):
         # 1 = part cooling, 2 = auxiliary, 3 = chamber.
-        mqtt_client.set_fan_percent(1, 100)
-        mqtt_client.set_fan_percent(3, 100)
+        mqtt_client.set_fan_percent(1, 100, sequence_id="1")
+        mqtt_client.set_fan_percent(3, 100, sequence_id="1")
         assert self._published_gcode(mqtt_client) == ["M106 P1 S255", "M106 P3 S255"]
 
     def test_invalid_fan_index_is_refused_without_publishing(self, mqtt_client):
         """The validity gate lives in set_fan_speed; set_fan_percent must not bypass it."""
-        assert mqtt_client.set_fan_percent(4, 100) is False
+        assert mqtt_client.set_fan_percent(4, 100, sequence_id="1") is False
         assert self._published_gcode(mqtt_client) == []
 
     def test_disconnected_client_reports_failure(self, mqtt_client):
         """send_gcode is fail-loud (2026-07-21): a disconnected printer cannot eat a
         command silently, so the percent wrapper must propagate the False."""
         mqtt_client.state.connected = False
-        assert mqtt_client.set_fan_percent(2, 100) is False
+        assert mqtt_client.set_fan_percent(2, 100, sequence_id="1") is False
         assert self._published_gcode(mqtt_client) == []
 
 
@@ -6746,7 +7008,7 @@ class TestAmsControlPublisher:
 
     @pytest.mark.parametrize("action", ["resume", "reset", "pause", "done", "abort"])
     def test_the_whitelist_covers_every_action_the_hms_modal_dispatches(self, mqtt_client, action):
-        assert mqtt_client.ams_control(action) is True
+        assert mqtt_client.ams_control(action, sequence_id="1") is True
 
         # A fresh client's first sequenced send — BambuStudio's `m_sequence_id++` shape.
         assert _published_payloads(mqtt_client)[0] == {
@@ -6754,33 +7016,32 @@ class TestAmsControlPublisher:
         }
 
     def test_an_unknown_action_is_refused(self, mqtt_client):
-        assert mqtt_client.ams_control("detonate") is False
+        assert mqtt_client.ams_control("detonate", sequence_id="1") is False
 
         assert _published_payloads(mqtt_client) == []
-        assert mqtt_client.last_sent_sequence_id("ams_control") is None  # no id burnt either
 
     def test_a_bare_call_carries_no_pushall(self, mqtt_client):
         """The recovery driver reads the AMS state machine off the next ~1 Hz push
         anyway; a full report per command would be pure wire cost."""
-        mqtt_client.ams_control("resume")
+        mqtt_client.ams_control("resume", sequence_id="1")
 
         assert len(_published_payloads(mqtt_client)) == 1
 
     def test_request_pushall_appends_the_full_report_ask(self, mqtt_client):
-        mqtt_client.ams_control("resume", request_pushall=True)
+        mqtt_client.ams_control("resume", request_pushall=True, sequence_id="1")
 
         assert _published_payloads(mqtt_client)[1] == {"pushing": {"command": "pushall", "sequence_id": "0"}}
 
     def test_disconnected_is_fail_loud(self, mqtt_client):
         mqtt_client.state.connected = False
 
-        assert mqtt_client.ams_control("resume") is False
+        assert mqtt_client.ams_control("resume", sequence_id="1") is False
         assert _published_payloads(mqtt_client) == []
 
 
 class TestTrayTarParse:
     """``tray_tar`` — the AMS's own target tray, part of the wire's answer to a motion
-    command (``services/ams_command`` reads it as movement evidence). Recorded exactly as
+    command (``services/command_outcome`` reads it as movement evidence). Recorded exactly as
     the wire spelled it, beside ``tray_now``, and never disambiguated."""
 
     client_kwargs = {"serial": "TEST_TRAY_TAR"}
@@ -6870,8 +7131,8 @@ def _ack_fields(ack):
 
 class TestCommandAckLane:
     """Invariant 14 — every command echo with a ``result`` is an ACK, recorded on
-    ``state.command_acks`` at the ONE parse point, whatever the command. ``ams_command``
-    correlates it to its own send by sequence id through ``ack_for``."""
+    ``state.command_acks`` at the ONE parse point, whatever the command. The record
+    (``printer_action``) correlates it to its own send by the action id through ``ack_for``."""
 
     client_kwargs = {"serial": "TEST_ACK"}
 
@@ -6897,6 +7158,44 @@ class TestCommandAckLane:
         [ack] = mqtt_client.state.command_acks
         assert _ack_fields(ack) == (command, "42", "success", "busy")
         assert before <= ack.at <= time.monotonic()
+
+    @pytest.mark.parametrize(
+        ("block", "command"),
+        [("system", "ledctrl"), ("xcam", "xcam_control_set"), ("xcam", "ipcam_record_set"), ("info", "get_version")],
+    )
+    def test_an_echo_in_every_block_lands_as_a_command_ack_and_is_handed_over(self, block, command):
+        """R28: the ONE parse point reads every top-level block carrying ``command`` + ``result`` — the chamber
+        light's ``ledctrl`` rides ``system``, the camera's ``xcam_control_set`` rides ``xcam`` — and hands each
+        ACK to the registry exactly like a ``print`` echo."""
+        handed: list = []
+        client = _make_client(serial="TEST_BLOCKS", on_command_ack=handed.append)
+
+        client._process_message({block: {"command": command, "sequence_id": "51", "result": "success"}})
+
+        assert [_ack_fields(a) for a in client.state.command_acks] == [(command, "51", "success", None)]
+        assert _ack_fields(client.ack_for("51")) == (command, "51", "success", None)
+        assert handed == list(client.state.command_acks)
+
+    def test_one_report_carrying_echoes_in_two_blocks_records_both(self, mqtt_client):
+        mqtt_client._process_message(
+            {
+                "system": {"command": "ledctrl", "sequence_id": "60", "result": "success"},
+                "print": {"command": "pause", "sequence_id": "61", "result": "success"},
+            }
+        )
+
+        assert sorted(_ack_fields(a) for a in mqtt_client.state.command_acks) == [
+            ("ledctrl", "60", "success", None),
+            ("pause", "61", "success", None),
+        ]
+
+    def test_a_block_without_a_result_and_a_pushing_block_are_not_acks(self, mqtt_client):
+        mqtt_client._process_message(
+            {"system": {"command": "get_access_code", "sequence_id": "70", "access_code": "x"}}
+        )
+        mqtt_client._process_message({"pushing": {"command": "pushall", "sequence_id": "0", "result": "success"}})
+
+        assert list(mqtt_client.state.command_acks) == []
 
     def test_the_motion_echo_line_is_still_logged_beside_the_ack(self, mqtt_client, caplog):
         caplog.set_level(logging.INFO, logger="backend.app.services.bambu_mqtt")
@@ -6942,15 +7241,11 @@ class TestCommandAckLane:
         ):
             mqtt_client._process_message({"print": echo})
 
-        assert _ack_fields(mqtt_client.ack_for("ams_change_filament", "7")) == (
-            "ams_change_filament",
-            "7",
-            "success",
-            None,
-        )
-        assert _ack_fields(mqtt_client.ack_for("ams_control", "7")) == ("ams_control", "7", "success", None)
-        assert mqtt_client.ack_for("ams_change_filament", "9") is None
-        assert mqtt_client.ack_for("pause", "7") is None
+        # The id is the action's row id — unique across printers and restarts — so it alone names
+        # the send (``services/printer_action``, the one caller).
+        assert _ack_fields(mqtt_client.ack_for("7")) == ("ams_change_filament", "7", "success", None)
+        assert _ack_fields(mqtt_client.ack_for("8")) == ("ams_change_filament", "8", "success", None)
+        assert mqtt_client.ack_for("9") is None
 
     def test_the_write_consumer_still_receives_only_the_two_config_writes(self, mqtt_client):
         """The tagless write-epoch consumer answers config writes; a motion or control
@@ -6989,68 +7284,26 @@ class TestCommandAckSucceeded:
         assert CommandAck("resume", "1", None, None, 0.0).succeeded is False
 
 
-class TestAwaitAck:
-    """``await_ack`` — the one wait for a published command's firmware answer, over
-    ``ack_for``: it finds ITS send's ACK by sequence id or answers ``None`` at the budget."""
+class TestThePressAndItsAck:
+    """End to end on the client: the dialog press carries its caller's sequence id (the action's row
+    id), the echo of that send lands on the ACK log, and ``ack_for`` reads it by that id."""
 
-    client_kwargs = {"serial": "TEST_AWAIT"}
+    client_kwargs = {"serial": "TEST_PRESS"}
 
-    async def test_an_ack_already_in_the_log_is_returned_at_once(self, mqtt_client):
-        mqtt_client._process_message({"print": {"command": "resume", "sequence_id": "5", "result": "success"}})
-
-        started = time.monotonic()
-        ack = await mqtt_client.await_ack(mqtt_mod.SentCommand("resume", "5"), budget_s=5.0, poll_s=1.0)
-
-        assert _ack_fields(ack) == ("resume", "5", "success", None)
-        assert time.monotonic() - started < 0.5
-
-    async def test_an_ack_that_lands_during_the_wait_is_found(self, mqtt_client):
-        loop = asyncio.get_running_loop()
-        loop.call_later(
-            0.05,
-            mqtt_client._process_message,
-            {"print": {"command": "ignore", "sequence_id": "7", "result": "fail", "reason": "err mismatch"}},
-        )
-
-        ack = await mqtt_client.await_ack(mqtt_mod.SentCommand("ignore", "7"), budget_s=2.0, poll_s=0.01)
-
-        assert _ack_fields(ack) == ("ignore", "7", "fail", "err mismatch")
-        assert ack.succeeded is False
-
-    async def test_no_ack_within_the_budget_is_none(self, mqtt_client):
-        # Another send's ACK and the same id under another command are not this send's.
-        mqtt_client._process_message({"print": {"command": "resume", "sequence_id": "8", "result": "success"}})
-        mqtt_client._process_message({"print": {"command": "ignore", "sequence_id": "9", "result": "success"}})
-
-        started = time.monotonic()
-        ack = await mqtt_client.await_ack(mqtt_mod.SentCommand("resume", "9"), budget_s=0.05, poll_s=0.01)
-
-        assert ack is None
-        assert time.monotonic() - started >= 0.05
-
-    async def test_an_unsequenced_send_has_no_readable_ack(self, mqtt_client):
-        started = time.monotonic()
-
-        assert await mqtt_client.await_ack(mqtt_mod.SentCommand("uiop", None), budget_s=5.0, poll_s=1.0) is None
-        assert time.monotonic() - started < 0.5
-
-    async def test_the_press_and_its_answer_round_trip(self, mqtt_client):
-        """End to end on the client: the dialog press names its send, the echo of that
-        send lands on the ACK log, and the wait reads it."""
+    def test_the_press_and_its_answer_round_trip(self, mqtt_client):
         from backend.app.services.hms_actions import HMSAction
 
         mqtt_client._client = MagicMock()
         mqtt_client.state.connected = True
 
-        sent = mqtt_client.execute_hms_action("0500808C", HMSAction.PROBLEM_SOLVED_RESUME, "771234")
+        assert mqtt_client.execute_hms_action("0500808C", HMSAction.PROBLEM_SOLVED_RESUME, "771234", sequence_id="41")
         frame = _published_payloads(mqtt_client)[0]["print"]
         mqtt_client._process_message(
             {"print": {"command": frame["command"], "sequence_id": frame["sequence_id"], "result": "success"}}
         )
-        ack = await mqtt_client.await_ack(sent, budget_s=1.0, poll_s=0.01)
 
-        assert (frame["err"], frame["sequence_id"]) == ("83918988", "1")
-        assert ack is not None and ack.succeeded
+        assert (frame["err"], frame["sequence_id"]) == ("83918988", "41")
+        assert mqtt_client.ack_for("41").succeeded
 
 
 class TestPrintErrorWireFact:
@@ -7094,58 +7347,90 @@ class TestPrintErrorWireFact:
         assert mqtt_client.state.hms_errors == []
 
 
-# Each sequenced publisher, called once, and the wire command name it records under.
+# Each publisher an ACK must be matched to, sending the caller's sequence id.
 _SEQUENCED_PUBLISHERS = [
-    pytest.param(lambda c: c.ams_control("resume"), "ams_control", id="ams_control"),
-    pytest.param(lambda c: c.pause_print(), "pause", id="pause_print"),
-    pytest.param(lambda c: c.resume_print(), "resume", id="resume_print"),
-    pytest.param(lambda c: c.clean_print_error(), "clean_print_error", id="clean_print_error"),
-    pytest.param(lambda c: c.ams_load_filament(1), "ams_change_filament", id="ams_load_filament"),
-    pytest.param(lambda c: c.ams_unload_filament(), "ams_change_filament", id="ams_unload_filament"),
+    pytest.param(lambda c, seq: c.ams_control("resume", sequence_id=seq), "ams_control", id="ams_control"),
+    pytest.param(lambda c, seq: c.pause_print(sequence_id=seq), "pause", id="pause_print"),
+    pytest.param(lambda c, seq: c.resume_print(sequence_id=seq), "resume", id="resume_print"),
+    pytest.param(lambda c, seq: c.clean_print_error(sequence_id=seq), "clean_print_error", id="clean_print_error"),
+    pytest.param(lambda c, seq: c.ams_load_filament(1, sequence_id=seq), "ams_change_filament", id="ams_load"),
+    pytest.param(lambda c, seq: c.ams_unload_filament(sequence_id=seq), "ams_change_filament", id="ams_unload"),
+    pytest.param(lambda c, seq: c.stop_print(sequence_id=seq), "stop", id="stop_print"),
 ]
 
 
 class TestSequencedPublishers:
-    """The six publishers an ACK must be matched to send a REAL incrementing
-    ``sequence_id`` (BambuStudio's ``command_ams_control`` sends ``m_sequence_id++``) and
-    record it for ``last_sent_sequence_id``. With every send numbered ``"0"`` no ACK
-    could name the send it answers."""
+    """Every state-changing publisher sends the ``sequence_id`` its CALLER gives — the
+    ``printer_action`` row id (2026-10-11): no client-side counter, so no two sends ever share an id,
+    across printers and restarts, and an ACK names exactly one recorded action."""
 
     client_kwargs = {"serial": "TEST_SEQ", "connected": True, "tray_now": 255}
 
     @pytest.mark.parametrize("publish, wire_command", _SEQUENCED_PUBLISHERS)
-    def test_each_send_carries_a_fresh_non_zero_id_and_records_it(self, mqtt_client, publish, wire_command):
-        assert mqtt_client.last_sent_sequence_id(wire_command) is None
-
-        assert publish(mqtt_client) is True
-        assert publish(mqtt_client) is True
+    def test_each_send_carries_its_callers_id(self, mqtt_client, publish, wire_command):
+        assert publish(mqtt_client, "41") is True
+        assert publish(mqtt_client, "42") is True
 
         frames = [p["print"] for p in _published_payloads(mqtt_client) if "print" in p]
         assert [f["command"] for f in frames] == [wire_command, wire_command]
-        assert [f["sequence_id"] for f in frames] == ["1", "2"]
-        assert mqtt_client.last_sent_sequence_id(wire_command) == "2"
+        assert [f["sequence_id"] for f in frames] == ["41", "42"]
 
-    def test_one_counter_numbers_every_command(self, mqtt_client):
-        mqtt_client.pause_print()
-        mqtt_client.ams_control("resume")
-        mqtt_client.resume_print()
-
-        assert [p["print"]["sequence_id"] for p in _published_payloads(mqtt_client)] == ["1", "2", "3"]
-        assert (
-            mqtt_client.last_sent_sequence_id("pause"),
-            mqtt_client.last_sent_sequence_id("ams_control"),
-            mqtt_client.last_sent_sequence_id("resume"),
-        ) == ("1", "2", "3")
+    def test_the_client_keeps_no_counter(self, mqtt_client):
+        assert not hasattr(mqtt_client, "_sequence_id")
+        assert not hasattr(mqtt_client, "last_sent_sequence_id")
 
     @pytest.mark.parametrize("publish, wire_command", _SEQUENCED_PUBLISHERS)
-    def test_a_disconnected_client_publishes_nothing_and_burns_no_id(self, mqtt_client, publish, wire_command):
+    def test_a_disconnected_client_publishes_nothing(self, mqtt_client, publish, wire_command):
         mqtt_client.state.connected = False
 
-        assert publish(mqtt_client) is False
+        assert publish(mqtt_client, "41") is False
 
         assert _published_payloads(mqtt_client) == []
-        assert mqtt_client._sequence_id == 0
-        assert mqtt_client.last_sent_sequence_id(wire_command) is None
+
+
+class TestForwardedFramePublisher:
+    """``publish_forwarded`` puts a slicer's own frame (forwarded by a virtual printer's bridge) on the wire
+    under the RECORD's id (``printer_action.slicer_forward``): never the slicer's own number, which could
+    equal a farm action's id and answer it."""
+
+    client_kwargs = {"serial": "TEST_FWD", "connected": True}
+
+    @pytest.fixture
+    def mqtt_client(self, mqtt_client):
+        # paho's publish answers an ``MQTTMessageInfo``; its ``rc`` says whether the frame went out.
+        mqtt_client._client.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_SUCCESS)
+        return mqtt_client
+
+    def test_a_publish_the_broker_rejects_did_not_go_out(self, mqtt_client):
+        mqtt_client._client.publish.return_value = SimpleNamespace(rc=mqtt.MQTT_ERR_NO_CONN)
+
+        assert (
+            mqtt_client.publish_forwarded({"print": {"command": "stop", "sequence_id": "5"}}, sequence_id="7") is False
+        )
+
+    def test_every_numbered_block_carries_the_records_id(self, mqtt_client):
+        frame = {"print": {"command": "ams_change_filament", "target": 2, "sequence_id": "20017"}}
+
+        assert mqtt_client.publish_forwarded(frame, sequence_id="41") is True
+
+        assert _published_payloads(mqtt_client) == [
+            {"print": {"command": "ams_change_filament", "target": 2, "sequence_id": "41"}}
+        ]
+        assert frame["print"]["sequence_id"] == "20017"  # the caller's frame is never mutated
+
+    def test_an_unnumbered_frame_is_numbered_on_its_command_block(self, mqtt_client):
+        assert mqtt_client.publish_forwarded({"system": {"command": "get_access_code"}}, sequence_id="7") is True
+
+        assert _published_payloads(mqtt_client) == [{"system": {"command": "get_access_code", "sequence_id": "7"}}]
+
+    def test_a_disconnected_client_publishes_nothing(self, mqtt_client):
+        mqtt_client.state.connected = False
+
+        assert (
+            mqtt_client.publish_forwarded({"print": {"command": "stop", "sequence_id": "5"}}, sequence_id="7") is False
+        )
+
+        assert _published_payloads(mqtt_client) == []
 
 
 class TestCleanPrintErrorPublisher:
@@ -7160,7 +7445,7 @@ class TestCleanPrintErrorPublisher:
     def test_the_frame_only(self, mqtt_client):
         mqtt_client.state.hms_errors = list(self._STANDING)
 
-        assert mqtt_client.clean_print_error() is True
+        assert mqtt_client.clean_print_error(sequence_id="1") is True
 
         assert _published_payloads(mqtt_client) == [{"print": {"command": "clean_print_error", "sequence_id": "1"}}]
         assert mqtt_client.state.hms_errors == self._STANDING, "no local wipe"
@@ -7168,17 +7453,16 @@ class TestCleanPrintErrorPublisher:
     def test_clear_hms_errors_publishes_through_the_one_frame_and_wipes_locally(self, mqtt_client):
         mqtt_client.state.hms_errors = list(self._STANDING)
 
-        assert mqtt_client.clear_hms_errors() is True
+        assert mqtt_client.clear_hms_errors(sequence_id="1") is True
 
         assert _published_payloads(mqtt_client) == [{"print": {"command": "clean_print_error", "sequence_id": "1"}}]
-        assert mqtt_client.last_sent_sequence_id("clean_print_error") == "1"
         assert mqtt_client.state.hms_errors == []
 
     def test_clear_hms_errors_disconnected_sends_nothing_and_keeps_the_list(self, mqtt_client):
         mqtt_client.state.connected = False
         mqtt_client.state.hms_errors = list(self._STANDING)
 
-        assert mqtt_client.clear_hms_errors() is False
+        assert mqtt_client.clear_hms_errors(sequence_id="1") is False
 
         assert _published_payloads(mqtt_client) == []
         assert mqtt_client.state.hms_errors == self._STANDING
@@ -7186,9 +7470,7 @@ class TestCleanPrintErrorPublisher:
     def test_the_hms_modal_ok_publishes_the_frame_then_a_pushall(self, mqtt_client):
         from backend.app.services.hms_actions import HMSAction
 
-        assert mqtt_client.execute_hms_action("03008070", HMSAction.OK_BUTTON, "") == SentCommand(
-            "clean_print_error", "1"
-        )
+        assert mqtt_client.execute_hms_action("03008070", HMSAction.OK_BUTTON, "", sequence_id="1") is True
 
         assert _published_payloads(mqtt_client) == [
             {"print": {"command": "clean_print_error", "sequence_id": "1"}},
@@ -7198,7 +7480,7 @@ class TestCleanPrintErrorPublisher:
     def test_the_hms_modal_double_check_ok_keeps_its_uiop_close(self, mqtt_client):
         from backend.app.services.hms_actions import HMSAction
 
-        assert mqtt_client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK, "") == SentCommand("uiop", None)
+        assert mqtt_client.execute_hms_action("03008070", HMSAction.DBL_CHECK_OK, "", sequence_id="1") is True
 
         payloads = _published_payloads(mqtt_client)
         assert payloads[:2] == [

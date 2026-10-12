@@ -862,7 +862,7 @@ class TestAsyncWrappers:
             timeout=30.0,
             printer_model="X1C",
         )
-        assert result is True
+        assert result == bambu_ftp.UPLOADED
 
     @pytest.mark.asyncio
     async def test_upload_file_async_a1_fallback(self, patch_ftp_port, tmp_path):
@@ -881,7 +881,7 @@ class TestAsyncWrappers:
             timeout=30.0,
             printer_model="A1",
         )
-        assert result is True
+        assert result == bambu_ftp.UPLOADED
 
     @pytest.mark.asyncio
     async def test_download_file_async_success(self, patch_ftp_port, tmp_path):
@@ -1292,6 +1292,117 @@ class TestFailureScenarios:
 # ---------------------------------------------------------------------------
 # Short-circuit retries on 550 (#972)
 # ---------------------------------------------------------------------------
+class TestTheUploadAnswerNamesItsFailure:
+    """An FTPS upload that did not land says WHY (2026-10-11, owner 9): the server's own refusal (a 5xx
+    reply) or an unreadable local file is ``permanent`` — the unit fails, as it always has; everything the
+    transport does (a timeout, a dropped connection, a transient 4xx, a connect that did not complete) is
+    a ``stall`` — the dispatch holds and a later one uploads again, never spending the unit's retry."""
+
+    def _client_with(self, ftp, tmp_path, *, local_exists=True):
+        client = bambu_ftp.BambuFTPClient("127.0.0.1", "code")
+        client._ftp = ftp
+        local = tmp_path / "unit.3mf"
+        if local_exists:
+            local.write_bytes(b"x" * 10)
+        return client, local
+
+    def test_a_5xx_reply_is_permanent(self, tmp_path):
+        import ftplib
+
+        ftp = SimpleNamespace(
+            transfercmd=lambda cmd: (_ for _ in ()).throw(ftplib.error_perm("553 Could not create file."))
+        )
+        client, local = self._client_with(ftp, tmp_path)
+        assert client.upload_file(local, "/unit.3mf") is False
+        assert client.last_upload_failure == "permanent"
+
+    @pytest.mark.parametrize(
+        "error",
+        [TimeoutError("timed out"), ConnectionResetError("reset"), "426"],
+    )
+    def test_the_transport_is_a_stall(self, tmp_path, error):
+        import ftplib
+
+        exc = ftplib.error_temp("426 Failure reading network stream.") if error == "426" else error
+        ftp = SimpleNamespace(transfercmd=lambda cmd: (_ for _ in ()).throw(exc))
+        client, local = self._client_with(ftp, tmp_path)
+        assert client.upload_file(local, "/unit.3mf") is False
+        assert client.last_upload_failure == "stall"
+
+    def test_an_unreadable_local_file_is_permanent(self, tmp_path):
+        ftp = SimpleNamespace(transfercmd=lambda cmd: SimpleNamespace())
+        client, local = self._client_with(ftp, tmp_path, local_exists=False)
+        assert client.upload_file(local, "/unit.3mf") is False
+        assert client.last_upload_failure == "permanent"
+
+    def test_no_session_is_a_stall(self, tmp_path):
+        client, local = self._client_with(None, tmp_path)
+        assert client.upload_file(local, "/unit.3mf") is False
+        assert client.last_upload_failure == "stall"
+
+    async def test_the_async_wrapper_carries_the_class(self, tmp_path, monkeypatch):
+        class _Client:
+            last_upload_failure = None
+            _mode_cache: dict[str, str] = {}
+            A1_MODELS: frozenset[str] = frozenset()
+
+            @staticmethod
+            def cache_mode(ip: str, mode: str) -> None:
+                pass
+
+            def __init__(self, *a, **k):
+                pass
+
+            def connect(self):
+                return True
+
+            def upload_file(self, *a, **k):
+                self.last_upload_failure = "permanent"
+                return False
+
+            def disconnect(self):
+                pass
+
+        monkeypatch.setattr(bambu_ftp, "BambuFTPClient", _Client)
+        result = await bambu_ftp.upload_file_async("10.0.0.1", "code", tmp_path / "u.3mf", "/u.3mf")
+        assert not result
+        assert result.failure == "permanent"
+        assert bambu_ftp.upload_stalled(result) is False
+
+    async def test_a_connect_that_does_not_complete_is_a_stall(self, tmp_path, monkeypatch):
+        class _Client:
+            _mode_cache: dict[str, str] = {}
+            A1_MODELS: frozenset[str] = frozenset()
+
+            def __init__(self, *a, **k):
+                pass
+
+            def connect(self):
+                return False
+
+        monkeypatch.setattr(bambu_ftp, "BambuFTPClient", _Client)
+        result = await bambu_ftp.upload_file_async("10.0.0.1", "code", tmp_path / "u.3mf", "/u.3mf")
+        assert bambu_ftp.upload_stalled(result) is True
+
+    def test_a_bare_false_is_not_a_stall(self):
+        assert bambu_ftp.upload_stalled(False) is False
+        assert bambu_ftp.upload_stalled(bambu_ftp.UPLOADED) is False
+
+    async def test_the_retry_lane_hands_back_the_last_answer(self):
+        """``with_ftp_retry`` used to flatten every exhausted failure to ``None``; it now hands back the
+        last answer the operation gave, so a stall is still a stall after the retries."""
+        stall = bambu_ftp.UploadResult(ok=False, failure="stall", detail="timed out")
+        attempts = {"n": 0}
+
+        async def stalls(*_a, **_k):
+            attempts["n"] += 1
+            return stall
+
+        result = await with_ftp_retry(stalls, max_retries=2, retry_delay=0.0, operation_name="stall")
+        assert result is stall
+        assert attempts["n"] == 3
+
+
 class TestFileNotOnPrinterShortCircuit:
     """FileNotOnPrinterError must bypass the retry budget.
 

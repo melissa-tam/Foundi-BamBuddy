@@ -162,6 +162,7 @@ from backend.app.models.farm_cycle_episode import (
     COOLDOWN_VARIANT_HOLD,
     KIND_COOLDOWN,
 )
+from backend.app.services import printer_action
 from backend.app.services.cycle_episodes import note_episode
 from backend.app.services.eject import donor, generator, remote as eject_remote
 from backend.app.services.eject.generator import EjectGenerationError
@@ -380,7 +381,7 @@ HoldOutcome = Literal[
 # verdict, so the type it stores travels with it and the monitor annotates its own
 # return with this name.
 WatchVerdict = Literal[
-    "released",  # the bed met its release condition (the release predicate, plateau, or the cap)
+    "released",  # the bed met its release condition (the release predicate, or a plateau at its own air)
     "stalled",  # cooling plateaued while genuinely hot, or the dispatch failed three times
     "cleared",  # the plate-clear gate dropped mid-watch — an operator, or the eject's own terminal
 ]
@@ -686,7 +687,13 @@ class CooldownPrep:
                 "[cooldown-prep] printer %s: no MQTT client — %s fan not stepped", self.printer_id, lane.fan.name
             )
             return "skipped:no_client"
-        if not client.set_fan_percent(lane.fan.index, lane.request.sustain_percent):
+        # A sync step on the status callback: the record sends it (``send_soon``), and the publish's
+        # own answer lands on the record — "sent" here is "handed to the record on a live session".
+        if not printer_action.send_soon(
+            self.printer_id,
+            printer_action.fan_percent(lane.fan.index, lane.request.sustain_percent),
+            actor=printer_action.ACTOR_FARM,
+        ):
             logger.warning("[cooldown-prep] printer %s: %s fan step publish refused", self.printer_id, lane.fan.name)
             return "skipped:publish"
         return "sent"
@@ -832,7 +839,10 @@ class CooldownPrep:
         client = printer_manager.get_client(self.printer_id)
         if client is None:
             return "skipped:no_client"
-        return "sent" if client.set_fan_percent(lane.fan.index, 0) else "skipped:publish"
+        sent = printer_action.send_soon(
+            self.printer_id, printer_action.fan_percent(lane.fan.index, 0), actor=printer_action.ACTOR_FARM
+        )
+        return "sent" if sent else "skipped:publish"
 
 
 async def begin(
@@ -882,7 +892,7 @@ async def begin(
     # awaited after them (the witness wait lives in ``CooldownPrep.observe_start``), so
     # a cancellation can never separate an ON that was sent from the ``end`` that
     # decides whether it stays on.
-    lanes = tuple(_start_fans(printer_id, fans, model))
+    lanes = tuple(await _start_fans(printer_id, fans, model))
     return CooldownPrep(
         printer_id=printer_id,
         hold=hold,
@@ -896,16 +906,16 @@ async def begin(
     )
 
 
-def _start_fans(printer_id: int, fans: CooldownFanSettings, model: str | None) -> list[FanLane]:
+async def _start_fans(printer_id: int, fans: CooldownFanSettings, model: str | None) -> list[FanLane]:
     """Arm every lane, in :data:`COOLDOWN_FANS` order. Sync, and never raises."""
     lanes: list[FanLane] = []
     for fan in COOLDOWN_FANS:
         request = fans.for_fan(fan)
-        lanes.append(FanLane(fan=fan, request=request, start=_start_fan(printer_id, fan, request, model)))
+        lanes.append(FanLane(fan=fan, request=request, start=await _start_fan(printer_id, fan, request, model)))
     return lanes
 
 
-def _start_fan(printer_id: int, fan: CooldownFan, request: FanRequest, model: str | None) -> FanStartOutcome:
+async def _start_fan(printer_id: int, fan: CooldownFan, request: FanRequest, model: str | None) -> FanStartOutcome:
     """Run one fan at its boost speed. Returns what happened, and never raises.
 
     Published, not confirmed: MQTT publish acceptance is all the wire offers
@@ -939,7 +949,17 @@ def _start_fan(printer_id: int, fan: CooldownFan, request: FanRequest, model: st
         if client is None:
             logger.warning("[cooldown-prep] printer %s: no MQTT client — %s fan not commanded", printer_id, fan.name)
             return "skipped:no_client"
-        if fan.airduct_cooling(model) and not client.send_gcode(AIRDUCT_COOLING_GCODE):
+        if (
+            fan.airduct_cooling(model)
+            and not (
+                await printer_action.send(
+                    printer_id,
+                    printer_action.gcode(AIRDUCT_COOLING_GCODE),
+                    actor=printer_action.ACTOR_FARM,
+                    client=client,
+                )
+            ).published
+        ):
             # The vendor's pair is this actuator's two-command contract: spinning the
             # exhaust up behind a closed flap moves air around a closed box, so a pair
             # that half-lands reports not-landed and the fan is never published.
@@ -949,7 +969,14 @@ def _start_fan(printer_id: int, fan: CooldownFan, request: FanRequest, model: st
                 fan.name,
             )
             return "skipped:airduct"
-        if not client.set_fan_percent(fan.index, request.boost_percent):
+        if not (
+            await printer_action.send(
+                printer_id,
+                printer_action.fan_percent(fan.index, request.boost_percent),
+                actor=printer_action.ACTOR_FARM,
+                client=client,
+            )
+        ).published:
             logger.warning("[cooldown-prep] printer %s: %s fan publish refused", printer_id, fan.name)
             return "skipped:publish"
         return "sent"
@@ -1113,7 +1140,10 @@ async def _hold_plate(
             if client is None:
                 logger.warning("[cooldown-prep] printer %s: no MQTT client — plate not held", printer_id)
                 return "skipped:publish", None, max_z
-            if not client.send_gcode("\n".join(lines)):
+            held = await printer_action.send(
+                printer_id, printer_action.gcode("\n".join(lines)), actor=printer_action.ACTOR_FARM, client=client
+            )
+            if not held.published:
                 logger.warning("[cooldown-prep] printer %s: hold publish refused — plate not held", printer_id)
                 return "skipped:publish", None, max_z
 

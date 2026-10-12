@@ -670,6 +670,14 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
                     onChange={(checked) => updateMutation.mutate({ on_cooldown_escalation: checked })}
                   />
                 </div>
+
+                <div className="flex items-center justify-between">
+                  <p className="text-sm text-white">{t('notifications.printerWaiting')}</p>
+                  <Toggle
+                    checked={provider.on_printer_waiting ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_printer_waiting: checked })}
+                  />
+                </div>
               </div>
 
               {/* Quiet Hours */}

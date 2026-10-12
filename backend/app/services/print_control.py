@@ -46,7 +46,7 @@ What it deliberately does NOT own: the queue row's END (status, ``stop_source``,
 stay with the caller — this module is the stop REQUEST plus the WIRE act, nothing else.
 
 **Never raises**, and returns whether the stop was DELIVERED. A caller that needs to report
-undelivered (the printer-card route's 502) reads the bool. ``printer_manager.stop_print``
+undelivered (the printer-card route's 502) reads the bool. The record's send (``printer_action``)
 answers False for a printer with no live client, so "no session" and "publish refused" are
 one answer here — they are one answer to the operator too. A request that could not be
 recorded is logged and the stop is still sent: losing the request mislabels a cancel as a
@@ -59,6 +59,7 @@ import logging
 from datetime import datetime, timezone
 
 from backend.app.core.database import run_with_retry
+from backend.app.services import printer_action
 from backend.app.services.farm_correlation import resolve_printing_item
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.queue_transitions import stamp_operator_stop
@@ -105,7 +106,9 @@ async def stop_as_operator(printer_id: int, *, unit_id: int | None = None) -> bo
 
     delivered = False
     try:
-        delivered = printer_manager.stop_print(printer_id)
+        delivered = (
+            await printer_action.send(printer_id, printer_action.stop(), actor=printer_action.ACTOR_OPERATOR)
+        ).published
     except Exception:  # noqa: BLE001 — a stop is best-effort; the caller reports it undelivered
         logger.exception("print_control: stop_print raised for printer %s", printer_id)
     if not delivered:

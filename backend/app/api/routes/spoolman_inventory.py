@@ -43,6 +43,7 @@ from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.models.user import User
 from backend.app.schemas.spool import SpoolKProfileBase
 from backend.app.schemas.spoolman import SpoolmanFilamentPatch, SpoolmanSlotAssignmentEnriched
+from backend.app.services import printer_action
 from backend.app.services.location_service import (
     enrich_spool_dicts_with_location_id,
     maybe_sync_spoolman_locations,
@@ -1575,16 +1576,22 @@ async def assign_spoolman_slot(
                     "printer" if printer_kp else "stored",
                 )
 
-            mqtt_client.ams_set_filament_setting(
-                ams_id=body.ams_id,
-                tray_id=body.tray_id,
-                tray_info_idx=effective_tray_info_idx,
-                tray_type=tray_type,
-                tray_sub_brands=tray_sub_brands,
-                tray_color=tray_color,
-                nozzle_temp_min=temp_min,
-                nozzle_temp_max=temp_max,
-                setting_id=effective_setting_id,
+            await printer_action.operator_verb(
+                body.printer_id,
+                "ams_filament_setting",
+                lambda live, seq: live.ams_set_filament_setting(
+                    ams_id=body.ams_id,
+                    tray_id=body.tray_id,
+                    tray_info_idx=effective_tray_info_idx,
+                    tray_type=tray_type,
+                    tray_sub_brands=tray_sub_brands,
+                    tray_color=tray_color,
+                    nozzle_temp_min=temp_min,
+                    nozzle_temp_max=temp_max,
+                    setting_id=effective_setting_id,
+                    sequence_id=seq,
+                ),
+                client=mqtt_client,
             )
 
             if matching_kp and matching_kp.cali_idx is not None:
@@ -1594,12 +1601,18 @@ async def assign_spoolman_slot(
                 cali_filament_id = (
                     printer_kp.filament_id if printer_kp and printer_kp.filament_id else None
                 ) or effective_tray_info_idx
-                mqtt_client.extrusion_cali_sel(
-                    ams_id=body.ams_id,
-                    tray_id=body.tray_id,
-                    cali_idx=matching_kp.cali_idx,
-                    filament_id=cali_filament_id,
-                    nozzle_diameter=nozzle_diameter,
+                await printer_action.operator_verb(
+                    body.printer_id,
+                    "extrusion_cali_sel",
+                    lambda live, seq: live.extrusion_cali_sel(
+                        ams_id=body.ams_id,
+                        tray_id=body.tray_id,
+                        cali_idx=matching_kp.cali_idx,
+                        filament_id=cali_filament_id,
+                        nozzle_diameter=nozzle_diameter,
+                        sequence_id=seq,
+                    ),
+                    client=mqtt_client,
                 )
                 logger.info(
                     "Spoolman assign: applied K-profile cali_idx=%d "
@@ -1617,12 +1630,18 @@ async def assign_spoolman_slot(
                 # Default K (cali_idx=-1). The live cali_idx belongs to whatever
                 # filament was there before, so preserving it would apply the
                 # wrong filament's calibration to the new spool.
-                mqtt_client.extrusion_cali_sel(
-                    ams_id=body.ams_id,
-                    tray_id=body.tray_id,
-                    cali_idx=-1,
-                    filament_id=effective_tray_info_idx,
-                    nozzle_diameter=nozzle_diameter,
+                await printer_action.operator_verb(
+                    body.printer_id,
+                    "extrusion_cali_sel",
+                    lambda live, seq: live.extrusion_cali_sel(
+                        ams_id=body.ams_id,
+                        tray_id=body.tray_id,
+                        cali_idx=-1,
+                        filament_id=effective_tray_info_idx,
+                        nozzle_diameter=nozzle_diameter,
+                        sequence_id=seq,
+                    ),
+                    client=mqtt_client,
                 )
                 logger.info(
                     "No stored K-profile for Spoolman spool %d — reset slot to Default K (cali_idx=-1)",

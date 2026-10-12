@@ -31,6 +31,7 @@ from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.plate_occupancy import plate_occupancy
 from backend.app.services.print_scheduler import WAITING_REASON_LIBRARY_FILE_MISSING, PrintScheduler
+from backend.tests._fixtures.printer_action import route_verbs
 
 
 @pytest.fixture(autouse=True)
@@ -161,7 +162,7 @@ async def _dispatch(ctx):
         patch("backend.app.services.archive.ArchiveService.archive_print", new=archive_print),
         patch("backend.app.services.print_scheduler.printer_manager.is_connected", MagicMock(return_value=True)),
         patch("backend.app.services.print_scheduler.printer_manager.get_status", MagicMock(return_value=None)),
-        patch("backend.app.services.print_scheduler.printer_manager.start_print", ctx.start_print),
+        route_verbs(start=ctx.start_print),
         # The dispatch path's unconditional plate write is gone (2026-08-30): there is
         # nothing to stub, and a HOLD writes nothing to the authority either.
         patch(

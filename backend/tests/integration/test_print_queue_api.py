@@ -2157,6 +2157,47 @@ class TestAbortedStatusNormalisation:
             row = await s.get(PrintQueueItem, item.id)
         assert row.status == "completed"
 
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_auto_off_after_routes_to_the_one_temperature_gated_cut(
+        self, queue_item_factory, smart_plug_factory, own_session_factory
+    ):
+        """S1: a terminal of an ``auto_off_after`` unit hands each ENABLED plug of its printer to
+        ``smart_plug_manager.schedule_temp_based_off`` with the plug's own threshold; ``main`` keeps
+        no cooldown wait of its own (it used to cut after at most 10 minutes whatever the nozzle read)."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from backend.app import main
+        from backend.tests._fixtures.print_callbacks import drain_new_tasks, print_callbacks
+
+        item = await queue_item_factory(status="printing", auto_off_after=True)
+        enabled = await smart_plug_factory(name="On", printer_id=item.printer_id, off_temp_threshold=45, auto_off=False)
+        await smart_plug_factory(name="Off", printer_id=item.printer_id, enabled=False, auto_off=False)
+
+        spm = MagicMock()
+        spm.on_print_complete = AsyncMock()
+        tasks_before = set(asyncio.all_tasks())
+        # The harness installs its own smart-plug mock; this test's is installed inside it.
+        with print_callbacks(own_session_factory), patch.object(main, "smart_plug_manager", spm):
+            await main.on_print_complete(
+                item.printer_id,
+                {
+                    "status": "completed",
+                    "filename": "test.gcode",
+                    "subtask_name": "Test",
+                    "timelapse_was_active": False,
+                    "peaks_reliable": True,
+                    "last_layer_num": 100,
+                    "last_progress": 100.0,
+                },
+            )
+            await drain_new_tasks(tasks_before)
+
+        spm.schedule_temp_based_off.assert_called_once()
+        routed_plug, printer_id, threshold = spm.schedule_temp_based_off.call_args.args
+        assert (routed_plug.id, printer_id, threshold) == (enabled.id, item.printer_id, 45)
+
     # ========================================================================
     # Library file usage tracking on print completion (#1008)
     #

@@ -995,10 +995,6 @@ class TestRecoverPrinter:
         lease = plate_occupancy.claim_for_dispatch(
             printer.id,
             4242,
-            pre_state="IDLE",
-            pre_subtask=None,
-            min_hold_s=60.0,
-            max_hold_s=180.0,
             ev=Evidence(live_state="IDLE"),
         )
         assert isinstance(lease, DispatchLease)
@@ -2008,11 +2004,9 @@ class TestOnTerminalEjectHandling:
 
     @staticmethod
     def _page_recorder():
-        """Patch the ONE plate-not-empty page and capture its ``source_detail``."""
-        return patch(
-            "backend.app.services.eject.monitor.notify_plate_not_empty",
-            new_callable=AsyncMock,
-        )
+        """Patch the plate-not-empty event's owner (``notification_service``, called by farm_policy itself —
+        it imports no eject watch, owner 6) and capture its ``source_detail``."""
+        return patch.object(farm_policy.notification_service, "on_plate_not_empty", new_callable=AsyncMock)
 
     async def test_never_started_failed_production_eject_pages_and_does_not_quarantine(self, db_session, caplog):
         printer = await self._mk_printer(db_session, "REJprod")
@@ -2146,8 +2140,9 @@ class TestOnTerminalEjectHandling:
 
         with (
             patch.object(farm_policy.printer_manager, "get_client", return_value=self._fake_client("SUB-E")),
-            patch(
-                "backend.app.services.eject.monitor.notify_plate_not_empty",
+            patch.object(
+                farm_policy.notification_service,
+                "on_plate_not_empty",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("smtp down"),
             ),
@@ -2367,7 +2362,7 @@ class _ParkClient:
         self.ok = ok
         self.sent: list[str] = []
 
-    def send_gcode(self, gcode: str) -> bool:
+    def send_gcode(self, gcode: str, *, sequence_id=None) -> bool:
         self.sent.append(gcode)
         return self.ok
 
@@ -2610,7 +2605,7 @@ class TestFaEjectCooldownGate:
         with (
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(80.0)),
-            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            patch.object(monitor_mod.eject_remote, "unit_releasable", new=AsyncMock(return_value=True)),
             _fa_line(33.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
         ):
@@ -2633,7 +2628,7 @@ class TestFaEjectCooldownGate:
         with (
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(80.0)),
-            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            patch.object(monitor_mod.eject_remote, "unit_releasable", new=AsyncMock(return_value=True)),
             _fa_line(33.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
             pytest.raises(HTTPException) as exc,
@@ -2652,7 +2647,7 @@ class TestFaEjectCooldownGate:
         with (
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(30.5)),
-            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            patch.object(monitor_mod.eject_remote, "unit_releasable", new=AsyncMock(return_value=True)),
             _fa_line(33.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
         ):
@@ -2675,7 +2670,7 @@ class TestFaEjectCooldownGate:
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=state),
             patch.object(farm_policy.printer_manager, "get_model", return_value="H2S"),
-            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            patch.object(monitor_mod.eject_remote, "unit_releasable", new=AsyncMock(return_value=True)),
             _fa_line(26.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
         ):
@@ -2693,7 +2688,7 @@ class TestFaEjectCooldownGate:
             patch.object(farm_policy.printer_manager, "is_connected", return_value=True),
             patch.object(farm_policy.printer_manager, "get_status", return_value=self._state(31.0)),
             patch.object(farm_policy.printer_manager, "get_model", return_value="H2S"),
-            patch.object(monitor_mod, "_unit_releasable", new=AsyncMock(return_value=True)),
+            patch.object(monitor_mod.eject_remote, "unit_releasable", new=AsyncMock(return_value=True)),
             _fa_line(26.0),
             patch.object(farm_policy.eject_remote, "dispatch_part_present_eject", new_callable=AsyncMock) as direct,
         ):
@@ -3726,11 +3721,13 @@ class TestEscalationNeverStops:
     lane ends a job in exactly ONE place — its last release rung,
     ``_LEVERS[printer_incidents.FAULT_RESTART_STEP]``, pulled only for a farm unit that has
     deposited nothing — and never as the operator: a mid-print stall still escalates and
-    holds. Where that one stop lives is pinned by
-    ``test_code_quality.TestRecoveryDriverOwnership.test_the_restart_stop_is_published_by_its_rung_alone``;
-    this case pins the rest at MODULE scope by parsing the recovery lane — the operator's
-    stop verbs never, and the raw stop once — because an AST walk is the only assertion that
-    covers every path, including the ones a future change adds.
+    holds. Amended again 2026-10-12 (operator ruling: "printing on air = ruined print already"): the
+    lane's ONE other stop is the air stop, ``_stop_printing_on_air`` — a print that laid down a layer
+    with nothing fed is stopped and its unit retried (the ordinary failed disposition). Where those two
+    stops live is pinned by ``test_code_quality.TestRecoveryDriverOwnership`` (the restart rung's table
+    row, the air stop's owner); this case pins the rest at MODULE scope by parsing the recovery lane —
+    the operator's stop verbs never, and the raw stop twice — because an AST walk is the only assertion
+    that covers every path, including the ones a future change adds.
     """
 
     async def test_the_recovery_lane_sends_no_stop_anywhere(self):
@@ -3749,4 +3746,173 @@ class TestEscalationNeverStops:
         assert set(called) & operator_verbs == set(), (
             f"spool_recovery must never stop a print as the operator: {set(called) & operator_verbs}"
         )
-        assert called.count("stop_print") == 1, "the recovery lane's one raw stop is its restart rung (R1)"
+        stops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "stop"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "printer_action"
+        ]
+        assert len(stops) == 2, "the recovery lane's raw stops are its restart rung (R1) and its air stop (2026-10-12)"
+
+
+class TestUploadStallQuarantine:
+    """R19 (2026-10-12): a dispatch's stalled FTPS upload is a strike against the PRINTER through the ONE
+    quarantine decider — ``RecoveryEscalation(reason="upload_stalled")``, naming its unit — and two with no
+    completed print between them quarantine it (the event-counted rule the AMS escalations use). Production
+    failed the unit instead (retry spent, consecutive-failure count)."""
+
+    async def _printer(self, db, name):
+        p = Printer(name=name, serial_number=f"S{name}", ip_address="1.2.3.4", access_code="x", model="H2S")
+        db.add(p)
+        await db.flush()
+        return p
+
+    async def _unit(self, db, *, status="pending", position=1):
+        unit = PrintQueueItem(status=status, plate_id=1, position=position, target_model="H2S")
+        db.add(unit)
+        await db.commit()
+        await db.refresh(unit)
+        return unit
+
+    async def _completed_print(self, db, printer_id):
+        from backend.app.models.archive import PrintArchive
+
+        db.add(
+            PrintArchive(
+                printer_id=printer_id,
+                filename="done.gcode.3mf",
+                file_path="/x/done.gcode.3mf",
+                file_size=1,
+                status="completed",
+                completed_at=datetime.utcnow() + timedelta(seconds=1),
+            )
+        )
+        await db.commit()
+
+    @staticmethod
+    def _quiet():
+        return (
+            patch.object(farm_policy.printer_manager, "set_quarantined"),
+            patch.object(farm_policy.notification_service, "on_printer_quarantined", new_callable=AsyncMock),
+        )
+
+    async def test_the_second_stall_with_no_completed_print_between_quarantines(self, db_session):
+        from backend.app.models.recovery_escalation import RecoveryEscalation
+
+        printer = await self._printer(db_session, "US1")
+        unit = await self._unit(db_session)
+        sq, notif = self._quiet()
+        with sq, notif as notified:
+            assert (
+                await farm_policy.record_upload_stall(db_session, printer_id=printer.id, queue_item_id=unit.id) is False
+            )
+            assert (
+                await farm_policy.record_upload_stall(db_session, printer_id=printer.id, queue_item_id=unit.id) is True
+            )
+        await db_session.refresh(printer)
+        assert printer.quarantined is True
+        assert "upload stalls" in (printer.quarantine_reason or "")
+        notified.assert_awaited_once()
+        rows = (
+            (await db_session.execute(select(RecoveryEscalation).where(RecoveryEscalation.printer_id == printer.id)))
+            .scalars()
+            .all()
+        )
+        assert [(r.reason, r.queue_item_id) for r in rows] == [("upload_stalled", unit.id)] * 2
+
+    async def test_a_completed_print_between_two_stalls_is_no_quarantine(self, db_session):
+        printer = await self._printer(db_session, "US2")
+        unit = await self._unit(db_session)
+        sq, notif = self._quiet()
+        with sq, notif:
+            await farm_policy.record_upload_stall(db_session, printer_id=printer.id, queue_item_id=unit.id)
+            await self._completed_print(db_session, printer.id)
+            assert (
+                await farm_policy.record_upload_stall(db_session, printer_id=printer.id, queue_item_id=unit.id) is False
+            )
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
+
+    async def test_an_ams_give_up_and_an_upload_stall_are_counted_apart(self, db_session):
+        printer = await self._printer(db_session, "US3")
+        unit = await self._unit(db_session)
+        sq, notif = self._quiet()
+        with sq, notif:
+            await farm_policy.record_recovery_escalation(
+                db_session,
+                printer_id=printer.id,
+                reason="unload_failed",
+                code=None,
+                opened_at=None,
+                counting_reasons=frozenset({"unload_failed"}),
+            )
+            assert (
+                await farm_policy.record_upload_stall(db_session, printer_id=printer.id, queue_item_id=unit.id) is False
+            )
+        await db_session.refresh(printer)
+        assert printer.quarantined is False
+
+    async def test_an_upload_stall_never_stands_for_an_incidents_own_escalation_row(self, db_session):
+        from backend.app.models.recovery_escalation import RecoveryEscalation
+
+        printer = await self._printer(db_session, "US4")
+        unit = await self._unit(db_session)
+        opened = datetime.utcnow() - timedelta(minutes=5)
+        sq, notif = self._quiet()
+        with sq, notif:
+            await farm_policy.record_upload_stall(db_session, printer_id=printer.id, queue_item_id=unit.id)
+            await farm_policy.record_recovery_escalation(
+                db_session,
+                printer_id=printer.id,
+                reason="unload_failed",
+                code="0700_8010",
+                opened_at=opened,
+                counting_reasons=frozenset({"unload_failed"}),
+            )
+        reasons = (
+            (
+                await db_session.execute(
+                    select(RecoveryEscalation.reason).where(RecoveryEscalation.printer_id == printer.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(reasons) == ["unload_failed", "upload_stalled"]
+
+    async def test_the_bulk_read_names_each_pending_units_stalled_printers_in_one_query(self, db_session, test_engine):
+        from sqlalchemy import event
+
+        a = await self._printer(db_session, "USA")
+        b = await self._printer(db_session, "USB")
+        c = await self._printer(db_session, "USC")
+        pooled = await self._unit(db_session, position=1)
+        other = await self._unit(db_session, position=2)
+        started = await self._unit(db_session, status="printing", position=3)
+        sq, notif = self._quiet()
+        with sq, notif:
+            await farm_policy.record_upload_stall(db_session, printer_id=a.id, queue_item_id=pooled.id)
+            await farm_policy.record_upload_stall(db_session, printer_id=b.id, queue_item_id=pooled.id)
+            await farm_policy.record_upload_stall(db_session, printer_id=c.id, queue_item_id=other.id)
+            await farm_policy.record_upload_stall(db_session, printer_id=c.id, queue_item_id=started.id)
+        # b completed a print since: the pool may use it again. c was quarantined and then cleared by an
+        # operator (2 stalls, no completion): inspected — counted fresh.
+        await self._completed_print(db_session, b.id)
+        await db_session.refresh(c)
+        assert c.quarantined is True
+        await farm_policy.clear_quarantine(db_session, c.id)
+
+        statements: list[str] = []
+
+        def _count(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(test_engine.sync_engine, "before_cursor_execute", _count)
+        try:
+            stalled = await farm_policy.upload_stalled_printers(db_session)
+        finally:
+            event.remove(test_engine.sync_engine, "before_cursor_execute", _count)
+        assert stalled == {pooled.id: frozenset({a.id})}
+        assert len(statements) == 1

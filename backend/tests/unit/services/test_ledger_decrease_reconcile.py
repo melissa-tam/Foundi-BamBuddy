@@ -611,9 +611,7 @@ class TestIncreaseSyncIdentityGate:
 
         assert (await db_session.get(Spool, spool.id)).weight_used == 500.0
 
-    async def test_increase_sync_tagless_unaffected(
-        self, db_session, printer_factory, notify, trusted, monkeypatch
-    ):
+    async def test_increase_sync_tagless_unaffected(self, db_session, printer_factory, notify, trusted, monkeypatch):
         """A tagless slot was already inert here and stays inert: the firmware reports
         ``remain = -1`` for a roll whose chip it never read, which fails the 1..100 parse
         long before the identity gate is consulted (doctrine rule 8 — only a TAGGED row

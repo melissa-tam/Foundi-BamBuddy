@@ -14,17 +14,18 @@ slot can only produce. The old ``data_origin == "ams_auto"`` eligibility rule is
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
 from backend.app.models.spool import Spool
 from backend.app.models.spool_assignment import SpoolAssignment
-from backend.app.services import ams_presence
+from backend.app.services import ams_presence, printer_action
 from backend.app.services.tray_observation import observe_ams_push
 from backend.tests._fixtures import feed_wire
+from backend.tests._fixtures.clock import FakeClock
 
 _VALID_TAG = "1234567890ABCDEF"
 
@@ -145,6 +146,26 @@ def _patch_pm(monkeypatch, *, status=None, client=None):
     monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
 
 
+def _pending(action_id=7, *, ago=0.0):
+    """A commanded read still owed its answer, commanded ``ago`` monotonic seconds back and anchored at
+    the record's clock now (its self-heal bound counts the printer's ONLINE seconds from there)."""
+    return ams_presence._PendingRead(ams_presence.time.monotonic() - ago, action_id, printer_action.now())
+
+
+_T0 = datetime(2026, 10, 12, 8, 0, 0)
+
+
+@pytest.fixture
+async def online(monkeypatch):
+    """The record's clock (``printer_action._now``) stepped by hand from ``_T0``, with printer 1's first
+    fresh report of this process at ``_T0`` — so ``printer_action.bound_due`` counts real online seconds."""
+    clock = FakeClock(start=0.0)
+    monkeypatch.setattr(printer_action, "_now", lambda: _T0 + timedelta(seconds=clock.t))
+    monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+    await printer_action.reread_session(1, 1)
+    return clock
+
+
 class TestPresenceTracking:
     """on_tray_observations presence transitions (steady state, after the first push)."""
 
@@ -159,7 +180,7 @@ class TestPresenceTracking:
 
         # Second push: physical insert 9→11 while idle → immediate re-read.
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
 
     async def test_first_push_seeds_quietly(self, db_session, monkeypatch):
         # A present-but-unidentified slot on the very first push must NOT re-read
@@ -373,7 +394,7 @@ class TestTerminalSweep:
 
         order: list[str] = []
         client = MagicMock()
-        client.ams_refresh_tray.side_effect = lambda a, t: order.append(f"read {a},{t}") or (True, "ok")
+        client.ams_refresh_tray.side_effect = lambda a, t, **_k: order.append(f"read {a},{t}") or (True, "ok")
         client.wait_ams_settle = AsyncMock(side_effect=lambda: order.append("settle"))
         status = SimpleNamespace(
             state="FINISH",
@@ -452,7 +473,7 @@ class TestTerminalSweep:
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
 
         await ams_presence.on_printer_terminal(1)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
 
     async def test_discovery_evidence_is_consumed_by_the_read(self, db_session, sessions, monkeypatch):
         # ONE discovery read per change: the next terminal with no NEW physical cycle
@@ -473,7 +494,7 @@ class TestTerminalSweep:
         await ams_presence.on_printer_terminal(1)
         assert client.ams_refresh_tray.call_count == 1
 
-        ams_presence._echo_pending.clear()  # a whole print elapsed; the identify is long done
+        _answer_the_read()  # a whole print elapsed: the identify ran and ended
         status.subtask_id = "t2"
         await ams_presence.on_printer_terminal(1)
         assert client.ams_refresh_tray.call_count == 1  # evidence consumed — no second read
@@ -530,10 +551,9 @@ class TestTerminalSweep:
         await ams_presence.on_printer_terminal(1)  # duplicate terminal callback, same subtask
         assert client.ams_refresh_tray.call_count == 1
 
-        # A whole print cycle (minutes) elapses before the next terminal, so the
-        # prior sweep's identify has long completed and its in-flight echo flag aged
-        # out — Guard 3d skips only a STILL-in-flight identify, not a new sweep.
-        ams_presence._echo_pending.clear()
+        # A whole print cycle elapses before the next terminal: the prior sweep's identify ran and
+        # ENDED (its answer) — Guard 3d skips only a STILL-unanswered read, not a new sweep.
+        _answer_the_read()
         status.subtask_id = "t2"  # a NEW print reached terminal
         await ams_presence.on_printer_terminal(1)
         assert client.ams_refresh_tray.call_count == 2
@@ -586,6 +606,7 @@ class TestEchoConsume:
         assert client.ams_refresh_tray.call_count == 1  # echo swallowed — no 2nd re-read
         assert clear.await_count == 1  # feed-fault clear NOT re-run for the echo
         assert (1, 0, 0) not in ams_presence._echo_pending  # flag consumed
+        _answer_the_read(ago=60)  # the unit's identify cycle ended — the read answered
 
         # A SECOND genuine pull+reseat afterwards is acted on normally (no lingering
         # gate). Its absence is backdated past _MIN_PHYSICAL_ABSENT_S: only a real
@@ -615,7 +636,7 @@ class TestEchoConsume:
         # A real insertion gain moments later fires the re-read immediately.
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # insert
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
 
     async def test_terminal_sweep_ignition_killed(self, db_session, sessions, monkeypatch):
         # The loop's ignition: the terminal sweep's discovery read on a changed slot
@@ -633,13 +654,13 @@ class TestEchoConsume:
 
         # Terminal sweep on the present untagged slot → one re-read + flag armed.
         await ams_presence.on_printer_terminal(1)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
         assert (1, 0, 0) in ams_presence._echo_pending
 
         # The identify flap's settle-back gain is the sweep command's echo.
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
-        client.ams_refresh_tray.assert_called_once_with(0, 0)  # still ONE — echo swallowed, loop dead
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)  # still ONE — echo swallowed, loop dead
         assert (1, 0, 0) not in ams_presence._echo_pending
 
     async def test_valid_tag_gain_skips_reread_but_clears(self, db_session, monkeypatch):
@@ -683,26 +704,31 @@ class TestEchoConsume:
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # gain
         assert client.ams_refresh_tray.call_count == 2
 
-    async def test_stale_flag_treated_genuine(self, db_session, monkeypatch):
-        # A flag whose identify cycle never ran (command lost to a race) is GC'd:
-        # once older than _ECHO_PENDING_STALE_S it reads as no-flag, so the gain is
-        # treated genuine — re-read fires and the feed-fault clear runs. The flag is
-        # arm-aged directly (real monotonic, minus the bound) rather than freezing
-        # the process-wide time.monotonic, which is the async event loop's clock.
+    async def test_a_read_the_printer_never_ran_arms_nothing_that_lingers(self, db_session, monkeypatch):
+        # A command whose identify never ran (the record answers it VOID — a reboot, a lost session)
+        # leaves no echo to wait for: the record's answer retires the flag, so the next gain is
+        # genuine — re-read fires and the feed-fault clear runs. An event, never a staleness bound.
+        from backend.app.services.printer_events import ActionAnswered
+
         clear = AsyncMock()
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
         _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
 
-        # Arm the flag with a timestamp already older than the staleness bound.
-        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - ams_presence._ECHO_PENDING_STALE_S - 1
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()
+        ams_presence._read_pending[(1, 0, 0)] = _pending(9)
+        ams_presence.on_action_answered(
+            ActionAnswered(
+                printer_id=1, action_id=9, command="ams_get_rfid", actor="farm", incident_id=None, answer="void"
+            )
+        )
 
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
-        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # stale gain
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # a genuine gain
 
-        client.ams_refresh_tray.assert_called_once_with(0, 0)  # stale flag → genuine → re-read fires
-        clear.assert_awaited_once()  # and the feed-fault clear runs
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
+        clear.assert_awaited_once()
 
 
 class TestIdentifyNeeded:
@@ -835,7 +861,7 @@ class TestDiscoveryFailureSuppression:
         finish = _pstate([_tray(0, state=11)], gcode_state="FINISH", subtask_id="t1")
         _patch_pm(monkeypatch, status=finish, client=client)
         await ams_presence.on_printer_terminal(1)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)  # exactly ONE discovery read
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)  # exactly ONE discovery read
 
         # …and the read's failure is recognized as its own answer, not a fault.
         assert ams_presence.is_expected_read_failure(1, self._ATTR_SLOT0, self._READ_FAIL_CODE) is True
@@ -899,7 +925,7 @@ class TestManualRefreshBypass:
 
         ok, _msg = await ams_presence.command_identify(1, 0, 0, source="manual_refresh", enforce_need=False)
         assert ok is True
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
         assert (1, 0, 0) in ams_presence._echo_pending  # same bookkeeping as every read
         # An operator read is not a discovery read: its failure is NOT suppressed.
         assert ams_presence._discovery_read_at == {}
@@ -953,16 +979,39 @@ class TestIdentifyInFlight:
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=2))
         assert ams_presence.identify_in_flight(1, 0, 0) is True
 
-    def test_fresh_flag_is_true(self, monkeypatch):
-        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
-        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic()
+    async def test_a_read_not_yet_answered_is_in_flight_inside_its_bound(self, online):
+        """Slow firmware: a read commanded 25 s of online time ago that has not answered is still in
+        flight — only its self-heal bound (``_IDENTIFY_SELF_HEAL``, 30 s online) ends the wait."""
+        ams_presence._read_pending[(1, 0, 0)] = _pending()
+        online.advance(25)
         assert ams_presence.identify_in_flight(1, 0, 0) is True
-
-    def test_stale_flag_is_false(self, monkeypatch):
-        # A flag older than _IDENTIFY_ACTIVE_S no longer implies an in-flight identify.
-        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
-        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - ams_presence._IDENTIFY_ACTIVE_S - 1
+        online.advance(5)
         assert ams_presence.identify_in_flight(1, 0, 0) is False
+
+    def test_the_units_identify_ending_answers_it(self, monkeypatch):
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+        ams_presence._read_pending[(1, 0, 0)] = _pending()
+        ams_presence.note_identify_activity(1, True)
+        assert ams_presence.identify_in_flight(1, 0, 0) is True  # identifying: the cycle runs
+        ams_presence.note_identify_activity(1, False)
+        assert ams_presence.identify_in_flight(1, 0, 0) is False  # it ended: answered
+
+    @pytest.mark.parametrize("answer", ["refused", "void"])
+    def test_a_read_the_record_refused_or_voided_is_answered(self, monkeypatch, answer):
+        """A fail ACK or a read the printer never received (a reboot): no identify will run to end it —
+        the record's answer retires it, with what it armed."""
+        from backend.app.services.printer_events import ActionAnswered
+
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+        ams_presence._read_pending[(1, 0, 0)] = _pending()
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()
+        ams_presence.on_action_answered(
+            ActionAnswered(
+                printer_id=1, action_id=7, command="ams_get_rfid", actor="farm", incident_id=None, answer=answer
+            )
+        )
+        assert ams_presence.identify_in_flight(1, 0, 0) is False
+        assert ams_presence._echo_pending == {}
 
     def test_neither_is_false(self, monkeypatch):
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
@@ -975,11 +1024,10 @@ class TestIdentifyInFlight:
 
 
 class TestTerminalSweepIdentifySkip:
-    """Guard 3d: the terminal sweep skips a slot whose identify is already in
-    flight (fresh _echo_pending) so a concurrent idle-gain re-read is never
-    doubled, but still sweeps a slot whose flag has gone stale."""
+    """Guard 3d: the terminal sweep skips a slot whose read is still in flight (not answered) so a
+    concurrent idle-gain re-read is never doubled, but sweeps a slot whose read has answered."""
 
-    async def test_skips_fresh_flag_sweeps_stale(self, db_session, sessions, monkeypatch):
+    async def test_skips_an_unanswered_read_sweeps_the_rest(self, db_session, sessions, monkeypatch):
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
         client.wait_ams_settle = AsyncMock(return_value=True)
@@ -994,12 +1042,11 @@ class TestTerminalSweepIdentifySkip:
 
         _arm_cycle(1, 0, 0)  # both slots NEED a discovery read …
         _arm_cycle(1, 0, 1)
-        now = ams_presence.time.monotonic()
-        ams_presence._echo_pending[(1, 0, 0)] = now  # … fresh flag → T0 skipped anyway
-        ams_presence._echo_pending[(1, 0, 1)] = now - ams_presence._IDENTIFY_ACTIVE_S - 1  # stale → T1 swept
+        # … T0's read is in flight (inside its self-heal bound) → skipped; T1's answered → swept.
+        ams_presence._read_pending[(1, 0, 0)] = _pending(ago=20)
 
         await ams_presence.on_printer_terminal(1)
-        assert [c.args for c in client.ams_refresh_tray.call_args_list] == [(0, 1)]  # only the stale slot
+        assert [c.args for c in client.ams_refresh_tray.call_args_list] == [(0, 1)]  # only the answered slot
 
 
 class TestIdentifyCollisionRegression:
@@ -1156,7 +1203,7 @@ class TestDryingGates:
 
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
 
 
 class TestTrayPresentSingleOrigin:
@@ -1173,38 +1220,105 @@ class TestTrayPresentSingleOrigin:
         assert ams_presence._tray_present({"state": None}) is False
 
 
-class TestEchoWindowBoundary:
-    """F3: the echo-consume window equals the identify-cycle bound (30 s). A gain
-    within it is the identify flap's echo (swallowed); beyond it a gain is a real
-    reseat and runs clear_on_reinsert."""
+class TestTheReadIsAnsweredOnEveryPushAndAtTheSessionStart:
+    """FIX 2 of capsule 4's review: the identify-ended edge is sampled on EVERY status push (the hub),
+    never only on pushes carrying tray data — the push that carries the flag leaving IDENTIFYING may
+    carry none, and a settled AMS sends none; and a new session's first fresh report retires the reads
+    the farm commanded before the gap (a read still running shows as identifying on that report)."""
 
-    async def test_echo_swallowed_under_30s(self, db_session, monkeypatch):
+    def test_a_status_push_with_no_tray_data_answers_the_read(self, monkeypatch):
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+        ams_presence._read_pending[(1, 0, 0)] = _pending()
+        _status_push(SimpleNamespace(ams_status_main=ams_presence.AMS_STATUS_IDENTIFYING))
+        assert ams_presence.identify_in_flight(1, 0, 0) is True
+        _status_push(SimpleNamespace(ams_status_main=0))  # a status-only push: the identify ended
+        assert ams_presence.identify_in_flight(1, 0, 0) is False
+
+    async def test_the_tray_lane_does_not_stamp_the_identify_observation(self, db_session, monkeypatch):
+        """One sampler per push — the hub's; the tray lane never double-samples."""
+        status = _pstate([_tray(0, state=10)], ams_status_main=ams_presence.AMS_STATUS_IDENTIFYING)
+        _patch_pm(monkeypatch, status=status, client=MagicMock())
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=10)]}], db_session)
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=10)]}], db_session)
+        assert ams_presence._identifying_seen_at.get(1) is None
+
+    def test_a_session_start_retires_the_pending_reads_and_keeps_the_echo(self, monkeypatch):
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: SimpleNamespace(ams_status_main=0))
+        now = ams_presence.time.monotonic()
+        ams_presence._read_pending[(1, 0, 0)] = _pending(7)
+        ams_presence._read_pending[(2, 0, 0)] = _pending(8)
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()
+        ams_presence._commanded_read_at[(1, 0, 0)] = now
+
+        ams_presence.note_session_start(1)
+
+        assert ams_presence.identify_in_flight(1, 0, 0) is False
+        assert ams_presence.identify_in_flight(2, 0, 0) is True  # another printer's read is its own
+        assert (1, 0, 0) in ams_presence._echo_pending  # the settle-back flap still consumes it
+        assert (1, 0, 0) in ams_presence._commanded_read_at
+
+    def test_a_read_still_running_on_the_new_session_reads_in_flight(self, monkeypatch):
+        """The live arm guards it: the new session's report shows the unit identifying."""
+        monkeypatch.setattr(
+            ams_presence.printer_manager,
+            "get_status",
+            lambda pid: SimpleNamespace(ams_status_main=ams_presence.AMS_STATUS_IDENTIFYING),
+        )
+        ams_presence._read_pending[(1, 0, 0)] = _pending()
+        ams_presence.note_session_start(1)
+        assert ams_presence.identify_in_flight(1, 0, 0) is True
+
+
+class TestTheIdentifysOwnAnswer:
+    """The audit's "identify echo 30 s returns a jammed roll to rotation" (2026-10-11): a SLOW identify's
+    settle-back must never read as a human reseat. The flag's events come first — the settle-back of a
+    flap that BEGAN under the identify consumes it however late; the read answering with the slot present
+    retires it, so a genuine reseat after the answer still clears (F3). Behind them, production's 30 s
+    (R25, 2026-10-12): an echo whose flap never began within the read's bound no longer swallows."""
+
+    async def test_a_slow_identifys_settle_back_never_returns_a_jammed_roll(self, db_session, monkeypatch, online):
         clear = AsyncMock()
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
         _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # present (seed)
 
-        # Arm the flag 10 s ago (< 30 s) → the next gain is the identify echo, swallowed.
-        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - 10
-        await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
-        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
-        clear.assert_not_awaited()  # swallowed — feed-fault clear NOT run
+        # A read commanded on the present slot; its identify flap begins inside the bound …
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()
+        ams_presence._read_pending[(1, 0, 0)] = _pending()
+        online.advance(10)
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # the identify unloads the tray
+        # … and the slow firmware settles it back two minutes later, well past the bound.
+        online.advance(110)
+        _status_push(SimpleNamespace(ams_status_main=0))  # the bound concludes the read; the flap still runs
+        assert (1, 0, 0) not in ams_presence._read_pending
+        assert (1, 0, 0) in ams_presence._echo_pending  # its flap began under the identify: still owed
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # the settle-back
+        clear.assert_not_awaited()  # swallowed — the jammed roll stays out of rotation
         assert client.ams_refresh_tray.call_count == 0
+        assert ams_presence.identify_in_flight(1, 0, 0) is False
 
-    async def test_genuine_reinsert_over_30s_runs_clear(self, db_session, monkeypatch):
+    async def test_after_the_read_answered_a_genuine_reseat_clears(self, db_session, monkeypatch):
         clear = AsyncMock()
         monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
         client = MagicMock()
         client.ams_refresh_tray.return_value = (True, "ok")
         _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
 
-        # Arm the flag 31 s ago (> 30 s) → GC'd; the gain is a genuine reseat and clears.
-        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic() - 31
-        await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # prime absent
-        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # genuine gain
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # present (seed)
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()
+        ams_presence._read_pending[(1, 0, 0)] = _pending()
+        _answer_the_read(ago=60)  # the identify ended with the slot reading present: nothing left to swallow
+        assert ams_presence._echo_pending == {}
+
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # a human pulls the roll
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # and reseats it
         clear.assert_awaited_once()
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
 
 
 class TestPhysicalCycleNote:
@@ -1265,7 +1379,7 @@ class TestPhysicalCycleNote:
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
         ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - 10
-        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic()  # arm the echo flag
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()  # arm the echo flag
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
         _spy_note.assert_not_awaited()
 
@@ -1318,7 +1432,7 @@ class TestEngagedFilamentDefer:
         status.tray_now = 255  # filament unloaded
         status.subtask_id = "t2"  # a NEW print reached terminal
         await ams_presence.on_printer_terminal(1)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)  # deferred refresh now runs
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)  # deferred refresh now runs
 
     async def test_engaged_preserves_discovery_eligibility(self, db_session, sessions, monkeypatch):
         # A DISCOVERY read deferred for engaged filament must NOT consume the unanswered
@@ -1336,7 +1450,7 @@ class TestEngagedFilamentDefer:
         status.tray_now = 255
         status.subtask_id = "t2"
         await ams_presence.on_printer_terminal(1)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
 
     async def test_two_engaged_tagged_slots_emit_no_warning(self, db_session, sessions, monkeypatch, caplog):
         # THE double-log pin: two tagged slots eligible while slot 1 is engaged. The old
@@ -1374,7 +1488,7 @@ class TestEngagedFilamentDefer:
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
 
         await ams_presence.on_printer_terminal(1)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
 
     async def test_command_identify_defer_logs_debug_and_stamps_nothing(self, monkeypatch, caplog):
         # The defer path directly: DEBUG (not WARNING), no client command, and NONE of
@@ -1409,7 +1523,7 @@ class TestEngagedFilamentDefer:
 
         ok, msg = await ams_presence.command_identify(1, 0, 0, source="manual_refresh", enforce_need=False)
         assert ok is False and "unload filament" in msg
-        client.ams_refresh_tray.assert_called_once_with(0, 0)  # reached the client, not pre-empted
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)  # reached the client, not pre-empted
 
     def test_engaged_helper_mirrors_the_client_sentinel(self, monkeypatch):
         # _filament_engaged reads the live state (get_status) through bambu_mqtt.filament_engaged
@@ -1467,7 +1581,7 @@ class TestEngagedFilamentDefer:
         client.state.active_extruder = active
         monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: client.state)
 
-        ok, _msg = client.ams_refresh_tray(0, 0)
+        ok, _msg = client.ams_refresh_tray(0, 0, sequence_id="1")
 
         if ams_presence._filament_engaged(1):
             assert ok is False, "the mirror deferred a read the client would have allowed"
@@ -1595,7 +1709,7 @@ class TestLoadedAtReStamp:
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # seed present
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)  # loss
         ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - 10
-        ams_presence._echo_pending[(1, 0, 0)] = ams_presence.time.monotonic()  # arm the echo flag
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()  # arm the echo flag
         await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # echo gain
         _spy_stamp.assert_not_awaited()
 
@@ -1642,7 +1756,7 @@ class TestIdleGainNeedSurvivesDefer:
 
         ok, _msg = await ams_presence.command_identify(1, 0, 0, source="idle_gain", reason="discovery")
         assert ok is False
-        client.ams_refresh_tray.assert_called_once_with(0, 0)  # tried the wire, was refused
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)  # tried the wire, was refused
         reason = await ams_presence.identify_needed(db_session, 1, 0, 0, tray, spoolman_active=False)
         assert reason == "discovery"  # refused command stamps no identity-learned
 
@@ -1880,7 +1994,7 @@ class TestOwedReadObservability:
                 db_session, monkeypatch, cycle_age=ams_presence._OWED_READ_WARN_AFTER_S + 60, tray_now=255
             )
         assert ok is True
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert ams_presence._unanswered_cycle(1, 0, 0) is False  # the read answered it
 
@@ -2112,7 +2226,8 @@ class TestCauseBasedEdgeSuppressionWidened:
         assert ok is True and ams_presence._echo_pending == {}  # the echo lane is blind here
 
         await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
-        assert ams_presence._absent_under_identify[(1, 0, 0)] is False  # …and so is the loss-edge flag
+        # …but the read is IN FLIGHT until it answers, and the loss edge records that it explains the absence.
+        assert ams_presence._absent_under_identify[(1, 0, 0)] is True
         ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
             ams_presence._MIN_PHYSICAL_ABSENT_S + 1
         )
@@ -2137,6 +2252,7 @@ class TestCauseBasedEdgeSuppressionWidened:
         await ams_presence.command_identify(1, 0, 0, source="terminal_sweep", reason="rfid_refresh")
         await self._cycle(db_session)  # the identify's own flap — suppressed
         assert ams_presence.last_physical_cycle_age(1, 0, 0) is None
+        _answer_the_read(ago=60)  # the unit's identify cycle ended
 
         await self._cycle(db_session)  # a human pull+reseat afterwards
         assert ams_presence.last_physical_cycle_age(1, 0, 0) < 1.0
@@ -2153,6 +2269,7 @@ class TestCauseBasedEdgeSuppressionWidened:
 
         def _flag_identifying():
             status.ams_status_main = ams_presence.AMS_STATUS_IDENTIFYING
+            _status_push(status)  # the hub samples the flag on the status push that carries it
 
         await self._cycle(db_session, mid_absence=_flag_identifying)
         assert ams_presence._identifying_seen_at.get(1) is not None
@@ -2302,7 +2419,7 @@ class TestTerminalRemainRefresh:
         monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
 
         await ams_presence.on_printer_terminal(1)
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
         assert ams_presence._read_occasion_open(1, 0, 0) is False  # the read consumed it
 
 
@@ -2395,22 +2512,23 @@ class TestOwedReadIsLogOnly:
 # --- the spent-occupied constellation's own read (2026-08-07, spool 226) ------
 
 
-def _age_slot_stamps(printer_id=1, ams_id=0, tray_id=0, *, by):
-    """Backdate every stamp a commanded read left on a slot by ``by`` seconds.
+def _status_push(state, printer_id=1):
+    """ONE status push as the hub delivers it to the identify sampler (``printer_event_wiring``) —
+    every push, whether or not it carries tray data."""
+    from backend.app.services import printer_event_wiring
+    from backend.app.services.printer_events import StatusReported
 
-    The monotonic-clock stand-in for "that read happened ``by`` seconds ago". Ages the
-    ledgers TOGETHER (identity-learned, discovery, echo, cause record) because a real
-    command writes them in one instant — ageing only some of them would fabricate an
-    ordering the wire cannot produce."""
-    key = (printer_id, ams_id, tray_id)
-    for ledger in (
-        ams_presence._slot_read_at,
-        ams_presence._discovery_read_at,
-        ams_presence._echo_pending,
-        ams_presence._commanded_read_at,
-    ):
-        if key in ledger:
-            ledger[key] -= by
+    printer_event_wiring._identify_activity(StatusReported(printer_id=printer_id, state=state))
+
+
+def _answer_the_read(printer_id=1, *, ago=0.0):
+    """The unit's own identify ran and ENDED — the answer every read commanded before it gets
+    (``ams_presence._note_identify_activity``: observed identifying, then not). An event, never an
+    age (2026-10-11: the 30 s ``_IDENTIFY_ACTIVE_S`` window it replaced). ``ago`` places the identify
+    observation that many seconds back, for a case whose next human pull is backdated past it."""
+    ams_presence.note_identify_activity(printer_id, True)
+    ams_presence.note_identify_activity(printer_id, False)
+    ams_presence._identifying_seen_at[printer_id] -= ago
 
 
 async def _commanded_discovery_read(monkeypatch, *, state=10, printer_id=1):
@@ -2459,7 +2577,7 @@ class TestReadAnsweredNoTag:
         ``tagged_swap_no_tag_read`` unlinks it and mints tagless in its place.
         """
         await _commanded_discovery_read(monkeypatch)
-        _age_slot_stamps(by=100.0)
+        _answer_the_read()
         assert self._ask() is True, "LIVENESS: the aged answer stands while nothing has moved"
 
         # An UNQUALIFIED gain is a sub-5 s flap (rule 6's filter) and states nothing about
@@ -2498,14 +2616,14 @@ class TestReadAnsweredNoTag:
 
     async def test_an_aged_unanswered_read_over_a_seated_bare_tray_is_a_no_tag_answer(self, monkeypatch):
         await _commanded_discovery_read(monkeypatch)
-        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+        _answer_the_read()
         assert self._ask() is True
 
     async def test_an_identify_still_in_flight_is_not_an_answer(self, monkeypatch):
         # The unit-scoped live signal: a read is running RIGHT NOW, so the slot's silence
         # is the cycle, not the answer.
         await _commanded_discovery_read(monkeypatch)
-        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+        _answer_the_read()
         _patch_pm(
             monkeypatch,
             status=_pstate([_tray(0, state=10)], ams_status_main=ams_presence.AMS_STATUS_IDENTIFYING),
@@ -2517,7 +2635,7 @@ class TestReadAnsweredNoTag:
         # The firmware published a valid tag for the slot → note_identity_learned re-stamps
         # _slot_read_at past the discovery stamp. The read answered WITH a tag.
         await _commanded_discovery_read(monkeypatch)
-        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+        _answer_the_read()
         ams_presence.note_identity_learned(1, 0, 0)
         assert self._ask() is False
 
@@ -2525,20 +2643,20 @@ class TestReadAnsweredNoTag:
         # State 11 (feeding) and every non-seated shape arrive as tray_seated=False: a
         # feeding tray must never be mint-swapped.
         await _commanded_discovery_read(monkeypatch)
-        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+        _answer_the_read()
         assert self._ask(seated=False) is False
 
     async def test_a_configured_tray_is_not_an_answer(self, monkeypatch):
         # Config or identity asserted → not bare → the tagless/identity lanes own it.
         await _commanded_discovery_read(monkeypatch)
-        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+        _answer_the_read()
         assert self._ask(bare=False) is False
 
     async def test_asking_never_consumes_the_answer(self, monkeypatch):
         # Non-consuming by contract: _discovery_read_at also drives the 0700_0081 HMS
         # suppression, so popping it would let an expected read failure escape as a fault.
         await _commanded_discovery_read(monkeypatch)
-        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+        _answer_the_read()
         for _ in range(3):
             assert self._ask() is True
         assert (1, 0, 0) in ams_presence._discovery_read_at
@@ -2560,7 +2678,7 @@ class TestTheAnsweredReadClosesItsEntitlement:
 
     async def _answered_read(self, monkeypatch, *, state=10):
         await _commanded_discovery_read(monkeypatch, state=state)
-        _age_slot_stamps(by=ams_presence._IDENTIFY_ACTIVE_S + 5)
+        _answer_the_read()
 
     @pytest.mark.parametrize(
         "binding",
@@ -2643,8 +2761,11 @@ class TestTheAnsweredReadClosesItsEntitlement:
         """Wired where every push already goes. The answer lands ~15 s after the command,
         by which time the slot is emitting steady-state pushes and no longer edges, so the
         closure runs per OBSERVATION rather than per gain."""
+        ams_presence._last_presence[(1, 0, 0)] = True  # the slot was present when the read was put
         await self._answered_read(monkeypatch)
-        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence.time.monotonic()
+        # The cycle that CAUSED the read, stamped BEFORE it (the 2026-08-20 by-cause rule, as the
+        # class's other cases stamp it): a cycle after the read is a NEW question, never answered.
+        ams_presence._physical_cycle_at[(1, 0, 0)] = ams_presence._discovery_read_at[(1, 0, 0)] - 1.0
         ams_presence.open_read_occasion(1, 0, 0)
         ams_presence._primed.add(1)  # steady state, not the first batch
 
@@ -2829,7 +2950,7 @@ class TestStandingOccasionDrain:
         ok = await ams_presence.maybe_command_owed_identify(db_session, 1, 0, 0, _tray(0, state=10), state)
 
         assert ok is True
-        client.ams_refresh_tray.assert_called_once_with(0, 0)
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
         assert ams_presence._read_occasion_open(1, 0, 0) is False  # the accepted read spent it
         # Classified ``discovery``, so its expected no-tag failure is suppressed farm-side —
         # and the stamp is exactly what ``read_answered_no_tag`` later adjudicates.
@@ -3083,3 +3204,187 @@ class TestTheLossEdgeAsksTheFeedState:
         await self._loss(db_session, client, "after_the_push", {"tray": 0, "layer": 3, "absent": {3}})
 
         assert ams_presence.absent_under_active_feed(self.PRINTER, 0, 3) is False
+
+
+# --- the commanded read's self-heal bound (2026-10-12, capsule R-C10) --------
+
+
+class TestTheReadsSelfHealBound:
+    """Raymond, 2026-10-12: "The behaviour should stay the same for the most part, im not asking to change
+    behaviour, i was asking to not rely on timers only as it's finnikey. so if it was self heal, it should
+    stay self heal." A commanded read is answered by its EVENTS first (the identify-ended edge, its flap
+    settling back, the record refusing or voiding it, a new session); one no event answers within
+    ``_IDENTIFY_SELF_HEAL`` (30 s of the printer's ONLINE time) concludes there, and with no tag landed it
+    is production's ANSWERED NO-TAG read — never a slot frozen until a reconnect. Duration decides no
+    identity: a tag landing after the bound still displaces."""
+
+    _KEY = (1, 0, 0)
+
+    async def _seed_and_command(self, db_session, monkeypatch):
+        """A seated, bare slot (the first push only seeds), then ONE real discovery read on it."""
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=10)]), client=MagicMock())
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=10)]}], db_session)
+        client = await _commanded_discovery_read(monkeypatch)
+        assert ams_presence.identify_in_flight(*self._KEY) is True
+        return client
+
+    @staticmethod
+    def _monotonic_passes(seconds):
+        """The read's monotonic stamps aged by ``seconds``: the edge maps' own clock moving with the
+        record's (the Windows monotonic tick is coarse, so a tag landing later must be strictly later)."""
+        for ledger in (ams_presence._slot_read_at, ams_presence._discovery_read_at, ams_presence._commanded_read_at):
+            if (1, 0, 0) in ledger:
+                ledger[(1, 0, 0)] -= seconds
+
+    async def test_slow_firmware_a_tag_at_25_s_identifies(self, db_session, monkeypatch, online):
+        await self._seed_and_command(db_session, monkeypatch)
+        online.advance(25)
+        self._monotonic_passes(25)
+        assert ams_presence.identify_in_flight(*self._KEY) is True  # inside the bound: still waiting
+
+        tagged = _tray(0, state=10, tag=_VALID_TAG, tray_uuid="A" * 32, tray_type="PETG")
+        await _push(1, [{"id": 0, "tray": [tagged]}], db_session)  # the firmware publishes the tag
+        online.advance(10)
+        _status_push(SimpleNamespace(ams_status_main=0))
+
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is False
+        assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is False
+
+    async def test_no_tag_by_30_s_online_concludes_an_answered_no_tag_read(
+        self, db_session, monkeypatch, online, caplog
+    ):
+        await self._seed_and_command(db_session, monkeypatch)
+        online.advance(29)
+        _status_push(SimpleNamespace(ams_status_main=0))
+        assert self._KEY in ams_presence._read_pending
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is False
+
+        online.advance(1)
+        with caplog.at_level(logging.WARNING):
+            _status_push(SimpleNamespace(ams_status_main=0))
+
+        assert self._KEY not in ams_presence._read_pending  # retired
+        assert ams_presence.identify_in_flight(*self._KEY) is False
+        assert self._KEY not in ams_presence._echo_pending  # the slot reads present: no flap is owed
+        assert self._KEY not in ams_presence._commanded_read_at
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[self-heal]")]
+        assert len(lines) == 1 and "_IDENTIFY_SELF_HEAL" in lines[0]
+        # Production's conclusion: an answered no-tag read, which closes the read's entitlements.
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is True
+        assert ams_presence.close_answered_read(1, 0, 0, tray_seated=True, tray_bare=True) is True
+
+    async def test_identify_in_flight_reads_the_bound_before_any_push(self, db_session, monkeypatch, online):
+        """No consumer waits on a push to see the conclusion: the bound is read where the wait is asked."""
+        await self._seed_and_command(db_session, monkeypatch)
+        online.advance(30)
+        assert self._KEY in ams_presence._read_pending  # not yet retired (no push)
+        assert ams_presence.identify_in_flight(*self._KEY) is False
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is True
+
+    async def test_a_late_tag_after_the_bound_still_displaces(self, db_session, monkeypatch, online):
+        await self._seed_and_command(db_session, monkeypatch)
+        online.advance(31)
+        self._monotonic_passes(31)
+        _status_push(SimpleNamespace(ams_status_main=0))
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is True
+
+        tagged = _tray(0, state=10, tag=_VALID_TAG, tray_uuid="A" * 32, tray_type="PETG")
+        await _push(1, [{"id": 0, "tray": [tagged]}], db_session)  # the tag lands late
+
+        # ``_slot_read_at`` re-stamped past the question: no longer a no-tag answer, so the identity
+        # tier's tag displaces whatever the bound's conclusion let the farm conclude (self-correction).
+        assert ams_presence._slot_read_at[self._KEY] > ams_presence._discovery_read_at[self._KEY]
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is False
+
+    async def test_offline_time_does_not_count_toward_the_bound(self, db_session, monkeypatch, online):
+        from backend.app.services.printer_events import SessionLost
+
+        await self._seed_and_command(db_session, monkeypatch)
+        online.advance(10)
+        printer_action.on_session_lost(SessionLost(printer_id=1))
+        online.advance(300)  # five minutes offline
+        _status_push(SimpleNamespace(ams_status_main=0))
+
+        assert self._KEY in ams_presence._read_pending
+        assert ams_presence.identify_in_flight(*self._KEY) is True  # 10 s online: still waiting
+        assert ams_presence.read_answered_no_tag(1, 0, 0, tray_seated=True, tray_bare=True) is False
+
+    async def test_every_event_exit_stays_first(self, db_session, monkeypatch, online, caplog):
+        """The identify-ended edge answers at 12 s, long before the bound: no self-heal line."""
+        await self._seed_and_command(db_session, monkeypatch)
+        online.advance(12)
+        _answer_the_read()
+        assert ams_presence.identify_in_flight(*self._KEY) is False
+        online.advance(60)
+        with caplog.at_level(logging.WARNING):
+            _status_push(SimpleNamespace(ams_status_main=0))
+        assert self._KEY not in ams_presence._read_pending
+        assert not [r for r in caplog.records if r.getMessage().startswith("[self-heal]")]
+
+    async def test_liveness_the_terminal_sweep_reads_the_slot_again_after_the_conclusion(
+        self, db_session, sessions, monkeypatch, online
+    ):
+        """The base journey: a read the firmware never visibly ended no longer freezes the slot. The
+        next terminal's sweep commands its read (it skipped the slot while the read was in flight), and
+        every lane gated on ``identify_in_flight`` (autoconfig, harmonise, re-check) proceeds."""
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        client.wait_ams_settle = AsyncMock(return_value=True)
+        status = SimpleNamespace(
+            state="FINISH",
+            subtask_id="t1",
+            ams_status_main=0,
+            raw_data={"ams": [{"id": 0, "tray": [_tray(0, state=11)]}]},
+        )
+        monkeypatch.setattr(ams_presence.printer_manager, "get_status", lambda pid: status)
+        monkeypatch.setattr(ams_presence.printer_manager, "get_client", lambda pid: client)
+        _arm_cycle(1, 0, 0)
+        ams_presence._read_pending[self._KEY] = _pending()
+
+        await ams_presence.on_printer_terminal(1)
+        assert client.ams_refresh_tray.call_count == 0  # in flight: skipped
+
+        online.advance(30)
+        assert ams_presence.identify_in_flight(*self._KEY) is False
+        status.subtask_id = "t2"  # the next print's terminal
+        await ams_presence.on_printer_terminal(1)
+        assert [c.args for c in client.ams_refresh_tray.call_args_list] == [(0, 0)]
+
+
+class TestTheEchoExpiresOnTheReadsBound:
+    """R25 (2026-10-12): production's ``_ECHO_PENDING_STALE_S`` meaning on ``_IDENTIFY_SELF_HEAL``. An echo
+    whose flap never began within the read's bound is an echo that never came, and it no longer swallows
+    the next real edge; one whose flap began under the identify keeps it however late (pinned in
+    ``TestTheIdentifysOwnAnswer``)."""
+
+    async def test_an_echo_that_never_came_no_longer_swallows_a_real_reseat(self, db_session, monkeypatch, online):
+        clear = AsyncMock()
+        monkeypatch.setattr("backend.app.services.spool_recovery.clear_on_reinsert", clear)
+        client = MagicMock()
+        client.ams_refresh_tray.return_value = (True, "ok")
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)], gcode_state="IDLE"), client=client)
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # present (seed)
+
+        # A read on the present slot whose identify flapped nothing; no push ends it.
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()
+        online.advance(31)
+        # A human pulls the roll after the bound, and reseats it.
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=9)]}], db_session)
+        ams_presence._absent_since[(1, 0, 0)] = ams_presence.time.monotonic() - (
+            ams_presence._MIN_PHYSICAL_ABSENT_S + 1
+        )
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)
+
+        clear.assert_awaited_once()  # acted on: the stale echo swallowed nothing
+        client.ams_refresh_tray.assert_called_once_with(0, 0, sequence_id=ANY)
+
+    async def test_the_push_sweep_drops_an_expired_echo(self, db_session, monkeypatch, online):
+        _patch_pm(monkeypatch, status=_pstate([_tray(0, state=11)]), client=MagicMock())
+        await _push(1, [{"id": 0, "tray": [_tray(0, state=11)]}], db_session)  # present (seed)
+        ams_presence._echo_pending[(1, 0, 0)] = printer_action.now()
+        online.advance(29)
+        _status_push(SimpleNamespace(ams_status_main=0))
+        assert (1, 0, 0) in ams_presence._echo_pending  # inside the bound
+        online.advance(1)
+        _status_push(SimpleNamespace(ams_status_main=0))
+        assert (1, 0, 0) not in ams_presence._echo_pending

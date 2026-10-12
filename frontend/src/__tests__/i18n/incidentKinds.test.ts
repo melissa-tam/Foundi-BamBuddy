@@ -1,6 +1,6 @@
 /**
- * The printer-card incident chip looks its label up DYNAMICALLY —
- * `t(`printers.incident.${status.open_incident.kind}`)` (PrintersPage) — so the
+ * The backend's hold chip (`services/hold_chip`) names an incident's label by the
+ * locale key `printers.incident.<kind>`, which the card renders with `t()` — so the
  * compiler cannot see the key. A backend `printer_incident` kind that ships
  * without its locale leaf renders the raw key string on the operator's card,
  * on the one surface a FOREIGN print's hold is visible at all.
@@ -12,10 +12,17 @@
  * requires an identical leaf set.
  */
 import { describe, it, expect } from 'vitest';
-import { OWN_SURFACE_INCIDENT_KINDS } from '../../api/client';
 import type { PrinterIncidentKind } from '../../api/client';
 import en from '../../i18n/locales/en';
-import { RECOVERING_ACTION_KINDS } from '../../utils/incidentChip';
+
+/**
+ * The backend hold chip (`services/hold_chip`) names these locale leaves by kind; the two
+ * kind sets below are ITS (`hold_chip.OWN_SURFACE_KINDS` / `RECOVERING_ACTION_KINDS`),
+ * spelled here because the chip is decided server-side — `test_hold_chip.py` pins the
+ * backend's sets equal to these.
+ */
+const OWN_SURFACE_INCIDENT_KINDS: readonly PrinterIncidentKind[] = ['service_hold'];
+const RECOVERING_ACTION_KINDS: readonly PrinterIncidentKind[] = ['plate_vision', 'toolhead_refill'];
 
 /** Every kind the status payload can carry — value is unused; the KEYS are the
  *  assertion, and `Record` makes omitting one a compile error. */
@@ -69,8 +76,8 @@ describe('printer incident chip labels', () => {
     }
   });
 
-  /** The recovering-state tooltip (`printers.incidentRecoveringAction.<kind>`,
-   *  `utils/incidentChip`) is looked up the same dynamic way: a missing leaf
+  /** The recovering-state tooltip (`printers.incidentRecoveringAction.<kind>`, the
+   *  backend chip's) is looked up the same dynamic way: a missing leaf
    *  renders its raw key on hover, and an extra leaf is copy nothing renders. */
   it('has the recovering tooltip for exactly the kinds that override it', () => {
     const recovering: Record<string, string> = en.printers.incidentRecoveringAction;
